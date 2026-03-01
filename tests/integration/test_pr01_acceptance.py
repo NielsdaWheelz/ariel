@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 from testcontainers.postgres import PostgresContainer
 
-from ariel.app import create_app
+from ariel.app import ModelAdapter, create_app
 from ariel.db import run_migrations
 
 
@@ -58,7 +58,7 @@ def fresh_postgres_url() -> Generator[str, None, None]:
         yield url.replace("psycopg2", "psycopg")
 
 
-def _build_client(postgres_url: str, adapter: DeterministicModelAdapter) -> TestClient:
+def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
     app = create_app(
         database_url=postgres_url,
         model_adapter=adapter,
@@ -313,3 +313,167 @@ def test_phone_surface_renders_timeline_from_stored_event_chain(postgres_url: st
         assert [turn["user_message"] for turn in turns] == ["msg-a", "msg-b"]
         assert turns[0]["events"][0]["event_type"] == "evt.turn.started"
         assert turns[1]["events"][0]["event_type"] == "evt.turn.started"
+
+
+@dataclass
+class SecretLeakingFailureAdapter:
+    provider: str = "provider.leaky"
+    model: str = "model.leaky-v1"
+    secret_value: str = "sk-live-very-secret"
+
+    def respond(
+        self,
+        user_message: str,
+        *,
+        session_id: str,
+        turn_id: str,
+        history: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        raise RuntimeError(f"provider rejected credential {self.secret_value}")
+
+
+@dataclass
+class NonSecretFailureAdapter:
+    provider: str = "provider.non-secret"
+    model: str = "model.non-secret-v1"
+
+    def respond(
+        self,
+        user_message: str,
+        *,
+        session_id: str,
+        turn_id: str,
+        history: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        raise RuntimeError("token limit exceeded for this request")
+
+
+def test_default_runtime_model_requires_server_secret_credentials(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARIEL_MODEL_PROVIDER", "openai")
+    monkeypatch.setenv("ARIEL_MODEL_NAME", "gpt-4o-mini")
+    monkeypatch.delenv("ARIEL_MODEL_API_KEY", raising=False)
+
+    app = create_app(
+        database_url=postgres_url,
+        model_adapter=None,
+        reset_database=True,
+    )
+    with TestClient(app) as client:
+        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
+        send = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "credential check"},
+        )
+        assert send.status_code == 503
+        body = send.json()
+        assert body["ok"] is False
+        assert body["error"]["code"] == "E_MODEL_CREDENTIALS"
+        assert body["error"]["retryable"] is False
+        assert "credential" in body["error"]["message"].lower()
+        assert "sk-" not in str(body)
+
+        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        assert timeline.status_code == 200
+        events = timeline.json()["turns"][0]["events"]
+        event_types = [event["event_type"] for event in events]
+        assert event_types == [
+            "evt.turn.started",
+            "evt.model.started",
+            "evt.model.failed",
+            "evt.turn.failed",
+        ]
+        failure_payload = next(
+            event["payload"] for event in events if event["event_type"] == "evt.model.failed"
+        )
+        assert "credential" in failure_payload["failure_reason"].lower()
+        assert "sk-" not in failure_payload["failure_reason"]
+
+
+def test_model_failure_reason_is_redacted_for_secret_like_exceptions(postgres_url: str) -> None:
+    adapter = SecretLeakingFailureAdapter()
+    with _build_client(postgres_url, adapter) as client:
+        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
+        send = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "trigger redaction"},
+        )
+        assert send.status_code == 502
+        body = send.json()
+        assert body["ok"] is False
+        assert body["error"]["code"] == "E_MODEL_FAILURE"
+
+        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        assert timeline.status_code == 200
+        events = timeline.json()["turns"][0]["events"]
+        model_failed = next(event for event in events if event["event_type"] == "evt.model.failed")
+        assert adapter.secret_value not in model_failed["payload"]["failure_reason"]
+        assert "RuntimeError" in model_failed["payload"]["failure_reason"]
+
+
+def test_model_failure_reason_preserves_non_secret_detail(postgres_url: str) -> None:
+    adapter = NonSecretFailureAdapter()
+    with _build_client(postgres_url, adapter) as client:
+        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
+        send = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "trigger non-secret failure"},
+        )
+        assert send.status_code == 502
+        body = send.json()
+        assert body["ok"] is False
+        assert body["error"]["code"] == "E_MODEL_FAILURE"
+
+        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        assert timeline.status_code == 200
+        events = timeline.json()["turns"][0]["events"]
+        model_failed = next(event for event in events if event["event_type"] == "evt.model.failed")
+        assert model_failed["payload"]["failure_reason"] == "token limit exceeded for this request"
+
+
+def test_restart_preserves_history_and_appends_to_same_active_session(postgres_url: str) -> None:
+    adapter = DeterministicModelAdapter()
+    with _build_client(postgres_url, adapter) as first_client:
+        first_session = first_client.get("/v1/sessions/active")
+        assert first_session.status_code == 200
+        session_id = first_session.json()["session"]["id"]
+        first_send = first_client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "before restart"},
+        )
+        assert first_send.status_code == 200
+
+        timeline_before = first_client.get(f"/v1/sessions/{session_id}/events")
+        assert timeline_before.status_code == 200
+        assert [turn["user_message"] for turn in timeline_before.json()["turns"]] == ["before restart"]
+
+    restarted_app = create_app(
+        database_url=postgres_url,
+        model_adapter=adapter,
+        reset_database=False,
+    )
+    with TestClient(restarted_app) as second_client:
+        active_after_restart = second_client.get("/v1/sessions/active")
+        assert active_after_restart.status_code == 200
+        assert active_after_restart.json()["session"]["id"] == session_id
+
+        timeline_after_restart = second_client.get(f"/v1/sessions/{session_id}/events")
+        assert timeline_after_restart.status_code == 200
+        assert [turn["user_message"] for turn in timeline_after_restart.json()["turns"]] == [
+            "before restart"
+        ]
+
+        second_send = second_client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "after restart"},
+        )
+        assert second_send.status_code == 200
+
+        final_timeline = second_client.get(f"/v1/sessions/{session_id}/events")
+        assert final_timeline.status_code == 200
+        assert [turn["user_message"] for turn in final_timeline.json()["turns"]] == [
+            "before restart",
+            "after restart",
+        ]
