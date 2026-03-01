@@ -3,6 +3,7 @@
 ### PR-01: Durable Single-Session Chat Skeleton
 - **goal**: stand up a minimal Ariel backend + phone-friendly web chat that handles one full model-backed turn and persists the full audit chain in Postgres.
 - **builds on**: none (current repo state is docs-only).
+- **status**: implemented (2026-03-01)
 - **acceptance**:
   - user can send a message in the chat surface and receive a model-backed response for that same turn.
   - Ariel maintains one active session and appends each new turn into that session.
@@ -17,6 +18,7 @@
   - app service binds localhost only; phone reaches Ariel through `tailscale serve` HTTPS on the node's private tailnet DNS name.
   - no public ingress is enabled for Ariel (no funnel/public exposure), and this is verifiable in deployment state.
   - tailnet policy restricts Ariel access to explicitly allowed user/device identities only.
+  - model provider wiring uses real configured credentials in deployed runtime, with explicit auth/secrets handling paths documented and validated.
   - after service restart, prior conversation history and timeline remain visible, and new turns append to the same active session.
   - model failures still produce auditable model/timeline events with explicit terminal failure state and reason.
   - deployment/run workflow documents a repeatable private setup for a self-hosted machine.

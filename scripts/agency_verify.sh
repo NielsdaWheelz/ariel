@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# agency stub: replace with repo-specific verification (tests/lint/etc)
-echo "replace scripts/agency_verify.sh"
-exit 1
+
+if [[ ! -x ".venv/bin/python" ]]; then
+  echo "missing .venv. run scripts/agency_setup.sh first."
+  exit 1
+fi
+
+make verify
