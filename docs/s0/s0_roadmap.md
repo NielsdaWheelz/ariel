@@ -3,6 +3,7 @@
 ### PR-01: Durable Single-Session Chat Skeleton
 - **goal**: stand up a minimal Ariel backend + phone-friendly web chat that handles one full model-backed turn and persists the full audit chain in Postgres.
 - **builds on**: none (current repo state is docs-only).
+- **status**: implemented (2026-03-01)
 - **acceptance**:
   - user can send a message in the chat surface and receive a model-backed response for that same turn.
   - Ariel maintains one active session and appends each new turn into that session.
