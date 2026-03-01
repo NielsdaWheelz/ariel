@@ -18,6 +18,7 @@
   - app service binds localhost only; phone reaches Ariel through `tailscale serve` HTTPS on the node's private tailnet DNS name.
   - no public ingress is enabled for Ariel (no funnel/public exposure), and this is verifiable in deployment state.
   - tailnet policy restricts Ariel access to explicitly allowed user/device identities only.
+  - model provider wiring uses real configured credentials in deployed runtime, with explicit auth/secrets handling paths documented and validated.
   - after service restart, prior conversation history and timeline remain visible, and new turns append to the same active session.
   - model failures still produce auditable model/timeline events with explicit terminal failure state and reason.
   - deployment/run workflow documents a repeatable private setup for a self-hosted machine.

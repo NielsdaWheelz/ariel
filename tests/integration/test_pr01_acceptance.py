@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from testcontainers.postgres import PostgresContainer
 
 from ariel.app import create_app
+from ariel.db import run_migrations
 
 
 def _parse_utc_rfc3339(value: str) -> datetime:
@@ -45,6 +46,13 @@ class DeterministicModelAdapter:
 
 @pytest.fixture(scope="session")
 def postgres_url() -> Generator[str, None, None]:
+    with PostgresContainer("postgres:16-alpine") as postgres:
+        url = postgres.get_connection_url()
+        yield url.replace("psycopg2", "psycopg")
+
+
+@pytest.fixture
+def fresh_postgres_url() -> Generator[str, None, None]:
     with PostgresContainer("postgres:16-alpine") as postgres:
         url = postgres.get_connection_url()
         yield url.replace("psycopg2", "psycopg")
@@ -91,6 +99,39 @@ def test_create_session_endpoint_reuses_single_active_session(postgres_url: str)
         first_id = first.json()["session"]["id"]
         assert second.json()["session"]["id"] == first_id
         assert active.json()["session"]["id"] == first_id
+
+
+def test_schema_not_ready_returns_503_until_migrated(fresh_postgres_url: str) -> None:
+    adapter = DeterministicModelAdapter()
+
+    app_without_migration = create_app(
+        database_url=fresh_postgres_url,
+        model_adapter=adapter,
+        reset_database=False,
+    )
+    with TestClient(app_without_migration) as client:
+        health = client.get("/v1/health")
+        assert health.status_code == 503
+        health_body = health.json()
+        assert health_body["ok"] is False
+        assert health_body["error"]["code"] == "E_SCHEMA_NOT_READY"
+        assert "missing_tables" in health_body["error"]["details"]
+
+        active = client.get("/v1/sessions/active")
+        assert active.status_code == 503
+        active_body = active.json()
+        assert active_body["ok"] is False
+        assert active_body["error"]["code"] == "E_SCHEMA_NOT_READY"
+
+    run_migrations(fresh_postgres_url)
+    app_with_migration = create_app(
+        database_url=fresh_postgres_url,
+        model_adapter=adapter,
+        reset_database=False,
+    )
+    with TestClient(app_with_migration) as client:
+        assert client.get("/v1/health").status_code == 200
+        assert client.get("/v1/sessions/active").status_code == 200
 
 
 def test_single_active_session_and_ordered_turn_event_chain(postgres_url: str) -> None:

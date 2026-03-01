@@ -9,6 +9,7 @@ description = "slice-0 private walking skeleton for ariel"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+  "alembic>=1.16.5",
   "fastapi>=0.115.11",
   "pydantic-settings>=2.8.1",
   "psycopg[binary]>=3.2.6",
@@ -48,5 +49,5 @@ check_untyped_defs = true
 disallow_untyped_defs = true
 
 [[tool.mypy.overrides]]
-module = ["testcontainers.*", "ulid"]
+module = ["alembic.*", "testcontainers.*", "ulid"]
 ignore_missing_imports = true

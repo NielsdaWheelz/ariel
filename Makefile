@@ -1,8 +1,11 @@
-.PHONY: setup lint typecheck test verify
+.PHONY: setup db-upgrade lint typecheck test verify
 
 setup:
 	python3 -m venv .venv
 	.venv/bin/pip install -e ".[dev]"
+
+db-upgrade:
+	.venv/bin/alembic upgrade head
 
 lint:
 	.venv/bin/ruff check .

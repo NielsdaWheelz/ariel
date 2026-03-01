@@ -30,6 +30,8 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
+from ariel.db import missing_required_tables, reset_schema_for_tests
+
 
 def _utcnow() -> datetime:
     return datetime.now(tz=UTC)
@@ -293,10 +295,10 @@ def create_app(
     session_factory = sessionmaker(bind=engine, future=True, expire_on_commit=False)
 
     @asynccontextmanager
-    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if reset_database:
-            Base.metadata.drop_all(bind=engine)
-        Base.metadata.create_all(bind=engine)
+            reset_schema_for_tests(engine, db_url)
+        app.state.schema_missing_tables = missing_required_tables(engine)
         try:
             yield
         finally:
@@ -306,6 +308,7 @@ def create_app(
     app.state.engine = engine
     app.state.session_factory = session_factory
     app.state.model_adapter = adapter
+    app.state.schema_missing_tables = []
 
     @app.exception_handler(ApiError)
     def _handle_api_error(_: Request, exc: ApiError) -> JSONResponse:
@@ -339,12 +342,33 @@ def create_app(
     def phone_surface() -> str:
         return _PHONE_SURFACE_HTML
 
-    @app.get("/v1/health")
-    def health() -> dict[str, bool]:
+    def _ensure_schema_ready() -> None:
+        if app.state.schema_missing_tables:
+            raise ApiError(
+                status_code=503,
+                code="E_SCHEMA_NOT_READY",
+                message="database schema is not migrated",
+                details={"missing_tables": app.state.schema_missing_tables},
+                retryable=False,
+            )
+
+    @app.get("/v1/health", response_model=None)
+    def health() -> JSONResponse | dict[str, bool]:
+        if app.state.schema_missing_tables:
+            return _error_response(
+                ApiError(
+                    status_code=503,
+                    code="E_SCHEMA_NOT_READY",
+                    message="database schema is not migrated",
+                    details={"missing_tables": app.state.schema_missing_tables},
+                    retryable=False,
+                )
+            )
         return {"ok": True}
 
     @app.post("/v1/sessions")
     def create_or_get_session() -> dict[str, Any]:
+        _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
                 active_session = _get_or_create_active_session(db)
@@ -352,6 +376,7 @@ def create_app(
 
     @app.get("/v1/sessions/active")
     def get_active_session() -> dict[str, Any]:
+        _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
                 active_session = _get_or_create_active_session(db)
@@ -359,6 +384,7 @@ def create_app(
 
     @app.post("/v1/sessions/{session_id}/message", response_model=None)
     def post_message(session_id: str, payload: MessageRequest) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
                 active_session = db.scalar(
@@ -501,6 +527,7 @@ def create_app(
 
     @app.get("/v1/sessions/{session_id}/events")
     def get_session_events(session_id: str) -> dict[str, Any]:
+        _ensure_schema_ready()
         with session_factory() as db:
             session_record = db.scalar(
                 select(SessionRecord).where(SessionRecord.id == session_id).limit(1)
