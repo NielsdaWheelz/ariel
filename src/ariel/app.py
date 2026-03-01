@@ -647,10 +647,37 @@ _PHONE_SURFACE_HTML = """<!doctype html>
     }
 
     function escapeHtml(value) {
-      return value
+      return String(value ?? "")
         .replaceAll("&", "&amp;")
         .replaceAll("<", "&lt;")
         .replaceAll(">", "&gt;");
+    }
+
+    function formatUsage(usage) {
+      if (!usage || typeof usage !== "object") return "";
+      const fields = [
+        ["prompt", usage.prompt_tokens],
+        ["completion", usage.completion_tokens],
+        ["total", usage.total_tokens],
+      ];
+      const tokenParts = fields
+        .filter(([, value]) => Number.isFinite(Number(value)))
+        .map(([label, value]) => `${label}=${value}`);
+      return tokenParts.length ? `tokens(${tokenParts.join(", ")})` : "";
+    }
+
+    function formatEventDetails(event) {
+      const payload = (event && typeof event.payload === "object" && event.payload !== null)
+        ? event.payload
+        : {};
+      const parts = [];
+      if (payload.provider) parts.push(`provider=${payload.provider}`);
+      if (payload.model) parts.push(`model=${payload.model}`);
+      if (typeof payload.duration_ms === "number") parts.push(`duration_ms=${payload.duration_ms}`);
+      const usage = formatUsage(payload.usage);
+      if (usage) parts.push(usage);
+      if (payload.failure_reason) parts.push(`failure_reason=${payload.failure_reason}`);
+      return parts.join(" | ");
     }
 
     function renderTimeline(turns) {
@@ -660,7 +687,11 @@ _PHONE_SURFACE_HTML = """<!doctype html>
       }
       timelineNode.innerHTML = turns.map((turn) => {
         const events = turn.events
-          .map((event) => `<div class="event">[${event.sequence}] ${escapeHtml(event.event_type)}</div>`)
+          .map((event) => {
+            const detailText = formatEventDetails(event);
+            const suffix = detailText ? ` - ${escapeHtml(detailText)}` : "";
+            return `<div class="event">[${escapeHtml(event.sequence)}] ${escapeHtml(event.event_type)}${suffix}</div>`;
+          })
           .join("");
         return `
           <article class="turn">

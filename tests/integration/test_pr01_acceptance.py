@@ -301,6 +301,12 @@ def test_phone_surface_renders_timeline_from_stored_event_chain(postgres_url: st
         assert "viewport" in html
         assert "/v1/sessions/active" in html
         assert "/v1/sessions/${sessionId}/events" in html
+        assert "formatEventDetails" in html
+        assert "provider=" in html
+        assert "model=" in html
+        assert "duration_ms=" in html
+        assert "failure_reason=" in html
+        assert "tokens(" in html
 
         timeline = client.get(f"/v1/sessions/{session_id}/events")
         turns = timeline.json()["turns"]
