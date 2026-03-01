@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from ipaddress import ip_address
+import re
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, AsyncIterator, Protocol
 
+import httpx
 import ulid
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
@@ -49,6 +52,34 @@ class AppSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="ARIEL_", extra="ignore")
 
     database_url: str = "postgresql+psycopg://localhost/ariel"
+    bind_host: str = "127.0.0.1"
+    bind_port: int = 8000
+    model_provider: str = "openai"
+    model_name: str = "gpt-4o-mini"
+    model_api_base_url: str = "https://api.openai.com/v1"
+    model_api_key: str | None = None
+    model_timeout_seconds: float = 30.0
+
+    @field_validator("bind_host")
+    @classmethod
+    def _bind_host_must_be_loopback(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized in {"localhost", "127.0.0.1", "::1"}:
+            return normalized
+        try:
+            if ip_address(normalized).is_loopback:
+                return normalized
+        except ValueError:
+            pass
+        raise ValueError("bind_host must be loopback-only (localhost, 127.0.0.1, or ::1)")
+
+    @field_validator("model_provider")
+    @classmethod
+    def _model_provider_must_be_supported(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"openai", "echo"}:
+            raise ValueError("model_provider must be one of: openai, echo")
+        return normalized
 
 
 _ACTIVE_SESSION_LOCK_ID = 24_310_001
@@ -188,6 +219,208 @@ class EchoModelAdapter:
         }
 
 
+class ModelAdapterError(Exception):
+    def __init__(
+        self,
+        *,
+        safe_reason: str,
+        status_code: int,
+        code: str,
+        message: str,
+        retryable: bool,
+    ) -> None:
+        super().__init__(safe_reason)
+        self.safe_reason = safe_reason
+        self.status_code = status_code
+        self.code = code
+        self.message = message
+        self.retryable = retryable
+
+
+@dataclass(slots=True)
+class OpenAIChatCompletionsAdapter:
+    provider: str
+    model: str
+    api_base_url: str
+    api_key: str | None
+    timeout_seconds: float = 30.0
+
+    def respond(
+        self,
+        user_message: str,
+        *,
+        session_id: str,
+        turn_id: str,
+        history: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if not self.api_key:
+            raise ModelAdapterError(
+                safe_reason="model credentials are not configured",
+                status_code=503,
+                code="E_MODEL_CREDENTIALS",
+                message="model credentials are not configured",
+                retryable=False,
+            )
+
+        try:
+            response = httpx.post(
+                f"{self.api_base_url.rstrip('/')}/chat/completions",
+                headers={
+                    "authorization": f"Bearer {self.api_key}",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": self.model,
+                    "messages": _build_openai_messages(history=history, user_message=user_message),
+                },
+                timeout=self.timeout_seconds,
+            )
+        except httpx.TimeoutException as exc:
+            raise ModelAdapterError(
+                safe_reason="model provider request timed out",
+                status_code=502,
+                code="E_MODEL_FAILURE",
+                message="model provider request failed",
+                retryable=True,
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise ModelAdapterError(
+                safe_reason="model provider network request failed",
+                status_code=502,
+                code="E_MODEL_FAILURE",
+                message="model provider request failed",
+                retryable=True,
+            ) from exc
+
+        if response.status_code in {401, 403}:
+            raise ModelAdapterError(
+                safe_reason="model credentials were rejected by provider",
+                status_code=502,
+                code="E_MODEL_CREDENTIALS",
+                message="model credentials were rejected by provider",
+                retryable=False,
+            )
+
+        if response.status_code >= 400:
+            raise ModelAdapterError(
+                safe_reason=f"model provider returned HTTP {response.status_code}",
+                status_code=502,
+                code="E_MODEL_FAILURE",
+                message="model provider request failed",
+                retryable=True,
+            )
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise ModelAdapterError(
+                safe_reason="model provider returned invalid JSON",
+                status_code=502,
+                code="E_MODEL_FAILURE",
+                message="model provider request failed",
+                retryable=True,
+            ) from exc
+
+        assistant_text = _extract_openai_assistant_text(payload)
+        if not assistant_text:
+            raise ModelAdapterError(
+                safe_reason="model provider returned empty assistant response",
+                status_code=502,
+                code="E_MODEL_FAILURE",
+                message="model provider request failed",
+                retryable=True,
+            )
+
+        usage_payload = payload.get("usage")
+        usage = usage_payload if isinstance(usage_payload, dict) else None
+        provider_response_id = payload.get("id")
+
+        return {
+            "assistant_text": assistant_text,
+            "provider": self.provider,
+            "model": self.model,
+            "usage": usage,
+            "provider_response_id": provider_response_id,
+        }
+
+
+def _build_openai_messages(*, history: list[dict[str, Any]], user_message: str) -> list[dict[str, str]]:
+    messages: list[dict[str, str]] = []
+    for prior_turn in history:
+        prior_user_message = prior_turn.get("user_message")
+        if isinstance(prior_user_message, str) and prior_user_message:
+            messages.append({"role": "user", "content": prior_user_message})
+        prior_assistant_message = prior_turn.get("assistant_message")
+        if isinstance(prior_assistant_message, str) and prior_assistant_message:
+            messages.append({"role": "assistant", "content": prior_assistant_message})
+    messages.append({"role": "user", "content": user_message})
+    return messages
+
+
+def _extract_openai_assistant_text(payload: dict[str, Any]) -> str:
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    first_choice = choices[0]
+    if not isinstance(first_choice, dict):
+        return ""
+    message_payload = first_choice.get("message")
+    if not isinstance(message_payload, dict):
+        return ""
+    content = message_payload.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") != "text":
+                continue
+            text = item.get("text")
+            if isinstance(text, str) and text:
+                text_parts.append(text)
+        return "".join(text_parts).strip()
+    return ""
+
+
+_SECRET_LIKE_PATTERN = re.compile(
+    (
+        r"(sk-[A-Za-z0-9_\-]{8,}"
+        r"|api[_-]?key"
+        r"|secret(?:[_-]?(?:key|value))?"
+        r"|authorization"
+        r"|bearer\s+[A-Za-z0-9\-_.]+"
+        r"|token\s*[:=]\s*[A-Za-z0-9\-_.]+)"
+    ),
+    re.IGNORECASE,
+)
+
+
+def _safe_failure_reason(raw_message: str, *, fallback: str) -> str:
+    candidate = raw_message.strip()
+    if not candidate:
+        return fallback
+    if _SECRET_LIKE_PATTERN.search(candidate):
+        return fallback
+    return candidate[:500]
+
+
+def _build_default_model_adapter(settings: AppSettings) -> ModelAdapter:
+    if settings.model_provider == "echo":
+        return EchoModelAdapter(model=settings.model_name)
+    if settings.model_provider == "openai":
+        return OpenAIChatCompletionsAdapter(
+            provider="provider.openai",
+            model=settings.model_name,
+            api_base_url=settings.model_api_base_url,
+            api_key=settings.model_api_key,
+            timeout_seconds=settings.model_timeout_seconds,
+        )
+    msg = f"unsupported model provider: {settings.model_provider}"
+    raise RuntimeError(msg)
+
+
 @dataclass(slots=True)
 class ApiError(Exception):
     status_code: int
@@ -288,8 +521,9 @@ def create_app(
     model_adapter: ModelAdapter | None = None,
     reset_database: bool = False,
 ) -> FastAPI:
-    db_url = database_url or AppSettings().database_url
-    adapter = model_adapter or EchoModelAdapter()
+    settings = AppSettings()
+    db_url = database_url or settings.database_url
+    adapter = model_adapter or _build_default_model_adapter(settings)
 
     engine = create_engine(db_url, future=True, pool_pre_ping=True)
     session_factory = sessionmaker(bind=engine, future=True, expire_on_commit=False)
@@ -308,6 +542,8 @@ def create_app(
     app.state.engine = engine
     app.state.session_factory = session_factory
     app.state.model_adapter = adapter
+    app.state.bind_host = settings.bind_host
+    app.state.bind_port = settings.bind_port
     app.state.schema_missing_tables = []
 
     @app.exception_handler(ApiError)
@@ -486,7 +722,25 @@ def create_app(
                     add_event("evt.turn.completed", {})
                 except Exception as exc:
                     duration_ms = int((time.perf_counter() - started_at) * 1000)
-                    failure_reason = str(exc) or exc.__class__.__name__
+                    fallback_reason = f"unexpected {exc.__class__.__name__}"
+                    if isinstance(exc, ModelAdapterError):
+                        failure_reason = _safe_failure_reason(exc.safe_reason, fallback=fallback_reason)
+                        model_failure = ApiError(
+                            status_code=exc.status_code,
+                            code=exc.code,
+                            message=exc.message,
+                            details={"session_id": session_id, "turn_id": turn.id},
+                            retryable=exc.retryable,
+                        )
+                    else:
+                        failure_reason = _safe_failure_reason(str(exc), fallback=fallback_reason)
+                        model_failure = ApiError(
+                            status_code=502,
+                            code="E_MODEL_FAILURE",
+                            message="model provider request failed",
+                            details={"session_id": session_id, "turn_id": turn.id},
+                            retryable=True,
+                        )
                     add_event(
                         "evt.model.failed",
                         {
@@ -499,13 +753,6 @@ def create_app(
                     turn.status = "failed"
                     turn.updated_at = _utcnow()
                     add_event("evt.turn.failed", {"failure_reason": failure_reason})
-                    model_failure = ApiError(
-                        status_code=502,
-                        code="E_MODEL_FAILURE",
-                        message="model provider request failed",
-                        details={"session_id": session_id, "turn_id": turn.id},
-                        retryable=True,
-                    )
 
                 active_session.updated_at = _utcnow()
                 db.flush()

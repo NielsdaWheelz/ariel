@@ -1,0 +1,12 @@
+{
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["user:alice@example.com", "tag:alice-phone"],
+      "dst": ["tag:ariel:443"]
+    }
+  ],
+  "tagOwners": {
+    "tag:ariel": ["user:alice@example.com"]
+  }
+}

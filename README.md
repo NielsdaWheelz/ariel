@@ -24,10 +24,25 @@ bash scripts/agency_verify.sh
 
 ## run locally
 
-set `ARIEL_DATABASE_URL`, run migrations, then start uvicorn:
+set `ARIEL_DATABASE_URL`, choose model wiring, run migrations, then start uvicorn.
+
+real provider mode (default):
 
 ```bash
 export ARIEL_DATABASE_URL="postgresql+psycopg://<user>:<password>@localhost/<database>"
+export ARIEL_MODEL_PROVIDER="openai"
+export ARIEL_MODEL_NAME="gpt-4o-mini"
+export ARIEL_MODEL_API_KEY="<provider-key>"
+make db-upgrade
+.venv/bin/uvicorn ariel.app:create_app --factory --reload
+```
+
+local deterministic dev mode (no external model call):
+
+```bash
+export ARIEL_DATABASE_URL="postgresql+psycopg://<user>:<password>@localhost/<database>"
+export ARIEL_MODEL_PROVIDER="echo"
+export ARIEL_MODEL_NAME="echo-v1"
 make db-upgrade
 .venv/bin/uvicorn ariel.app:create_app --factory --reload
 ```
@@ -41,3 +56,9 @@ curl -sS http://127.0.0.1:8000/v1/health
 curl -sS http://127.0.0.1:8000/v1/sessions/active
 curl -sS http://127.0.0.1:8000/
 ```
+
+## private tailnet deployment
+
+for the pr-02 private ingress setup + restart durability verification workflow, use:
+
+- `docs/v1/s0/private_tailnet_runbook.md`

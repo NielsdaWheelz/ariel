@@ -11,9 +11,10 @@
   - timeline UI renders turn history from the stored event chain and shows provider/model identity, duration, usage metadata when available, and failure reason when present.
 - **non-goals**: tailnet/private ingress hardening and restart-proof validation.
 
-### PR-02: Private Tailnet Access + Restart Durability Hardening (planned after PR-01 merges)
+### PR-02: Private Tailnet Access + Restart Durability Hardening
 - **goal**: make the walking skeleton usable from phone over private routing only and prove history continuity across restarts.
 - **builds on**: PR-01.
+- **status**: implemented (2026-03-01)
 - **acceptance**:
   - app service binds localhost only; phone reaches Ariel through `tailscale serve` HTTPS on the node's private tailnet DNS name.
   - no public ingress is enabled for Ariel (no funnel/public exposure), and this is verifiable in deployment state.
