@@ -34,6 +34,8 @@ class AppSettings(BaseSettings):
     max_response_tokens: int = 700
     max_model_attempts: int = 2
     max_turn_wall_time_ms: int = 20000
+    approval_ttl_seconds: int = 900
+    approval_actor_id: str = "user.local"
 
     @field_validator("bind_host")
     @classmethod
@@ -90,3 +92,18 @@ class AppSettings(BaseSettings):
         if value < 1:
             raise ValueError("max_turn_wall_time_ms must be >= 1")
         return value
+
+    @field_validator("approval_ttl_seconds")
+    @classmethod
+    def _approval_ttl_seconds_must_be_positive(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("approval_ttl_seconds must be >= 1")
+        return value
+
+    @field_validator("approval_actor_id")
+    @classmethod
+    def _approval_actor_id_must_not_be_blank(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("approval_actor_id must not be blank")
+        return normalized

@@ -4,6 +4,7 @@ slice-0 walking skeleton with:
 
 - fastapi backend
 - postgres-backed sessions/turns/events persistence
+- slice-2 action-attempt + approval persistence (`action_attempts`, `approval_requests`)
 - single active-session contract
 - phone-first web chat surface at `/`
 - acceptance-first integration tests using real postgres (testcontainers)
@@ -34,6 +35,34 @@ bash scripts/agency_verify.sh
 ```
 
 `make e2e` runs high-signal smoke coverage for the phone surface timeline plus slice-1 bounded-context event auditing.
+
+## slice-2 action surface
+
+the action engine now evaluates model proposals per turn and emits an auditable lifecycle:
+
+- `evt.action.proposed`
+- `evt.action.policy_decided`
+- `evt.action.approval.requested|approved|denied|expired`
+- `evt.action.execution.started|succeeded|failed`
+
+approval decisions are handled through:
+
+```bash
+POST /v1/approvals
+```
+
+request body:
+
+```json
+{
+  "approval_id": "apr_xxx",
+  "decision": "approve",
+  "actor_id": "user.local",
+  "reason": "optional"
+}
+```
+
+the endpoint is single-use, actor-bound, expiry-bound, and executes only the frozen proposed payload.
 
 ## run locally
 
@@ -97,6 +126,8 @@ slice-1 turn budgets are runtime-configurable:
 - `ARIEL_MAX_RESPONSE_TOKENS` (default `700`) bounds assistant completion tokens per turn.
 - `ARIEL_MAX_MODEL_ATTEMPTS` (default `2`) bounds retryable model attempts per turn.
 - `ARIEL_MAX_TURN_WALL_TIME_MS` (default `20000`) bounds total turn processing wall time.
+- `ARIEL_APPROVAL_TTL_SECONDS` (default `900`) sets approval expiry window for approval-gated actions.
+- `ARIEL_APPROVAL_ACTOR_ID` (default `user.local`) sets the expected actor for approval-bound actions.
 
 when a configured turn budget is exhausted, `POST /v1/sessions/{session_id}/message` returns HTTP `429` with
 `E_TURN_LIMIT_REACHED` and structured limit details (`budget`, `unit`, `limit`, `measured`, `applied_limits`).
