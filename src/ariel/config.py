@@ -30,6 +30,10 @@ class AppSettings(BaseSettings):
     model_api_key: str | None = None
     model_timeout_seconds: float = 30.0
     max_recent_turns: int = 12
+    max_context_tokens: int = 6000
+    max_response_tokens: int = 700
+    max_model_attempts: int = 2
+    max_turn_wall_time_ms: int = 20000
 
     @field_validator("bind_host")
     @classmethod
@@ -57,4 +61,32 @@ class AppSettings(BaseSettings):
     def _max_recent_turns_must_be_positive(cls, value: int) -> int:
         if value < 1:
             raise ValueError("max_recent_turns must be >= 1")
+        return value
+
+    @field_validator("max_context_tokens")
+    @classmethod
+    def _max_context_tokens_must_be_positive(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("max_context_tokens must be >= 1")
+        return value
+
+    @field_validator("max_response_tokens")
+    @classmethod
+    def _max_response_tokens_must_be_positive(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("max_response_tokens must be >= 1")
+        return value
+
+    @field_validator("max_model_attempts")
+    @classmethod
+    def _max_model_attempts_must_be_positive(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("max_model_attempts must be >= 1")
+        return value
+
+    @field_validator("max_turn_wall_time_ms")
+    @classmethod
+    def _max_turn_wall_time_ms_must_be_positive(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("max_turn_wall_time_ms must be >= 1")
         return value

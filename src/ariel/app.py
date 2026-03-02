@@ -411,6 +411,115 @@ def _safe_failure_reason(raw_message: str, *, fallback: str) -> str:
     return candidate[:500]
 
 
+@dataclass(slots=True, frozen=True)
+class TurnLimitViolation:
+    budget: str
+    unit: str
+    measured: int
+    limit: int
+
+
+def _estimate_text_tokens(text: str) -> int:
+    return len(re.findall(r"\S+", text))
+
+
+def _response_tokens_from_model_payload(
+    assistant_response: dict[str, Any],
+    *,
+    assistant_text: str,
+) -> int:
+    usage_payload = assistant_response.get("usage")
+    if isinstance(usage_payload, dict):
+        completion_tokens = usage_payload.get("completion_tokens")
+        if isinstance(completion_tokens, int) and completion_tokens >= 0:
+            return completion_tokens
+    return _estimate_text_tokens(assistant_text)
+
+
+def _estimate_context_tokens(*, context_bundle: dict[str, Any], user_message: str) -> int:
+    token_total = _estimate_text_tokens(user_message)
+
+    policy_system_instructions = context_bundle.get("policy_system_instructions")
+    if isinstance(policy_system_instructions, list):
+        for instruction in policy_system_instructions:
+            if isinstance(instruction, str):
+                token_total += _estimate_text_tokens(instruction)
+
+    recent_active_session_turns = context_bundle.get("recent_active_session_turns")
+    if isinstance(recent_active_session_turns, list):
+        for prior_turn in recent_active_session_turns:
+            if not isinstance(prior_turn, dict):
+                continue
+            prior_user_message = prior_turn.get("user_message")
+            if isinstance(prior_user_message, str):
+                token_total += _estimate_text_tokens(prior_user_message)
+            prior_assistant_message = prior_turn.get("assistant_message")
+            if isinstance(prior_assistant_message, str):
+                token_total += _estimate_text_tokens(prior_assistant_message)
+
+    return token_total
+
+
+def _turn_limit_message(violation: TurnLimitViolation) -> str:
+    if violation.budget == "context_tokens":
+        return (
+            "this turn stopped because the context budget was exhausted. "
+            "please resend with only the most relevant details needed to proceed."
+        )
+    if violation.budget == "response_tokens":
+        return (
+            "this turn stopped because the response budget was exhausted. "
+            "please narrow the request so i can answer within the response budget."
+        )
+    if violation.budget == "model_attempts":
+        return (
+            "this turn stopped because the model attempt limit was exhausted. "
+            "please provide missing details or retry with a narrower request."
+        )
+    if violation.budget == "turn_wall_time_ms":
+        return (
+            "this turn stopped because the turn time budget was exhausted. "
+            "please split the request into smaller steps so i can complete it."
+        )
+    return "this turn stopped because a configured turn budget was exhausted."
+
+
+def _applied_turn_limits(app: FastAPI) -> dict[str, int]:
+    return {
+        "max_recent_turns": int(app.state.max_recent_turns),
+        "max_context_tokens": int(app.state.max_context_tokens),
+        "max_response_tokens": int(app.state.max_response_tokens),
+        "max_model_attempts": int(app.state.max_model_attempts),
+        "max_turn_wall_time_ms": int(app.state.max_turn_wall_time_ms),
+    }
+
+
+def _build_turn_limit_error(
+    *,
+    session_id: str,
+    turn_id: str,
+    violation: TurnLimitViolation,
+    applied_limits: dict[str, int],
+) -> ApiError:
+    return ApiError(
+        status_code=429,
+        code="E_TURN_LIMIT_REACHED",
+        message=_turn_limit_message(violation),
+        details={
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "limit": {
+                "budget": violation.budget,
+                "unit": violation.unit,
+                "limit": violation.limit,
+                "measured": violation.measured,
+            },
+            "applied_limits": applied_limits,
+        },
+        retryable=False,
+    )
+
+
 def _build_default_model_adapter(settings: AppSettings) -> ModelAdapter:
     if settings.model_provider == "echo":
         return EchoModelAdapter(model=settings.model_name)
@@ -621,6 +730,10 @@ def create_app(
     app.state.bind_host = settings.bind_host
     app.state.bind_port = settings.bind_port
     app.state.max_recent_turns = settings.max_recent_turns
+    app.state.max_context_tokens = settings.max_context_tokens
+    app.state.max_response_tokens = settings.max_response_tokens
+    app.state.max_model_attempts = settings.max_model_attempts
+    app.state.max_turn_wall_time_ms = settings.max_turn_wall_time_ms
     app.state.schema_missing_tables = []
 
     @app.exception_handler(ApiError)
@@ -757,37 +870,236 @@ def create_app(
                     created_events.append(event)
 
                 add_event("evt.turn.started", {"message": payload.message})
-                add_event(
-                    "evt.model.started",
-                    {
-                        "provider": app.state.model_adapter.provider,
-                        "model": app.state.model_adapter.model,
-                        "context": context_metadata,
-                    },
-                )
+                applied_limits = _applied_turn_limits(app)
 
-                started_at = time.perf_counter()
-                model_failure: ApiError | None = None
-                assistant_response: dict[str, Any] | None = None
-                try:
-                    assistant_response = app.state.model_adapter.respond(
-                        payload.message,
+                def elapsed_turn_ms(started_at: float) -> int:
+                    return int((time.perf_counter() - started_at) * 1000)
+
+                def build_turn_limit_failure(
+                    *,
+                    budget: str,
+                    unit: str,
+                    measured: int,
+                    limit: int,
+                ) -> ApiError:
+                    return _build_turn_limit_error(
                         session_id=session_id,
                         turn_id=turn.id,
-                        history=context_bundle["recent_active_session_turns"],
-                        context_bundle=context_bundle,
+                        violation=TurnLimitViolation(
+                            budget=budget,
+                            unit=unit,
+                            measured=measured,
+                            limit=limit,
+                        ),
+                        applied_limits=applied_limits,
                     )
-                    duration_ms = int((time.perf_counter() - started_at) * 1000)
+
+                def emit_turn_limit_failure(failure: ApiError) -> None:
+                    raw_limit = failure.details.get("limit")
+                    limit_details = raw_limit if isinstance(raw_limit, dict) else {}
                     add_event(
-                        "evt.model.completed",
+                        "evt.turn.limit_reached",
                         {
-                            "provider": assistant_response["provider"],
-                            "model": assistant_response["model"],
-                            "duration_ms": duration_ms,
-                            "usage": assistant_response.get("usage"),
-                            "provider_response_id": assistant_response.get("provider_response_id"),
+                            "code": failure.code,
+                            "message": failure.message,
+                            "limit": limit_details,
+                            "applied_limits": applied_limits,
                         },
                     )
+                    add_event(
+                        "evt.assistant.emitted",
+                        {
+                            "message": failure.message,
+                            "bounded_failure": {
+                                "code": failure.code,
+                                "limit": limit_details,
+                            },
+                        },
+                    )
+                    turn.assistant_message = failure.message
+                    turn.status = "failed"
+                    turn.updated_at = _utcnow()
+                    add_event(
+                        "evt.turn.failed",
+                        {
+                            "failure_reason": failure.message,
+                            "error_code": failure.code,
+                            "limit": limit_details,
+                        },
+                    )
+
+                bounded_failure: ApiError | None = None
+                model_failure: ApiError | None = None
+                model_failure_reason: str | None = None
+                assistant_response: dict[str, Any] | None = None
+
+                context_tokens = _estimate_context_tokens(
+                    context_bundle=context_bundle,
+                    user_message=payload.message,
+                )
+                if context_tokens > app.state.max_context_tokens:
+                    bounded_failure = build_turn_limit_failure(
+                        budget="context_tokens",
+                        unit="tokens",
+                        measured=context_tokens,
+                        limit=app.state.max_context_tokens,
+                    )
+                else:
+                    turn_started_at = time.perf_counter()
+                    for attempt in range(1, app.state.max_model_attempts + 1):
+                        if attempt > 1:
+                            elapsed_before_attempt_ms = elapsed_turn_ms(turn_started_at)
+                            if elapsed_before_attempt_ms > app.state.max_turn_wall_time_ms:
+                                bounded_failure = build_turn_limit_failure(
+                                    budget="turn_wall_time_ms",
+                                    unit="ms",
+                                    measured=elapsed_before_attempt_ms,
+                                    limit=app.state.max_turn_wall_time_ms,
+                                )
+                                break
+
+                        add_event(
+                            "evt.model.started",
+                            {
+                                "provider": app.state.model_adapter.provider,
+                                "model": app.state.model_adapter.model,
+                                "context": context_metadata,
+                                "attempt": attempt,
+                            },
+                        )
+                        model_started_at = time.perf_counter()
+                        try:
+                            candidate_response = app.state.model_adapter.respond(
+                                payload.message,
+                                session_id=session_id,
+                                turn_id=turn.id,
+                                history=context_bundle["recent_active_session_turns"],
+                                context_bundle=context_bundle,
+                            )
+                            duration_ms = int((time.perf_counter() - model_started_at) * 1000)
+                            add_event(
+                                "evt.model.completed",
+                                {
+                                    "provider": candidate_response["provider"],
+                                    "model": candidate_response["model"],
+                                    "duration_ms": duration_ms,
+                                    "usage": candidate_response.get("usage"),
+                                    "provider_response_id": candidate_response.get(
+                                        "provider_response_id"
+                                    ),
+                                    "attempt": attempt,
+                                },
+                            )
+
+                            elapsed_after_model_ms = elapsed_turn_ms(turn_started_at)
+                            if elapsed_after_model_ms > app.state.max_turn_wall_time_ms:
+                                bounded_failure = build_turn_limit_failure(
+                                    budget="turn_wall_time_ms",
+                                    unit="ms",
+                                    measured=elapsed_after_model_ms,
+                                    limit=app.state.max_turn_wall_time_ms,
+                                )
+                                break
+
+                            assistant_text = candidate_response.get("assistant_text")
+                            if not isinstance(assistant_text, str) or not assistant_text.strip():
+                                raise RuntimeError("model response missing assistant_text")
+                            response_tokens = _response_tokens_from_model_payload(
+                                candidate_response,
+                                assistant_text=assistant_text,
+                            )
+                            if response_tokens > app.state.max_response_tokens:
+                                bounded_failure = build_turn_limit_failure(
+                                    budget="response_tokens",
+                                    unit="tokens",
+                                    measured=response_tokens,
+                                    limit=app.state.max_response_tokens,
+                                )
+                                break
+
+                            assistant_response = candidate_response
+                            break
+                        except Exception as exc:
+                            duration_ms = int((time.perf_counter() - model_started_at) * 1000)
+                            fallback_reason = f"unexpected {exc.__class__.__name__}"
+                            should_retry = False
+                            if isinstance(exc, ModelAdapterError):
+                                failure_reason = _safe_failure_reason(
+                                    exc.safe_reason,
+                                    fallback=fallback_reason,
+                                )
+                                model_failure_candidate = ApiError(
+                                    status_code=exc.status_code,
+                                    code=exc.code,
+                                    message=exc.message,
+                                    details={
+                                        "session_id": session_id,
+                                        "turn_id": turn.id,
+                                        "attempt": attempt,
+                                    },
+                                    retryable=exc.retryable,
+                                )
+                                should_retry = exc.retryable
+                            else:
+                                failure_reason = _safe_failure_reason(str(exc), fallback=fallback_reason)
+                                model_failure_candidate = ApiError(
+                                    status_code=502,
+                                    code="E_MODEL_FAILURE",
+                                    message="model provider request failed",
+                                    details={
+                                        "session_id": session_id,
+                                        "turn_id": turn.id,
+                                        "attempt": attempt,
+                                    },
+                                    retryable=True,
+                                )
+
+                            add_event(
+                                "evt.model.failed",
+                                {
+                                    "provider": app.state.model_adapter.provider,
+                                    "model": app.state.model_adapter.model,
+                                    "duration_ms": duration_ms,
+                                    "failure_reason": failure_reason,
+                                    "attempt": attempt,
+                                },
+                            )
+
+                            elapsed_after_failure_ms = elapsed_turn_ms(turn_started_at)
+                            if elapsed_after_failure_ms > app.state.max_turn_wall_time_ms:
+                                bounded_failure = build_turn_limit_failure(
+                                    budget="turn_wall_time_ms",
+                                    unit="ms",
+                                    measured=elapsed_after_failure_ms,
+                                    limit=app.state.max_turn_wall_time_ms,
+                                )
+                                break
+                            if should_retry and attempt < app.state.max_model_attempts:
+                                continue
+                            if should_retry and attempt >= app.state.max_model_attempts:
+                                bounded_failure = build_turn_limit_failure(
+                                    budget="model_attempts",
+                                    unit="attempts",
+                                    measured=attempt,
+                                    limit=app.state.max_model_attempts,
+                                )
+                                break
+
+                            model_failure = model_failure_candidate
+                            model_failure_reason = failure_reason
+                            break
+
+                if bounded_failure is not None:
+                    emit_turn_limit_failure(bounded_failure)
+                elif model_failure is not None:
+                    turn.status = "failed"
+                    turn.updated_at = _utcnow()
+                    add_event(
+                        "evt.turn.failed",
+                        {"failure_reason": model_failure_reason or "model provider request failed"},
+                    )
+                else:
+                    assert assistant_response is not None
                     turn.assistant_message = assistant_response["assistant_text"]
                     turn.status = "completed"
                     turn.updated_at = _utcnow()
@@ -796,43 +1108,12 @@ def create_app(
                         {"message": assistant_response["assistant_text"]},
                     )
                     add_event("evt.turn.completed", {})
-                except Exception as exc:
-                    duration_ms = int((time.perf_counter() - started_at) * 1000)
-                    fallback_reason = f"unexpected {exc.__class__.__name__}"
-                    if isinstance(exc, ModelAdapterError):
-                        failure_reason = _safe_failure_reason(exc.safe_reason, fallback=fallback_reason)
-                        model_failure = ApiError(
-                            status_code=exc.status_code,
-                            code=exc.code,
-                            message=exc.message,
-                            details={"session_id": session_id, "turn_id": turn.id},
-                            retryable=exc.retryable,
-                        )
-                    else:
-                        failure_reason = _safe_failure_reason(str(exc), fallback=fallback_reason)
-                        model_failure = ApiError(
-                            status_code=502,
-                            code="E_MODEL_FAILURE",
-                            message="model provider request failed",
-                            details={"session_id": session_id, "turn_id": turn.id},
-                            retryable=True,
-                        )
-                    add_event(
-                        "evt.model.failed",
-                        {
-                            "provider": app.state.model_adapter.provider,
-                            "model": app.state.model_adapter.model,
-                            "duration_ms": duration_ms,
-                            "failure_reason": failure_reason,
-                        },
-                    )
-                    turn.status = "failed"
-                    turn.updated_at = _utcnow()
-                    add_event("evt.turn.failed", {"failure_reason": failure_reason})
 
                 active_session.updated_at = _utcnow()
                 db.flush()
 
+                if bounded_failure is not None:
+                    return _error_response(bounded_failure)
                 if model_failure is not None:
                     return _error_response(model_failure)
 
