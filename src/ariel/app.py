@@ -6,7 +6,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, AsyncIterator, Protocol
+from typing import Any, AsyncIterator, Literal, Protocol
 
 import httpx
 import ulid
@@ -16,32 +16,36 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import (
-    Boolean,
-    CheckConstraint,
-    DateTime,
-    ForeignKey,
-    Index,
-    Integer,
-    String,
-    Text,
     create_engine,
     select,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
+from ariel.action_runtime import (
+    ActionRuntimeError,
+    process_action_proposals,
+    resolve_approval_decision,
+)
 from ariel.config import AppSettings
 from ariel.db import missing_required_tables, reset_schema_for_tests
+from ariel.persistence import (
+    ActionAttemptRecord,
+    ApprovalRequestRecord,
+    EventRecord,
+    SessionRecord,
+    TurnRecord,
+    serialize_approval_request,
+    serialize_action_attempt,
+    serialize_session,
+    serialize_turn,
+)
+from ariel.phone_surface import PHONE_SURFACE_HTML
 
 
 def _utcnow() -> datetime:
     return datetime.now(tz=UTC)
-
-
-def _to_rfc3339(timestamp: datetime) -> str:
-    return timestamp.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _new_id(prefix: str) -> str:
@@ -65,86 +69,6 @@ _POLICY_SYSTEM_INSTRUCTIONS = (
 )
 
 
-class Base(DeclarativeBase):
-    pass
-
-
-class SessionRecord(Base):
-    __tablename__ = "sessions"
-
-    id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-
-    turns: Mapped[list["TurnRecord"]] = relationship(back_populates="session")
-
-    __table_args__ = (
-        Index(
-            "ix_single_active_session",
-            "is_active",
-            unique=True,
-            postgresql_where=(is_active.is_(True)),
-        ),
-    )
-
-
-class TurnRecord(Base):
-    __tablename__ = "turns"
-
-    id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    session_id: Mapped[str] = mapped_column(
-        String(32),
-        ForeignKey("sessions.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
-    user_message: Mapped[str] = mapped_column(Text, nullable=False)
-    assistant_message: Mapped[str | None] = mapped_column(Text, nullable=True)
-    status: Mapped[str] = mapped_column(String(32), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-
-    session: Mapped[SessionRecord] = relationship(back_populates="turns")
-    events: Mapped[list["EventRecord"]] = relationship(back_populates="turn")
-
-    __table_args__ = (
-        CheckConstraint(
-            "status IN ('in_progress', 'completed', 'failed')",
-            name="ck_turn_status",
-        ),
-    )
-
-
-class EventRecord(Base):
-    __tablename__ = "events"
-
-    id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    session_id: Mapped[str] = mapped_column(
-        String(32),
-        ForeignKey("sessions.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
-    turn_id: Mapped[str] = mapped_column(
-        String(32),
-        ForeignKey("turns.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
-    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
-    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
-
-    turn: Mapped[TurnRecord] = relationship(back_populates="events")
-
-    __table_args__ = (
-        CheckConstraint("sequence > 0", name="ck_event_sequence_positive"),
-        Index("ix_turn_sequence_unique", "turn_id", "sequence", unique=True),
-    )
-
-
 class MessageRequest(BaseModel):
     message: str = Field(min_length=1, max_length=20000)
 
@@ -154,6 +78,28 @@ class MessageRequest(BaseModel):
         if not value.strip():
             raise ValueError("message must not be blank")
         return value
+
+
+class ApprovalDecisionRequest(BaseModel):
+    approval_id: str = Field(min_length=1, max_length=64)
+    decision: Literal["approve", "deny"]
+    actor_id: str = Field(min_length=1, max_length=128)
+    reason: str | None = Field(default=None, max_length=500)
+
+    @field_validator("approval_id", "actor_id")
+    @classmethod
+    def _must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("field must not be blank")
+        return value.strip()
+
+    @field_validator("reason")
+    @classmethod
+    def _normalize_reason(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
 
 
 class ModelAdapter(Protocol):
@@ -559,39 +505,6 @@ def _error_response(error: ApiError) -> JSONResponse:
     )
 
 
-def _serialize_session(session: SessionRecord) -> dict[str, Any]:
-    return {
-        "id": session.id,
-        "is_active": session.is_active,
-        "created_at": _to_rfc3339(session.created_at),
-        "updated_at": _to_rfc3339(session.updated_at),
-    }
-
-
-def _serialize_turn(turn: TurnRecord, *, events: list[EventRecord]) -> dict[str, Any]:
-    return {
-        "id": turn.id,
-        "session_id": turn.session_id,
-        "user_message": turn.user_message,
-        "assistant_message": turn.assistant_message,
-        "status": turn.status,
-        "created_at": _to_rfc3339(turn.created_at),
-        "updated_at": _to_rfc3339(turn.updated_at),
-        "events": [_serialize_event(event) for event in events],
-    }
-
-
-def _serialize_event(event: EventRecord) -> dict[str, Any]:
-    return {
-        "id": event.id,
-        "turn_id": event.turn_id,
-        "sequence": event.sequence,
-        "event_type": event.event_type,
-        "payload": event.payload,
-        "created_at": _to_rfc3339(event.created_at),
-    }
-
-
 def _build_turn_context_bundle(
     *,
     prior_turns: Sequence[TurnRecord],
@@ -734,6 +647,8 @@ def create_app(
     app.state.max_response_tokens = settings.max_response_tokens
     app.state.max_model_attempts = settings.max_model_attempts
     app.state.max_turn_wall_time_ms = settings.max_turn_wall_time_ms
+    app.state.approval_ttl_seconds = settings.approval_ttl_seconds
+    app.state.approval_actor_id = settings.approval_actor_id
     app.state.schema_missing_tables = []
 
     @app.exception_handler(ApiError)
@@ -766,7 +681,7 @@ def create_app(
 
     @app.get("/", response_class=HTMLResponse)
     def phone_surface() -> str:
-        return _PHONE_SURFACE_HTML
+        return PHONE_SURFACE_HTML
 
     def _ensure_schema_ready() -> None:
         if app.state.schema_missing_tables:
@@ -798,7 +713,7 @@ def create_app(
         with session_factory() as db:
             with db.begin():
                 active_session = _get_or_create_active_session(db)
-            return {"ok": True, "session": _serialize_session(active_session)}
+            return {"ok": True, "session": serialize_session(active_session)}
 
     @app.get("/v1/sessions/active")
     def get_active_session() -> dict[str, Any]:
@@ -806,7 +721,7 @@ def create_app(
         with session_factory() as db:
             with db.begin():
                 active_session = _get_or_create_active_session(db)
-            return {"ok": True, "session": _serialize_session(active_session)}
+            return {"ok": True, "session": serialize_session(active_session)}
 
     @app.post("/v1/sessions/{session_id}/message", response_model=None)
     def post_message(session_id: str, payload: MessageRequest) -> JSONResponse | dict[str, Any]:
@@ -853,6 +768,7 @@ def create_app(
 
                 sequence = 0
                 created_events: list[EventRecord] = []
+                created_action_attempts: list[ActionAttemptRecord] = []
 
                 def add_event(event_type: str, payload_data: dict[str, Any]) -> None:
                     nonlocal sequence
@@ -1100,12 +1016,26 @@ def create_app(
                     )
                 else:
                     assert assistant_response is not None
-                    turn.assistant_message = assistant_response["assistant_text"]
+                    proposal_processing = process_action_proposals(
+                        db=db,
+                        session_id=session_id,
+                        turn=turn,
+                        assistant_message=assistant_response["assistant_text"],
+                        proposals_raw=assistant_response.get("action_proposals"),
+                        approval_ttl_seconds=int(app.state.approval_ttl_seconds),
+                        approval_actor_id=str(app.state.approval_actor_id),
+                        add_event=add_event,
+                        now_fn=_utcnow,
+                        new_id_fn=_new_id,
+                    )
+                    created_action_attempts.extend(proposal_processing.action_attempts)
+
+                    turn.assistant_message = proposal_processing.assistant_message
                     turn.status = "completed"
                     turn.updated_at = _utcnow()
                     add_event(
                         "evt.assistant.emitted",
-                        {"message": assistant_response["assistant_text"]},
+                        {"message": proposal_processing.assistant_message},
                     )
                     add_event("evt.turn.completed", {})
 
@@ -1118,15 +1048,74 @@ def create_app(
                     return _error_response(model_failure)
 
                 assert assistant_response is not None
+                approvals_by_attempt_id = {
+                    approval.action_attempt_id: approval
+                    for approval in db.scalars(
+                        select(ApprovalRequestRecord).where(
+                            ApprovalRequestRecord.action_attempt_id.in_(
+                                [attempt.id for attempt in created_action_attempts]
+                            )
+                        )
+                    ).all()
+                } if created_action_attempts else {}
+                serialized_action_attempts = [
+                    serialize_action_attempt(
+                        action_attempt,
+                        approval=approvals_by_attempt_id.get(action_attempt.id),
+                    )
+                    for action_attempt in created_action_attempts
+                ]
                 return {
                     "ok": True,
-                    "session": _serialize_session(active_session),
-                    "turn": _serialize_turn(turn, events=created_events),
+                    "session": serialize_session(active_session),
+                    "turn": serialize_turn(
+                        turn,
+                        events=created_events,
+                        action_attempts=serialized_action_attempts,
+                    ),
                     "assistant": {
-                        "message": assistant_response["assistant_text"],
+                        "message": turn.assistant_message,
                         "provider": assistant_response["provider"],
                         "model": assistant_response["model"],
                     },
+                }
+
+    @app.post("/v1/approvals", response_model=None)
+    def post_approval_decision(
+        payload: ApprovalDecisionRequest,
+    ) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                try:
+                    decision_result = resolve_approval_decision(
+                        db=db,
+                        approval_id=payload.approval_id,
+                        decision=payload.decision,
+                        actor_id=payload.actor_id,
+                        reason=payload.reason,
+                        now_fn=_utcnow,
+                        new_id_fn=_new_id,
+                    )
+                except ActionRuntimeError as exc:
+                    return _error_response(
+                        ApiError(
+                            status_code=exc.status_code,
+                            code=exc.code,
+                            message=exc.message,
+                            details=exc.details,
+                            retryable=exc.retryable,
+                        )
+                    )
+
+                return {
+                    "ok": True,
+                    "approval": serialize_approval_request(decision_result.approval),
+                    "action_attempt": serialize_action_attempt(
+                        decision_result.action_attempt,
+                        approval=decision_result.approval,
+                    ),
+                    "assistant": {"message": decision_result.assistant_message},
                 }
 
     @app.get("/v1/sessions/{session_id}/events")
@@ -1153,6 +1142,10 @@ def create_app(
             turn_ids = [turn.id for turn in turns]
 
             events_by_turn: dict[str, list[EventRecord]] = {turn_id: [] for turn_id in turn_ids}
+            action_attempts_by_turn: dict[str, list[ActionAttemptRecord]] = {
+                turn_id: [] for turn_id in turn_ids
+            }
+            approvals_by_attempt_id: dict[str, ApprovalRequestRecord] = {}
             if turn_ids:
                 for event in db.scalars(
                     select(EventRecord)
@@ -1166,204 +1159,43 @@ def create_app(
                 for turn_events in events_by_turn.values():
                     turn_events.sort(key=lambda event: (event.sequence, event.created_at, event.id))
 
+                action_attempts = db.scalars(
+                    select(ActionAttemptRecord)
+                    .where(ActionAttemptRecord.turn_id.in_(turn_ids))
+                    .order_by(
+                        ActionAttemptRecord.proposal_index.asc(),
+                        ActionAttemptRecord.created_at.asc(),
+                        ActionAttemptRecord.id.asc(),
+                    )
+                ).all()
+                for action_attempt in action_attempts:
+                    action_attempts_by_turn[action_attempt.turn_id].append(action_attempt)
+
+                action_attempt_ids = [action_attempt.id for action_attempt in action_attempts]
+                if action_attempt_ids:
+                    approvals = db.scalars(
+                        select(ApprovalRequestRecord).where(
+                            ApprovalRequestRecord.action_attempt_id.in_(action_attempt_ids)
+                        )
+                    ).all()
+                    approvals_by_attempt_id = {
+                        approval.action_attempt_id: approval for approval in approvals
+                    }
+
             serialized_turns = [
-                _serialize_turn(turn, events=events_by_turn.get(turn.id, [])) for turn in turns
+                serialize_turn(
+                    turn,
+                    events=events_by_turn.get(turn.id, []),
+                    action_attempts=[
+                        serialize_action_attempt(
+                            action_attempt,
+                            approval=approvals_by_attempt_id.get(action_attempt.id),
+                        )
+                        for action_attempt in action_attempts_by_turn.get(turn.id, [])
+                    ],
+                )
+                for turn in turns
             ]
             return {"ok": True, "session_id": session_id, "turns": serialized_turns}
 
     return app
-
-
-_PHONE_SURFACE_HTML = """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Ariel Chat</title>
-  <style>
-    :root { color-scheme: dark; }
-    body {
-      margin: 0;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: #0f1115;
-      color: #e6edf3;
-    }
-    main { max-width: 760px; margin: 0 auto; padding: 16px; }
-    h1 { font-size: 1.1rem; margin: 0 0 12px; }
-    #timeline {
-      border: 1px solid #30363d;
-      border-radius: 10px;
-      padding: 12px;
-      min-height: 140px;
-      margin-bottom: 12px;
-      background: #161b22;
-    }
-    .turn {
-      margin-bottom: 10px;
-      border-bottom: 1px solid #30363d;
-      padding-bottom: 8px;
-    }
-    .turn:last-child { border-bottom: none; margin-bottom: 0; }
-    .meta { color: #8b949e; font-size: 0.8rem; margin-bottom: 4px; }
-    .event { font-size: 0.85rem; margin-left: 8px; color: #c9d1d9; }
-    form { display: flex; gap: 8px; }
-    input {
-      flex: 1;
-      font-size: 16px;
-      border: 1px solid #30363d;
-      border-radius: 8px;
-      padding: 10px;
-      background: #0d1117;
-      color: #e6edf3;
-    }
-    button {
-      border: none;
-      border-radius: 8px;
-      padding: 10px 14px;
-      background: #2f81f7;
-      color: #fff;
-      font-weight: 600;
-      font-size: 0.95rem;
-    }
-    #status { margin: 8px 0; min-height: 18px; color: #8b949e; font-size: 0.85rem; }
-  </style>
-</head>
-<body>
-  <main>
-    <h1>ariel chat (slice 0)</h1>
-    <section id="timeline"></section>
-    <div id="status"></div>
-    <form id="chat-form">
-      <input id="message" name="message" autocomplete="off" placeholder="type a message" required />
-      <button type="submit">send</button>
-    </form>
-  </main>
-  <script>
-    let sessionId = null;
-
-    const timelineNode = document.getElementById("timeline");
-    const statusNode = document.getElementById("status");
-    const formNode = document.getElementById("chat-form");
-    const messageNode = document.getElementById("message");
-
-    function setStatus(text) {
-      statusNode.textContent = text;
-    }
-
-    function escapeHtml(value) {
-      return String(value ?? "")
-        .replaceAll("&", "&amp;")
-        .replaceAll("<", "&lt;")
-        .replaceAll(">", "&gt;");
-    }
-
-    function formatUsage(usage) {
-      if (!usage || typeof usage !== "object") return "";
-      const fields = [
-        ["prompt", usage.prompt_tokens],
-        ["completion", usage.completion_tokens],
-        ["total", usage.total_tokens],
-      ];
-      const tokenParts = fields
-        .filter(([, value]) => Number.isFinite(Number(value)))
-        .map(([label, value]) => `${label}=${value}`);
-      return tokenParts.length ? `tokens(${tokenParts.join(", ")})` : "";
-    }
-
-    function formatEventDetails(event) {
-      const payload = (event && typeof event.payload === "object" && event.payload !== null)
-        ? event.payload
-        : {};
-      const parts = [];
-      if (payload.provider) parts.push(`provider=${payload.provider}`);
-      if (payload.model) parts.push(`model=${payload.model}`);
-      if (typeof payload.duration_ms === "number") parts.push(`duration_ms=${payload.duration_ms}`);
-      const usage = formatUsage(payload.usage);
-      if (usage) parts.push(usage);
-      if (payload.failure_reason) parts.push(`failure_reason=${payload.failure_reason}`);
-      return parts.join(" | ");
-    }
-
-    function renderTimeline(turns) {
-      if (!turns.length) {
-        timelineNode.innerHTML = "<p>no turns yet.</p>";
-        return;
-      }
-      timelineNode.innerHTML = turns.map((turn) => {
-        const events = turn.events
-          .map((event) => {
-            const detailText = formatEventDetails(event);
-            const suffix = detailText ? ` - ${escapeHtml(detailText)}` : "";
-            return `<div class="event">[${escapeHtml(event.sequence)}] ${escapeHtml(event.event_type)}${suffix}</div>`;
-          })
-          .join("");
-        return `
-          <article class="turn">
-            <div class="meta">${escapeHtml(turn.id)} · ${escapeHtml(turn.status)}</div>
-            <div><strong>user:</strong> ${escapeHtml(turn.user_message)}</div>
-            <div><strong>assistant:</strong> ${escapeHtml(turn.assistant_message || "(none)")}</div>
-            ${events}
-          </article>
-        `;
-      }).join("");
-    }
-
-    async function loadTimeline() {
-      const response = await fetch(`/v1/sessions/${sessionId}/events`);
-      const data = await response.json();
-      if (!response.ok || !data.ok) {
-        setStatus(data?.error?.message || "timeline load failed");
-        return;
-      }
-      renderTimeline(data.turns);
-    }
-
-    async function ensureSession() {
-      const response = await fetch("/v1/sessions/active");
-      const data = await response.json();
-      if (!response.ok || !data.ok) {
-        throw new Error("session bootstrap failed");
-      }
-      sessionId = data.session.id;
-    }
-
-    async function sendMessage(text) {
-      const response = await fetch(`/v1/sessions/${sessionId}/message`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ message: text }),
-      });
-      const data = await response.json();
-      if (!response.ok || !data.ok) {
-        throw new Error(data?.error?.message || "send failed");
-      }
-    }
-
-    formNode.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      const text = messageNode.value.trim();
-      if (!text) return;
-      messageNode.value = "";
-      setStatus("sending...");
-      try {
-        await sendMessage(text);
-        await loadTimeline();
-        setStatus("ok");
-      } catch (error) {
-        setStatus(error.message);
-      }
-    });
-
-    (async () => {
-      try {
-        await ensureSession();
-        await loadTimeline();
-        setStatus("ready");
-      } catch (error) {
-        setStatus(error.message);
-      }
-    })();
-  </script>
-</body>
-</html>
-"""

@@ -71,6 +71,8 @@ def test_slice1_turn_budget_defaults_are_configured(monkeypatch: pytest.MonkeyPa
     monkeypatch.delenv("ARIEL_MAX_RESPONSE_TOKENS", raising=False)
     monkeypatch.delenv("ARIEL_MAX_MODEL_ATTEMPTS", raising=False)
     monkeypatch.delenv("ARIEL_MAX_TURN_WALL_TIME_MS", raising=False)
+    monkeypatch.delenv("ARIEL_APPROVAL_TTL_SECONDS", raising=False)
+    monkeypatch.delenv("ARIEL_APPROVAL_ACTOR_ID", raising=False)
 
     settings = AppSettings.model_validate({})
     assert settings.max_recent_turns == 12
@@ -78,6 +80,8 @@ def test_slice1_turn_budget_defaults_are_configured(monkeypatch: pytest.MonkeyPa
     assert settings.max_response_tokens == 700
     assert settings.max_model_attempts == 2
     assert settings.max_turn_wall_time_ms == 20000
+    assert settings.approval_ttl_seconds == 900
+    assert settings.approval_actor_id == "user.local"
 
 
 def test_turn_budget_env_overrides_are_loaded(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -85,12 +89,16 @@ def test_turn_budget_env_overrides_are_loaded(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "321")
     monkeypatch.setenv("ARIEL_MAX_MODEL_ATTEMPTS", "4")
     monkeypatch.setenv("ARIEL_MAX_TURN_WALL_TIME_MS", "15000")
+    monkeypatch.setenv("ARIEL_APPROVAL_TTL_SECONDS", "1200")
+    monkeypatch.setenv("ARIEL_APPROVAL_ACTOR_ID", "user.integration")
 
     settings = AppSettings()
     assert settings.max_context_tokens == 4321
     assert settings.max_response_tokens == 321
     assert settings.max_model_attempts == 4
     assert settings.max_turn_wall_time_ms == 15000
+    assert settings.approval_ttl_seconds == 1200
+    assert settings.approval_actor_id == "user.integration"
 
 
 @pytest.mark.parametrize(
@@ -100,6 +108,7 @@ def test_turn_budget_env_overrides_are_loaded(monkeypatch: pytest.MonkeyPatch) -
         ("ARIEL_MAX_RESPONSE_TOKENS", "0"),
         ("ARIEL_MAX_MODEL_ATTEMPTS", "0"),
         ("ARIEL_MAX_TURN_WALL_TIME_MS", "0"),
+        ("ARIEL_APPROVAL_TTL_SECONDS", "0"),
     ],
 )
 def test_turn_budget_fields_reject_non_positive_values(
@@ -108,6 +117,13 @@ def test_turn_budget_fields_reject_non_positive_values(
     env_value: str,
 ) -> None:
     monkeypatch.setenv(env_name, env_value)
+
+    with pytest.raises(ValidationError):
+        AppSettings()
+
+
+def test_approval_actor_id_rejects_blank_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARIEL_APPROVAL_ACTOR_ID", "   ")
 
     with pytest.raises(ValidationError):
         AppSettings()
