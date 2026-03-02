@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from ipaddress import ip_address
 import os
 from pathlib import Path
+import socket
 import subprocess
 import time
 from typing import Mapping
@@ -137,6 +138,27 @@ def _container_exists(container_name: str) -> bool:
     return any(line.strip() == container_name for line in result.stdout.splitlines())
 
 
+def _container_host_port(container_name: str) -> int | None:
+    """Return the published host port for container port 5432, or None."""
+    result = _run(
+        [
+            "docker",
+            "inspect",
+            "--format",
+            '{{(index (index .HostConfig.PortBindings "5432/tcp") 0).HostPort}}',
+            container_name,
+        ],
+        capture=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        return int(result.stdout.strip())
+    except ValueError:
+        return None
+
+
 def _container_running(container_name: str) -> bool:
     result = _run(
         [
@@ -179,16 +201,37 @@ def _wait_until_ready(runtime: LocalPostgresRuntime, *, timeout_seconds: int = 4
     raise RuntimeError(msg)
 
 
+def _port_available(host: str, port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1)
+        return s.connect_ex((host, port)) != 0
+
+
 def cmd_up(runtime: LocalPostgresRuntime) -> int:
     if _container_running(runtime.container_name):
         print(f"postgres container '{runtime.container_name}' is already running")
         return 0
 
+    if not _port_available("127.0.0.1", runtime.host_port):
+        print(
+            f"error: port {runtime.host_port} is already in use — "
+            "update ARIEL_DATABASE_URL in .env.local to use a free port"
+        )
+        return 1
+
     if _container_exists(runtime.container_name):
-        _run(["docker", "start", runtime.container_name])
-        _wait_until_ready(runtime)
-        print(f"postgres container '{runtime.container_name}' started")
-        return 0
+        existing_port = _container_host_port(runtime.container_name)
+        if existing_port is not None and existing_port != runtime.host_port:
+            print(
+                f"existing container '{runtime.container_name}' is bound to port "
+                f"{existing_port}, but config expects {runtime.host_port} — recreating"
+            )
+            _run(["docker", "rm", runtime.container_name])
+        else:
+            _run(["docker", "start", runtime.container_name])
+            _wait_until_ready(runtime)
+            print(f"postgres container '{runtime.container_name}' started")
+            return 0
 
     _run(
         [

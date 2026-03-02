@@ -15,8 +15,8 @@ class AppSettings(BaseSettings):
         env_prefix="ARIEL_",
         extra="ignore",
         env_file=(
-            _PROJECT_ROOT / ".env.local",
             _PROJECT_ROOT / ".env",
+            _PROJECT_ROOT / ".env.local",
         ),
         env_file_encoding="utf-8",
     )
