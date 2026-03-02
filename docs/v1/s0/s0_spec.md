@@ -47,7 +47,7 @@ Prove a complete end-to-end user path from phone to Ariel on a private network.
 
 ## Out of Scope
 
-- Natural multi-turn reasoning behavior, clarifying-question strategy, and turn-budget handling (-> Slice 1)
+- Natural multi-turn reasoning behavior, missing-details interaction behavior, and turn-budget handling (-> Slice 1)
 - Capability policy enforcement and approval-gated execution (-> Slice 2)
 - Agency task execution and artifact workflows (-> Slice 3)
 - Calendar read/propose/create flows (-> Slice 4)

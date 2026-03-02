@@ -6,7 +6,7 @@
 Work and life actions are fragmented across tools and devices. Away from a desk, it is hard to execute high-leverage actions reliably.
 
 ### solution
-Ariel is a private, self-hosted assistant that accepts natural language, plans with bounded reasoning, and executes actions through typed capabilities with policy checks, approvals, and full auditability.
+Ariel is a private, self-hosted assistant that accepts natural language, uses model-led open-ended reasoning inside bounded runtime guardrails, and executes actions through typed capabilities with policy checks, approvals, and full auditability.
 
 ### scope (mvp)
 - Phone-first chat UI (web) over Tailscale.
@@ -93,6 +93,7 @@ Ariel is a private, self-hosted assistant that accepts natural language, plans w
 | storage | Postgres is the system of truth for sessions, turns, memories, jobs, and events. |
 | conversation model | Episodic sessions, not one unbounded forever thread. |
 | context model | Deterministic bounded context builder per turn. |
+| response policy | No hard-coded response-type state machine; the model decides assistant messaging while runtime guardrails enforce safety and limits. |
 | model providers | Pluggable adapters behind one internal interface. |
 | tool execution | No generic shell/ssh capability in MVP; code changes go through `cap.agency.*`. |
 | approvals | Required for irreversible or externally visible actions. |
@@ -163,6 +164,7 @@ Ariel is a private, self-hosted assistant that accepts natural language, plans w
 ### model interface
 - Internal adapter:
   - `respond(messages, tools, config) -> {assistant_text, tool_calls[], usage, provider_response_id}`
+- Turn orchestration may iterate model <-> tool execution until terminal assistant output or bounded failure, with global limits on attempts/tokens/wall time.
 - Invalid JSON or schema-invalid tool call is treated as planning failure, never executed.
 
 ### context builder (deterministic order)
