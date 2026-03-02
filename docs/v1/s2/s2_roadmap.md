@@ -42,6 +42,7 @@
 - **builds on**: PR-03.
 - **acceptance**:
   - users can inspect proposal payload summary, policy outcome, approval outcome (including denied/expired reasons), execution outcome, and output/error for each action attempt.
+  - user-facing turn/timeline APIs expose a dedicated, allowlisted lifecycle view (not raw engine records) that the phone-first surface renders directly.
   - approval and execution outcomes are visible in timeline/action details without relying on internal logs.
   - surfaced data remains redacted and excludes internal-only execution metadata.
 - **non-goals**: no visual redesign, no bulk/delegated approvals UX, no multi-user tenancy changes.

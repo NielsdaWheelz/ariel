@@ -44,7 +44,7 @@ Enable tool-enabled behavior with deterministic policy and approval controls.
 ### user can inspect the full action lifecycle
 - **given**: an action proposal has been created for a turn
 - **when**: the user inspects Ariel’s timeline/action details
-- **then**: the user can see what was proposed, what was approved or denied (including expiry outcome), what executed, and what output/error was returned
+- **then**: the user can see what was proposed, what was approved or denied (including expiry outcome), what executed, and what output/error was returned through user-facing timeline/action views without relying on internal logs
 
 ## Key Decisions
 
@@ -71,6 +71,8 @@ Enable tool-enabled behavior with deterministic policy and approval controls.
 **Layered guardrails wrap execution boundaries**: In addition to schema and policy gates, Ariel applies pre-execution and post-execution safety checks so unsafe inputs/outputs are caught before side effects or user surfacing.
 
 **Action lifecycle observability is first-class**: Event chains must make proposal, policy decision, approval request/decision, execution start/end, and returned outcome reconstructable by the user and by audit tooling.
+
+**User-facing lifecycle data is explicitly projected**: Surface APIs expose an allowlisted, redacted lifecycle view and do not rely on clients as a security boundary for internal execution metadata filtering.
 
 ## Out of Scope
 
