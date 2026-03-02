@@ -35,6 +35,7 @@
   - action events include provenance evidence sufficient to reconstruct why taint controls applied.
   - regression tests prove side-effecting auto-execution cannot bypass taint controls via missing/malformed taint metadata.
 - **non-goals**: no probabilistic trust scoring engine; no cross-session memory trust-policy redesign.
+- **status**: landed in current implementation branch; see `s2_prs/s2_pr03_implementation_notes.md`.
 
 ### PR-04: Surface Lifecycle Inspectability (planned after PR-03 merges)
 - **goal**: ensure the phone-first surface exposes the full action lifecycle required by Slice 2.

@@ -27,6 +27,9 @@ from ariel.policy_engine import evaluate_proposal
 
 _SIDE_EFFECT_EXECUTION_LOCK_ID = 24_310_002
 
+ModelDeclaredTaintStatus = Literal["missing", "true", "false", "malformed"]
+ProposalProvenanceStatus = Literal["clean", "tainted", "ambiguous"]
+
 
 class ActionRuntimeError(Exception):
     def __init__(
@@ -57,6 +60,12 @@ class ApprovalDecisionResult:
     approval: ApprovalRequestRecord
     action_attempt: ActionAttemptRecord
     assistant_message: str
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeProvenance:
+    status: Literal["clean", "tainted"]
+    evidence: tuple[dict[str, Any], ...] = ()
 
 
 def _execution_integrity_error(
@@ -90,6 +99,66 @@ def _acquire_side_effect_execution_lock(
     )
 
 
+def _model_declared_taint_status(proposal_payload: dict[str, Any]) -> ModelDeclaredTaintStatus:
+    if "influenced_by_untrusted_content" not in proposal_payload:
+        return "missing"
+    raw_value = proposal_payload.get("influenced_by_untrusted_content")
+    if raw_value is True:
+        return "true"
+    if raw_value is False:
+        return "false"
+    return "malformed"
+
+
+def _effective_provenance_status(
+    *,
+    runtime_provenance: RuntimeProvenance | None,
+    model_declared_taint_status: ModelDeclaredTaintStatus,
+) -> ProposalProvenanceStatus:
+    if runtime_provenance is None:
+        if model_declared_taint_status == "true":
+            return "tainted"
+        return "ambiguous"
+    if runtime_provenance.status == "tainted":
+        return "tainted"
+    if runtime_provenance.status != "clean":
+        return "ambiguous"
+    if model_declared_taint_status == "true":
+        return "tainted"
+    if model_declared_taint_status == "malformed":
+        return "ambiguous"
+    return "clean"
+
+
+def _taint_event_payload(
+    *,
+    provenance_status: ProposalProvenanceStatus,
+    runtime_provenance: RuntimeProvenance | None,
+    model_declared_taint_status: ModelDeclaredTaintStatus,
+) -> dict[str, Any]:
+    runtime_status = runtime_provenance.status if runtime_provenance is not None else "ambiguous"
+    evidence: list[dict[str, Any]] = []
+    if runtime_provenance is None:
+        evidence.append({"kind": "runtime_provenance_missing"})
+    else:
+        for item in runtime_provenance.evidence:
+            if isinstance(item, dict):
+                evidence.append(dict(item))
+            else:
+                evidence.append({"kind": "runtime_provenance_evidence_malformed"})
+    return {
+        "influenced_by_untrusted_content": provenance_status in {"tainted", "ambiguous"},
+        "provenance_status": provenance_status,
+        "runtime_provenance": {
+            "status": runtime_status,
+            "evidence": evidence,
+        },
+        "model_declared_taint": {
+            "status": model_declared_taint_status,
+        },
+    }
+
+
 def process_action_proposals(
     *,
     db: Session,
@@ -102,6 +171,7 @@ def process_action_proposals(
     add_event: Callable[[str, dict[str, Any]], None],
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
+    runtime_provenance: RuntimeProvenance | None = None,
 ) -> ProposalProcessingResult:
     inline_results: list[dict[str, Any]] = []
     pending_approvals: list[dict[str, Any]] = []
@@ -120,14 +190,22 @@ def process_action_proposals(
         )
         raw_input_payload = proposal_payload.get("input")
         input_payload = jsonable_encoder(raw_input_payload) if isinstance(raw_input_payload, dict) else {}
-        influenced_by_untrusted_content = (
-            proposal_payload.get("influenced_by_untrusted_content") is True
+        model_declared_taint_status = _model_declared_taint_status(proposal_payload)
+        provenance_status = _effective_provenance_status(
+            runtime_provenance=runtime_provenance,
+            model_declared_taint_status=model_declared_taint_status,
+        )
+        taint_payload = _taint_event_payload(
+            provenance_status=provenance_status,
+            runtime_provenance=runtime_provenance,
+            model_declared_taint_status=model_declared_taint_status,
         )
         evaluation = evaluate_proposal(
             capability_id=capability_id,
             input_payload=input_payload,
             pending_approval_exists=pending_approval_created,
-            influenced_by_untrusted_content=influenced_by_untrusted_content,
+            influenced_by_untrusted_content=taint_payload["influenced_by_untrusted_content"],
+            provenance_status=provenance_status,
         )
 
         now_action = now_fn()
@@ -173,7 +251,7 @@ def process_action_proposals(
                 "action_attempt_id": action_attempt.id,
                 "capability_id": action_attempt.capability_id,
                 "input": action_attempt.proposed_input,
-                "taint": {"influenced_by_untrusted_content": influenced_by_untrusted_content},
+                "taint": taint_payload,
             },
         )
 
@@ -189,6 +267,7 @@ def process_action_proposals(
                     "action_attempt_id": action_attempt.id,
                     "decision": "deny",
                     "reason": evaluation.reason,
+                    "taint": taint_payload,
                 },
             )
             continue
@@ -205,6 +284,7 @@ def process_action_proposals(
                     "action_attempt_id": action_attempt.id,
                     "decision": "requires_approval",
                     "reason": evaluation.reason,
+                    "taint": taint_payload,
                 },
             )
 
@@ -257,6 +337,7 @@ def process_action_proposals(
                     "action_attempt_id": action_attempt.id,
                     "decision": "deny",
                     "reason": "policy_invariant_violation",
+                    "taint": taint_payload,
                 },
             )
             continue
@@ -271,6 +352,7 @@ def process_action_proposals(
                 "action_attempt_id": action_attempt.id,
                 "decision": "allow_inline",
                 "reason": evaluation.reason,
+                "taint": taint_payload,
             },
         )
         integrity_error = _execution_integrity_error(

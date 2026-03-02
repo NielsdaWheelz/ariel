@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from ariel.action_runtime import (
     ActionRuntimeError,
+    RuntimeProvenance,
     process_action_proposals,
     resolve_approval_decision,
 )
@@ -576,6 +577,49 @@ def _context_bundle_audit_metadata(context_bundle: dict[str, Any]) -> dict[str, 
     }
 
 
+def _runtime_provenance_for_turn(
+    *,
+    db: Session,
+    prior_turns: Sequence[TurnRecord],
+    max_recent_turns: int,
+) -> RuntimeProvenance:
+    recent_turns = prior_turns[-max_recent_turns:]
+    recent_turn_ids = [turn.id for turn in recent_turns]
+    if not recent_turn_ids:
+        return RuntimeProvenance(status="clean", evidence=())
+    attempts_by_turn: dict[str, list[ActionAttemptRecord]] = {turn_id: [] for turn_id in recent_turn_ids}
+    for action_attempt in db.scalars(
+        select(ActionAttemptRecord)
+        .where(
+            ActionAttemptRecord.turn_id.in_(recent_turn_ids),
+            ActionAttemptRecord.policy_decision == "allow_inline",
+            ActionAttemptRecord.status == "succeeded",
+        )
+        .order_by(
+            ActionAttemptRecord.created_at.asc(),
+            ActionAttemptRecord.proposal_index.asc(),
+            ActionAttemptRecord.id.asc(),
+        )
+    ).all():
+        if action_attempt.turn_id in attempts_by_turn:
+            attempts_by_turn[action_attempt.turn_id].append(action_attempt)
+
+    evidence: list[dict[str, Any]] = []
+    for turn_id in recent_turn_ids:
+        for action_attempt in attempts_by_turn[turn_id]:
+            evidence.append(
+                {
+                    "kind": "prior_tool_output_in_context",
+                    "turn_id": turn_id,
+                    "action_attempt_id": action_attempt.id,
+                    "capability_id": action_attempt.capability_id,
+                    "impact_level": action_attempt.impact_level,
+                }
+            )
+    status: Literal["clean", "tainted"] = "tainted" if evidence else "clean"
+    return RuntimeProvenance(status=status, evidence=tuple(evidence))
+
+
 def _get_or_create_active_session(db: Session) -> SessionRecord:
     bind = db.get_bind()
     if bind is not None and bind.dialect.name == "postgresql":
@@ -747,6 +791,11 @@ def create_app(
                     .where(TurnRecord.session_id == session_id)
                     .order_by(TurnRecord.created_at.asc(), TurnRecord.id.asc())
                 ).all()
+                runtime_provenance = _runtime_provenance_for_turn(
+                    db=db,
+                    prior_turns=prior_turns,
+                    max_recent_turns=int(app.state.max_recent_turns),
+                )
                 context_bundle = _build_turn_context_bundle(
                     prior_turns=prior_turns,
                     max_recent_turns=app.state.max_recent_turns,
@@ -1027,6 +1076,7 @@ def create_app(
                         add_event=add_event,
                         now_fn=_utcnow,
                         new_id_fn=_new_id,
+                        runtime_provenance=runtime_provenance,
                     )
                     created_action_attempts.extend(proposal_processing.action_attempts)
 
