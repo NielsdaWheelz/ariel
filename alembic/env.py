@@ -1,9 +1,17 @@
 from __future__ import annotations
 
-import os
+import sys
+from pathlib import Path
 
 from alembic import context
 from sqlalchemy import engine_from_config, pool
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_SRC_DIR = _PROJECT_ROOT / "src"
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
+from ariel.config import AppSettings  # noqa: E402
 
 
 config = context.config
@@ -11,9 +19,10 @@ config = context.config
 # Schema is managed with explicit revision scripts.
 target_metadata = None
 
-database_url = os.getenv("ARIEL_DATABASE_URL")
-if database_url:
-    config.set_main_option("sqlalchemy.url", database_url)
+settings = AppSettings()
+configured_database_url = config.get_main_option("sqlalchemy.url")
+if not configured_database_url or configured_database_url == "postgresql+psycopg://localhost/ariel":
+    config.set_main_option("sqlalchemy.url", settings.database_url)
 
 
 def run_migrations_offline() -> None:

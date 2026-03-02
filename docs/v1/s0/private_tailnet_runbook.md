@@ -10,14 +10,13 @@ this runbook defines a repeatable private deployment for slice 0:
 ## 1) prepare runtime secrets + database
 
 ```bash
-export ARIEL_DATABASE_URL="postgresql+psycopg://<user>:<password>@localhost/<database>"
-export ARIEL_MODEL_PROVIDER="openai"
-export ARIEL_MODEL_NAME="gpt-4o-mini"
-export ARIEL_MODEL_API_KEY="<real-provider-key>"
+cp .env.example .env.local
+# edit .env.local with your real runtime values
 make db-upgrade
 ```
 
-`ARIEL_MODEL_API_KEY` must exist only on the server host (not in client code, not in tracked files).
+`ARIEL_MODEL_API_KEY` must exist only on the server host (not in client code, not in tracked files).  
+when needed, explicit shell env vars still override `.env.local`.
 
 ## 2) start ariel as localhost-only
 

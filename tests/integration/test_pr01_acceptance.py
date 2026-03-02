@@ -354,7 +354,8 @@ def test_default_runtime_model_requires_server_secret_credentials(
 ) -> None:
     monkeypatch.setenv("ARIEL_MODEL_PROVIDER", "openai")
     monkeypatch.setenv("ARIEL_MODEL_NAME", "gpt-4o-mini")
-    monkeypatch.delenv("ARIEL_MODEL_API_KEY", raising=False)
+    # Force empty key so this assertion is stable even if local .env files exist.
+    monkeypatch.setenv("ARIEL_MODEL_API_KEY", "")
 
     app = create_app(
         database_url=postgres_url,

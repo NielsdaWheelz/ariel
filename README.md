@@ -24,15 +24,16 @@ bash scripts/agency_verify.sh
 
 ## run locally
 
-set `ARIEL_DATABASE_URL`, choose model wiring, run migrations, then start uvicorn.
+create a local env file once (no repeated `export`/`source` needed). app + alembic both auto-load `.env.local`.
+
+```bash
+cp .env.example .env.local
+# edit .env.local with real values for your machine
+```
 
 real provider mode (default):
 
 ```bash
-export ARIEL_DATABASE_URL="postgresql+psycopg://<user>:<password>@localhost/<database>"
-export ARIEL_MODEL_PROVIDER="openai"
-export ARIEL_MODEL_NAME="gpt-4o-mini"
-export ARIEL_MODEL_API_KEY="<provider-key>"
 make db-upgrade
 .venv/bin/uvicorn ariel.app:create_app --factory --reload
 ```
@@ -40,12 +41,11 @@ make db-upgrade
 local deterministic dev mode (no external model call):
 
 ```bash
-export ARIEL_DATABASE_URL="postgresql+psycopg://<user>:<password>@localhost/<database>"
-export ARIEL_MODEL_PROVIDER="echo"
-export ARIEL_MODEL_NAME="echo-v1"
-make db-upgrade
-.venv/bin/uvicorn ariel.app:create_app --factory --reload
+ARIEL_MODEL_PROVIDER=echo ARIEL_MODEL_NAME=echo-v1 make db-upgrade
+ARIEL_MODEL_PROVIDER=echo ARIEL_MODEL_NAME=echo-v1 .venv/bin/uvicorn ariel.app:create_app --factory --reload
 ```
+
+env vars still work and take precedence over `.env.local` when explicitly set.
 
 if migrations are missing, `/v1/*` endpoints return `E_SCHEMA_NOT_READY` (503) until schema is upgraded.
 

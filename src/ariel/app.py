@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from ipaddress import ip_address
 import re
 import time
 from dataclasses import dataclass
@@ -15,7 +14,6 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
@@ -33,6 +31,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
+from ariel.config import AppSettings
 from ariel.db import missing_required_tables, reset_schema_for_tests
 
 
@@ -46,40 +45,6 @@ def _to_rfc3339(timestamp: datetime) -> str:
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}_{ulid.new().str.lower()}"
-
-
-class AppSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="ARIEL_", extra="ignore")
-
-    database_url: str = "postgresql+psycopg://localhost/ariel"
-    bind_host: str = "127.0.0.1"
-    bind_port: int = 8000
-    model_provider: str = "openai"
-    model_name: str = "gpt-4o-mini"
-    model_api_base_url: str = "https://api.openai.com/v1"
-    model_api_key: str | None = None
-    model_timeout_seconds: float = 30.0
-
-    @field_validator("bind_host")
-    @classmethod
-    def _bind_host_must_be_loopback(cls, value: str) -> str:
-        normalized = value.strip().lower()
-        if normalized in {"localhost", "127.0.0.1", "::1"}:
-            return normalized
-        try:
-            if ip_address(normalized).is_loopback:
-                return normalized
-        except ValueError:
-            pass
-        raise ValueError("bind_host must be loopback-only (localhost, 127.0.0.1, or ::1)")
-
-    @field_validator("model_provider")
-    @classmethod
-    def _model_provider_must_be_supported(cls, value: str) -> str:
-        normalized = value.strip().lower()
-        if normalized not in {"openai", "echo"}:
-            raise ValueError("model_provider must be one of: openai, echo")
-        return normalized
 
 
 _ACTIVE_SESSION_LOCK_ID = 24_310_001
