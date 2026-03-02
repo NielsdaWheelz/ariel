@@ -6,10 +6,16 @@ from datetime import datetime, timedelta
 from typing import Any, Literal
 
 from fastapi.encoders import jsonable_encoder
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
-from ariel.capability_registry import canonical_action_payload, get_capability, payload_hash
+from ariel.capability_registry import (
+    CapabilityDefinition,
+    canonical_action_payload,
+    capability_contract_hash,
+    get_capability,
+    payload_hash,
+)
 from ariel.executor import (
     append_turn_event,
     build_assistant_action_appendix,
@@ -18,6 +24,8 @@ from ariel.executor import (
 )
 from ariel.persistence import ActionAttemptRecord, ApprovalRequestRecord, TurnRecord, to_rfc3339
 from ariel.policy_engine import evaluate_proposal
+
+_SIDE_EFFECT_EXECUTION_LOCK_ID = 24_310_002
 
 
 class ActionRuntimeError(Exception):
@@ -51,6 +59,37 @@ class ApprovalDecisionResult:
     assistant_message: str
 
 
+def _execution_integrity_error(
+    *,
+    action_attempt: ActionAttemptRecord,
+    capability: CapabilityDefinition,
+) -> str | None:
+    if action_attempt.capability_id != capability.capability_id:
+        return "integrity_mismatch:capability_id"
+    if action_attempt.capability_version != capability.version:
+        return "integrity_mismatch:capability_version"
+    runtime_contract_hash = capability_contract_hash(capability)
+    if action_attempt.capability_contract_hash != runtime_contract_hash:
+        return "integrity_mismatch:capability_contract"
+    return None
+
+
+def _acquire_side_effect_execution_lock(
+    *,
+    db: Session,
+    impact_level: str,
+) -> None:
+    bind = db.get_bind()
+    if bind is None or bind.dialect.name != "postgresql":
+        return
+    if impact_level == "read":
+        return
+    db.execute(
+        text("SELECT pg_advisory_xact_lock(:lock_id)"),
+        {"lock_id": _SIDE_EFFECT_EXECUTION_LOCK_ID},
+    )
+
+
 def process_action_proposals(
     *,
     db: Session,
@@ -81,10 +120,14 @@ def process_action_proposals(
         )
         raw_input_payload = proposal_payload.get("input")
         input_payload = jsonable_encoder(raw_input_payload) if isinstance(raw_input_payload, dict) else {}
+        influenced_by_untrusted_content = (
+            proposal_payload.get("influenced_by_untrusted_content") is True
+        )
         evaluation = evaluate_proposal(
             capability_id=capability_id,
             input_payload=input_payload,
             pending_approval_exists=pending_approval_created,
+            influenced_by_untrusted_content=influenced_by_untrusted_content,
         )
 
         now_action = now_fn()
@@ -101,7 +144,14 @@ def process_action_proposals(
             turn_id=turn.id,
             proposal_index=proposal_index,
             capability_id=capability_id,
-            capability_version="1.0",
+            capability_version=(
+                evaluation.capability.version if evaluation.capability is not None else "unknown"
+            ),
+            capability_contract_hash=(
+                capability_contract_hash(evaluation.capability)
+                if evaluation.capability is not None
+                else payload_hash({"capability_id": capability_id, "contract": "unknown"})
+            ),
             impact_level=evaluation.impact_level,
             proposed_input=frozen_input_payload,
             payload_hash=payload_hash(frozen_payload),
@@ -123,6 +173,7 @@ def process_action_proposals(
                 "action_attempt_id": action_attempt.id,
                 "capability_id": action_attempt.capability_id,
                 "input": action_attempt.proposed_input,
+                "taint": {"influenced_by_untrusted_content": influenced_by_untrusted_content},
             },
         )
 
@@ -222,12 +273,36 @@ def process_action_proposals(
                 "reason": evaluation.reason,
             },
         )
+        integrity_error = _execution_integrity_error(
+            action_attempt=action_attempt,
+            capability=evaluation.capability,
+        )
+        if integrity_error is not None:
+            action_attempt.execution_output = None
+            action_attempt.execution_error = integrity_error
+            action_attempt.status = "failed"
+            action_attempt.policy_reason = "integrity_mismatch"
+            action_attempt.updated_at = now_fn()
+            blocked_reasons.append(f"{capability_id}: {integrity_error}")
+            add_event(
+                "evt.action.execution.failed",
+                {
+                    "action_attempt_id": action_attempt.id,
+                    "error": integrity_error,
+                },
+            )
+            continue
+
         add_event(
             "evt.action.execution.started",
             {
                 "action_attempt_id": action_attempt.id,
                 "capability_id": capability_id,
             },
+        )
+        _acquire_side_effect_execution_lock(
+            db=db,
+            impact_level=evaluation.capability.impact_level,
         )
         execution_result = execute_capability(
             capability=evaluation.capability,
@@ -257,12 +332,14 @@ def process_action_proposals(
         action_attempt.execution_error = execution_result.error or "execution_output_missing"
         action_attempt.status = "failed"
         action_attempt.updated_at = now_fn()
-        blocked_reasons.append(f"{capability_id}: execution_failed")
+        blocked_reasons.append(
+            f"{capability_id}: {execution_result.error or 'execution_output_missing'}"
+        )
         add_event(
             "evt.action.execution.failed",
             {
                 "action_attempt_id": action_attempt.id,
-                "error": execution_result.error,
+                "error": action_attempt.execution_error,
             },
         )
 
@@ -484,55 +561,80 @@ def resolve_approval_decision(
             },
         )
     else:
-        normalized_input, input_error = capability.validate_input(action_attempt.proposed_input)
-        if input_error is not None or normalized_input is None:
+        integrity_error = _execution_integrity_error(
+            action_attempt=action_attempt,
+            capability=capability,
+        )
+        if integrity_error is not None:
             action_attempt.status = "failed"
-            action_attempt.execution_error = "schema_invalid"
-            action_attempt.policy_reason = "schema_invalid"
+            action_attempt.execution_error = integrity_error
+            action_attempt.policy_reason = "integrity_mismatch"
             action_attempt.updated_at = now_fn()
             add_approval_event(
                 "evt.action.execution.failed",
                 {
                     "action_attempt_id": action_attempt.id,
-                    "error": "schema_invalid",
+                    "error": integrity_error,
                 },
             )
         else:
-            execution_result = execute_capability(
-                capability=capability,
-                normalized_input=normalized_input,
+            _acquire_side_effect_execution_lock(
+                db=db,
+                impact_level=action_attempt.impact_level,
             )
-            if execution_result.status == "succeeded" and execution_result.output is not None:
-                action_attempt.status = "succeeded"
-                action_attempt.execution_output = execution_result.output
-                action_attempt.execution_error = None
-                action_attempt.updated_at = now_fn()
-                add_approval_event(
-                    "evt.action.execution.succeeded",
-                    {
-                        "action_attempt_id": action_attempt.id,
-                        "output": execution_result.output,
-                    },
-                )
-            else:
+            normalized_input, input_error = capability.validate_input(action_attempt.proposed_input)
+            if input_error is not None or normalized_input is None:
                 action_attempt.status = "failed"
-                action_attempt.execution_output = None
-                action_attempt.execution_error = execution_result.error or "execution_output_missing"
+                action_attempt.execution_error = "schema_invalid"
+                action_attempt.policy_reason = "schema_invalid"
                 action_attempt.updated_at = now_fn()
                 add_approval_event(
                     "evt.action.execution.failed",
                     {
                         "action_attempt_id": action_attempt.id,
-                        "error": execution_result.error,
+                        "error": "schema_invalid",
                     },
                 )
+            else:
+                execution_result = execute_capability(
+                    capability=capability,
+                    normalized_input=normalized_input,
+                )
+                if execution_result.status == "succeeded" and execution_result.output is not None:
+                    action_attempt.status = "succeeded"
+                    action_attempt.execution_output = execution_result.output
+                    action_attempt.execution_error = None
+                    action_attempt.updated_at = now_fn()
+                    add_approval_event(
+                        "evt.action.execution.succeeded",
+                        {
+                            "action_attempt_id": action_attempt.id,
+                            "output": execution_result.output,
+                        },
+                    )
+                else:
+                    action_attempt.status = "failed"
+                    action_attempt.execution_output = None
+                    action_attempt.execution_error = (
+                        execution_result.error or "execution_output_missing"
+                    )
+                    action_attempt.updated_at = now_fn()
+                    add_approval_event(
+                        "evt.action.execution.failed",
+                        {
+                            "action_attempt_id": action_attempt.id,
+                            "error": action_attempt.execution_error,
+                        },
+                    )
 
     db.flush()
-    assistant_message = (
-        "approved action executed successfully."
-        if action_attempt.status == "succeeded"
-        else "approval recorded, but action execution failed."
-    )
+    if action_attempt.status == "succeeded":
+        assistant_message = "approved action executed successfully."
+    else:
+        failure_reason = action_attempt.execution_error or "execution_failed"
+        if failure_reason.startswith("integrity_mismatch"):
+            failure_reason = failure_reason.replace("integrity_mismatch", "integrity mismatch", 1)
+        assistant_message = f"approval recorded, but action execution failed: {failure_reason}"
     return ApprovalDecisionResult(
         approval=approval,
         action_attempt=action_attempt,

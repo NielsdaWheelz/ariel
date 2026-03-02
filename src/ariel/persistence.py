@@ -121,6 +121,7 @@ class ActionAttemptRecord(Base):
     proposal_index: Mapped[int] = mapped_column(Integer, nullable=False)
     capability_id: Mapped[str] = mapped_column(String(128), nullable=False)
     capability_version: Mapped[str] = mapped_column(String(32), nullable=False, default="1.0")
+    capability_contract_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     impact_level: Mapped[str] = mapped_column(String(32), nullable=False)
     proposed_input: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -258,6 +259,7 @@ def serialize_action_attempt(
         "proposal_index": action_attempt.proposal_index,
         "capability_id": action_attempt.capability_id,
         "capability_version": action_attempt.capability_version,
+        "capability_contract_hash": action_attempt.capability_contract_hash,
         "impact_level": action_attempt.impact_level,
         "status": action_attempt.status,
         "proposal_input": action_attempt.proposed_input,

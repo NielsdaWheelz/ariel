@@ -64,6 +64,16 @@ request body:
 
 the endpoint is single-use, actor-bound, expiry-bound, and executes only the frozen proposed payload.
 
+slice-2 pr-02 hardening adds runtime boundary checks for side effects:
+
+- taint-aware authorization for side-effecting proposals (`influenced_by_untrusted_content`) with explicit escalate/deny reasons.
+- proposal-time execution identity capture (`capability_id`, `capability_version`, `capability_contract_hash`) and execution-time integrity enforcement.
+- deny-by-default outbound control via per-capability destination allowlists; non-allowlisted egress is blocked.
+- pre-execution input guardrails and post-execution output guardrails before side effects/user surfacing.
+- serialized side-effect execution gates during approval-triggered runs using transactional postgres advisory locks.
+
+see `docs/v1/s2/s2_prs/s2_pr02_implementation_notes.md` for implementation details and tradeoffs.
+
 ## run locally
 
 create local config once (no repeated `export`/`source` needed). app + alembic auto-load `.env.local`.
