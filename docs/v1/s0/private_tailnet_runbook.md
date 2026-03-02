@@ -10,8 +10,9 @@ this runbook defines a repeatable private deployment for slice 0:
 ## 1) prepare runtime secrets + database
 
 ```bash
-cp .env.example .env.local
+make env-init
 # edit .env.local with your real runtime values
+make db-up
 make db-upgrade
 ```
 
@@ -21,7 +22,7 @@ when needed, explicit shell env vars still override `.env.local`.
 ## 2) start ariel as localhost-only
 
 ```bash
-.venv/bin/uvicorn ariel.app:create_app --factory --host 127.0.0.1 --port 8000
+make run
 ```
 
 the app must not bind `0.0.0.0` or another public interface.

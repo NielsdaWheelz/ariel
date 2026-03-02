@@ -24,28 +24,58 @@ bash scripts/agency_verify.sh
 
 ## run locally
 
-create a local env file once (no repeated `export`/`source` needed). app + alembic both auto-load `.env.local`.
+create local config once (no repeated `export`/`source` needed). app + alembic auto-load `.env.local`.
 
 ```bash
-cp .env.example .env.local
+make env-init
 # edit .env.local with real values for your machine
 ```
 
-real provider mode (default):
+inspect resolved local-db runtime config (derived from `ARIEL_DATABASE_URL`):
+
+```bash
+make db-config
+```
+
+manage local postgres with docker (idempotent):
+
+```bash
+make db-up
+make db-status
+make db-logs
+# when needed:
+make db-stop
+make db-down
+make db-destroy
+```
+
+start app in real provider mode:
 
 ```bash
 make db-upgrade
-.venv/bin/uvicorn ariel.app:create_app --factory --reload
+make run
 ```
 
-local deterministic dev mode (no external model call):
+or run end-to-end with one command:
 
 ```bash
-ARIEL_MODEL_PROVIDER=echo ARIEL_MODEL_NAME=echo-v1 make db-upgrade
-ARIEL_MODEL_PROVIDER=echo ARIEL_MODEL_NAME=echo-v1 .venv/bin/uvicorn ariel.app:create_app --factory --reload
+make dev
 ```
 
-env vars still work and take precedence over `.env.local` when explicitly set.
+switch model provider cleanly:
+
+```bash
+make run-openai
+make run-echo
+```
+
+connection-string values (`user/password/database/port`) can be any values you want, as long as:
+
+- they are valid PostgreSQL credentials,
+- they match the database actually running,
+- and for `make db-up` they point to loopback host (`localhost`, `127.0.0.1`, or `::1`).
+
+explicit shell env vars still override `.env.local` when set.
 
 if migrations are missing, `/v1/*` endpoints return `E_SCHEMA_NOT_READY` (503) until schema is upgraded.
 
