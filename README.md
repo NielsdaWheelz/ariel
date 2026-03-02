@@ -28,9 +28,12 @@ make dev
 
 ```bash
 make verify
+make e2e
 # or:
 bash scripts/agency_verify.sh
 ```
+
+`make e2e` runs high-signal smoke coverage for the phone surface timeline plus slice-1 bounded-context event auditing.
 
 ## run locally
 
@@ -86,6 +89,10 @@ connection-string values (`user/password/database/port`) can be any values you w
 - and for `make db-up` they point to loopback host (`localhost`, `127.0.0.1`, or `::1`).
 
 explicit shell env vars still override `.env.local` when set.
+
+slice-1 conversation window is runtime-configurable:
+
+- `ARIEL_MAX_RECENT_TURNS` (default `12`) bounds how many prior turns are included in the deterministic turn context bundle.
 
 if migrations are missing, `/v1/*` endpoints return `E_SCHEMA_NOT_READY` (503) until schema is upgraded.
 

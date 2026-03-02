@@ -52,6 +52,8 @@ Deliver natural multi-turn conversation with bounded assistant decision-making.
 
 **Configurable budgets with operational defaults**: Limit thresholds are configuration-driven so they can be tuned without API contract changes. Initial defaults are: `max_recent_turns=12`, `max_context_tokens=6000`, `max_response_tokens=700`, `max_model_attempts=2`, `max_turn_wall_time_ms=20000`.
 
+For the PR-01 implementation baseline, `max_recent_turns` is exposed via `ARIEL_MAX_RECENT_TURNS`, and the applied bounded-window metadata is emitted in turn events for auditability.
+
 **Auditable decision and limit semantics**: The append-only turn event chain must make it observable whether a turn produced an assistant message or a bounded-failure terminal outcome, and still end in one terminal turn status.
 
 **Single active session remains continuity boundary**: Slice 1 continues the one-active-session model for short-term continuity. Session rotation and cross-session recall stay deferred.
