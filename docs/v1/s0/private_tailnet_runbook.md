@@ -9,6 +9,8 @@ this runbook defines a repeatable private deployment for slice 0:
 
 ## 1) prepare runtime secrets + database
 
+`make bootstrap` handles steps 1–3 (env, db, tailscale serve) in one command. the steps below are kept for reference or manual runs.
+
 ```bash
 make env-init
 # edit .env.local with your real runtime values

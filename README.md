@@ -10,8 +10,18 @@ slice-0 walking skeleton with:
 
 ## quickstart
 
+first-time setup (checks prerequisites, creates venv, starts db, runs migrations, configures tailscale):
+
 ```bash
-bash scripts/agency_setup.sh
+make bootstrap
+```
+
+if the API key is still the placeholder, edit `.env.local` and re-run `make bootstrap`.
+
+daily development after bootstrap:
+
+```bash
+make dev
 ```
 
 ## verification gates

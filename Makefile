@@ -7,7 +7,10 @@ done)
 
 UVICORN_CMD := .venv/bin/uvicorn ariel.app:create_app --factory --host 127.0.0.1 --port 8000
 
-.PHONY: help setup env-init check-venv db-up db-stop db-down db-destroy db-status db-logs db-config db-upgrade run run-openai run-echo dev lint typecheck test verify
+.PHONY: help bootstrap setup env-init check-venv db-up db-stop db-down db-destroy db-status db-logs db-config db-upgrade run run-openai run-echo dev lint typecheck test verify
+
+bootstrap:
+	bash scripts/bootstrap.sh
 
 setup:
 ifndef PYTHON
@@ -19,6 +22,7 @@ endif
 
 help:
 	@printf "%s\n" \
+	  "bootstrap    - one-command first-time setup (prereqs, venv, db, tailscale)" \
 	  "setup        - create .venv and install deps" \
 	  "env-init     - create .env.local from .env.example when missing" \
 	  "db-up        - start/create local postgres container from ARIEL_DATABASE_URL" \
