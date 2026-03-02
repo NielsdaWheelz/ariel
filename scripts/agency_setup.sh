@@ -18,4 +18,7 @@ if [ ! -f .env.local ] && [ -f ../../repo.json ]; then
   fi
 fi
 
-make bootstrap
+make setup
+make env-init
+make db-up
+make db-upgrade

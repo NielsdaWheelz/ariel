@@ -7,7 +7,7 @@ done)
 
 UVICORN_CMD := .venv/bin/uvicorn ariel.app:create_app --factory --host 127.0.0.1 --port 8000
 
-.PHONY: help bootstrap setup env-init check-venv db-up db-stop db-down db-destroy db-status db-logs db-config db-upgrade run run-openai run-echo dev lint typecheck test verify e2e
+.PHONY: help bootstrap setup env-init check-venv db-up db-stop db-down db-destroy db-status db-logs db-config db-upgrade tailscale-serve run run-openai run-echo dev lint typecheck test verify e2e
 
 bootstrap:
 	bash scripts/bootstrap.sh
@@ -22,7 +22,7 @@ endif
 
 help:
 	@printf "%s\n" \
-	  "bootstrap    - one-command first-time setup (prereqs, venv, db, tailscale)" \
+	  "bootstrap    - one-command first-time setup (prereqs, venv, db)" \
 	  "setup        - create .venv and install deps" \
 	  "env-init     - create .env.local from .env.example when missing" \
 	  "db-up        - start/create local postgres container from ARIEL_DATABASE_URL" \
@@ -33,6 +33,7 @@ help:
 	  "db-logs      - show local postgres container logs" \
 	  "db-config    - print resolved docker db config from env" \
 	  "db-upgrade   - run alembic migrations" \
+	  "tailscale-serve - expose app via tailscale (https :443 → localhost:8000)" \
 	  "run          - run ariel app (provider from .env.local/env)" \
 	  "run-openai   - run app forcing openai provider" \
 	  "run-echo     - run app forcing echo provider" \
@@ -98,6 +99,15 @@ endif
 
 db-upgrade: check-venv
 	.venv/bin/alembic upgrade head
+
+tailscale-serve:
+	@if command -v tailscale >/dev/null 2>&1; then \
+	  tailscale serve --bg --https=443 http://127.0.0.1:8000 && \
+	  echo "tailscale serve configured (https :443 → localhost:8000)"; \
+	else \
+	  echo "tailscale not found. Install from https://tailscale.com/download"; \
+	  exit 1; \
+	fi
 
 run: check-venv
 	$(UVICORN_CMD)

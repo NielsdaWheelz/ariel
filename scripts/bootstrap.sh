@@ -26,13 +26,6 @@ else
   errors=$((errors + 1))
 fi
 
-# Tailscale (warn only — not strictly required for local dev)
-if command -v tailscale >/dev/null 2>&1; then
-  ok "tailscale"
-else
-  fail "Tailscale not found (optional, needed for private ingress). Install from https://tailscale.com/download"
-fi
-
 if [ "$errors" -gt 0 ]; then
   printf '\n\033[1;31mFix the above errors and re-run: make bootstrap\033[0m\n'
   exit 1
@@ -65,20 +58,7 @@ make db-up
 info "Running database migrations"
 make db-upgrade
 
-# ── 7. Configure Tailscale serve (best-effort) ─────────────────────────
-info "Configuring Tailscale private ingress"
-if command -v tailscale >/dev/null 2>&1; then
-  if tailscale serve --https=443 http://127.0.0.1:8000 2>/dev/null; then
-    ok "tailscale serve configured (https :443 → localhost:8000)"
-  else
-    fail "Could not configure tailscale serve automatically."
-    printf '  Run manually when ready:\n'
-    printf '    tailscale serve --https=443 http://127.0.0.1:8000\n'
-  fi
-else
-  printf '  Skipped — tailscale not installed.\n'
-fi
-
-# ── 8. Done ─────────────────────────────────────────────────────────────
+# ── 7. Done ──────────────────────────────────────────────────────────────
 info "Bootstrap complete"
-printf '  Run \033[1mmake dev\033[0m to start the app.\n\n'
+printf '  Run \033[1mmake dev\033[0m to start the app.\n'
+printf '  Run \033[1mmake tailscale-serve\033[0m to expose via Tailscale.\n\n'
