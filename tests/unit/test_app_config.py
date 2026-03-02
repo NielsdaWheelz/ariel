@@ -49,3 +49,17 @@ def test_bind_host_rejects_public_interfaces(monkeypatch: pytest.MonkeyPatch) ->
 
     with pytest.raises(ValidationError):
         AppSettings()
+
+
+def test_max_recent_turns_loads_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARIEL_MAX_RECENT_TURNS", "7")
+
+    settings = AppSettings()
+    assert settings.max_recent_turns == 7
+
+
+def test_max_recent_turns_rejects_non_positive_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARIEL_MAX_RECENT_TURNS", "0")
+
+    with pytest.raises(ValidationError):
+        AppSettings()

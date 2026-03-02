@@ -29,6 +29,7 @@ class AppSettings(BaseSettings):
     model_api_base_url: str = "https://api.openai.com/v1"
     model_api_key: str | None = None
     model_timeout_seconds: float = 30.0
+    max_recent_turns: int = 12
 
     @field_validator("bind_host")
     @classmethod
@@ -50,3 +51,10 @@ class AppSettings(BaseSettings):
         if normalized not in {"openai", "echo"}:
             raise ValueError("model_provider must be one of: openai, echo")
         return normalized
+
+    @field_validator("max_recent_turns")
+    @classmethod
+    def _max_recent_turns_must_be_positive(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("max_recent_turns must be >= 1")
+        return value

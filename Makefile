@@ -7,7 +7,7 @@ done)
 
 UVICORN_CMD := .venv/bin/uvicorn ariel.app:create_app --factory --host 127.0.0.1 --port 8000
 
-.PHONY: help bootstrap setup env-init check-venv db-up db-stop db-down db-destroy db-status db-logs db-config db-upgrade run run-openai run-echo dev lint typecheck test verify
+.PHONY: help bootstrap setup env-init check-venv db-up db-stop db-down db-destroy db-status db-logs db-config db-upgrade run run-openai run-echo dev lint typecheck test verify e2e
 
 bootstrap:
 	bash scripts/bootstrap.sh
@@ -37,7 +37,8 @@ help:
 	  "run-openai   - run app forcing openai provider" \
 	  "run-echo     - run app forcing echo provider" \
 	  "dev          - env-init + db-up + db-upgrade + run" \
-	  "verify       - lint + typecheck + tests"
+	  "verify       - lint + typecheck + tests" \
+	  "e2e          - high-signal end-to-end smoke tests"
 
 env-init:
 	@if [ ! -f ".env.local" ]; then \
@@ -119,3 +120,6 @@ test: check-venv
 	.venv/bin/python -m pytest
 
 verify: lint typecheck test
+
+e2e: check-venv
+	.venv/bin/python -m pytest tests/integration/test_pr01_acceptance.py -k "phone_surface_renders_timeline_from_stored_event_chain or pr01_turn_context_is_bounded_ordered_and_auditable or pr01_context_audit_is_stable_even_if_adapter_mutates_context_bundle"

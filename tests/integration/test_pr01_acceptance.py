@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Generator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -32,7 +32,9 @@ class DeterministicModelAdapter:
         session_id: str,
         turn_id: str,
         history: list[dict[str, Any]],
+        context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
+        del session_id, turn_id, history, context_bundle
         if self.fail:
             raise RuntimeError("simulated provider failure")
         return {
@@ -41,6 +43,100 @@ class DeterministicModelAdapter:
             "model": self.model,
             "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
             "provider_response_id": "resp_test_123",
+        }
+
+
+@dataclass
+class ContextWindowDecisionAdapter:
+    provider: str = "provider.context-window"
+    model: str = "model.context-window-v1"
+    context_bundles: list[dict[str, Any]] = field(default_factory=list)
+
+    def respond(
+        self,
+        user_message: str,
+        *,
+        session_id: str,
+        turn_id: str,
+        history: list[dict[str, Any]],
+        context_bundle: dict[str, Any],
+    ) -> dict[str, Any]:
+        del session_id, turn_id, history
+        self.context_bundles.append(context_bundle)
+
+        normalized = user_message.strip().lower()
+        if normalized == "book me travel":
+            assistant_text = (
+                "i need your destination and travel dates before i can plan this trip."
+            )
+        elif normalized.startswith("project codename is "):
+            declared_codename = normalized.replace("project codename is ", "", 1).strip()
+            assistant_text = f"noted. project codename set to {declared_codename}."
+        elif normalized == "what is the project codename?":
+            codename = self._find_recent_codename(context_bundle)
+            if codename is None:
+                assistant_text = (
+                    "i'm not sure because that detail is outside my recent context window. "
+                    "please remind me of the codename."
+                )
+            else:
+                assistant_text = f"your project codename is {codename}."
+        else:
+            assistant_text = f"direct::{user_message}"
+
+        return {
+            "assistant_text": assistant_text,
+            "provider": self.provider,
+            "model": self.model,
+            "usage": {"prompt_tokens": 9, "completion_tokens": 11, "total_tokens": 20},
+            "provider_response_id": "resp_context_window_123",
+        }
+
+    def _find_recent_codename(self, context_bundle: dict[str, Any]) -> str | None:
+        recent_turns = context_bundle.get("recent_active_session_turns")
+        if not isinstance(recent_turns, list):
+            return None
+        for turn in reversed(recent_turns):
+            if not isinstance(turn, dict):
+                continue
+            prior_user_message = turn.get("user_message")
+            if not isinstance(prior_user_message, str):
+                continue
+            normalized = prior_user_message.strip().lower()
+            if normalized.startswith("project codename is "):
+                return normalized.replace("project codename is ", "", 1).strip()
+        return None
+
+
+@dataclass
+class MutatingContextAdapter:
+    provider: str = "provider.mutating"
+    model: str = "model.mutating-v1"
+
+    def respond(
+        self,
+        user_message: str,
+        *,
+        session_id: str,
+        turn_id: str,
+        history: list[dict[str, Any]],
+        context_bundle: dict[str, Any],
+    ) -> dict[str, Any]:
+        del user_message, session_id, turn_id, history
+        section_order = context_bundle.get("section_order")
+        if isinstance(section_order, list):
+            section_order.append("mutated")
+        recent_window = context_bundle.get("recent_window")
+        if isinstance(recent_window, dict):
+            recent_window["included_turn_count"] = 999
+            recent_window["included_turn_ids"] = ["mutated"]
+
+        return {
+            "assistant_text": "mutating-adapter-response",
+            "provider": self.provider,
+            "model": self.model,
+            "usage": {"prompt_tokens": 3, "completion_tokens": 3, "total_tokens": 6},
+            "provider_response_id": "resp_mutating_123",
         }
 
 
@@ -83,6 +179,160 @@ def test_user_can_send_message_and_receive_model_backed_response(postgres_url: s
         assert body["ok"] is True
         assert body["assistant"]["message"] == "assistant::hello from phone"
         assert body["turn"]["status"] == "completed"
+
+
+def test_pr01_model_led_direct_and_clarification_messages_are_emitted(postgres_url: str) -> None:
+    adapter = ContextWindowDecisionAdapter()
+    with _build_client(postgres_url, adapter) as client:
+        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
+
+        clear_turn = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "summarize this in one line"},
+        )
+        assert clear_turn.status_code == 200
+        assert clear_turn.json()["assistant"]["message"].startswith("direct::")
+
+        ambiguous_turn = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "book me travel"},
+        )
+        assert ambiguous_turn.status_code == 200
+        assert "destination and travel dates" in ambiguous_turn.json()["assistant"]["message"]
+
+        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        assert timeline.status_code == 200
+        event_types_by_turn = [
+            [event["event_type"] for event in turn["events"]] for turn in timeline.json()["turns"]
+        ]
+        assert all("evt.assistant.emitted" in event_types for event_types in event_types_by_turn)
+        assert all("evt.turn.completed" in event_types for event_types in event_types_by_turn)
+
+
+def test_pr01_turn_context_is_bounded_ordered_and_auditable(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARIEL_MAX_RECENT_TURNS", "1")
+    adapter = ContextWindowDecisionAdapter()
+
+    with _build_client(postgres_url, adapter) as client:
+        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
+
+        turn_1 = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "project codename is aurora"},
+        )
+        assert turn_1.status_code == 200
+
+        turn_2 = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "what is the project codename?"},
+        )
+        assert turn_2.status_code == 200
+        assert "aurora" in turn_2.json()["assistant"]["message"]
+
+        turn_3 = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "let's move on"},
+        )
+        assert turn_3.status_code == 200
+
+        turn_4 = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "what is the project codename?"},
+        )
+        assert turn_4.status_code == 200
+        assert "outside my recent context window" in turn_4.json()["assistant"]["message"]
+
+        assert len(adapter.context_bundles) == 4
+        for context_bundle in adapter.context_bundles:
+            assert context_bundle["section_order"] == [
+                "policy_system_instructions",
+                "recent_active_session_turns",
+            ]
+
+        second_turn_context = adapter.context_bundles[1]
+        assert [turn["user_message"] for turn in second_turn_context["recent_active_session_turns"]] == [
+            "project codename is aurora"
+        ]
+
+        fourth_turn_context = adapter.context_bundles[3]
+        assert [turn["user_message"] for turn in fourth_turn_context["recent_active_session_turns"]] == [
+            "let's move on"
+        ]
+
+        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        assert timeline.status_code == 200
+        turns = timeline.json()["turns"]
+        assert len(turns) == 4
+
+        model_started_second_turn = next(
+            event for event in turns[1]["events"] if event["event_type"] == "evt.model.started"
+        )
+        second_context_meta = model_started_second_turn["payload"]["context"]
+        assert second_context_meta["schema_version"] == "1.0"
+        assert second_context_meta["section_order"] == [
+            "policy_system_instructions",
+            "recent_active_session_turns",
+        ]
+        assert second_context_meta["policy_instruction_count"] >= 1
+        assert second_context_meta["recent_window"] == {
+            "max_recent_turns": 1,
+            "included_turn_count": 1,
+            "omitted_turn_count": 0,
+            "included_turn_ids": [turns[0]["id"]],
+        }
+
+        model_started_fourth_turn = next(
+            event for event in turns[3]["events"] if event["event_type"] == "evt.model.started"
+        )
+        fourth_context_meta = model_started_fourth_turn["payload"]["context"]
+        assert fourth_context_meta["schema_version"] == "1.0"
+        assert fourth_context_meta["recent_window"]["max_recent_turns"] == 1
+        assert fourth_context_meta["recent_window"]["included_turn_count"] == 1
+        assert fourth_context_meta["recent_window"]["omitted_turn_count"] == 2
+        assert fourth_context_meta["recent_window"]["included_turn_ids"] == [turns[2]["id"]]
+
+
+def test_pr01_context_audit_is_stable_even_if_adapter_mutates_context_bundle(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARIEL_MAX_RECENT_TURNS", "1")
+    adapter = MutatingContextAdapter()
+    with _build_client(postgres_url, adapter) as client:
+        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
+        first = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "seed history"},
+        )
+        assert first.status_code == 200
+
+        second = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "mutate context"},
+        )
+        assert second.status_code == 200
+
+        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        assert timeline.status_code == 200
+        turns = timeline.json()["turns"]
+        model_started_second_turn = next(
+            event for event in turns[1]["events"] if event["event_type"] == "evt.model.started"
+        )
+        context_meta = model_started_second_turn["payload"]["context"]
+        assert context_meta["schema_version"] == "1.0"
+        assert context_meta["section_order"] == [
+            "policy_system_instructions",
+            "recent_active_session_turns",
+        ]
+        assert context_meta["recent_window"] == {
+            "max_recent_turns": 1,
+            "included_turn_count": 1,
+            "omitted_turn_count": 0,
+            "included_turn_ids": [turns[0]["id"]],
+        }
 
 
 def test_create_session_endpoint_reuses_single_active_session(postgres_url: str) -> None:
@@ -328,7 +578,9 @@ class SecretLeakingFailureAdapter:
         session_id: str,
         turn_id: str,
         history: list[dict[str, Any]],
+        context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
+        del user_message, session_id, turn_id, history, context_bundle
         raise RuntimeError(f"provider rejected credential {self.secret_value}")
 
 
@@ -344,7 +596,9 @@ class NonSecretFailureAdapter:
         session_id: str,
         turn_id: str,
         history: list[dict[str, Any]],
+        context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
+        del user_message, session_id, turn_id, history, context_bundle
         raise RuntimeError("token limit exceeded for this request")
 
 

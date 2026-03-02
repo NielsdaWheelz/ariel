@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from contextlib import asynccontextmanager
 import re
 import time
@@ -48,6 +49,20 @@ def _new_id(prefix: str) -> str:
 
 
 _ACTIVE_SESSION_LOCK_ID = 24_310_001
+
+_CONTEXT_SECTION_ORDER = (
+    "policy_system_instructions",
+    "recent_active_session_turns",
+)
+
+_CONTEXT_AUDIT_SCHEMA_VERSION = "1.0"
+
+_POLICY_SYSTEM_INSTRUCTIONS = (
+    "You are Ariel, a private assistant for one active user session.",
+    "If user intent is clear, answer directly in this turn.",
+    "If user intent is ambiguous or conflicting, ask for the missing details instead of guessing.",
+    "If the user asks about details not present in this context, state uncertainty and ask for recovery details.",
+)
 
 
 class Base(DeclarativeBase):
@@ -152,6 +167,7 @@ class ModelAdapter(Protocol):
         session_id: str,
         turn_id: str,
         history: list[dict[str, Any]],
+        context_bundle: dict[str, Any],
     ) -> dict[str, Any]: ...
 
 
@@ -167,7 +183,9 @@ class EchoModelAdapter:
         session_id: str,
         turn_id: str,
         history: list[dict[str, Any]],
+        context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
+        del session_id, turn_id, history, context_bundle
         prompt_tokens = max(1, len(user_message.split()))
         completion_text = f"echo: {user_message}"
         completion_tokens = max(1, len(completion_text.split()))
@@ -217,7 +235,9 @@ class OpenAIChatCompletionsAdapter:
         session_id: str,
         turn_id: str,
         history: list[dict[str, Any]],
+        context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
+        del session_id, turn_id, history
         if not self.api_key:
             raise ModelAdapterError(
                 safe_reason="model credentials are not configured",
@@ -236,7 +256,10 @@ class OpenAIChatCompletionsAdapter:
                 },
                 json={
                     "model": self.model,
-                    "messages": _build_openai_messages(history=history, user_message=user_message),
+                    "messages": _build_openai_messages(
+                        context_bundle=context_bundle,
+                        user_message=user_message,
+                    ),
                 },
                 timeout=self.timeout_seconds,
             )
@@ -309,9 +332,26 @@ class OpenAIChatCompletionsAdapter:
         }
 
 
-def _build_openai_messages(*, history: list[dict[str, Any]], user_message: str) -> list[dict[str, str]]:
+def _build_openai_messages(
+    *,
+    context_bundle: dict[str, Any],
+    user_message: str,
+) -> list[dict[str, str]]:
     messages: list[dict[str, str]] = []
-    for prior_turn in history:
+
+    policy_system_instructions = context_bundle.get("policy_system_instructions")
+    if isinstance(policy_system_instructions, list):
+        for instruction in policy_system_instructions:
+            if isinstance(instruction, str) and instruction:
+                messages.append({"role": "system", "content": instruction})
+
+    recent_turns = context_bundle.get("recent_active_session_turns")
+    if not isinstance(recent_turns, list):
+        recent_turns = []
+
+    for prior_turn in recent_turns:
+        if not isinstance(prior_turn, dict):
+            continue
         prior_user_message = prior_turn.get("user_message")
         if isinstance(prior_user_message, str) and prior_user_message:
             messages.append({"role": "user", "content": prior_user_message})
@@ -443,6 +483,77 @@ def _serialize_event(event: EventRecord) -> dict[str, Any]:
     }
 
 
+def _build_turn_context_bundle(
+    *,
+    prior_turns: Sequence[TurnRecord],
+    max_recent_turns: int,
+) -> dict[str, Any]:
+    recent_turns = prior_turns[-max_recent_turns:]
+    recent_active_session_turns = [
+        {
+            "turn_id": turn.id,
+            "user_message": turn.user_message,
+            "assistant_message": turn.assistant_message,
+            "status": turn.status,
+        }
+        for turn in recent_turns
+    ]
+    omitted_turn_count = len(prior_turns) - len(recent_active_session_turns)
+    included_turn_ids = [turn["turn_id"] for turn in recent_active_session_turns]
+
+    return {
+        "section_order": list(_CONTEXT_SECTION_ORDER),
+        "policy_system_instructions": list(_POLICY_SYSTEM_INSTRUCTIONS),
+        "recent_active_session_turns": recent_active_session_turns,
+        "recent_window": {
+            "max_recent_turns": max_recent_turns,
+            "included_turn_count": len(recent_active_session_turns),
+            "omitted_turn_count": omitted_turn_count,
+            "included_turn_ids": included_turn_ids,
+        },
+    }
+
+
+def _context_bundle_audit_metadata(context_bundle: dict[str, Any]) -> dict[str, Any]:
+    section_order_raw = context_bundle.get("section_order")
+    section_order = (
+        [entry for entry in section_order_raw if isinstance(entry, str)]
+        if isinstance(section_order_raw, list)
+        else []
+    )
+
+    policy_system_instructions_raw = context_bundle.get("policy_system_instructions")
+    policy_system_instructions = (
+        [entry for entry in policy_system_instructions_raw if isinstance(entry, str)]
+        if isinstance(policy_system_instructions_raw, list)
+        else []
+    )
+
+    recent_window_raw = context_bundle.get("recent_window")
+    recent_window = recent_window_raw if isinstance(recent_window_raw, dict) else {}
+    max_recent_turns = recent_window.get("max_recent_turns")
+    included_turn_count = recent_window.get("included_turn_count")
+    omitted_turn_count = recent_window.get("omitted_turn_count")
+    included_turn_ids_raw = recent_window.get("included_turn_ids")
+    included_turn_ids = (
+        [turn_id for turn_id in included_turn_ids_raw if isinstance(turn_id, str)]
+        if isinstance(included_turn_ids_raw, list)
+        else []
+    )
+
+    return {
+        "schema_version": _CONTEXT_AUDIT_SCHEMA_VERSION,
+        "section_order": section_order,
+        "policy_instruction_count": len(policy_system_instructions),
+        "recent_window": {
+            "max_recent_turns": max_recent_turns if isinstance(max_recent_turns, int) else 0,
+            "included_turn_count": included_turn_count if isinstance(included_turn_count, int) else 0,
+            "omitted_turn_count": omitted_turn_count if isinstance(omitted_turn_count, int) else 0,
+            "included_turn_ids": included_turn_ids,
+        },
+    }
+
+
 def _get_or_create_active_session(db: Session) -> SessionRecord:
     bind = db.get_bind()
     if bind is not None and bind.dialect.name == "postgresql":
@@ -509,6 +620,7 @@ def create_app(
     app.state.model_adapter = adapter
     app.state.bind_host = settings.bind_host
     app.state.bind_port = settings.bind_port
+    app.state.max_recent_turns = settings.max_recent_turns
     app.state.schema_missing_tables = []
 
     @app.exception_handler(ApiError)
@@ -607,14 +719,11 @@ def create_app(
                     .where(TurnRecord.session_id == session_id)
                     .order_by(TurnRecord.created_at.asc(), TurnRecord.id.asc())
                 ).all()
-                history = [
-                    {
-                        "user_message": turn.user_message,
-                        "assistant_message": turn.assistant_message,
-                        "status": turn.status,
-                    }
-                    for turn in prior_turns
-                ]
+                context_bundle = _build_turn_context_bundle(
+                    prior_turns=prior_turns,
+                    max_recent_turns=app.state.max_recent_turns,
+                )
+                context_metadata = _context_bundle_audit_metadata(context_bundle)
 
                 now = _utcnow()
                 turn = TurnRecord(
@@ -641,7 +750,7 @@ def create_app(
                         turn_id=turn.id,
                         sequence=sequence,
                         event_type=event_type,
-                        payload=payload_data,
+                        payload=jsonable_encoder(payload_data),
                         created_at=_utcnow(),
                     )
                     db.add(event)
@@ -653,6 +762,7 @@ def create_app(
                     {
                         "provider": app.state.model_adapter.provider,
                         "model": app.state.model_adapter.model,
+                        "context": context_metadata,
                     },
                 )
 
@@ -664,7 +774,8 @@ def create_app(
                         payload.message,
                         session_id=session_id,
                         turn_id=turn.id,
-                        history=history,
+                        history=context_bundle["recent_active_session_turns"],
+                        context_bundle=context_bundle,
                     )
                     duration_ms = int((time.perf_counter() - started_at) * 1000)
                     add_event(
