@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from ariel.capability_registry import CapabilityDefinition, PolicyDecision, get_capability
 
@@ -21,6 +21,7 @@ def evaluate_proposal(
     input_payload: dict[str, Any],
     pending_approval_exists: bool,
     influenced_by_untrusted_content: bool = False,
+    provenance_status: Literal["clean", "tainted", "ambiguous"] | None = None,
 ) -> PolicyEvaluation:
     capability = get_capability(capability_id)
     if capability is None:
@@ -52,7 +53,10 @@ def evaluate_proposal(
         )
 
     is_side_effecting = capability.impact_level != "read"
-    if is_side_effecting and influenced_by_untrusted_content:
+    effective_taint = influenced_by_untrusted_content
+    if provenance_status is not None:
+        effective_taint = provenance_status in {"tainted", "ambiguous"}
+    if is_side_effecting and effective_taint:
         if capability.impact_level in {"write_irreversible", "external_send"}:
             return PolicyEvaluation(
                 capability=capability,

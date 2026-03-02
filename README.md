@@ -64,15 +64,18 @@ request body:
 
 the endpoint is single-use, actor-bound, expiry-bound, and executes only the frozen proposed payload.
 
-slice-2 pr-02 hardening adds runtime boundary checks for side effects:
+slice-2 pr-02/pr-03 hardening adds runtime boundary checks for side effects:
 
-- taint-aware authorization for side-effecting proposals (`influenced_by_untrusted_content`) with explicit escalate/deny reasons.
+- runtime-provenance taint authorization for side-effecting proposals; model taint flags are advisory-only and cannot clear runtime taint.
+- fail-closed taint handling for side effects: tainted/ambiguous `write_reversible` requires approval; tainted/ambiguous `write_irreversible` and `external_send` are denied.
+- action lifecycle events include taint provenance evidence and decision-basis metadata for audit reconstruction.
 - proposal-time execution identity capture (`capability_id`, `capability_version`, `capability_contract_hash`) and execution-time integrity enforcement.
 - deny-by-default outbound control via per-capability destination allowlists; non-allowlisted egress is blocked.
 - pre-execution input guardrails and post-execution output guardrails before side effects/user surfacing.
 - serialized side-effect execution gates during approval-triggered runs using transactional postgres advisory locks.
 
-see `docs/v1/s2/s2_prs/s2_pr02_implementation_notes.md` for implementation details and tradeoffs.
+see `docs/v1/s2/s2_prs/s2_pr02_implementation_notes.md` and
+`docs/v1/s2/s2_prs/s2_pr03_implementation_notes.md` for implementation details and tradeoffs.
 
 ## run locally
 
