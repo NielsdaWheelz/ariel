@@ -13,7 +13,7 @@
   - orchestration enforces Slice 2 MVP bounds: zero or more allowlisted reads may run inline per turn, while at most one approval-gated action may remain pending from that turn.
 - **non-goals**: no agency- or calendar-domain behavior beyond minimal framework-probe capabilities; no batched/delegated approvals; no cross-session memory/session-rotation/provider-portability changes; no roadmap-level lock-in to concrete probe capability IDs (those are defined in PR-01 brief/tests).
 
-### PR-02: Taint-Aware Authorization + Execution Integrity + Egress Controls (planned after PR-01 merges)
+### PR-02: Taint-Aware Authorization + Execution Integrity + Egress Controls
 - **goal**: harden Slice 2 boundaries so untrusted content cannot escalate side effects and runtime execution stays integrity-checked and least-privilege.
 - **builds on**: PR-01.
 - **acceptance**:
@@ -24,3 +24,4 @@
   - layered pre-execution and post-execution guardrails block unsafe inputs/outputs before side effects or unsafe user surfacing.
   - event/audit streams remain reconstructable for allow, deny, approval, expiry, execution success/failure, and guardrail-blocked outcomes.
 - **non-goals**: no dynamic plugin loading, no generic shell/ssh capability exposure, no autonomous background side-effect loops, no multi-user tenancy/public hosting changes.
+- **status**: landed in current implementation branch; see `s2_prs/s2_pr02_implementation_notes.md`.

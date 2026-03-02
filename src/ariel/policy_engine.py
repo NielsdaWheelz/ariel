@@ -20,6 +20,7 @@ def evaluate_proposal(
     capability_id: str,
     input_payload: dict[str, Any],
     pending_approval_exists: bool,
+    influenced_by_untrusted_content: bool = False,
 ) -> PolicyEvaluation:
     capability = get_capability(capability_id)
     if capability is None:
@@ -48,6 +49,32 @@ def evaluate_proposal(
             impact_level=capability.impact_level,
             decision="deny",
             reason="policy_denied",
+        )
+
+    is_side_effecting = capability.impact_level != "read"
+    if is_side_effecting and influenced_by_untrusted_content:
+        if capability.impact_level in {"write_irreversible", "external_send"}:
+            return PolicyEvaluation(
+                capability=capability,
+                normalized_input=normalized_input,
+                impact_level=capability.impact_level,
+                decision="deny",
+                reason="taint_denied_untrusted_side_effect",
+            )
+        if pending_approval_exists:
+            return PolicyEvaluation(
+                capability=capability,
+                normalized_input=normalized_input,
+                impact_level=capability.impact_level,
+                decision="deny",
+                reason="pending_approval_limit_reached",
+            )
+        return PolicyEvaluation(
+            capability=capability,
+            normalized_input=normalized_input,
+            impact_level=capability.impact_level,
+            decision="requires_approval",
+            reason="taint_escalated_requires_approval",
         )
 
     if capability.policy_decision == "requires_approval":
