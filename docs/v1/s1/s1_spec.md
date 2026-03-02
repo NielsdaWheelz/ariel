@@ -40,9 +40,11 @@ Deliver natural multi-turn conversation with bounded assistant decision-making.
 
 **Deterministic bounded context bundle for Slice 1**: Each turn context is assembled in fixed order from policy/system instructions plus a bounded recent-turn window from the active session. Unbounded full-session replay is explicitly disallowed.
 
-**Two-path decision contract (answer vs clarify)**: The engine produces exactly one conversational decision per turn: direct answer or clarifying question. Ambiguous intent routes to clarification by default.
+**Model-led conversational routing within bounded outcomes**: For Slice 1, the model decides from prompt+context whether to answer directly or ask for clarification. Ariel does not require a brittle rule-based intent classifier, but each turn must still expose exactly one observable conversational outcome.
 
 **Explicit turn-budget enforcement**: Turn execution is bounded by configured limits for model attempts, context budget, response budget, and clarification budget. Budget exhaustion is a first-class, user-visible failure condition, not silent degradation.
+
+**Runtime contracts over prompt rigidity**: Determinism is enforced in context assembly order, budget checks, terminal turn states, and auditable event semantics. Prompt wording can evolve without changing these contracts.
 
 **Dedicated bounded-failure error semantics**: Any turn that exhausts a configured limit returns `E_TURN_LIMIT_REACHED` with structured limit metadata and ends in terminal failed status. Limit failures are not merged into generic provider/network failures.
 
@@ -50,7 +52,7 @@ Deliver natural multi-turn conversation with bounded assistant decision-making.
 
 **Configurable budgets with operational defaults**: Limit thresholds are configuration-driven so they can be tuned without API contract changes. Initial defaults are: `max_recent_turns=12`, `max_context_tokens=6000`, `max_response_tokens=700`, `max_model_attempts=2`, `max_consecutive_clarifications=2`, `max_turn_wall_time_ms=20000`.
 
-**Auditable decision and limit semantics**: The append-only turn event chain must make it observable whether the turn took direct-answer, clarifying-question, or bounded-failure path, and still ends in one terminal turn status.
+**Auditable decision and limit semantics**: The append-only turn event chain must make the turn decision outcome observable (`answer`, `clarification`, or bounded-failure) and still end in one terminal turn status.
 
 **Single active session remains continuity boundary**: Slice 1 continues the one-active-session model for short-term continuity. Session rotation and cross-session recall stay deferred.
 

@@ -43,7 +43,7 @@ Slice 3: Agency Doer Integration    Slice 4: Calendar Assistant
 - **Dependencies**: Slice 0
 - **Acceptance**:
   - User can send several related messages and Ariel maintains short-term continuity.
-  - Ariel can decide to answer directly or ask a clarifying question when intent is ambiguous.
+  - Ariel chooses whether to answer directly or ask a clarifying question from prompt+context, while runtime contracts keep the outcome bounded and auditable.
   - When turn limits are reached, user gets a clear bounded failure message instead of silent degradation.
 
 ### Slice 2: Safe Action Framework
