@@ -90,9 +90,17 @@ connection-string values (`user/password/database/port`) can be any values you w
 
 explicit shell env vars still override `.env.local` when set.
 
-slice-1 conversation window is runtime-configurable:
+slice-1 turn budgets are runtime-configurable:
 
 - `ARIEL_MAX_RECENT_TURNS` (default `12`) bounds how many prior turns are included in the deterministic turn context bundle.
+- `ARIEL_MAX_CONTEXT_TOKENS` (default `6000`) bounds estimated prompt/context tokens for a turn.
+- `ARIEL_MAX_RESPONSE_TOKENS` (default `700`) bounds assistant completion tokens per turn.
+- `ARIEL_MAX_MODEL_ATTEMPTS` (default `2`) bounds retryable model attempts per turn.
+- `ARIEL_MAX_TURN_WALL_TIME_MS` (default `20000`) bounds total turn processing wall time.
+
+when a configured turn budget is exhausted, `POST /v1/sessions/{session_id}/message` returns HTTP `429` with
+`E_TURN_LIMIT_REACHED` and structured limit details (`budget`, `unit`, `limit`, `measured`, `applied_limits`).
+turn event chains remain auditable and include explicit bounded-failure emission before terminal `evt.turn.failed`.
 
 if migrations are missing, `/v1/*` endpoints return `E_SCHEMA_NOT_READY` (503) until schema is upgraded.
 

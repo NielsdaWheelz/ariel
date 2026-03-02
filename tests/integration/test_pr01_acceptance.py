@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 from testcontainers.postgres import PostgresContainer
 
-from ariel.app import ModelAdapter, create_app
+from ariel.app import ModelAdapter, ModelAdapterError, create_app
 from ariel.db import run_migrations
 
 
@@ -732,3 +732,365 @@ def test_restart_preserves_history_and_appends_to_same_active_session(postgres_u
             "before restart",
             "after restart",
         ]
+
+
+@dataclass
+class LongResponseAdapter:
+    provider: str = "provider.long-response"
+    model: str = "model.long-response-v1"
+    response_token_count: int = 16
+
+    def respond(
+        self,
+        user_message: str,
+        *,
+        session_id: str,
+        turn_id: str,
+        history: list[dict[str, Any]],
+        context_bundle: dict[str, Any],
+    ) -> dict[str, Any]:
+        del user_message, session_id, turn_id, history, context_bundle
+        assistant_text = " ".join(["long"] * self.response_token_count)
+        return {
+            "assistant_text": assistant_text,
+            "provider": self.provider,
+            "model": self.model,
+            "usage": {"prompt_tokens": 5, "completion_tokens": self.response_token_count, "total_tokens": 5},
+            "provider_response_id": "resp_long_123",
+        }
+
+
+@dataclass
+class UsageDrivenResponseAdapter:
+    provider: str = "provider.usage-driven"
+    model: str = "model.usage-driven-v1"
+    reported_completion_tokens: int = 12
+
+    def respond(
+        self,
+        user_message: str,
+        *,
+        session_id: str,
+        turn_id: str,
+        history: list[dict[str, Any]],
+        context_bundle: dict[str, Any],
+    ) -> dict[str, Any]:
+        del user_message, session_id, turn_id, history, context_bundle
+        return {
+            "assistant_text": "ok",
+            "provider": self.provider,
+            "model": self.model,
+            "usage": {
+                "prompt_tokens": 2,
+                "completion_tokens": self.reported_completion_tokens,
+                "total_tokens": self.reported_completion_tokens + 2,
+            },
+            "provider_response_id": "resp_usage_123",
+        }
+
+
+@dataclass
+class RetryableFailureAdapter:
+    provider: str = "provider.retryable-failure"
+    model: str = "model.retryable-failure-v1"
+    attempts: int = 0
+
+    def respond(
+        self,
+        user_message: str,
+        *,
+        session_id: str,
+        turn_id: str,
+        history: list[dict[str, Any]],
+        context_bundle: dict[str, Any],
+    ) -> dict[str, Any]:
+        del user_message, session_id, turn_id, history, context_bundle
+        self.attempts += 1
+        raise ModelAdapterError(
+            safe_reason="temporary provider timeout",
+            status_code=502,
+            code="E_MODEL_FAILURE",
+            message="model provider request failed",
+            retryable=True,
+        )
+
+
+def test_pr02_context_budget_exhaustion_returns_bounded_failure_with_audit_details(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARIEL_MAX_CONTEXT_TOKENS", "1")
+
+    adapter = DeterministicModelAdapter()
+    with _build_client(postgres_url, adapter) as client:
+        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
+
+        send = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "hello from bounded context"},
+        )
+        assert send.status_code == 429
+        body = send.json()
+        assert body["ok"] is False
+        assert body["error"]["code"] == "E_TURN_LIMIT_REACHED"
+        assert "context budget" in body["error"]["message"].lower()
+
+        limit_details = body["error"]["details"]["limit"]
+        assert limit_details["budget"] == "context_tokens"
+        assert limit_details["unit"] == "tokens"
+        assert limit_details["limit"] == 1
+        assert limit_details["measured"] > 1
+        assert body["error"]["details"]["session_id"] == session_id
+        assert body["error"]["details"]["applied_limits"]["max_recent_turns"] == 12
+        assert body["error"]["details"]["applied_limits"]["max_context_tokens"] == 1
+
+        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        assert timeline.status_code == 200
+        turns = timeline.json()["turns"]
+        assert len(turns) == 1
+        assert not any(saved_turn["status"] == "in_progress" for saved_turn in turns)
+
+        turn = turns[0]
+        assert turn["status"] == "failed"
+        event_types = [event["event_type"] for event in turn["events"]]
+        assert event_types == [
+            "evt.turn.started",
+            "evt.turn.limit_reached",
+            "evt.assistant.emitted",
+            "evt.turn.failed",
+        ]
+        limit_event = next(
+            event for event in turn["events"] if event["event_type"] == "evt.turn.limit_reached"
+        )
+        assert limit_event["payload"]["code"] == "E_TURN_LIMIT_REACHED"
+        assert limit_event["payload"]["limit"]["budget"] == "context_tokens"
+        assistant_emitted = next(
+            event for event in turn["events"] if event["event_type"] == "evt.assistant.emitted"
+        )
+        assert "context budget" in assistant_emitted["payload"]["message"].lower()
+
+
+def test_pr02_response_budget_exhaustion_is_emitted_before_terminal_failed(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARIEL_MAX_CONTEXT_TOKENS", "20000")
+    monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "3")
+
+    adapter = LongResponseAdapter(response_token_count=8)
+    with _build_client(postgres_url, adapter) as client:
+        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
+        send = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "trigger response budget"},
+        )
+        assert send.status_code == 429
+        body = send.json()
+        assert body["ok"] is False
+        assert body["error"]["code"] == "E_TURN_LIMIT_REACHED"
+        assert "response budget" in body["error"]["message"].lower()
+
+        limit_details = body["error"]["details"]["limit"]
+        assert limit_details["budget"] == "response_tokens"
+        assert limit_details["unit"] == "tokens"
+        assert limit_details["limit"] == 3
+        assert limit_details["measured"] > 3
+        assert body["error"]["details"]["applied_limits"]["max_response_tokens"] == 3
+
+        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        assert timeline.status_code == 200
+        turn = timeline.json()["turns"][0]
+        assert turn["status"] == "failed"
+        assert not any(
+            saved_turn["status"] == "in_progress" for saved_turn in timeline.json()["turns"]
+        )
+        event_types = [event["event_type"] for event in turn["events"]]
+        assert event_types == [
+            "evt.turn.started",
+            "evt.model.started",
+            "evt.model.completed",
+            "evt.turn.limit_reached",
+            "evt.assistant.emitted",
+            "evt.turn.failed",
+        ]
+        model_completed = next(
+            event for event in turn["events"] if event["event_type"] == "evt.model.completed"
+        )
+        assert model_completed["payload"]["provider"] == adapter.provider
+        assert model_completed["payload"]["model"] == adapter.model
+
+
+def test_pr02_response_budget_uses_reported_completion_tokens_when_present(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARIEL_MAX_CONTEXT_TOKENS", "20000")
+    monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "5")
+
+    adapter = UsageDrivenResponseAdapter(reported_completion_tokens=9)
+    with _build_client(postgres_url, adapter) as client:
+        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
+        send = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "trigger usage-driven response budget"},
+        )
+        assert send.status_code == 429
+        body = send.json()
+        assert body["ok"] is False
+        assert body["error"]["code"] == "E_TURN_LIMIT_REACHED"
+        limit_details = body["error"]["details"]["limit"]
+        assert limit_details["budget"] == "response_tokens"
+        assert limit_details["measured"] == 9
+        assert limit_details["limit"] == 5
+
+        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        assert timeline.status_code == 200
+        turn = timeline.json()["turns"][0]
+        event_types = [event["event_type"] for event in turn["events"]]
+        assert event_types == [
+            "evt.turn.started",
+            "evt.model.started",
+            "evt.model.completed",
+            "evt.turn.limit_reached",
+            "evt.assistant.emitted",
+            "evt.turn.failed",
+        ]
+
+
+def test_pr02_model_attempt_budget_exhaustion_uses_limit_error_not_model_error(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARIEL_MAX_CONTEXT_TOKENS", "20000")
+    monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "20000")
+    monkeypatch.setenv("ARIEL_MAX_MODEL_ATTEMPTS", "2")
+    adapter = RetryableFailureAdapter()
+    with _build_client(postgres_url, adapter) as client:
+        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
+        send = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "trigger model attempt budget"},
+        )
+        assert send.status_code == 429
+        body = send.json()
+        assert body["ok"] is False
+        assert body["error"]["code"] == "E_TURN_LIMIT_REACHED"
+        assert "attempt limit" in body["error"]["message"].lower()
+
+        limit_details = body["error"]["details"]["limit"]
+        assert limit_details["budget"] == "model_attempts"
+        assert limit_details["unit"] == "attempts"
+        assert limit_details["limit"] == 2
+        assert limit_details["measured"] == 2
+        assert body["error"]["details"]["applied_limits"]["max_model_attempts"] == 2
+
+        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        assert timeline.status_code == 200
+        turn = timeline.json()["turns"][0]
+        assert turn["status"] == "failed"
+        events = turn["events"]
+        assert len([event for event in events if event["event_type"] == "evt.model.started"]) == 2
+        assert len([event for event in events if event["event_type"] == "evt.model.failed"]) == 2
+        event_types = [event["event_type"] for event in events]
+        assert event_types[-3:] == [
+            "evt.turn.limit_reached",
+            "evt.assistant.emitted",
+            "evt.turn.failed",
+        ]
+        assert not any(saved_turn["status"] == "in_progress" for saved_turn in timeline.json()["turns"])
+
+
+def test_pr02_wall_time_budget_takes_precedence_if_multiple_limits_exhaust(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARIEL_MAX_CONTEXT_TOKENS", "20000")
+    monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "20000")
+    monkeypatch.setenv("ARIEL_MAX_MODEL_ATTEMPTS", "1")
+    monkeypatch.setenv("ARIEL_MAX_TURN_WALL_TIME_MS", "20")
+
+    counter = {"seconds": 0.0}
+
+    def fake_perf_counter() -> float:
+        counter["seconds"] += 0.03
+        return counter["seconds"]
+
+    monkeypatch.setattr("ariel.app.time.perf_counter", fake_perf_counter)
+
+    adapter = RetryableFailureAdapter()
+    with _build_client(postgres_url, adapter) as client:
+        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
+        send = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "trigger competing limits"},
+        )
+        assert send.status_code == 429
+        body = send.json()
+        assert body["ok"] is False
+        assert body["error"]["code"] == "E_TURN_LIMIT_REACHED"
+        limit_details = body["error"]["details"]["limit"]
+        assert limit_details["budget"] == "turn_wall_time_ms"
+        assert limit_details["measured"] > limit_details["limit"]
+
+        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        assert timeline.status_code == 200
+        turn = timeline.json()["turns"][0]
+        assert turn["status"] == "failed"
+        event_types = [event["event_type"] for event in turn["events"]]
+        assert event_types == [
+            "evt.turn.started",
+            "evt.model.started",
+            "evt.model.failed",
+            "evt.turn.limit_reached",
+            "evt.assistant.emitted",
+            "evt.turn.failed",
+        ]
+
+
+def test_pr02_wall_time_budget_exhaustion_is_bounded_and_auditable(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARIEL_MAX_CONTEXT_TOKENS", "20000")
+    monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "20000")
+    monkeypatch.setenv("ARIEL_MAX_TURN_WALL_TIME_MS", "20")
+
+    counter = {"seconds": 0.0}
+
+    def fake_perf_counter() -> float:
+        counter["seconds"] += 0.03
+        return counter["seconds"]
+
+    monkeypatch.setattr("ariel.app.time.perf_counter", fake_perf_counter)
+
+    adapter = DeterministicModelAdapter()
+    with _build_client(postgres_url, adapter) as client:
+        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
+        send = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "trigger wall-time budget"},
+        )
+        assert send.status_code == 429
+        body = send.json()
+        assert body["ok"] is False
+        assert body["error"]["code"] == "E_TURN_LIMIT_REACHED"
+        assert "time budget" in body["error"]["message"].lower()
+
+        limit_details = body["error"]["details"]["limit"]
+        assert limit_details["budget"] == "turn_wall_time_ms"
+        assert limit_details["unit"] == "ms"
+        assert limit_details["limit"] == 20
+        assert limit_details["measured"] > 20
+        assert body["error"]["details"]["applied_limits"]["max_turn_wall_time_ms"] == 20
+
+        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        assert timeline.status_code == 200
+        turn = timeline.json()["turns"][0]
+        event_types = [event["event_type"] for event in turn["events"]]
+        assert event_types[-3:] == [
+            "evt.turn.limit_reached",
+            "evt.assistant.emitted",
+            "evt.turn.failed",
+        ]
+        assert turn["status"] == "failed"
+        assert not any(saved_turn["status"] == "in_progress" for saved_turn in timeline.json()["turns"])
