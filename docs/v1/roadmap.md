@@ -51,11 +51,14 @@ Slice 3: Agency Doer Integration    Slice 4: Calendar Assistant
 - **Outcome**: Ariel can propose actions, enforce approval rules, and execute only authorized actions.
 - **Dependencies**: Slice 1
 - **Acceptance**:
-  - Read-only actions run without approval and results are visible to the user.
+  - Read-only actions run without approval for allowlisted low-impact capabilities, and results are visible to the user with standard redaction.
   - Approval-required actions do not run before approval and run only after explicit approval.
   - Denied or expired approvals prevent execution and show a clear reason.
+  - Unknown, schema-invalid, or policy-denied tool calls are blocked before execution with auditable rejection reasons.
+  - Untrusted external/tool-sourced content cannot silently authorize side effects; policy must escalate to approval or deny.
+  - Execution enforces capability identity/contract integrity and policy-allowed outbound destinations.
   - User can inspect what action was proposed, approved, executed, and returned.
-- **Risks**: Approval UX can become too heavy or too permissive if thresholds are poorly tuned.
+- **Risks**: Approval UX can become too heavy or too permissive if thresholds are poorly tuned; read-capability scope and egress boundaries can be too broad if not aggressively constrained.
 
 ### Slice 3: Agency Doer Integration
 - **Goal**: Let Ariel initiate and manage coding work through Agency from the same chat.

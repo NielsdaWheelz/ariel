@@ -35,6 +35,7 @@ Ariel is a private, self-hosted assistant that accepts natural language, uses mo
 | **surface** | Authenticated channel where the user interacts (web now, voice/mobile later). |
 | **session** | One episodic conversation with short-term continuity. Exactly one active session per user at a time. |
 | **turn** | One user input and the resulting sequence of model/tool events. |
+| **action attempt** | Durable record for one proposed capability call and its lifecycle (`proposed -> awaiting_approval -> approved|denied|expired -> executing -> succeeded|failed`). |
 | **memory record** | Durable cross-session fact/preference/commitment with provenance and confidence. |
 | **context bundle** | Deterministically assembled prompt context for a turn (session tail + summary + retrieved memory + open commitments). |
 | **capability** | Typed tool contract: `{name, version, input_schema, output_schema, impact, approval_policy, timeout}`. |
@@ -80,6 +81,7 @@ Ariel is a private, self-hosted assistant that accepts natural language, uses mo
 - Executor is least privilege and only returns schema-valid structured outputs.
 - Model outputs are untrusted until schema + policy checks pass.
 - External/untrusted content is data only and cannot mutate policy, prompts, or permissions.
+- Untrusted content cannot independently authorize side effects; policy must explicitly allow, escalate to approval, or deny.
 
 ---
 
@@ -97,6 +99,8 @@ Ariel is a private, self-hosted assistant that accepts natural language, uses mo
 | model providers | Pluggable adapters behind one internal interface. |
 | tool execution | No generic shell/ssh capability in MVP; code changes go through `cap.agency.*`. |
 | approvals | Required for irreversible or externally visible actions. |
+| side-effect execution model | Side-effecting capability calls are serialized for deterministic safety/audit behavior in MVP. |
+| egress model | Capability execution uses explicit destination allowlists; arbitrary outbound network access is denied by default. |
 | observability | Structured JSON logs and append-only event log are mandatory. |
 | redaction | Secrets never enter prompts or logs; UI output is scrubbed by default. |
 
@@ -156,10 +160,17 @@ Ariel is a private, self-hosted assistant that accepts natural language, uses mo
 ### policy and approval
 - Capability impact levels: `read | write_reversible | write_irreversible | external_send`.
 - Enforcement:
-  - `read`: no approval.
+  - `read`: no approval only for explicitly allowlisted low-impact read capabilities.
   - `write_reversible`: approval unless explicitly allowlisted.
   - `write_irreversible` and `external_send`: always requires approval.
 - Approval token must include hash of exact action payload, actor id, and expiry.
+- Approval tokens are single-use and authorize execution of the frozen proposed payload (no re-planning at approval time).
+- Proposals derived from untrusted external/tool content cannot auto-authorize side effects; policy escalates to approval or denies.
+
+### capability integrity and egress
+- Execution is bound to stable capability identity/version and contract metadata captured at proposal time.
+- Any capability identity/contract mismatch at execution time is blocked and auditable.
+- Capability outbound access is constrained to explicit policy-allowed destinations.
 
 ### model interface
 - Internal adapter:
@@ -190,6 +201,11 @@ Ariel is a private, self-hosted assistant that accepts natural language, uses mo
 10. Every capability call has timeout and max output constraints; truncation is explicit.
 11. Jobs use durable state transitions with idempotency for side-effecting operations.
 12. User can inspect executed capability calls, approvals, job status, and artifacts in the surface.
+13. Untrusted content cannot independently authorize side-effecting capability execution.
+14. Approval decisions are single-use and execute only the exact approved payload.
+15. Side-effecting capability execution is serialized in MVP.
+16. Capability identity/contract mismatch at execution time blocks execution.
+17. Capability outbound access is limited to policy-allowed destinations.
 
 ---
 
@@ -199,6 +215,11 @@ Ariel is a private, self-hosted assistant that accepts natural language, uses mo
 - Event log is canonical SoT.
 - Session and turn tables are materialized query views over events.
 - Provider conversation ids are cache/optimization only and can be dropped without semantic loss.
+
+### action attempts
+- Action attempt lifecycle: `proposed -> awaiting_approval -> approved|denied|expired -> executing -> succeeded|failed`.
+- Action-attempt events are canonical SoT for proposal, policy decision, approval decision, execution, and returned outcome.
+- Turn status and action-attempt status are related but separate state machines.
 
 ### jobs
 - Job lifecycle: `queued -> running -> waiting_approval -> running -> succeeded|failed|cancelled|timed_out`.
