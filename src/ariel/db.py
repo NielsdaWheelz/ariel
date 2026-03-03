@@ -17,6 +17,7 @@ REQUIRED_TABLES: Final[tuple[str, ...]] = (
     "action_attempts",
     "approval_requests",
     "artifacts",
+    "weather_default_locations",
 )
 
 

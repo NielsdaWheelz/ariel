@@ -250,6 +250,23 @@ class ArtifactRecord(Base):
     )
 
 
+class WeatherDefaultLocationRecord(Base):
+    __tablename__ = "weather_default_locations"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    default_location: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "source IN ('bootstrap', 'user')",
+            name="ck_weather_default_location_source",
+        ),
+    )
+
+
 def serialize_session(session: SessionRecord) -> dict[str, Any]:
     return {
         "id": session.id,
