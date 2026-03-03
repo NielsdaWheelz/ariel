@@ -37,7 +37,7 @@
 - **non-goals**: no probabilistic trust scoring engine; no cross-session memory trust-policy redesign.
 - **status**: landed in current implementation branch; see `s2_prs/s2_pr03_implementation_notes.md`.
 
-### PR-04: Surface Lifecycle Inspectability (planned after PR-03 merges)
+### PR-04: Surface Lifecycle Inspectability
 - **goal**: ensure the phone-first surface exposes the full action lifecycle required by Slice 2.
 - **builds on**: PR-03.
 - **acceptance**:
@@ -46,3 +46,4 @@
   - approval and execution outcomes are visible in timeline/action details without relying on internal logs.
   - surfaced data remains redacted and excludes internal-only execution metadata.
 - **non-goals**: no visual redesign, no bulk/delegated approvals UX, no multi-user tenancy changes.
+- **status**: landed in current implementation branch; see `s2_prs/s2_pr04_implementation_notes.md`.

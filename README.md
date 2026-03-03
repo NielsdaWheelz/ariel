@@ -45,6 +45,16 @@ the action engine now evaluates model proposals per turn and emits an auditable 
 - `evt.action.approval.requested|approved|denied|expired`
 - `evt.action.execution.started|succeeded|failed`
 
+user-facing turn/timeline payloads now include a dedicated surfaced lifecycle projection:
+
+- `turn.surface_action_lifecycle[]` with allowlisted, redacted fields only:
+  - `proposal` (`capability_id`, `input_summary`)
+  - `policy` (`decision`, `reason`)
+  - `approval` (`status`, `reason`, `expires_at`, `decided_at`)
+  - `execution` (`status`, `output`, `error`)
+
+the phone surface renders action details directly from this surfaced projection, not from raw engine records.
+
 approval decisions are handled through:
 
 ```bash
@@ -75,7 +85,8 @@ slice-2 pr-02/pr-03 hardening adds runtime boundary checks for side effects:
 - serialized side-effect execution gates during approval-triggered runs using transactional postgres advisory locks.
 
 see `docs/v1/s2/s2_prs/s2_pr02_implementation_notes.md` and
-`docs/v1/s2/s2_prs/s2_pr03_implementation_notes.md` for implementation details and tradeoffs.
+`docs/v1/s2/s2_prs/s2_pr03_implementation_notes.md` and
+`docs/v1/s2/s2_prs/s2_pr04_implementation_notes.md` for implementation details and tradeoffs.
 
 ## run locally
 
