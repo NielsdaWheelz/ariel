@@ -27,6 +27,7 @@ from ariel.action_runtime import (
     ActionRuntimeError,
     RuntimeProvenance,
     process_action_proposals,
+    reconcile_expired_approvals_for_session,
     resolve_approval_decision,
 )
 from ariel.config import AppSettings
@@ -1212,86 +1213,94 @@ def create_app(
     def get_session_events(session_id: str) -> dict[str, Any]:
         _ensure_schema_ready()
         with session_factory() as db:
-            session_record = db.scalar(
-                select(SessionRecord).where(SessionRecord.id == session_id).limit(1)
-            )
-            if session_record is None:
-                raise ApiError(
-                    status_code=404,
-                    code="E_SESSION_NOT_FOUND",
-                    message="session not found",
-                    details={"session_id": session_id},
-                    retryable=False,
+            with db.begin():
+                session_record = db.scalar(
+                    select(SessionRecord).where(SessionRecord.id == session_id).limit(1)
+                )
+                if session_record is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_SESSION_NOT_FOUND",
+                        message="session not found",
+                        details={"session_id": session_id},
+                        retryable=False,
+                    )
+
+                reconcile_expired_approvals_for_session(
+                    db=db,
+                    session_id=session_id,
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
                 )
 
-            turns = db.scalars(
-                select(TurnRecord)
-                .where(TurnRecord.session_id == session_id)
-                .order_by(TurnRecord.created_at.asc(), TurnRecord.id.asc())
-            ).all()
-            turn_ids = [turn.id for turn in turns]
-
-            events_by_turn: dict[str, list[EventRecord]] = {turn_id: [] for turn_id in turn_ids}
-            action_attempts_by_turn: dict[str, list[ActionAttemptRecord]] = {
-                turn_id: [] for turn_id in turn_ids
-            }
-            approvals_by_attempt_id: dict[str, ApprovalRequestRecord] = {}
-            if turn_ids:
-                for event in db.scalars(
-                    select(EventRecord)
-                    .where(EventRecord.turn_id.in_(turn_ids))
-                    .order_by(
-                        EventRecord.created_at.asc(),
-                        EventRecord.id.asc(),
-                    )
-                ).all():
-                    events_by_turn[event.turn_id].append(event)
-                for turn_events in events_by_turn.values():
-                    turn_events.sort(key=lambda event: (event.sequence, event.created_at, event.id))
-
-                action_attempts = db.scalars(
-                    select(ActionAttemptRecord)
-                    .where(ActionAttemptRecord.turn_id.in_(turn_ids))
-                    .order_by(
-                        ActionAttemptRecord.proposal_index.asc(),
-                        ActionAttemptRecord.created_at.asc(),
-                        ActionAttemptRecord.id.asc(),
-                    )
+                turns = db.scalars(
+                    select(TurnRecord)
+                    .where(TurnRecord.session_id == session_id)
+                    .order_by(TurnRecord.created_at.asc(), TurnRecord.id.asc())
                 ).all()
-                for action_attempt in action_attempts:
-                    action_attempts_by_turn[action_attempt.turn_id].append(action_attempt)
+                turn_ids = [turn.id for turn in turns]
 
-                action_attempt_ids = [action_attempt.id for action_attempt in action_attempts]
-                if action_attempt_ids:
-                    approvals = db.scalars(
-                        select(ApprovalRequestRecord).where(
-                            ApprovalRequestRecord.action_attempt_id.in_(action_attempt_ids)
+                events_by_turn: dict[str, list[EventRecord]] = {turn_id: [] for turn_id in turn_ids}
+                action_attempts_by_turn: dict[str, list[ActionAttemptRecord]] = {
+                    turn_id: [] for turn_id in turn_ids
+                }
+                approvals_by_attempt_id: dict[str, ApprovalRequestRecord] = {}
+                if turn_ids:
+                    for event in db.scalars(
+                        select(EventRecord)
+                        .where(EventRecord.turn_id.in_(turn_ids))
+                        .order_by(
+                            EventRecord.created_at.asc(),
+                            EventRecord.id.asc(),
+                        )
+                    ).all():
+                        events_by_turn[event.turn_id].append(event)
+                    for turn_events in events_by_turn.values():
+                        turn_events.sort(key=lambda event: (event.sequence, event.created_at, event.id))
+
+                    action_attempts = db.scalars(
+                        select(ActionAttemptRecord)
+                        .where(ActionAttemptRecord.turn_id.in_(turn_ids))
+                        .order_by(
+                            ActionAttemptRecord.proposal_index.asc(),
+                            ActionAttemptRecord.created_at.asc(),
+                            ActionAttemptRecord.id.asc(),
                         )
                     ).all()
-                    approvals_by_attempt_id = {
-                        approval.action_attempt_id: approval for approval in approvals
-                    }
+                    for action_attempt in action_attempts:
+                        action_attempts_by_turn[action_attempt.turn_id].append(action_attempt)
 
-            serialized_turns = [
-                serialize_turn(
-                    turn,
-                    events=events_by_turn.get(turn.id, []),
-                    action_attempts=[
-                        serialize_action_attempt(
-                            action_attempt,
-                            approval=approvals_by_attempt_id.get(action_attempt.id),
-                        )
-                        for action_attempt in action_attempts_by_turn.get(turn.id, [])
-                    ],
-                )
-                for turn in turns
-            ]
-            try:
-                return build_surface_timeline_response(
-                    session_id=session_id,
-                    turns=serialized_turns,
-                )
-            except ResponseContractViolation as exc:
-                raise _response_contract_error(exc) from exc
+                    action_attempt_ids = [action_attempt.id for action_attempt in action_attempts]
+                    if action_attempt_ids:
+                        approvals = db.scalars(
+                            select(ApprovalRequestRecord).where(
+                                ApprovalRequestRecord.action_attempt_id.in_(action_attempt_ids)
+                            )
+                        ).all()
+                        approvals_by_attempt_id = {
+                            approval.action_attempt_id: approval for approval in approvals
+                        }
+
+                serialized_turns = [
+                    serialize_turn(
+                        turn,
+                        events=events_by_turn.get(turn.id, []),
+                        action_attempts=[
+                            serialize_action_attempt(
+                                action_attempt,
+                                approval=approvals_by_attempt_id.get(action_attempt.id),
+                            )
+                            for action_attempt in action_attempts_by_turn.get(turn.id, [])
+                        ],
+                    )
+                    for turn in turns
+                ]
+                try:
+                    return build_surface_timeline_response(
+                        session_id=session_id,
+                        turns=serialized_turns,
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
 
     return app

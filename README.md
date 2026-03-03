@@ -64,6 +64,12 @@ slice-2 pr-06 locks response boundaries for user-facing slice-2 APIs:
 - turn events use strict per-`event_type` payload schemas (no open `events[].payload` dictionaries).
 - contract drift is fail-closed with `E_RESPONSE_CONTRACT` and sanitized error details.
 
+slice-2 pr-07 closes the deterministic expiry gap for pending approvals:
+
+- `GET /v1/sessions/{session_id}/events` reconciles expired pending approvals to terminal `expired` state.
+- reconciliation emits exactly one auditable `evt.action.approval.expired` per reconciled approval.
+- repeated timeline reads and post-reconcile approval decisions remain non-executing and idempotent.
+
 approval decisions are handled through:
 
 ```bash
@@ -116,7 +122,8 @@ see `docs/v1/s2/s2_prs/s2_pr02_implementation_notes.md` and
 `docs/v1/s2/s2_prs/s2_pr03_implementation_notes.md` and
 `docs/v1/s2/s2_prs/s2_pr04_implementation_notes.md` and
 `docs/v1/s2/s2_prs/s2_pr05_implementation_notes.md` and
-`docs/v1/s2/s2_prs/s2_pr06_implementation_notes.md` for implementation details and tradeoffs.
+`docs/v1/s2/s2_prs/s2_pr06_implementation_notes.md` and
+`docs/v1/s2/s2_prs/s2_pr07_implementation_notes.md` for implementation details and tradeoffs.
 
 ## run locally
 

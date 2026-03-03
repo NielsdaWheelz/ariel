@@ -80,6 +80,7 @@
   - timeline/action lifecycle payloads show clear expired reasons for reconciled approvals without requiring a failed approve request to materialize expiry.
   - approval decision attempts against already-reconciled expired approvals remain non-executing and idempotent.
 - **non-goals**: no bulk/delegated approvals, no policy classification changes, no scheduler redesign beyond expiry reconciliation.
+- **status**: landed in current implementation branch; see `s2_prs/s2_pr07_implementation_notes.md`.
 
 ### PR-08: Fail-Closed Egress Preflight Enforcement
 - **goal**: make egress controls truly execution-gating by validating outbound destinations before side effects can occur.

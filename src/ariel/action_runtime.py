@@ -437,6 +437,98 @@ def process_action_proposals(
     )
 
 
+def _mark_approval_expired(
+    *,
+    db: Session,
+    approval: ApprovalRequestRecord,
+    action_attempt: ActionAttemptRecord,
+    now: datetime,
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> None:
+    if approval.status != "pending":
+        msg = "expiry reconciliation requires a pending approval"
+        raise RuntimeError(msg)
+    if approval.action_attempt_id != action_attempt.id:
+        msg = "approval/action attempt mismatch during expiry reconciliation"
+        raise RuntimeError(msg)
+    if approval.session_id != action_attempt.session_id or approval.turn_id != action_attempt.turn_id:
+        msg = "approval/action attempt scope mismatch during expiry reconciliation"
+        raise RuntimeError(msg)
+
+    approval.status = "expired"
+    approval.decision_reason = "approval_expired"
+    approval.decided_at = now
+    approval.updated_at = now
+
+    action_attempt.status = "expired"
+    action_attempt.policy_reason = "approval_expired"
+    action_attempt.updated_at = now
+
+    append_turn_event(
+        db=db,
+        session_id=approval.session_id,
+        turn_id=approval.turn_id,
+        sequence=next_turn_event_sequence(db=db, turn_id=approval.turn_id),
+        event_type="evt.action.approval.expired",
+        payload_data={
+            "action_attempt_id": action_attempt.id,
+            "approval_ref": approval.id,
+            "reason": "approval_expired",
+        },
+        new_id_fn=new_id_fn,
+        now_fn=now_fn,
+    )
+
+
+def reconcile_expired_approvals_for_session(
+    *,
+    db: Session,
+    session_id: str,
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> int:
+    now = now_fn()
+    approvals = db.scalars(
+        select(ApprovalRequestRecord)
+        .where(
+            ApprovalRequestRecord.session_id == session_id,
+            ApprovalRequestRecord.status == "pending",
+            ApprovalRequestRecord.expires_at < now,
+        )
+        .order_by(
+            ApprovalRequestRecord.expires_at.asc(),
+            ApprovalRequestRecord.id.asc(),
+        )
+        .with_for_update()
+    ).all()
+
+    reconciled_count = 0
+    for approval in approvals:
+        action_attempt = db.scalar(
+            select(ActionAttemptRecord)
+            .where(ActionAttemptRecord.id == approval.action_attempt_id)
+            .with_for_update()
+            .limit(1)
+        )
+        if action_attempt is None:
+            msg = "approval references missing action attempt"
+            raise RuntimeError(msg)
+        _mark_approval_expired(
+            db=db,
+            approval=approval,
+            action_attempt=action_attempt,
+            now=now,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        reconciled_count += 1
+
+    if reconciled_count > 0:
+        db.flush()
+    return reconciled_count
+
+
 def resolve_approval_decision(
     *,
     db: Session,
@@ -497,6 +589,28 @@ def resolve_approval_decision(
             retryable=False,
         )
 
+    now = now_fn()
+    if now > approval.expires_at:
+        _mark_approval_expired(
+            db=db,
+            approval=approval,
+            action_attempt=action_attempt,
+            now=now,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        db.flush()
+        raise ActionRuntimeError(
+            status_code=409,
+            code="E_APPROVAL_EXPIRED",
+            message="approval request has expired",
+            details={
+                "approval_ref": approval.id,
+                "expires_at": to_rfc3339(approval.expires_at),
+            },
+            retryable=False,
+        )
+
     sequence = next_turn_event_sequence(db=db, turn_id=approval.turn_id) - 1
 
     def add_approval_event(event_type: str, payload_data: dict[str, Any]) -> None:
@@ -511,35 +625,6 @@ def resolve_approval_decision(
             payload_data=payload_data,
             new_id_fn=new_id_fn,
             now_fn=now_fn,
-        )
-
-    now = now_fn()
-    if now > approval.expires_at:
-        approval.status = "expired"
-        approval.decision_reason = "approval_expired"
-        approval.decided_at = now
-        approval.updated_at = now
-        action_attempt.status = "expired"
-        action_attempt.policy_reason = "approval_expired"
-        action_attempt.updated_at = now
-        add_approval_event(
-            "evt.action.approval.expired",
-            {
-                "action_attempt_id": action_attempt.id,
-                "approval_ref": approval.id,
-                "reason": "approval_expired",
-            },
-        )
-        db.flush()
-        raise ActionRuntimeError(
-            status_code=409,
-            code="E_APPROVAL_EXPIRED",
-            message="approval request has expired",
-            details={
-                "approval_ref": approval.id,
-                "expires_at": to_rfc3339(approval.expires_at),
-            },
-            retryable=False,
         )
 
     if decision == "deny":
