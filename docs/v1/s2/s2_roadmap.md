@@ -70,3 +70,23 @@
   - contract tests fail when internal lifecycle metadata reappears in user-facing responses.
 - **non-goals**: no authorization-policy redesign, no changes to capability contracts, and no UI redesign work beyond surfaced-contract adoption.
 - **status**: landed in current implementation branch; see `s2_prs/s2_pr06_implementation_notes.md`.
+
+### PR-07: Deterministic Approval Expiry Reconciliation
+- **goal**: close the remaining approval-lifecycle gap by ensuring expired approvals become terminal and user-visible without requiring a `/v1/approvals` decision call.
+- **builds on**: PR-06.
+- **acceptance**:
+  - pending approvals that pass `expires_at` are reconciled to terminal `expired` state and never remain indefinitely `pending` in user-facing timeline/action views.
+  - reconciliation emits exactly-once auditable expiry outcomes (`evt.action.approval.expired`) linked to the original action attempt and approval reference.
+  - timeline/action lifecycle payloads show clear expired reasons for reconciled approvals without requiring a failed approve request to materialize expiry.
+  - approval decision attempts against already-reconciled expired approvals remain non-executing and idempotent.
+- **non-goals**: no bulk/delegated approvals, no policy classification changes, no scheduler redesign beyond expiry reconciliation.
+
+### PR-08: Fail-Closed Egress Preflight Enforcement
+- **goal**: make egress controls truly execution-gating by validating outbound destinations before side effects can occur.
+- **builds on**: PR-07.
+- **acceptance**:
+  - side-effecting capabilities execute through an egress-aware runtime boundary where outbound destinations are declared and policy-validated pre-dispatch.
+  - non-allowlisted egress is blocked before external side effects, with deterministic auditable deny outcomes and user-visible failure reasons.
+  - regression tests prove denied egress paths perform zero external dispatch attempts and preserve redacted surfaced lifecycle output.
+  - approved/allowlisted egress paths continue to succeed under the same surfaced response contracts and audit event chain.
+- **non-goals**: no OS-level sandboxing guarantees, no new capability domains, and no changes to approval token semantics.
