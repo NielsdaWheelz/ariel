@@ -77,6 +77,44 @@ def _session_id(client: TestClient) -> str:
     return active.json()["session"]["id"]
 
 
+def _surface_attempts(turn_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    lifecycle = turn_payload.get("surface_action_lifecycle")
+    assert isinstance(lifecycle, list)
+    return lifecycle
+
+
+def _surface_attempt(turn_payload: dict[str, Any], *, proposal_index: int = 1) -> dict[str, Any]:
+    attempts = _surface_attempts(turn_payload)
+    assert len(attempts) >= proposal_index
+    attempt = attempts[proposal_index - 1]
+    assert isinstance(attempt, dict)
+    return attempt
+
+
+def _approval_ref(turn_payload: dict[str, Any], *, proposal_index: int = 1) -> str:
+    attempt = _surface_attempt(turn_payload, proposal_index=proposal_index)
+    approval = attempt.get("approval")
+    assert isinstance(approval, dict)
+    approval_ref = approval.get("reference")
+    assert isinstance(approval_ref, str)
+    return approval_ref
+
+
+def _assert_surface_approval_response(
+    payload: dict[str, Any],
+    *,
+    expected_status: str,
+) -> None:
+    assert set(payload.keys()) == {"ok", "approval", "assistant"}
+    assert payload["ok"] is True
+    assert "action_attempt" not in payload
+    approval = payload["approval"]
+    assert isinstance(approval, dict)
+    assert set(approval.keys()) == {"reference", "status", "reason", "expires_at", "decided_at"}
+    assert isinstance(approval["reference"], str)
+    assert approval["status"] == expected_status
+
+
 def test_s2_pr01_allowlisted_read_executes_inline_with_redacted_output_and_audit_chain(
     postgres_url: str,
 ) -> None:
@@ -101,11 +139,10 @@ def test_s2_pr01_allowlisted_read_executes_inline_with_redacted_output_and_audit
         assert "sk-live-super-secret" not in body["assistant"]["message"]
 
         turn = body["turn"]
-        action_attempts = turn["action_attempts"]
+        action_attempts = _surface_attempts(turn)
         assert len(action_attempts) == 1
         action_attempt = action_attempts[0]
-        assert action_attempt["status"] == "succeeded"
-        assert action_attempt["policy_decision"] == "allow_inline"
+        assert action_attempt["policy"]["decision"] == "allow_inline"
         assert action_attempt["execution"]["status"] == "succeeded"
         assert "[REDACTED]" in str(action_attempt["execution"]["output"])
         assert "sk-live-super-secret" not in str(action_attempt["execution"]["output"])
@@ -136,11 +173,11 @@ def test_s2_pr01_approval_required_action_is_persisted_pending_without_preapprov
         assert sent.status_code == 200
         turn = sent.json()["turn"]
 
-        attempt = turn["action_attempts"][0]
-        assert attempt["status"] == "awaiting_approval"
-        assert attempt["approval"] is not None
+        attempt = _surface_attempt(turn)
+        assert attempt["policy"]["decision"] == "requires_approval"
         assert attempt["approval"]["status"] == "pending"
-        assert attempt["approval"]["actor_id"] == "user.local"
+        assert isinstance(attempt["approval"]["reference"], str)
+        assert attempt["execution"]["status"] == "not_executed"
         assert "approval required" in sent.json()["assistant"]["message"].lower()
         assert "evt.action.execution.started" not in _event_types(turn)
 
@@ -157,12 +194,12 @@ def test_s2_pr01_post_approvals_approve_executes_once_with_actor_binding_and_rep
         session_id = _session_id(client)
         sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "do write"})
         assert sent.status_code == 200
-        approval_id = sent.json()["turn"]["action_attempts"][0]["approval"]["id"]
+        approval_ref = _approval_ref(sent.json()["turn"])
 
         wrong_actor = client.post(
             "/v1/approvals",
             json={
-                "approval_id": approval_id,
+                "approval_ref": approval_ref,
                 "decision": "approve",
                 "actor_id": "intruder.user",
             },
@@ -173,22 +210,26 @@ def test_s2_pr01_post_approvals_approve_executes_once_with_actor_binding_and_rep
         approved = client.post(
             "/v1/approvals",
             json={
-                "approval_id": approval_id,
+                "approval_ref": approval_ref,
                 "decision": "approve",
                 "actor_id": "user.local",
             },
         )
         assert approved.status_code == 200
         approved_body = approved.json()
-        assert approved_body["ok"] is True
-        assert approved_body["action_attempt"]["status"] == "succeeded"
-        assert approved_body["action_attempt"]["execution"]["status"] == "succeeded"
-        assert approved_body["action_attempt"]["execution"]["output"]["note"] == "frozen-a"
+        _assert_surface_approval_response(approved_body, expected_status="approved")
+
+        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        assert timeline.status_code == 200
+        latest_attempt = _surface_attempt(timeline.json()["turns"][-1])
+        assert latest_attempt["approval"]["status"] == "approved"
+        assert latest_attempt["execution"]["status"] == "succeeded"
+        assert latest_attempt["execution"]["output"]["note"] == "frozen-a"
 
         replay = client.post(
             "/v1/approvals",
             json={
-                "approval_id": approval_id,
+                "approval_ref": approval_ref,
                 "decision": "approve",
                 "actor_id": "user.local",
             },
@@ -214,20 +255,25 @@ def test_s2_pr01_approval_executes_canonical_frozen_payload_identity(
             json={"message": "do write canonical"},
         )
         assert sent.status_code == 200
-        attempt = sent.json()["turn"]["action_attempts"][0]
-        assert attempt["proposal_input"]["note"] == "frozen-a"
+        attempt = _surface_attempt(sent.json()["turn"])
+        assert attempt["proposal"]["input_summary"]["note"] == "frozen-a"
 
-        approval_id = attempt["approval"]["id"]
+        approval_ref = attempt["approval"]["reference"]
         approved = client.post(
             "/v1/approvals",
             json={
-                "approval_id": approval_id,
+                "approval_ref": approval_ref,
                 "decision": "approve",
                 "actor_id": "user.local",
             },
         )
         assert approved.status_code == 200
-        output = approved.json()["action_attempt"]["execution"]["output"]
+        _assert_surface_approval_response(approved.json(), expected_status="approved")
+        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        assert timeline.status_code == 200
+        latest_attempt = _surface_attempt(timeline.json()["turns"][-1])
+        output = latest_attempt["execution"]["output"]
+        assert isinstance(output, dict)
         assert output["note"] == "frozen-a"
 
 
@@ -250,24 +296,32 @@ def test_s2_pr01_deny_and_expire_are_terminal_and_non_executing(
 
         deny_turn = client.post(f"/v1/sessions/{session_id}/message", json={"message": "deny me"})
         assert deny_turn.status_code == 200
-        deny_approval_id = deny_turn.json()["turn"]["action_attempts"][0]["approval"]["id"]
+        deny_approval_ref = _approval_ref(deny_turn.json()["turn"])
 
         denied = client.post(
             "/v1/approvals",
-            json={"approval_id": deny_approval_id, "decision": "deny", "actor_id": "user.local"},
+            json={"approval_ref": deny_approval_ref, "decision": "deny", "actor_id": "user.local"},
         )
         assert denied.status_code == 200
-        assert denied.json()["action_attempt"]["status"] == "denied"
-        assert denied.json()["action_attempt"]["execution"]["status"] == "not_executed"
+        _assert_surface_approval_response(denied.json(), expected_status="denied")
+        deny_timeline = client.get(f"/v1/sessions/{session_id}/events")
+        assert deny_timeline.status_code == 200
+        denied_attempt = _surface_attempt(deny_timeline.json()["turns"][-1])
+        assert denied_attempt["approval"]["status"] == "denied"
+        assert denied_attempt["execution"]["status"] == "not_executed"
 
         expire_turn = client.post(f"/v1/sessions/{session_id}/message", json={"message": "expire me"})
         assert expire_turn.status_code == 200
-        expire_approval_id = expire_turn.json()["turn"]["action_attempts"][0]["approval"]["id"]
+        expire_approval_ref = _approval_ref(expire_turn.json()["turn"])
         clock.advance_seconds(10)
 
         expired = client.post(
             "/v1/approvals",
-            json={"approval_id": expire_approval_id, "decision": "approve", "actor_id": "user.local"},
+            json={
+                "approval_ref": expire_approval_ref,
+                "decision": "approve",
+                "actor_id": "user.local",
+            },
         )
         assert expired.status_code == 409
         assert expired.json()["error"]["code"] == "E_APPROVAL_EXPIRED"
@@ -275,8 +329,8 @@ def test_s2_pr01_deny_and_expire_are_terminal_and_non_executing(
         timeline = client.get(f"/v1/sessions/{session_id}/events")
         assert timeline.status_code == 200
         latest_turn = timeline.json()["turns"][-1]
-        latest_attempt = latest_turn["action_attempts"][0]
-        assert latest_attempt["status"] == "expired"
+        latest_attempt = _surface_attempt(latest_turn)
+        assert latest_attempt["approval"]["status"] == "expired"
         assert latest_attempt["execution"]["status"] == "not_executed"
         assert "evt.action.approval.expired" in _event_types(latest_turn)
 
@@ -310,9 +364,9 @@ def test_s2_pr01_invalid_or_denied_proposals_are_blocked_with_explicit_reason_an
         assert sent.status_code == 200
         body = sent.json()
 
-        attempt = body["turn"]["action_attempts"][0]
-        assert attempt["status"] == "rejected"
-        assert expected_reason in attempt["policy_reason"]
+        attempt = _surface_attempt(body["turn"])
+        assert attempt["policy"]["decision"] == "deny"
+        assert expected_reason in (attempt["policy"]["reason"] or "")
         assert "blocked" in body["assistant"]["message"].lower()
         assert "evt.action.execution.started" not in _event_types(body["turn"])
 
@@ -335,14 +389,13 @@ def test_s2_pr01_turn_allows_multiple_inline_reads_and_only_one_pending_approval
         sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "mix actions"})
         assert sent.status_code == 200
 
-        attempts = sent.json()["turn"]["action_attempts"]
+        attempts = _surface_attempts(sent.json()["turn"])
         assert len(attempts) == 4
-        assert [attempt["status"] for attempt in attempts] == [
-            "succeeded",
-            "succeeded",
-            "awaiting_approval",
-            "rejected",
-        ]
-        assert attempts[3]["policy_reason"] == "pending_approval_limit_reached"
-        assert sum(attempt["status"] == "awaiting_approval" for attempt in attempts) == 1
+        assert attempts[0]["execution"]["status"] == "succeeded"
+        assert attempts[1]["execution"]["status"] == "succeeded"
+        assert attempts[2]["approval"]["status"] == "pending"
+        assert attempts[2]["execution"]["status"] == "not_executed"
+        assert attempts[3]["policy"]["decision"] == "deny"
+        assert attempts[3]["policy"]["reason"] == "pending_approval_limit_reached"
+        assert sum(attempt["approval"]["status"] == "pending" for attempt in attempts) == 1
 

@@ -52,7 +52,8 @@ the surfaced projection intentionally excludes internal-only execution metadata 
 - impact-level internals
 - internal egress sentinel metadata
 
-raw `action_attempts` remain present for backward compatibility in this iteration; the phone surface uses only `surface_action_lifecycle`.
+historical note: PR-04 shipped with raw `action_attempts` still present for compatibility in that iteration.
+PR-05 removes raw turn `action_attempts` from user-facing turn/timeline payloads and enforces surfaced-only approval flow handles.
 
 ## Implementation Details
 

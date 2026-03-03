@@ -67,6 +67,39 @@ def _event_types(turn_payload: dict[str, Any]) -> list[str]:
     return [event["event_type"] for event in turn_payload["events"]]
 
 
+def _surface_attempt(turn_payload: dict[str, Any], *, proposal_index: int = 1) -> dict[str, Any]:
+    lifecycle = turn_payload.get("surface_action_lifecycle")
+    assert isinstance(lifecycle, list)
+    assert len(lifecycle) >= proposal_index
+    attempt = lifecycle[proposal_index - 1]
+    assert isinstance(attempt, dict)
+    return attempt
+
+
+def _approval_ref(turn_payload: dict[str, Any], *, proposal_index: int = 1) -> str:
+    attempt = _surface_attempt(turn_payload, proposal_index=proposal_index)
+    approval = attempt.get("approval")
+    assert isinstance(approval, dict)
+    approval_ref = approval.get("reference")
+    assert isinstance(approval_ref, str)
+    return approval_ref
+
+
+def _assert_surface_approval_response(
+    payload: dict[str, Any],
+    *,
+    expected_status: str,
+) -> None:
+    assert set(payload.keys()) == {"ok", "approval", "assistant"}
+    assert payload["ok"] is True
+    assert "action_attempt" not in payload
+    approval = payload["approval"]
+    assert isinstance(approval, dict)
+    assert set(approval.keys()) == {"reference", "status", "reason", "expires_at", "decided_at"}
+    assert isinstance(approval["reference"], str)
+    assert approval["status"] == expected_status
+
+
 def test_s2_pr02_tainted_side_effect_is_escalated_to_approval_with_auditable_reason(
     postgres_url: str,
 ) -> None:
@@ -87,10 +120,10 @@ def test_s2_pr02_tainted_side_effect_is_escalated_to_approval_with_auditable_rea
         assert sent.status_code == 200
         body = sent.json()
 
-        attempt = body["turn"]["action_attempts"][0]
-        assert attempt["status"] == "awaiting_approval"
-        assert attempt["policy_decision"] == "requires_approval"
-        assert attempt["policy_reason"] == "taint_escalated_requires_approval"
+        attempt = _surface_attempt(body["turn"])
+        assert attempt["approval"]["status"] == "pending"
+        assert attempt["policy"]["decision"] == "requires_approval"
+        assert attempt["policy"]["reason"] == "taint_escalated_requires_approval"
 
         event_types = _event_types(body["turn"])
         assert "evt.action.execution.started" not in event_types
@@ -129,10 +162,9 @@ def test_s2_pr02_tainted_external_send_is_denied_with_explicit_reason(
         assert sent.status_code == 200
         body = sent.json()
 
-        attempt = body["turn"]["action_attempts"][0]
-        assert attempt["status"] == "rejected"
-        assert attempt["policy_decision"] == "deny"
-        assert attempt["policy_reason"] == "taint_denied_untrusted_side_effect"
+        attempt = _surface_attempt(body["turn"])
+        assert attempt["policy"]["decision"] == "deny"
+        assert attempt["policy"]["reason"] == "taint_denied_untrusted_side_effect"
         assert "taint_denied_untrusted_side_effect" in body["assistant"]["message"]
 
         event_types = _event_types(body["turn"])
@@ -159,9 +191,9 @@ def test_s2_pr02_approval_execution_blocks_on_integrity_mismatch_before_invocati
         session_id = _session_id(client)
         sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "integrity check"})
         assert sent.status_code == 200
-        attempt = sent.json()["turn"]["action_attempts"][0]
-        approval_id = attempt["approval"]["id"]
-        action_attempt_id = attempt["id"]
+        attempt = _surface_attempt(sent.json()["turn"])
+        approval_ref = attempt["approval"]["reference"]
+        action_attempt_id = attempt["action_attempt_id"]
 
         app = cast(Any, client.app)
         with app.state.session_factory() as db:
@@ -176,17 +208,19 @@ def test_s2_pr02_approval_execution_blocks_on_integrity_mismatch_before_invocati
 
         approved = client.post(
             "/v1/approvals",
-            json={"approval_id": approval_id, "decision": "approve", "actor_id": "user.local"},
+            json={"approval_ref": approval_ref, "decision": "approve", "actor_id": "user.local"},
         )
         assert approved.status_code == 200
         approved_body = approved.json()
-        assert approved_body["action_attempt"]["status"] == "failed"
-        assert "integrity_mismatch" in (approved_body["action_attempt"]["execution"]["error"] or "")
+        _assert_surface_approval_response(approved_body, expected_status="approved")
         assert "integrity mismatch" in approved_body["assistant"]["message"].lower()
 
         timeline = client.get(f"/v1/sessions/{session_id}/events")
         assert timeline.status_code == 200
         latest_turn = timeline.json()["turns"][-1]
+        latest_attempt = _surface_attempt(latest_turn)
+        assert latest_attempt["execution"]["status"] == "failed"
+        assert "integrity_mismatch" in (latest_attempt["execution"]["error"] or "")
         event_types = _event_types(latest_turn)
         assert event_types.index("evt.action.approval.approved") < event_types.index(
             "evt.action.execution.failed"
@@ -214,21 +248,23 @@ def test_s2_pr02_non_allowlisted_egress_is_blocked_with_user_visible_auditable_r
         session_id = _session_id(client)
         sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "egress deny"})
         assert sent.status_code == 200
-        approval_id = sent.json()["turn"]["action_attempts"][0]["approval"]["id"]
+        approval_ref = _approval_ref(sent.json()["turn"])
 
         approved = client.post(
             "/v1/approvals",
-            json={"approval_id": approval_id, "decision": "approve", "actor_id": "user.local"},
+            json={"approval_ref": approval_ref, "decision": "approve", "actor_id": "user.local"},
         )
         assert approved.status_code == 200
         body = approved.json()
-        assert body["action_attempt"]["status"] == "failed"
-        assert "egress_destination_denied" in (body["action_attempt"]["execution"]["error"] or "")
+        _assert_surface_approval_response(body, expected_status="approved")
         assert "egress_destination_denied" in body["assistant"]["message"]
 
         timeline = client.get(f"/v1/sessions/{session_id}/events")
         assert timeline.status_code == 200
         latest_turn = timeline.json()["turns"][-1]
+        latest_attempt = _surface_attempt(latest_turn)
+        assert latest_attempt["execution"]["status"] == "failed"
+        assert "egress_destination_denied" in (latest_attempt["execution"]["error"] or "")
         failed_event = next(
             event for event in latest_turn["events"] if event["event_type"] == "evt.action.execution.failed"
         )
@@ -255,16 +291,19 @@ def test_s2_pr02_allowlisted_egress_executes_and_does_not_surface_internal_egres
         session_id = _session_id(client)
         sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "egress allow"})
         assert sent.status_code == 200
-        approval_id = sent.json()["turn"]["action_attempts"][0]["approval"]["id"]
+        approval_ref = _approval_ref(sent.json()["turn"])
 
         approved = client.post(
             "/v1/approvals",
-            json={"approval_id": approval_id, "decision": "approve", "actor_id": "user.local"},
+            json={"approval_ref": approval_ref, "decision": "approve", "actor_id": "user.local"},
         )
         assert approved.status_code == 200
-        body = approved.json()
-        assert body["action_attempt"]["status"] == "succeeded"
-        output = body["action_attempt"]["execution"]["output"]
+        _assert_surface_approval_response(approved.json(), expected_status="approved")
+        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        assert timeline.status_code == 200
+        latest_attempt = _surface_attempt(timeline.json()["turns"][-1])
+        assert latest_attempt["execution"]["status"] == "succeeded"
+        output = latest_attempt["execution"]["output"]
         assert output is not None
         assert output["status"] == "sent"
         assert output["destination"] == "https://api.framework.local/notify"
@@ -288,16 +327,19 @@ def test_s2_pr02_pre_execution_guardrail_blocks_unsafe_input_before_side_effects
         session_id = _session_id(client)
         sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "unsafe write"})
         assert sent.status_code == 200
-        approval_id = sent.json()["turn"]["action_attempts"][0]["approval"]["id"]
+        approval_ref = _approval_ref(sent.json()["turn"])
 
         approved = client.post(
             "/v1/approvals",
-            json={"approval_id": approval_id, "decision": "approve", "actor_id": "user.local"},
+            json={"approval_ref": approval_ref, "decision": "approve", "actor_id": "user.local"},
         )
         assert approved.status_code == 200
-        body = approved.json()
-        assert body["action_attempt"]["status"] == "failed"
-        assert "guardrail_pre_input_blocked" in (body["action_attempt"]["execution"]["error"] or "")
+        _assert_surface_approval_response(approved.json(), expected_status="approved")
+        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        assert timeline.status_code == 200
+        latest_attempt = _surface_attempt(timeline.json()["turns"][-1])
+        assert latest_attempt["execution"]["status"] == "failed"
+        assert "guardrail_pre_input_blocked" in (latest_attempt["execution"]["error"] or "")
 
 
 def test_s2_pr02_post_execution_guardrail_blocks_unsafe_output_before_user_surfacing(
@@ -318,8 +360,8 @@ def test_s2_pr02_post_execution_guardrail_blocks_unsafe_output_before_user_surfa
         sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "unsafe read"})
         assert sent.status_code == 200
         body = sent.json()
-        attempt = body["turn"]["action_attempts"][0]
-        assert attempt["status"] == "failed"
+        attempt = _surface_attempt(body["turn"])
+        assert attempt["execution"]["status"] == "failed"
         assert "guardrail_post_output_blocked" in (attempt["execution"]["error"] or "")
         assert "<script>" not in body["assistant"]["message"]
 
@@ -336,18 +378,21 @@ def test_s2_pr02_approval_replay_does_not_duplicate_side_effect_execution(
         session_id = _session_id(client)
         sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "single write"})
         assert sent.status_code == 200
-        approval_id = sent.json()["turn"]["action_attempts"][0]["approval"]["id"]
+        approval_ref = _approval_ref(sent.json()["turn"])
 
         first = client.post(
             "/v1/approvals",
-            json={"approval_id": approval_id, "decision": "approve", "actor_id": "user.local"},
+            json={"approval_ref": approval_ref, "decision": "approve", "actor_id": "user.local"},
         )
         assert first.status_code == 200
-        assert first.json()["action_attempt"]["status"] == "succeeded"
+        _assert_surface_approval_response(first.json(), expected_status="approved")
+        first_timeline = client.get(f"/v1/sessions/{session_id}/events")
+        assert first_timeline.status_code == 200
+        assert _surface_attempt(first_timeline.json()["turns"][-1])["execution"]["status"] == "succeeded"
 
         replay = client.post(
             "/v1/approvals",
-            json={"approval_id": approval_id, "decision": "approve", "actor_id": "user.local"},
+            json={"approval_ref": approval_ref, "decision": "approve", "actor_id": "user.local"},
         )
         assert replay.status_code == 409
         assert replay.json()["error"]["code"] == "E_APPROVAL_NOT_PENDING"

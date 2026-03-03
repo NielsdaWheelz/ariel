@@ -78,6 +78,15 @@ def _event_types(turn_payload: dict[str, Any]) -> list[str]:
     return [event["event_type"] for event in turn_payload["events"]]
 
 
+def _surface_attempt(turn_payload: dict[str, Any], *, proposal_index: int = 1) -> dict[str, Any]:
+    lifecycle = turn_payload.get("surface_action_lifecycle")
+    assert isinstance(lifecycle, list)
+    assert len(lifecycle) >= proposal_index
+    attempt = lifecycle[proposal_index - 1]
+    assert isinstance(attempt, dict)
+    return attempt
+
+
 @pytest.mark.parametrize(
     ("include_taint_field", "taint_value", "expected_model_taint_status"),
     [
@@ -119,9 +128,9 @@ def test_s2_pr03_runtime_provenance_taint_applies_to_side_effects_despite_unreli
         assert ingest.status_code == 200
         ingest_body = ingest.json()
         ingest_turn_id = ingest_body["turn"]["id"]
-        ingest_attempt = ingest_body["turn"]["action_attempts"][0]
-        ingest_attempt_id = ingest_attempt["id"]
-        assert ingest_attempt["status"] == "succeeded"
+        ingest_attempt = _surface_attempt(ingest_body["turn"])
+        ingest_attempt_id = ingest_attempt["action_attempt_id"]
+        assert ingest_attempt["execution"]["status"] == "succeeded"
 
         sent = client.post(
             f"/v1/sessions/{session_id}/message",
@@ -130,10 +139,10 @@ def test_s2_pr03_runtime_provenance_taint_applies_to_side_effects_despite_unreli
         assert sent.status_code == 200
         body = sent.json()
 
-        attempt = body["turn"]["action_attempts"][0]
-        assert attempt["status"] == "awaiting_approval"
-        assert attempt["policy_decision"] == "requires_approval"
-        assert attempt["policy_reason"] == "taint_escalated_requires_approval"
+        attempt = _surface_attempt(body["turn"])
+        assert attempt["approval"]["status"] == "pending"
+        assert attempt["policy"]["decision"] == "requires_approval"
+        assert attempt["policy"]["reason"] == "taint_escalated_requires_approval"
         assert "evt.action.execution.started" not in _event_types(body["turn"])
 
         proposed_event = next(
@@ -191,7 +200,7 @@ def test_s2_pr03_tainted_external_send_is_denied_even_when_model_declares_clean(
             json={"message": "ingest untrusted"},
         )
         assert ingest.status_code == 200
-        assert ingest.json()["turn"]["action_attempts"][0]["status"] == "succeeded"
+        assert _surface_attempt(ingest.json()["turn"])["execution"]["status"] == "succeeded"
 
         sent = client.post(
             f"/v1/sessions/{session_id}/message",
@@ -199,10 +208,9 @@ def test_s2_pr03_tainted_external_send_is_denied_even_when_model_declares_clean(
         )
         assert sent.status_code == 200
         body = sent.json()
-        attempt = body["turn"]["action_attempts"][0]
-        assert attempt["status"] == "rejected"
-        assert attempt["policy_decision"] == "deny"
-        assert attempt["policy_reason"] == "taint_denied_untrusted_side_effect"
+        attempt = _surface_attempt(body["turn"])
+        assert attempt["policy"]["decision"] == "deny"
+        assert attempt["policy"]["reason"] == "taint_denied_untrusted_side_effect"
         assert "evt.action.execution.started" not in _event_types(body["turn"])
 
         policy_event = next(
@@ -236,10 +244,10 @@ def test_s2_pr03_malformed_taint_metadata_is_treated_as_provenance_ambiguous_for
         )
         assert sent.status_code == 200
         body = sent.json()
-        attempt = body["turn"]["action_attempts"][0]
-        assert attempt["status"] == "awaiting_approval"
-        assert attempt["policy_decision"] == "requires_approval"
-        assert attempt["policy_reason"] == "taint_escalated_requires_approval"
+        attempt = _surface_attempt(body["turn"])
+        assert attempt["approval"]["status"] == "pending"
+        assert attempt["policy"]["decision"] == "requires_approval"
+        assert attempt["policy"]["reason"] == "taint_escalated_requires_approval"
         assert "evt.action.execution.started" not in _event_types(body["turn"])
 
         proposed_event = next(
@@ -278,10 +286,9 @@ def test_s2_pr03_malformed_taint_metadata_is_treated_as_provenance_ambiguous_for
         )
         assert sent.status_code == 200
         body = sent.json()
-        attempt = body["turn"]["action_attempts"][0]
-        assert attempt["status"] == "rejected"
-        assert attempt["policy_decision"] == "deny"
-        assert attempt["policy_reason"] == "taint_denied_untrusted_side_effect"
+        attempt = _surface_attempt(body["turn"])
+        assert attempt["policy"]["decision"] == "deny"
+        assert attempt["policy"]["reason"] == "taint_denied_untrusted_side_effect"
         assert "evt.action.execution.started" not in _event_types(body["turn"])
 
         policy_event = next(
@@ -328,16 +335,16 @@ def test_s2_pr03_read_behavior_does_not_clear_runtime_taint_for_later_side_effec
             json={"message": "ingest untrusted"},
         )
         assert ingest.status_code == 200
-        assert ingest.json()["turn"]["action_attempts"][0]["status"] == "succeeded"
+        assert _surface_attempt(ingest.json()["turn"])["execution"]["status"] == "succeeded"
 
         read_turn = client.post(
             f"/v1/sessions/{session_id}/message",
             json={"message": "another read"},
         )
         assert read_turn.status_code == 200
-        read_attempt = read_turn.json()["turn"]["action_attempts"][0]
-        assert read_attempt["status"] == "succeeded"
-        assert read_attempt["policy_decision"] == "allow_inline"
+        read_attempt = _surface_attempt(read_turn.json()["turn"])
+        assert read_attempt["execution"]["status"] == "succeeded"
+        assert read_attempt["policy"]["decision"] == "allow_inline"
 
         side_effect_turn = client.post(
             f"/v1/sessions/{session_id}/message",
@@ -345,8 +352,8 @@ def test_s2_pr03_read_behavior_does_not_clear_runtime_taint_for_later_side_effec
         )
         assert side_effect_turn.status_code == 200
         body = side_effect_turn.json()
-        attempt = body["turn"]["action_attempts"][0]
-        assert attempt["status"] == "awaiting_approval"
-        assert attempt["policy_decision"] == "requires_approval"
-        assert attempt["policy_reason"] == "taint_escalated_requires_approval"
+        attempt = _surface_attempt(body["turn"])
+        assert attempt["approval"]["status"] == "pending"
+        assert attempt["policy"]["decision"] == "requires_approval"
+        assert attempt["policy"]["reason"] == "taint_escalated_requires_approval"
         assert "evt.action.execution.started" not in _event_types(body["turn"])

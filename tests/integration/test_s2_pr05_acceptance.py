@@ -15,8 +15,8 @@ from ariel.app import ModelAdapter, create_app
 
 @dataclass
 class ActionProposalAdapter:
-    provider: str = "provider.s2-pr04"
-    model: str = "model.s2-pr04-v1"
+    provider: str = "provider.s2-pr05"
+    model: str = "model.s2-pr05-v1"
     proposals_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
     def respond(
@@ -34,8 +34,8 @@ class ActionProposalAdapter:
             "assistant_text": f"assistant::{user_message}",
             "provider": self.provider,
             "model": self.model,
-            "usage": {"prompt_tokens": 19, "completion_tokens": 13, "total_tokens": 32},
-            "provider_response_id": "resp_s2_pr04_123",
+            "usage": {"prompt_tokens": 23, "completion_tokens": 17, "total_tokens": 40},
+            "provider_response_id": "resp_s2_pr05_123",
             "action_proposals": copy.deepcopy(proposals),
         }
 
@@ -73,6 +73,12 @@ def _session_id(client: TestClient) -> str:
     return active.json()["session"]["id"]
 
 
+def _assert_redacted(value: Any) -> None:
+    text = str(value)
+    assert "sk-live" not in text
+    assert "api_key=" not in text
+
+
 def _assert_allowlisted_lifecycle_item(item: dict[str, Any]) -> None:
     assert set(item.keys()) == {
         "action_attempt_id",
@@ -84,11 +90,25 @@ def _assert_allowlisted_lifecycle_item(item: dict[str, Any]) -> None:
     }
     assert set(item["proposal"].keys()) == {"capability_id", "input_summary"}
     assert set(item["policy"].keys()) == {"decision", "reason"}
-    assert set(item["approval"].keys()) == {"status", "reference", "reason", "expires_at", "decided_at"}
+    assert set(item["approval"].keys()) == {
+        "status",
+        "reference",
+        "reason",
+        "expires_at",
+        "decided_at",
+    }
     assert set(item["execution"].keys()) == {"status", "output", "error"}
+    raw_internal_keys = {
+        "capability_contract_hash",
+        "payload_hash",
+        "impact_level",
+        "approval_required",
+    }
+    assert raw_internal_keys.isdisjoint(item.keys())
 
 
 def _surface_attempt(turn_payload: dict[str, Any], *, proposal_index: int = 1) -> dict[str, Any]:
+    assert "action_attempts" not in turn_payload
     lifecycle = turn_payload.get("surface_action_lifecycle")
     assert isinstance(lifecycle, list)
     assert len(lifecycle) >= proposal_index
@@ -100,10 +120,11 @@ def _surface_attempt(turn_payload: dict[str, Any], *, proposal_index: int = 1) -
 
 def _approval_ref(turn_payload: dict[str, Any], *, proposal_index: int = 1) -> str:
     item = _surface_attempt(turn_payload, proposal_index=proposal_index)
-    approval = item["approval"]
-    assert approval["status"] == "pending"
-    approval_ref = approval.get("reference")
+    approval_payload = item["approval"]
+    assert approval_payload["status"] == "pending"
+    approval_ref = approval_payload.get("reference")
     assert isinstance(approval_ref, str)
+    assert approval_ref.startswith("apr_")
     return approval_ref
 
 
@@ -122,13 +143,7 @@ def _assert_surface_approval_response(
     assert approval["status"] == expected_status
 
 
-def _assert_redacted(value: Any) -> None:
-    text = str(value)
-    assert "sk-live" not in text
-    assert "api_key=" not in text
-
-
-def test_s2_pr04_inline_read_success_is_surface_inspectable_redacted_and_allowlisted(
+def test_s2_pr05_turn_timeline_and_phone_surface_use_surface_only_lifecycle_contract(
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
@@ -146,13 +161,14 @@ def test_s2_pr04_inline_read_success_is_surface_inspectable_redacted_and_allowli
         sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "run read"})
         assert sent.status_code == 200
         body = sent.json()
-
         item = _surface_attempt(body["turn"])
+
         assert item["proposal"]["capability_id"] == "cap.framework.read_echo"
         assert item["proposal"]["input_summary"]["text"] == "my credential is [REDACTED]"
         assert item["policy"]["decision"] == "allow_inline"
         assert item["policy"]["reason"] == "allowlisted_read"
         assert item["approval"]["status"] == "not_requested"
+        assert item["approval"]["reference"] is None
         assert item["execution"]["status"] == "succeeded"
         assert item["execution"]["output"]["text"] == "my credential is [REDACTED]"
         _assert_redacted(item)
@@ -165,11 +181,13 @@ def test_s2_pr04_inline_read_success_is_surface_inspectable_redacted_and_allowli
 
         surface = client.get("/")
         assert surface.status_code == 200
-        assert "surface_action_lifecycle" in surface.text
         assert "turn.surface_action_lifecycle" in surface.text
+        assert "approval_ref" in surface.text
+        assert "lifecycleItem.approval.reference" in surface.text
+        assert "turn.action_attempts" not in surface.text
 
 
-def test_s2_pr04_approval_denied_is_surface_inspectable_with_redacted_reason(
+def test_s2_pr05_denied_flow_uses_surface_approval_ref_only(
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
@@ -188,11 +206,16 @@ def test_s2_pr04_approval_denied_is_surface_inspectable_with_redacted_reason(
             json={
                 "approval_ref": approval_ref,
                 "decision": "deny",
-                "actor_id": "user.local",
                 "reason": "deny because api_key=sk-live-deny-secret",
             },
         )
         assert denied.status_code == 200
+        denied_payload = denied.json()
+        _assert_surface_approval_response(denied_payload, expected_status="denied")
+        denied_reason = denied_payload["approval"]["reason"]
+        assert isinstance(denied_reason, str)
+        assert "[REDACTED]" in denied_reason
+        assert "sk-live-deny-secret" not in denied_reason
 
         timeline = client.get(f"/v1/sessions/{session_id}/events")
         assert timeline.status_code == 200
@@ -208,7 +231,7 @@ def test_s2_pr04_approval_denied_is_surface_inspectable_with_redacted_reason(
         _assert_redacted(item)
 
 
-def test_s2_pr04_approval_expired_is_surface_inspectable_as_terminal_not_executed(
+def test_s2_pr05_expired_flow_uses_surface_approval_ref_only(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -230,7 +253,7 @@ def test_s2_pr04_approval_expired_is_surface_inspectable_as_terminal_not_execute
         clock.advance(seconds=10)
         expired = client.post(
             "/v1/approvals",
-            json={"approval_ref": approval_ref, "decision": "approve", "actor_id": "user.local"},
+            json={"approval_ref": approval_ref, "decision": "approve"},
         )
         assert expired.status_code == 409
         assert expired.json()["error"]["code"] == "E_APPROVAL_EXPIRED"
@@ -247,7 +270,7 @@ def test_s2_pr04_approval_expired_is_surface_inspectable_as_terminal_not_execute
         assert item["execution"]["error"] is None
 
 
-def test_s2_pr04_approval_approved_execution_success_is_surface_inspectable_and_redacted(
+def test_s2_pr05_approval_approved_execution_success_is_surface_only_and_redacted(
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
@@ -271,7 +294,7 @@ def test_s2_pr04_approval_approved_execution_success_is_surface_inspectable_and_
 
         approved = client.post(
             "/v1/approvals",
-            json={"approval_ref": approval_ref, "decision": "approve", "actor_id": "user.local"},
+            json={"approval_ref": approval_ref, "decision": "approve"},
         )
         assert approved.status_code == 200
         _assert_surface_approval_response(approved.json(), expected_status="approved")
@@ -290,7 +313,7 @@ def test_s2_pr04_approval_approved_execution_success_is_surface_inspectable_and_
         _assert_redacted(item)
 
 
-def test_s2_pr04_approval_approved_execution_failure_is_surface_inspectable(
+def test_s2_pr05_approval_approved_execution_failure_is_surface_only(
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
@@ -314,7 +337,7 @@ def test_s2_pr04_approval_approved_execution_failure_is_surface_inspectable(
 
         approved = client.post(
             "/v1/approvals",
-            json={"approval_ref": approval_ref, "decision": "approve", "actor_id": "user.local"},
+            json={"approval_ref": approval_ref, "decision": "approve"},
         )
         assert approved.status_code == 200
         _assert_surface_approval_response(approved.json(), expected_status="approved")
@@ -328,3 +351,30 @@ def test_s2_pr04_approval_approved_execution_failure_is_surface_inspectable(
         assert item["execution"]["status"] == "failed"
         assert isinstance(item["execution"]["error"], str)
         assert "egress_destination_denied" in item["execution"]["error"]
+
+
+def test_s2_pr05_approval_endpoint_rejects_legacy_approval_id_field(
+    postgres_url: str,
+) -> None:
+    adapter = ActionProposalAdapter(
+        proposals_by_message={
+            "legacy approval key": [
+                {"capability_id": "cap.framework.write_note", "input": {"note": "modern only"}}
+            ]
+        }
+    )
+    with _build_client(postgres_url, adapter) as client:
+        session_id = _session_id(client)
+        sent = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "legacy approval key"},
+        )
+        assert sent.status_code == 200
+        approval_ref = _approval_ref(sent.json()["turn"])
+
+        legacy = client.post(
+            "/v1/approvals",
+            json={"approval_id": approval_ref, "decision": "approve"},
+        )
+        assert legacy.status_code == 422
+        assert legacy.json()["error"]["code"] == "E_VALIDATION"

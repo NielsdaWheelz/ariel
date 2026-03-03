@@ -320,6 +320,9 @@ def _serialize_surface_action_lifecycle(
 
         approval_payload = action_attempt.get("approval")
         if isinstance(approval_payload, dict):
+            approval_reference = (
+                approval_payload.get("id") if isinstance(approval_payload.get("id"), str) else None
+            )
             approval_status_raw = approval_payload.get("status")
             approval_status = (
                 approval_status_raw if isinstance(approval_status_raw, str) else "unknown"
@@ -336,6 +339,7 @@ def _serialize_surface_action_lifecycle(
                 else None
             )
         else:
+            approval_reference = None
             approval_status = "not_requested"
             approval_reason = None
             expires_at = None
@@ -370,6 +374,7 @@ def _serialize_surface_action_lifecycle(
                 },
                 "approval": {
                     "status": approval_status,
+                    "reference": approval_reference,
                     "reason": approval_reason,
                     "expires_at": expires_at,
                     "decided_at": decided_at,
@@ -400,7 +405,6 @@ def serialize_turn(
         "status": turn.status,
         "created_at": to_rfc3339(turn.created_at),
         "updated_at": to_rfc3339(turn.updated_at),
-        "action_attempts": action_attempts,
         "events": serialized_events,
         "surface_action_lifecycle": _serialize_surface_action_lifecycle(
             action_attempts=action_attempts,
