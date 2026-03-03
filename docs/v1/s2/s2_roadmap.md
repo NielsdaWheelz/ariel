@@ -60,7 +60,7 @@
 - **non-goals**: no changes to policy decisions, taint semantics, execution ordering/idempotency, or new domain capabilities.
 - **status**: landed in current implementation branch with strict boundary (`approval_ref` only; surfaced-only approval response contract).
 
-### PR-06: (planned after PR-05 merges) Response Boundary Lock-In
+### PR-06: Response Boundary Lock-In
 - **goal**: prevent future metadata leakage by enforcing strict response-boundary contracts on user-facing Slice 2 APIs.
 - **builds on**: PR-05.
 - **acceptance**:
@@ -69,3 +69,4 @@
   - compatibility/deprecation behavior is explicit and documented for any removed legacy fields.
   - contract tests fail when internal lifecycle metadata reappears in user-facing responses.
 - **non-goals**: no authorization-policy redesign, no changes to capability contracts, and no UI redesign work beyond surfaced-contract adoption.
+- **status**: landed in current implementation branch; see `s2_prs/s2_pr06_implementation_notes.md`.
