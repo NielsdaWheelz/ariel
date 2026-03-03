@@ -9,7 +9,7 @@ Prove external read integrations through Ariel's safe capability framework.
 ### factual questions return grounded answers with inspectable sources
 - **given**: an active session and a user factual query that requires external retrieval
 - **when**: Ariel completes retrieval and response synthesis for that turn
-- **then**: Ariel returns a direct answer grounded in retrieved evidence, includes user-visible source references in the response flow, and preserves inspectable provenance artifacts for each cited source
+- **then**: Ariel returns a direct answer grounded in retrieved evidence, includes user-visible source references in the response flow (inline citation markers plus structured citation entries), and preserves inspectable provenance artifacts for each cited source
 
 ### unsupported factual claims are not emitted without evidence
 - **given**: a factual query where retrieval returns insufficient, conflicting, or no usable evidence
@@ -17,7 +17,7 @@ Prove external read integrations through Ariel's safe capability framework.
 - **then**: Ariel does not present an uncited factual claim as true, and instead returns explicit uncertainty plus a concrete next step to recover
 
 ### weather queries return location-aware forecasts
-- **given**: a user weather request with an explicit location, or a previously configured default location
+- **given**: a user weather request with an explicit location, or a previously configured default location persisted in Ariel's canonical user settings
 - **when**: Ariel processes the turn through the weather read capability
 - **then**: Ariel returns a forecast bound to the resolved location and timeframe, with clear forecast/observation timestamps and source reference(s)
 
@@ -51,7 +51,13 @@ Prove external read integrations through Ariel's safe capability framework.
 
 **No-approval reads still enforce strict runtime controls**: `cap.search.web`, `cap.search.news`, and `cap.weather.forecast` run inline as `read` actions, but still require schema validation, timeout/output bounds, redaction, auditable lifecycle events, and explicit least-privilege egress destination policy.
 
+**Citations use a dual response contract**: Grounded answers expose citations in two synchronized forms: inline reference markers in assistant text for readability, and structured citation payloads (for example `assistant.sources[]`) that include artifact ids and normalized source metadata for API/UI durability.
+
+**Weather provider strategy is production-safe and swappable**: `cap.weather.forecast` is implemented behind a provider abstraction with a paid SLA-backed production default backend, while retaining a non-SLA adapter for local/dev fallback; orchestrator contracts remain provider-agnostic.
+
 **Weather location resolution is deterministic and privacy-safe**: Location resolution order is explicit user location first, configured default second, clarification otherwise. Implicit IP/device geolocation inference is excluded from MVP behavior.
+
+**Configured weather default is canonical user state**: The configured default location is persisted in Postgres user settings as canonical state (with optional environment bootstrap on first-run setup), and runtime resolution still follows `explicit -> configured default -> clarification`.
 
 **External factual claims are citation-gated**: Ariel does not emit externally grounded factual assertions unless they are backed by user-visible citation references linked to provenance artifacts; insufficient evidence must produce uncertainty rather than confident unsupported claims.
 
