@@ -105,6 +105,43 @@ slice-3 pr-03 hardens grounding safety for conflicting evidence and mixed propos
   surfaced answer text is derived from citation-backed retrieval synthesis.
 - conflicting same-claim retrieval evidence fails closed to uncertainty + concrete recovery guidance.
 
+## slice-4 pr-01 google connector + read flows
+
+slice-4 pr-01 adds google oauth connector lifecycle and allowlisted read capabilities:
+
+- connector lifecycle endpoints:
+  - `GET /v1/connectors/google`
+  - `GET /v1/connectors/google/events`
+  - `POST /v1/connectors/google/start`
+  - `POST /v1/connectors/google/reconnect`
+  - `GET /v1/connectors/google/callback`
+  - `DELETE /v1/connectors/google`
+- allowlisted read capabilities:
+  - `cap.calendar.list`
+  - `cap.calendar.propose_slots`
+  - `cap.email.search`
+  - `cap.email.read`
+- typed recoverable auth/scope failures:
+  - `not_connected`, `consent_required`, `scope_missing`, `token_expired`, `access_revoked`
+
+google connector runtime config:
+
+- `ARIEL_GOOGLE_OAUTH_CLIENT_ID`
+- `ARIEL_GOOGLE_OAUTH_CLIENT_SECRET`
+- `ARIEL_GOOGLE_OAUTH_REDIRECT_URI` (default `http://127.0.0.1:8000/v1/connectors/google/callback`)
+- `ARIEL_GOOGLE_OAUTH_STATE_TTL_SECONDS` (default `600`)
+- `ARIEL_GOOGLE_OAUTH_TIMEOUT_SECONDS` (default `10.0`)
+- `ARIEL_CONNECTOR_ENCRYPTION_KEY_VERSION` (default `v1`)
+- `ARIEL_CONNECTOR_ENCRYPTION_KEYS` (recommended for production key rotation)
+- `ARIEL_CONNECTOR_ENCRYPTION_SECRET` (fallback/dev secret path only)
+
+`ARIEL_CONNECTOR_ENCRYPTION_KEYS` accepts either:
+
+- JSON object: `{"v1":"<base64url-key>","v2":"<base64url-key>"}`
+- comma list: `v1:<base64url-key>,v2:<base64url-key>`
+
+use 16/24/32-byte keys (base64url encoded). keep previous key versions configured during rotation windows.
+
 search capability runtime config:
 
 - `ARIEL_SEARCH_WEB_API_KEY` (required for live web retrieval backend)
@@ -188,7 +225,8 @@ see `docs/v1/s2/s2_prs/s2_pr02_implementation_notes.md` and
 `docs/v1/s2/s2_prs/s2_pr08_implementation_notes.md` and
 `docs/v1/s3/s3_prs/s3_pr01_implementation_notes.md` and
 `docs/v1/s3/s3_prs/s3_pr02_implementation_notes.md` and
-`docs/v1/s3/s3_prs/s3_pr03_implementation_notes.md` for implementation details and tradeoffs.
+`docs/v1/s3/s3_prs/s3_pr03_implementation_notes.md` and
+`docs/v1/s4/s4_prs/s4_pr01_implementation_notes.md` for implementation details and tradeoffs.
 
 ## run locally
 

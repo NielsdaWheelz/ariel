@@ -36,6 +36,14 @@ class AppSettings(BaseSettings):
     max_turn_wall_time_ms: int = 20000
     approval_ttl_seconds: int = 900
     approval_actor_id: str = "user.local"
+    google_oauth_client_id: str | None = None
+    google_oauth_client_secret: str | None = None
+    google_oauth_redirect_uri: str = "http://127.0.0.1:8000/v1/connectors/google/callback"
+    google_oauth_state_ttl_seconds: int = 600
+    google_oauth_timeout_seconds: float = 10.0
+    connector_encryption_secret: str = "dev-local-connector-secret"
+    connector_encryption_key_version: str = "v1"
+    connector_encryption_keys: str | None = None
 
     @field_validator("bind_host")
     @classmethod
@@ -106,4 +114,42 @@ class AppSettings(BaseSettings):
         normalized = value.strip()
         if not normalized:
             raise ValueError("approval_actor_id must not be blank")
+        return normalized
+
+    @field_validator("google_oauth_redirect_uri")
+    @classmethod
+    def _google_oauth_redirect_uri_must_not_be_blank(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("google_oauth_redirect_uri must not be blank")
+        return normalized
+
+    @field_validator("google_oauth_state_ttl_seconds")
+    @classmethod
+    def _google_oauth_state_ttl_seconds_must_be_positive(cls, value: int) -> int:
+        if value < 30:
+            raise ValueError("google_oauth_state_ttl_seconds must be >= 30")
+        return value
+
+    @field_validator("google_oauth_timeout_seconds")
+    @classmethod
+    def _google_oauth_timeout_seconds_must_be_positive(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("google_oauth_timeout_seconds must be > 0")
+        return value
+
+    @field_validator("connector_encryption_secret")
+    @classmethod
+    def _connector_encryption_secret_must_not_be_blank(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("connector_encryption_secret must not be blank")
+        return normalized
+
+    @field_validator("connector_encryption_key_version")
+    @classmethod
+    def _connector_encryption_key_version_must_not_be_blank(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("connector_encryption_key_version must not be blank")
         return normalized

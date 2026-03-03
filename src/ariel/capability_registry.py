@@ -13,6 +13,15 @@ import httpx
 
 PolicyDecision = Literal["allow_inline", "requires_approval", "deny"]
 
+_GOOGLE_CALENDAR_READ_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
+_GOOGLE_CALENDAR_FREEBUSY_SCOPE = "https://www.googleapis.com/auth/calendar.freebusy"
+_GOOGLE_GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+_GOOGLE_ALLOWED_EGRESS_DESTINATIONS = (
+    "www.googleapis.com",
+    "gmail.googleapis.com",
+    "oauth2.googleapis.com",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class CapabilityDefinition:
@@ -68,6 +77,89 @@ def _validate_search_web_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any
 
 def _validate_search_news_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
     return _validate_exact_text_input(raw_input, field_name="query", max_length=1000)
+
+
+def _normalize_rfc3339_like(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    try:
+        parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _validate_calendar_list_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {"window_start", "window_end"}:
+        return None, "schema_invalid"
+    window_start = _normalize_rfc3339_like(raw_input.get("window_start"))
+    window_end = _normalize_rfc3339_like(raw_input.get("window_end"))
+    if window_start is None or window_end is None:
+        return None, "schema_invalid"
+    window_start_dt = datetime.fromisoformat(window_start.replace("Z", "+00:00"))
+    window_end_dt = datetime.fromisoformat(window_end.replace("Z", "+00:00"))
+    if window_end_dt <= window_start_dt:
+        return None, "schema_invalid"
+    return {
+        "window_start": window_start,
+        "window_end": window_end,
+    }, None
+
+
+def _validate_calendar_propose_slots_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not set(raw_input.keys()).issubset(
+        {"window_start", "window_end", "duration_minutes", "attendees"}
+    ):
+        return None, "schema_invalid"
+
+    window_start = _normalize_rfc3339_like(raw_input.get("window_start"))
+    window_end = _normalize_rfc3339_like(raw_input.get("window_end"))
+    if window_start is None or window_end is None:
+        return None, "schema_invalid"
+    window_start_dt = datetime.fromisoformat(window_start.replace("Z", "+00:00"))
+    window_end_dt = datetime.fromisoformat(window_end.replace("Z", "+00:00"))
+    if window_end_dt <= window_start_dt:
+        return None, "schema_invalid"
+
+    duration_raw = raw_input.get("duration_minutes", 30)
+    if not isinstance(duration_raw, int):
+        return None, "schema_invalid"
+    if duration_raw < 5 or duration_raw > 480:
+        return None, "schema_invalid"
+
+    attendees_raw = raw_input.get("attendees", [])
+    if not isinstance(attendees_raw, list):
+        return None, "schema_invalid"
+    attendees: list[str] = []
+    for attendee_raw in attendees_raw:
+        if not isinstance(attendee_raw, str):
+            return None, "schema_invalid"
+        attendee = attendee_raw.strip().lower()
+        if not attendee or len(attendee) > 320:
+            return None, "schema_invalid"
+        attendees.append(attendee)
+
+    return {
+        "window_start": window_start,
+        "window_end": window_end,
+        "duration_minutes": duration_raw,
+        "attendees": attendees,
+    }, None
+
+
+def _validate_email_search_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    return _validate_exact_text_input(raw_input, field_name="query", max_length=1000)
+
+
+def _validate_email_read_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    return _validate_exact_text_input(raw_input, field_name="message_id", max_length=256)
 
 
 _WEATHER_ALLOWED_TIMEFRAMES = {"now", "today", "tomorrow", "next_24h"}
@@ -421,6 +513,80 @@ def _search_news_allowed_destinations() -> tuple[str, ...]:
     if host is not None:
         return (host,)
     return ("api.search.brave.com",)
+
+
+def _execute_google_calendar_list(_: dict[str, Any]) -> dict[str, Any]:
+    raise RuntimeError("google_runtime_not_bound")
+
+
+def _execute_google_calendar_propose_slots(_: dict[str, Any]) -> dict[str, Any]:
+    raise RuntimeError("google_runtime_not_bound")
+
+
+def _execute_google_email_search(_: dict[str, Any]) -> dict[str, Any]:
+    raise RuntimeError("google_runtime_not_bound")
+
+
+def _execute_google_email_read(_: dict[str, Any]) -> dict[str, Any]:
+    raise RuntimeError("google_runtime_not_bound")
+
+
+def _declare_google_calendar_list_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "destination": "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+            "payload": {
+                "window_start": input_payload["window_start"],
+                "window_end": input_payload["window_end"],
+            },
+        }
+    ]
+
+
+def _declare_google_calendar_propose_slots_egress_intent(
+    input_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    payload = {
+        "window_start": input_payload["window_start"],
+        "window_end": input_payload["window_end"],
+        "duration_minutes": input_payload["duration_minutes"],
+    }
+    attendees_raw = input_payload.get("attendees", [])
+    attendees = attendees_raw if isinstance(attendees_raw, list) else []
+    declarations: list[dict[str, Any]] = [
+        {
+            "destination": "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+            "payload": payload,
+        }
+    ]
+    if attendees:
+        declarations.append(
+            {
+                "destination": "https://www.googleapis.com/calendar/v3/freeBusy",
+                "payload": {"attendees": attendees},
+            }
+        )
+    return declarations
+
+
+def _declare_google_email_search_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "destination": "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+            "payload": {"query": input_payload["query"]},
+        }
+    ]
+
+
+def _declare_google_email_read_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "destination": (
+                f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{input_payload['message_id']}"
+            ),
+            "payload": {"message_id": input_payload["message_id"]},
+        }
+    ]
 
 
 class _WeatherProviderAdapter(Protocol):
@@ -782,6 +948,71 @@ def _declare_external_notify_egress_intent(input_payload: dict[str, Any]) -> lis
 
 
 _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
+    "cap.calendar.list": CapabilityDefinition(
+        capability_id="cap.calendar.list",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "calendar_window_v1",
+            "output_schema": "calendar_list_v1",
+            "idempotency": "deterministic_read",
+            "required_scopes": [_GOOGLE_CALENDAR_READ_SCOPE],
+        },
+        allowed_egress_destinations=_GOOGLE_ALLOWED_EGRESS_DESTINATIONS,
+        validate_input=_validate_calendar_list_input,
+        execute=_execute_google_calendar_list,
+        declare_egress_intent=_declare_google_calendar_list_egress_intent,
+    ),
+    "cap.calendar.propose_slots": CapabilityDefinition(
+        capability_id="cap.calendar.propose_slots",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "calendar_slot_planning_v1",
+            "output_schema": "calendar_slot_options_v1",
+            "idempotency": "deterministic_read",
+            "required_scopes": [_GOOGLE_CALENDAR_READ_SCOPE],
+            "attendee_intersection_scope": _GOOGLE_CALENDAR_FREEBUSY_SCOPE,
+        },
+        allowed_egress_destinations=_GOOGLE_ALLOWED_EGRESS_DESTINATIONS,
+        validate_input=_validate_calendar_propose_slots_input,
+        execute=_execute_google_calendar_propose_slots,
+        declare_egress_intent=_declare_google_calendar_propose_slots_egress_intent,
+    ),
+    "cap.email.search": CapabilityDefinition(
+        capability_id="cap.email.search",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "email_search_v1",
+            "output_schema": "email_search_results_v1",
+            "idempotency": "deterministic_read",
+            "required_scopes": [_GOOGLE_GMAIL_READ_SCOPE],
+        },
+        allowed_egress_destinations=_GOOGLE_ALLOWED_EGRESS_DESTINATIONS,
+        validate_input=_validate_email_search_input,
+        execute=_execute_google_email_search,
+        declare_egress_intent=_declare_google_email_search_egress_intent,
+    ),
+    "cap.email.read": CapabilityDefinition(
+        capability_id="cap.email.read",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "email_read_v1",
+            "output_schema": "email_read_result_v1",
+            "idempotency": "deterministic_read",
+            "required_scopes": [_GOOGLE_GMAIL_READ_SCOPE],
+        },
+        allowed_egress_destinations=_GOOGLE_ALLOWED_EGRESS_DESTINATIONS,
+        validate_input=_validate_email_read_input,
+        execute=_execute_google_email_read,
+        declare_egress_intent=_declare_google_email_read_egress_intent,
+    ),
     "cap.search.web": CapabilityDefinition(
         capability_id="cap.search.web",
         version="1.0",
