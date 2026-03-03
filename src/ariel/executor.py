@@ -103,28 +103,32 @@ def _normalize_destination(destination: str) -> str | None:
     return host or None
 
 
-def _extract_egress_requests(raw_output: Any) -> tuple[list[dict[str, Any]], str | None]:
-    if not isinstance(raw_output, dict):
-        return [], None
-    egress_raw = raw_output.get(_EGRESS_SENTINEL_KEY)
-    if egress_raw is None:
-        return [], None
-    if not isinstance(egress_raw, list):
-        return [], "egress_contract_invalid"
+def _normalize_declared_egress_requests(
+    raw_declarations: Any,
+) -> tuple[list[dict[str, Any]], str | None]:
+    if raw_declarations is None:
+        return [], "egress_preflight_missing_intent"
+    if not isinstance(raw_declarations, list):
+        return [], "egress_preflight_contract_invalid"
+    if len(raw_declarations) == 0:
+        return [], "egress_preflight_undeclared_intent"
 
     egress_requests: list[dict[str, Any]] = []
-    for entry in egress_raw:
+    for entry in raw_declarations:
         if not isinstance(entry, dict):
-            return [], "egress_contract_invalid"
+            return [], "egress_preflight_contract_invalid"
         destination_raw = entry.get("destination")
         if not isinstance(destination_raw, str) or not destination_raw.strip():
-            return [], "egress_contract_invalid"
+            return [], "egress_preflight_contract_invalid"
+        if "payload" not in entry:
+            return [], "egress_preflight_contract_invalid"
         payload_raw = entry.get("payload")
-        payload = payload_raw if isinstance(payload_raw, dict) else {}
+        if not isinstance(payload_raw, dict):
+            return [], "egress_preflight_contract_invalid"
         egress_requests.append(
             {
                 "destination": destination_raw.strip(),
-                "payload": payload,
+                "payload": payload_raw,
             }
         )
     return egress_requests, None
@@ -152,10 +156,58 @@ def _egress_policy_error(
     return None
 
 
-def _strip_egress_metadata(raw_output: Any) -> Any:
-    if not isinstance(raw_output, dict):
-        return raw_output
-    return {key: value for key, value in raw_output.items() if key != _EGRESS_SENTINEL_KEY}
+def _preflight_egress_requests(
+    *,
+    capability: CapabilityDefinition,
+    normalized_input: dict[str, Any],
+) -> tuple[list[dict[str, Any]], str | None]:
+    if capability.impact_level != "external_send":
+        return [], None
+
+    declare_egress_intent = capability.declare_egress_intent
+    if declare_egress_intent is None:
+        return [], "egress_preflight_missing_intent"
+    if not callable(declare_egress_intent):
+        return [], "egress_preflight_contract_invalid"
+
+    try:
+        raw_declarations = declare_egress_intent(normalized_input)
+    except Exception:  # noqa: BLE001
+        return [], "egress_preflight_contract_invalid"
+
+    egress_requests, declaration_error = _normalize_declared_egress_requests(raw_declarations)
+    if declaration_error is not None:
+        return [], declaration_error
+
+    egress_error = _egress_policy_error(capability=capability, egress_requests=egress_requests)
+    if egress_error is not None:
+        return [], egress_error
+    return egress_requests, None
+
+
+def _dispatch_egress_request(*, destination: str, payload: dict[str, Any]) -> str | None:
+    # Centralized outbound dispatch boundary for external side effects.
+    del destination, payload
+    return None
+
+
+def _dispatch_egress_requests(*, egress_requests: list[dict[str, Any]]) -> str | None:
+    for request in egress_requests:
+        destination = request.get("destination")
+        payload = request.get("payload")
+        if not isinstance(destination, str) or not isinstance(payload, dict):
+            return "egress_dispatch_contract_invalid"
+        try:
+            dispatch_error = _dispatch_egress_request(destination=destination, payload=payload)
+        except Exception as exc:  # noqa: BLE001
+            safe_reason = safe_failure_reason(
+                str(exc),
+                fallback=f"unexpected {exc.__class__.__name__}",
+            )
+            return f"egress_dispatch_failed:{safe_reason}"
+        if dispatch_error is not None:
+            return f"egress_dispatch_failed:{dispatch_error}"
+    return None
 
 
 def build_assistant_action_appendix(
@@ -223,33 +275,38 @@ def execute_capability(
     if pre_guardrail_error is not None:
         return ExecutionResult(status="failed", output=None, error=pre_guardrail_error)
 
+    egress_requests, egress_preflight_error = _preflight_egress_requests(
+        capability=capability,
+        normalized_input=normalized_input,
+    )
+    if egress_preflight_error is not None:
+        return ExecutionResult(status="failed", output=None, error=egress_preflight_error)
+
     try:
         raw_output = capability.execute(normalized_input)
-        egress_requests, egress_contract_error = _extract_egress_requests(raw_output)
-        if egress_contract_error is not None:
-            return ExecutionResult(status="failed", output=None, error=egress_contract_error)
+        if isinstance(raw_output, dict) and _EGRESS_SENTINEL_KEY in raw_output:
+            return ExecutionResult(
+                status="failed",
+                output=None,
+                error="egress_preflight_undeclared_intent",
+            )
 
-        egress_error = _egress_policy_error(capability=capability, egress_requests=egress_requests)
-        if egress_error is not None:
-            return ExecutionResult(status="failed", output=None, error=egress_error)
-
-        output_without_egress = _strip_egress_metadata(raw_output)
-        post_guardrail_error = _post_execution_guardrail_error(output_without_egress)
+        post_guardrail_error = _post_execution_guardrail_error(raw_output)
         if post_guardrail_error is not None:
             return ExecutionResult(status="failed", output=None, error=post_guardrail_error)
 
         encoded_output = jsonable_encoder(raw_output)
-        encoded_output_without_egress = _strip_egress_metadata(encoded_output)
-        post_guardrail_error = _post_execution_guardrail_error(encoded_output_without_egress)
+        post_guardrail_error = _post_execution_guardrail_error(encoded_output)
         if post_guardrail_error is not None:
             return ExecutionResult(status="failed", output=None, error=post_guardrail_error)
 
+        dispatch_error = _dispatch_egress_requests(egress_requests=egress_requests)
+        if dispatch_error is not None:
+            return ExecutionResult(status="failed", output=None, error=dispatch_error)
+
         redacted_output = redact_json_value(encoded_output)
-        redacted_output_without_egress = _strip_egress_metadata(redacted_output)
         output_payload = (
-            redacted_output_without_egress
-            if isinstance(redacted_output_without_egress, dict)
-            else {"value": redacted_output_without_egress}
+            redacted_output if isinstance(redacted_output, dict) else {"value": redacted_output}
         )
         return ExecutionResult(status="succeeded", output=output_payload, error=None)
     except Exception as exc:  # noqa: BLE001
