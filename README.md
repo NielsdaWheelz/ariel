@@ -78,6 +78,28 @@ slice-2 pr-08 hardens outbound side effects with fail-closed egress preflight:
 - outbound dispatch flows through a centralized runtime boundary instead of capability-specific
   side-effect paths.
 
+## slice-3 pr-01 grounded retrieval core
+
+slice-3 pr-01 introduces the first externally grounded factual retrieval path with citation and provenance
+contracts:
+
+- factual retrieval executes through `cap.search.web` (`read`) under capability policy, not model-vendor
+  native search shortcuts.
+- grounded message responses now include:
+  - inline citation markers in `assistant.message` (for example `[1]`, `[2]`)
+  - structured citation metadata in `assistant.sources[]` with stable `artifact_id` values.
+- each cited source is persisted as a retrieval provenance artifact and can be inspected via:
+  - `GET /v1/artifacts/{artifact_id}`
+- retrieval egress is fail-closed with explicit declared intent + destination allowlist preflight.
+- retrieval failure modes (timeout/rate-limit/upstream/no evidence) surface explicit uncertainty or
+  partial-result recovery guidance in user-visible assistant messages.
+
+search capability runtime config:
+
+- `ARIEL_SEARCH_WEB_API_KEY` (required for live web retrieval backend)
+- `ARIEL_SEARCH_WEB_ENDPOINT` (optional; defaults to Brave web search endpoint)
+- `ARIEL_SEARCH_WEB_TIMEOUT_SECONDS` (optional; defaults to `8.0`)
+
 approval decisions are handled through:
 
 ```bash

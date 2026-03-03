@@ -26,7 +26,7 @@ MESSAGE_RESPONSE_KEYS = {"ok", "session", "turn", "assistant"}
 TIMELINE_RESPONSE_KEYS = {"ok", "session_id", "turns"}
 APPROVAL_RESPONSE_KEYS = {"ok", "approval", "assistant"}
 SESSION_KEYS = {"id", "is_active", "created_at", "updated_at"}
-ASSISTANT_KEYS = {"message"}
+ASSISTANT_KEYS = {"message", "sources"}
 TURN_KEYS = {
     "id",
     "session_id",
@@ -269,6 +269,7 @@ def _assert_surface_message_response(payload: dict[str, Any]) -> None:
     assistant = payload["assistant"]
     assert isinstance(assistant, dict)
     _assert_keys(assistant, ASSISTANT_KEYS)
+    assert isinstance(assistant["sources"], list)
 
     turn = payload["turn"]
     assert isinstance(turn, dict)
@@ -304,6 +305,7 @@ def _assert_surface_approval_response(payload: dict[str, Any], *, expected_statu
     assistant = payload["assistant"]
     assert isinstance(assistant, dict)
     _assert_keys(assistant, ASSISTANT_KEYS)
+    assert assistant["sources"] == []
 
     _assert_no_forbidden_keys(payload)
 

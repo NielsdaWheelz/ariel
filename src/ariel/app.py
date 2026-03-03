@@ -36,8 +36,10 @@ from ariel.persistence import (
     ActionAttemptRecord,
     ApprovalRequestRecord,
     EventRecord,
+    ArtifactRecord,
     SessionRecord,
     TurnRecord,
+    serialize_artifact,
     serialize_action_attempt,
     serialize_session,
     serialize_turn,
@@ -47,6 +49,7 @@ from ariel.phone_surface import PHONE_SURFACE_HTML
 from ariel.redaction import redact_text, safe_failure_reason
 from ariel.response_contracts import (
     ResponseContractViolation,
+    build_surface_artifact_response,
     build_surface_approval_response,
     build_surface_message_response,
     build_surface_timeline_response,
@@ -1153,6 +1156,7 @@ def create_app(
                         session=raw_session,
                         turn=raw_turn,
                         assistant_message=turn.assistant_message,
+                        assistant_sources=proposal_processing.assistant_sources,
                     )
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
@@ -1300,6 +1304,27 @@ def create_app(
                         session_id=session_id,
                         turns=serialized_turns,
                     )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/artifacts/{artifact_id}")
+    def get_artifact(artifact_id: str) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                artifact = db.scalar(
+                    select(ArtifactRecord).where(ArtifactRecord.id == artifact_id).limit(1)
+                )
+                if artifact is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_ARTIFACT_NOT_FOUND",
+                        message="artifact not found",
+                        details={"artifact_id": artifact_id},
+                        retryable=False,
+                    )
+                try:
+                    return build_surface_artifact_response(artifact=serialize_artifact(artifact))
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
 

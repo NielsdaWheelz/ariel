@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from fastapi.encoders import jsonable_encoder
@@ -22,7 +22,13 @@ from ariel.executor import (
     execute_capability,
     next_turn_event_sequence,
 )
-from ariel.persistence import ActionAttemptRecord, ApprovalRequestRecord, TurnRecord, to_rfc3339
+from ariel.persistence import (
+    ActionAttemptRecord,
+    ApprovalRequestRecord,
+    ArtifactRecord,
+    TurnRecord,
+    to_rfc3339,
+)
 from ariel.policy_engine import evaluate_proposal
 
 _SIDE_EFFECT_EXECUTION_LOCK_ID = 24_310_002
@@ -53,6 +59,7 @@ class ActionRuntimeError(Exception):
 class ProposalProcessingResult:
     assistant_message: str
     action_attempts: list[ActionAttemptRecord]
+    assistant_sources: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -66,6 +73,15 @@ class ApprovalDecisionResult:
 class RuntimeProvenance:
     status: Literal["clean", "tainted"]
     evidence: tuple[dict[str, Any], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class GroundedSourceCandidate:
+    title: str
+    source: str
+    snippet: str
+    retrieved_at: datetime
+    published_at: datetime | None
 
 
 def _execution_integrity_error(
@@ -159,6 +175,169 @@ def _taint_event_payload(
     }
 
 
+_MAX_CITED_SOURCES = 4
+_MAX_SNIPPET_LENGTH = 320
+
+
+def _parse_rfc3339_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    try:
+        parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _truncate_snippet(value: str) -> str:
+    normalized = value.strip()
+    if len(normalized) <= _MAX_SNIPPET_LENGTH:
+        return normalized
+    return normalized[:_MAX_SNIPPET_LENGTH].rstrip() + "..."
+
+
+def _extract_search_source_candidates(
+    *,
+    output_payload: Any,
+    now_fn: Callable[[], datetime],
+) -> list[GroundedSourceCandidate]:
+    if not isinstance(output_payload, dict):
+        return []
+    raw_results = output_payload.get("results")
+    if not isinstance(raw_results, list):
+        return []
+
+    retrieved_at = _parse_rfc3339_timestamp(output_payload.get("retrieved_at")) or now_fn()
+    candidates: list[GroundedSourceCandidate] = []
+    for raw_result in raw_results:
+        if not isinstance(raw_result, dict):
+            continue
+        title_raw = raw_result.get("title")
+        source_raw = raw_result.get("source")
+        snippet_raw = raw_result.get("snippet")
+        if (
+            not isinstance(title_raw, str)
+            or not isinstance(source_raw, str)
+            or not isinstance(snippet_raw, str)
+        ):
+            continue
+        title = title_raw.strip()
+        source = source_raw.strip()
+        snippet = _truncate_snippet(snippet_raw)
+        if not title or not source or not snippet:
+            continue
+        published_at = _parse_rfc3339_timestamp(raw_result.get("published_at"))
+        candidates.append(
+            GroundedSourceCandidate(
+                title=title,
+                source=source,
+                snippet=snippet,
+                retrieved_at=retrieved_at,
+                published_at=published_at,
+            )
+        )
+    return candidates
+
+
+def _persist_retrieval_artifacts(
+    *,
+    db: Session,
+    session_id: str,
+    turn_id: str,
+    action_attempt: ActionAttemptRecord,
+    candidates: list[GroundedSourceCandidate],
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    assistant_sources: list[dict[str, Any]] = []
+    citation_snippets: list[str] = []
+    for candidate in candidates:
+        now = now_fn()
+        artifact = ArtifactRecord(
+            id=new_id_fn("art"),
+            session_id=session_id,
+            turn_id=turn_id,
+            action_attempt_id=action_attempt.id,
+            artifact_type="retrieval_provenance",
+            title=candidate.title,
+            source=candidate.source,
+            snippet=candidate.snippet,
+            retrieved_at=candidate.retrieved_at,
+            published_at=candidate.published_at,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(artifact)
+        db.flush()
+        assistant_sources.append(
+            {
+                "artifact_id": artifact.id,
+                "title": artifact.title,
+                "source": artifact.source,
+                "retrieved_at": to_rfc3339(artifact.retrieved_at),
+                "published_at": (
+                    to_rfc3339(artifact.published_at) if artifact.published_at is not None else None
+                ),
+            }
+        )
+        citation_snippets.append(candidate.snippet)
+    return assistant_sources, citation_snippets
+
+
+def _synthesize_grounded_retrieval_answer(
+    *,
+    collected_sources: list[dict[str, Any]],
+    citation_snippets: list[str],
+    retrieval_errors: list[str],
+) -> tuple[str, list[dict[str, Any]]]:
+    normalized_errors: list[str] = []
+    for error in retrieval_errors:
+        lowered = error.lower()
+        if "timeout" in lowered or "timed out" in lowered:
+            normalized_errors.append("timeout")
+            continue
+        if "rate limit" in lowered:
+            normalized_errors.append("rate_limited")
+            continue
+        normalized_errors.append(error)
+
+    if not collected_sources:
+        if normalized_errors:
+            primary_error = normalized_errors[0]
+            return (
+                "i'm uncertain because web retrieval failed "
+                f"({primary_error}). please retry with a narrower query or try again shortly.",
+                [],
+            )
+        return (
+            "i'm uncertain because i could not find enough external evidence to support this claim. "
+            "please provide a more specific query or share a source to verify.",
+            [],
+        )
+
+    citation_lines: list[str] = []
+    for index, snippet in enumerate(citation_snippets[: len(collected_sources)], start=1):
+        normalized_snippet = snippet.strip()
+        if not normalized_snippet:
+            continue
+        citation_lines.append(f"{normalized_snippet} [{index}]")
+    if not citation_lines:
+        citation_lines.append("i found grounded external evidence for this request. [1]")
+
+    message = " ".join(citation_lines)
+    if normalized_errors:
+        message = (
+            f"{message} partial results: some retrieval attempts failed "
+            f"({'; '.join(normalized_errors[:2])}). please retry with a narrower query."
+        )
+    return message, collected_sources
+
+
 def process_action_proposals(
     *,
     db: Session,
@@ -178,6 +357,11 @@ def process_action_proposals(
     blocked_reasons: list[str] = []
     created_action_attempts: list[ActionAttemptRecord] = []
     pending_approval_created = False
+    retrieval_requested = False
+    retrieval_only_proposals = True
+    retrieval_errors: list[str] = []
+    retrieval_sources: list[dict[str, Any]] = []
+    retrieval_snippets: list[str] = []
 
     proposals = proposals_raw if isinstance(proposals_raw, list) else []
     for proposal_index, proposal_raw in enumerate(proposals, start=1):
@@ -188,6 +372,11 @@ def process_action_proposals(
             if isinstance(capability_id_raw, str) and capability_id_raw.strip()
             else "invalid.capability"
         )
+        is_search_web_proposal = capability_id == "cap.search.web"
+        if is_search_web_proposal:
+            retrieval_requested = True
+        else:
+            retrieval_only_proposals = False
         raw_input_payload = proposal_payload.get("input")
         input_payload = jsonable_encoder(raw_input_payload) if isinstance(raw_input_payload, dict) else {}
         model_declared_taint_status = _model_declared_taint_status(proposal_payload)
@@ -270,6 +459,8 @@ def process_action_proposals(
                     "taint": taint_payload,
                 },
             )
+            if is_search_web_proposal:
+                retrieval_errors.append(evaluation.reason)
             continue
 
         if evaluation.decision == "requires_approval":
@@ -323,6 +514,8 @@ def process_action_proposals(
                     "expires_at": to_rfc3339(approval_request.expires_at),
                 },
             )
+            if is_search_web_proposal:
+                retrieval_errors.append(evaluation.reason)
             continue
 
         if evaluation.capability is None or evaluation.normalized_input is None:
@@ -340,6 +533,8 @@ def process_action_proposals(
                     "taint": taint_payload,
                 },
             )
+            if is_search_web_proposal:
+                retrieval_errors.append("policy_invariant_violation")
             continue
 
         action_attempt.status = "executing"
@@ -373,6 +568,8 @@ def process_action_proposals(
                     "error": integrity_error,
                 },
             )
+            if is_search_web_proposal:
+                retrieval_errors.append(integrity_error)
             continue
 
         add_event(
@@ -401,6 +598,27 @@ def process_action_proposals(
                     "output": execution_result.output,
                 }
             )
+            if is_search_web_proposal:
+                remaining_citations = _MAX_CITED_SOURCES - len(retrieval_sources)
+                if remaining_citations > 0:
+                    candidates = _extract_search_source_candidates(
+                        output_payload=execution_result.output,
+                        now_fn=now_fn,
+                    )
+                    if candidates:
+                        persisted_sources, persisted_snippets = _persist_retrieval_artifacts(
+                            db=db,
+                            session_id=session_id,
+                            turn_id=turn.id,
+                            action_attempt=action_attempt,
+                            candidates=candidates[:remaining_citations],
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        retrieval_sources.extend(persisted_sources)
+                        retrieval_snippets.extend(persisted_snippets)
+                    else:
+                        retrieval_errors.append("insufficient_evidence")
             add_event(
                 "evt.action.execution.succeeded",
                 {
@@ -417,6 +635,8 @@ def process_action_proposals(
         blocked_reasons.append(
             f"{capability_id}: {execution_result.error or 'execution_output_missing'}"
         )
+        if is_search_web_proposal:
+            retrieval_errors.append(action_attempt.execution_error)
         add_event(
             "evt.action.execution.failed",
             {
@@ -425,15 +645,24 @@ def process_action_proposals(
             },
         )
 
-    appendix = build_assistant_action_appendix(
-        inline_results=inline_results,
-        pending_approvals=pending_approvals,
-        blocked_reasons=blocked_reasons,
-    )
-    final_assistant_message = f"{assistant_message}\n{appendix}" if appendix else assistant_message
+    if retrieval_requested and retrieval_only_proposals:
+        final_assistant_message, assistant_sources = _synthesize_grounded_retrieval_answer(
+            collected_sources=retrieval_sources,
+            citation_snippets=retrieval_snippets,
+            retrieval_errors=retrieval_errors,
+        )
+    else:
+        appendix = build_assistant_action_appendix(
+            inline_results=inline_results,
+            pending_approvals=pending_approvals,
+            blocked_reasons=blocked_reasons,
+        )
+        final_assistant_message = f"{assistant_message}\n{appendix}" if appendix else assistant_message
+        assistant_sources = []
     return ProposalProcessingResult(
         assistant_message=final_assistant_message,
         action_attempts=created_action_attempts,
+        assistant_sources=assistant_sources,
     )
 
 
