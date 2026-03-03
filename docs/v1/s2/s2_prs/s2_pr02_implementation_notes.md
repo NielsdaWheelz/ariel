@@ -39,7 +39,7 @@ integrity mismatches fail closed before invocation with auditable `integrity_mis
 
 capabilities declare allowlisted outbound destinations in the registry.
 
-capability outputs may include internal `__egress__` metadata for outbound intents. executor validates each destination and blocks on mismatch (`egress_destination_denied:*`). internal egress metadata is stripped from user-facing outputs.
+pr-02 originally used internal `__egress__` output metadata for outbound intents. as of pr-08, egress moved to explicit preflight intent declaration (`declare_egress_intent`) validated before centralized dispatch; legacy `__egress__` output metadata is now treated as contract-invalid/undeclared intent and blocked fail-closed.
 
 ### Guardrails
 

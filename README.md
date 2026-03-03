@@ -70,6 +70,14 @@ slice-2 pr-07 closes the deterministic expiry gap for pending approvals:
 - reconciliation emits exactly one auditable `evt.action.approval.expired` per reconciled approval.
 - repeated timeline reads and post-reconcile approval decisions remain non-executing and idempotent.
 
+slice-2 pr-08 hardens outbound side effects with fail-closed egress preflight:
+
+- `external_send` capabilities declare egress intent via capability contract metadata and runtime
+  preflights destinations before dispatch.
+- missing/malformed/undeclared/non-allowlisted intent is blocked before external dispatch attempts.
+- outbound dispatch flows through a centralized runtime boundary instead of capability-specific
+  side-effect paths.
+
 approval decisions are handled through:
 
 ```bash
@@ -114,7 +122,7 @@ slice-2 pr-02/pr-03 hardening adds runtime boundary checks for side effects:
 - fail-closed taint handling for side effects: tainted/ambiguous `write_reversible` requires approval; tainted/ambiguous `write_irreversible` and `external_send` are denied.
 - action lifecycle events include taint provenance evidence and decision-basis metadata for audit reconstruction.
 - proposal-time execution identity capture (`capability_id`, `capability_version`, `capability_contract_hash`) and execution-time integrity enforcement.
-- deny-by-default outbound control via per-capability destination allowlists; non-allowlisted egress is blocked.
+- deny-by-default outbound control via preflight-declared per-capability destination allowlists; non-allowlisted egress is blocked before dispatch.
 - pre-execution input guardrails and post-execution output guardrails before side effects/user surfacing.
 - serialized side-effect execution gates during approval-triggered runs using transactional postgres advisory locks.
 
@@ -123,7 +131,8 @@ see `docs/v1/s2/s2_prs/s2_pr02_implementation_notes.md` and
 `docs/v1/s2/s2_prs/s2_pr04_implementation_notes.md` and
 `docs/v1/s2/s2_prs/s2_pr05_implementation_notes.md` and
 `docs/v1/s2/s2_prs/s2_pr06_implementation_notes.md` and
-`docs/v1/s2/s2_prs/s2_pr07_implementation_notes.md` for implementation details and tradeoffs.
+`docs/v1/s2/s2_prs/s2_pr07_implementation_notes.md` and
+`docs/v1/s2/s2_prs/s2_pr08_implementation_notes.md` for implementation details and tradeoffs.
 
 ## run locally
 

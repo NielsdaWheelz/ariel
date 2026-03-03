@@ -19,6 +19,7 @@ class CapabilityDefinition:
     allowed_egress_destinations: tuple[str, ...]
     validate_input: Callable[[dict[str, Any]], tuple[dict[str, Any] | None, str | None]]
     execute: Callable[[dict[str, Any]], dict[str, Any]]
+    declare_egress_intent: Callable[[dict[str, Any]], list[dict[str, Any]] | None] | None = None
 
 
 def _validate_exact_text_input(
@@ -95,13 +96,16 @@ def _execute_external_notify(input_payload: dict[str, Any]) -> dict[str, Any]:
         "status": "sent",
         "destination": input_payload["destination"],
         "message": input_payload["message"],
-        "__egress__": [
-            {
-                "destination": input_payload["destination"],
-                "payload": {"message": input_payload["message"]},
-            }
-        ],
     }
+
+
+def _declare_external_notify_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "destination": input_payload["destination"],
+            "payload": {"message": input_payload["message"]},
+        }
+    ]
 
 
 _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
@@ -174,6 +178,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         allowed_egress_destinations=("api.framework.local",),
         validate_input=_validate_external_notify_input,
         execute=_execute_external_notify,
+        declare_egress_intent=_declare_external_notify_egress_intent,
     ),
 }
 
