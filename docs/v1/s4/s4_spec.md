@@ -70,6 +70,12 @@ Deliver the highest-value Google productivity flows with correct safety boundari
 
 **Connector lifecycle is auditable end-to-end**: Connect/reconnect/disconnect/refresh outcomes are captured as durable events so users can inspect what authorization state changed, when it changed, and why capability execution was allowed or blocked.
 
+**Connector audit events stay in the connector domain**: Connector lifecycle audit records are first-class and durable, but are kept separate from turn/action timeline contracts to preserve clear event-domain boundaries.
+
+**Typed auth/scope failures are structured contracts**: Runtime surfaces auth/scope failures as machine-readable typed outcomes with explicit recovery guidance, not free-text parsing conventions.
+
+**`reconnect_required` is a derived readiness state**: User-visible connector readiness maps to `connected|not_connected|reconnect_required`; `reconnect_required` includes missing consent/scope, revoked access, and non-recoverable token state while excluding transient provider/network failures.
+
 **User-visible status must map to durable action lifecycle**: Every Google action (read, draft, create, send) remains reconstructable through proposal/policy/approval/execution events, so users can inspect what was requested, what was authorized, and what actually happened.
 
 Reference implementation baseline: `docs/v1/s4/s4_oauth_mvp_blueprint.md`.

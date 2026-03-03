@@ -44,6 +44,12 @@ Minimum durable fields:
 - `last_error_code` / `last_error_at`
 - `created_at` / `updated_at`
 
+Derived readiness (response surface):
+
+- expose raw connector `status` plus derived readiness `connected|not_connected|reconnect_required`.
+- `reconnect_required` means user action is required before safe capability execution (missing consent/scope, revoked access, or non-recoverable token state).
+- transient provider/network failures do not by themselves remap a connected connector to `reconnect_required`.
+
 Security baseline:
 
 - Token fields are encrypted at rest.
@@ -83,6 +89,19 @@ Rules:
 - Capability runtime must emit one typed class only.
 - No silent fallback to broader or unsafe behavior.
 - Typed reason must be persisted in lifecycle/audit events.
+- Typed failures are surfaced as structured machine-readable outcomes (typed class + recovery guidance), not free-text parsing contracts.
+
+Recommended runtime payload shape:
+
+```json
+{
+  "ok": false,
+  "auth_failure": {
+    "class": "consent_required",
+    "recovery": "Reconnect Google and grant requested scope"
+  }
+}
+```
 
 ## Token Refresh and Concurrency
 
@@ -120,6 +139,11 @@ Required auditable connector events:
 - `evt.connector.google.disconnected`
 
 Each event includes: connector id, account subject/email (redacted where needed), requested/granted scopes (non-secret), and safe failure reason when applicable.
+
+Boundary rule:
+
+- connector lifecycle events are connector-domain audit records and are not forced into turn/action timeline schemas.
+- capability execution still records turn/action lifecycle events and may reference connector failure classes/reasons when applicable.
 
 ## Non-Goals for Slice 4
 
