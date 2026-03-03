@@ -35,11 +35,14 @@ notes:
   `published_at`).
 - runtime-only/internal fields remain unsurfaced.
 
-## runtime behavior notes
+## runtime behavior notes (historical)
 
-- retrieval synthesis is applied only for retrieval-only proposal sets (`cap.search.web` proposals only).
-- mixed proposal sets (retrieval + non-retrieval) keep standard action appendix behavior so non-retrieval
-  action outcomes are preserved.
+- at pr-01 merge time, retrieval synthesis applied only for retrieval-only proposal sets
+  (`cap.search.web` proposals only).
+- at pr-01 merge time, mixed proposal sets (retrieval + non-retrieval) kept standard action appendix
+  behavior so non-retrieval action outcomes were preserved.
+- superseded in pr-03: retrieval-backed mixed turns now keep grounded narrative in `assistant.message`
+  with telemetry retained in structured lifecycle/event surfaces.
 - retrieval citations are capped and persisted with stable identities.
 
 ## config
