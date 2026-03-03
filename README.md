@@ -56,6 +56,14 @@ user-facing turn/timeline payloads now include a dedicated surfaced lifecycle pr
 the phone surface renders action details directly from this surfaced projection, not from raw engine records.
 `turn.action_attempts` is not part of the user-facing turn/timeline contract.
 
+slice-2 pr-06 locks response boundaries for user-facing slice-2 APIs:
+
+- `POST /v1/sessions/{session_id}/message`, `GET /v1/sessions/{session_id}/events`, and
+  `POST /v1/approvals` are schema-enforced surfaced contracts.
+- message responses expose `assistant.message` only (not `assistant.provider/model`).
+- turn events use strict per-`event_type` payload schemas (no open `events[].payload` dictionaries).
+- contract drift is fail-closed with `E_RESPONSE_CONTRACT` and sanitized error details.
+
 approval decisions are handled through:
 
 ```bash
@@ -107,7 +115,8 @@ slice-2 pr-02/pr-03 hardening adds runtime boundary checks for side effects:
 see `docs/v1/s2/s2_prs/s2_pr02_implementation_notes.md` and
 `docs/v1/s2/s2_prs/s2_pr03_implementation_notes.md` and
 `docs/v1/s2/s2_prs/s2_pr04_implementation_notes.md` and
-`docs/v1/s2/s2_prs/s2_pr05_implementation_notes.md` for implementation details and tradeoffs.
+`docs/v1/s2/s2_prs/s2_pr05_implementation_notes.md` and
+`docs/v1/s2/s2_prs/s2_pr06_implementation_notes.md` for implementation details and tradeoffs.
 
 ## run locally
 
