@@ -91,3 +91,4 @@
   - regression tests prove denied egress paths perform zero external dispatch attempts and preserve redacted surfaced lifecycle output.
   - approved/allowlisted egress paths continue to succeed under the same surfaced response contracts and audit event chain.
 - **non-goals**: no OS-level sandboxing guarantees, no new capability domains, and no changes to approval token semantics.
+- **status**: landed in current implementation branch; see `s2_prs/s2_pr08_implementation_notes.md`.
