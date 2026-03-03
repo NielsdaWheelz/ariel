@@ -23,3 +23,14 @@
   - weather responses include resolved location/timeframe, forecast or observation timestamps, and source references; upstream weather/search failures remain explicit and recoverable.
   - regression coverage demonstrates end-to-end Slice 3 behavior across grounded factual Q&A, news recency/attribution, weather location handling, and failure recovery.
 - **non-goals**: no proactive scheduler/notification execution, no durable-memory/session-rotation changes, no provider failover guarantees beyond capability-mediated retrieval architecture.
+
+### PR-03: Grounding Safety Hardening (planned after PR-02 merges)
+- **goal**: close remaining Slice 3 grounding safety gaps so external factual responses stay citation-gated even under conflicting evidence and mixed proposal sets.
+- **builds on**: PR-02.
+- **acceptance**:
+  - when retrieval evidence is conflicting for the same factual claim, Ariel returns explicit uncertainty plus a concrete recovery step instead of presenting a definitive claim.
+  - turns that include retrieval (`cap.search.web`/`cap.search.news`/`cap.weather.forecast`) still produce grounded synthesis with inline citations + `assistant.sources[]`, even when mixed with non-retrieval proposals.
+  - external factual assertions in surfaced assistant text are blocked unless they are backed by cited provenance artifacts; unsupported assertions are replaced with uncertainty language.
+  - non-retrieval action outcomes remain inspectable in the same turn response flow without regressing lifecycle/event auditability.
+  - regression coverage adds explicit conflict-evidence and mixed-turn citation-gating cases and blocks release on failure.
+- **non-goals**: no full claim-extraction/NLI platform, no cross-turn truth maintenance, and no ranking/relevance ML changes beyond deterministic MVP heuristics.
