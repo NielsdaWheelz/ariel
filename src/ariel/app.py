@@ -32,6 +32,12 @@ from ariel.action_runtime import (
 )
 from ariel.config import AppSettings
 from ariel.db import missing_required_tables, reset_schema_for_tests
+from ariel.google_connector import (
+    DefaultGoogleOAuthClient,
+    DefaultGoogleWorkspaceProvider,
+    GoogleConnectorError,
+    GoogleConnectorRuntime,
+)
 from ariel.persistence import (
     ActionAttemptRecord,
     ApprovalRequestRecord,
@@ -733,6 +739,18 @@ def create_app(
     app.state.max_turn_wall_time_ms = settings.max_turn_wall_time_ms
     app.state.approval_ttl_seconds = settings.approval_ttl_seconds
     app.state.approval_actor_id = settings.approval_actor_id
+    app.state.google_oauth_redirect_uri = settings.google_oauth_redirect_uri
+    app.state.google_oauth_state_ttl_seconds = settings.google_oauth_state_ttl_seconds
+    app.state.google_oauth_timeout_seconds = settings.google_oauth_timeout_seconds
+    app.state.connector_encryption_secret = settings.connector_encryption_secret
+    app.state.connector_encryption_key_version = settings.connector_encryption_key_version
+    app.state.connector_encryption_keys = settings.connector_encryption_keys
+    app.state.google_oauth_client = DefaultGoogleOAuthClient(
+        client_id=settings.google_oauth_client_id,
+        client_secret=settings.google_oauth_client_secret,
+        timeout_seconds=settings.google_oauth_timeout_seconds,
+    )
+    app.state.google_workspace_provider = DefaultGoogleWorkspaceProvider()
     app.state.schema_missing_tables = []
 
     @app.exception_handler(ApiError)
@@ -776,6 +794,21 @@ def create_app(
                 details={"missing_tables": app.state.schema_missing_tables},
                 retryable=False,
             )
+
+    def _google_runtime() -> GoogleConnectorRuntime:
+        return GoogleConnectorRuntime(
+            oauth_client=app.state.google_oauth_client,
+            workspace_provider=app.state.google_workspace_provider,
+            redirect_uri=str(app.state.google_oauth_redirect_uri),
+            oauth_state_ttl_seconds=int(app.state.google_oauth_state_ttl_seconds),
+            encryption_secret=str(app.state.connector_encryption_secret),
+            encryption_key_version=str(app.state.connector_encryption_key_version),
+            encryption_keys=(
+                str(app.state.connector_encryption_keys)
+                if app.state.connector_encryption_keys is not None
+                else None
+            ),
+        )
 
     @app.get("/v1/health", response_model=None)
     def health() -> JSONResponse | dict[str, bool]:
@@ -840,6 +873,151 @@ def create_app(
                 "source": state.source,
                 "updated_at": to_rfc3339(state.updated_at) if state.updated_at is not None else None,
             }
+
+    @app.get("/v1/connectors/google", response_model=None)
+    def get_google_connector_status() -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                try:
+                    connector_payload = _google_runtime().status_payload(
+                        db=db,
+                        now_fn=_utcnow,
+                    )
+                except GoogleConnectorError as exc:
+                    return _error_response(
+                        ApiError(
+                            status_code=exc.status_code,
+                            code=exc.code,
+                            message=exc.message,
+                            details=exc.details,
+                            retryable=exc.retryable,
+                        )
+                    )
+            return {"ok": True, "connector": connector_payload}
+
+    @app.get("/v1/connectors/google/events", response_model=None)
+    def get_google_connector_events(limit: int = 100) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                try:
+                    events_payload = _google_runtime().list_events(
+                        db=db,
+                        limit=limit,
+                    )
+                except GoogleConnectorError as exc:
+                    return _error_response(
+                        ApiError(
+                            status_code=exc.status_code,
+                            code=exc.code,
+                            message=exc.message,
+                            details=exc.details,
+                            retryable=exc.retryable,
+                        )
+                    )
+            return {"ok": True, "events": events_payload}
+
+    @app.post("/v1/connectors/google/start", response_model=None)
+    def post_google_connector_start() -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                try:
+                    payload = _google_runtime().start_oauth(
+                        db=db,
+                        reconnect=False,
+                        now_fn=_utcnow,
+                        new_id_fn=_new_id,
+                    )
+                except GoogleConnectorError as exc:
+                    return _error_response(
+                        ApiError(
+                            status_code=exc.status_code,
+                            code=exc.code,
+                            message=exc.message,
+                            details=exc.details,
+                            retryable=exc.retryable,
+                        )
+                    )
+            return {"ok": True, **payload}
+
+    @app.post("/v1/connectors/google/reconnect", response_model=None)
+    def post_google_connector_reconnect() -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                try:
+                    payload = _google_runtime().start_oauth(
+                        db=db,
+                        reconnect=True,
+                        now_fn=_utcnow,
+                        new_id_fn=_new_id,
+                    )
+                except GoogleConnectorError as exc:
+                    return _error_response(
+                        ApiError(
+                            status_code=exc.status_code,
+                            code=exc.code,
+                            message=exc.message,
+                            details=exc.details,
+                            retryable=exc.retryable,
+                        )
+                    )
+            return {"ok": True, **payload}
+
+    @app.get("/v1/connectors/google/callback", response_model=None)
+    def get_google_connector_callback(
+        state: str | None = None,
+        code: str | None = None,
+        error: str | None = None,
+    ) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                try:
+                    connector_payload = _google_runtime().complete_oauth_callback(
+                        db=db,
+                        state=state,
+                        code=code,
+                        error=error,
+                        now_fn=_utcnow,
+                        new_id_fn=_new_id,
+                    )
+                except GoogleConnectorError as exc:
+                    return _error_response(
+                        ApiError(
+                            status_code=exc.status_code,
+                            code=exc.code,
+                            message=exc.message,
+                            details=exc.details,
+                            retryable=exc.retryable,
+                        )
+                    )
+            return {"ok": True, "connector": connector_payload}
+
+    @app.delete("/v1/connectors/google", response_model=None)
+    def delete_google_connector() -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                try:
+                    connector_payload = _google_runtime().disconnect(
+                        db=db,
+                        now_fn=_utcnow,
+                        new_id_fn=_new_id,
+                    )
+                except GoogleConnectorError as exc:
+                    return _error_response(
+                        ApiError(
+                            status_code=exc.status_code,
+                            code=exc.code,
+                            message=exc.message,
+                            details=exc.details,
+                            retryable=exc.retryable,
+                        )
+                    )
+            return {"ok": True, "connector": connector_payload}
 
     @app.post("/v1/sessions/{session_id}/message", response_model=None)
     def post_message(session_id: str, payload: MessageRequest) -> JSONResponse | dict[str, Any]:
@@ -1154,6 +1332,7 @@ def create_app(
                         now_fn=_utcnow,
                         new_id_fn=_new_id,
                         runtime_provenance=runtime_provenance,
+                        google_runtime=_google_runtime(),
                     )
                     created_action_attempts.extend(proposal_processing.action_attempts)
 

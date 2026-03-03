@@ -18,10 +18,17 @@ from ariel.capability_registry import (
     payload_hash,
 )
 from ariel.executor import (
+    ExecutionResult,
     append_turn_event,
     build_assistant_action_appendix,
     execute_capability,
     next_turn_event_sequence,
+)
+from ariel.google_connector import (
+    GOOGLE_READ_CAPABILITY_IDS,
+    GoogleCapabilityExecutionResult,
+    GoogleConnectorRuntime,
+    TypedAuthFailure,
 )
 from ariel.persistence import (
     ActionAttemptRecord,
@@ -185,6 +192,23 @@ _GROUNDED_RETRIEVAL_CAPABILITIES = {
     "cap.search.web",
     "cap.search.news",
     "cap.weather.forecast",
+    *GOOGLE_READ_CAPABILITY_IDS,
+}
+
+_TYPED_AUTH_FAILURE_CLASSES = {
+    "not_connected",
+    "consent_required",
+    "scope_missing",
+    "token_expired",
+    "access_revoked",
+}
+
+_TYPED_AUTH_RECOVERY: dict[str, str] = {
+    "not_connected": "Connect Google to continue.",
+    "consent_required": "Reconnect Google and grant the requested scope.",
+    "scope_missing": "Reconnect Google and re-consent to required scopes.",
+    "token_expired": "Retry once; if it still fails, reconnect Google.",
+    "access_revoked": "Reconnect Google from scratch.",
 }
 
 
@@ -551,6 +575,89 @@ def _synthesize_weather_retrieval_answer(
     return message, collected_sources
 
 
+def _synthesize_google_read_answer(
+    *,
+    collected_sources: list[dict[str, Any]],
+    citation_snippets: list[str],
+    retrieval_errors: list[str],
+    retrieval_capability_ids: set[str],
+    google_outputs: list[dict[str, Any]],
+    google_auth_failures: list[TypedAuthFailure],
+) -> tuple[str, list[dict[str, Any]]]:
+    if google_auth_failures:
+        first_failure = google_auth_failures[0]
+        return (
+            f"google connector auth failure ({first_failure.failure_class}). "
+            f"{first_failure.recovery}",
+            [],
+        )
+
+    for candidate in retrieval_errors:
+        if candidate in _TYPED_AUTH_FAILURE_CLASSES:
+            recovery = _TYPED_AUTH_RECOVERY.get(candidate, "Reconnect Google and retry.")
+            return (
+                f"google connector auth failure ({candidate}). {recovery}",
+                [],
+            )
+
+    if not collected_sources:
+        if retrieval_errors:
+            return (
+                "i could not retrieve google workspace data. "
+                f"failure: {retrieval_errors[0]}. reconnect google and retry.",
+                [],
+            )
+        return (
+            "i could not retrieve google workspace data. reconnect google and retry.",
+            [],
+        )
+
+    if retrieval_capability_ids == {"cap.calendar.list"}:
+        prefix = "schedule context:"
+    elif retrieval_capability_ids == {"cap.calendar.propose_slots"}:
+        prefix = "slot options:"
+    elif retrieval_capability_ids.issubset({"cap.email.search", "cap.email.read"}):
+        prefix = "email results:"
+    else:
+        prefix = "google workspace results:"
+
+    bounded_snippets = citation_snippets[: len(collected_sources)]
+    rendered_snippets: list[str] = []
+    for index, snippet in enumerate(bounded_snippets, start=1):
+        normalized = snippet.strip()
+        if not normalized:
+            continue
+        rendered_snippets.append(f"{normalized} [{index}]")
+    if not rendered_snippets:
+        rendered_snippets.append("results available. [1]")
+
+    message = f"{prefix} {' '.join(rendered_snippets)}"
+
+    for output in google_outputs:
+        attendee_intersection_used = output.get("attendee_intersection_used")
+        if attendee_intersection_used is not False:
+            continue
+        recovery_hint_raw = output.get("attendee_recovery_hint")
+        recovery_hint = (
+            recovery_hint_raw.strip()
+            if isinstance(recovery_hint_raw, str) and recovery_hint_raw.strip()
+            else (
+                "Reconnect Google and grant attendee free/busy scope to include "
+                "attendee intersection."
+            )
+        )
+        message = (
+            f"{message} attendee availability was unavailable, so planning used "
+            f"user-calendar-only mode. {recovery_hint}"
+        )
+        break
+
+    non_typed_errors = [item for item in retrieval_errors if item not in _TYPED_AUTH_FAILURE_CLASSES]
+    if non_typed_errors:
+        message = f"{message} partial results: {non_typed_errors[0]}. retry with narrower input."
+    return message, collected_sources
+
+
 def process_action_proposals(
     *,
     db: Session,
@@ -564,6 +671,7 @@ def process_action_proposals(
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
     runtime_provenance: RuntimeProvenance | None = None,
+    google_runtime: GoogleConnectorRuntime | None = None,
 ) -> ProposalProcessingResult:
     inline_results: list[dict[str, Any]] = []
     pending_approvals: list[dict[str, Any]] = []
@@ -577,6 +685,8 @@ def process_action_proposals(
     retrieval_source_metadata: list[dict[str, Any]] = []
     retrieval_capability_ids: set[str] = set()
     weather_outputs: list[dict[str, Any]] = []
+    google_outputs: list[dict[str, Any]] = []
+    google_auth_failures: list[TypedAuthFailure] = []
 
     proposals = proposals_raw if isinstance(proposals_raw, list) else []
     for proposal_index, proposal_raw in enumerate(proposals, start=1):
@@ -587,6 +697,7 @@ def process_action_proposals(
             if isinstance(capability_id_raw, str) and capability_id_raw.strip()
             else "invalid.capability"
         )
+        is_google_read_proposal = capability_id in GOOGLE_READ_CAPABILITY_IDS
         is_retrieval_proposal = capability_id in _GROUNDED_RETRIEVAL_CAPABILITIES
         is_weather_forecast_proposal = capability_id == "cap.weather.forecast"
         if is_retrieval_proposal:
@@ -805,14 +916,53 @@ def process_action_proposals(
                 "capability_id": capability_id,
             },
         )
-        _acquire_side_effect_execution_lock(
-            db=db,
-            impact_level=evaluation.capability.impact_level,
-        )
-        execution_result = execute_capability(
-            capability=evaluation.capability,
-            normalized_input=evaluation.normalized_input,
-        )
+        execution_result: ExecutionResult | GoogleCapabilityExecutionResult
+        if is_google_read_proposal and google_runtime is not None:
+            google_execution_result = google_runtime.execute_read_capability(
+                db=db,
+                capability_id=capability_id,
+                normalized_input=evaluation.normalized_input,
+                now_fn=now_fn,
+                new_id_fn=new_id_fn,
+            )
+            if (
+                google_execution_result.status == "succeeded"
+                and google_execution_result.output is not None
+            ):
+                execution_result = google_execution_result
+                google_outputs.append(google_execution_result.output)
+            else:
+                error_reason = (
+                    google_execution_result.auth_failure.failure_class
+                    if google_execution_result.auth_failure is not None
+                    else (google_execution_result.error or "execution_output_missing")
+                )
+                if google_execution_result.auth_failure is not None:
+                    google_auth_failures.append(google_execution_result.auth_failure)
+                action_attempt.execution_output = None
+                action_attempt.execution_error = error_reason
+                action_attempt.status = "failed"
+                action_attempt.updated_at = now_fn()
+                blocked_reasons.append(f"{capability_id}: {error_reason}")
+                if is_retrieval_proposal:
+                    retrieval_errors.append(error_reason)
+                add_event(
+                    "evt.action.execution.failed",
+                    {
+                        "action_attempt_id": action_attempt.id,
+                        "error": error_reason,
+                    },
+                )
+                continue
+        else:
+            _acquire_side_effect_execution_lock(
+                db=db,
+                impact_level=evaluation.capability.impact_level,
+            )
+            execution_result = execute_capability(
+                capability=evaluation.capability,
+                normalized_input=evaluation.normalized_input,
+            )
         if execution_result.status == "succeeded" and execution_result.output is not None:
             action_attempt.execution_output = execution_result.output
             action_attempt.execution_error = None
@@ -880,7 +1030,16 @@ def process_action_proposals(
         )
 
     if retrieval_requested:
-        if retrieval_capability_ids == {"cap.search.news"}:
+        if retrieval_capability_ids and retrieval_capability_ids.issubset(GOOGLE_READ_CAPABILITY_IDS):
+            final_assistant_message, assistant_sources = _synthesize_google_read_answer(
+                collected_sources=retrieval_sources,
+                citation_snippets=retrieval_snippets,
+                retrieval_errors=retrieval_errors,
+                retrieval_capability_ids=retrieval_capability_ids,
+                google_outputs=google_outputs,
+                google_auth_failures=google_auth_failures,
+            )
+        elif retrieval_capability_ids == {"cap.search.news"}:
             final_assistant_message, assistant_sources = _synthesize_news_retrieval_answer(
                 collected_sources=retrieval_sources,
                 citation_snippets=retrieval_snippets,
