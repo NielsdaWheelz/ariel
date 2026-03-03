@@ -31,6 +31,7 @@
   - when retrieval evidence is conflicting for the same factual claim, Ariel returns explicit uncertainty plus a concrete recovery step instead of presenting a definitive claim.
   - turns that include retrieval (`cap.search.web`/`cap.search.news`/`cap.weather.forecast`) still produce grounded synthesis with inline citations + `assistant.sources[]`, even when mixed with non-retrieval proposals.
   - external factual assertions in surfaced assistant text are blocked unless they are backed by cited provenance artifacts; unsupported assertions are replaced with uncertainty language.
-  - non-retrieval action outcomes remain inspectable in the same turn response flow without regressing lifecycle/event auditability.
+  - non-retrieval action outcomes remain inspectable via structured lifecycle/event surfaces in the same turn response flow without regressing auditability.
+  - for retrieval-backed mixed turns, `assistant.message` remains grounded narrative (not raw action-result appendix text), with execution telemetry preserved in structured surfaces.
   - regression coverage adds explicit conflict-evidence and mixed-turn citation-gating cases and blocks release on failure.
 - **non-goals**: no full claim-extraction/NLI platform, no cross-turn truth maintenance, and no ranking/relevance ML changes beyond deterministic MVP heuristics.
