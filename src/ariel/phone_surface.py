@@ -33,6 +33,17 @@ PHONE_SURFACE_HTML = """<!doctype html>
     .turn:last-child { border-bottom: none; margin-bottom: 0; }
     .meta { color: #8b949e; font-size: 0.8rem; margin-bottom: 4px; }
     .action { font-size: 0.85rem; margin-left: 8px; color: #d2a8ff; }
+    .approval-controls { margin-left: 8px; margin-top: 4px; display: flex; gap: 6px; }
+    .approval-btn {
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 4px 8px;
+      background: #238636;
+      color: #fff;
+      font-size: 0.78rem;
+      font-weight: 600;
+    }
+    .approval-deny { background: #da3633; }
     .event { font-size: 0.85rem; margin-left: 8px; color: #c9d1d9; }
     form { display: flex; gap: 8px; }
     input {
@@ -82,7 +93,9 @@ PHONE_SURFACE_HTML = """<!doctype html>
       return String(value ?? "")
         .replaceAll("&", "&amp;")
         .replaceAll("<", "&lt;")
-        .replaceAll(">", "&gt;");
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
     }
 
     function formatUsage(usage) {
@@ -142,6 +155,7 @@ PHONE_SURFACE_HTML = """<!doctype html>
       if (policy.decision) parts.push(`policy=${policy.decision}`);
       if (policy.reason) parts.push(`policy_reason=${policy.reason}`);
       if (approval.status) parts.push(`approval=${approval.status}`);
+      if (approval.reference) parts.push(`approval_ref=${approval.reference}`);
       if (approval.reason) parts.push(`approval_reason=${approval.reason}`);
       if (execution.status) parts.push(`execution=${execution.status}`);
       if (execution.output !== undefined && execution.output !== null) {
@@ -149,6 +163,33 @@ PHONE_SURFACE_HTML = """<!doctype html>
       }
       if (execution.error) parts.push(`error=${execution.error}`);
       return parts.join(" | ");
+    }
+
+    function approvalReferenceFromLifecycle(lifecycleItem) {
+      const approvalRef = (
+        lifecycleItem &&
+        lifecycleItem.approval &&
+        typeof lifecycleItem.approval.reference === "string" &&
+        lifecycleItem.approval.reference
+      )
+        ? lifecycleItem.approval.reference
+        : null;
+      return approvalRef;
+    }
+
+    function renderApprovalControls(lifecycleItem) {
+      const approval = (lifecycleItem && typeof lifecycleItem.approval === "object" && lifecycleItem.approval !== null)
+        ? lifecycleItem.approval
+        : {};
+      if (approval.status !== "pending") return "";
+      const approvalRef = approvalReferenceFromLifecycle(lifecycleItem);
+      if (!approvalRef) return "";
+      return `
+        <div class="approval-controls">
+          <button class="approval-btn" type="button" data-approval-ref="${escapeHtml(approvalRef)}" data-decision="approve">approve</button>
+          <button class="approval-btn approval-deny" type="button" data-approval-ref="${escapeHtml(approvalRef)}" data-decision="deny">deny</button>
+        </div>
+      `;
     }
 
     function renderTimeline(turns) {
@@ -160,7 +201,11 @@ PHONE_SURFACE_HTML = """<!doctype html>
         const actionAttempts = (Array.isArray(turn.surface_action_lifecycle) ? turn.surface_action_lifecycle : [])
           .map((lifecycleItem) => {
             const detailText = formatSurfaceLifecycleDetails(lifecycleItem);
-            return `<div class="action">action[${escapeHtml(lifecycleItem.proposal_index)}] ${escapeHtml(detailText)}</div>`;
+            const controls = renderApprovalControls(lifecycleItem);
+            return `
+              <div class="action">action[${escapeHtml(lifecycleItem.proposal_index)}] ${escapeHtml(detailText)}</div>
+              ${controls}
+            `;
           })
           .join("");
         const events = turn.events
@@ -213,6 +258,21 @@ PHONE_SURFACE_HTML = """<!doctype html>
       }
     }
 
+    async function submitApprovalDecision(approvalRef, decision) {
+      const response = await fetch("/v1/approvals", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          approval_ref: approvalRef,
+          decision,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok || !data.ok) {
+        throw new Error(data?.error?.message || "approval update failed");
+      }
+    }
+
     formNode.addEventListener("submit", async (event) => {
       event.preventDefault();
       const text = messageNode.value.trim();
@@ -225,6 +285,27 @@ PHONE_SURFACE_HTML = """<!doctype html>
         setStatus("ok");
       } catch (error) {
         setStatus(error.message);
+      }
+    });
+
+    timelineNode.addEventListener("click", async (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) return;
+      const button = target.closest("button[data-approval-ref][data-decision]");
+      if (!(button instanceof HTMLButtonElement)) return;
+      const approvalRef = button.getAttribute("data-approval-ref");
+      const decision = button.getAttribute("data-decision");
+      if (!approvalRef || (decision !== "approve" && decision !== "deny")) return;
+      button.disabled = true;
+      setStatus(`submitting ${decision}...`);
+      try {
+        await submitApprovalDecision(approvalRef, decision);
+        await loadTimeline();
+        setStatus("approval updated");
+      } catch (error) {
+        setStatus(error.message);
+      } finally {
+        button.disabled = false;
       }
     });
 

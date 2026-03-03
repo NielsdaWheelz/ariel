@@ -309,7 +309,7 @@ def process_action_proposals(
             pending_approval_created = True
             pending_approvals.append(
                 {
-                    "approval_id": approval_request.id,
+                    "approval_ref": approval_request.id,
                     "capability_id": capability_id,
                     "expires_at": to_rfc3339(approval_request.expires_at),
                 }
@@ -318,7 +318,7 @@ def process_action_proposals(
                 "evt.action.approval.requested",
                 {
                     "action_attempt_id": action_attempt.id,
-                    "approval_id": approval_request.id,
+                    "approval_ref": approval_request.id,
                     "actor_id": approval_request.actor_id,
                     "expires_at": to_rfc3339(approval_request.expires_at),
                 },
@@ -440,7 +440,7 @@ def process_action_proposals(
 def resolve_approval_decision(
     *,
     db: Session,
-    approval_id: str,
+    approval_ref: str,
     decision: Literal["approve", "deny"],
     actor_id: str,
     reason: str | None,
@@ -449,7 +449,7 @@ def resolve_approval_decision(
 ) -> ApprovalDecisionResult:
     approval = db.scalar(
         select(ApprovalRequestRecord)
-        .where(ApprovalRequestRecord.id == approval_id)
+        .where(ApprovalRequestRecord.id == approval_ref)
         .with_for_update()
         .limit(1)
     )
@@ -458,7 +458,7 @@ def resolve_approval_decision(
             status_code=404,
             code="E_APPROVAL_NOT_FOUND",
             message="approval request not found",
-            details={"approval_id": approval_id},
+            details={"approval_ref": approval_ref},
             retryable=False,
         )
 
@@ -478,7 +478,7 @@ def resolve_approval_decision(
             code="E_APPROVAL_ACTOR_MISMATCH",
             message="approval actor does not match the pending request",
             details={
-                "approval_id": approval.id,
+                "approval_ref": approval.id,
                 "expected_actor_id": approval.actor_id,
                 "received_actor_id": actor_id,
             },
@@ -491,9 +491,8 @@ def resolve_approval_decision(
             code="E_APPROVAL_NOT_PENDING",
             message="approval request is already resolved",
             details={
-                "approval_id": approval.id,
+                "approval_ref": approval.id,
                 "status": approval.status,
-                "action_attempt_id": approval.action_attempt_id,
             },
             retryable=False,
         )
@@ -527,7 +526,7 @@ def resolve_approval_decision(
             "evt.action.approval.expired",
             {
                 "action_attempt_id": action_attempt.id,
-                "approval_id": approval.id,
+                "approval_ref": approval.id,
                 "reason": "approval_expired",
             },
         )
@@ -537,8 +536,7 @@ def resolve_approval_decision(
             code="E_APPROVAL_EXPIRED",
             message="approval request has expired",
             details={
-                "approval_id": approval.id,
-                "action_attempt_id": action_attempt.id,
+                "approval_ref": approval.id,
                 "expires_at": to_rfc3339(approval.expires_at),
             },
             retryable=False,
@@ -556,7 +554,7 @@ def resolve_approval_decision(
             "evt.action.approval.denied",
             {
                 "action_attempt_id": action_attempt.id,
-                "approval_id": approval.id,
+                "approval_ref": approval.id,
                 "actor_id": approval.actor_id,
                 "reason": approval.decision_reason,
             },
@@ -587,7 +585,7 @@ def resolve_approval_decision(
             "evt.action.execution.failed",
             {
                 "action_attempt_id": action_attempt.id,
-                "approval_id": approval.id,
+                "approval_ref": approval.id,
                 "error": "approval payload mismatch",
             },
         )
@@ -597,8 +595,7 @@ def resolve_approval_decision(
             code="E_APPROVAL_PAYLOAD_MISMATCH",
             message="approval payload mismatch",
             details={
-                "approval_id": approval.id,
-                "action_attempt_id": action_attempt.id,
+                "approval_ref": approval.id,
             },
             retryable=False,
         )
@@ -614,7 +611,7 @@ def resolve_approval_decision(
         "evt.action.approval.approved",
         {
             "action_attempt_id": action_attempt.id,
-            "approval_id": approval.id,
+            "approval_ref": approval.id,
             "actor_id": approval.actor_id,
         },
     )

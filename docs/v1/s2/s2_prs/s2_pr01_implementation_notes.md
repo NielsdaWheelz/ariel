@@ -42,6 +42,9 @@ Request body:
 }
 ```
 
+historical note: this PR-01 contract used `approval_id`. PR-05 replaces this with surfaced
+`approval_ref` and surfaced-only approval responses.
+
 Enforced invariants:
 
 - pending-only, single-use approval records

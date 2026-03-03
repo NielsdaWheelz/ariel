@@ -50,10 +50,11 @@ user-facing turn/timeline payloads now include a dedicated surfaced lifecycle pr
 - `turn.surface_action_lifecycle[]` with allowlisted, redacted fields only:
   - `proposal` (`capability_id`, `input_summary`)
   - `policy` (`decision`, `reason`)
-  - `approval` (`status`, `reason`, `expires_at`, `decided_at`)
+  - `approval` (`status`, `reference`, `reason`, `expires_at`, `decided_at`)
   - `execution` (`status`, `output`, `error`)
 
 the phone surface renders action details directly from this surfaced projection, not from raw engine records.
+`turn.action_attempts` is not part of the user-facing turn/timeline contract.
 
 approval decisions are handled through:
 
@@ -65,14 +66,33 @@ request body:
 
 ```json
 {
-  "approval_id": "apr_xxx",
+  "approval_ref": "apr_xxx",
   "decision": "approve",
   "actor_id": "user.local",
   "reason": "optional"
 }
 ```
 
-the endpoint is single-use, actor-bound, expiry-bound, and executes only the frozen proposed payload.
+response body:
+
+```json
+{
+  "ok": true,
+  "approval": {
+    "reference": "apr_xxx",
+    "status": "approved|denied|expired",
+    "reason": null,
+    "expires_at": "2026-03-03T07:00:00Z",
+    "decided_at": "2026-03-03T06:59:30Z"
+  },
+  "assistant": {
+    "message": "approved action executed successfully."
+  }
+}
+```
+
+the endpoint is single-use, actor-bound, expiry-bound, executes only the frozen proposed payload,
+and exposes surfaced approval state only (no internal action-attempt object in response).
 
 slice-2 pr-02/pr-03 hardening adds runtime boundary checks for side effects:
 
@@ -86,7 +106,8 @@ slice-2 pr-02/pr-03 hardening adds runtime boundary checks for side effects:
 
 see `docs/v1/s2/s2_prs/s2_pr02_implementation_notes.md` and
 `docs/v1/s2/s2_prs/s2_pr03_implementation_notes.md` and
-`docs/v1/s2/s2_prs/s2_pr04_implementation_notes.md` for implementation details and tradeoffs.
+`docs/v1/s2/s2_prs/s2_pr04_implementation_notes.md` and
+`docs/v1/s2/s2_prs/s2_pr05_implementation_notes.md` for implementation details and tradeoffs.
 
 ## run locally
 

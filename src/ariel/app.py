@@ -37,13 +37,13 @@ from ariel.persistence import (
     EventRecord,
     SessionRecord,
     TurnRecord,
-    serialize_approval_request,
     serialize_action_attempt,
     serialize_session,
     serialize_turn,
+    to_rfc3339,
 )
 from ariel.phone_surface import PHONE_SURFACE_HTML
-from ariel.redaction import safe_failure_reason
+from ariel.redaction import redact_text, safe_failure_reason
 
 
 def _utcnow() -> datetime:
@@ -83,17 +83,26 @@ class MessageRequest(BaseModel):
 
 
 class ApprovalDecisionRequest(BaseModel):
-    approval_id: str = Field(min_length=1, max_length=64)
+    approval_ref: str = Field(min_length=1, max_length=64)
     decision: Literal["approve", "deny"]
-    actor_id: str = Field(min_length=1, max_length=128)
+    actor_id: str | None = Field(default=None, max_length=128)
     reason: str | None = Field(default=None, max_length=500)
 
-    @field_validator("approval_id", "actor_id")
+    @field_validator("approval_ref")
     @classmethod
-    def _must_not_be_blank(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("field must not be blank")
-        return value.strip()
+    def _approval_ref_must_not_be_blank(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("approval_ref must not be blank")
+        return normalized
+
+    @field_validator("actor_id")
+    @classmethod
+    def _normalize_actor_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
 
     @field_validator("reason")
     @classmethod
@@ -1120,11 +1129,12 @@ def create_app(
         with session_factory() as db:
             with db.begin():
                 try:
+                    actor_id = payload.actor_id or str(app.state.approval_actor_id)
                     decision_result = resolve_approval_decision(
                         db=db,
-                        approval_id=payload.approval_id,
+                        approval_ref=payload.approval_ref,
                         decision=payload.decision,
-                        actor_id=payload.actor_id,
+                        actor_id=actor_id,
                         reason=payload.reason,
                         now_fn=_utcnow,
                         new_id_fn=_new_id,
@@ -1142,11 +1152,21 @@ def create_app(
 
                 return {
                     "ok": True,
-                    "approval": serialize_approval_request(decision_result.approval),
-                    "action_attempt": serialize_action_attempt(
-                        decision_result.action_attempt,
-                        approval=decision_result.approval,
-                    ),
+                    "approval": {
+                        "reference": decision_result.approval.id,
+                        "status": decision_result.approval.status,
+                        "reason": (
+                            redact_text(decision_result.approval.decision_reason)
+                            if isinstance(decision_result.approval.decision_reason, str)
+                            else None
+                        ),
+                        "expires_at": to_rfc3339(decision_result.approval.expires_at),
+                        "decided_at": (
+                            to_rfc3339(decision_result.approval.decided_at)
+                            if decision_result.approval.decided_at is not None
+                            else None
+                        ),
+                    },
                     "assistant": {"message": decision_result.assistant_message},
                 }
 

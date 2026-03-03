@@ -172,7 +172,7 @@ def build_assistant_action_appendix(
     for pending in pending_approvals:
         lines.append(
             "approval required "
-            f"({pending['capability_id']}): approval_id={pending['approval_id']} "
+            f"({pending['capability_id']}): approval_ref={pending['approval_ref']} "
             f"expires_at={pending['expires_at']}"
         )
     if blocked_reasons:

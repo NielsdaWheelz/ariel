@@ -46,7 +46,7 @@
   - approval and execution outcomes are visible in timeline/action details without relying on internal logs.
   - surfaced data remains redacted and excludes internal-only execution metadata.
 - **non-goals**: no visual redesign, no bulk/delegated approvals UX, no multi-user tenancy changes.
-- **status**: landed in current implementation branch; compatibility mode still exposes raw `action_attempts` internals, so strict surfaced-only minimization remains open.
+- **status**: landed in current implementation branch; strict surfaced-only boundary finalized in PR-05.
 
 ### PR-05: Surface-Only Lifecycle Contract + Approval Handle
 - **goal**: close the remaining Slice 2 surface-boundary gap by making user-facing lifecycle APIs surfaced-only and migration-safe for approval flows.
@@ -58,6 +58,7 @@
   - lifecycle data shown to users remains redacted across proposal summaries, policy/approval reasons, execution outputs/errors, and excludes internal execution metadata.
   - regression coverage proves surfaced lifecycle completeness for inline reads, approval pending/denied/expired/approved, and execution success/failure without depending on raw action-attempt payloads.
 - **non-goals**: no changes to policy decisions, taint semantics, execution ordering/idempotency, or new domain capabilities.
+- **status**: landed in current implementation branch with strict boundary (`approval_ref` only; surfaced-only approval response contract).
 
 ### PR-06: (planned after PR-05 merges) Response Boundary Lock-In
 - **goal**: prevent future metadata leakage by enforcing strict response-boundary contracts on user-facing Slice 2 APIs.
