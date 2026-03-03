@@ -315,7 +315,7 @@ def test_s3_pr01_timeout_failure_is_partial_and_auditable(
         assert event_types.count("evt.action.execution.failed") == 1
 
 
-def test_s3_pr01_mixed_search_and_non_search_proposals_preserve_standard_action_appendix(
+def test_s3_pr01_mixed_search_and_non_search_proposals_keep_grounded_message_and_sources(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -355,6 +355,22 @@ def test_s3_pr01_mixed_search_and_non_search_proposals_preserve_standard_action_
         assert sent.status_code == 200
         payload = sent.json()
         message = payload["assistant"]["message"]
-        assert "action result (cap.search.web):" in message
-        assert "action result (cap.framework.read_echo):" in message
-        assert payload["assistant"]["sources"] == []
+        assert "[1]" in message
+        assert "action result (" not in message
+
+        sources = payload["assistant"]["sources"]
+        assert isinstance(sources, list)
+        assert len(sources) == 1
+
+        lifecycle = payload["turn"]["surface_action_lifecycle"]
+        assert len(lifecycle) == 2
+        lifecycle_by_capability = {
+            item["proposal"]["capability_id"]: item for item in lifecycle if isinstance(item, dict)
+        }
+        assert "cap.search.web" in lifecycle_by_capability
+        assert lifecycle_by_capability["cap.search.web"]["execution"]["status"] == "succeeded"
+        assert "cap.framework.read_echo" in lifecycle_by_capability
+        assert lifecycle_by_capability["cap.framework.read_echo"]["execution"]["status"] == "succeeded"
+        assert lifecycle_by_capability["cap.framework.read_echo"]["execution"]["output"] == {
+            "text": "alpha"
+        }
