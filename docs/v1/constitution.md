@@ -1,4 +1,4 @@
-# ariel — constitution v2
+# ariel — constitution v3
 
 ## 1. vision
 
@@ -6,14 +6,19 @@
 Work and life actions are fragmented across tools and devices. Away from a desk, it is hard to execute high-leverage actions reliably.
 
 ### solution
-Ariel is a private, self-hosted assistant that accepts natural language, uses model-led open-ended reasoning inside bounded runtime guardrails, and executes actions through typed capabilities with policy checks, approvals, and full auditability.
+Ariel is a private, self-hosted assistant that accepts natural language and multimodal input, uses model-led open-ended reasoning inside bounded runtime guardrails, and executes actions through typed capabilities with policy checks, approvals, and full auditability.
 
 ### scope (mvp)
-- Phone-first chat UI (web) over Tailscale.
+- Phone-first surface (web chat plus speech-to-text/text-to-speech push-to-talk voice I/O) over Tailscale.
 - Core orchestrator loop: intake -> context build -> think/plan -> tool calls -> response.
 - Capability system with strict input/output schemas and policy enforcement.
+- Provider-agnostic external knowledge retrieval (web search/news/weather and URL extraction) with user-visible provenance.
+- Google Workspace integration (calendar, email, drive, maps) with approval-gated side effects.
 - First-class `agency` integration (start runs, check status, fetch artifacts).
-- Calendar read/propose; event creation requires approval.
+- Nexus notes integration for read/write notes plus durable-memory projection.
+- Vision-capable image understanding in conversation and capture workflows.
+- Proactive notification layer with user-configured scheduled checks and notification delivery.
+- Quick-capture entry points (share sheet, clipboard, shortcuts) that ingest into the active session.
 - Append-only event log plus structured logs with redaction.
 - Provider-agnostic model router (swap providers without core refactors).
 - Episodic conversation sessions with durable cross-session memory.
@@ -21,8 +26,12 @@ Ariel is a private, self-hosted assistant that accepts natural language, uses mo
 ### non-scope (mvp)
 - Plugin marketplace, third-party skill auto-install, or arbitrary dynamic code loading.
 - Generic shell/ssh capability exposed to the model.
-- Fully autonomous background agents without an initiating user request (except status polling for a user-started job).
-- Fully automated external sending (email/message/post); draft or approval-gated only.
+- Autonomous open-ended background agents; only bounded user-configured proactive checks/notifications are allowed.
+- Fully automated external sending (email/post) outside subscription-bound notification policy; draft or approval-gated only.
+- Phone-call placement/receiving (voice telephony).
+- Financial transaction or payment automation.
+- Smart-home device control.
+- Real-time always-on streaming voice conversation.
 - Multi-user tenancy or public internet hosting.
 - Unbounded "forever context replay" per turn.
 
@@ -35,13 +44,9 @@ Ariel is a private, self-hosted assistant that accepts natural language, uses mo
 | **surface** | Authenticated channel where the user interacts (web now, voice/mobile later). |
 | **session** | One episodic conversation with short-term continuity. Exactly one active session per user at a time. |
 | **turn** | One user input and the resulting sequence of model/tool events. |
+| **capability** | Typed tool contract executed under schema, policy, timeout, and output guardrails. |
 | **action attempt** | Durable record for one proposed capability call and its lifecycle (`proposed -> awaiting_approval -> approved|denied|expired -> executing -> succeeded|failed`). |
 | **memory record** | Durable cross-session fact/preference/commitment with provenance and confidence. |
-| **context bundle** | Deterministically assembled prompt context for a turn (session tail + summary + retrieved memory + open commitments). |
-| **capability** | Typed tool contract: `{name, version, input_schema, output_schema, impact, approval_policy, timeout}`. |
-| **policy** | Deterministic allow/deny/confirm rules for capability execution and memory writes. |
-| **approval** | User confirmation bound to exact action payload hash and expiry. |
-| **job** | Async unit of work with durable status, events, and artifacts. |
 | **event log** | Append-only system-of-record stream for turns, model calls, tools, approvals, and jobs. |
 
 ---
@@ -51,28 +56,35 @@ Ariel is a private, self-hosted assistant that accepts natural language, uses mo
 ### components
 
 ```text
-+----------------------+      HTTPS (tailnet only)      +-------------------------+
-| surface (web mvp)    | -----------------------------> | core API + orchestrator |
-| one active session   |                                 | session/memory builder   |
-+----------------------+                                 | policy + approvals       |
-                                                         | event log writer         |
-                                                         +------------+------------+
-                                                                      |
-                                                                      | typed internal RPC
-                                                                      v
-                                                         +-------------------------+
-                                                         | executor (cap runtime)  |
-                                                         | schema validation        |
-                                                         | timeout/output limits    |
-                                                         | adapters: agency, cal    |
-                                                         +------------+------------+
-                                                                      |
-                                                                      v
-                                                         +-------------------------+
-                                                         | local/remote services   |
-                                                         | agency, google apis,    |
-                                                         | secret manager           |
-                                                         +-------------------------+
++------------------------------------------+      HTTPS (tailnet only)      +-----------------------------+
+| surface (web, voice, capture ingress)    | -----------------------------> | core API + orchestrator     |
+| one active session                        |                                 | session/memory builder       |
++------------------------------------------+                                 | policy + approvals           |
+                                                                             | event log writer             |
+                                                                             +-----------+-----------------+
+                                                                                         | typed internal RPC
+                                                                                         v
+                                                                             +-----------------------------+
+                                                                             | executor (cap runtime)      |
+                                                                             | schema validation            |
+                                                                             | timeout/output limits        |
+                                                                             | adapters: agency/google/     |
+                                                                             | brave/nexus/web-extract      |
+                                                                             +-----------+-----------------+
+                                                                                         |
+                                                                                         v
+                                                                             +-----------------------------+
+                                                                             | local/remote services       |
+                                                                             | agency, google apis,        |
+                                                                             | brave, nexus, secret mgr    |
+                                                                             +-----------------------------+
+                                                                                         ^
+                                                                                         |
+                                                                             +-----------------------------+
+                                                                             | notification scheduler      |
+                                                                             | (subscription-bound,        |
+                                                                             | read-only checks)           |
+                                                                             +-----------------------------+
 ```
 
 ### trust model
@@ -82,6 +94,7 @@ Ariel is a private, self-hosted assistant that accepts natural language, uses mo
 - Model outputs are untrusted until schema + policy checks pass.
 - External/untrusted content is data only and cannot mutate policy, prompts, or permissions.
 - Untrusted content cannot independently authorize side effects; policy must explicitly allow, escalate to approval, or deny.
+- Proactive scheduler flows are policy-bounded and cannot authorize side effects.
 
 ---
 
@@ -92,14 +105,18 @@ Ariel is a private, self-hosted assistant that accepts natural language, uses mo
 | language/runtime | Python only (`fastapi` + async workers). |
 | deployment | Single-user self-hosted home machine, reachable over private Tailscale network. |
 | remote exposure | No public ingress in MVP; service binds localhost and is proxied via Tailscale Serve. |
-| storage | Postgres is the system of truth for sessions, turns, memories, jobs, and events. |
+| storage | Postgres is the system of truth for sessions, turns, memories, jobs, notifications, and events. |
+| memory authority | External stores (including Nexus) are projections/integrations; they are never canonical memory SoT. |
 | conversation model | Episodic sessions, not one unbounded forever thread. |
 | context model | Deterministic bounded context builder per turn. |
 | response policy | No hard-coded response-type state machine; the model decides assistant messaging while runtime guardrails enforce safety and limits. |
 | model providers | Pluggable adapters behind one internal interface. |
+| retrieval provider portability | External web/news retrieval runs through Ariel capability contracts independent of model-provider built-in search tools. |
 | tool execution | No generic shell/ssh capability in MVP; code changes go through `cap.agency.*`. |
 | approvals | Required for irreversible or externally visible actions. |
 | side-effect execution model | Side-effecting capability calls are serialized for deterministic safety/audit behavior in MVP. |
+| proactive execution model | Proactive checks are read-only and subscription-bound; notification delivery does not require per-notification approval. |
+| quality gate model | Capability and orchestration changes must pass regression evaluations for grounding, safety, reliability, and multimodal behavior before release. |
 | egress model | Capability execution uses explicit destination allowlists; arbitrary outbound network access is denied by default. |
 | observability | Structured JSON logs and append-only event log are mandatory. |
 | redaction | Secrets never enter prompts or logs; UI output is scrubbed by default. |
@@ -115,6 +132,8 @@ Ariel is a private, self-hosted assistant that accepts natural language, uses mo
 - turn ids: `trn_<ulid>`
 - job ids: `job_<ulid>`
 - memory ids: `mem_<ulid>`
+- notification subscription ids: `sub_<ulid>`
+- capture ids: `cpt_<ulid>`
 
 ### ids and timestamps
 - IDs: ULID
@@ -167,6 +186,11 @@ Ariel is a private, self-hosted assistant that accepts natural language, uses mo
 - Approval tokens are single-use and authorize execution of the frozen proposed payload (no re-planning at approval time).
 - Proposals derived from untrusted external/tool content cannot auto-authorize side effects; policy escalates to approval or denies.
 
+### proactive notifications
+- Notification delivery is subscription-bound (explicit user opt-in, schedule, and channel policy) and does not require per-notification approval.
+- Proactive checks can invoke `read` capabilities only.
+- Proactive flows cannot execute side-effecting capabilities unless the user initiates a normal turn and approval policy passes.
+
 ### capability integrity and egress
 - Execution is bound to stable capability identity/version and contract metadata captured at proposal time.
 - Any capability identity/contract mismatch at execution time is blocked and auditable.
@@ -184,6 +208,7 @@ Ariel is a private, self-hosted assistant that accepts natural language, uses mo
 3. Rolling summary of current session.
 4. Retrieved durable memories (top-k, scored by relevance/recency/confidence).
 5. Open commitments/jobs relevant to this turn.
+6. Relevant source artifacts/proactive signals for the current request context (bounded and auditable).
 
 ---
 
@@ -206,6 +231,12 @@ Ariel is a private, self-hosted assistant that accepts natural language, uses mo
 15. Side-effecting capability execution is serialized in MVP.
 16. Capability identity/contract mismatch at execution time blocks execution.
 17. Capability outbound access is limited to policy-allowed destinations.
+18. Postgres is canonical memory SoT; external systems (including Nexus) are projections and cannot silently overwrite canonical memory.
+19. Proactive scheduler executions are read-only and cannot trigger side-effecting capabilities.
+20. Every proactive notification is linked to its originating subscription/check and is user-inspectable.
+21. Connector credentials/scopes are least-privilege and auditable per capability.
+22. External factual claims sourced from web/news/search responses include user-inspectable provenance artifacts.
+23. Releases are blocked when regression evaluations fail on grounding, policy safety, reliability, or multimodal interaction quality.
 
 ---
 
@@ -230,6 +261,12 @@ Ariel is a private, self-hosted assistant that accepts natural language, uses mo
 - Memory classes: `profile`, `preference`, `project`, `commitment`, `episodic_summary`.
 - Each memory stores provenance (`source_turn_id`), confidence, and `last_verified_at`.
 - Durable memory writes are policy-gated and auditable.
+- Nexus note linkage is projection metadata (reference ids + sync state), not canonical memory state.
+
+### notifications
+- Subscription configuration and notification events are canonical in Postgres.
+- Delivery history is append-only and auditable.
+- Notification payloads reference source artifacts/check evidence.
 
 ---
 
@@ -240,7 +277,10 @@ Ariel is a private, self-hosted assistant that accepts natural language, uses mo
 - `GET /v1/sessions/active`
 - `POST /v1/sessions/{session_id}/message`
 - `GET /v1/sessions/{session_id}/events?after={event_id}`
+- `POST /v1/captures`
 - `POST /v1/approvals`
+- `POST /v1/notifications/subscriptions`
+- `GET /v1/notifications`
 - `GET /v1/jobs/{job_id}`
 - `GET /v1/jobs/{job_id}/events`
 - `GET /v1/artifacts/{artifact_id}`
@@ -259,7 +299,39 @@ Ariel is a private, self-hosted assistant that accepts natural language, uses mo
 - `cap.agency.artifacts`
 - `cap.agency.request_pr` (approval required if it pushes remote changes)
 
+### search
+- `cap.search.web` (`read`, provider-agnostic; Brave-backed by default in MVP)
+- `cap.search.news` (`read`)
+
+### weather
+- `cap.weather.forecast` (`read`)
+
+### web
+- `cap.web.extract` (`read`)
+
+### email
+- `cap.email.search` (`read`)
+- `cap.email.read` (`read`)
+- `cap.email.draft` (`write_reversible`)
+- `cap.email.send` (`external_send`, approval required)
+
 ### calendar
 - `cap.calendar.list` (`read`)
 - `cap.calendar.propose_slots` (`read`)
 - `cap.calendar.create_event` (`write_reversible`, approval required)
+
+### drive
+- `cap.drive.search` (`read`)
+- `cap.drive.read` (`read`)
+- `cap.drive.upload` (`write_reversible`)
+- `cap.drive.share` (`external_send`, approval required)
+
+### maps
+- `cap.maps.directions` (`read`)
+- `cap.maps.search_places` (`read`)
+
+### nexus
+- `cap.nexus.search` (`read`)
+- `cap.nexus.read` (`read`)
+- `cap.nexus.create` (`write_reversible`)
+- `cap.nexus.append` (`write_reversible`)

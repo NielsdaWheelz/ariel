@@ -10,19 +10,27 @@ Slice 1: Core Conversation Loop
     |
     v
 Slice 2: Safe Action Framework
-   / \
-  v   v
-Slice 3: Agency Doer Integration    Slice 4: Calendar Assistant
-   \                                   /
-    \                                 /
-     v                               v
-      Slice 5: Durable Memory + Session Rotation
-                    |
-                    v
-       Slice 6: Provider Portability + Reliability
-                    |
-                    v
-         Slice 7: Production Readiness Gate
+ /   |   |   \
+v    v   v    v
+Slice 3: Lightweight Read Capabilities
+Slice 4: Google Workspace Core (Calendar + Email)
+Slice 5: Nexus Notes Integration
+Slice 6: Agency Doer Integration
+
+Slice 4 -> Slice 9: Web Browsing
+Slice 5 -> Slice 7: Durable Memory + Session Rotation
+Slice 6 -> Slice 7
+Slice 4 -> Slice 8: Google Workspace Expansion (Drive + Maps)
+
+Slice 7 -> Slice 10: Quick Capture Surface
+Slice 10 -> Slice 11: Voice + Vision Interface
+
+Slice 4 -> Slice 12: Proactive Notification Layer
+Slice 6 -> Slice 12
+Slice 7 -> Slice 12
+
+Slice 12 -> Slice 13: Provider Portability + Reliability
+Slice 13 -> Slice 14: Production Readiness Gate
 ```
 
 ## Slices
@@ -60,7 +68,43 @@ Slice 3: Agency Doer Integration    Slice 4: Calendar Assistant
   - User can inspect what action was proposed, approved, executed, and returned.
 - **Risks**: Approval UX can become too heavy or too permissive if thresholds are poorly tuned; read-capability scope and egress boundaries can be too broad if not aggressively constrained.
 
-### Slice 3: Agency Doer Integration
+### Slice 3: Lightweight Read Capabilities
+- **Goal**: Prove external read integrations through Ariel's safe capability framework.
+- **Outcome**: User can ask factual questions, web/news queries, and weather questions in natural language.
+- **Dependencies**: Slice 2
+- **Acceptance**:
+  - User can ask a factual question and receive a grounded answer with source references.
+  - User can ask for weather and receive a location-aware forecast.
+  - User can ask for topic news and receive relevant recent results.
+  - Web/news retrieval runs through Ariel's provider-independent search capability (Brave-backed by default per constitution) rather than model-provider-locked search.
+  - These reads execute without approval under read-impact policy.
+  - External API failures return clear user-visible recovery guidance.
+- **Risks**: Search quality variability and external API rate limits can degrade perceived reliability.
+
+### Slice 4: Google Workspace Core (Calendar + Email)
+- **Goal**: Deliver the highest-value Google productivity flows with correct safety boundaries.
+- **Outcome**: User can manage schedule and email through natural language with policy-correct approvals.
+- **Dependencies**: Slice 2
+- **Acceptance**:
+  - User can retrieve schedule information and available slot options.
+  - Event creation requires approval and confirms result status.
+  - User can search/read email without approval.
+  - User can draft email while send actions remain approval-gated.
+  - Permission and consent issues are surfaced with clear recovery paths.
+- **Risks**: Consent/scopes and third-party API errors can create brittle first-run UX.
+
+### Slice 5: Nexus Notes Integration
+- **Goal**: Connect Ariel to the user's notes workspace for safe note retrieval and note updates.
+- **Outcome**: User can search/read/create/append notes in Nexus through chat.
+- **Dependencies**: Slice 2
+- **Acceptance**:
+  - User can retrieve relevant notes for a topic request.
+  - User can ask Ariel to save or append a note and see the result in conversation flow.
+  - Note writes follow reversible-write policy and remain auditable.
+  - Connector/permission failures surface clear remediation guidance.
+- **Risks**: External notes API semantics and conflict behavior can create sync edge cases.
+
+### Slice 6: Agency Doer Integration
 - **Goal**: Let Ariel initiate and manage coding work through Agency from the same chat.
 - **Outcome**: User can request coding tasks, monitor progress, and inspect outputs without leaving Ariel.
 - **Dependencies**: Slice 2
@@ -71,42 +115,92 @@ Slice 3: Agency Doer Integration    Slice 4: Calendar Assistant
   - Failure cases are surfaced with actionable next steps.
 - **Risks**: Long-running tasks and partial failures can create confusing states without clear job visibility.
 
-### Slice 4: Calendar Assistant
-- **Goal**: Provide safe schedule awareness and scheduling actions.
-- **Outcome**: User can ask what is upcoming, request slot proposals, and create events with approval.
-- **Dependencies**: Slice 2
+### Slice 7: Durable Memory + Session Rotation
+- **Goal**: Preserve continuity across sessions with durable canonical memory and user-visible projection.
+- **Outcome**: Ariel rotates sessions safely while retaining validated preferences, commitments, and project context.
+- **Dependencies**: Slice 5, Slice 6
 - **Acceptance**:
-  - User can retrieve upcoming schedule information in natural language.
-  - User can request available time proposals under constraints and receive options.
-  - User can create an event only through an approval step and confirm the result.
-  - Permission issues are reported with clear recovery guidance.
+  - User can start a new conversation and Ariel recalls validated preferences and commitments.
+  - User can correct or remove remembered information and future behavior reflects the change.
+  - Memory remains auditable and bounded rather than full historical replay.
+  - Nexus-visible memory projection remains consistent with canonical memory behavior.
+- **Risks**: Stale or low-confidence memory can degrade quality if verification discipline is weak.
 
-### Slice 5: Durable Memory + Session Rotation
-- **Goal**: Preserve continuity across new conversations without relying on one unbounded thread.
-- **Outcome**: Ariel starts fresh sessions while retaining relevant durable memory and active commitments.
-- **Dependencies**: Slice 3, Slice 4
+### Slice 8: Google Workspace Expansion (Drive + Maps)
+- **Goal**: Complete key Google productivity/navigation workflows after core integration is stable.
+- **Outcome**: User can find/read Drive content and request map/place information through Ariel.
+- **Dependencies**: Slice 4
 - **Acceptance**:
-  - User can start a new conversation and Ariel still recalls validated preferences and commitments.
-  - User can correct or remove remembered information and future behavior reflects that change.
-  - Ariel keeps current-session flow natural without replaying full historical transcripts.
-- **Risks**: Memory quality can regress if stale or low-confidence memories are not controlled.
+  - User can search and inspect relevant files in Drive.
+  - User can ask for directions and nearby places in natural language.
+  - Sharing/external-send actions remain approval-gated.
+  - Permission issues are recoverable with clear guidance.
+- **Risks**: Scope sprawl and API quota behavior can complicate access management.
 
-### Slice 6: Provider Portability + Reliability
+### Slice 9: Web Browsing
+- **Goal**: Add robust URL-driven research behavior on top of lightweight search.
+- **Outcome**: User can provide a URL and receive extracted, summarized, source-grounded content.
+- **Dependencies**: Slice 3
+- **Acceptance**:
+  - User can submit a URL and receive structured extracted content and summary.
+  - Extraction failures (blocked pages, unsupported formats, access restrictions) are clear and actionable.
+  - Large/complex pages are handled within bounded response behavior.
+  - Retrieved content is represented with provenance for user inspection.
+- **Risks**: Extraction reliability varies across dynamic, protected, and malformed pages.
+
+### Slice 10: Quick Capture Surface
+- **Goal**: Allow fast non-chat ingestion flows into Ariel.
+- **Outcome**: User can send text/URL/content captures from phone share mechanisms into the active session.
+- **Dependencies**: Slice 7
+- **Acceptance**:
+  - User can push quick-capture content and it appears as a normal Ariel turn.
+  - Captured payloads are auditable and handled under the same policy framework.
+  - Capture failures are visible with clear retry/recovery guidance.
+  - Captures can feed notes/memory workflows without bypassing policy.
+- **Risks**: Input normalization and platform-specific capture behavior can be inconsistent.
+
+### Slice 11: Voice + Vision Interface
+- **Goal**: Extend the phone surface with speech and image-based interaction.
+- **Outcome**: User can speak to Ariel, hear spoken responses, and send images for analysis.
+- **Dependencies**: Slice 10
+- **Acceptance**:
+  - User can trigger speech input and receive speech-to-text transcript-backed turn behavior.
+  - Ariel can return text-to-speech output from assistant responses.
+  - User can send an image and receive useful analysis in the same conversation flow.
+  - Voice/vision errors are visible and do not corrupt session state.
+- **Risks**: Speech and vision quality variance can impact trust without transparent fallback UX.
+
+### Slice 12: Proactive Notification Layer
+- **Goal**: Deliver user-configured proactive surfacing without opening autonomous side-effect risk.
+- **Outcome**: Ariel can notify users about relevant changes/events based on subscriptions and schedules.
+- **Dependencies**: Slice 4, Slice 6, Slice 7
+- **Acceptance**:
+  - User can configure recurring notification checks and notification preferences.
+  - Ariel sends notifications for high-value events (for example schedule reminders and completed jobs).
+  - Proactive execution is read-only and policy-bounded.
+  - Notification history is user-inspectable and auditable.
+  - User can mute, disable, or adjust proactive behavior.
+- **Risks**: Notification fatigue and delivery reliability can reduce product value if not tuned.
+
+### Slice 13: Provider Portability + Reliability
 - **Goal**: Make the assistant resilient to model/provider changes without user-facing regressions.
-- **Outcome**: Core conversation and action flows remain stable when provider configuration changes.
-- **Dependencies**: Slice 5
+- **Outcome**: Core conversation, capability, and proactive flows remain stable when provider configuration changes.
+- **Dependencies**: Slice 12
 - **Acceptance**:
   - Core user journeys continue to work when switching model providers.
   - Provider outages or degraded responses fail clearly without corrupting conversation or action state.
   - Decision and action traces remain inspectable across providers.
+  - Provider changes do not break external knowledge capability behavior.
+  - Cross-provider evaluation scorecards on must-have workflows are at or above the defined OpenClaw-comparison baseline.
 - **Risks**: Behavior drift between providers can reduce predictability of plans and tool usage.
 
-### Slice 7: Production Readiness Gate
+### Slice 14: Production Readiness Gate
 - **Goal**: Make Ariel safe and dependable for day-to-day personal operations.
 - **Outcome**: The system has operational safeguards, recoverability, and release confidence for ongoing use.
-- **Dependencies**: Slice 6
+- **Dependencies**: Slice 13
 - **Acceptance**:
   - User can inspect system health and recent failures.
-  - Backups and restores preserve conversations, memory, jobs, and audit history.
+  - Backups and restores preserve conversations, canonical memory, jobs, notifications, and audit history.
   - Common failure scenarios have clear recovery playbooks.
+  - Release gates include measurable quality budgets for grounded answers, tool success, notification relevance, and multimodal UX reliability.
   - Release checklist passes before promotion to daily-use status.
