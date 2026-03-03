@@ -4,7 +4,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 import json
-import re
 from typing import Any, Literal
 from urllib.parse import urlparse
 
@@ -14,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from ariel.capability_registry import CapabilityDefinition
 from ariel.persistence import EventRecord
+from ariel.redaction import redact_json_value, safe_failure_reason
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,18 +22,6 @@ class ExecutionResult:
     output: dict[str, Any] | None
     error: str | None
 
-
-_SECRET_LIKE_PATTERN = re.compile(
-    (
-        r"(sk-[A-Za-z0-9_\-]{8,}"
-        r"|api[_-]?key"
-        r"|secret(?:[_-]?(?:key|value))?"
-        r"|authorization"
-        r"|bearer\s+[A-Za-z0-9\-_.]+"
-        r"|token\s*[:=]\s*[A-Za-z0-9\-_.]+)"
-    ),
-    re.IGNORECASE,
-)
 
 _UNSAFE_INPUT_PATTERNS: tuple[tuple[str, str], ...] = (
     ("sql_dangerous", "drop table"),
@@ -168,29 +156,6 @@ def _strip_egress_metadata(raw_output: Any) -> Any:
     if not isinstance(raw_output, dict):
         return raw_output
     return {key: value for key, value in raw_output.items() if key != _EGRESS_SENTINEL_KEY}
-
-
-def safe_failure_reason(raw_message: str, *, fallback: str) -> str:
-    candidate = raw_message.strip()
-    if not candidate:
-        return fallback
-    if _SECRET_LIKE_PATTERN.search(candidate):
-        return fallback
-    return candidate[:500]
-
-
-def redact_text(value: str) -> str:
-    return _SECRET_LIKE_PATTERN.sub("[REDACTED]", value)
-
-
-def redact_json_value(value: Any) -> Any:
-    if isinstance(value, str):
-        return redact_text(value)
-    if isinstance(value, dict):
-        return {str(key): redact_json_value(nested) for key, nested in value.items()}
-    if isinstance(value, list):
-        return [redact_json_value(item) for item in value]
-    return value
 
 
 def build_assistant_action_appendix(

@@ -16,6 +16,8 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+from ariel.redaction import redact_json_value, redact_text
+
 
 def to_rfc3339(timestamp: datetime) -> str:
     return timestamp.astimezone(UTC).isoformat().replace("+00:00", "Z")
@@ -277,12 +279,119 @@ def serialize_action_attempt(
     }
 
 
+def _redacted_optional_text(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    return redact_text(normalized)
+
+
+def _policy_reasons_by_action_attempt(events: list[EventRecord]) -> dict[str, str]:
+    reasons: dict[str, str] = {}
+    for event in events:
+        if event.event_type != "evt.action.policy_decided":
+            continue
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        action_attempt_id = payload.get("action_attempt_id")
+        reason = payload.get("reason")
+        if isinstance(action_attempt_id, str) and isinstance(reason, str) and reason.strip():
+            reasons[action_attempt_id] = reason
+    return reasons
+
+
+def _serialize_surface_action_lifecycle(
+    *,
+    action_attempts: list[dict[str, Any]],
+    events: list[EventRecord],
+) -> list[dict[str, Any]]:
+    policy_reasons = _policy_reasons_by_action_attempt(events)
+    lifecycle_items: list[dict[str, Any]] = []
+
+    for action_attempt in action_attempts:
+        action_attempt_id = action_attempt.get("id")
+        proposal_index = action_attempt.get("proposal_index")
+        capability_id = action_attempt.get("capability_id")
+        policy_decision = action_attempt.get("policy_decision")
+        policy_reason = policy_reasons.get(action_attempt_id) if isinstance(action_attempt_id, str) else None
+        if policy_reason is None:
+            policy_reason = action_attempt.get("policy_reason")
+
+        approval_payload = action_attempt.get("approval")
+        if isinstance(approval_payload, dict):
+            approval_status_raw = approval_payload.get("status")
+            approval_status = (
+                approval_status_raw if isinstance(approval_status_raw, str) else "unknown"
+            )
+            approval_reason = _redacted_optional_text(approval_payload.get("decision_reason"))
+            expires_at = (
+                approval_payload.get("expires_at")
+                if isinstance(approval_payload.get("expires_at"), str)
+                else None
+            )
+            decided_at = (
+                approval_payload.get("decided_at")
+                if isinstance(approval_payload.get("decided_at"), str)
+                else None
+            )
+        else:
+            approval_status = "not_requested"
+            approval_reason = None
+            expires_at = None
+            decided_at = None
+
+        execution_payload = action_attempt.get("execution")
+        if isinstance(execution_payload, dict):
+            execution_status_raw = execution_payload.get("status")
+            execution_status = (
+                execution_status_raw if isinstance(execution_status_raw, str) else "not_executed"
+            )
+            execution_output = redact_json_value(execution_payload.get("output"))
+            execution_error = _redacted_optional_text(execution_payload.get("error"))
+        else:
+            execution_status = "not_executed"
+            execution_output = None
+            execution_error = None
+
+        lifecycle_items.append(
+            {
+                "action_attempt_id": action_attempt_id if isinstance(action_attempt_id, str) else "",
+                "proposal_index": proposal_index if isinstance(proposal_index, int) else 0,
+                "proposal": {
+                    "capability_id": (
+                        capability_id if isinstance(capability_id, str) else "unknown.capability"
+                    ),
+                    "input_summary": redact_json_value(action_attempt.get("proposal_input")),
+                },
+                "policy": {
+                    "decision": policy_decision if isinstance(policy_decision, str) else "deny",
+                    "reason": _redacted_optional_text(policy_reason),
+                },
+                "approval": {
+                    "status": approval_status,
+                    "reason": approval_reason,
+                    "expires_at": expires_at,
+                    "decided_at": decided_at,
+                },
+                "execution": {
+                    "status": execution_status,
+                    "output": execution_output,
+                    "error": execution_error,
+                },
+            }
+        )
+
+    return lifecycle_items
+
+
 def serialize_turn(
     turn: TurnRecord,
     *,
     events: list[EventRecord],
     action_attempts: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    serialized_events = [serialize_event(event) for event in events]
     return {
         "id": turn.id,
         "session_id": turn.session_id,
@@ -292,5 +401,9 @@ def serialize_turn(
         "created_at": to_rfc3339(turn.created_at),
         "updated_at": to_rfc3339(turn.updated_at),
         "action_attempts": action_attempts,
-        "events": [serialize_event(event) for event in events],
+        "events": serialized_events,
+        "surface_action_lifecycle": _serialize_surface_action_lifecycle(
+            action_attempts=action_attempts,
+            events=events,
+        ),
     }
