@@ -94,6 +94,17 @@ contracts:
 - retrieval failure modes (timeout/rate-limit/upstream/no evidence) surface explicit uncertainty or
   partial-result recovery guidance in user-visible assistant messages.
 
+slice-3 pr-03 hardens grounding safety for conflicting evidence and mixed proposal sets:
+
+- when any retrieval capability executes (`cap.search.web`, `cap.search.news`, `cap.weather.forecast`),
+  `assistant.message` stays grounded narrative with inline citations and synchronized `assistant.sources[]`,
+  even if non-retrieval proposals run in the same turn.
+- mixed-turn non-retrieval outcomes remain auditable through structured surfaces
+  (`turn.surface_action_lifecycle[]`, `turn.events[]`) instead of raw action-result appendix text.
+- unsupported model-authored external assertions are not surfaced when retrieval grounding is present;
+  surfaced answer text is derived from citation-backed retrieval synthesis.
+- conflicting same-claim retrieval evidence fails closed to uncertainty + concrete recovery guidance.
+
 search capability runtime config:
 
 - `ARIEL_SEARCH_WEB_API_KEY` (required for live web retrieval backend)
@@ -174,7 +185,10 @@ see `docs/v1/s2/s2_prs/s2_pr02_implementation_notes.md` and
 `docs/v1/s2/s2_prs/s2_pr05_implementation_notes.md` and
 `docs/v1/s2/s2_prs/s2_pr06_implementation_notes.md` and
 `docs/v1/s2/s2_prs/s2_pr07_implementation_notes.md` and
-`docs/v1/s2/s2_prs/s2_pr08_implementation_notes.md` for implementation details and tradeoffs.
+`docs/v1/s2/s2_prs/s2_pr08_implementation_notes.md` and
+`docs/v1/s3/s3_prs/s3_pr01_implementation_notes.md` and
+`docs/v1/s3/s3_prs/s3_pr02_implementation_notes.md` and
+`docs/v1/s3/s3_prs/s3_pr03_implementation_notes.md` for implementation details and tradeoffs.
 
 ## run locally
 

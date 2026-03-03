@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+import re
 from typing import Any, Literal
 
 from fastapi.encoders import jsonable_encoder
@@ -179,6 +180,7 @@ def _taint_event_payload(
 _MAX_CITED_SOURCES = 4
 _MAX_SNIPPET_LENGTH = 320
 _NEWS_FRESHNESS_MAX_AGE = timedelta(hours=48)
+_MAX_CONFLICT_COMPONENT_TOKENS = 8
 _GROUNDED_RETRIEVAL_CAPABILITIES = {
     "cap.search.web",
     "cap.search.news",
@@ -318,6 +320,77 @@ def _normalize_retrieval_errors(retrieval_errors: list[str]) -> list[str]:
     return normalized_errors
 
 
+def _normalize_claim_component(value: str) -> str:
+    normalized = re.sub(r"[^a-z0-9\s]", " ", value.lower())
+    return " ".join(normalized.split())
+
+
+def _is_usable_claim_component(value: str) -> bool:
+    tokens = value.split()
+    return 0 < len(tokens) <= _MAX_CONFLICT_COMPONENT_TOKENS
+
+
+def _extract_claim_signature(snippet: str) -> tuple[str, str] | None:
+    if not isinstance(snippet, str):
+        return None
+    normalized_snippet = " ".join(snippet.split())
+    if not normalized_snippet:
+        return None
+
+    claim_of_match = re.search(
+        r"\b(?:the\s+)?(?P<attribute>[a-zA-Z][a-zA-Z0-9\s'-]{0,40}?)\s+of\s+"
+        r"(?P<entity>[a-zA-Z][a-zA-Z0-9\s'-]{0,40}?)\s+is\s+"
+        r"(?P<value>[a-zA-Z0-9][a-zA-Z0-9\s'-]{0,40})\b",
+        normalized_snippet,
+    )
+    if claim_of_match is not None:
+        attribute = _normalize_claim_component(claim_of_match.group("attribute"))
+        entity = _normalize_claim_component(claim_of_match.group("entity"))
+        value = _normalize_claim_component(claim_of_match.group("value"))
+        if (
+            _is_usable_claim_component(attribute)
+            and _is_usable_claim_component(entity)
+            and _is_usable_claim_component(value)
+        ):
+            return f"{attribute} of {entity}", value
+
+    claim_possessive_match = re.search(
+        r"\b(?P<entity>[a-zA-Z][a-zA-Z0-9\s'-]{0,40}?)'s\s+"
+        r"(?P<attribute>[a-zA-Z][a-zA-Z0-9\s'-]{0,40}?)\s+is\s+"
+        r"(?P<value>[a-zA-Z0-9][a-zA-Z0-9\s'-]{0,40})\b",
+        normalized_snippet,
+    )
+    if claim_possessive_match is None:
+        return None
+
+    attribute = _normalize_claim_component(claim_possessive_match.group("attribute"))
+    entity = _normalize_claim_component(claim_possessive_match.group("entity"))
+    value = _normalize_claim_component(claim_possessive_match.group("value"))
+    if (
+        _is_usable_claim_component(attribute)
+        and _is_usable_claim_component(entity)
+        and _is_usable_claim_component(value)
+    ):
+        return f"{attribute} of {entity}", value
+    return None
+
+
+def _conflicting_claim_keys(citation_snippets: list[str]) -> list[str]:
+    observed_values_by_claim: dict[str, set[str]] = {}
+    for snippet in citation_snippets:
+        claim_signature = _extract_claim_signature(snippet)
+        if claim_signature is None:
+            continue
+        claim_key, claim_value = claim_signature
+        values = observed_values_by_claim.setdefault(claim_key, set())
+        values.add(claim_value)
+    conflicting_claims = [
+        claim_key for claim_key, values in observed_values_by_claim.items() if len(values) > 1
+    ]
+    conflicting_claims.sort()
+    return conflicting_claims
+
+
 def _synthesize_grounded_retrieval_answer(
     *,
     collected_sources: list[dict[str, Any]],
@@ -340,12 +413,32 @@ def _synthesize_grounded_retrieval_answer(
             [],
         )
 
+    bounded_snippets = citation_snippets[: len(collected_sources)]
+    conflicting_claims = _conflicting_claim_keys(bounded_snippets)
     citation_lines: list[str] = []
-    for index, snippet in enumerate(citation_snippets[: len(collected_sources)], start=1):
+    for index, snippet in enumerate(bounded_snippets, start=1):
         normalized_snippet = snippet.strip()
         if not normalized_snippet:
             continue
         citation_lines.append(f"{normalized_snippet} [{index}]")
+
+    if conflicting_claims:
+        conflict_details = (
+            f" ({conflicting_claims[0]})" if len(conflicting_claims) == 1 else " (multiple claims)"
+        )
+        evidence_summary = " ".join(citation_lines) if citation_lines else "cited evidence is inconsistent."
+        message = (
+            "i'm uncertain because cited sources conflict on the same claim"
+            f"{conflict_details}. {evidence_summary} "
+            "please retry with a narrower query, add a timeframe, or share a trusted source."
+        )
+        if normalized_errors:
+            message = (
+                f"{message} some retrieval attempts also failed "
+                f"({'; '.join(normalized_errors[:2])})."
+            )
+        return message, collected_sources
+
     if not citation_lines:
         citation_lines.append("i found grounded external evidence for this request. [1]")
 
@@ -478,7 +571,6 @@ def process_action_proposals(
     created_action_attempts: list[ActionAttemptRecord] = []
     pending_approval_created = False
     retrieval_requested = False
-    retrieval_only_proposals = True
     retrieval_errors: list[str] = []
     retrieval_sources: list[dict[str, Any]] = []
     retrieval_snippets: list[str] = []
@@ -500,8 +592,6 @@ def process_action_proposals(
         if is_retrieval_proposal:
             retrieval_requested = True
             retrieval_capability_ids.add(capability_id)
-        else:
-            retrieval_only_proposals = False
         raw_input_payload = proposal_payload.get("input")
         input_payload = jsonable_encoder(raw_input_payload) if isinstance(raw_input_payload, dict) else {}
         if is_weather_forecast_proposal and set(input_payload.keys()).issubset({"location", "timeframe"}):
@@ -789,7 +879,7 @@ def process_action_proposals(
             },
         )
 
-    if retrieval_requested and retrieval_only_proposals:
+    if retrieval_requested:
         if retrieval_capability_ids == {"cap.search.news"}:
             final_assistant_message, assistant_sources = _synthesize_news_retrieval_answer(
                 collected_sources=retrieval_sources,
