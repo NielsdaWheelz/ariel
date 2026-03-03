@@ -161,7 +161,10 @@ def _preflight_egress_requests(
     capability: CapabilityDefinition,
     normalized_input: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], str | None]:
-    if capability.impact_level != "external_send":
+    requires_preflight = capability.declare_egress_intent is not None or bool(
+        capability.allowed_egress_destinations
+    )
+    if not requires_preflight:
         return [], None
 
     declare_egress_intent = capability.declare_egress_intent
@@ -300,9 +303,10 @@ def execute_capability(
         if post_guardrail_error is not None:
             return ExecutionResult(status="failed", output=None, error=post_guardrail_error)
 
-        dispatch_error = _dispatch_egress_requests(egress_requests=egress_requests)
-        if dispatch_error is not None:
-            return ExecutionResult(status="failed", output=None, error=dispatch_error)
+        if capability.impact_level == "external_send":
+            dispatch_error = _dispatch_egress_requests(egress_requests=egress_requests)
+            if dispatch_error is not None:
+                return ExecutionResult(status="failed", output=None, error=dispatch_error)
 
         redacted_output = redact_json_value(encoded_output)
         output_payload = (

@@ -365,6 +365,17 @@ class SurfaceAssistantContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     message: str
+    sources: list["SurfaceAssistantSourceContract"]
+
+
+class SurfaceAssistantSourceContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_id: str
+    title: str
+    source: str
+    retrieved_at: str
+    published_at: str | None
 
 
 class SurfaceApprovalContract(BaseModel):
@@ -400,6 +411,24 @@ class SurfaceApprovalResponseContract(BaseModel):
     ok: bool
     approval: SurfaceApprovalContract
     assistant: SurfaceAssistantContract
+
+
+class SurfaceArtifactContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    type: str
+    title: str
+    source: str
+    retrieved_at: str
+    published_at: str | None
+
+
+class SurfaceArtifactResponseContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    artifact: SurfaceArtifactContract
 
 
 def _validate_contract(
@@ -597,7 +626,9 @@ def build_surface_message_response(
     session: Any,
     turn: Any,
     assistant_message: Any,
+    assistant_sources: Any,
 ) -> dict[str, Any]:
+    sources_payload = assistant_sources if isinstance(assistant_sources, list) else []
     return _validate_contract(
         "surface_message_response",
         SurfaceMessageResponseContract,
@@ -606,7 +637,7 @@ def build_surface_message_response(
             "session": _project_surface_session(session),
             "turn": _project_surface_turn(turn),
             # PR-06 deprecates assistant.provider/model for surfaced responses.
-            "assistant": {"message": assistant_message},
+            "assistant": {"message": assistant_message, "sources": sources_payload},
         },
     )
 
@@ -642,6 +673,25 @@ def build_surface_approval_response(
                 "expires_at": approval_payload.get("expires_at"),
                 "decided_at": approval_payload.get("decided_at"),
             },
-            "assistant": {"message": assistant_message},
+            "assistant": {"message": assistant_message, "sources": []},
+        },
+    )
+
+
+def build_surface_artifact_response(*, artifact: Any) -> dict[str, Any]:
+    artifact_payload = artifact if isinstance(artifact, dict) else {}
+    return _validate_contract(
+        "surface_artifact_response",
+        SurfaceArtifactResponseContract,
+        {
+            "ok": True,
+            "artifact": {
+                "id": artifact_payload.get("id"),
+                "type": artifact_payload.get("type"),
+                "title": artifact_payload.get("title"),
+                "source": artifact_payload.get("source"),
+                "retrieved_at": artifact_payload.get("retrieved_at"),
+                "published_at": artifact_payload.get("published_at"),
+            },
         },
     )

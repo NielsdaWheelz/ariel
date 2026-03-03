@@ -141,6 +141,7 @@ class ActionAttemptRecord(Base):
         back_populates="action_attempt",
         uselist=False,
     )
+    artifacts: Mapped[list["ArtifactRecord"]] = relationship(back_populates="action_attempt")
 
     __table_args__ = (
         CheckConstraint("proposal_index > 0", name="ck_action_attempt_proposal_index_positive"),
@@ -204,6 +205,47 @@ class ApprovalRequestRecord(Base):
         CheckConstraint(
             "status IN ('pending', 'approved', 'denied', 'expired')",
             name="ck_approval_request_status",
+        ),
+    )
+
+
+class ArtifactRecord(Base):
+    __tablename__ = "artifacts"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    session_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("sessions.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    turn_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("turns.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    action_attempt_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("action_attempts.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    artifact_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[str] = mapped_column(Text, nullable=False)
+    snippet: Mapped[str | None] = mapped_column(Text, nullable=True)
+    retrieved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    action_attempt: Mapped[ActionAttemptRecord] = relationship(back_populates="artifacts")
+
+    __table_args__ = (
+        CheckConstraint(
+            "artifact_type IN ('retrieval_provenance')",
+            name="ck_artifact_type",
         ),
     )
 
@@ -286,6 +328,17 @@ def _redacted_optional_text(value: Any) -> str | None:
     if not normalized:
         return None
     return redact_text(normalized)
+
+
+def serialize_artifact(artifact: ArtifactRecord) -> dict[str, Any]:
+    return {
+        "id": artifact.id,
+        "type": artifact.artifact_type,
+        "title": redact_text(artifact.title),
+        "source": redact_text(artifact.source),
+        "retrieved_at": to_rfc3339(artifact.retrieved_at),
+        "published_at": to_rfc3339(artifact.published_at) if artifact.published_at is not None else None,
+    }
 
 
 def _policy_reasons_by_action_attempt(events: list[EventRecord]) -> dict[str, str]:
