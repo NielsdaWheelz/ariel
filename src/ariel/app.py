@@ -43,6 +43,7 @@ from ariel.persistence import (
     serialize_turn,
 )
 from ariel.phone_surface import PHONE_SURFACE_HTML
+from ariel.redaction import safe_failure_reason
 
 
 def _utcnow() -> datetime:
@@ -334,28 +335,6 @@ def _extract_openai_assistant_text(payload: dict[str, Any]) -> str:
                 text_parts.append(text)
         return "".join(text_parts).strip()
     return ""
-
-
-_SECRET_LIKE_PATTERN = re.compile(
-    (
-        r"(sk-[A-Za-z0-9_\-]{8,}"
-        r"|api[_-]?key"
-        r"|secret(?:[_-]?(?:key|value))?"
-        r"|authorization"
-        r"|bearer\s+[A-Za-z0-9\-_.]+"
-        r"|token\s*[:=]\s*[A-Za-z0-9\-_.]+)"
-    ),
-    re.IGNORECASE,
-)
-
-
-def _safe_failure_reason(raw_message: str, *, fallback: str) -> str:
-    candidate = raw_message.strip()
-    if not candidate:
-        return fallback
-    if _SECRET_LIKE_PATTERN.search(candidate):
-        return fallback
-    return candidate[:500]
 
 
 @dataclass(slots=True, frozen=True)
@@ -989,7 +968,7 @@ def create_app(
                             fallback_reason = f"unexpected {exc.__class__.__name__}"
                             should_retry = False
                             if isinstance(exc, ModelAdapterError):
-                                failure_reason = _safe_failure_reason(
+                                failure_reason = safe_failure_reason(
                                     exc.safe_reason,
                                     fallback=fallback_reason,
                                 )
@@ -1006,7 +985,10 @@ def create_app(
                                 )
                                 should_retry = exc.retryable
                             else:
-                                failure_reason = _safe_failure_reason(str(exc), fallback=fallback_reason)
+                                failure_reason = safe_failure_reason(
+                                    str(exc),
+                                    fallback=fallback_reason,
+                                )
                                 model_failure_candidate = ApiError(
                                     status_code=502,
                                     code="E_MODEL_FAILURE",

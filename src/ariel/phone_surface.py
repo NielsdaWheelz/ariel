@@ -112,18 +112,42 @@ PHONE_SURFACE_HTML = """<!doctype html>
       return parts.join(" | ");
     }
 
-    function formatActionAttemptDetails(actionAttempt) {
+    function safeJsonStringify(value) {
+      try {
+        return JSON.stringify(value);
+      } catch {
+        return "(unserializable)";
+      }
+    }
+
+    function formatSurfaceLifecycleDetails(lifecycleItem) {
+      const proposal = (lifecycleItem && typeof lifecycleItem.proposal === "object" && lifecycleItem.proposal !== null)
+        ? lifecycleItem.proposal
+        : {};
+      const policy = (lifecycleItem && typeof lifecycleItem.policy === "object" && lifecycleItem.policy !== null)
+        ? lifecycleItem.policy
+        : {};
+      const approval = (lifecycleItem && typeof lifecycleItem.approval === "object" && lifecycleItem.approval !== null)
+        ? lifecycleItem.approval
+        : {};
+      const execution = (lifecycleItem && typeof lifecycleItem.execution === "object" && lifecycleItem.execution !== null)
+        ? lifecycleItem.execution
+        : {};
+
       const parts = [];
-      parts.push(`capability=${actionAttempt.capability_id}`);
-      parts.push(`status=${actionAttempt.status}`);
-      if (actionAttempt.policy_decision) parts.push(`policy=${actionAttempt.policy_decision}`);
-      if (actionAttempt.policy_reason) parts.push(`reason=${actionAttempt.policy_reason}`);
-      if (actionAttempt.approval && actionAttempt.approval.status) {
-        parts.push(`approval=${actionAttempt.approval.status}`);
+      if (proposal.capability_id) parts.push(`proposal=${proposal.capability_id}`);
+      if (proposal.input_summary !== undefined) {
+        parts.push(`input=${safeJsonStringify(proposal.input_summary)}`);
       }
-      if (actionAttempt.execution && actionAttempt.execution.status) {
-        parts.push(`execution=${actionAttempt.execution.status}`);
+      if (policy.decision) parts.push(`policy=${policy.decision}`);
+      if (policy.reason) parts.push(`policy_reason=${policy.reason}`);
+      if (approval.status) parts.push(`approval=${approval.status}`);
+      if (approval.reason) parts.push(`approval_reason=${approval.reason}`);
+      if (execution.status) parts.push(`execution=${execution.status}`);
+      if (execution.output !== undefined && execution.output !== null) {
+        parts.push(`output=${safeJsonStringify(execution.output)}`);
       }
+      if (execution.error) parts.push(`error=${execution.error}`);
       return parts.join(" | ");
     }
 
@@ -133,10 +157,10 @@ PHONE_SURFACE_HTML = """<!doctype html>
         return;
       }
       timelineNode.innerHTML = turns.map((turn) => {
-        const actionAttempts = (Array.isArray(turn.action_attempts) ? turn.action_attempts : [])
-          .map((actionAttempt) => {
-            const detailText = formatActionAttemptDetails(actionAttempt);
-            return `<div class="action">action[${escapeHtml(actionAttempt.proposal_index)}] ${escapeHtml(detailText)}</div>`;
+        const actionAttempts = (Array.isArray(turn.surface_action_lifecycle) ? turn.surface_action_lifecycle : [])
+          .map((lifecycleItem) => {
+            const detailText = formatSurfaceLifecycleDetails(lifecycleItem);
+            return `<div class="action">action[${escapeHtml(lifecycleItem.proposal_index)}] ${escapeHtml(detailText)}</div>`;
           })
           .join("");
         const events = turn.events
