@@ -46,4 +46,25 @@
   - approval and execution outcomes are visible in timeline/action details without relying on internal logs.
   - surfaced data remains redacted and excludes internal-only execution metadata.
 - **non-goals**: no visual redesign, no bulk/delegated approvals UX, no multi-user tenancy changes.
-- **status**: landed in current implementation branch; see `s2_prs/s2_pr04_implementation_notes.md`.
+- **status**: landed in current implementation branch; compatibility mode still exposes raw `action_attempts` internals, so strict surfaced-only minimization remains open.
+
+### PR-05: Surface-Only Lifecycle Contract + Approval Handle
+- **goal**: close the remaining Slice 2 surface-boundary gap by making user-facing lifecycle APIs surfaced-only and migration-safe for approval flows.
+- **builds on**: PR-04.
+- **acceptance**:
+  - user-facing turn/timeline payloads expose only the redacted, allowlisted lifecycle contract for action details; raw engine lifecycle internals are no longer exposed in those responses.
+  - users can still complete approval flows through structured surfaced data (including a stable approval reference) without parsing assistant free text or internal records.
+  - phone-first timeline/action rendering and approval interactions consume surfaced contracts only.
+  - lifecycle data shown to users remains redacted across proposal summaries, policy/approval reasons, execution outputs/errors, and excludes internal execution metadata.
+  - regression coverage proves surfaced lifecycle completeness for inline reads, approval pending/denied/expired/approved, and execution success/failure without depending on raw action-attempt payloads.
+- **non-goals**: no changes to policy decisions, taint semantics, execution ordering/idempotency, or new domain capabilities.
+
+### PR-06: (planned after PR-05 merges) Response Boundary Lock-In
+- **goal**: prevent future metadata leakage by enforcing strict response-boundary contracts on user-facing Slice 2 APIs.
+- **builds on**: PR-05.
+- **acceptance**:
+  - user-facing Slice 2 responses are schema-enforced so non-allowlisted/internal lifecycle fields cannot appear by accident.
+  - approval response payloads expose only user-relevant surfaced lifecycle data needed for UX continuity and audit clarity.
+  - compatibility/deprecation behavior is explicit and documented for any removed legacy fields.
+  - contract tests fail when internal lifecycle metadata reappears in user-facing responses.
+- **non-goals**: no authorization-policy redesign, no changes to capability contracts, and no UI redesign work beyond surfaced-contract adoption.
