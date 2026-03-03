@@ -44,6 +44,12 @@ from ariel.persistence import (
 )
 from ariel.phone_surface import PHONE_SURFACE_HTML
 from ariel.redaction import redact_text, safe_failure_reason
+from ariel.response_contracts import (
+    ResponseContractViolation,
+    build_surface_approval_response,
+    build_surface_message_response,
+    build_surface_timeline_response,
+)
 
 
 def _utcnow() -> datetime:
@@ -491,6 +497,35 @@ def _error_response(error: ApiError) -> JSONResponse:
                 "retryable": error.retryable,
             },
         },
+    )
+
+
+def _sanitize_response_contract_errors(errors: list[Any]) -> list[dict[str, Any]]:
+    sanitized: list[dict[str, Any]] = []
+    for item in errors:
+        if not isinstance(item, dict):
+            continue
+        loc_raw = item.get("loc")
+        loc = [part for part in loc_raw if isinstance(part, (str, int))] if isinstance(loc_raw, (list, tuple)) else []
+        error_type = item.get("type")
+        if not isinstance(error_type, str):
+            error_type = "unknown"
+        sanitized.append({"loc": loc, "type": error_type})
+    return sanitized
+
+
+def _response_contract_error(contract_error: ResponseContractViolation) -> ApiError:
+    sanitized_errors = _sanitize_response_contract_errors(contract_error.errors)
+    return ApiError(
+        status_code=500,
+        code="E_RESPONSE_CONTRACT",
+        message="response contract enforcement failed",
+        details={
+            "contract": contract_error.contract,
+            "violation_count": len(sanitized_errors),
+            "errors": sanitized_errors,
+        },
+        retryable=False,
     )
 
 
@@ -1106,20 +1141,20 @@ def create_app(
                     )
                     for action_attempt in created_action_attempts
                 ]
-                return {
-                    "ok": True,
-                    "session": serialize_session(active_session),
-                    "turn": serialize_turn(
-                        turn,
-                        events=created_events,
-                        action_attempts=serialized_action_attempts,
-                    ),
-                    "assistant": {
-                        "message": turn.assistant_message,
-                        "provider": assistant_response["provider"],
-                        "model": assistant_response["model"],
-                    },
-                }
+                raw_session = serialize_session(active_session)
+                raw_turn = serialize_turn(
+                    turn,
+                    events=created_events,
+                    action_attempts=serialized_action_attempts,
+                )
+                try:
+                    return build_surface_message_response(
+                        session=raw_session,
+                        turn=raw_turn,
+                        assistant_message=turn.assistant_message,
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
 
     @app.post("/v1/approvals", response_model=None)
     def post_approval_decision(
@@ -1150,25 +1185,28 @@ def create_app(
                         )
                     )
 
-                return {
-                    "ok": True,
-                    "approval": {
-                        "reference": decision_result.approval.id,
-                        "status": decision_result.approval.status,
-                        "reason": (
-                            redact_text(decision_result.approval.decision_reason)
-                            if isinstance(decision_result.approval.decision_reason, str)
-                            else None
-                        ),
-                        "expires_at": to_rfc3339(decision_result.approval.expires_at),
-                        "decided_at": (
-                            to_rfc3339(decision_result.approval.decided_at)
-                            if decision_result.approval.decided_at is not None
-                            else None
-                        ),
-                    },
-                    "assistant": {"message": decision_result.assistant_message},
+                raw_approval = {
+                    "reference": decision_result.approval.id,
+                    "status": decision_result.approval.status,
+                    "reason": (
+                        redact_text(decision_result.approval.decision_reason)
+                        if isinstance(decision_result.approval.decision_reason, str)
+                        else None
+                    ),
+                    "expires_at": to_rfc3339(decision_result.approval.expires_at),
+                    "decided_at": (
+                        to_rfc3339(decision_result.approval.decided_at)
+                        if decision_result.approval.decided_at is not None
+                        else None
+                    ),
                 }
+                try:
+                    return build_surface_approval_response(
+                        approval=raw_approval,
+                        assistant_message=decision_result.assistant_message,
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
 
     @app.get("/v1/sessions/{session_id}/events")
     def get_session_events(session_id: str) -> dict[str, Any]:
@@ -1248,6 +1286,12 @@ def create_app(
                 )
                 for turn in turns
             ]
-            return {"ok": True, "session_id": session_id, "turns": serialized_turns}
+            try:
+                return build_surface_timeline_response(
+                    session_id=session_id,
+                    turns=serialized_turns,
+                )
+            except ResponseContractViolation as exc:
+                raise _response_contract_error(exc) from exc
 
     return app
