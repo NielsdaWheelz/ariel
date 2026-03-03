@@ -61,8 +61,8 @@ For the PR-01 implementation baseline, `max_recent_turns` is exposed via `ARIEL_
 ## Out of Scope
 
 - Capability/tool planning and execution, policy authorization, and approval workflows (-> Slice 2)
-- Agency task runs, status orchestration, and artifact retrieval UX (-> Slice 3)
+- Agency task runs, status orchestration, and artifact retrieval UX (-> Slice 6)
 - Calendar-specific assistant behavior (-> Slice 4)
-- Durable cross-session memory retrieval, memory correction flows, and session rotation policy (-> Slice 5)
-- Provider portability/failover hardening (-> Slice 6)
+- Durable cross-session memory retrieval, memory correction flows, and session rotation policy (-> Slice 7)
+- Provider portability/failover hardening (-> Slice 13)
 - Public ingress, multi-user tenancy, or autonomous background action loops

@@ -112,6 +112,8 @@ Ariel is a private, self-hosted assistant that accepts natural language and mult
 | response policy | No hard-coded response-type state machine; the model decides assistant messaging while runtime guardrails enforce safety and limits. |
 | model providers | Pluggable adapters behind one internal interface. |
 | retrieval provider portability | External web/news retrieval runs through Ariel capability contracts independent of model-provider built-in search tools. |
+| factual grounding policy | External factual claims from web/news/weather are citation-gated: user-visible references are required, and insufficient/conflicting evidence must be disclosed as uncertainty. |
+| weather location policy | Weather location resolution order is explicit location first, configured default second, clarification otherwise; implicit IP/device geolocation inference is not used in MVP. |
 | tool execution | No generic shell/ssh capability in MVP; code changes go through `cap.agency.*`. |
 | approvals | Required for irreversible or externally visible actions. |
 | side-effect execution model | Side-effecting capability calls are serialized for deterministic safety/audit behavior in MVP. |
@@ -236,7 +238,9 @@ Ariel is a private, self-hosted assistant that accepts natural language and mult
 20. Every proactive notification is linked to its originating subscription/check and is user-inspectable.
 21. Connector credentials/scopes are least-privilege and auditable per capability.
 22. External factual claims sourced from web/news/search responses include user-inspectable provenance artifacts.
-23. Releases are blocked when regression evaluations fail on grounding, policy safety, reliability, or multimodal interaction quality.
+23. Ariel does not present externally grounded factual claims as true without user-visible citations to provenance artifacts.
+24. Weather answers resolve location deterministically (`explicit -> configured default -> clarification`) and do not rely on implicit IP/device geolocation.
+25. Releases are blocked when regression evaluations fail on grounding, policy safety, reliability, or multimodal interaction quality.
 
 ---
 

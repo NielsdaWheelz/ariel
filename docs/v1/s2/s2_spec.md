@@ -76,10 +76,11 @@ Enable tool-enabled behavior with deterministic policy and approval controls.
 
 ## Out of Scope
 
-- Agency-specific workflows (`cap.agency.run/status/artifacts/request_pr`) and long-running coding-job UX (-> Slice 3)
+- Lightweight external read capabilities (`cap.search.web`, `cap.search.news`, `cap.weather.forecast`) and grounded answer synthesis with source references (-> Slice 3)
 - Calendar domain behaviors (`cap.calendar.list/propose_slots/create_event`) beyond reusing the Slice 2 safety framework (-> Slice 4)
-- Cross-session memory writes/retrieval policy and session rotation behavior (-> Slice 5)
-- Provider portability/failover hardening beyond preserving Slice 1 behavior (-> Slice 6)
+- Agency-specific workflows (`cap.agency.run/status/artifacts/request_pr`) and long-running coding-job UX (-> Slice 6)
+- Cross-session memory writes/retrieval policy and session rotation behavior (-> Slice 7)
+- Provider portability/failover hardening beyond preserving Slice 1 behavior (-> Slice 13)
 - Multi-user tenancy, public internet exposure, and autonomous background action loops
 - Bulk/batched approvals, delegated approvals, and adaptive auto-approval heuristics
 - Automatic trust of tool output as policy authority

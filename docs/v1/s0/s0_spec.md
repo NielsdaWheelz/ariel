@@ -49,9 +49,9 @@ Prove a complete end-to-end user path from phone to Ariel on a private network.
 
 - Natural multi-turn reasoning behavior, missing-details interaction behavior, and turn-budget handling (-> Slice 1)
 - Capability policy enforcement and approval-gated execution (-> Slice 2)
-- Agency task execution and artifact workflows (-> Slice 3)
+- Agency task execution and artifact workflows (-> Slice 6)
 - Calendar read/propose/create flows (-> Slice 4)
-- Durable cross-session memory retrieval and session rotation policy (-> Slice 5)
-- Provider failover/portability hardening and provider switching guarantees (-> Slice 6)
-- Production readiness operations (health gate, backup/restore playbooks, release gate) (-> Slice 7)
+- Durable cross-session memory retrieval and session rotation policy (-> Slice 7)
+- Provider failover/portability hardening and provider switching guarantees (-> Slice 13)
+- Production readiness operations (health gate, backup/restore playbooks, release gate) (-> Slice 14)
 - Public internet hosting, multi-user tenancy, and autonomous background actions

@@ -74,7 +74,9 @@ Slice 13 -> Slice 14: Production Readiness Gate
 - **Dependencies**: Slice 2
 - **Acceptance**:
   - User can ask a factual question and receive a grounded answer with source references.
+  - Ariel does not present externally grounded factual claims without user-visible source references; insufficient evidence is disclosed as uncertainty.
   - User can ask for weather and receive a location-aware forecast.
+  - Weather location resolution is deterministic (`explicit location -> configured default -> clarification`) and does not rely on implicit IP/device geolocation.
   - User can ask for topic news and receive relevant recent results.
   - Web/news retrieval runs through Ariel's provider-independent search capability (Brave-backed by default per constitution) rather than model-provider-locked search.
   - These reads execute without approval under read-impact policy.
