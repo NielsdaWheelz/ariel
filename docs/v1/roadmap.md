@@ -90,6 +90,7 @@ Slice 13 -> Slice 14: Production Readiness Gate
 - **Outcome**: User can manage schedule and email through natural language with policy-correct approvals.
 - **Dependencies**: Slice 2
 - **Acceptance**:
+  - User can complete secure Google OAuth connect/reconnect/disconnect flows with clear connector status and recovery prompts.
   - User can retrieve schedule information and available slot options.
   - Event creation requires approval and confirms result status.
   - User can search/read email without approval.

@@ -117,6 +117,7 @@ Ariel is a private, self-hosted assistant that accepts natural language and mult
 | tool execution | No generic shell/ssh capability in MVP; code changes go through `cap.agency.*`. |
 | approvals | Required for irreversible or externally visible actions. |
 | side-effect execution model | Side-effecting capability calls are serialized for deterministic safety/audit behavior in MVP. |
+| oauth connector model | External connectors use OAuth authorization-code + PKCE with short-lived state and strict callback validation; token material is encrypted at rest. |
 | proactive execution model | Proactive checks are read-only and subscription-bound; notification delivery does not require per-notification approval. |
 | quality gate model | Capability and orchestration changes must pass regression evaluations for grounding, safety, reliability, and multimodal behavior before release. |
 | egress model | Capability execution uses explicit destination allowlists; arbitrary outbound network access is denied by default. |
@@ -241,6 +242,9 @@ Ariel is a private, self-hosted assistant that accepts natural language and mult
 23. Ariel does not present externally grounded factual claims as true without user-visible citations to provenance artifacts.
 24. Weather answers resolve location deterministically (`explicit -> configured default -> clarification`) and do not rely on implicit IP/device geolocation.
 25. Releases are blocked when regression evaluations fail on grounding, policy safety, reliability, or multimodal interaction quality.
+26. OAuth connector state handles are single-use, short-lived, and replay-safe.
+27. Connector token material is never surfaced in user APIs or logs and remains encrypted at rest.
+28. Capability calls requiring connector scopes fail with typed recoverable auth/scope outcomes instead of silent fallback behavior.
 
 ---
 
@@ -281,6 +285,11 @@ Ariel is a private, self-hosted assistant that accepts natural language and mult
 - `GET /v1/sessions/active`
 - `POST /v1/sessions/{session_id}/message`
 - `GET /v1/sessions/{session_id}/events?after={event_id}`
+- `POST /v1/connectors/google/start`
+- `GET /v1/connectors/google/callback`
+- `GET /v1/connectors/google`
+- `POST /v1/connectors/google/reconnect`
+- `DELETE /v1/connectors/google`
 - `POST /v1/captures`
 - `POST /v1/approvals`
 - `POST /v1/notifications/subscriptions`

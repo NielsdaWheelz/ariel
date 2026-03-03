@@ -6,6 +6,11 @@ Deliver the highest-value Google productivity flows with correct safety boundari
 
 ## Acceptance Criteria
 
+### google oauth connector lifecycle is complete and secure by default
+- **given**: no active Google connector, or a connector that needs additional scopes
+- **when**: the user initiates connect, reconnect, or disconnect for Google Workspace access
+- **then**: Ariel completes OAuth authorization-code flow with PKCE and CSRF-safe state, persists connector status/scopes/tokens securely in canonical state, and returns clear connected/not-connected/reconnect-required status without exposing secrets
+
 ### schedule retrieval and slot proposals work as read flows
 - **given**: an active session and a connected Google account with calendar access
 - **when**: the user asks to view schedule context or asks for available meeting times under stated constraints (date range, duration, or participants/time windows)
@@ -55,7 +60,19 @@ Deliver the highest-value Google productivity flows with correct safety boundari
 
 **Least-privilege OAuth is incremental per capability**: Calendar and Gmail capabilities request only minimal required scopes and expand only when a newly requested operation requires broader scope. Scope usage remains auditable per capability.
 
+**OAuth flow is explicit and web-security hardened**: Google connector authorization uses OAuth authorization-code with PKCE, state-bound CSRF protection, short-lived one-time state handles, and strict callback redirect validation.
+
+**Connector state is canonical and secret-safe**: Connector status, granted scopes, and token metadata are durable Postgres state; token material is encrypted at rest, never surfaced in user APIs, and never logged in plaintext.
+
+**Token refresh behavior is centralized and race-safe**: Access-token refresh is handled in one connector runtime boundary with deterministic locking semantics so concurrent capability calls cannot race into inconsistent token state.
+
+**Capability-scope mapping is deterministic and testable**: Each Google capability declares required scopes; runtime checks connector scope coverage before dispatch, returning typed recoverable failures instead of unsafe or silent fallback behavior.
+
+**Connector lifecycle is auditable end-to-end**: Connect/reconnect/disconnect/refresh outcomes are captured as durable events so users can inspect what authorization state changed, when it changed, and why capability execution was allowed or blocked.
+
 **User-visible status must map to durable action lifecycle**: Every Google action (read, draft, create, send) remains reconstructable through proposal/policy/approval/execution events, so users can inspect what was requested, what was authorized, and what actually happened.
+
+Reference implementation baseline: `docs/v1/s4/s4_oauth_mvp_blueprint.md`.
 
 ## Out of Scope
 
