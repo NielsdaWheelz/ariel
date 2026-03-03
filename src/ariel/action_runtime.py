@@ -30,6 +30,7 @@ from ariel.persistence import (
     to_rfc3339,
 )
 from ariel.policy_engine import evaluate_proposal
+from ariel.weather_state import resolve_weather_location
 
 _SIDE_EFFECT_EXECUTION_LOCK_ID = 24_310_002
 
@@ -177,6 +178,12 @@ def _taint_event_payload(
 
 _MAX_CITED_SOURCES = 4
 _MAX_SNIPPET_LENGTH = 320
+_NEWS_FRESHNESS_MAX_AGE = timedelta(hours=48)
+_GROUNDED_RETRIEVAL_CAPABILITIES = {
+    "cap.search.web",
+    "cap.search.news",
+    "cap.weather.forecast",
+}
 
 
 def _parse_rfc3339_timestamp(value: Any) -> datetime | None:
@@ -250,12 +257,14 @@ def _persist_retrieval_artifacts(
     session_id: str,
     turn_id: str,
     action_attempt: ActionAttemptRecord,
+    capability_id: str,
     candidates: list[GroundedSourceCandidate],
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
-) -> tuple[list[dict[str, Any]], list[str]]:
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
     assistant_sources: list[dict[str, Any]] = []
     citation_snippets: list[str] = []
+    source_metadata: list[dict[str, Any]] = []
     for candidate in candidates:
         now = now_fn()
         artifact = ArtifactRecord(
@@ -286,15 +295,16 @@ def _persist_retrieval_artifacts(
             }
         )
         citation_snippets.append(candidate.snippet)
-    return assistant_sources, citation_snippets
+        source_metadata.append(
+            {
+                "capability_id": capability_id,
+                "published_at": candidate.published_at,
+            }
+        )
+    return assistant_sources, citation_snippets, source_metadata
 
 
-def _synthesize_grounded_retrieval_answer(
-    *,
-    collected_sources: list[dict[str, Any]],
-    citation_snippets: list[str],
-    retrieval_errors: list[str],
-) -> tuple[str, list[dict[str, Any]]]:
+def _normalize_retrieval_errors(retrieval_errors: list[str]) -> list[str]:
     normalized_errors: list[str] = []
     for error in retrieval_errors:
         lowered = error.lower()
@@ -305,6 +315,16 @@ def _synthesize_grounded_retrieval_answer(
             normalized_errors.append("rate_limited")
             continue
         normalized_errors.append(error)
+    return normalized_errors
+
+
+def _synthesize_grounded_retrieval_answer(
+    *,
+    collected_sources: list[dict[str, Any]],
+    citation_snippets: list[str],
+    retrieval_errors: list[str],
+) -> tuple[str, list[dict[str, Any]]]:
+    normalized_errors = _normalize_retrieval_errors(retrieval_errors)
 
     if not collected_sources:
         if normalized_errors:
@@ -338,6 +358,106 @@ def _synthesize_grounded_retrieval_answer(
     return message, collected_sources
 
 
+def _synthesize_news_retrieval_answer(
+    *,
+    collected_sources: list[dict[str, Any]],
+    citation_snippets: list[str],
+    retrieval_errors: list[str],
+    source_metadata: list[dict[str, Any]],
+    now_fn: Callable[[], datetime],
+) -> tuple[str, list[dict[str, Any]]]:
+    message, assistant_sources = _synthesize_grounded_retrieval_answer(
+        collected_sources=collected_sources,
+        citation_snippets=citation_snippets,
+        retrieval_errors=retrieval_errors,
+    )
+    if not assistant_sources:
+        return message, assistant_sources
+
+    stale_count = 0
+    missing_count = 0
+    ambiguous_count = 0
+    now = now_fn()
+    for item in source_metadata:
+        capability_id = item.get("capability_id")
+        if capability_id != "cap.search.news":
+            continue
+        published_at = item.get("published_at")
+        if published_at is None:
+            missing_count += 1
+            continue
+        if not isinstance(published_at, datetime):
+            ambiguous_count += 1
+            continue
+        age = now - published_at
+        if age < timedelta(0):
+            ambiguous_count += 1
+            continue
+        if age > _NEWS_FRESHNESS_MAX_AGE:
+            stale_count += 1
+
+    freshness_notes: list[str] = []
+    if stale_count:
+        freshness_notes.append(
+            f"{stale_count} cited item(s) are stale (> {int(_NEWS_FRESHNESS_MAX_AGE.total_seconds() // 3600)}h)"
+        )
+    if missing_count:
+        freshness_notes.append(f"{missing_count} cited item(s) have missing publication timing")
+    if ambiguous_count:
+        freshness_notes.append(f"{ambiguous_count} cited item(s) have ambiguous publication timing")
+    if freshness_notes:
+        message = f"{message} freshness note: {'; '.join(freshness_notes)}."
+    return message, assistant_sources
+
+
+def _synthesize_weather_retrieval_answer(
+    *,
+    collected_sources: list[dict[str, Any]],
+    citation_snippets: list[str],
+    retrieval_errors: list[str],
+    weather_outputs: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]]]:
+    normalized_errors = _normalize_retrieval_errors(retrieval_errors)
+    if not collected_sources:
+        if any("weather_location_required" in error for error in normalized_errors):
+            return (
+                "i need your weather location before i can answer. "
+                "tell me a city or region (for example: weather in seattle today).",
+                [],
+            )
+        if normalized_errors:
+            primary_error = normalized_errors[0]
+            return (
+                "i'm uncertain because weather retrieval failed "
+                f"({primary_error}). please retry with a specific location or try again shortly.",
+                [],
+            )
+        return (
+            "i'm uncertain because i could not retrieve weather evidence. "
+            "please share a location and timeframe to retry.",
+            [],
+        )
+
+    first_output = weather_outputs[0] if weather_outputs else {}
+    location_raw = first_output.get("location")
+    timeframe_raw = first_output.get("timeframe")
+    forecast_timestamp_raw = first_output.get("forecast_timestamp")
+    location = location_raw.strip() if isinstance(location_raw, str) and location_raw.strip() else "your location"
+    timeframe = timeframe_raw.strip() if isinstance(timeframe_raw, str) and timeframe_raw.strip() else "now"
+    forecast_timestamp = (
+        forecast_timestamp_raw.strip()
+        if isinstance(forecast_timestamp_raw, str) and forecast_timestamp_raw.strip()
+        else "timestamp unavailable"
+    )
+    grounded_message, _ = _synthesize_grounded_retrieval_answer(
+        collected_sources=collected_sources,
+        citation_snippets=citation_snippets,
+        retrieval_errors=retrieval_errors,
+    )
+    message = f"weather for {location} ({timeframe}) at {forecast_timestamp}. {grounded_message}"
+    return message, collected_sources
+
+
 def process_action_proposals(
     *,
     db: Session,
@@ -362,6 +482,9 @@ def process_action_proposals(
     retrieval_errors: list[str] = []
     retrieval_sources: list[dict[str, Any]] = []
     retrieval_snippets: list[str] = []
+    retrieval_source_metadata: list[dict[str, Any]] = []
+    retrieval_capability_ids: set[str] = set()
+    weather_outputs: list[dict[str, Any]] = []
 
     proposals = proposals_raw if isinstance(proposals_raw, list) else []
     for proposal_index, proposal_raw in enumerate(proposals, start=1):
@@ -372,13 +495,26 @@ def process_action_proposals(
             if isinstance(capability_id_raw, str) and capability_id_raw.strip()
             else "invalid.capability"
         )
-        is_search_web_proposal = capability_id == "cap.search.web"
-        if is_search_web_proposal:
+        is_retrieval_proposal = capability_id in _GROUNDED_RETRIEVAL_CAPABILITIES
+        is_weather_forecast_proposal = capability_id == "cap.weather.forecast"
+        if is_retrieval_proposal:
             retrieval_requested = True
+            retrieval_capability_ids.add(capability_id)
         else:
             retrieval_only_proposals = False
         raw_input_payload = proposal_payload.get("input")
         input_payload = jsonable_encoder(raw_input_payload) if isinstance(raw_input_payload, dict) else {}
+        if is_weather_forecast_proposal and set(input_payload.keys()).issubset({"location", "timeframe"}):
+            explicit_location_raw = input_payload.get("location")
+            explicit_location = (
+                explicit_location_raw if isinstance(explicit_location_raw, str) else None
+            )
+            resolved_location, _ = resolve_weather_location(
+                db=db,
+                explicit_location=explicit_location,
+                now_fn=now_fn,
+            )
+            input_payload["location"] = resolved_location
         model_declared_taint_status = _model_declared_taint_status(proposal_payload)
         provenance_status = _effective_provenance_status(
             runtime_provenance=runtime_provenance,
@@ -459,7 +595,7 @@ def process_action_proposals(
                     "taint": taint_payload,
                 },
             )
-            if is_search_web_proposal:
+            if is_retrieval_proposal:
                 retrieval_errors.append(evaluation.reason)
             continue
 
@@ -514,7 +650,7 @@ def process_action_proposals(
                     "expires_at": to_rfc3339(approval_request.expires_at),
                 },
             )
-            if is_search_web_proposal:
+            if is_retrieval_proposal:
                 retrieval_errors.append(evaluation.reason)
             continue
 
@@ -533,7 +669,7 @@ def process_action_proposals(
                     "taint": taint_payload,
                 },
             )
-            if is_search_web_proposal:
+            if is_retrieval_proposal:
                 retrieval_errors.append("policy_invariant_violation")
             continue
 
@@ -568,7 +704,7 @@ def process_action_proposals(
                     "error": integrity_error,
                 },
             )
-            if is_search_web_proposal:
+            if is_retrieval_proposal:
                 retrieval_errors.append(integrity_error)
             continue
 
@@ -598,7 +734,7 @@ def process_action_proposals(
                     "output": execution_result.output,
                 }
             )
-            if is_search_web_proposal:
+            if is_retrieval_proposal:
                 remaining_citations = _MAX_CITED_SOURCES - len(retrieval_sources)
                 if remaining_citations > 0:
                     candidates = _extract_search_source_candidates(
@@ -606,19 +742,27 @@ def process_action_proposals(
                         now_fn=now_fn,
                     )
                     if candidates:
-                        persisted_sources, persisted_snippets = _persist_retrieval_artifacts(
+                        (
+                            persisted_sources,
+                            persisted_snippets,
+                            persisted_metadata,
+                        ) = _persist_retrieval_artifacts(
                             db=db,
                             session_id=session_id,
                             turn_id=turn.id,
                             action_attempt=action_attempt,
+                            capability_id=capability_id,
                             candidates=candidates[:remaining_citations],
                             now_fn=now_fn,
                             new_id_fn=new_id_fn,
                         )
                         retrieval_sources.extend(persisted_sources)
                         retrieval_snippets.extend(persisted_snippets)
+                        retrieval_source_metadata.extend(persisted_metadata)
                     else:
                         retrieval_errors.append("insufficient_evidence")
+                if is_weather_forecast_proposal:
+                    weather_outputs.append(execution_result.output)
             add_event(
                 "evt.action.execution.succeeded",
                 {
@@ -635,7 +779,7 @@ def process_action_proposals(
         blocked_reasons.append(
             f"{capability_id}: {execution_result.error or 'execution_output_missing'}"
         )
-        if is_search_web_proposal:
+        if is_retrieval_proposal:
             retrieval_errors.append(action_attempt.execution_error)
         add_event(
             "evt.action.execution.failed",
@@ -646,11 +790,27 @@ def process_action_proposals(
         )
 
     if retrieval_requested and retrieval_only_proposals:
-        final_assistant_message, assistant_sources = _synthesize_grounded_retrieval_answer(
-            collected_sources=retrieval_sources,
-            citation_snippets=retrieval_snippets,
-            retrieval_errors=retrieval_errors,
-        )
+        if retrieval_capability_ids == {"cap.search.news"}:
+            final_assistant_message, assistant_sources = _synthesize_news_retrieval_answer(
+                collected_sources=retrieval_sources,
+                citation_snippets=retrieval_snippets,
+                retrieval_errors=retrieval_errors,
+                source_metadata=retrieval_source_metadata,
+                now_fn=now_fn,
+            )
+        elif retrieval_capability_ids == {"cap.weather.forecast"}:
+            final_assistant_message, assistant_sources = _synthesize_weather_retrieval_answer(
+                collected_sources=retrieval_sources,
+                citation_snippets=retrieval_snippets,
+                retrieval_errors=retrieval_errors,
+                weather_outputs=weather_outputs,
+            )
+        else:
+            final_assistant_message, assistant_sources = _synthesize_grounded_retrieval_answer(
+                collected_sources=retrieval_sources,
+                citation_snippets=retrieval_snippets,
+                retrieval_errors=retrieval_errors,
+            )
     else:
         appendix = build_assistant_action_appendix(
             inline_results=inline_results,

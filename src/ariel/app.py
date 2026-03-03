@@ -54,6 +54,7 @@ from ariel.response_contracts import (
     build_surface_message_response,
     build_surface_timeline_response,
 )
+from ariel.weather_state import get_weather_default_location_state, set_weather_default_location
 
 
 def _utcnow() -> datetime:
@@ -121,6 +122,18 @@ class ApprovalDecisionRequest(BaseModel):
             return None
         normalized = value.strip()
         return normalized or None
+
+
+class WeatherDefaultLocationRequest(BaseModel):
+    location: str = Field(min_length=1, max_length=200)
+
+    @field_validator("location")
+    @classmethod
+    def _location_must_not_be_blank(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("location must not be blank")
+        return normalized
 
 
 class ModelAdapter(Protocol):
@@ -793,6 +806,40 @@ def create_app(
             with db.begin():
                 active_session = _get_or_create_active_session(db)
             return {"ok": True, "session": serialize_session(active_session)}
+
+    @app.get("/v1/weather/default-location")
+    def get_weather_default_location() -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                state = get_weather_default_location_state(
+                    db=db,
+                    now_fn=_utcnow,
+                    bootstrap_if_unset=True,
+                )
+            return {
+                "ok": True,
+                "default_location": state.location,
+                "source": state.source,
+                "updated_at": to_rfc3339(state.updated_at) if state.updated_at is not None else None,
+            }
+
+    @app.put("/v1/weather/default-location")
+    def put_weather_default_location(payload: WeatherDefaultLocationRequest) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                state = set_weather_default_location(
+                    db=db,
+                    location=payload.location,
+                    now_fn=_utcnow,
+                )
+            return {
+                "ok": True,
+                "default_location": state.location,
+                "source": state.source,
+                "updated_at": to_rfc3339(state.updated_at) if state.updated_at is not None else None,
+            }
 
     @app.post("/v1/sessions/{session_id}/message", response_model=None)
     def post_message(session_id: str, payload: MessageRequest) -> JSONResponse | dict[str, Any]:

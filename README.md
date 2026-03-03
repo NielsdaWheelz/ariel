@@ -99,6 +99,26 @@ search capability runtime config:
 - `ARIEL_SEARCH_WEB_API_KEY` (required for live web retrieval backend)
 - `ARIEL_SEARCH_WEB_ENDPOINT` (optional; defaults to Brave web search endpoint)
 - `ARIEL_SEARCH_WEB_TIMEOUT_SECONDS` (optional; defaults to `8.0`)
+- `ARIEL_SEARCH_NEWS_API_KEY` (optional; falls back to `ARIEL_SEARCH_WEB_API_KEY`)
+- `ARIEL_SEARCH_NEWS_ENDPOINT` (optional; defaults to Brave news search endpoint)
+- `ARIEL_SEARCH_NEWS_TIMEOUT_SECONDS` (optional; defaults to `8.0`)
+
+weather capability runtime config:
+
+- `ARIEL_WEATHER_PROVIDER_MODE` (`production` default, `dev_fallback` optional)
+- `ARIEL_WEATHER_PRODUCTION_ENDPOINT` (optional; defaults to Tomorrow.io forecast endpoint)
+- `ARIEL_WEATHER_PRODUCTION_API_KEY` (required for production weather backend)
+- `ARIEL_WEATHER_PRODUCTION_TIMEOUT_SECONDS` (optional; defaults to `8.0`)
+- `ARIEL_WEATHER_DEV_ENDPOINT` (optional; defaults to `https://wttr.in`)
+- `ARIEL_WEATHER_DEV_TIMEOUT_SECONDS` (optional; defaults to `8.0`)
+- `ARIEL_WEATHER_DEFAULT_LOCATION` (optional bootstrap-only fallback; seeded once when canonical state is unset)
+
+weather default location APIs:
+
+```bash
+GET /v1/weather/default-location
+PUT /v1/weather/default-location
+```
 
 approval decisions are handled through:
 
