@@ -49,6 +49,13 @@ Derived readiness (response surface):
 - expose raw connector `status` plus derived readiness `connected|not_connected|reconnect_required`.
 - `reconnect_required` means user action is required before safe capability execution (missing consent/scope, revoked access, or non-recoverable token state).
 - transient provider/network failures do not by themselves remap a connected connector to `reconnect_required`.
+- readiness remains `reconnect_required` until successful reconnect (or explicit disconnect).
+
+Readiness classification contract:
+
+- blocking failures (`consent_required`, `scope_missing`, `access_revoked`) remap readiness to `reconnect_required`.
+- transient retryable failures (for example upstream timeout/network instability/retryable provider errors) do not remap readiness by themselves.
+- classification must be consistent across read and write capabilities.
 
 Security baseline:
 

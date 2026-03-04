@@ -34,6 +34,7 @@
 - **acceptance**:
   - when a calendar/email capability fails with `consent_required`, `scope_missing`, or `access_revoked`, connector readiness transitions to `reconnect_required` and remains so until reconnect succeeds.
   - transient retryable failures (for example temporary upstream/network failures) do not incorrectly force readiness to `reconnect_required`.
+  - readiness transitions follow an explicit blocking-vs-transient classifier so reconnect-required behavior is deterministic across capability types and retry paths.
   - reconnect can deterministically request attendee free/busy consent for slot-planning intent while preserving already granted scopes and avoiding unrelated scope escalation.
   - once attendee free/busy consent is granted, slot proposals with attendees use attendee intersection; when not granted, fallback remains explicit with concrete reconnect guidance.
   - connector status/readiness transitions and reconnect scope requests remain auditable and are covered by acceptance regression tests.

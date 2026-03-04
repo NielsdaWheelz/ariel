@@ -76,6 +76,8 @@ Deliver the highest-value Google productivity flows with correct safety boundari
 
 **`reconnect_required` is a derived readiness state**: User-visible connector readiness maps to `connected|not_connected|reconnect_required`; `reconnect_required` includes missing consent/scope, revoked access, and non-recoverable token state while excluding transient provider/network failures.
 
+**Readiness classification is explicit and deterministic**: Runtime uses a documented blocking-vs-transient classifier for readiness remapping. Blocking typed auth/scope failures drive `reconnect_required`; transient retryable upstream/network failures do not.
+
 **User-visible status must map to durable action lifecycle**: Every Google action (read, draft, create, send) remains reconstructable through proposal/policy/approval/execution events, so users can inspect what was requested, what was authorized, and what actually happened.
 
 Reference implementation baseline: `docs/v1/s4/s4_oauth_mvp_blueprint.md`.
