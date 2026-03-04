@@ -55,8 +55,17 @@ GOOGLE_CAPABILITY_SCOPES: dict[str, set[str]] = {
     **GOOGLE_WRITE_CAPABILITY_SCOPES,
 }
 GOOGLE_CAPABILITY_IDS = frozenset(GOOGLE_CAPABILITY_SCOPES.keys())
+GOOGLE_RECONNECT_INTENT_EXTRA_SCOPES: dict[str, set[str]] = {
+    "cap.calendar.propose_slots": {GOOGLE_CALENDAR_FREEBUSY_SCOPE},
+}
 
 _GOOGLE_MINIMUM_READ_SCOPES = {GOOGLE_CALENDAR_READ_SCOPE, GOOGLE_GMAIL_READ_SCOPE}
+_READINESS_BLOCKING_FAILURE_CODES = {
+    "consent_required",
+    "scope_missing",
+    "access_revoked",
+}
+_READINESS_TRANSIENT_FAILURE_CODES = {"token_expired"}
 
 TypedAuthFailureClass = Literal[
     "not_connected",
@@ -1041,6 +1050,7 @@ def _resolve_reconnect_scopes(
             msg = "unsupported capability intent"
             raise RuntimeError(msg)
         requested_scopes.update(required_scopes)
+        requested_scopes.update(GOOGLE_RECONNECT_INTENT_EXTRA_SCOPES.get(normalized_intent, set()))
     return sorted(requested_scopes), normalized_intent
 
 
@@ -1299,12 +1309,65 @@ def _pkce_challenge(verifier: str) -> str:
     return _urlsafe_b64encode(digest)
 
 
+def _readiness_failure_kind(error_code: str | None) -> Literal["none", "blocking", "transient", "other"]:
+    if error_code is None:
+        return "none"
+    normalized = error_code.strip().lower()
+    if not normalized:
+        return "none"
+    if normalized in _READINESS_BLOCKING_FAILURE_CODES:
+        return "blocking"
+    if normalized in _READINESS_TRANSIENT_FAILURE_CODES:
+        return "transient"
+    return "other"
+
+
+def _is_blocking_readiness_failure(error_code: str | None) -> bool:
+    return _readiness_failure_kind(error_code) == "blocking"
+
+
+def _set_connector_error(
+    *,
+    connector: GoogleConnectorRecord,
+    error_code: str,
+    now_fn: Callable[[], datetime],
+    preserve_existing_blocking: bool = True,
+) -> None:
+    normalized_error_code = error_code.strip()
+    if not normalized_error_code:
+        return
+    if preserve_existing_blocking and _is_blocking_readiness_failure(
+        connector.last_error_code
+    ) and not _is_blocking_readiness_failure(normalized_error_code):
+        connector.updated_at = now_fn()
+        return
+    connector.last_error_code = normalized_error_code
+    connector.last_error_at = now_fn()
+    connector.updated_at = now_fn()
+
+
+def _clear_connector_error(
+    *,
+    connector: GoogleConnectorRecord,
+    now_fn: Callable[[], datetime],
+    preserve_existing_blocking: bool,
+) -> None:
+    if preserve_existing_blocking and _is_blocking_readiness_failure(connector.last_error_code):
+        connector.updated_at = now_fn()
+        return
+    connector.last_error_code = None
+    connector.last_error_at = None
+    connector.updated_at = now_fn()
+
+
 def _readiness(connector: GoogleConnectorRecord | None) -> str:
     if connector is None:
         return "not_connected"
     if connector.status == "not_connected":
         return "not_connected"
     if connector.status != "connected":
+        return "reconnect_required"
+    if _is_blocking_readiness_failure(connector.last_error_code):
         return "reconnect_required"
     granted_scopes = set(_normalize_scope_list(connector.granted_scopes))
     if not _GOOGLE_MINIMUM_READ_SCOPES.issubset(granted_scopes):
@@ -1528,9 +1591,12 @@ class GoogleConnectorRuntime:
             )
         except Exception as exc:
             reason = safe_failure_reason(str(exc), fallback=f"unexpected {exc.__class__.__name__}")
-            connector.last_error_code = "oauth_start_failed"
-            connector.last_error_at = now_fn()
-            connector.updated_at = now_fn()
+            _set_connector_error(
+                connector=connector,
+                error_code="oauth_start_failed",
+                now_fn=now_fn,
+                preserve_existing_blocking=True,
+            )
             failed_event_type = (
                 "evt.connector.google.reconnect.failed"
                 if reconnect
@@ -1580,9 +1646,12 @@ class GoogleConnectorRuntime:
         now_fn: Callable[[], datetime],
         new_id_fn: Callable[[str], str],
     ) -> GoogleConnectorError:
-        connector.last_error_code = reason
-        connector.last_error_at = now_fn()
-        connector.updated_at = now_fn()
+        _set_connector_error(
+            connector=connector,
+            error_code=reason,
+            now_fn=now_fn,
+            preserve_existing_blocking=True,
+        )
         failed_event_type = (
             "evt.connector.google.reconnect.failed" if flow == "reconnect" else "evt.connector.google.connect.failed"
         )
@@ -1724,9 +1793,12 @@ class GoogleConnectorRuntime:
                 else "evt.connector.google.connect.failed"
             )
             connector.status = "error"
-            connector.last_error_code = "oauth_exchange_failed"
-            connector.last_error_at = now_fn()
-            connector.updated_at = now_fn()
+            _set_connector_error(
+                connector=connector,
+                error_code="oauth_exchange_failed",
+                now_fn=now_fn,
+                preserve_existing_blocking=True,
+            )
             _append_connector_event(
                 db=db,
                 connector_id=connector.id,
@@ -1947,9 +2019,12 @@ class GoogleConnectorRuntime:
         new_id_fn: Callable[[str], str],
     ) -> tuple[str | None, GoogleCapabilityExecutionResult | None]:
         if connector.access_token_enc is None:
-            connector.last_error_code = "token_missing"
-            connector.last_error_at = now_fn()
-            connector.updated_at = now_fn()
+            _set_connector_error(
+                connector=connector,
+                error_code="token_missing",
+                now_fn=now_fn,
+                preserve_existing_blocking=True,
+            )
             return None, self._typed_failure(failure_class="token_expired")
         access_token = _decrypt_secret(
             ciphertext=connector.access_token_enc,
@@ -1961,9 +2036,12 @@ class GoogleConnectorRuntime:
         if connector.access_token_expires_at is None or connector.access_token_expires_at > now:
             return access_token, None
         if connector.refresh_token_enc is None:
-            connector.last_error_code = "refresh_missing"
-            connector.last_error_at = now_fn()
-            connector.updated_at = now_fn()
+            _set_connector_error(
+                connector=connector,
+                error_code="refresh_missing",
+                now_fn=now_fn,
+                preserve_existing_blocking=True,
+            )
             _append_connector_event(
                 db=db,
                 connector_id=connector.id,
@@ -1992,9 +2070,12 @@ class GoogleConnectorRuntime:
             reason = safe_failure_reason(str(exc), fallback=f"unexpected {exc.__class__.__name__}").lower()
             if "invalid_grant" in reason or "revoked" in reason:
                 connector.status = "revoked"
-                connector.last_error_code = "access_revoked"
-                connector.last_error_at = now_fn()
-                connector.updated_at = now_fn()
+                _set_connector_error(
+                    connector=connector,
+                    error_code="access_revoked",
+                    now_fn=now_fn,
+                    preserve_existing_blocking=True,
+                )
                 _append_connector_event(
                     db=db,
                     connector_id=connector.id,
@@ -2010,9 +2091,12 @@ class GoogleConnectorRuntime:
                     new_id_fn=new_id_fn,
                 )
                 return None, self._typed_failure(failure_class="access_revoked")
-            connector.last_error_code = "token_expired"
-            connector.last_error_at = now_fn()
-            connector.updated_at = now_fn()
+            _set_connector_error(
+                connector=connector,
+                error_code="token_expired",
+                now_fn=now_fn,
+                preserve_existing_blocking=True,
+            )
             _append_connector_event(
                 db=db,
                 connector_id=connector.id,
@@ -2031,9 +2115,12 @@ class GoogleConnectorRuntime:
 
         access_token_raw = refreshed_payload.get("access_token")
         if not isinstance(access_token_raw, str) or not access_token_raw.strip():
-            connector.last_error_code = "token_expired"
-            connector.last_error_at = now_fn()
-            connector.updated_at = now_fn()
+            _set_connector_error(
+                connector=connector,
+                error_code="token_expired",
+                now_fn=now_fn,
+                preserve_existing_blocking=True,
+            )
             return None, self._typed_failure(failure_class="token_expired")
 
         refreshed_refresh_token_raw = refreshed_payload.get("refresh_token")
@@ -2062,9 +2149,11 @@ class GoogleConnectorRuntime:
         now_refreshed = now_fn()
         connector.access_token_expires_at = now_refreshed + timedelta(seconds=expires_in_seconds)
         connector.token_obtained_at = now_refreshed
-        connector.last_error_code = None
-        connector.last_error_at = None
-        connector.updated_at = now_fn()
+        _clear_connector_error(
+            connector=connector,
+            now_fn=now_fn,
+            preserve_existing_blocking=True,
+        )
         _append_connector_event(
             db=db,
             connector_id=connector.id,
@@ -2105,9 +2194,12 @@ class GoogleConnectorRuntime:
             return self._typed_failure(failure_class="access_revoked")
         granted_scopes = set(_normalize_scope_list(connector.granted_scopes))
         if not required_scopes.issubset(granted_scopes):
-            connector.last_error_code = "consent_required"
-            connector.last_error_at = now_fn()
-            connector.updated_at = now_fn()
+            _set_connector_error(
+                connector=connector,
+                error_code="consent_required",
+                now_fn=now_fn,
+                preserve_existing_blocking=True,
+            )
             return self._typed_failure(failure_class="consent_required")
 
         try:
@@ -2179,20 +2271,29 @@ class GoogleConnectorRuntime:
             reason = safe_failure_reason(str(exc), fallback=f"unexpected {exc.__class__.__name__}")
             lowered = reason.lower()
             if "insufficient" in lowered or "permission" in lowered:
-                connector.last_error_code = "scope_missing"
-                connector.last_error_at = now_fn()
-                connector.updated_at = now_fn()
+                _set_connector_error(
+                    connector=connector,
+                    error_code="scope_missing",
+                    now_fn=now_fn,
+                    preserve_existing_blocking=True,
+                )
                 return self._typed_failure(failure_class="scope_missing")
             if "invalid_grant" in lowered or "revoked" in lowered:
                 connector.status = "revoked"
-                connector.last_error_code = "access_revoked"
-                connector.last_error_at = now_fn()
-                connector.updated_at = now_fn()
+                _set_connector_error(
+                    connector=connector,
+                    error_code="access_revoked",
+                    now_fn=now_fn,
+                    preserve_existing_blocking=True,
+                )
                 return self._typed_failure(failure_class="access_revoked")
             if "token" in lowered and "expired" in lowered:
-                connector.last_error_code = "token_expired"
-                connector.last_error_at = now_fn()
-                connector.updated_at = now_fn()
+                _set_connector_error(
+                    connector=connector,
+                    error_code="token_expired",
+                    now_fn=now_fn,
+                    preserve_existing_blocking=True,
+                )
                 return self._typed_failure(failure_class="token_expired")
             return GoogleCapabilityExecutionResult(
                 status="failed",
