@@ -640,6 +640,7 @@ def _runtime_provenance_for_turn(
             ActionAttemptRecord.turn_id.in_(recent_turn_ids),
             ActionAttemptRecord.policy_decision == "allow_inline",
             ActionAttemptRecord.status == "succeeded",
+            ActionAttemptRecord.impact_level == "read",
         )
         .order_by(
             ActionAttemptRecord.created_at.asc(),
@@ -943,16 +944,24 @@ def create_app(
             return {"ok": True, **payload}
 
     @app.post("/v1/connectors/google/reconnect", response_model=None)
-    def post_google_connector_reconnect() -> JSONResponse | dict[str, Any]:
+    def post_google_connector_reconnect(
+        capability_intent: str | None = None,
+    ) -> JSONResponse | dict[str, Any]:
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
                 try:
+                    normalized_capability_intent = (
+                        capability_intent.strip()
+                        if isinstance(capability_intent, str) and capability_intent.strip()
+                        else None
+                    )
                     payload = _google_runtime().start_oauth(
                         db=db,
                         reconnect=True,
                         now_fn=_utcnow,
                         new_id_fn=_new_id,
+                        capability_intent=normalized_capability_intent,
                     )
                 except GoogleConnectorError as exc:
                     return _error_response(
@@ -1404,6 +1413,7 @@ def create_app(
                         reason=payload.reason,
                         now_fn=_utcnow,
                         new_id_fn=_new_id,
+                        google_runtime=_google_runtime(),
                     )
                 except ActionRuntimeError as exc:
                     return _error_response(

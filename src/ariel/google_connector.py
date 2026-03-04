@@ -4,6 +4,7 @@ import base64
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from email.message import EmailMessage
 import json
 import hashlib
 import hmac
@@ -31,7 +32,10 @@ GOOGLE_PROVIDER = "google"
 
 GOOGLE_CALENDAR_READ_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
 GOOGLE_CALENDAR_FREEBUSY_SCOPE = "https://www.googleapis.com/auth/calendar.freebusy"
+GOOGLE_CALENDAR_WRITE_SCOPE = "https://www.googleapis.com/auth/calendar.events"
 GOOGLE_GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+GOOGLE_GMAIL_COMPOSE_SCOPE = "https://www.googleapis.com/auth/gmail.compose"
+GOOGLE_GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 
 GOOGLE_READ_CAPABILITY_SCOPES: dict[str, set[str]] = {
     "cap.calendar.list": {GOOGLE_CALENDAR_READ_SCOPE},
@@ -40,6 +44,17 @@ GOOGLE_READ_CAPABILITY_SCOPES: dict[str, set[str]] = {
     "cap.email.read": {GOOGLE_GMAIL_READ_SCOPE},
 }
 GOOGLE_READ_CAPABILITY_IDS = frozenset(GOOGLE_READ_CAPABILITY_SCOPES.keys())
+GOOGLE_WRITE_CAPABILITY_SCOPES: dict[str, set[str]] = {
+    "cap.calendar.create_event": {GOOGLE_CALENDAR_WRITE_SCOPE},
+    "cap.email.draft": {GOOGLE_GMAIL_COMPOSE_SCOPE},
+    "cap.email.send": {GOOGLE_GMAIL_SEND_SCOPE},
+}
+GOOGLE_WRITE_CAPABILITY_IDS = frozenset(GOOGLE_WRITE_CAPABILITY_SCOPES.keys())
+GOOGLE_CAPABILITY_SCOPES: dict[str, set[str]] = {
+    **GOOGLE_READ_CAPABILITY_SCOPES,
+    **GOOGLE_WRITE_CAPABILITY_SCOPES,
+}
+GOOGLE_CAPABILITY_IDS = frozenset(GOOGLE_CAPABILITY_SCOPES.keys())
 
 _GOOGLE_MINIMUM_READ_SCOPES = {GOOGLE_CALENDAR_READ_SCOPE, GOOGLE_GMAIL_READ_SCOPE}
 
@@ -148,6 +163,27 @@ class GoogleWorkspaceProvider(Protocol):
     ) -> dict[str, Any]: ...
 
     def email_read(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]: ...
+
+    def calendar_create_event(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]: ...
+
+    def email_create_draft(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]: ...
+
+    def email_send(
         self,
         *,
         access_token: str,
@@ -705,6 +741,121 @@ class DefaultGoogleWorkspaceProvider:
             "retrieved_at": to_rfc3339(_utcnow()),
         }
 
+    def _compose_raw_email_message(self, *, normalized_input: dict[str, Any]) -> str:
+        message = EmailMessage()
+        to_recipients = normalized_input.get("to", [])
+        cc_recipients = normalized_input.get("cc", [])
+        bcc_recipients = normalized_input.get("bcc", [])
+        if isinstance(to_recipients, list) and to_recipients:
+            message["To"] = ", ".join(str(item) for item in to_recipients)
+        if isinstance(cc_recipients, list) and cc_recipients:
+            message["Cc"] = ", ".join(str(item) for item in cc_recipients)
+        if isinstance(bcc_recipients, list) and bcc_recipients:
+            message["Bcc"] = ", ".join(str(item) for item in bcc_recipients)
+        message["Subject"] = str(normalized_input["subject"])
+        message.set_content(str(normalized_input["body"]))
+        return base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
+
+    def calendar_create_event(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "summary": str(normalized_input["title"]),
+            "start": {"dateTime": str(normalized_input["start_time"])},
+            "end": {"dateTime": str(normalized_input["end_time"])},
+        }
+        description_raw = normalized_input.get("description")
+        if isinstance(description_raw, str) and description_raw.strip():
+            payload["description"] = description_raw.strip()
+        location_raw = normalized_input.get("location")
+        if isinstance(location_raw, str) and location_raw.strip():
+            payload["location"] = location_raw.strip()
+        attendees_raw = normalized_input.get("attendees", [])
+        if isinstance(attendees_raw, list) and attendees_raw:
+            payload["attendees"] = [{"email": attendee} for attendee in attendees_raw]
+
+        created_payload = self._request_json(
+            method="POST",
+            url=f"{self.calendar_api_base_url}/calendars/primary/events",
+            access_token=access_token,
+            json_payload=payload,
+        )
+        event_id_raw = created_payload.get("id")
+        event_id = event_id_raw.strip() if isinstance(event_id_raw, str) and event_id_raw.strip() else "unknown"
+        source_raw = created_payload.get("htmlLink")
+        source = (
+            source_raw.strip()
+            if isinstance(source_raw, str) and source_raw.strip()
+            else f"calendar://{event_id}"
+        )
+        return {
+            "status": "created",
+            "event_id": event_id,
+            "title": str(normalized_input["title"]),
+            "start_time": str(normalized_input["start_time"]),
+            "end_time": str(normalized_input["end_time"]),
+            "provider_event_ref": source,
+        }
+
+    def email_create_draft(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]:
+        raw_message = self._compose_raw_email_message(normalized_input=normalized_input)
+        payload = self._request_json(
+            method="POST",
+            url=f"{self.gmail_api_base_url}/users/me/drafts",
+            access_token=access_token,
+            json_payload={"message": {"raw": raw_message}},
+        )
+        draft_id_raw = payload.get("id")
+        if not isinstance(draft_id_raw, str) or not draft_id_raw.strip():
+            draft_id_raw = (
+                payload.get("message", {}).get("id")
+                if isinstance(payload.get("message"), dict)
+                else None
+            )
+        draft_id = (
+            draft_id_raw.strip()
+            if isinstance(draft_id_raw, str) and draft_id_raw.strip()
+            else None
+        )
+        return {
+            "provider_draft_ref": f"gmail://draft/{draft_id}" if draft_id is not None else None,
+        }
+
+    def email_send(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]:
+        raw_message = self._compose_raw_email_message(normalized_input=normalized_input)
+        payload = self._request_json(
+            method="POST",
+            url=f"{self.gmail_api_base_url}/users/me/messages/send",
+            access_token=access_token,
+            json_payload={"raw": raw_message},
+        )
+        message_id_raw = payload.get("id")
+        message_id = (
+            message_id_raw.strip()
+            if isinstance(message_id_raw, str) and message_id_raw.strip()
+            else "unknown"
+        )
+        return {
+            "status": "sent",
+            "message_id": message_id,
+            "provider_message_ref": f"gmail://sent/{message_id}",
+            "to": normalized_input.get("to", []),
+            "subject": normalized_input.get("subject"),
+        }
+
 
 def _parse_rfc3339(value: Any) -> datetime | None:
     if not isinstance(value, str):
@@ -864,6 +1015,59 @@ def _normalize_scope_list(raw_scopes: Any) -> list[str]:
         seen.add(scope)
         normalized.append(scope)
     return normalized
+
+
+def _normalize_capability_intent(capability_intent: str | None) -> str | None:
+    if capability_intent is None:
+        return None
+    normalized = capability_intent.strip()
+    if not normalized:
+        return None
+    return normalized
+
+
+def _resolve_reconnect_scopes(
+    *,
+    granted_scopes: list[str],
+    capability_intent: str | None,
+) -> tuple[list[str], str | None]:
+    requested_scopes = set(_normalize_scope_list(granted_scopes))
+    if not requested_scopes:
+        requested_scopes = set(_GOOGLE_MINIMUM_READ_SCOPES)
+    normalized_intent = _normalize_capability_intent(capability_intent)
+    if normalized_intent is not None:
+        required_scopes = GOOGLE_CAPABILITY_SCOPES.get(normalized_intent)
+        if required_scopes is None:
+            msg = "unsupported capability intent"
+            raise RuntimeError(msg)
+        requested_scopes.update(required_scopes)
+    return sorted(requested_scopes), normalized_intent
+
+
+def _canonical_draft_output(
+    *,
+    normalized_input: dict[str, Any],
+    provider_projection: dict[str, Any],
+) -> dict[str, Any]:
+    provider_ref_raw = provider_projection.get("provider_draft_ref")
+    provider_ref = (
+        provider_ref_raw.strip()
+        if isinstance(provider_ref_raw, str) and provider_ref_raw.strip()
+        else None
+    )
+    return {
+        "status": "drafted_not_sent",
+        "delivery_state": "draft_only",
+        "sent": False,
+        "draft": {
+            "to": normalized_input.get("to", []),
+            "cc": normalized_input.get("cc", []),
+            "bcc": normalized_input.get("bcc", []),
+            "subject": normalized_input.get("subject"),
+            "body": normalized_input.get("body"),
+        },
+        "provider_draft_ref": provider_ref,
+    }
 
 
 def _urlsafe_b64encode(value: bytes) -> str:
@@ -1247,9 +1451,26 @@ class GoogleConnectorRuntime:
         reconnect: bool,
         now_fn: Callable[[], datetime],
         new_id_fn: Callable[[str], str],
+        capability_intent: str | None = None,
     ) -> dict[str, Any]:
         connector = self._ensure_connector(db=db, now_fn=now_fn)
-        requested_scopes = sorted(_GOOGLE_MINIMUM_READ_SCOPES)
+        if reconnect:
+            try:
+                requested_scopes, normalized_capability_intent = _resolve_reconnect_scopes(
+                    granted_scopes=_normalize_scope_list(connector.granted_scopes),
+                    capability_intent=capability_intent,
+                )
+            except RuntimeError as exc:
+                raise GoogleConnectorError(
+                    status_code=400,
+                    code="E_CONNECTOR_RECONNECT_INVALID_INTENT",
+                    message="google reconnect capability intent is invalid",
+                    details={"reason": safe_failure_reason(str(exc), fallback="invalid_capability_intent")},
+                    retryable=False,
+                ) from exc
+        else:
+            requested_scopes = sorted(_GOOGLE_MINIMUM_READ_SCOPES)
+            normalized_capability_intent = None
         state_handle = f"st_{secrets.token_urlsafe(24)}"
         verifier = _pkce_verifier()
         challenge = _pkce_challenge(verifier)
@@ -1281,15 +1502,18 @@ class GoogleConnectorRuntime:
             if reconnect
             else "evt.connector.google.connect.started"
         )
+        started_event_payload = {
+            **_connector_event_payload(connector, scopes=requested_scopes),
+            "requested_scopes": requested_scopes,
+            "state_expires_at": to_rfc3339(expires_at),
+        }
+        if normalized_capability_intent is not None:
+            started_event_payload["capability_intent"] = normalized_capability_intent
         _append_connector_event(
             db=db,
             connector_id=connector.id,
             event_type=event_type,
-            payload_data={
-                **_connector_event_payload(connector, scopes=requested_scopes),
-                "requested_scopes": requested_scopes,
-                "state_expires_at": to_rfc3339(expires_at),
-            },
+            payload_data=started_event_payload,
             now_fn=now_fn,
             new_id_fn=new_id_fn,
         )
@@ -1312,15 +1536,18 @@ class GoogleConnectorRuntime:
                 if reconnect
                 else "evt.connector.google.connect.failed"
             )
+            failed_payload = {
+                **_connector_event_payload(connector, scopes=requested_scopes),
+                "requested_scopes": requested_scopes,
+                "failure_reason": reason,
+            }
+            if normalized_capability_intent is not None:
+                failed_payload["capability_intent"] = normalized_capability_intent
             _append_connector_event(
                 db=db,
                 connector_id=connector.id,
                 event_type=failed_event_type,
-                payload_data={
-                    **_connector_event_payload(connector, scopes=requested_scopes),
-                    "requested_scopes": requested_scopes,
-                    "failure_reason": reason,
-                },
+                payload_data=failed_payload,
                 now_fn=now_fn,
                 new_id_fn=new_id_fn,
             )
@@ -1339,6 +1566,7 @@ class GoogleConnectorRuntime:
                 "state": state_handle,
                 "expires_at": to_rfc3339(expires_at),
                 "requested_scopes": requested_scopes,
+                "capability_intent": normalized_capability_intent,
             },
         }
 
@@ -1853,7 +2081,7 @@ class GoogleConnectorRuntime:
         )
         return access_token_raw.strip(), None
 
-    def execute_read_capability(
+    def execute_capability(
         self,
         *,
         db: Session,
@@ -1862,7 +2090,7 @@ class GoogleConnectorRuntime:
         now_fn: Callable[[], datetime],
         new_id_fn: Callable[[str], str],
     ) -> GoogleCapabilityExecutionResult:
-        required_scopes = GOOGLE_READ_CAPABILITY_SCOPES.get(capability_id)
+        required_scopes = GOOGLE_CAPABILITY_SCOPES.get(capability_id)
         if required_scopes is None:
             return GoogleCapabilityExecutionResult(
                 status="failed",
@@ -1915,13 +2143,35 @@ class GoogleConnectorRuntime:
                     normalized_input=normalized_input,
                     attendee_intersection_enabled=attendee_intersection_enabled,
                 )
+            elif capability_id == "cap.calendar.create_event":
+                output_payload = self.workspace_provider.calendar_create_event(
+                    access_token=access_token,
+                    normalized_input=normalized_input,
+                )
             elif capability_id == "cap.email.search":
                 output_payload = self.workspace_provider.email_search(
                     access_token=access_token,
                     normalized_input=normalized_input,
                 )
-            else:
+            elif capability_id == "cap.email.read":
                 output_payload = self.workspace_provider.email_read(
+                    access_token=access_token,
+                    normalized_input=normalized_input,
+                )
+            elif capability_id == "cap.email.draft":
+                draft_projection = self.workspace_provider.email_create_draft(
+                    access_token=access_token,
+                    normalized_input=normalized_input,
+                )
+                projection_payload = (
+                    draft_projection if isinstance(draft_projection, dict) else {}
+                )
+                output_payload = _canonical_draft_output(
+                    normalized_input=normalized_input,
+                    provider_projection=projection_payload,
+                )
+            else:
+                output_payload = self.workspace_provider.email_send(
                     access_token=access_token,
                     normalized_input=normalized_input,
                 )
@@ -1965,4 +2215,21 @@ class GoogleConnectorRuntime:
             output=output_dict,
             auth_failure=None,
             error=None,
+        )
+
+    def execute_read_capability(
+        self,
+        *,
+        db: Session,
+        capability_id: str,
+        normalized_input: dict[str, Any],
+        now_fn: Callable[[], datetime],
+        new_id_fn: Callable[[str], str],
+    ) -> GoogleCapabilityExecutionResult:
+        return self.execute_capability(
+            db=db,
+            capability_id=capability_id,
+            normalized_input=normalized_input,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
         )

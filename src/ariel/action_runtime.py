@@ -25,6 +25,7 @@ from ariel.executor import (
     next_turn_event_sequence,
 )
 from ariel.google_connector import (
+    GOOGLE_CAPABILITY_IDS,
     GOOGLE_READ_CAPABILITY_IDS,
     GoogleCapabilityExecutionResult,
     GoogleConnectorRuntime,
@@ -697,7 +698,7 @@ def process_action_proposals(
             if isinstance(capability_id_raw, str) and capability_id_raw.strip()
             else "invalid.capability"
         )
-        is_google_read_proposal = capability_id in GOOGLE_READ_CAPABILITY_IDS
+        is_google_capability_proposal = capability_id in GOOGLE_CAPABILITY_IDS
         is_retrieval_proposal = capability_id in _GROUNDED_RETRIEVAL_CAPABILITIES
         is_weather_forecast_proposal = capability_id == "cap.weather.forecast"
         if is_retrieval_proposal:
@@ -917,8 +918,12 @@ def process_action_proposals(
             },
         )
         execution_result: ExecutionResult | GoogleCapabilityExecutionResult
-        if is_google_read_proposal and google_runtime is not None:
-            google_execution_result = google_runtime.execute_read_capability(
+        if is_google_capability_proposal and google_runtime is not None:
+            _acquire_side_effect_execution_lock(
+                db=db,
+                impact_level=evaluation.capability.impact_level,
+            )
+            google_execution_result = google_runtime.execute_capability(
                 db=db,
                 capability_id=capability_id,
                 normalized_input=evaluation.normalized_input,
@@ -943,7 +948,12 @@ def process_action_proposals(
                 action_attempt.execution_error = error_reason
                 action_attempt.status = "failed"
                 action_attempt.updated_at = now_fn()
-                blocked_reasons.append(f"{capability_id}: {error_reason}")
+                blocked_reason = f"{capability_id}: {error_reason}"
+                if google_execution_result.auth_failure is not None:
+                    blocked_reason = (
+                        f"{blocked_reason} ({google_execution_result.auth_failure.recovery})"
+                    )
+                blocked_reasons.append(blocked_reason)
                 if is_retrieval_proposal:
                     retrieval_errors.append(error_reason)
                 add_event(
@@ -1176,6 +1186,7 @@ def resolve_approval_decision(
     reason: str | None,
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
+    google_runtime: GoogleConnectorRuntime | None = None,
 ) -> ApprovalDecisionResult:
     approval = db.scalar(
         select(ApprovalRequestRecord)
@@ -1349,6 +1360,7 @@ def resolve_approval_decision(
         },
     )
 
+    typed_recovery_hint: str | None = None
     capability = get_capability(action_attempt.capability_id)
     if capability is None:
         action_attempt.status = "failed"
@@ -1398,36 +1410,78 @@ def resolve_approval_decision(
                     },
                 )
             else:
-                execution_result = execute_capability(
-                    capability=capability,
-                    normalized_input=normalized_input,
-                )
-                if execution_result.status == "succeeded" and execution_result.output is not None:
-                    action_attempt.status = "succeeded"
-                    action_attempt.execution_output = execution_result.output
-                    action_attempt.execution_error = None
-                    action_attempt.updated_at = now_fn()
-                    add_approval_event(
-                        "evt.action.execution.succeeded",
-                        {
-                            "action_attempt_id": action_attempt.id,
-                            "output": execution_result.output,
-                        },
+                if action_attempt.capability_id in GOOGLE_CAPABILITY_IDS and google_runtime is not None:
+                    google_execution_result = google_runtime.execute_capability(
+                        db=db,
+                        capability_id=action_attempt.capability_id,
+                        normalized_input=normalized_input,
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
                     )
+                    if (
+                        google_execution_result.status == "succeeded"
+                        and google_execution_result.output is not None
+                    ):
+                        action_attempt.status = "succeeded"
+                        action_attempt.execution_output = google_execution_result.output
+                        action_attempt.execution_error = None
+                        action_attempt.updated_at = now_fn()
+                        add_approval_event(
+                            "evt.action.execution.succeeded",
+                            {
+                                "action_attempt_id": action_attempt.id,
+                                "output": google_execution_result.output,
+                            },
+                        )
+                    else:
+                        action_attempt.status = "failed"
+                        action_attempt.execution_output = None
+                        action_attempt.execution_error = (
+                            google_execution_result.auth_failure.failure_class
+                            if google_execution_result.auth_failure is not None
+                            else (google_execution_result.error or "execution_output_missing")
+                        )
+                        if google_execution_result.auth_failure is not None:
+                            typed_recovery_hint = google_execution_result.auth_failure.recovery
+                        action_attempt.updated_at = now_fn()
+                        add_approval_event(
+                            "evt.action.execution.failed",
+                            {
+                                "action_attempt_id": action_attempt.id,
+                                "error": action_attempt.execution_error,
+                            },
+                        )
                 else:
-                    action_attempt.status = "failed"
-                    action_attempt.execution_output = None
-                    action_attempt.execution_error = (
-                        execution_result.error or "execution_output_missing"
+                    execution_result = execute_capability(
+                        capability=capability,
+                        normalized_input=normalized_input,
                     )
-                    action_attempt.updated_at = now_fn()
-                    add_approval_event(
-                        "evt.action.execution.failed",
-                        {
-                            "action_attempt_id": action_attempt.id,
-                            "error": action_attempt.execution_error,
-                        },
-                    )
+                    if execution_result.status == "succeeded" and execution_result.output is not None:
+                        action_attempt.status = "succeeded"
+                        action_attempt.execution_output = execution_result.output
+                        action_attempt.execution_error = None
+                        action_attempt.updated_at = now_fn()
+                        add_approval_event(
+                            "evt.action.execution.succeeded",
+                            {
+                                "action_attempt_id": action_attempt.id,
+                                "output": execution_result.output,
+                            },
+                        )
+                    else:
+                        action_attempt.status = "failed"
+                        action_attempt.execution_output = None
+                        action_attempt.execution_error = (
+                            execution_result.error or "execution_output_missing"
+                        )
+                        action_attempt.updated_at = now_fn()
+                        add_approval_event(
+                            "evt.action.execution.failed",
+                            {
+                                "action_attempt_id": action_attempt.id,
+                                "error": action_attempt.execution_error,
+                            },
+                        )
 
     db.flush()
     if action_attempt.status == "succeeded":
@@ -1437,6 +1491,8 @@ def resolve_approval_decision(
         if failure_reason.startswith("integrity_mismatch"):
             failure_reason = failure_reason.replace("integrity_mismatch", "integrity mismatch", 1)
         assistant_message = f"approval recorded, but action execution failed: {failure_reason}"
+        if typed_recovery_hint is not None:
+            assistant_message = f"{assistant_message}. {typed_recovery_hint}"
     return ApprovalDecisionResult(
         approval=approval,
         action_attempt=action_attempt,
