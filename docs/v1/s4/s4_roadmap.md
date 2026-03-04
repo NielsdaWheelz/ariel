@@ -28,9 +28,10 @@
   - typed connector/consent failures remain deterministic and recoverable across write paths too, with no silent downgrade to unsafe fallback behavior.
 - **non-goals**: no auto-send/autonomous delivery behavior; no advanced calendar management (series-wide edits, RSVP orchestration, resource booking/conflict optimization); no advanced Gmail automation beyond core search/read/draft/send.
 
-### PR-03: Connector Readiness Semantics + Attendee Consent Closure (planned next)
+### PR-03: Connector Readiness Semantics + Attendee Consent Closure
 - **goal**: close remaining Slice 4 readiness and attendee-consent gaps so reconnect guidance is fully deterministic and status semantics match runtime auth outcomes.
 - **builds on**: PR-02.
+- **status**: landed in current implementation branch (see `s4_prs/s4_pr03_implementation_notes.md`).
 - **acceptance**:
   - when a calendar/email capability fails with `consent_required`, `scope_missing`, or `access_revoked`, connector readiness transitions to `reconnect_required` and remains so until reconnect succeeds.
   - transient retryable failures (for example temporary upstream/network failures) do not incorrectly force readiness to `reconnect_required`.
