@@ -143,6 +143,27 @@ approval-safe execution boundaries:
     and never performs external delivery.
   - send remains approval-gated and executes only once per approved payload hash.
 
+## slice-4 pr-03 connector readiness semantics + attendee consent closure
+
+slice-4 pr-03 closes readiness/remediation gaps so connector status semantics match runtime auth outcomes:
+
+- readiness remap is deterministic and explicit:
+  - blocking failures (`consent_required`, `scope_missing`, `access_revoked`) surface as
+    `readiness=reconnect_required`.
+  - transient failures (for example `token_expired`) do not remap a healthy connected connector by
+    themselves.
+- blocking readiness is sticky until user remediation:
+  - reconnect-required state is preserved until successful reconnect callback completion (or explicit
+    disconnect).
+- attendee slot-planning reconnect is intent-aware and least-privilege:
+  - `POST /v1/connectors/google/reconnect?capability_intent=cap.calendar.propose_slots`
+    requests `calendar.freebusy` while preserving already granted scopes and avoiding unrelated scope
+    escalation.
+- slot-planning behavior closes the consent loop:
+  - without attendee free/busy consent, outputs stay explicit user-calendar-only fallback with reconnect
+    guidance.
+  - after attendee consent, outputs use attendee intersection and stop fallback-only guidance.
+
 google connector runtime config:
 
 - `ARIEL_GOOGLE_OAUTH_CLIENT_ID`
@@ -246,7 +267,8 @@ see `docs/v1/s2/s2_prs/s2_pr02_implementation_notes.md` and
 `docs/v1/s3/s3_prs/s3_pr02_implementation_notes.md` and
 `docs/v1/s3/s3_prs/s3_pr03_implementation_notes.md` and
 `docs/v1/s4/s4_prs/s4_pr01_implementation_notes.md` and
-`docs/v1/s4/s4_prs/s4_pr02_implementation_notes.md` for implementation details and tradeoffs.
+`docs/v1/s4/s4_prs/s4_pr02_implementation_notes.md` and
+`docs/v1/s4/s4_prs/s4_pr03_implementation_notes.md` for implementation details and tradeoffs.
 
 ## run locally
 
