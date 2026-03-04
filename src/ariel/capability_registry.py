@@ -15,7 +15,10 @@ PolicyDecision = Literal["allow_inline", "requires_approval", "deny"]
 
 _GOOGLE_CALENDAR_READ_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
 _GOOGLE_CALENDAR_FREEBUSY_SCOPE = "https://www.googleapis.com/auth/calendar.freebusy"
+_GOOGLE_CALENDAR_WRITE_SCOPE = "https://www.googleapis.com/auth/calendar.events"
 _GOOGLE_GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+_GOOGLE_GMAIL_COMPOSE_SCOPE = "https://www.googleapis.com/auth/gmail.compose"
+_GOOGLE_GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 _GOOGLE_ALLOWED_EGRESS_DESTINATIONS = (
     "www.googleapis.com",
     "gmail.googleapis.com",
@@ -160,6 +163,142 @@ def _validate_email_search_input(raw_input: dict[str, Any]) -> tuple[dict[str, A
 
 def _validate_email_read_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
     return _validate_exact_text_input(raw_input, field_name="message_id", max_length=256)
+
+
+def _normalize_email_recipient(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    if not normalized or len(normalized) > 320:
+        return None
+    local, sep, domain = normalized.partition("@")
+    if not sep or not local or not domain or "." not in domain:
+        return None
+    if any(ch.isspace() for ch in normalized):
+        return None
+    return normalized
+
+
+def _normalize_email_recipients(raw_value: Any) -> list[str] | None:
+    if raw_value is None:
+        return []
+    if not isinstance(raw_value, list):
+        return None
+    recipients: list[str] = []
+    seen: set[str] = set()
+    for raw_entry in raw_value:
+        recipient = _normalize_email_recipient(raw_entry)
+        if recipient is None:
+            return None
+        if recipient in seen:
+            continue
+        seen.add(recipient)
+        recipients.append(recipient)
+    return recipients
+
+
+def _validate_calendar_create_event_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not set(raw_input.keys()).issubset(
+        {"title", "start_time", "end_time", "description", "location", "attendees"}
+    ):
+        return None, "schema_invalid"
+
+    title_raw = raw_input.get("title")
+    if not isinstance(title_raw, str):
+        return None, "schema_invalid"
+    title = title_raw.strip()
+    if not title or len(title) > 200:
+        return None, "schema_invalid"
+
+    start_time = _normalize_rfc3339_like(raw_input.get("start_time"))
+    end_time = _normalize_rfc3339_like(raw_input.get("end_time"))
+    if start_time is None or end_time is None:
+        return None, "schema_invalid"
+    start_dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+    end_dt = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
+    if end_dt <= start_dt:
+        return None, "schema_invalid"
+
+    description_raw = raw_input.get("description")
+    description: str | None
+    if description_raw is None:
+        description = None
+    elif isinstance(description_raw, str):
+        normalized_description = description_raw.strip()
+        if len(normalized_description) > 4000:
+            return None, "schema_invalid"
+        description = normalized_description or None
+    else:
+        return None, "schema_invalid"
+
+    location_raw = raw_input.get("location")
+    location: str | None
+    if location_raw is None:
+        location = None
+    elif isinstance(location_raw, str):
+        normalized_location = location_raw.strip()
+        if len(normalized_location) > 500:
+            return None, "schema_invalid"
+        location = normalized_location or None
+    else:
+        return None, "schema_invalid"
+
+    attendees = _normalize_email_recipients(raw_input.get("attendees"))
+    if attendees is None:
+        return None, "schema_invalid"
+
+    return {
+        "title": title,
+        "start_time": start_time,
+        "end_time": end_time,
+        "description": description,
+        "location": location,
+        "attendees": attendees,
+    }, None
+
+
+def _validate_email_composition_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not set(raw_input.keys()).issubset({"to", "cc", "bcc", "subject", "body"}):
+        return None, "schema_invalid"
+
+    to_recipients = _normalize_email_recipients(raw_input.get("to"))
+    cc_recipients = _normalize_email_recipients(raw_input.get("cc"))
+    bcc_recipients = _normalize_email_recipients(raw_input.get("bcc"))
+    if to_recipients is None or cc_recipients is None or bcc_recipients is None:
+        return None, "schema_invalid"
+    if not to_recipients and not cc_recipients and not bcc_recipients:
+        return None, "schema_invalid"
+
+    subject_raw = raw_input.get("subject")
+    body_raw = raw_input.get("body")
+    if not isinstance(subject_raw, str) or not isinstance(body_raw, str):
+        return None, "schema_invalid"
+    subject = subject_raw.strip()
+    body = body_raw.strip()
+    if not subject or not body:
+        return None, "schema_invalid"
+    if len(subject) > 998 or len(body) > 20000:
+        return None, "schema_invalid"
+
+    return {
+        "to": to_recipients,
+        "cc": cc_recipients,
+        "bcc": bcc_recipients,
+        "subject": subject,
+        "body": body,
+    }, None
+
+
+def _validate_email_draft_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    return _validate_email_composition_input(raw_input)
+
+
+def _validate_email_send_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    return _validate_email_composition_input(raw_input)
 
 
 _WEATHER_ALLOWED_TIMEFRAMES = {"now", "today", "tomorrow", "next_24h"}
@@ -531,6 +670,18 @@ def _execute_google_email_read(_: dict[str, Any]) -> dict[str, Any]:
     raise RuntimeError("google_runtime_not_bound")
 
 
+def _execute_google_calendar_create_event(_: dict[str, Any]) -> dict[str, Any]:
+    raise RuntimeError("google_runtime_not_bound")
+
+
+def _execute_google_email_draft(_: dict[str, Any]) -> dict[str, Any]:
+    raise RuntimeError("google_runtime_not_bound")
+
+
+def _execute_google_email_send(_: dict[str, Any]) -> dict[str, Any]:
+    raise RuntimeError("google_runtime_not_bound")
+
+
 def _declare_google_calendar_list_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
     return [
         {
@@ -585,6 +736,58 @@ def _declare_google_email_read_egress_intent(input_payload: dict[str, Any]) -> l
                 f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{input_payload['message_id']}"
             ),
             "payload": {"message_id": input_payload["message_id"]},
+        }
+    ]
+
+
+def _declare_google_calendar_create_event_egress_intent(
+    input_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    payload: dict[str, Any] = {
+        "title": input_payload["title"],
+        "start_time": input_payload["start_time"],
+        "end_time": input_payload["end_time"],
+    }
+    if isinstance(input_payload.get("description"), str):
+        payload["description"] = input_payload["description"]
+    if isinstance(input_payload.get("location"), str):
+        payload["location"] = input_payload["location"]
+    attendees_raw = input_payload.get("attendees", [])
+    attendees = attendees_raw if isinstance(attendees_raw, list) else []
+    if attendees:
+        payload["attendees"] = attendees
+    return [
+        {
+            "destination": "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+            "payload": payload,
+        }
+    ]
+
+
+def _declare_google_email_draft_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "destination": "https://gmail.googleapis.com/gmail/v1/users/me/drafts",
+            "payload": {
+                "to": input_payload["to"],
+                "cc": input_payload["cc"],
+                "bcc": input_payload["bcc"],
+                "subject": input_payload["subject"],
+            },
+        }
+    ]
+
+
+def _declare_google_email_send_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "destination": "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            "payload": {
+                "to": input_payload["to"],
+                "cc": input_payload["cc"],
+                "bcc": input_payload["bcc"],
+                "subject": input_payload["subject"],
+            },
         }
     ]
 
@@ -1012,6 +1215,55 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         validate_input=_validate_email_read_input,
         execute=_execute_google_email_read,
         declare_egress_intent=_declare_google_email_read_egress_intent,
+    ),
+    "cap.calendar.create_event": CapabilityDefinition(
+        capability_id="cap.calendar.create_event",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="requires_approval",
+        contract_metadata={
+            "input_schema": "calendar_create_event_v1",
+            "output_schema": "calendar_create_result_v1",
+            "idempotency": "action_attempt_id",
+            "required_scopes": [_GOOGLE_CALENDAR_WRITE_SCOPE],
+        },
+        allowed_egress_destinations=_GOOGLE_ALLOWED_EGRESS_DESTINATIONS,
+        validate_input=_validate_calendar_create_event_input,
+        execute=_execute_google_calendar_create_event,
+        declare_egress_intent=_declare_google_calendar_create_event_egress_intent,
+    ),
+    "cap.email.draft": CapabilityDefinition(
+        capability_id="cap.email.draft",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "email_compose_v1",
+            "output_schema": "email_draft_result_v1",
+            "idempotency": "action_attempt_id",
+            "required_scopes": [_GOOGLE_GMAIL_COMPOSE_SCOPE],
+            "delivery_state": "draft_only",
+        },
+        allowed_egress_destinations=_GOOGLE_ALLOWED_EGRESS_DESTINATIONS,
+        validate_input=_validate_email_draft_input,
+        execute=_execute_google_email_draft,
+        declare_egress_intent=_declare_google_email_draft_egress_intent,
+    ),
+    "cap.email.send": CapabilityDefinition(
+        capability_id="cap.email.send",
+        version="1.0",
+        impact_level="external_send",
+        policy_decision="requires_approval",
+        contract_metadata={
+            "input_schema": "email_compose_v1",
+            "output_schema": "email_send_result_v1",
+            "idempotency": "action_attempt_id",
+            "required_scopes": [_GOOGLE_GMAIL_SEND_SCOPE],
+        },
+        allowed_egress_destinations=_GOOGLE_ALLOWED_EGRESS_DESTINATIONS,
+        validate_input=_validate_email_send_input,
+        execute=_execute_google_email_send,
+        declare_egress_intent=_declare_google_email_send_egress_intent,
     ),
     "cap.search.web": CapabilityDefinition(
         capability_id="cap.search.web",

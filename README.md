@@ -124,6 +124,25 @@ slice-4 pr-01 adds google oauth connector lifecycle and allowlisted read capabil
 - typed recoverable auth/scope failures:
   - `not_connected`, `consent_required`, `scope_missing`, `token_expired`, `access_revoked`
 
+## slice-4 pr-02 approval-safe writes (calendar create + email draft/send)
+
+slice-4 pr-02 extends google workspace write safety with least-privilege scope remediation and
+approval-safe execution boundaries:
+
+- new write capabilities:
+  - `cap.calendar.create_event` (`write_reversible`, approval required)
+  - `cap.email.draft` (`write_reversible`, allowlisted inline, draft-only by construction)
+  - `cap.email.send` (`external_send`, approval required)
+- reconnect is capability-intent driven:
+  - `POST /v1/connectors/google/reconnect?capability_intent=<capability_id>`
+  - runtime requests only scopes needed for the attempted write intent while preserving already-granted scopes.
+- write-path auth/scope failures stay typed and deterministic:
+  - `not_connected`, `consent_required`, `scope_missing`, `token_expired`, `access_revoked`
+- draft/send boundary is hard:
+  - draft returns canonical local draft state (`drafted_not_sent`, `delivery_state=draft_only`, `sent=false`)
+    and never performs external delivery.
+  - send remains approval-gated and executes only once per approved payload hash.
+
 google connector runtime config:
 
 - `ARIEL_GOOGLE_OAUTH_CLIENT_ID`
@@ -226,7 +245,8 @@ see `docs/v1/s2/s2_prs/s2_pr02_implementation_notes.md` and
 `docs/v1/s3/s3_prs/s3_pr01_implementation_notes.md` and
 `docs/v1/s3/s3_prs/s3_pr02_implementation_notes.md` and
 `docs/v1/s3/s3_prs/s3_pr03_implementation_notes.md` and
-`docs/v1/s4/s4_prs/s4_pr01_implementation_notes.md` for implementation details and tradeoffs.
+`docs/v1/s4/s4_prs/s4_pr01_implementation_notes.md` and
+`docs/v1/s4/s4_prs/s4_pr02_implementation_notes.md` for implementation details and tradeoffs.
 
 ## run locally
 
