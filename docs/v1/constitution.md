@@ -14,8 +14,8 @@ Ariel is a private, self-hosted assistant that accepts natural language and mult
 - Capability system with strict input/output schemas and policy enforcement.
 - Provider-agnostic external knowledge retrieval (web search/news/weather and URL extraction) with user-visible provenance.
 - Google Workspace integration (calendar, email, drive, maps) with approval-gated side effects.
-- First-class `agency` integration (start runs, check status, fetch artifacts).
-- Nexus notes integration for read/write notes plus durable-memory projection.
+- `agency` integration is later-phase roadmap work (`Slice 10`) after additional MCP hardening.
+- Nexus notes integration is deferred indefinitely (unscheduled) and is not a current MVP dependency.
 - Vision-capable image understanding in conversation and capture workflows.
 - Proactive notification layer with user-configured scheduled checks and notification delivery.
 - Quick-capture entry points (share sheet, clipboard, shortcuts) that ingest into the active session.
@@ -68,15 +68,15 @@ Ariel is a private, self-hosted assistant that accepts natural language and mult
                                                                              | executor (cap runtime)      |
                                                                              | schema validation            |
                                                                              | timeout/output limits        |
-                                                                             | adapters: agency/google/     |
-                                                                             | brave/nexus/web-extract      |
+                                                                             | adapters: google/brave/      |
+                                                                             | web-extract (+agency later)  |
                                                                              +-----------+-----------------+
                                                                                          |
                                                                                          v
                                                                              +-----------------------------+
                                                                              | local/remote services       |
-                                                                             | agency, google apis,        |
-                                                                             | brave, nexus, secret mgr    |
+                                                                             | google apis, brave,         |
+                                                                             | secret mgr (+agency later)  |
                                                                              +-----------------------------+
                                                                                          ^
                                                                                          |
@@ -106,7 +106,7 @@ Ariel is a private, self-hosted assistant that accepts natural language and mult
 | deployment | Single-user self-hosted home machine, reachable over private Tailscale network. |
 | remote exposure | No public ingress in MVP; service binds localhost and is proxied via Tailscale Serve. |
 | storage | Postgres is the system of truth for sessions, turns, memories, jobs, notifications, and events. |
-| memory authority | External stores (including Nexus) are projections/integrations; they are never canonical memory SoT. |
+| memory authority | External stores (including Nexus when enabled) are projections/integrations; they are never canonical memory SoT. |
 | conversation model | Episodic sessions, not one unbounded forever thread. |
 | context model | Deterministic bounded context builder per turn. |
 | response policy | No hard-coded response-type state machine; the model decides assistant messaging while runtime guardrails enforce safety and limits. |
@@ -114,7 +114,7 @@ Ariel is a private, self-hosted assistant that accepts natural language and mult
 | retrieval provider portability | External web/news retrieval runs through Ariel capability contracts independent of model-provider built-in search tools. |
 | factual grounding policy | External factual claims from web/news/weather are citation-gated: user-visible references are required, and insufficient/conflicting evidence must be disclosed as uncertainty. |
 | weather location policy | Weather location resolution order is explicit location first, configured default second, clarification otherwise; implicit IP/device geolocation inference is not used in MVP. |
-| tool execution | No generic shell/ssh capability in MVP; code changes go through `cap.agency.*`. |
+| tool execution | No generic shell/ssh capability in MVP; when code-change capabilities are enabled, they route through `cap.agency.*` only. |
 | approvals | Required for irreversible or externally visible actions. |
 | side-effect execution model | Side-effecting capability calls are serialized for deterministic safety/audit behavior in MVP. |
 | oauth connector model | External connectors use OAuth authorization-code + PKCE with short-lived state and strict callback validation; token material is encrypted at rest. |
@@ -222,7 +222,7 @@ Ariel is a private, self-hosted assistant that accepts natural language and mult
 3. Every turn writes a complete event chain: `turn.started`, model/tool events, and terminal `turn.completed|turn.failed`.
 4. Secrets are injected only at executor runtime; they are never included in model prompts.
 5. No generic remote code execution capability exists in MVP.
-6. All repo/code modifications initiated by Ariel must route via `cap.agency.*`.
+6. When repo/code modification capabilities are enabled, all such actions initiated by Ariel must route via `cap.agency.*`.
 7. Untrusted external content cannot mutate policy, capability permissions, or system prompts.
 8. Each user has at most one active session at a time; sessions rotate by policy without losing durable memory.
 9. Context assembly is deterministic, bounded, and auditable for every turn.
@@ -234,7 +234,7 @@ Ariel is a private, self-hosted assistant that accepts natural language and mult
 15. Side-effecting capability execution is serialized in MVP.
 16. Capability identity/contract mismatch at execution time blocks execution.
 17. Capability outbound access is limited to policy-allowed destinations.
-18. Postgres is canonical memory SoT; external systems (including Nexus) are projections and cannot silently overwrite canonical memory.
+18. Postgres is canonical memory SoT; external systems (including Nexus when enabled) are projections and cannot silently overwrite canonical memory.
 19. Proactive scheduler executions are read-only and cannot trigger side-effecting capabilities.
 20. Every proactive notification is linked to its originating subscription/check and is user-inspectable.
 21. Connector credentials/scopes are least-privilege and auditable per capability.
@@ -269,7 +269,7 @@ Ariel is a private, self-hosted assistant that accepts natural language and mult
 - Memory classes: `profile`, `preference`, `project`, `commitment`, `episodic_summary`.
 - Each memory stores provenance (`source_turn_id`), confidence, and `last_verified_at`.
 - Durable memory writes are policy-gated and auditable.
-- Nexus note linkage is projection metadata (reference ids + sync state), not canonical memory state.
+- When Nexus integration is enabled, nexus note linkage is projection metadata (reference ids + sync state), not canonical memory state.
 
 ### notifications
 - Subscription configuration and notification events are canonical in Postgres.
@@ -304,9 +304,9 @@ Ariel is a private, self-hosted assistant that accepts natural language and mult
 
 ---
 
-## appendix: initial capability set
+## appendix: capability set (implemented + planned/deferred)
 
-### agency
+### agency (planned later-phase, roadmap slice 10)
 - `cap.agency.run`
 - `cap.agency.status`
 - `cap.agency.artifacts`
@@ -343,7 +343,7 @@ Ariel is a private, self-hosted assistant that accepts natural language and mult
 - `cap.maps.directions` (`read`)
 - `cap.maps.search_places` (`read`)
 
-### nexus
+### nexus (deferred indefinitely, unscheduled)
 - `cap.nexus.search` (`read`)
 - `cap.nexus.read` (`read`)
 - `cap.nexus.create` (`write_reversible`)

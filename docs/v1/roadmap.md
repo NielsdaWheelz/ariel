@@ -10,27 +10,28 @@ Slice 1: Core Conversation Loop
     |
     v
 Slice 2: Safe Action Framework
- /   |   |   \
-v    v   v    v
+ /   |   \
+v    v    v
 Slice 3: Lightweight Read Capabilities
 Slice 4: Google Workspace Core (Calendar + Email)
-Slice 5: Nexus Notes Integration
-Slice 6: Agency Doer Integration
+Slice 5: Durable Memory + Session Rotation
 
-Slice 4 -> Slice 9: Web Browsing
-Slice 5 -> Slice 7: Durable Memory + Session Rotation
-Slice 6 -> Slice 7
-Slice 4 -> Slice 8: Google Workspace Expansion (Drive + Maps)
+Slice 4 -> Slice 6: Google Workspace Expansion (Drive + Maps)
+Slice 3 -> Slice 7: Web Browsing
 
-Slice 7 -> Slice 10: Quick Capture Surface
-Slice 10 -> Slice 11: Voice + Vision Interface
+Slice 5 -> Slice 8: Quick Capture Surface
+Slice 8 -> Slice 9: Voice + Vision Interface
 
-Slice 4 -> Slice 12: Proactive Notification Layer
-Slice 6 -> Slice 12
-Slice 7 -> Slice 12
+Slice 2 -> Slice 10: Agency Doer Integration
 
-Slice 12 -> Slice 13: Provider Portability + Reliability
-Slice 13 -> Slice 14: Production Readiness Gate
+Slice 4 -> Slice 11: Proactive Notification Layer
+Slice 5 -> Slice 11
+Slice 10 -> Slice 11
+
+Slice 11 -> Slice 12: Provider Portability + Reliability
+Slice 12 -> Slice 13: Production Readiness Gate
+
+Deferred indefinitely (unscheduled): Nexus Notes Integration
 ```
 
 ## Slices
@@ -98,40 +99,18 @@ Slice 13 -> Slice 14: Production Readiness Gate
   - Permission and consent issues are surfaced with clear recovery paths.
 - **Risks**: Consent/scopes and third-party API errors can create brittle first-run UX.
 
-### Slice 5: Nexus Notes Integration
-- **Goal**: Connect Ariel to the user's notes workspace for safe note retrieval and note updates.
-- **Outcome**: User can search/read/create/append notes in Nexus through chat.
-- **Dependencies**: Slice 2
-- **Acceptance**:
-  - User can retrieve relevant notes for a topic request.
-  - User can ask Ariel to save or append a note and see the result in conversation flow.
-  - Note writes follow reversible-write policy and remain auditable.
-  - Connector/permission failures surface clear remediation guidance.
-- **Risks**: External notes API semantics and conflict behavior can create sync edge cases.
-
-### Slice 6: Agency Doer Integration
-- **Goal**: Let Ariel initiate and manage coding work through Agency from the same chat.
-- **Outcome**: User can request coding tasks, monitor progress, and inspect outputs without leaving Ariel.
-- **Dependencies**: Slice 2
-- **Acceptance**:
-  - User can request a coding task and receive status updates until completion.
-  - User can inspect returned artifacts from completed runs in chat.
-  - Actions with external or irreversible impact are approval-gated before execution.
-  - Failure cases are surfaced with actionable next steps.
-- **Risks**: Long-running tasks and partial failures can create confusing states without clear job visibility.
-
-### Slice 7: Durable Memory + Session Rotation
+### Slice 5: Durable Memory + Session Rotation
 - **Goal**: Preserve continuity across sessions with durable canonical memory and user-visible projection.
 - **Outcome**: Ariel rotates sessions safely while retaining validated preferences, commitments, and project context.
-- **Dependencies**: Slice 5, Slice 6
+- **Dependencies**: Slice 2
 - **Acceptance**:
   - User can start a new conversation and Ariel recalls validated preferences and commitments.
   - User can correct or remove remembered information and future behavior reflects the change.
   - Memory remains auditable and bounded rather than full historical replay.
-  - Nexus-visible memory projection remains consistent with canonical memory behavior.
+  - User-visible memory projection remains consistent with canonical memory behavior.
 - **Risks**: Stale or low-confidence memory can degrade quality if verification discipline is weak.
 
-### Slice 8: Google Workspace Expansion (Drive + Maps)
+### Slice 6: Google Workspace Expansion (Drive + Maps)
 - **Goal**: Complete key Google productivity/navigation workflows after core integration is stable.
 - **Outcome**: User can find/read Drive content and request map/place information through Ariel.
 - **Dependencies**: Slice 4
@@ -142,7 +121,7 @@ Slice 13 -> Slice 14: Production Readiness Gate
   - Permission issues are recoverable with clear guidance.
 - **Risks**: Scope sprawl and API quota behavior can complicate access management.
 
-### Slice 9: Web Browsing
+### Slice 7: Web Browsing
 - **Goal**: Add robust URL-driven research behavior on top of lightweight search.
 - **Outcome**: User can provide a URL and receive extracted, summarized, source-grounded content.
 - **Dependencies**: Slice 3
@@ -153,21 +132,21 @@ Slice 13 -> Slice 14: Production Readiness Gate
   - Retrieved content is represented with provenance for user inspection.
 - **Risks**: Extraction reliability varies across dynamic, protected, and malformed pages.
 
-### Slice 10: Quick Capture Surface
+### Slice 8: Quick Capture Surface
 - **Goal**: Allow fast non-chat ingestion flows into Ariel.
 - **Outcome**: User can send text/URL/content captures from phone share mechanisms into the active session.
-- **Dependencies**: Slice 7
+- **Dependencies**: Slice 5
 - **Acceptance**:
   - User can push quick-capture content and it appears as a normal Ariel turn.
   - Captured payloads are auditable and handled under the same policy framework.
   - Capture failures are visible with clear retry/recovery guidance.
-  - Captures can feed notes/memory workflows without bypassing policy.
+  - Captures can feed memory workflows without bypassing policy.
 - **Risks**: Input normalization and platform-specific capture behavior can be inconsistent.
 
-### Slice 11: Voice + Vision Interface
+### Slice 9: Voice + Vision Interface
 - **Goal**: Extend the phone surface with speech and image-based interaction.
 - **Outcome**: User can speak to Ariel, hear spoken responses, and send images for analysis.
-- **Dependencies**: Slice 10
+- **Dependencies**: Slice 8
 - **Acceptance**:
   - User can trigger speech input and receive speech-to-text transcript-backed turn behavior.
   - Ariel can return text-to-speech output from assistant responses.
@@ -175,10 +154,21 @@ Slice 13 -> Slice 14: Production Readiness Gate
   - Voice/vision errors are visible and do not corrupt session state.
 - **Risks**: Speech and vision quality variance can impact trust without transparent fallback UX.
 
-### Slice 12: Proactive Notification Layer
+### Slice 10: Agency Doer Integration
+- **Goal**: Let Ariel initiate and manage coding work through Agency from the same chat.
+- **Outcome**: User can request coding tasks, monitor progress, and inspect outputs without leaving Ariel.
+- **Dependencies**: Slice 2
+- **Acceptance**:
+  - User can request a coding task and receive status updates until completion.
+  - User can inspect returned artifacts from completed runs in chat.
+  - Actions with external or irreversible impact are approval-gated before execution.
+  - Failure cases are surfaced with actionable next steps.
+- **Risks**: Long-running tasks and partial failures can create confusing states without clear job visibility.
+
+### Slice 11: Proactive Notification Layer
 - **Goal**: Deliver user-configured proactive surfacing without opening autonomous side-effect risk.
 - **Outcome**: Ariel can notify users about relevant changes/events based on subscriptions and schedules.
-- **Dependencies**: Slice 4, Slice 6, Slice 7
+- **Dependencies**: Slice 4, Slice 5, Slice 10
 - **Acceptance**:
   - User can configure recurring notification checks and notification preferences.
   - Ariel sends notifications for high-value events (for example schedule reminders and completed jobs).
@@ -187,10 +177,10 @@ Slice 13 -> Slice 14: Production Readiness Gate
   - User can mute, disable, or adjust proactive behavior.
 - **Risks**: Notification fatigue and delivery reliability can reduce product value if not tuned.
 
-### Slice 13: Provider Portability + Reliability
+### Slice 12: Provider Portability + Reliability
 - **Goal**: Make the assistant resilient to model/provider changes without user-facing regressions.
 - **Outcome**: Core conversation, capability, and proactive flows remain stable when provider configuration changes.
-- **Dependencies**: Slice 12
+- **Dependencies**: Slice 11
 - **Acceptance**:
   - Core user journeys continue to work when switching model providers.
   - Provider outages or degraded responses fail clearly without corrupting conversation or action state.
@@ -199,13 +189,25 @@ Slice 13 -> Slice 14: Production Readiness Gate
   - Cross-provider evaluation scorecards on must-have workflows are at or above the defined OpenClaw-comparison baseline.
 - **Risks**: Behavior drift between providers can reduce predictability of plans and tool usage.
 
-### Slice 14: Production Readiness Gate
+### Slice 13: Production Readiness Gate
 - **Goal**: Make Ariel safe and dependable for day-to-day personal operations.
 - **Outcome**: The system has operational safeguards, recoverability, and release confidence for ongoing use.
-- **Dependencies**: Slice 13
+- **Dependencies**: Slice 12
 - **Acceptance**:
   - User can inspect system health and recent failures.
   - Backups and restores preserve conversations, canonical memory, jobs, notifications, and audit history.
   - Common failure scenarios have clear recovery playbooks.
   - Release gates include measurable quality budgets for grounded answers, tool success, notification relevance, and multimodal UX reliability.
   - Release checklist passes before promotion to daily-use status.
+
+### Deferred: Nexus Notes Integration (Indefinite)
+- **Status**: Deferred indefinitely; not scheduled in the current slice plan.
+- **Goal**: Connect Ariel to the user's notes workspace for safe note retrieval and note updates.
+- **Outcome**: User can search/read/create/append notes in Nexus through chat.
+- **Dependencies**: Unscheduled
+- **Acceptance (when resumed)**:
+  - User can retrieve relevant notes for a topic request.
+  - User can ask Ariel to save or append a note and see the result in conversation flow.
+  - Note writes follow reversible-write policy and remain auditable.
+  - Connector/permission failures surface clear remediation guidance.
+- **Risks**: External notes API semantics and conflict behavior can create sync edge cases.
