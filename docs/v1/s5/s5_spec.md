@@ -14,7 +14,7 @@ Preserve continuity across sessions with durable canonical memory and user-visib
 ### session rotation is explicit-first with deterministic automatic fallback
 - **given**: an active session exists
 - **when**: the user explicitly starts a new conversation through a dedicated rotation-intent surface, or deterministic rotation thresholds are reached at a turn boundary
-- **then**: Ariel closes the prior session, opens exactly one new active session, records the rotation reason (`user_initiated` or threshold-based), links continuity artifacts for auditability, and keeps default session-bootstrap behavior non-rotating unless rotation intent is explicit
+- **then**: Ariel closes the prior session, opens exactly one new active session, records the rotation reason (`user_initiated`, `threshold_turn_count`, `threshold_age`, or `threshold_context_pressure`), links continuity artifacts for auditability, and keeps default session-bootstrap behavior non-rotating unless rotation intent is explicit
 
 ### user corrections and removals deterministically change future behavior
 - **given**: a remembered fact, preference, or commitment is incorrect, stale, or no longer wanted
@@ -24,7 +24,17 @@ Preserve continuity across sessions with durable canonical memory and user-visib
 ### memory context remains bounded and does not become full-history replay
 - **given**: long-running usage across many sessions
 - **when**: Ariel builds context for a turn
-- **then**: context includes only bounded, deterministic memory sections (for example recent session context, summaries, and top relevant durable memory) rather than unbounded full transcript replay
+- **then**: context includes only bounded, deterministic memory sections (for example recent session context, summaries, top relevant durable memory, open commitments/jobs, and relevant artifacts/signals) rather than unbounded full transcript replay
+
+### timeline incremental sync is deterministic and cursored
+- **given**: a client has already consumed part of a session timeline
+- **when**: the client calls `GET /v1/sessions/{session_id}/events?after={event_id}`
+- **then**: Ariel returns only events strictly after the cursor (session-scoped), omits turns with no events after the cursor, and returns `404` with `E_EVENT_CURSOR_NOT_FOUND` for unknown cursors
+
+### message ingress idempotency is replay-safe
+- **given**: a client retries message submission due to network ambiguity
+- **when**: the client resubmits `POST /v1/sessions/{session_id}/message` with the same `Idempotency-Key`
+- **then**: Ariel replays the prior outcome for identical payload and returns `409` with `E_IDEMPOTENCY_KEY_REUSED` when the payload differs
 
 ### memory behavior remains user-inspectable and auditable
 - **given**: memory reads/writes and session rotations occur over time
@@ -58,6 +68,10 @@ Preserve continuity across sessions with durable canonical memory and user-visib
 **Rotation closes sessions with durable continuity artifacts**: Session rotation writes a bounded episodic continuity artifact so future sessions can recover key context without replaying full historical turns.
 
 **Context builder is extended but remains deterministic and bounded**: Turn context keeps fixed-order assembly and explicit limits while adding durable-memory sections. Added memory recall cannot bypass existing turn-budget guardrails.
+
+**Context section order is fixed**: Context is assembled in this strict order: `policy_system_instructions`, `recent_active_session_turns`, `rolling_session_summary`, `durable_memory_recall`, `open_commitments_and_jobs`, `relevant_artifacts_and_signals`.
+
+**Session lifecycle is explicit**: Session payloads include `lifecycle_state` (`active`, `rotating`, `closed`, `recovery_needed`) with `is_active=true` only for `active`.
 
 **Corrections/removals are immediate but integrity-controlled**: Memory correction/removal does not use approval workflows in MVP, but still requires authenticated user intent, idempotency-safe mutation semantics, append-only audit records, and optional bounded undo support.
 

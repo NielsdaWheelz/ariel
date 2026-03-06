@@ -24,6 +24,6 @@
   - promotion from `candidate` to `validated` requires explicit user confirmation in MVP, with auditable transition outcomes.
   - user can correct or remove remembered facts/preferences/projects/commitments through normal interaction; changes apply immediately without approval and future behavior reflects only active corrected memory.
   - memory lifecycle transitions remain append-only and idempotent (`candidate`, `validated`, `superseded`, `retracted`) with user-visible inspectable history.
-  - deterministic automatic rotation triggers (age/turn-count/context-pressure) execute only at turn boundaries, preserve one-active-session invariant, and emit typed threshold-based rotation reasons.
+  - deterministic automatic rotation triggers (age/turn-count/context-pressure) execute only at turn boundaries, preserve one-active-session invariant, and emit typed rotation reasons: `user_initiated`, `threshold_turn_count`, `threshold_age`, `threshold_context_pressure`.
   - memory recall/mutation/skip behavior remains user-inspectable and projection-consistent with canonical state across create/promote/correct/remove/rotate paths.
 - **non-goals**: no autonomous background memory rewriting/consolidation loops, no Nexus sync-authority changes, no proactive memory-driven notification policy, and no generic memory CRUD write API.
