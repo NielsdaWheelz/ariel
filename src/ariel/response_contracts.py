@@ -17,12 +17,19 @@ class SurfaceSessionContract(BaseModel):
 
     id: str
     is_active: bool
+    lifecycle_state: str
     created_at: str
     updated_at: str
 
 
 SurfaceEventType = Literal[
     "evt.turn.started",
+    "evt.memory.recalled",
+    "evt.memory.candidate_proposed",
+    "evt.memory.captured",
+    "evt.memory.promoted",
+    "evt.memory.corrected",
+    "evt.memory.retracted",
     "evt.turn.limit_reached",
     "evt.assistant.emitted",
     "evt.turn.failed",
@@ -134,6 +141,23 @@ class SurfaceEventTurnStartedPayloadContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     message: str
+
+
+class SurfaceMemoryRecallExclusionContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    memory_id: str
+    reason: str
+
+
+class SurfaceEventMemoryRecalledPayloadContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_recalled_memories: int
+    included_memory_count: int
+    omitted_memory_count: int
+    included_memory_ids: list[str]
+    excluded_memories: list[SurfaceMemoryRecallExclusionContract]
 
 
 class SurfaceEventTurnLimitReachedPayloadContract(BaseModel):
@@ -266,6 +290,19 @@ class SurfaceEventActionExecutionFailedPayloadContract(BaseModel):
     action_attempt_id: str
     error: str
     approval_ref: str | None = None
+
+
+class SurfaceEventMemoryLifecyclePayloadContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    memory_item_id: str
+    revision_id: str
+    memory_class: str
+    lifecycle_state: str
+    memory_key: str
+    value_preview: str
+    confidence: float
+    source_turn_id: str | None
 
 
 class SurfaceEventEnvelopeContract(BaseModel):
@@ -405,6 +442,44 @@ class SurfaceTimelineResponseContract(BaseModel):
     turns: list[SurfaceTurnContract]
 
 
+class SurfaceRotationContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rotation_id: str
+    reason: str
+    rotated_from_session_id: str
+    idempotency_key: str | None
+    idempotent_replay: bool
+
+
+class SurfaceRotationResponseContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    session: SurfaceSessionContract
+    rotation: SurfaceRotationContract
+
+
+class SurfaceRotationListItemContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rotation_id: str
+    reason: str
+    rotated_from_session_id: str
+    rotated_to_session_id: str
+    idempotency_key: str | None
+    actor_id: str
+    trigger_snapshot: dict[str, Any]
+    created_at: str
+
+
+class SurfaceRotationListResponseContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    rotations: list[SurfaceRotationListItemContract]
+
+
 class SurfaceApprovalResponseContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -431,6 +506,32 @@ class SurfaceArtifactResponseContract(BaseModel):
     artifact: SurfaceArtifactContract
 
 
+class SurfaceMemoryProjectionItemContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    memory_item_id: str
+    memory_key: str
+    memory_class: str
+    revision_id: str | None
+    revision_count: int
+    lifecycle_state: str
+    value: str
+    confidence: float
+    source_turn_id: str | None
+    source_session_id: str | None
+    evidence: Any
+    last_verified_at: str
+    created_at: str
+    updated_at: str
+
+
+class SurfaceMemoryProjectionResponseContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    items: list[SurfaceMemoryProjectionItemContract]
+
+
 def _validate_contract(
     contract: str,
     model_type: type[BaseModel],
@@ -448,12 +549,45 @@ def _project_surface_session(raw_session: Any) -> dict[str, Any]:
     return _validate_contract("surface_session", SurfaceSessionContract, session_payload)
 
 
+def _default_surface_context_metadata() -> dict[str, Any]:
+    return {
+        "schema_version": "1.0",
+        "section_order": [
+            "policy_system_instructions",
+            "recent_active_session_turns",
+        ],
+        "policy_instruction_count": 0,
+        "recent_window": {
+            "max_recent_turns": 0,
+            "included_turn_count": 0,
+            "omitted_turn_count": 0,
+            "included_turn_ids": [],
+        },
+    }
+
+
+def _coerce_surface_model_usage(raw_usage: Any) -> dict[str, Any] | None:
+    if not isinstance(raw_usage, dict):
+        return None
+    usage: dict[str, Any] = {}
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = raw_usage.get(key)
+        usage[key] = int(value) if isinstance(value, int) else None
+    return usage
+
+
 def _project_surface_event_payload(event_type: SurfaceEventType, raw_payload: Any) -> dict[str, Any]:
     payload = raw_payload if isinstance(raw_payload, dict) else {}
     if event_type == "evt.turn.started":
         return _validate_contract(
             "surface_event_payload.evt.turn.started",
             SurfaceEventTurnStartedPayloadContract,
+            payload,
+        )
+    if event_type == "evt.memory.recalled":
+        return _validate_contract(
+            "surface_event_payload.evt.memory.recalled",
+            SurfaceEventMemoryRecalledPayloadContract,
             payload,
         )
     if event_type == "evt.turn.limit_reached":
@@ -481,22 +615,35 @@ def _project_surface_event_payload(event_type: SurfaceEventType, raw_payload: An
             payload,
         )
     if event_type == "evt.model.started":
+        context_payload = payload.get("context")
+        normalized_payload = dict(payload)
+        if not isinstance(context_payload, dict):
+            normalized_payload["context"] = _default_surface_context_metadata()
+        if not isinstance(normalized_payload.get("attempt"), int):
+            normalized_payload["attempt"] = 1
         return _validate_contract(
             "surface_event_payload.evt.model.started",
             SurfaceEventModelStartedPayloadContract,
-            payload,
+            normalized_payload,
         )
     if event_type == "evt.model.completed":
+        normalized_payload = dict(payload)
+        normalized_payload["usage"] = _coerce_surface_model_usage(payload.get("usage"))
+        if not isinstance(normalized_payload.get("attempt"), int):
+            normalized_payload["attempt"] = 1
         return _validate_contract(
             "surface_event_payload.evt.model.completed",
             SurfaceEventModelCompletedPayloadContract,
-            payload,
+            normalized_payload,
         )
     if event_type == "evt.model.failed":
+        normalized_payload = dict(payload)
+        if not isinstance(normalized_payload.get("attempt"), int):
+            normalized_payload["attempt"] = 1
         return _validate_contract(
             "surface_event_payload.evt.model.failed",
             SurfaceEventModelFailedPayloadContract,
-            payload,
+            normalized_payload,
         )
     if event_type == "evt.action.proposed":
         return _validate_contract(
@@ -550,6 +697,18 @@ def _project_surface_event_payload(event_type: SurfaceEventType, raw_payload: An
         return _validate_contract(
             "surface_event_payload.evt.action.execution.failed",
             SurfaceEventActionExecutionFailedPayloadContract,
+            payload,
+        )
+    if event_type in {
+        "evt.memory.candidate_proposed",
+        "evt.memory.captured",
+        "evt.memory.promoted",
+        "evt.memory.corrected",
+        "evt.memory.retracted",
+    }:
+        return _validate_contract(
+            f"surface_event_payload.{event_type}",
+            SurfaceEventMemoryLifecyclePayloadContract,
             payload,
         )
     raise ResponseContractViolation(
@@ -655,6 +814,37 @@ def build_surface_timeline_response(*, session_id: Any, turns: Any) -> dict[str,
     )
 
 
+def build_surface_rotation_response(*, session: Any, rotation: Any) -> dict[str, Any]:
+    rotation_payload = rotation if isinstance(rotation, dict) else {}
+    return _validate_contract(
+        "surface_rotation_response",
+        SurfaceRotationResponseContract,
+        {
+            "ok": True,
+            "session": _project_surface_session(session),
+            "rotation": {
+                "rotation_id": rotation_payload.get("rotation_id"),
+                "reason": rotation_payload.get("reason"),
+                "rotated_from_session_id": rotation_payload.get("rotated_from_session_id"),
+                "idempotency_key": rotation_payload.get("idempotency_key"),
+                "idempotent_replay": rotation_payload.get("idempotent_replay"),
+            },
+        },
+    )
+
+
+def build_surface_rotation_list_response(*, rotations: Any) -> dict[str, Any]:
+    rotations_payload = rotations if isinstance(rotations, list) else []
+    return _validate_contract(
+        "surface_rotation_list_response",
+        SurfaceRotationListResponseContract,
+        {
+            "ok": True,
+            "rotations": rotations_payload,
+        },
+    )
+
+
 def build_surface_approval_response(
     *,
     approval: Any,
@@ -674,6 +864,18 @@ def build_surface_approval_response(
                 "decided_at": approval_payload.get("decided_at"),
             },
             "assistant": {"message": assistant_message, "sources": []},
+        },
+    )
+
+
+def build_surface_memory_projection_response(*, items: Any) -> dict[str, Any]:
+    items_payload = items if isinstance(items, list) else []
+    return _validate_contract(
+        "surface_memory_projection_response",
+        SurfaceMemoryProjectionResponseContract,
+        {
+            "ok": True,
+            "items": items_payload,
         },
     )
 

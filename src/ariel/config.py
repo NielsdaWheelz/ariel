@@ -30,7 +30,11 @@ class AppSettings(BaseSettings):
     model_api_key: str | None = None
     model_timeout_seconds: float = 30.0
     max_recent_turns: int = 12
+    max_recalled_memories: int = 8
     max_context_tokens: int = 6000
+    auto_rotate_max_turns: int = 120
+    auto_rotate_max_age_seconds: int = 172800
+    auto_rotate_context_pressure_tokens: int = 5400
     max_response_tokens: int = 700
     max_model_attempts: int = 2
     max_turn_wall_time_ms: int = 20000
@@ -73,11 +77,39 @@ class AppSettings(BaseSettings):
             raise ValueError("max_recent_turns must be >= 1")
         return value
 
+    @field_validator("max_recalled_memories")
+    @classmethod
+    def _max_recalled_memories_must_be_positive(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("max_recalled_memories must be >= 1")
+        return value
+
     @field_validator("max_context_tokens")
     @classmethod
     def _max_context_tokens_must_be_positive(cls, value: int) -> int:
         if value < 1:
             raise ValueError("max_context_tokens must be >= 1")
+        return value
+
+    @field_validator("auto_rotate_max_turns")
+    @classmethod
+    def _auto_rotate_max_turns_must_be_positive(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("auto_rotate_max_turns must be >= 1")
+        return value
+
+    @field_validator("auto_rotate_max_age_seconds")
+    @classmethod
+    def _auto_rotate_max_age_seconds_must_be_positive(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("auto_rotate_max_age_seconds must be >= 1")
+        return value
+
+    @field_validator("auto_rotate_context_pressure_tokens")
+    @classmethod
+    def _auto_rotate_context_pressure_tokens_must_be_positive(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("auto_rotate_context_pressure_tokens must be >= 1")
         return value
 
     @field_validator("max_response_tokens")
