@@ -8,7 +8,9 @@
   - memory projection responses are contract-enforced and redaction-safe, with no projection-only authority over canonical behavior.
   - explicit user-provided facts/preferences/commitments can be captured as validated durable memory through normal turn flow with auditable outcomes.
   - memory mutation remains conversation-mediated in MVP (no generic memory CRUD write endpoint in this PR).
-  - user can explicitly start a new conversation; Ariel rotates sessions safely (exactly one active session), marks the prior session inactive, and records `user_initiated` rotation reason for auditability.
+  - user can explicitly start a new conversation through a dedicated rotation-intent surface; Ariel rotates sessions safely (exactly one active session), marks the prior session inactive, and records `user_initiated` rotation reason for auditability.
+  - existing session bootstrap/status surfaces remain backward-compatible and non-rotating by default unless explicit rotation intent is provided.
+  - rotation intent handling is idempotent and race-safe; duplicate rotate submissions do not create multiple active sessions or duplicate user-visible rotation outcomes.
   - session rotation writes bounded continuity artifacts (including episodic summary and open commitments context) used for future continuity without full transcript replay.
   - when the next active session starts, Ariel recalls relevant validated memory (including open commitments) across sessions while excluding candidate-only memory from recall.
   - context assembly remains deterministic and bounded after memory integration; memory retrieval uses explicit top-k bounded selection with stable ordering and does not bypass existing turn-budget failure semantics.

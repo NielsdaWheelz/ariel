@@ -13,8 +13,8 @@ Preserve continuity across sessions with durable canonical memory and user-visib
 
 ### session rotation is explicit-first with deterministic automatic fallback
 - **given**: an active session exists
-- **when**: the user explicitly starts a new conversation, or deterministic rotation thresholds are reached at a turn boundary
-- **then**: Ariel closes the prior session, opens exactly one new active session, records the rotation reason (`user_initiated` or threshold-based), and links continuity artifacts for auditability
+- **when**: the user explicitly starts a new conversation through a dedicated rotation-intent surface, or deterministic rotation thresholds are reached at a turn boundary
+- **then**: Ariel closes the prior session, opens exactly one new active session, records the rotation reason (`user_initiated` or threshold-based), links continuity artifacts for auditability, and keeps default session-bootstrap behavior non-rotating unless rotation intent is explicit
 
 ### user corrections and removals deterministically change future behavior
 - **given**: a remembered fact, preference, or commitment is incorrect, stale, or no longer wanted
@@ -49,7 +49,11 @@ Preserve continuity across sessions with durable canonical memory and user-visib
 
 **Validation is required before cross-session recall**: Ariel stores inferred facts as `candidate` memory but does not use them for cross-session recall. Promotion to `validated` requires explicit user confirmation in MVP.
 
-**Session rotation is hybrid and deterministic**: Ariel keeps exactly one active session at a time. Rotation happens on explicit user intent first, and also on deterministic threshold triggers (age/turn-count/context-pressure) at turn boundaries, with typed auditable reason codes.
+**Session rotation is hybrid and deterministic**: Ariel keeps exactly one active session at a time. Rotation happens on explicit user intent first (through a dedicated rotate-intent surface), and also on deterministic threshold triggers (age/turn-count/context-pressure) at turn boundaries, with typed auditable reason codes.
+
+**Rotation intent is explicit and backward-compatible**: Existing session bootstrap/status flows remain non-rotating by default; rotation requires explicit user intent (or threshold policy), avoiding ambiguous contract behavior for existing clients.
+
+**Rotation transitions are idempotent and race-safe**: Rotation execution is transaction-safe and duplicate rotate requests cannot produce multiple active sessions or duplicate user-visible rotation outcomes.
 
 **Rotation closes sessions with durable continuity artifacts**: Session rotation writes a bounded episodic continuity artifact so future sessions can recover key context without replaying full historical turns.
 
