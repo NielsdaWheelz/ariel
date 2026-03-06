@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import asynccontextmanager
+import hashlib
 import re
 import time
 from dataclasses import dataclass
@@ -16,7 +17,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import (
+    and_,
     create_engine,
+    func,
+    or_,
     select,
     text,
 )
@@ -43,8 +47,13 @@ from ariel.persistence import (
     ApprovalRequestRecord,
     EventRecord,
     ArtifactRecord,
+    MemoryItemRecord,
+    MemoryRevisionRecord,
     SessionRecord,
+    SessionRotationRecord,
+    TurnIdempotencyRecord,
     TurnRecord,
+    serialize_memory_projection_item,
     serialize_artifact,
     serialize_action_attempt,
     serialize_session,
@@ -58,6 +67,9 @@ from ariel.response_contracts import (
     build_surface_artifact_response,
     build_surface_approval_response,
     build_surface_message_response,
+    build_surface_memory_projection_response,
+    build_surface_rotation_list_response,
+    build_surface_rotation_response,
     build_surface_timeline_response,
 )
 from ariel.weather_state import get_weather_default_location_state, set_weather_default_location
@@ -72,13 +84,27 @@ def _new_id(prefix: str) -> str:
 
 
 _ACTIVE_SESSION_LOCK_ID = 24_310_001
+_ALLOWED_ROTATION_REASONS = {
+    "user_initiated",
+    "threshold_turn_count",
+    "threshold_age",
+    "threshold_context_pressure",
+}
 
 _CONTEXT_SECTION_ORDER = (
     "policy_system_instructions",
     "recent_active_session_turns",
+    "rolling_session_summary",
+    "durable_memory_recall",
+    "open_commitments_and_jobs",
+    "relevant_artifacts_and_signals",
 )
 
 _CONTEXT_AUDIT_SCHEMA_VERSION = "1.0"
+_SESSION_ROLLING_SUMMARY_MAX_CHARS = 1200
+_SESSION_ROLLING_SUMMARY_MAX_TURNS = 6
+_MAX_OPEN_COMMITMENTS_IN_CONTEXT = 12
+_MAX_ARTIFACTS_IN_CONTEXT = 8
 
 _POLICY_SYSTEM_INSTRUCTIONS = (
     "You are Ariel, a private assistant for one active user session.",
@@ -86,6 +112,86 @@ _POLICY_SYSTEM_INSTRUCTIONS = (
     "If user intent is ambiguous or conflicting, ask for the missing details instead of guessing.",
     "If the user asks about details not present in this context, state uncertainty and ask for recovery details.",
 )
+
+_MEMORY_VALUE_MAX_CHARS = 500
+
+_MEMORY_COMMAND_REMEMBER_PATTERN = re.compile(r"^\s*remember\s+(?P<body>.+?)\s*$", re.IGNORECASE)
+_MEMORY_COMMAND_CORRECT_PATTERN = re.compile(r"^\s*correct\s+(?P<body>.+?)\s*$", re.IGNORECASE)
+_MEMORY_COMMAND_FORGET_PATTERN = re.compile(r"^\s*forget\s+(?P<body>.+?)\s*$", re.IGNORECASE)
+_MEMORY_CLASS_KEY_VALUE_PATTERN = re.compile(
+    r"^\s*(?P<memory_class>[a-z_]+):(?P<memory_key>[a-z0-9_]+)\s*=\s*(?P<value>.+?)\s*$",
+    re.IGNORECASE,
+)
+_MEMORY_CLASS_KEY_PATTERN = re.compile(
+    r"^\s*(?P<memory_class>[a-z_]+):(?P<memory_key>[a-z0-9_]+)\s*$",
+    re.IGNORECASE,
+)
+_INFERRED_NOTEBOOK_STYLE_PATTERN = re.compile(
+    r"^\s*i\s+like\s+(?P<value>.+?notebooks?)\s*[.!]?\s*$",
+    re.IGNORECASE,
+)
+_NATURAL_REMEMBER_PREFERENCE_PATTERN = re.compile(
+    r"^\s*remember that i prefer\s+(?P<value>.+?)\s*$",
+    re.IGNORECASE,
+)
+_NATURAL_REMEMBER_COMMITMENT_PATTERN = re.compile(
+    r"^\s*remember that i commit to\s+(?P<value>.+?)\s*$",
+    re.IGNORECASE,
+)
+_NATURAL_REMEMBER_PROFILE_PATTERN = re.compile(
+    r"^\s*remember that my\s+(?P<key>[a-z0-9 _-]{1,64})\s+is\s+(?P<value>.+?)\s*$",
+    re.IGNORECASE,
+)
+_NATURAL_REMEMBER_PROJECT_PATTERN = re.compile(
+    r"^\s*remember that project\s+(?P<key>[a-z0-9 _-]{1,64})\s+is\s+(?P<value>.+?)\s*$",
+    re.IGNORECASE,
+)
+
+_ALLOWED_MEMORY_CLASSES = {
+    "profile",
+    "preference",
+    "project",
+    "commitment",
+    "episodic_summary",
+}
+
+_MEMORY_CLASS_PRIORITY = {
+    "commitment": 5,
+    "profile": 4,
+    "preference": 3,
+    "project": 2,
+    "episodic_summary": 1,
+}
+
+_MEMORY_RECALL_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "again",
+    "for",
+    "from",
+    "i",
+    "in",
+    "is",
+    "it",
+    "my",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "what",
+}
+
+
+@dataclass(slots=True, frozen=True)
+class MemoryMutationProposal:
+    action: Literal["candidate", "remember", "correct", "forget"]
+    memory_class: str
+    memory_key: str
+    value: str | None
+    confidence: float
+    evidence: dict[str, Any]
 
 
 class MessageRequest(BaseModel):
@@ -155,6 +261,31 @@ class ModelAdapter(Protocol):
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]: ...
+
+
+class ContextCompactionAdapter(Protocol):
+    def compact(
+        self,
+        *,
+        context_bundle: dict[str, Any],
+        user_message: str,
+        estimated_context_tokens: int,
+        max_context_tokens: int,
+    ) -> dict[str, Any] | None: ...
+
+
+@dataclass(slots=True)
+class NoopContextCompactionAdapter:
+    def compact(
+        self,
+        *,
+        context_bundle: dict[str, Any],
+        user_message: str,
+        estimated_context_tokens: int,
+        max_context_tokens: int,
+    ) -> dict[str, Any] | None:
+        del context_bundle, user_message, estimated_context_tokens, max_context_tokens
+        return None
 
 
 @dataclass(slots=True)
@@ -335,6 +466,79 @@ def _build_openai_messages(
     if not isinstance(recent_turns, list):
         recent_turns = []
 
+    rolling_summary = context_bundle.get("rolling_session_summary")
+    if isinstance(rolling_summary, dict):
+        summary_text = rolling_summary.get("summary_text")
+        if isinstance(summary_text, str) and summary_text.strip():
+            messages.append(
+                {
+                    "role": "system",
+                    "content": "rolling session summary:\n" + summary_text,
+                }
+            )
+
+    durable_memory_recall = context_bundle.get("durable_memory_recall")
+    if isinstance(durable_memory_recall, list) and durable_memory_recall:
+        memory_lines: list[str] = []
+        for memory in durable_memory_recall:
+            if not isinstance(memory, dict):
+                continue
+            memory_class = memory.get("memory_class")
+            key = memory.get("key")
+            value = memory.get("value")
+            if not (
+                isinstance(memory_class, str) and isinstance(key, str) and isinstance(value, str)
+            ):
+                continue
+            memory_lines.append(f"- {memory_class}: {key} = {value}")
+        if memory_lines:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": "durable memory recall:\n" + "\n".join(memory_lines),
+                }
+            )
+
+    open_commitments_and_jobs = context_bundle.get("open_commitments_and_jobs")
+    if isinstance(open_commitments_and_jobs, dict):
+        commitments_raw = open_commitments_and_jobs.get("open_commitments")
+        if isinstance(commitments_raw, list) and commitments_raw:
+            commitment_lines: list[str] = []
+            for commitment in commitments_raw:
+                if not isinstance(commitment, dict):
+                    continue
+                memory_key = commitment.get("memory_key")
+                value = commitment.get("value")
+                if isinstance(memory_key, str) and isinstance(value, str):
+                    commitment_lines.append(f"- {memory_key}: {value}")
+            if commitment_lines:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": "open commitments:\n" + "\n".join(commitment_lines),
+                    }
+                )
+
+    relevant_artifacts_and_signals = context_bundle.get("relevant_artifacts_and_signals")
+    if isinstance(relevant_artifacts_and_signals, dict):
+        artifacts_raw = relevant_artifacts_and_signals.get("artifacts")
+        if isinstance(artifacts_raw, list) and artifacts_raw:
+            artifact_lines: list[str] = []
+            for artifact in artifacts_raw:
+                if not isinstance(artifact, dict):
+                    continue
+                title = artifact.get("title")
+                source = artifact.get("source")
+                if isinstance(title, str) and isinstance(source, str):
+                    artifact_lines.append(f"- {title} ({source})")
+            if artifact_lines:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": "recent artifacts:\n" + "\n".join(artifact_lines),
+                    }
+                )
+
     for prior_turn in recent_turns:
         if not isinstance(prior_turn, dict):
             continue
@@ -420,6 +624,46 @@ def _estimate_context_tokens(*, context_bundle: dict[str, Any], user_message: st
             prior_assistant_message = prior_turn.get("assistant_message")
             if isinstance(prior_assistant_message, str):
                 token_total += _estimate_text_tokens(prior_assistant_message)
+
+    rolling_session_summary = context_bundle.get("rolling_session_summary")
+    if isinstance(rolling_session_summary, dict):
+        summary_text = rolling_session_summary.get("summary_text")
+        if isinstance(summary_text, str):
+            token_total += _estimate_text_tokens(summary_text)
+
+    durable_memory_recall = context_bundle.get("durable_memory_recall")
+    if isinstance(durable_memory_recall, list):
+        for memory in durable_memory_recall:
+            if not isinstance(memory, dict):
+                continue
+            for key in ("memory_class", "key", "value"):
+                raw_value = memory.get(key)
+                if isinstance(raw_value, str):
+                    token_total += _estimate_text_tokens(raw_value)
+
+    open_commitments_and_jobs = context_bundle.get("open_commitments_and_jobs")
+    if isinstance(open_commitments_and_jobs, dict):
+        commitments_raw = open_commitments_and_jobs.get("open_commitments")
+        if isinstance(commitments_raw, list):
+            for commitment in commitments_raw:
+                if not isinstance(commitment, dict):
+                    continue
+                for key in ("memory_key", "value"):
+                    raw_value = commitment.get(key)
+                    if isinstance(raw_value, str):
+                        token_total += _estimate_text_tokens(raw_value)
+
+    relevant_artifacts_and_signals = context_bundle.get("relevant_artifacts_and_signals")
+    if isinstance(relevant_artifacts_and_signals, dict):
+        artifacts_raw = relevant_artifacts_and_signals.get("artifacts")
+        if isinstance(artifacts_raw, list):
+            for artifact in artifacts_raw:
+                if not isinstance(artifact, dict):
+                    continue
+                for key in ("title", "source"):
+                    raw_value = artifact.get(key)
+                    if isinstance(raw_value, str):
+                        token_total += _estimate_text_tokens(raw_value)
 
     return token_total
 
@@ -508,19 +752,20 @@ class ApiError(Exception):
     retryable: bool = False
 
 
-def _error_response(error: ApiError) -> JSONResponse:
-    return JSONResponse(
-        status_code=error.status_code,
-        content={
-            "ok": False,
-            "error": {
-                "code": error.code,
-                "message": error.message,
-                "details": error.details,
-                "retryable": error.retryable,
-            },
+def _error_payload(error: ApiError) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "error": {
+            "code": error.code,
+            "message": error.message,
+            "details": error.details,
+            "retryable": error.retryable,
         },
-    )
+    }
+
+
+def _error_response(error: ApiError) -> JSONResponse:
+    return JSONResponse(status_code=error.status_code, content=_error_payload(error))
 
 
 def _sanitize_response_contract_errors(errors: list[Any]) -> list[dict[str, Any]]:
@@ -552,10 +797,819 @@ def _response_contract_error(contract_error: ResponseContractViolation) -> ApiEr
     )
 
 
+def _session_turn_lock_id(session_id: str) -> int:
+    digest = hashlib.sha256(f"turn-lock:{session_id}".encode("utf-8")).digest()
+    lock_value = int.from_bytes(digest[:8], byteorder="big", signed=False)
+    if lock_value >= 2**63:
+        lock_value -= 2**64
+    return lock_value
+
+
+def _acquire_session_turn_lock(db: Session, *, session_id: str) -> None:
+    bind = db.get_bind()
+    if bind is None or bind.dialect.name != "postgresql":
+        return
+    db.execute(
+        text("SELECT pg_advisory_xact_lock(:lock_id)"),
+        {"lock_id": _session_turn_lock_id(session_id)},
+    )
+
+
+def _normalize_idempotency_key(raw_key: str | None) -> str | None:
+    if raw_key is None:
+        return None
+    normalized = raw_key.strip()
+    if not normalized:
+        return None
+    if len(normalized) > 128:
+        raise ApiError(
+            status_code=422,
+            code="E_IDEMPOTENCY_KEY_INVALID",
+            message="idempotency key is invalid",
+            details={"max_length": 128},
+            retryable=False,
+        )
+    return normalized
+
+
+def _message_idempotency_request_hash(*, request_session_id: str, message: str) -> str:
+    payload = f"{request_session_id}\n{message}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+@dataclass(slots=True, frozen=True)
+class MemoryMutationResult:
+    event_type: str
+    item: MemoryItemRecord
+    revision: MemoryRevisionRecord
+
+
+def _normalize_memory_key(value: str, *, fallback: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+    return normalized or fallback
+
+
+def _normalize_memory_value(value: str) -> str:
+    normalized = " ".join(value.strip().split())
+    return normalized[:_MEMORY_VALUE_MAX_CHARS]
+
+
+def _normalized_terms(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", text.lower())
+        if token and token not in _MEMORY_RECALL_STOPWORDS
+    }
+
+
+def _parse_memory_class_key_value(body: str) -> tuple[str, str, str] | None:
+    match = _MEMORY_CLASS_KEY_VALUE_PATTERN.match(body)
+    if match is None:
+        return None
+    memory_class = match.group("memory_class").strip().lower()
+    if memory_class not in _ALLOWED_MEMORY_CLASSES:
+        return None
+    key = _normalize_memory_key(match.group("memory_key"), fallback="general")
+    value = _normalize_memory_value(match.group("value"))
+    if not value:
+        return None
+    return memory_class, f"{memory_class}:{key}", value
+
+
+def _parse_memory_class_key(body: str) -> tuple[str, str] | None:
+    match = _MEMORY_CLASS_KEY_PATTERN.match(body)
+    if match is None:
+        return None
+    memory_class = match.group("memory_class").strip().lower()
+    if memory_class not in _ALLOWED_MEMORY_CLASSES:
+        return None
+    key = _normalize_memory_key(match.group("memory_key"), fallback="general")
+    return memory_class, f"{memory_class}:{key}"
+
+
+def _extract_memory_mutation_proposal(user_message: str) -> MemoryMutationProposal | None:
+    remember_match = _MEMORY_COMMAND_REMEMBER_PATTERN.match(user_message)
+    if remember_match is not None:
+        parsed = _parse_memory_class_key_value(remember_match.group("body"))
+        if parsed is None:
+            return None
+        memory_class, memory_key, value = parsed
+        return MemoryMutationProposal(
+            action="remember",
+            memory_class=memory_class,
+            memory_key=memory_key,
+            value=value,
+            confidence=1.0,
+            evidence={"capture_mode": "explicit_memory_command", "command": "remember"},
+        )
+
+    correct_match = _MEMORY_COMMAND_CORRECT_PATTERN.match(user_message)
+    if correct_match is not None:
+        parsed = _parse_memory_class_key_value(correct_match.group("body"))
+        if parsed is None:
+            return None
+        memory_class, memory_key, value = parsed
+        return MemoryMutationProposal(
+            action="correct",
+            memory_class=memory_class,
+            memory_key=memory_key,
+            value=value,
+            confidence=1.0,
+            evidence={"capture_mode": "explicit_memory_command", "command": "correct"},
+        )
+
+    forget_match = _MEMORY_COMMAND_FORGET_PATTERN.match(user_message)
+    if forget_match is not None:
+        parsed_key = _parse_memory_class_key(forget_match.group("body"))
+        if parsed_key is None:
+            return None
+        memory_class, memory_key = parsed_key
+        return MemoryMutationProposal(
+            action="forget",
+            memory_class=memory_class,
+            memory_key=memory_key,
+            value=None,
+            confidence=1.0,
+            evidence={"capture_mode": "explicit_memory_command", "command": "forget"},
+        )
+
+    natural_preference_match = _NATURAL_REMEMBER_PREFERENCE_PATTERN.match(user_message)
+    if natural_preference_match is not None:
+        value = _normalize_memory_value(natural_preference_match.group("value"))
+        if value:
+            return MemoryMutationProposal(
+                action="remember",
+                memory_class="preference",
+                memory_key="preference:general",
+                value=value,
+                confidence=1.0,
+                evidence={"capture_mode": "explicit_user_statement", "command": "remember"},
+            )
+
+    natural_commitment_match = _NATURAL_REMEMBER_COMMITMENT_PATTERN.match(user_message)
+    if natural_commitment_match is not None:
+        value = _normalize_memory_value(natural_commitment_match.group("value"))
+        if value:
+            commitment_key = _normalize_memory_key(value, fallback="commitment")
+            return MemoryMutationProposal(
+                action="remember",
+                memory_class="commitment",
+                memory_key=f"commitment:{commitment_key}",
+                value=value,
+                confidence=1.0,
+                evidence={
+                    "capture_mode": "explicit_user_statement",
+                    "command": "remember",
+                    "status": "open",
+                },
+            )
+
+    natural_profile_match = _NATURAL_REMEMBER_PROFILE_PATTERN.match(user_message)
+    if natural_profile_match is not None:
+        profile_key = _normalize_memory_key(natural_profile_match.group("key"), fallback="profile")
+        value = _normalize_memory_value(natural_profile_match.group("value"))
+        if value:
+            return MemoryMutationProposal(
+                action="remember",
+                memory_class="profile",
+                memory_key=f"profile:{profile_key}",
+                value=value,
+                confidence=1.0,
+                evidence={"capture_mode": "explicit_user_statement", "command": "remember"},
+            )
+
+    natural_project_match = _NATURAL_REMEMBER_PROJECT_PATTERN.match(user_message)
+    if natural_project_match is not None:
+        project_key = _normalize_memory_key(natural_project_match.group("key"), fallback="project")
+        value = _normalize_memory_value(natural_project_match.group("value"))
+        if value:
+            return MemoryMutationProposal(
+                action="remember",
+                memory_class="project",
+                memory_key=f"project:{project_key}",
+                value=value,
+                confidence=1.0,
+                evidence={"capture_mode": "explicit_user_statement", "command": "remember"},
+            )
+
+    inferred_match = _INFERRED_NOTEBOOK_STYLE_PATTERN.match(user_message)
+    if inferred_match is not None:
+        value = _normalize_memory_value(inferred_match.group("value"))
+        if value:
+            return MemoryMutationProposal(
+                action="candidate",
+                memory_class="preference",
+                memory_key="preference:notebook_style",
+                value=value,
+                confidence=0.55,
+                evidence={"capture_mode": "inferred_statement"},
+            )
+
+    return None
+
+
+def _get_or_create_memory_item(
+    *,
+    db: Session,
+    memory_class: str,
+    memory_key: str,
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> MemoryItemRecord:
+    existing = db.scalar(
+        select(MemoryItemRecord)
+        .where(
+            MemoryItemRecord.memory_class == memory_class,
+            MemoryItemRecord.memory_key == memory_key,
+        )
+        .limit(1)
+    )
+    if existing is not None:
+        return existing
+    now = now_fn()
+    created = MemoryItemRecord(
+        id=new_id_fn("mit"),
+        memory_class=memory_class,
+        memory_key=memory_key,
+        active_revision_id=None,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(created)
+    db.flush()
+    return created
+
+
+def _active_revision_for_item(db: Session, item: MemoryItemRecord) -> MemoryRevisionRecord | None:
+    if not isinstance(item.active_revision_id, str):
+        return None
+    return db.scalar(
+        select(MemoryRevisionRecord).where(MemoryRevisionRecord.id == item.active_revision_id).limit(1)
+    )
+
+
+def _append_memory_revision(
+    *,
+    db: Session,
+    item: MemoryItemRecord,
+    lifecycle_state: str,
+    value: str | None,
+    confidence: float,
+    source_turn_id: str | None,
+    source_session_id: str,
+    evidence: dict[str, Any],
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> MemoryRevisionRecord:
+    now = now_fn()
+    revision = MemoryRevisionRecord(
+        id=new_id_fn("mrv"),
+        memory_item_id=item.id,
+        lifecycle_state=lifecycle_state,
+        value=value,
+        confidence=confidence,
+        source_turn_id=source_turn_id,
+        source_session_id=source_session_id,
+        evidence=evidence,
+        last_verified_at=now,
+        created_at=now,
+    )
+    db.add(revision)
+    item.active_revision_id = revision.id
+    item.updated_at = now
+    db.flush()
+    return revision
+
+
+def _capture_validated_memory_candidates(
+    *,
+    db: Session,
+    session_id: str,
+    source_turn_id: str,
+    user_message: str,
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> list[MemoryMutationResult]:
+    proposal = _extract_memory_mutation_proposal(user_message)
+    if proposal is None:
+        return []
+
+    item = _get_or_create_memory_item(
+        db=db,
+        memory_class=proposal.memory_class,
+        memory_key=proposal.memory_key,
+        now_fn=now_fn,
+        new_id_fn=new_id_fn,
+    )
+    active_revision = _active_revision_for_item(db, item)
+    value = proposal.value
+
+    if proposal.action == "candidate":
+        if value is None:
+            return []
+        if (
+            active_revision is not None
+            and active_revision.lifecycle_state in {"candidate", "validated"}
+            and active_revision.value == value
+        ):
+            return []
+        candidate_revision = _append_memory_revision(
+            db=db,
+            item=item,
+            lifecycle_state="candidate",
+            value=value,
+            confidence=proposal.confidence,
+            source_turn_id=source_turn_id,
+            source_session_id=session_id,
+            evidence=proposal.evidence,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        return [
+            MemoryMutationResult(
+                event_type="evt.memory.candidate_proposed",
+                item=item,
+                revision=candidate_revision,
+            )
+        ]
+
+    if proposal.action == "remember":
+        if value is None:
+            return []
+        if (
+            active_revision is not None
+            and active_revision.lifecycle_state == "validated"
+            and active_revision.value == value
+        ):
+            return []
+        event_type = "evt.memory.captured"
+        if active_revision is not None and active_revision.lifecycle_state == "candidate":
+            event_type = "evt.memory.promoted"
+        remembered_revision = _append_memory_revision(
+            db=db,
+            item=item,
+            lifecycle_state="validated",
+            value=value,
+            confidence=proposal.confidence,
+            source_turn_id=source_turn_id,
+            source_session_id=session_id,
+            evidence=proposal.evidence,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        return [MemoryMutationResult(event_type=event_type, item=item, revision=remembered_revision)]
+
+    if proposal.action == "correct":
+        if value is None:
+            return []
+        if (
+            active_revision is not None
+            and active_revision.lifecycle_state == "validated"
+            and active_revision.value == value
+        ):
+            return []
+        corrected_revision = _append_memory_revision(
+            db=db,
+            item=item,
+            lifecycle_state="validated",
+            value=value,
+            confidence=proposal.confidence,
+            source_turn_id=source_turn_id,
+            source_session_id=session_id,
+            evidence=proposal.evidence,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        return [
+            MemoryMutationResult(
+                event_type="evt.memory.corrected",
+                item=item,
+                revision=corrected_revision,
+            )
+        ]
+
+    if proposal.action == "forget":
+        if active_revision is None:
+            return []
+        if active_revision.lifecycle_state == "retracted":
+            return []
+        retracted_revision = _append_memory_revision(
+            db=db,
+            item=item,
+            lifecycle_state="retracted",
+            value=None,
+            confidence=proposal.confidence,
+            source_turn_id=source_turn_id,
+            source_session_id=session_id,
+            evidence=proposal.evidence,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        return [
+            MemoryMutationResult(
+                event_type="evt.memory.retracted",
+                item=item,
+                revision=retracted_revision,
+            )
+        ]
+
+    return []
+
+
+def _is_open_commitment(*, item: MemoryItemRecord, revision: MemoryRevisionRecord) -> bool:
+    if item.memory_class != "commitment":
+        return False
+    evidence_payload = revision.evidence if isinstance(revision.evidence, dict) else {}
+    status = evidence_payload.get("status")
+    if isinstance(status, str) and status in {"completed", "cancelled", "closed"}:
+        return False
+    return True
+
+
+def _active_item_revision_pairs(db: Session) -> list[tuple[MemoryItemRecord, MemoryRevisionRecord]]:
+    items = db.scalars(
+        select(MemoryItemRecord)
+        .where(MemoryItemRecord.active_revision_id.is_not(None))
+        .order_by(MemoryItemRecord.updated_at.desc(), MemoryItemRecord.id.asc())
+    ).all()
+    revision_ids = [
+        item.active_revision_id
+        for item in items
+        if isinstance(item.active_revision_id, str) and item.active_revision_id
+    ]
+    if not revision_ids:
+        return []
+    revisions = db.scalars(
+        select(MemoryRevisionRecord).where(MemoryRevisionRecord.id.in_(revision_ids))
+    ).all()
+    revisions_by_id = {revision.id: revision for revision in revisions}
+    pairs: list[tuple[MemoryItemRecord, MemoryRevisionRecord]] = []
+    for item in items:
+        if not isinstance(item.active_revision_id, str):
+            continue
+        active_revision = revisions_by_id.get(item.active_revision_id)
+        if active_revision is None:
+            continue
+        pairs.append((item, active_revision))
+    return pairs
+
+
+def _recall_validated_memory_for_turn(
+    *,
+    db: Session,
+    user_message: str,
+    max_recalled_memories: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    query_terms = _normalized_terms(user_message)
+    ranked: list[tuple[int, int, float, float, str, MemoryItemRecord, MemoryRevisionRecord]] = []
+    for item, revision in _active_item_revision_pairs(db):
+        if item.memory_class == "episodic_summary":
+            continue
+        if revision.lifecycle_state != "validated":
+            continue
+        memory_terms = _normalized_terms(f"{item.memory_key} {revision.value or ''}")
+        overlap_count = len(query_terms.intersection(memory_terms))
+        if _is_open_commitment(item=item, revision=revision):
+            overlap_count += 1
+        if overlap_count <= 0:
+            continue
+        class_priority = _MEMORY_CLASS_PRIORITY.get(item.memory_class, 0)
+        ranked.append(
+            (
+                overlap_count,
+                class_priority,
+                revision.last_verified_at.timestamp(),
+                revision.created_at.timestamp(),
+                item.id,
+                item,
+                revision,
+            )
+        )
+
+    ranked.sort(key=lambda row: (-row[0], -row[1], -row[2], -row[3], row[4]))
+    selected = ranked[:max_recalled_memories]
+    excluded = ranked[max_recalled_memories:]
+
+    recalled_memory = [
+        {
+            "memory_id": item.id,
+            "memory_class": item.memory_class,
+            "key": item.memory_key,
+            "value": revision.value or "",
+            "confidence": revision.confidence,
+            "last_verified_at": to_rfc3339(revision.last_verified_at),
+        }
+        for _, _, _, _, _, item, revision in selected
+    ]
+    excluded_memories = [
+        {"memory_id": item.id, "reason": "top_k_bounded"}
+        for _, _, _, _, _, item, _ in excluded
+    ]
+    recall_window = {
+        "max_recalled_memories": max_recalled_memories,
+        "included_memory_count": len(recalled_memory),
+        "omitted_memory_count": len(excluded_memories),
+        "included_memory_ids": [memory["memory_id"] for memory in recalled_memory],
+        "excluded_memories": excluded_memories,
+    }
+    return recalled_memory, recall_window
+
+
+def _build_episodic_continuity_summary(*, prior_turns: Sequence[TurnRecord]) -> str:
+    if not prior_turns:
+        return "session rotated with no prior turns."
+    snippets: list[str] = []
+    for turn in prior_turns[-3:]:
+        user_text = _normalize_memory_value(turn.user_message)
+        assistant_text = (
+            _normalize_memory_value(turn.assistant_message)
+            if isinstance(turn.assistant_message, str)
+            else ""
+        )
+        if assistant_text:
+            snippets.append(f"user: {user_text} | assistant: {assistant_text}")
+        else:
+            snippets.append(f"user: {user_text}")
+    return _normalize_memory_value(" || ".join(snippets))
+
+
+def _open_commitments_context(*, db: Session) -> list[dict[str, Any]]:
+    open_commitments: list[dict[str, Any]] = []
+    for item, revision in _active_item_revision_pairs(db):
+        if item.memory_class != "commitment":
+            continue
+        if revision.lifecycle_state != "validated":
+            continue
+        if not _is_open_commitment(item=item, revision=revision):
+            continue
+        open_commitments.append(
+            {
+                "memory_item_id": item.id,
+                "memory_key": item.memory_key,
+                "value": revision.value or "",
+                "confidence": revision.confidence,
+                "last_verified_at": to_rfc3339(revision.last_verified_at),
+            }
+        )
+    open_commitments.sort(key=lambda row: (row["last_verified_at"], row["memory_item_id"]), reverse=True)
+    return open_commitments[:_MAX_OPEN_COMMITMENTS_IN_CONTEXT]
+
+
+def _open_validated_commitment_ids(*, db: Session) -> list[str]:
+    return [commitment["memory_item_id"] for commitment in _open_commitments_context(db=db)]
+
+
+def _build_rolling_session_summary(
+    *,
+    prior_turns: Sequence[TurnRecord],
+    max_summary_turns: int = _SESSION_ROLLING_SUMMARY_MAX_TURNS,
+) -> dict[str, Any]:
+    if not prior_turns:
+        return {
+            "summary_text": "",
+            "source_turn_ids": [],
+            "included_turn_count": 0,
+            "max_chars": _SESSION_ROLLING_SUMMARY_MAX_CHARS,
+        }
+
+    turns_for_summary = prior_turns[-max_summary_turns:]
+    snippets: list[str] = []
+    source_turn_ids: list[str] = []
+    for turn in turns_for_summary:
+        source_turn_ids.append(turn.id)
+        user_text = _normalize_memory_value(turn.user_message)
+        assistant_text = (
+            _normalize_memory_value(turn.assistant_message)
+            if isinstance(turn.assistant_message, str)
+            else ""
+        )
+        if assistant_text:
+            snippets.append(f"user={user_text}; assistant={assistant_text}")
+        else:
+            snippets.append(f"user={user_text}")
+    summary_text = _normalize_memory_value(" | ".join(snippets))
+    summary_text = summary_text[:_SESSION_ROLLING_SUMMARY_MAX_CHARS]
+    return {
+        "summary_text": summary_text,
+        "source_turn_ids": source_turn_ids,
+        "included_turn_count": len(source_turn_ids),
+        "max_chars": _SESSION_ROLLING_SUMMARY_MAX_CHARS,
+    }
+
+
+def _relevant_artifacts_and_signals_context(
+    *,
+    db: Session,
+    prior_turns: Sequence[TurnRecord],
+) -> dict[str, Any]:
+    turn_ids = [turn.id for turn in prior_turns]
+    if not turn_ids:
+        return {
+            "artifacts": [],
+            "proactive_signals": [],
+        }
+    artifacts = db.scalars(
+        select(ArtifactRecord)
+        .where(ArtifactRecord.turn_id.in_(turn_ids))
+        .order_by(ArtifactRecord.retrieved_at.desc(), ArtifactRecord.id.desc())
+        .limit(_MAX_ARTIFACTS_IN_CONTEXT)
+    ).all()
+    return {
+        "artifacts": [serialize_artifact(artifact) for artifact in artifacts],
+        "proactive_signals": [],
+    }
+
+
+def _record_rotation_continuity_artifact(
+    *,
+    db: Session,
+    prior_session_id: str,
+    new_session_id: str,
+    rotation_reason: str,
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> None:
+    prior_turns = db.scalars(
+        select(TurnRecord)
+        .where(TurnRecord.session_id == prior_session_id)
+        .order_by(TurnRecord.created_at.asc(), TurnRecord.id.asc())
+    ).all()
+    source_turn_id = prior_turns[-1].id if prior_turns else None
+    continuity_summary = _build_episodic_continuity_summary(prior_turns=prior_turns)
+    open_commitment_ids = _open_validated_commitment_ids(db=db)[:12]
+
+    item = _get_or_create_memory_item(
+        db=db,
+        memory_class="episodic_summary",
+        memory_key=f"episodic_summary:rotation_{prior_session_id}",
+        now_fn=now_fn,
+        new_id_fn=new_id_fn,
+    )
+    _append_memory_revision(
+        db=db,
+        item=item,
+        lifecycle_state="validated",
+        value=continuity_summary,
+        confidence=0.9,
+        source_turn_id=source_turn_id,
+        source_session_id=prior_session_id,
+        evidence={
+            "capture_mode": "session_rotation",
+            "rotation_reason": rotation_reason,
+            "prior_session_id": prior_session_id,
+            "new_session_id": new_session_id,
+            "open_commitment_memory_ids": open_commitment_ids,
+        },
+        now_fn=now_fn,
+        new_id_fn=new_id_fn,
+    )
+
+
+def _rotate_active_session(
+    db: Session,
+    *,
+    reason: str,
+    idempotency_key: str | None,
+    actor_id: str,
+    trigger_snapshot: dict[str, Any] | None = None,
+) -> tuple[SessionRecord, SessionRotationRecord, bool]:
+    if reason not in _ALLOWED_ROTATION_REASONS:
+        raise RuntimeError("unsupported rotation reason")
+
+    bind = db.get_bind()
+    if bind is not None and bind.dialect.name == "postgresql":
+        db.execute(
+            text("SELECT pg_advisory_xact_lock(:lock_id)"),
+            {"lock_id": _ACTIVE_SESSION_LOCK_ID},
+        )
+
+    normalized_idempotency_key = (
+        idempotency_key.strip() if isinstance(idempotency_key, str) and idempotency_key.strip() else None
+    )
+
+    if reason == "user_initiated" and isinstance(normalized_idempotency_key, str):
+        existing_rotation = db.scalar(
+            select(SessionRotationRecord)
+            .where(SessionRotationRecord.idempotency_key == normalized_idempotency_key)
+            .limit(1)
+        )
+        if existing_rotation is not None:
+            existing_session = db.scalar(
+                select(SessionRecord)
+                .where(SessionRecord.id == existing_rotation.rotated_to_session_id)
+                .limit(1)
+            )
+            if existing_session is not None:
+                return existing_session, existing_rotation, True
+
+    active_session = db.scalar(
+        select(SessionRecord).where(SessionRecord.is_active.is_(True)).limit(1)
+    )
+    if active_session is None:
+        active_session = _get_or_create_active_session(db)
+
+    active_turn_count_raw = db.scalar(
+        select(func.count(TurnRecord.id)).where(TurnRecord.session_id == active_session.id)
+    )
+    active_turn_count = int(active_turn_count_raw or 0)
+    if (
+        reason == "user_initiated"
+        and normalized_idempotency_key is None
+        and active_session.rotation_reason == "user_initiated"
+        and isinstance(active_session.rotated_from_session_id, str)
+        and active_turn_count == 0
+    ):
+        existing_rotation = db.scalar(
+            select(SessionRotationRecord)
+            .where(SessionRotationRecord.rotated_to_session_id == active_session.id)
+            .limit(1)
+        )
+        if existing_rotation is not None:
+            return active_session, existing_rotation, True
+
+    now = _utcnow()
+    prior_session_id = active_session.id
+    active_session.is_active = False
+    active_session.lifecycle_state = "closed"
+    active_session.updated_at = now
+
+    rotated_session = SessionRecord(
+        id=_new_id("ses"),
+        is_active=True,
+        lifecycle_state="active",
+        rotated_from_session_id=prior_session_id,
+        rotation_reason=reason,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(rotated_session)
+    db.flush()
+
+    rotation_record = SessionRotationRecord(
+        id=_new_id("rot"),
+        rotated_from_session_id=prior_session_id,
+        rotated_to_session_id=rotated_session.id,
+        reason=reason,
+        idempotency_key=normalized_idempotency_key,
+        actor_id=actor_id,
+        trigger_snapshot=trigger_snapshot if isinstance(trigger_snapshot, dict) else {},
+        created_at=now,
+    )
+    db.add(rotation_record)
+    db.flush()
+
+    _record_rotation_continuity_artifact(
+        db=db,
+        prior_session_id=prior_session_id,
+        new_session_id=rotated_session.id,
+        rotation_reason=reason,
+        now_fn=_utcnow,
+        new_id_fn=_new_id,
+    )
+    return rotated_session, rotation_record, False
+
+
+def _auto_rotation_reason(
+    *,
+    session_created_at: datetime,
+    prior_turn_count: int,
+    estimated_context_tokens: int,
+    max_turns: int,
+    max_age_seconds: int,
+    max_context_pressure_tokens: int,
+    now: datetime,
+) -> tuple[str | None, dict[str, Any]]:
+    session_age_seconds = max(0, int((now - session_created_at).total_seconds()))
+    snapshot = {
+        "session_age_seconds": session_age_seconds,
+        "prior_turn_count": prior_turn_count,
+        "estimated_context_tokens": estimated_context_tokens,
+        "thresholds": {
+            "max_turns": max_turns,
+            "max_age_seconds": max_age_seconds,
+            "max_context_pressure_tokens": max_context_pressure_tokens,
+        },
+    }
+    if prior_turn_count <= 0:
+        return None, snapshot
+    if prior_turn_count >= max_turns:
+        return "threshold_turn_count", snapshot
+    if session_age_seconds >= max_age_seconds:
+        return "threshold_age", snapshot
+    if estimated_context_tokens >= max_context_pressure_tokens:
+        return "threshold_context_pressure", snapshot
+    return None, snapshot
+
+
 def _build_turn_context_bundle(
     *,
     prior_turns: Sequence[TurnRecord],
     max_recent_turns: int,
+    rolling_session_summary: dict[str, Any],
+    durable_memory_recall: Sequence[dict[str, Any]],
+    durable_memory_recall_window: dict[str, Any],
+    open_commitments_and_jobs: dict[str, Any],
+    relevant_artifacts_and_signals: dict[str, Any],
 ) -> dict[str, Any]:
     recent_turns = prior_turns[-max_recent_turns:]
     recent_active_session_turns = [
@@ -574,6 +1628,11 @@ def _build_turn_context_bundle(
         "section_order": list(_CONTEXT_SECTION_ORDER),
         "policy_system_instructions": list(_POLICY_SYSTEM_INSTRUCTIONS),
         "recent_active_session_turns": recent_active_session_turns,
+        "rolling_session_summary": dict(rolling_session_summary),
+        "durable_memory_recall": list(durable_memory_recall),
+        "durable_memory_recall_window": dict(durable_memory_recall_window),
+        "open_commitments_and_jobs": dict(open_commitments_and_jobs),
+        "relevant_artifacts_and_signals": dict(relevant_artifacts_and_signals),
         "recent_window": {
             "max_recent_turns": max_recent_turns,
             "included_turn_count": len(recent_active_session_turns),
@@ -686,6 +1745,7 @@ def _get_or_create_active_session(db: Session) -> SessionRecord:
         created = SessionRecord(
             id=_new_id("ses"),
             is_active=True,
+            lifecycle_state="active",
             created_at=now,
             updated_at=now,
         )
@@ -708,11 +1768,13 @@ def create_app(
     *,
     database_url: str | None = None,
     model_adapter: ModelAdapter | None = None,
+    context_compaction_adapter: ContextCompactionAdapter | None = None,
     reset_database: bool = False,
 ) -> FastAPI:
     settings = AppSettings()
     db_url = database_url or settings.database_url
     adapter = model_adapter or _build_default_model_adapter(settings)
+    compaction_adapter = context_compaction_adapter or NoopContextCompactionAdapter()
 
     engine = create_engine(db_url, future=True, pool_pre_ping=True)
     session_factory = sessionmaker(bind=engine, future=True, expire_on_commit=False)
@@ -731,10 +1793,15 @@ def create_app(
     app.state.engine = engine
     app.state.session_factory = session_factory
     app.state.model_adapter = adapter
+    app.state.context_compaction_adapter = compaction_adapter
     app.state.bind_host = settings.bind_host
     app.state.bind_port = settings.bind_port
     app.state.max_recent_turns = settings.max_recent_turns
+    app.state.max_recalled_memories = settings.max_recalled_memories
     app.state.max_context_tokens = settings.max_context_tokens
+    app.state.auto_rotate_max_turns = settings.auto_rotate_max_turns
+    app.state.auto_rotate_max_age_seconds = settings.auto_rotate_max_age_seconds
+    app.state.auto_rotate_context_pressure_tokens = settings.auto_rotate_context_pressure_tokens
     app.state.max_response_tokens = settings.max_response_tokens
     app.state.max_model_attempts = settings.max_model_attempts
     app.state.max_turn_wall_time_ms = settings.max_turn_wall_time_ms
@@ -840,6 +1907,115 @@ def create_app(
             with db.begin():
                 active_session = _get_or_create_active_session(db)
             return {"ok": True, "session": serialize_session(active_session)}
+
+    @app.post("/v1/sessions/rotate", response_model=None)
+    def rotate_active_session(request: Request) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        idempotency_key = request.headers.get("Idempotency-Key")
+        with session_factory() as db:
+            with db.begin():
+                rotated_session, rotation_record, idempotent_replay = _rotate_active_session(
+                    db,
+                    reason="user_initiated",
+                    idempotency_key=idempotency_key,
+                    actor_id=str(app.state.approval_actor_id),
+                )
+                try:
+                    return build_surface_rotation_response(
+                        session=serialize_session(rotated_session),
+                        rotation={
+                            "rotation_id": rotation_record.id,
+                            "reason": rotation_record.reason,
+                            "rotated_from_session_id": rotation_record.rotated_from_session_id,
+                            "idempotency_key": rotation_record.idempotency_key,
+                            "idempotent_replay": idempotent_replay,
+                        },
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/sessions/rotations", response_model=None)
+    def get_session_rotations(limit: int = 100) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 500))
+        with session_factory() as db:
+            with db.begin():
+                rows = db.scalars(
+                    select(SessionRotationRecord)
+                    .order_by(
+                        SessionRotationRecord.created_at.desc(),
+                        SessionRotationRecord.id.desc(),
+                    )
+                    .limit(bounded_limit)
+                ).all()
+                payload = [
+                    {
+                        "rotation_id": row.id,
+                        "reason": row.reason,
+                        "rotated_from_session_id": row.rotated_from_session_id,
+                        "rotated_to_session_id": row.rotated_to_session_id,
+                        "idempotency_key": row.idempotency_key,
+                        "actor_id": row.actor_id,
+                        "trigger_snapshot": row.trigger_snapshot,
+                        "created_at": to_rfc3339(row.created_at),
+                    }
+                    for row in rows
+                ]
+                try:
+                    return build_surface_rotation_list_response(rotations=payload)
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/memory", response_model=None)
+    def get_memory_projection() -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                memory_items = db.scalars(
+                    select(MemoryItemRecord).order_by(
+                        MemoryItemRecord.updated_at.desc(),
+                        MemoryItemRecord.id.asc(),
+                    )
+                ).all()
+                memory_item_ids = [item.id for item in memory_items]
+                revision_counts: dict[str, int] = {}
+                if memory_item_ids:
+                    for memory_item_id, count in db.execute(
+                        select(
+                            MemoryRevisionRecord.memory_item_id,
+                            func.count(MemoryRevisionRecord.id),
+                        )
+                        .where(MemoryRevisionRecord.memory_item_id.in_(memory_item_ids))
+                        .group_by(MemoryRevisionRecord.memory_item_id)
+                    ).all():
+                        if isinstance(memory_item_id, str):
+                            revision_counts[memory_item_id] = int(count)
+
+                active_revision_ids = [
+                    item.active_revision_id
+                    for item in memory_items
+                    if isinstance(item.active_revision_id, str)
+                ]
+                active_revisions = db.scalars(
+                    select(MemoryRevisionRecord).where(MemoryRevisionRecord.id.in_(active_revision_ids))
+                ).all()
+                active_revisions_by_id = {revision.id: revision for revision in active_revisions}
+                projection = [
+                    serialize_memory_projection_item(
+                        item=item,
+                        active_revision=(
+                            active_revisions_by_id.get(item.active_revision_id)
+                            if isinstance(item.active_revision_id, str)
+                            else None
+                        ),
+                        revision_count=revision_counts.get(item.id, 0),
+                    )
+                    for item in memory_items
+                ]
+                try:
+                    return build_surface_memory_projection_response(items=projection)
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
 
     @app.get("/v1/weather/default-location")
     def get_weather_default_location() -> dict[str, Any]:
@@ -1029,13 +2205,113 @@ def create_app(
             return {"ok": True, "connector": connector_payload}
 
     @app.post("/v1/sessions/{session_id}/message", response_model=None)
-    def post_message(session_id: str, payload: MessageRequest) -> JSONResponse | dict[str, Any]:
+    def post_message(
+        session_id: str,
+        payload: MessageRequest,
+        request: Request,
+    ) -> JSONResponse | dict[str, Any]:
         _ensure_schema_ready()
+        request_session_id = session_id
+        normalized_idempotency_key = _normalize_idempotency_key(request.headers.get("Idempotency-Key"))
+        request_hash = (
+            _message_idempotency_request_hash(
+                request_session_id=request_session_id,
+                message=payload.message,
+            )
+            if normalized_idempotency_key is not None
+            else None
+        )
+
         with session_factory() as db:
             with db.begin():
+                _acquire_session_turn_lock(db, session_id=request_session_id)
+
+                existing_idempotency = (
+                    db.scalar(
+                        select(TurnIdempotencyRecord)
+                        .where(
+                            TurnIdempotencyRecord.session_id == request_session_id,
+                            TurnIdempotencyRecord.idempotency_key == normalized_idempotency_key,
+                        )
+                        .limit(1)
+                    )
+                    if normalized_idempotency_key is not None
+                    else None
+                )
+                if existing_idempotency is not None:
+                    if existing_idempotency.request_hash != request_hash:
+                        raise ApiError(
+                            status_code=409,
+                            code="E_IDEMPOTENCY_KEY_REUSED",
+                            message="idempotency key reused with different request payload",
+                            details={"session_id": request_session_id},
+                            retryable=False,
+                        )
+                    if existing_idempotency.status_code == 200:
+                        return existing_idempotency.response_payload
+                    return JSONResponse(
+                        status_code=existing_idempotency.status_code,
+                        content=existing_idempotency.response_payload,
+                    )
+
+                def persist_idempotency_result(
+                    *,
+                    turn_id: str,
+                    effective_session_id: str,
+                    status_code: int,
+                    response_payload: dict[str, Any],
+                ) -> None:
+                    if normalized_idempotency_key is None:
+                        return
+                    now = _utcnow()
+                    target_session_ids = [request_session_id]
+                    if effective_session_id != request_session_id:
+                        target_session_ids.append(effective_session_id)
+
+                    for target_session_id in target_session_ids:
+                        target_hash = _message_idempotency_request_hash(
+                            request_session_id=target_session_id,
+                            message=payload.message,
+                        )
+                        existing_for_target = db.scalar(
+                            select(TurnIdempotencyRecord)
+                            .where(
+                                TurnIdempotencyRecord.session_id == target_session_id,
+                                TurnIdempotencyRecord.idempotency_key == normalized_idempotency_key,
+                            )
+                            .limit(1)
+                        )
+                        if existing_for_target is not None:
+                            if existing_for_target.request_hash != target_hash:
+                                raise ApiError(
+                                    status_code=409,
+                                    code="E_IDEMPOTENCY_KEY_REUSED",
+                                    message="idempotency key reused with different request payload",
+                                    details={"session_id": target_session_id},
+                                    retryable=False,
+                                )
+                            continue
+                        db.add(
+                            TurnIdempotencyRecord(
+                                id=_new_id("idk"),
+                                session_id=target_session_id,
+                                idempotency_key=normalized_idempotency_key,
+                                request_hash=target_hash,
+                                turn_id=turn_id,
+                                status_code=status_code,
+                                response_payload=response_payload,
+                                created_at=now,
+                                updated_at=now,
+                            )
+                        )
+                    db.flush()
+
                 active_session = db.scalar(
                     select(SessionRecord)
-                    .where(SessionRecord.id == session_id, SessionRecord.is_active.is_(True))
+                    .where(
+                        SessionRecord.id == request_session_id,
+                        SessionRecord.is_active.is_(True),
+                    )
                     .limit(1)
                 )
                 if active_session is None:
@@ -1043,30 +2319,96 @@ def create_app(
                         status_code=404,
                         code="E_SESSION_NOT_FOUND",
                         message="active session not found",
-                        details={"session_id": session_id},
+                        details={"session_id": request_session_id},
                         retryable=False,
                     )
 
                 prior_turns = db.scalars(
                     select(TurnRecord)
-                    .where(TurnRecord.session_id == session_id)
+                    .where(TurnRecord.session_id == active_session.id)
                     .order_by(TurnRecord.created_at.asc(), TurnRecord.id.asc())
                 ).all()
+                pre_rotation_recall, pre_rotation_recall_window = _recall_validated_memory_for_turn(
+                    db=db,
+                    user_message=payload.message,
+                    max_recalled_memories=int(app.state.max_recalled_memories),
+                )
+                pre_rotation_open_commitments_and_jobs = {
+                    "open_commitments": _open_commitments_context(db=db),
+                    "open_jobs": [],
+                }
+                pre_rotation_context_bundle = _build_turn_context_bundle(
+                    prior_turns=prior_turns,
+                    max_recent_turns=int(app.state.max_recent_turns),
+                    rolling_session_summary=_build_rolling_session_summary(prior_turns=prior_turns),
+                    durable_memory_recall=pre_rotation_recall,
+                    durable_memory_recall_window=pre_rotation_recall_window,
+                    open_commitments_and_jobs=pre_rotation_open_commitments_and_jobs,
+                    relevant_artifacts_and_signals=_relevant_artifacts_and_signals_context(
+                        db=db,
+                        prior_turns=prior_turns,
+                    ),
+                )
+                estimated_context_tokens = _estimate_context_tokens(
+                    context_bundle=pre_rotation_context_bundle,
+                    user_message=payload.message,
+                )
+                auto_rotation_reason, trigger_snapshot = _auto_rotation_reason(
+                    session_created_at=active_session.created_at,
+                    prior_turn_count=len(prior_turns),
+                    estimated_context_tokens=estimated_context_tokens,
+                    max_turns=int(app.state.auto_rotate_max_turns),
+                    max_age_seconds=int(app.state.auto_rotate_max_age_seconds),
+                    max_context_pressure_tokens=int(app.state.auto_rotate_context_pressure_tokens),
+                    now=_utcnow(),
+                )
+                if auto_rotation_reason is not None:
+                    active_session, _, _ = _rotate_active_session(
+                        db,
+                        reason=auto_rotation_reason,
+                        idempotency_key=None,
+                        actor_id=str(app.state.approval_actor_id),
+                        trigger_snapshot=trigger_snapshot,
+                    )
+                    prior_turns = db.scalars(
+                        select(TurnRecord)
+                        .where(TurnRecord.session_id == active_session.id)
+                        .order_by(TurnRecord.created_at.asc(), TurnRecord.id.asc())
+                    ).all()
+
+                effective_session_id = active_session.id
                 runtime_provenance = _runtime_provenance_for_turn(
                     db=db,
                     prior_turns=prior_turns,
                     max_recent_turns=int(app.state.max_recent_turns),
                 )
+                durable_memory_recall, durable_memory_recall_window = _recall_validated_memory_for_turn(
+                    db=db,
+                    user_message=payload.message,
+                    max_recalled_memories=int(app.state.max_recalled_memories),
+                )
+                open_commitments_and_jobs = {
+                    "open_commitments": _open_commitments_context(db=db),
+                    "open_jobs": [],
+                }
                 context_bundle = _build_turn_context_bundle(
                     prior_turns=prior_turns,
-                    max_recent_turns=app.state.max_recent_turns,
+                    max_recent_turns=int(app.state.max_recent_turns),
+                    rolling_session_summary=_build_rolling_session_summary(prior_turns=prior_turns),
+                    durable_memory_recall=durable_memory_recall,
+                    durable_memory_recall_window=durable_memory_recall_window,
+                    open_commitments_and_jobs=open_commitments_and_jobs,
+                    relevant_artifacts_and_signals=_relevant_artifacts_and_signals_context(
+                        db=db,
+                        prior_turns=prior_turns,
+                    ),
                 )
                 context_metadata = _context_bundle_audit_metadata(context_bundle)
 
                 now = _utcnow()
                 turn = TurnRecord(
                     id=_new_id("trn"),
-                    session_id=session_id,
+                    session_id=effective_session_id,
                     user_message=payload.message,
                     assistant_message=None,
                     status="in_progress",
@@ -1085,7 +2427,7 @@ def create_app(
                     sequence += 1
                     event = EventRecord(
                         id=_new_id("evn"),
-                        session_id=session_id,
+                        session_id=effective_session_id,
                         turn_id=turn.id,
                         sequence=sequence,
                         event_type=event_type,
@@ -1096,6 +2438,27 @@ def create_app(
                     created_events.append(event)
 
                 add_event("evt.turn.started", {"message": payload.message})
+                if durable_memory_recall:
+                    add_event(
+                        "evt.memory.recalled",
+                        {
+                            "max_recalled_memories": durable_memory_recall_window[
+                                "max_recalled_memories"
+                            ],
+                            "included_memory_count": durable_memory_recall_window[
+                                "included_memory_count"
+                            ],
+                            "omitted_memory_count": durable_memory_recall_window[
+                                "omitted_memory_count"
+                            ],
+                            "included_memory_ids": durable_memory_recall_window[
+                                "included_memory_ids"
+                            ],
+                            "excluded_memories": durable_memory_recall_window[
+                                "excluded_memories"
+                            ],
+                        },
+                    )
                 applied_limits = _applied_turn_limits(app)
 
                 def elapsed_turn_ms(started_at: float) -> int:
@@ -1109,7 +2472,7 @@ def create_app(
                     limit: int,
                 ) -> ApiError:
                     return _build_turn_limit_error(
-                        session_id=session_id,
+                        session_id=effective_session_id,
                         turn_id=turn.id,
                         violation=TurnLimitViolation(
                             budget=budget,
@@ -1163,6 +2526,19 @@ def create_app(
                     context_bundle=context_bundle,
                     user_message=payload.message,
                 )
+                compacted_context_bundle = app.state.context_compaction_adapter.compact(
+                    context_bundle=context_bundle,
+                    user_message=payload.message,
+                    estimated_context_tokens=context_tokens,
+                    max_context_tokens=int(app.state.max_context_tokens),
+                )
+                if isinstance(compacted_context_bundle, dict):
+                    context_bundle = compacted_context_bundle
+                    context_metadata = _context_bundle_audit_metadata(context_bundle)
+                    context_tokens = _estimate_context_tokens(
+                        context_bundle=context_bundle,
+                        user_message=payload.message,
+                    )
                 if context_tokens > app.state.max_context_tokens:
                     bounded_failure = build_turn_limit_failure(
                         budget="context_tokens",
@@ -1197,7 +2573,7 @@ def create_app(
                         try:
                             candidate_response = app.state.model_adapter.respond(
                                 payload.message,
-                                session_id=session_id,
+                                session_id=effective_session_id,
                                 turn_id=turn.id,
                                 history=context_bundle["recent_active_session_turns"],
                                 context_bundle=context_bundle,
@@ -1259,7 +2635,7 @@ def create_app(
                                     code=exc.code,
                                     message=exc.message,
                                     details={
-                                        "session_id": session_id,
+                                        "session_id": effective_session_id,
                                         "turn_id": turn.id,
                                         "attempt": attempt,
                                     },
@@ -1276,7 +2652,7 @@ def create_app(
                                     code="E_MODEL_FAILURE",
                                     message="model provider request failed",
                                     details={
-                                        "session_id": session_id,
+                                        "session_id": effective_session_id,
                                         "turn_id": turn.id,
                                         "attempt": attempt,
                                     },
@@ -1331,7 +2707,7 @@ def create_app(
                     assert assistant_response is not None
                     proposal_processing = process_action_proposals(
                         db=db,
-                        session_id=session_id,
+                        session_id=effective_session_id,
                         turn=turn,
                         assistant_message=assistant_response["assistant_text"],
                         proposals_raw=assistant_response.get("action_proposals"),
@@ -1344,6 +2720,28 @@ def create_app(
                         google_runtime=_google_runtime(),
                     )
                     created_action_attempts.extend(proposal_processing.action_attempts)
+                    captured_memories = _capture_validated_memory_candidates(
+                        db=db,
+                        session_id=effective_session_id,
+                        source_turn_id=turn.id,
+                        user_message=payload.message,
+                        now_fn=_utcnow,
+                        new_id_fn=_new_id,
+                    )
+                    for captured_memory in captured_memories:
+                        add_event(
+                            captured_memory.event_type,
+                            {
+                                "memory_item_id": captured_memory.item.id,
+                                "revision_id": captured_memory.revision.id,
+                                "memory_class": captured_memory.item.memory_class,
+                                "lifecycle_state": captured_memory.revision.lifecycle_state,
+                                "memory_key": captured_memory.item.memory_key,
+                                "value_preview": redact_text(captured_memory.revision.value or ""),
+                                "confidence": captured_memory.revision.confidence,
+                                "source_turn_id": captured_memory.revision.source_turn_id,
+                            },
+                        )
 
                     turn.assistant_message = proposal_processing.assistant_message
                     turn.status = "completed"
@@ -1358,21 +2756,39 @@ def create_app(
                 db.flush()
 
                 if bounded_failure is not None:
-                    return _error_response(bounded_failure)
+                    payload_data = _error_payload(bounded_failure)
+                    persist_idempotency_result(
+                        turn_id=turn.id,
+                        effective_session_id=effective_session_id,
+                        status_code=bounded_failure.status_code,
+                        response_payload=payload_data,
+                    )
+                    return JSONResponse(status_code=bounded_failure.status_code, content=payload_data)
                 if model_failure is not None:
-                    return _error_response(model_failure)
+                    payload_data = _error_payload(model_failure)
+                    persist_idempotency_result(
+                        turn_id=turn.id,
+                        effective_session_id=effective_session_id,
+                        status_code=model_failure.status_code,
+                        response_payload=payload_data,
+                    )
+                    return JSONResponse(status_code=model_failure.status_code, content=payload_data)
 
                 assert assistant_response is not None
-                approvals_by_attempt_id = {
-                    approval.action_attempt_id: approval
-                    for approval in db.scalars(
-                        select(ApprovalRequestRecord).where(
-                            ApprovalRequestRecord.action_attempt_id.in_(
-                                [attempt.id for attempt in created_action_attempts]
+                approvals_by_attempt_id = (
+                    {
+                        approval.action_attempt_id: approval
+                        for approval in db.scalars(
+                            select(ApprovalRequestRecord).where(
+                                ApprovalRequestRecord.action_attempt_id.in_(
+                                    [attempt.id for attempt in created_action_attempts]
+                                )
                             )
-                        )
-                    ).all()
-                } if created_action_attempts else {}
+                        ).all()
+                    }
+                    if created_action_attempts
+                    else {}
+                )
                 serialized_action_attempts = [
                     serialize_action_attempt(
                         action_attempt,
@@ -1387,7 +2803,7 @@ def create_app(
                     action_attempts=serialized_action_attempts,
                 )
                 try:
-                    return build_surface_message_response(
+                    response_payload = build_surface_message_response(
                         session=raw_session,
                         turn=raw_turn,
                         assistant_message=turn.assistant_message,
@@ -1395,6 +2811,14 @@ def create_app(
                     )
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
+
+                persist_idempotency_result(
+                    turn_id=turn.id,
+                    effective_session_id=effective_session_id,
+                    status_code=200,
+                    response_payload=response_payload,
+                )
+                return response_payload
 
     @app.post("/v1/approvals", response_model=None)
     def post_approval_decision(
@@ -1450,7 +2874,7 @@ def create_app(
                     raise _response_contract_error(exc) from exc
 
     @app.get("/v1/sessions/{session_id}/events")
-    def get_session_events(session_id: str) -> dict[str, Any]:
+    def get_session_events(session_id: str, after: str | None = None) -> dict[str, Any]:
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
@@ -1485,15 +2909,41 @@ def create_app(
                     turn_id: [] for turn_id in turn_ids
                 }
                 approvals_by_attempt_id: dict[str, ApprovalRequestRecord] = {}
+                cursor_event: EventRecord | None = None
+                if isinstance(after, str) and after.strip():
+                    cursor_event = db.scalar(
+                        select(EventRecord)
+                        .where(EventRecord.id == after.strip(), EventRecord.session_id == session_id)
+                        .limit(1)
+                    )
+                    if cursor_event is None:
+                        raise ApiError(
+                            status_code=404,
+                            code="E_EVENT_CURSOR_NOT_FOUND",
+                            message="event cursor not found in session",
+                            details={"session_id": session_id, "after": after.strip()},
+                            retryable=False,
+                        )
                 if turn_ids:
-                    for event in db.scalars(
+                    events_query = (
                         select(EventRecord)
                         .where(EventRecord.turn_id.in_(turn_ids))
                         .order_by(
                             EventRecord.created_at.asc(),
                             EventRecord.id.asc(),
                         )
-                    ).all():
+                    )
+                    if cursor_event is not None:
+                        events_query = events_query.where(
+                            or_(
+                                EventRecord.created_at > cursor_event.created_at,
+                                and_(
+                                    EventRecord.created_at == cursor_event.created_at,
+                                    EventRecord.id > cursor_event.id,
+                                ),
+                            )
+                        )
+                    for event in db.scalars(events_query).all():
                         events_by_turn[event.turn_id].append(event)
                     for turn_events in events_by_turn.values():
                         turn_events.sort(key=lambda event: (event.sequence, event.created_at, event.id))
@@ -1521,6 +2971,16 @@ def create_app(
                             approval.action_attempt_id: approval for approval in approvals
                         }
 
+                turns_to_serialize = (
+                    [
+                        turn
+                        for turn in turns
+                        if events_by_turn.get(turn.id)
+                        or action_attempts_by_turn.get(turn.id)
+                    ]
+                    if cursor_event is not None
+                    else turns
+                )
                 serialized_turns = [
                     serialize_turn(
                         turn,
@@ -1533,7 +2993,7 @@ def create_app(
                             for action_attempt in action_attempts_by_turn.get(turn.id, [])
                         ],
                     )
-                    for turn in turns
+                    for turn in turns_to_serialize
                 ]
                 try:
                     return build_surface_timeline_response(

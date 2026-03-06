@@ -164,6 +164,31 @@ slice-4 pr-03 closes readiness/remediation gaps so connector status semantics ma
     guidance.
   - after attendee consent, outputs use attendee intersection and stop fallback-only guidance.
 
+## slice-5 durable memory + session management hardening
+
+slice-5 adds canonical durable memory, explicit + threshold rotation, and hardened session ingress:
+
+- message idempotency:
+  - `POST /v1/sessions/{session_id}/message` accepts optional `Idempotency-Key`.
+  - same key + same payload replays the prior turn result.
+  - same key + different payload returns `409` with `E_IDEMPOTENCY_KEY_REUSED`.
+- rotation surfaces:
+  - `POST /v1/sessions/rotate`
+  - `GET /v1/sessions/rotations`
+  - rotation reason codes: `user_initiated`, `threshold_turn_count`, `threshold_age`, `threshold_context_pressure`.
+- timeline incremental sync:
+  - `GET /v1/sessions/{session_id}/events?after=<event_id>`
+  - unknown cursor returns `404` with `E_EVENT_CURSOR_NOT_FOUND`.
+- session lifecycle:
+  - surfaced session payloads now include `lifecycle_state` (`active`, `rotating`, `closed`, `recovery_needed`).
+- context assembly contract (deterministic order):
+  - `policy_system_instructions`
+  - `recent_active_session_turns`
+  - `rolling_session_summary`
+  - `durable_memory_recall`
+  - `open_commitments_and_jobs`
+  - `relevant_artifacts_and_signals`
+
 google connector runtime config:
 
 - `ARIEL_GOOGLE_OAUTH_CLIENT_ID`
@@ -329,6 +354,9 @@ slice-1 turn budgets are runtime-configurable:
 
 - `ARIEL_MAX_RECENT_TURNS` (default `12`) bounds how many prior turns are included in the deterministic turn context bundle.
 - `ARIEL_MAX_CONTEXT_TOKENS` (default `6000`) bounds estimated prompt/context tokens for a turn.
+- `ARIEL_AUTO_ROTATE_MAX_TURNS` (default `120`) rotates on turn boundary when prior turn count meets/exceeds threshold.
+- `ARIEL_AUTO_ROTATE_MAX_AGE_SECONDS` (default `172800`) rotates on turn boundary when session age meets/exceeds threshold.
+- `ARIEL_AUTO_ROTATE_CONTEXT_PRESSURE_TOKENS` (default `5400`) rotates on turn boundary when estimated context pressure meets/exceeds threshold.
 - `ARIEL_MAX_RESPONSE_TOKENS` (default `700`) bounds assistant completion tokens per turn.
 - `ARIEL_MAX_MODEL_ATTEMPTS` (default `2`) bounds retryable model attempts per turn.
 - `ARIEL_MAX_TURN_WALL_TIME_MS` (default `20000`) bounds total turn processing wall time.

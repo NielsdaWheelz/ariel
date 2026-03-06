@@ -250,6 +250,10 @@ def test_pr01_turn_context_is_bounded_ordered_and_auditable(
             assert context_bundle["section_order"] == [
                 "policy_system_instructions",
                 "recent_active_session_turns",
+                "rolling_session_summary",
+                "durable_memory_recall",
+                "open_commitments_and_jobs",
+                "relevant_artifacts_and_signals",
             ]
 
         second_turn_context = adapter.context_bundles[1]
@@ -275,6 +279,10 @@ def test_pr01_turn_context_is_bounded_ordered_and_auditable(
         assert second_context_meta["section_order"] == [
             "policy_system_instructions",
             "recent_active_session_turns",
+            "rolling_session_summary",
+            "durable_memory_recall",
+            "open_commitments_and_jobs",
+            "relevant_artifacts_and_signals",
         ]
         assert second_context_meta["policy_instruction_count"] >= 1
         assert second_context_meta["recent_window"] == {
@@ -326,6 +334,10 @@ def test_pr01_context_audit_is_stable_even_if_adapter_mutates_context_bundle(
         assert context_meta["section_order"] == [
             "policy_system_instructions",
             "recent_active_session_turns",
+            "rolling_session_summary",
+            "durable_memory_recall",
+            "open_commitments_and_jobs",
+            "relevant_artifacts_and_signals",
         ]
         assert context_meta["recent_window"] == {
             "max_recent_turns": 1,

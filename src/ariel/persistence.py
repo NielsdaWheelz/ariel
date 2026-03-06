@@ -7,6 +7,7 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -32,17 +33,97 @@ class SessionRecord(Base):
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    rotated_from_session_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("sessions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    rotation_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     turns: Mapped[list["TurnRecord"]] = relationship(back_populates="session")
 
     __table_args__ = (
+        CheckConstraint(
+            (
+                "(rotation_reason IS NULL) OR "
+                "(rotation_reason IN ('user_initiated', 'threshold_turn_count', "
+                "'threshold_age', 'threshold_context_pressure'))"
+            ),
+            name="ck_session_rotation_reason",
+        ),
+        CheckConstraint(
+            "lifecycle_state IN ('active', 'rotating', 'closed', 'recovery_needed')",
+            name="ck_session_lifecycle_state",
+        ),
+        CheckConstraint(
+            (
+                "(is_active IS TRUE AND lifecycle_state = 'active') OR "
+                "(is_active IS FALSE AND lifecycle_state IN ('rotating', 'closed', 'recovery_needed'))"
+            ),
+            name="ck_session_lifecycle_matches_is_active",
+        ),
+        CheckConstraint(
+            (
+                "(rotation_reason IS NULL AND rotated_from_session_id IS NULL) OR "
+                "(rotation_reason IS NOT NULL AND rotated_from_session_id IS NOT NULL)"
+            ),
+            name="ck_session_rotation_fields_paired",
+        ),
         Index(
             "ix_single_active_session",
             "is_active",
             unique=True,
             postgresql_where=(is_active.is_(True)),
+        ),
+        Index(
+            "ix_sessions_rotated_from_session_id_unique",
+            "rotated_from_session_id",
+            unique=True,
+            postgresql_where=(rotated_from_session_id.is_not(None)),
+        ),
+    )
+
+
+class SessionRotationRecord(Base):
+    __tablename__ = "session_rotations"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    rotated_from_session_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("sessions.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    rotated_to_session_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("sessions.id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    reason: Mapped[str] = mapped_column(String(32), nullable=False)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    actor_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    trigger_snapshot: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            (
+                "reason IN ('user_initiated', 'threshold_turn_count', "
+                "'threshold_age', 'threshold_context_pressure')"
+            ),
+            name="ck_session_rotation_reason_type",
+        ),
+        Index(
+            "ix_session_rotations_idempotency_key_unique",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=(idempotency_key.is_not(None)),
         ),
     )
 
@@ -71,6 +152,39 @@ class TurnRecord(Base):
         CheckConstraint(
             "status IN ('in_progress', 'completed', 'failed')",
             name="ck_turn_status",
+        ),
+    )
+
+
+class TurnIdempotencyRecord(Base):
+    __tablename__ = "turn_idempotency_keys"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    session_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    turn_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("turns.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    status_code: Mapped[int] = mapped_column(Integer, nullable=False)
+    response_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+
+    __table_args__ = (
+        Index(
+            "ix_turn_idempotency_session_key_unique",
+            "session_id",
+            "idempotency_key",
+            unique=True,
         ),
     )
 
@@ -250,6 +364,86 @@ class ArtifactRecord(Base):
     )
 
 
+class MemoryItemRecord(Base):
+    __tablename__ = "memory_items"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    memory_class: Mapped[str] = mapped_column(String(32), nullable=False)
+    memory_key: Mapped[str] = mapped_column(Text, nullable=False)
+    active_revision_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            (
+                "memory_class IN "
+                "('profile', 'preference', 'project', 'commitment', 'episodic_summary')"
+            ),
+            name="ck_memory_item_class",
+        ),
+        Index(
+            "ix_memory_items_class_key_unique",
+            "memory_class",
+            "memory_key",
+            unique=True,
+        ),
+    )
+
+
+class MemoryRevisionRecord(Base):
+    __tablename__ = "memory_revisions"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    memory_item_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("memory_items.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    source_turn_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("turns.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    source_session_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("sessions.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    last_verified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "lifecycle_state IN ('candidate', 'validated', 'superseded', 'retracted')",
+            name="ck_memory_revision_lifecycle_state",
+        ),
+        CheckConstraint(
+            "confidence >= 0.0 AND confidence <= 1.0",
+            name="ck_memory_revision_confidence_range",
+        ),
+        CheckConstraint(
+            (
+                "(lifecycle_state = 'retracted' AND value IS NULL) OR "
+                "(lifecycle_state <> 'retracted' AND value IS NOT NULL)"
+            ),
+            name="ck_memory_revision_value_presence",
+        ),
+        Index(
+            "ix_memory_revisions_item_created",
+            "memory_item_id",
+            "created_at",
+        ),
+    )
+
+
 class WeatherDefaultLocationRecord(Base):
     __tablename__ = "weather_default_locations"
 
@@ -352,6 +546,7 @@ def serialize_session(session: SessionRecord) -> dict[str, Any]:
     return {
         "id": session.id,
         "is_active": session.is_active,
+        "lifecycle_state": session.lifecycle_state,
         "created_at": to_rfc3339(session.created_at),
         "updated_at": to_rfc3339(session.updated_at),
     }
@@ -436,6 +631,47 @@ def serialize_artifact(artifact: ArtifactRecord) -> dict[str, Any]:
         "source": redact_text(artifact.source),
         "retrieved_at": to_rfc3339(artifact.retrieved_at),
         "published_at": to_rfc3339(artifact.published_at) if artifact.published_at is not None else None,
+    }
+
+
+def serialize_memory_projection_item(
+    *,
+    item: MemoryItemRecord,
+    active_revision: MemoryRevisionRecord | None,
+    revision_count: int,
+) -> dict[str, Any]:
+    if active_revision is None:
+        return {
+            "memory_item_id": item.id,
+            "memory_key": item.memory_key,
+            "memory_class": item.memory_class,
+            "revision_id": None,
+            "revision_count": revision_count,
+            "lifecycle_state": "retracted",
+            "value": "",
+            "confidence": 0.0,
+            "source_turn_id": None,
+            "source_session_id": None,
+            "evidence": {},
+            "last_verified_at": to_rfc3339(item.updated_at),
+            "created_at": to_rfc3339(item.created_at),
+            "updated_at": to_rfc3339(item.updated_at),
+        }
+    return {
+        "memory_item_id": item.id,
+        "memory_key": item.memory_key,
+        "memory_class": item.memory_class,
+        "revision_id": active_revision.id,
+        "revision_count": revision_count,
+        "lifecycle_state": active_revision.lifecycle_state,
+        "value": redact_text(active_revision.value or ""),
+        "confidence": active_revision.confidence,
+        "source_turn_id": active_revision.source_turn_id,
+        "source_session_id": active_revision.source_session_id,
+        "evidence": redact_json_value(active_revision.evidence),
+        "last_verified_at": to_rfc3339(active_revision.last_verified_at),
+        "created_at": to_rfc3339(item.created_at),
+        "updated_at": to_rfc3339(item.updated_at),
     }
 
 
