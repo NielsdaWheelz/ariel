@@ -36,6 +36,11 @@ Preserve continuity across sessions with durable canonical memory and user-visib
 - **when**: the user views memory through surface projection(s)
 - **then**: projected memory state reflects canonical behavior without divergence or hidden projection-only overrides
 
+### dedicated memory projection is available without enabling generic write APIs
+- **given**: canonical memory records exist
+- **when**: the user requests a memory view from Ariel’s surface API
+- **then**: Ariel returns a strict read-only memory projection contract sourced from canonical state, while memory creation/correction/removal continues to flow through normal conversation turns rather than generic memory CRUD write endpoints
+
 ## Key Decisions
 
 **Canonical memory model is fixed and typed**: Durable memory uses explicit memory classes (`profile`, `preference`, `project`, `commitment`, `episodic_summary`) with required provenance (`source_turn_id`), confidence, and `last_verified_at`. Postgres remains canonical memory source of truth.
@@ -54,6 +59,10 @@ Preserve continuity across sessions with durable canonical memory and user-visib
 
 **Projection is derived from canonical state, never authoritative**: User-facing memory projection is a derived representation of canonical memory behavior. Any external integration/projection metadata cannot overwrite canonical memory semantics.
 
+**Memory surface follows read-only projection plus conversation-mediated mutation**: MVP exposes dedicated read-only memory projection for inspectability, while memory writes/promotions/corrections/removals are performed through authenticated conversation flow and auditable runtime decisions, not generic write endpoints.
+
+**Recall selection is deterministic and top-k bounded**: Durable-memory retrieval for turn context uses deterministic ranking/selection (relevance + recency + confidence) with explicit top-k bounds and stable ordering so memory recall remains reproducible and budget-safe.
+
 **Open commitments are first-class continuity objects**: Commitments remain distinctly modeled so Ariel can carry forward pending obligations across session rotation and stop surfacing them once completed/cancelled/removed.
 
 ## Out of Scope
@@ -63,3 +72,4 @@ Preserve continuity across sessions with durable canonical memory and user-visib
 - Nexus notes integration and external memory sync authority changes (still deferred)
 - Proactive notification logic driven by memory subscriptions (-> Slice 11B)
 - Quick-capture channel expansion and mobile ingestion UX (-> Slice 8)
+- Generic memory CRUD write APIs for direct out-of-band mutation
