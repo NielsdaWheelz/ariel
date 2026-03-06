@@ -1062,6 +1062,13 @@ def _append_memory_revision(
     new_id_fn: Callable[[str], str],
 ) -> MemoryRevisionRecord:
     now = now_fn()
+    prior_active_revision = _active_revision_for_item(db, item)
+    if (
+        prior_active_revision is not None
+        and prior_active_revision.lifecycle_state in {"candidate", "validated"}
+    ):
+        prior_active_revision.lifecycle_state = "superseded"
+
     revision = MemoryRevisionRecord(
         id=new_id_fn("mrv"),
         memory_item_id=item.id,
@@ -1483,9 +1490,7 @@ def _rotate_active_session(
             {"lock_id": _ACTIVE_SESSION_LOCK_ID},
         )
 
-    normalized_idempotency_key = (
-        idempotency_key.strip() if isinstance(idempotency_key, str) and idempotency_key.strip() else None
-    )
+    normalized_idempotency_key = _normalize_idempotency_key(idempotency_key)
 
     if reason == "user_initiated" and isinstance(normalized_idempotency_key, str):
         existing_rotation = db.scalar(
@@ -1911,7 +1916,7 @@ def create_app(
     @app.post("/v1/sessions/rotate", response_model=None)
     def rotate_active_session(request: Request) -> JSONResponse | dict[str, Any]:
         _ensure_schema_ready()
-        idempotency_key = request.headers.get("Idempotency-Key")
+        idempotency_key = _normalize_idempotency_key(request.headers.get("Idempotency-Key"))
         with session_factory() as db:
             with db.begin():
                 rotated_session, rotation_record, idempotent_replay = _rotate_active_session(
@@ -2948,9 +2953,14 @@ def create_app(
                     for turn_events in events_by_turn.values():
                         turn_events.sort(key=lambda event: (event.sequence, event.created_at, event.id))
 
+                    turn_ids_with_visible_events = (
+                        [turn_id for turn_id, turn_events in events_by_turn.items() if turn_events]
+                        if cursor_event is not None
+                        else turn_ids
+                    )
                     action_attempts = db.scalars(
                         select(ActionAttemptRecord)
-                        .where(ActionAttemptRecord.turn_id.in_(turn_ids))
+                        .where(ActionAttemptRecord.turn_id.in_(turn_ids_with_visible_events))
                         .order_by(
                             ActionAttemptRecord.proposal_index.asc(),
                             ActionAttemptRecord.created_at.asc(),
@@ -2976,7 +2986,6 @@ def create_app(
                         turn
                         for turn in turns
                         if events_by_turn.get(turn.id)
-                        or action_attempts_by_turn.get(turn.id)
                     ]
                     if cursor_event is not None
                     else turns

@@ -23,6 +23,7 @@ class SessionManagementProbeAdapter:
     context_bundles: list[dict[str, Any]] = field(default_factory=list)
     history_lengths_by_message: dict[str, int] = field(default_factory=dict)
     message_delays_seconds: dict[str, float] = field(default_factory=dict)
+    proposals_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def respond(
@@ -43,13 +44,17 @@ class SessionManagementProbeAdapter:
         if delay_seconds > 0:
             time.sleep(delay_seconds)
 
-        return {
+        response: dict[str, Any] = {
             "assistant_text": f"assistant::{user_message}",
             "provider": self.provider,
             "model": self.model,
             "usage": {"prompt_tokens": 17, "completion_tokens": 12, "total_tokens": 29},
             "provider_response_id": "resp_s5_pr02_123",
         }
+        proposals = self.proposals_by_message.get(user_message)
+        if isinstance(proposals, list):
+            response["action_proposals"] = copy.deepcopy(proposals)
+        return response
 
 
 @pytest.fixture(scope="session")
@@ -164,6 +169,20 @@ def test_s5_pr02_idempotency_replay_survives_auto_rotation_when_retrying_new_ses
 
         timeline_rotated = _timeline(client, rotated_session_id)
         assert len(timeline_rotated["turns"]) == 1
+
+
+def test_s5_pr02_rotate_rejects_overlong_idempotency_key_with_typed_validation_error(
+    postgres_url: str,
+) -> None:
+    adapter = SessionManagementProbeAdapter()
+    with _build_client(postgres_url, adapter, reset_database=True) as client:
+        response = client.post("/v1/sessions/rotate", headers={"Idempotency-Key": "k" * 129})
+        assert response.status_code == 422
+        payload = response.json()["error"]
+        assert payload["code"] == "E_IDEMPOTENCY_KEY_INVALID"
+        assert payload["message"] == "idempotency key is invalid"
+        assert payload["retryable"] is False
+        assert payload["details"]["max_length"] == 128
 
 
 def test_s5_pr02_rotation_falls_back_on_turn_count_threshold_with_typed_reason(
@@ -308,6 +327,43 @@ def test_s5_pr02_timeline_supports_after_cursor_for_incremental_sync(postgres_ur
         )
         assert missing.status_code == 404
         assert missing.json()["error"]["code"] == "E_EVENT_CURSOR_NOT_FOUND"
+
+
+def test_s5_pr02_timeline_after_cursor_omits_turns_with_action_attempts_and_no_new_events(
+    postgres_url: str,
+) -> None:
+    first_message = "propose an unavailable capability"
+    adapter = SessionManagementProbeAdapter(
+        proposals_by_message={
+            first_message: [
+                {"capability_id": "cap.unavailable.demo", "input": {"subject": "cursor regression"}}
+            ]
+        }
+    )
+    with _build_client(postgres_url, adapter, reset_database=True) as client:
+        session_id = _session_id(client)
+        first = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": first_message},
+        )
+        assert first.status_code == 200
+        second = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "plain follow-up turn"},
+        )
+        assert second.status_code == 200
+
+        full = _timeline(client, session_id)
+        assert len(full["turns"]) == 2
+        first_turn = full["turns"][0]
+        assert first_turn["surface_action_lifecycle"]
+        cursor_event_id = first_turn["events"][-1]["id"]
+
+        delta = _timeline(client, session_id, after=cursor_event_id)
+        assert len(delta["turns"]) == 1
+        assert delta["turns"][0]["id"] == full["turns"][1]["id"]
+        assert all(turn["id"] != first_turn["id"] for turn in delta["turns"])
+        assert all(turn["events"] for turn in delta["turns"])
 
 
 def test_s5_pr02_session_turn_lock_blocks_parallel_writes_to_same_session(postgres_url: str) -> None:

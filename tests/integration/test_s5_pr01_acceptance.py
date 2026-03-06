@@ -266,6 +266,81 @@ def test_s5_pr01_correction_and_retraction_apply_immediately(postgres_url: str) 
         assert coffee_item["lifecycle_state"] == "retracted"
 
 
+def test_s5_pr01_replacing_active_memory_revision_marks_prior_revision_superseded(
+    postgres_url: str,
+) -> None:
+    adapter = MemoryProbeAdapter()
+    with _build_client(postgres_url, adapter, reset_database=True) as client:
+        session_id = _session_id(client)
+
+        candidate = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "i like matte black notebooks"},
+        )
+        assert candidate.status_code == 200
+        assert "evt.memory.candidate_proposed" in _event_types(_latest_turn(client, session_id))
+
+        promotion = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "remember preference:notebook_style=matte black notebooks"},
+        )
+        assert promotion.status_code == 200
+        assert "evt.memory.promoted" in _event_types(_latest_turn(client, session_id))
+
+        correction = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "correct preference:notebook_style=dot grid notebooks"},
+        )
+        assert correction.status_code == 200
+        assert "evt.memory.corrected" in _event_types(_latest_turn(client, session_id))
+
+        overwrite = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "remember preference:notebook_style=spiral notebooks"},
+        )
+        assert overwrite.status_code == 200
+        assert "evt.memory.captured" in _event_types(_latest_turn(client, session_id))
+
+        retract = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "forget preference:notebook_style"},
+        )
+        assert retract.status_code == 200
+        assert "evt.memory.retracted" in _event_types(_latest_turn(client, session_id))
+
+        projection = _memory_projection_items(client)
+        notebook_item = next(item for item in projection if item["memory_key"] == "preference:notebook_style")
+        assert notebook_item["lifecycle_state"] == "retracted"
+        assert notebook_item["revision_count"] == 5
+
+        with cast(Any, client.app).state.session_factory() as db:
+            item_row = db.scalar(
+                select(MemoryItemRecord).where(MemoryItemRecord.memory_key == "preference:notebook_style").limit(1)
+            )
+            assert item_row is not None
+            revisions = db.scalars(
+                select(MemoryRevisionRecord)
+                .where(MemoryRevisionRecord.memory_item_id == item_row.id)
+                .order_by(MemoryRevisionRecord.created_at.asc(), MemoryRevisionRecord.id.asc())
+            ).all()
+            assert len(revisions) == 5
+            assert [revision.lifecycle_state for revision in revisions] == [
+                "superseded",
+                "superseded",
+                "superseded",
+                "superseded",
+                "retracted",
+            ]
+            assert [revision.value for revision in revisions] == [
+                "matte black notebooks",
+                "matte black notebooks",
+                "dot grid notebooks",
+                "spiral notebooks",
+                None,
+            ]
+            assert item_row.active_revision_id == revisions[-1].id
+
+
 def test_s5_pr01_rotation_is_idempotent_by_key_and_auditable(postgres_url: str) -> None:
     adapter = MemoryProbeAdapter()
     with _build_client(postgres_url, adapter, reset_database=True) as client:

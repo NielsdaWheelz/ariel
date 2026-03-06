@@ -1,29 +1,17 @@
 # Slice 5: Durable Memory + Session Rotation — PR Roadmap
 
-### PR-01: Canonical Memory Core + Explicit Session Rotation + Cross-Session Recall
-- **goal**: deliver the first full continuity vertical slice with canonical durable memory, explicit new-conversation rotation, and validated cross-session recall.
+### PR-01: Canonical Memory Core + Session Rotation + Lifecycle Semantics
+- **goal**: deliver the shipped continuity vertical slice with canonical durable memory, read-only projection, explicit + threshold-driven rotation, lifecycle-safe memory mutation, replay-safe ingress, and deterministic cursored timeline reads.
 - **builds on**: Slice 4 PR-03 merged state (bounded turn orchestration, surfaced response contracts, and policy/audit runtime already in place).
 - **acceptance**:
-  - Ariel persists durable memory in Postgres as canonical state with typed memory classes and required provenance/verification metadata, and exposes a dedicated read-only memory projection endpoint derived from canonical state.
-  - memory projection responses are contract-enforced and redaction-safe, with no projection-only authority over canonical behavior.
-  - explicit user-provided facts/preferences/commitments can be captured as validated durable memory through normal turn flow with auditable outcomes.
-  - memory mutation remains conversation-mediated in MVP (no generic memory CRUD write endpoint in this PR).
-  - user can explicitly start a new conversation through a dedicated rotation-intent surface; Ariel rotates sessions safely (exactly one active session), marks the prior session inactive, and records `user_initiated` rotation reason for auditability.
-  - existing session bootstrap/status surfaces remain backward-compatible and non-rotating by default unless explicit rotation intent is provided.
-  - rotation intent handling is idempotent and race-safe; duplicate rotate submissions do not create multiple active sessions or duplicate user-visible rotation outcomes.
-  - session rotation writes bounded continuity artifacts (including episodic summary and open commitments context) used for future continuity without full transcript replay.
-  - when the next active session starts, Ariel recalls relevant validated memory (including open commitments) across sessions while excluding candidate-only memory from recall.
-  - context assembly remains deterministic and bounded after memory integration; memory retrieval uses explicit top-k bounded selection with stable ordering and does not bypass existing turn-budget failure semantics.
-- **non-goals**: no automatic threshold-triggered rotation, no inferred-candidate promotion workflow, and no correction/removal lifecycle beyond baseline validated capture.
-
-### PR-02: Candidate Promotion + Correction/Removal + Threshold Rotation Hardening (planned after PR-01 merges)
-- **goal**: complete Slice 5 trust and lifecycle semantics by adding candidate validation flows, immediate correction/removal behavior, and deterministic automatic rotation triggers.
-- **builds on**: PR-01.
-- **acceptance**:
-  - Ariel stores inferred memory as `candidate` and never uses candidate-only memory for cross-session recall.
-  - promotion from `candidate` to `validated` requires explicit user confirmation in MVP, with auditable transition outcomes.
-  - user can correct or remove remembered facts/preferences/projects/commitments through normal interaction; changes apply immediately without approval and future behavior reflects only active corrected memory.
-  - memory lifecycle transitions remain append-only and idempotent (`candidate`, `validated`, `superseded`, `retracted`) with user-visible inspectable history.
-  - deterministic automatic rotation triggers (age/turn-count/context-pressure) execute only at turn boundaries, preserve one-active-session invariant, and emit typed rotation reasons: `user_initiated`, `threshold_turn_count`, `threshold_age`, `threshold_context_pressure`.
-  - memory recall/mutation/skip behavior remains user-inspectable and projection-consistent with canonical state across create/promote/correct/remove/rotate paths.
-- **non-goals**: no autonomous background memory rewriting/consolidation loops, no Nexus sync-authority changes, no proactive memory-driven notification policy, and no generic memory CRUD write API.
+  - canonical memory persists in Postgres with typed classes and revision metadata; projection is derived/read-only via `GET /v1/memory`.
+  - memory mutation remains conversation-mediated (no generic write endpoint) and supports `remember`, `correct`, `forget`, and inferred candidate capture.
+  - candidate memory is excluded from cross-session recall until explicitly promoted.
+  - memory lifecycle is append-only and inspectable (`candidate`, `validated`, `superseded`, `retracted`) with active-revision supersession semantics.
+  - explicit rotation is supported via `POST /v1/sessions/rotate`, with inspectable history via `GET /v1/sessions/rotations`.
+  - deterministic auto-rotation triggers run at turn boundaries with typed reasons (`threshold_turn_count`, `threshold_age`, `threshold_context_pressure`) while preserving one-active-session safety.
+  - rotate and message ingress are idempotency-safe, including conflict detection (`E_IDEMPOTENCY_KEY_REUSED`) and typed key validation (`E_IDEMPOTENCY_KEY_INVALID`).
+  - cursored timeline reads (`GET /v1/sessions/{session_id}/events?after=...`) are deterministic, session-scoped, and omit turns without post-cursor events.
+  - context assembly remains deterministic and bounded after memory integration (fixed order + bounded windows/top-k).
+  - regression coverage protects lifecycle, rotation, idempotency, context-order, and timeline-cursor contracts.
+- **non-goals**: no generic memory CRUD write API, no autonomous background memory rewriting/consolidation loops, no Nexus sync-authority changes, and no proactive memory-driven notification policy.
