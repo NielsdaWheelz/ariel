@@ -10,6 +10,7 @@ Ariel is a private, self-hosted assistant that accepts natural language and mult
 
 ### scope (mvp)
 - Phone-first surface (web chat plus speech-to-text/text-to-speech push-to-talk voice I/O) over Tailscale.
+- Installable web app (PWA) with first-party web push notifications and in-app notification center.
 - Core orchestrator loop: intake -> context build -> think/plan -> tool calls -> response.
 - Capability system with strict input/output schemas and policy enforcement.
 - Provider-agnostic external knowledge retrieval (web search/news/weather and URL extraction) with user-visible provenance.
@@ -25,6 +26,7 @@ Ariel is a private, self-hosted assistant that accepts natural language and mult
 
 ### non-scope (mvp)
 - Plugin marketplace, third-party skill auto-install, or arbitrary dynamic code loading.
+- Third-party chat platforms (Discord/Slack/Telegram) as primary interaction surfaces.
 - Generic shell/ssh capability exposed to the model.
 - Autonomous open-ended background agents; only bounded user-configured proactive checks/notifications are allowed.
 - Fully automated external sending (email/post) outside subscription-bound notification policy; draft or approval-gated only.
@@ -119,6 +121,7 @@ Ariel is a private, self-hosted assistant that accepts natural language and mult
 | side-effect execution model | Side-effecting capability calls are serialized for deterministic safety/audit behavior in MVP. |
 | oauth connector model | External connectors use OAuth authorization-code + PKCE with short-lived state and strict callback validation; token material is encrypted at rest. |
 | proactive execution model | Proactive checks are read-only and subscription-bound; notification delivery does not require per-notification approval. |
+| notification channel model | MVP notification channels are first-party web inbox plus web push (no third-party messaging dependency). |
 | quality gate model | Capability and orchestration changes must pass regression evaluations for grounding, safety, reliability, and multimodal behavior before release. |
 | egress model | Capability execution uses explicit destination allowlists; arbitrary outbound network access is denied by default. |
 | observability | Structured JSON logs and append-only event log are mandatory. |
@@ -191,6 +194,7 @@ Ariel is a private, self-hosted assistant that accepts natural language and mult
 
 ### proactive notifications
 - Notification delivery is subscription-bound (explicit user opt-in, schedule, and channel policy) and does not require per-notification approval.
+- Notification channel preferences are explicit and user-configurable (`in_app` and `web_push` in MVP).
 - Proactive checks can invoke `read` capabilities only.
 - Proactive flows cannot execute side-effecting capabilities unless the user initiates a normal turn and approval policy passes.
 
@@ -245,6 +249,10 @@ Ariel is a private, self-hosted assistant that accepts natural language and mult
 26. OAuth connector state handles are single-use, short-lived, and replay-safe.
 27. Connector token material is never surfaced in user APIs or logs and remains encrypted at rest.
 28. Capability calls requiring connector scopes fail with typed recoverable auth/scope outcomes instead of silent fallback behavior.
+29. Each delivered notification carries a stable dedupe/idempotency key to prevent duplicate user-visible delivery.
+30. Notification delivery attempts are append-only, auditable, and include retry/backoff outcomes.
+31. Quiet-hours and mute policies are enforced before push delivery is attempted.
+32. Push-to-talk is the only voice interaction mode in MVP; always-on streaming voice remains non-scope.
 
 ---
 
@@ -275,6 +283,7 @@ Ariel is a private, self-hosted assistant that accepts natural language and mult
 - Subscription configuration and notification events are canonical in Postgres.
 - Delivery history is append-only and auditable.
 - Notification payloads reference source artifacts/check evidence.
+- Push subscription endpoints are projections over canonical notification preference/subscription state.
 
 ---
 
@@ -294,6 +303,11 @@ Ariel is a private, self-hosted assistant that accepts natural language and mult
 - `POST /v1/approvals`
 - `POST /v1/notifications/subscriptions`
 - `GET /v1/notifications`
+- `GET /v1/notifications/preferences`
+- `POST /v1/notifications/preferences`
+- `POST /v1/notifications/{notification_id}/ack`
+- `POST /v1/push/subscriptions`
+- `DELETE /v1/push/subscriptions/{subscription_id}`
 - `GET /v1/jobs/{job_id}`
 - `GET /v1/jobs/{job_id}/events`
 - `GET /v1/artifacts/{artifact_id}`

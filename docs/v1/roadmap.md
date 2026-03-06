@@ -24,11 +24,14 @@ Slice 8 -> Slice 9: Voice + Vision Interface
 
 Slice 2 -> Slice 10: Agency Doer Integration
 
-Slice 4 -> Slice 11: Proactive Notification Layer
-Slice 5 -> Slice 11
-Slice 10 -> Slice 11
+Slice 4 -> Slice 11A: Notification Transport Foundation
+Slice 5 -> Slice 11A
 
-Slice 11 -> Slice 12: Provider Portability + Reliability
+Slice 4 -> Slice 11B: Proactive Notification Layer
+Slice 5 -> Slice 11B
+Slice 11A -> Slice 11B
+
+Slice 11B -> Slice 12: Provider Portability + Reliability
 Slice 12 -> Slice 13: Production Readiness Gate
 
 Deferred indefinitely (unscheduled): Nexus Notes Integration
@@ -148,10 +151,11 @@ Deferred indefinitely (unscheduled): Nexus Notes Integration
 - **Outcome**: User can speak to Ariel, hear spoken responses, and send images for analysis.
 - **Dependencies**: Slice 8
 - **Acceptance**:
-  - User can trigger speech input and receive speech-to-text transcript-backed turn behavior.
+  - User can trigger push-to-talk speech input and receive speech-to-text transcript-backed turn behavior.
   - Ariel can return text-to-speech output from assistant responses.
   - User can send an image and receive useful analysis in the same conversation flow.
   - Voice/vision errors are visible and do not corrupt session state.
+  - Always-on streaming voice remains out of scope for this slice.
 - **Risks**: Speech and vision quality variance can impact trust without transparent fallback UX.
 
 ### Slice 10: Agency Doer Integration
@@ -165,13 +169,25 @@ Deferred indefinitely (unscheduled): Nexus Notes Integration
   - Failure cases are surfaced with actionable next steps.
 - **Risks**: Long-running tasks and partial failures can create confusing states without clear job visibility.
 
-### Slice 11: Proactive Notification Layer
+### Slice 11A: Notification Transport Foundation
+- **Goal**: Establish production-grade, first-party notification delivery plumbing before proactive logic.
+- **Outcome**: Ariel can deliver auditable notifications through web inbox and web push with robust preference and retry behavior.
+- **Dependencies**: Slice 4, Slice 5
+- **Acceptance**:
+  - User can install the Ariel web app (PWA) and register/unregister web push subscriptions.
+  - Service-worker-backed web push delivery works end-to-end with explicit permission and revocation handling.
+  - Notification preferences (channel enablement, quiet hours, mute) are user-configurable and enforced.
+  - Notification delivery records include dedupe/idempotency key, attempt status, retry/backoff metadata, and timestamps.
+  - User can inspect notification history and acknowledge/dismiss events in-app.
+- **Risks**: Browser/platform push behavior and permission friction can reduce delivery consistency if not handled with resilient fallback UX.
+
+### Slice 11B: Proactive Notification Layer
 - **Goal**: Deliver user-configured proactive surfacing without opening autonomous side-effect risk.
 - **Outcome**: Ariel can notify users about relevant changes/events based on subscriptions and schedules.
-- **Dependencies**: Slice 4, Slice 5, Slice 10
+- **Dependencies**: Slice 4, Slice 5, Slice 11A
 - **Acceptance**:
   - User can configure recurring notification checks and notification preferences.
-  - Ariel sends notifications for high-value events (for example schedule reminders and completed jobs).
+  - Ariel sends notifications for high-value events (for example schedule reminders; completed-job notifications when Slice 10 is enabled).
   - Proactive execution is read-only and policy-bounded.
   - Notification history is user-inspectable and auditable.
   - User can mute, disable, or adjust proactive behavior.
@@ -180,13 +196,13 @@ Deferred indefinitely (unscheduled): Nexus Notes Integration
 ### Slice 12: Provider Portability + Reliability
 - **Goal**: Make the assistant resilient to model/provider changes without user-facing regressions.
 - **Outcome**: Core conversation, capability, and proactive flows remain stable when provider configuration changes.
-- **Dependencies**: Slice 11
+- **Dependencies**: Slice 11B
 - **Acceptance**:
   - Core user journeys continue to work when switching model providers.
   - Provider outages or degraded responses fail clearly without corrupting conversation or action state.
   - Decision and action traces remain inspectable across providers.
   - Provider changes do not break external knowledge capability behavior.
-  - Cross-provider evaluation scorecards on must-have workflows are at or above the defined OpenClaw-comparison baseline.
+  - Cross-provider must-have workflow scorecards meet explicit release targets: task success >= 90%, schema-valid tool-call rate >= 99%, citation-compliance rate = 100% for externally grounded claims, and critical policy violations = 0.
 - **Risks**: Behavior drift between providers can reduce predictability of plans and tool usage.
 
 ### Slice 13: Production Readiness Gate
