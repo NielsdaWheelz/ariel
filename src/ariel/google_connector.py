@@ -10,7 +10,7 @@ import hashlib
 import hmac
 import secrets
 from typing import Any, Literal, Protocol
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -36,18 +36,24 @@ GOOGLE_CALENDAR_WRITE_SCOPE = "https://www.googleapis.com/auth/calendar.events"
 GOOGLE_GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 GOOGLE_GMAIL_COMPOSE_SCOPE = "https://www.googleapis.com/auth/gmail.compose"
 GOOGLE_GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
+GOOGLE_DRIVE_METADATA_READ_SCOPE = "https://www.googleapis.com/auth/drive.metadata.readonly"
+GOOGLE_DRIVE_READ_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
+GOOGLE_DRIVE_SHARE_SCOPE = "https://www.googleapis.com/auth/drive"
 
 GOOGLE_READ_CAPABILITY_SCOPES: dict[str, set[str]] = {
     "cap.calendar.list": {GOOGLE_CALENDAR_READ_SCOPE},
     "cap.calendar.propose_slots": {GOOGLE_CALENDAR_READ_SCOPE},
     "cap.email.search": {GOOGLE_GMAIL_READ_SCOPE},
     "cap.email.read": {GOOGLE_GMAIL_READ_SCOPE},
+    "cap.drive.search": {GOOGLE_DRIVE_METADATA_READ_SCOPE},
+    "cap.drive.read": {GOOGLE_DRIVE_READ_SCOPE},
 }
 GOOGLE_READ_CAPABILITY_IDS = frozenset(GOOGLE_READ_CAPABILITY_SCOPES.keys())
 GOOGLE_WRITE_CAPABILITY_SCOPES: dict[str, set[str]] = {
     "cap.calendar.create_event": {GOOGLE_CALENDAR_WRITE_SCOPE},
     "cap.email.draft": {GOOGLE_GMAIL_COMPOSE_SCOPE},
     "cap.email.send": {GOOGLE_GMAIL_SEND_SCOPE},
+    "cap.drive.share": {GOOGLE_DRIVE_SHARE_SCOPE},
 }
 GOOGLE_WRITE_CAPABILITY_IDS = frozenset(GOOGLE_WRITE_CAPABILITY_SCOPES.keys())
 GOOGLE_CAPABILITY_SCOPES: dict[str, set[str]] = {
@@ -85,6 +91,19 @@ _AUTH_FAILURE_RECOVERY: dict[TypedAuthFailureClass, str] = {
 
 _GOOGLE_TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
 _MAX_GOOGLE_RESULTS = 5
+_MAX_DRIVE_READ_BYTES = 131072
+_MAX_DRIVE_READ_CHARS = 2000
+_DRIVE_NATIVE_DOC_MIME_TYPE = "application/vnd.google-apps.document"
+_DRIVE_PLAIN_TEXT_EXPORT_MIME_TYPE = "text/plain"
+_DRIVE_TEXT_LIKE_MIME_TYPES = {
+    "text/plain",
+    "text/markdown",
+    "text/csv",
+    "application/json",
+    "application/ld+json",
+    "application/rtf",
+    "application/xml",
+}
 
 
 def _utcnow() -> datetime:
@@ -193,6 +212,27 @@ class GoogleWorkspaceProvider(Protocol):
     ) -> dict[str, Any]: ...
 
     def email_send(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]: ...
+
+    def drive_search(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]: ...
+
+    def drive_read(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]: ...
+
+    def drive_share(
         self,
         *,
         access_token: str,
@@ -389,6 +429,7 @@ class DefaultGoogleOAuthClient:
 class DefaultGoogleWorkspaceProvider:
     calendar_api_base_url: str = "https://www.googleapis.com/calendar/v3"
     gmail_api_base_url: str = "https://gmail.googleapis.com/gmail/v1"
+    drive_api_base_url: str = "https://www.googleapis.com/drive/v3"
     timeout_seconds: float = 10.0
     max_attempts: int = 2
 
@@ -433,8 +474,7 @@ class DefaultGoogleWorkspaceProvider:
             if status_code == 401:
                 raise RuntimeError("token_expired")
             if status_code == 403:
-                reason = _google_error_reason(response).lower()
-                if "insufficient" in reason or "permission" in reason:
+                if _is_google_scope_failure(response):
                     raise RuntimeError("insufficient_permissions")
                 raise RuntimeError("google_forbidden")
             if status_code in _GOOGLE_TRANSIENT_STATUS_CODES:
@@ -450,6 +490,51 @@ class DefaultGoogleWorkspaceProvider:
             if not isinstance(payload, dict):
                 raise RuntimeError("google_invalid_payload")
             return payload
+        raise RuntimeError("google_request_unreachable")
+
+    def _request_text(
+        self,
+        *,
+        method: str,
+        url: str,
+        access_token: str,
+        params: dict[str, Any] | None = None,
+    ) -> str:
+        attempts = max(1, self.max_attempts)
+        for attempt in range(1, attempts + 1):
+            try:
+                response = httpx.request(
+                    method,
+                    url,
+                    headers=self._authorized_headers(access_token=access_token),
+                    params=params,
+                    timeout=self.timeout_seconds,
+                )
+            except httpx.TimeoutException as exc:
+                if attempt < attempts:
+                    continue
+                raise RuntimeError("google_upstream_timeout") from exc
+            except httpx.HTTPError as exc:
+                if attempt < attempts:
+                    continue
+                raise RuntimeError("google_upstream_network_failure") from exc
+
+            status_code = response.status_code
+            if status_code in _GOOGLE_TRANSIENT_STATUS_CODES and attempt < attempts:
+                continue
+            if status_code == 401:
+                raise RuntimeError("token_expired")
+            if status_code == 403:
+                if _is_google_scope_failure(response):
+                    raise RuntimeError("insufficient_permissions")
+                raise RuntimeError("google_forbidden")
+            if status_code in _GOOGLE_TRANSIENT_STATUS_CODES:
+                raise RuntimeError(f"google_upstream_{status_code}")
+            if status_code == 404:
+                raise RuntimeError("resource_not_found")
+            if status_code >= 400:
+                raise RuntimeError(f"google_request_failed:{status_code}")
+            return response.text
         raise RuntimeError("google_request_unreachable")
 
     def _calendar_events(
@@ -865,6 +950,290 @@ class DefaultGoogleWorkspaceProvider:
             "subject": normalized_input.get("subject"),
         }
 
+    def _drive_file_source(self, *, file_id: str, metadata: dict[str, Any]) -> str:
+        source_raw = metadata.get("webViewLink")
+        if isinstance(source_raw, str) and source_raw.strip():
+            return source_raw.strip()
+        return f"https://drive.google.com/file/d/{quote(file_id, safe='')}/view"
+
+    def _drive_size_bytes(self, raw_size: Any) -> int | None:
+        if isinstance(raw_size, int):
+            return raw_size if raw_size >= 0 else None
+        if isinstance(raw_size, str) and raw_size.strip():
+            try:
+                parsed = int(raw_size.strip())
+            except ValueError:
+                return None
+            return parsed if parsed >= 0 else None
+        return None
+
+    def _drive_metadata_snippet(self, metadata: dict[str, Any]) -> str:
+        parts: list[str] = []
+        mime_type_raw = metadata.get("mimeType")
+        if isinstance(mime_type_raw, str) and mime_type_raw.strip():
+            parts.append(f"mime_type={mime_type_raw.strip()}")
+        owner_value = None
+        owners_raw = metadata.get("owners")
+        if isinstance(owners_raw, list):
+            for owner in owners_raw:
+                if not isinstance(owner, dict):
+                    continue
+                owner_raw = owner.get("emailAddress") or owner.get("displayName")
+                if isinstance(owner_raw, str) and owner_raw.strip():
+                    owner_value = owner_raw.strip()
+                    break
+        if owner_value is not None:
+            parts.append(f"owner={owner_value}")
+        modified_raw = _normalize_google_timestamp(metadata.get("modifiedTime"))
+        if modified_raw is not None:
+            parts.append(f"modified={modified_raw}")
+        size_bytes = self._drive_size_bytes(metadata.get("size"))
+        if size_bytes is not None:
+            parts.append(f"size_bytes={size_bytes}")
+        if parts:
+            return " ".join(parts)
+        return "drive file metadata available"
+
+    def _drive_read_outcome_output(
+        self,
+        *,
+        file_id: str,
+        title: str,
+        source: str,
+        published_at: str | None,
+        status: Literal["unsupported", "too_large", "unavailable"],
+        reason_code: str,
+        recovery: str,
+        snippet: str,
+    ) -> dict[str, Any]:
+        return {
+            "file_id": file_id,
+            "retrieved_at": to_rfc3339(_utcnow()),
+            "content_excerpt": "",
+            "truncated": False,
+            "read_outcome": {
+                "status": status,
+                "reason_code": reason_code,
+                "recovery": recovery,
+            },
+            "results": [
+                {
+                    "title": title,
+                    "source": source,
+                    "snippet": snippet,
+                    "published_at": published_at,
+                }
+            ],
+        }
+
+    def drive_search(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]:
+        query = str(normalized_input["query"]).strip()
+        escaped_query = query.replace("\\", "\\\\").replace("'", "\\'")
+        drive_query = (
+            f"(name contains '{escaped_query}' or fullText contains '{escaped_query}') "
+            "and trashed = false"
+        )
+        payload = self._request_json(
+            method="GET",
+            url=f"{self.drive_api_base_url}/files",
+            access_token=access_token,
+            params={
+                "q": drive_query,
+                "pageSize": _MAX_GOOGLE_RESULTS,
+                "supportsAllDrives": "true",
+                "includeItemsFromAllDrives": "true",
+                "fields": (
+                    "files(id,name,mimeType,modifiedTime,webViewLink,size,"
+                    "owners(displayName,emailAddress))"
+                ),
+            },
+        )
+        raw_files = payload.get("files")
+        files = [item for item in raw_files if isinstance(item, dict)] if isinstance(raw_files, list) else []
+        results: list[dict[str, Any]] = []
+        for item in files[:_MAX_GOOGLE_RESULTS]:
+            file_id_raw = item.get("id")
+            file_id = file_id_raw.strip() if isinstance(file_id_raw, str) and file_id_raw.strip() else "unknown"
+            title_raw = item.get("name")
+            title = title_raw.strip() if isinstance(title_raw, str) and title_raw.strip() else f"file {file_id}"
+            results.append(
+                {
+                    "title": title,
+                    "source": self._drive_file_source(file_id=file_id, metadata=item),
+                    "snippet": self._drive_metadata_snippet(item),
+                    "published_at": _normalize_google_timestamp(item.get("modifiedTime")),
+                }
+            )
+        return {
+            "query": query,
+            "retrieved_at": to_rfc3339(_utcnow()),
+            "results": results,
+        }
+
+    def drive_read(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]:
+        file_id = str(normalized_input["file_id"]).strip()
+        metadata_url = f"{self.drive_api_base_url}/files/{quote(file_id, safe='')}"
+        try:
+            metadata = self._request_json(
+                method="GET",
+                url=metadata_url,
+                access_token=access_token,
+                params={
+                    "fields": "id,name,mimeType,modifiedTime,webViewLink,size,owners(displayName,emailAddress)",
+                    "supportsAllDrives": "true",
+                },
+            )
+        except RuntimeError as exc:
+            if safe_failure_reason(str(exc), fallback="drive_read_unavailable").lower() == "resource_not_found":
+                fallback_source = f"https://drive.google.com/file/d/{quote(file_id, safe='')}/view"
+                return self._drive_read_outcome_output(
+                    file_id=file_id,
+                    title=f"Drive file {file_id}",
+                    source=fallback_source,
+                    published_at=None,
+                    status="unavailable",
+                    reason_code="drive_read_unavailable",
+                    recovery="Verify file access and file ID, then retry.",
+                    snippet="File is unavailable. Verify file access and file ID, then retry.",
+                )
+            raise
+
+        title_raw = metadata.get("name")
+        title = title_raw.strip() if isinstance(title_raw, str) and title_raw.strip() else f"Drive file {file_id}"
+        source = self._drive_file_source(file_id=file_id, metadata=metadata)
+        published_at = _normalize_google_timestamp(metadata.get("modifiedTime"))
+        mime_type_raw = metadata.get("mimeType")
+        mime_type = mime_type_raw.strip() if isinstance(mime_type_raw, str) and mime_type_raw.strip() else ""
+        size_bytes = self._drive_size_bytes(metadata.get("size"))
+        if size_bytes is not None and size_bytes > _MAX_DRIVE_READ_BYTES:
+            return self._drive_read_outcome_output(
+                file_id=file_id,
+                title=title,
+                source=source,
+                published_at=published_at,
+                status="too_large",
+                reason_code="drive_read_too_large",
+                recovery="Open the file and request a smaller section, then retry.",
+                snippet="File exceeds read budget. Request a smaller section and retry.",
+            )
+
+        try:
+            if mime_type == _DRIVE_NATIVE_DOC_MIME_TYPE:
+                content_text = self._request_text(
+                    method="GET",
+                    url=f"{self.drive_api_base_url}/files/{quote(file_id, safe='')}/export",
+                    access_token=access_token,
+                    params={
+                        "mimeType": _DRIVE_PLAIN_TEXT_EXPORT_MIME_TYPE,
+                        "supportsAllDrives": "true",
+                    },
+                )
+            elif mime_type in _DRIVE_TEXT_LIKE_MIME_TYPES or mime_type.startswith("text/"):
+                content_text = self._request_text(
+                    method="GET",
+                    url=f"{self.drive_api_base_url}/files/{quote(file_id, safe='')}",
+                    access_token=access_token,
+                    params={"alt": "media", "supportsAllDrives": "true"},
+                )
+            else:
+                return self._drive_read_outcome_output(
+                    file_id=file_id,
+                    title=title,
+                    source=source,
+                    published_at=published_at,
+                    status="unsupported",
+                    reason_code="drive_read_unsupported",
+                    recovery="Export this file to Google Docs or plain text, then retry.",
+                    snippet=(
+                        "Unsupported content format. Export this file to Google Docs or plain text, "
+                        "then retry."
+                    ),
+                )
+        except RuntimeError as exc:
+            if safe_failure_reason(str(exc), fallback="drive_read_unavailable").lower() == "resource_not_found":
+                return self._drive_read_outcome_output(
+                    file_id=file_id,
+                    title=title,
+                    source=source,
+                    published_at=published_at,
+                    status="unavailable",
+                    reason_code="drive_read_unavailable",
+                    recovery="Verify file access and file ID, then retry.",
+                    snippet="File is unavailable. Verify file access and file ID, then retry.",
+                )
+            raise
+
+        normalized_content = " ".join(content_text.split())
+        if not normalized_content:
+            normalized_content = "(no readable text content found)"
+        truncated = len(normalized_content) > _MAX_DRIVE_READ_CHARS
+        content_excerpt = normalized_content[:_MAX_DRIVE_READ_CHARS].rstrip()
+        if truncated:
+            content_excerpt = f"{content_excerpt}..."
+        return {
+            "file_id": file_id,
+            "retrieved_at": to_rfc3339(_utcnow()),
+            "content_excerpt": content_excerpt,
+            "truncated": truncated,
+            "read_outcome": {
+                "status": "ok",
+                "reason_code": None,
+                "recovery": None,
+            },
+            "results": [
+                {
+                    "title": title,
+                    "source": source,
+                    "snippet": content_excerpt,
+                    "published_at": published_at,
+                }
+            ],
+        }
+
+    def drive_share(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]:
+        file_id = str(normalized_input["file_id"]).strip()
+        grantee_email = str(normalized_input["grantee_email"]).strip().lower()
+        role = str(normalized_input["role"]).strip().lower()
+        payload = self._request_json(
+            method="POST",
+            url=f"{self.drive_api_base_url}/files/{quote(file_id, safe='')}/permissions",
+            access_token=access_token,
+            params={"sendNotificationEmail": "true", "supportsAllDrives": "true"},
+            json_payload={
+                "type": "user",
+                "emailAddress": grantee_email,
+                "role": role,
+            },
+        )
+        permission_id_raw = payload.get("id")
+        permission_id = (
+            permission_id_raw.strip()
+            if isinstance(permission_id_raw, str) and permission_id_raw.strip()
+            else "unknown"
+        )
+        return {
+            "status": "shared",
+            "file_id": file_id,
+            "grantee_email": grantee_email,
+            "role": role,
+            "permission_id": permission_id,
+        }
+
 
 def _parse_rfc3339(value: Any) -> datetime | None:
     if not isinstance(value, str):
@@ -901,26 +1270,61 @@ def _normalize_google_timestamp(value: Any) -> str | None:
     return to_rfc3339(parsed)
 
 
-def _google_error_reason(response: httpx.Response) -> str:
+def _google_error_payload(response: httpx.Response) -> dict[str, Any] | None:
     try:
         payload = response.json()
     except ValueError:
-        return safe_failure_reason(response.text, fallback="google_request_failed")
+        return None
     if not isinstance(payload, dict):
-        return "google_request_failed"
+        return None
     error_payload = payload.get("error")
-    if isinstance(error_payload, dict):
-        message_raw = error_payload.get("message")
-        if isinstance(message_raw, str) and message_raw.strip():
-            return message_raw.strip()
-        errors_raw = error_payload.get("errors")
-        if isinstance(errors_raw, list):
-            for error_entry in errors_raw:
-                if not isinstance(error_entry, dict):
-                    continue
-                reason_raw = error_entry.get("reason")
-                if isinstance(reason_raw, str) and reason_raw.strip():
-                    return reason_raw.strip()
+    return error_payload if isinstance(error_payload, dict) else None
+
+
+def _is_google_scope_failure(response: httpx.Response) -> bool:
+    error_payload = _google_error_payload(response)
+    if error_payload is None:
+        return False
+
+    message_raw = error_payload.get("message")
+    if isinstance(message_raw, str) and message_raw.strip():
+        normalized_message = message_raw.strip().lower()
+        if "authentication scope" in normalized_message:
+            return True
+        if normalized_message in {"insufficient permission", "insufficient permissions"}:
+            return True
+
+    errors_raw = error_payload.get("errors")
+    if not isinstance(errors_raw, list):
+        return False
+    for error_entry in errors_raw:
+        if not isinstance(error_entry, dict):
+            continue
+        reason_raw = error_entry.get("reason")
+        if not isinstance(reason_raw, str) or not reason_raw.strip():
+            continue
+        normalized_reason = reason_raw.strip().lower()
+        if normalized_reason in {"insufficientpermissions", "insufficient_permissions"}:
+            return True
+    return False
+
+
+def _google_error_reason(response: httpx.Response) -> str:
+    error_payload = _google_error_payload(response)
+    if error_payload is None:
+        return safe_failure_reason(response.text, fallback="google_request_failed")
+
+    message_raw = error_payload.get("message")
+    if isinstance(message_raw, str) and message_raw.strip():
+        return message_raw.strip()
+    errors_raw = error_payload.get("errors")
+    if isinstance(errors_raw, list):
+        for error_entry in errors_raw:
+            if not isinstance(error_entry, dict):
+                continue
+            reason_raw = error_entry.get("reason")
+            if isinstance(reason_raw, str) and reason_raw.strip():
+                return reason_raw.strip()
     return safe_failure_reason(response.text, fallback="google_request_failed")
 
 
@@ -1052,6 +1456,31 @@ def _resolve_reconnect_scopes(
         requested_scopes.update(required_scopes)
         requested_scopes.update(GOOGLE_RECONNECT_INTENT_EXTRA_SCOPES.get(normalized_intent, set()))
     return sorted(requested_scopes), normalized_intent
+
+
+def _classify_google_provider_failure(error_reason: str) -> str | None:
+    normalized = error_reason.strip().lower()
+    if not normalized:
+        return None
+    if normalized == "google_upstream_timeout":
+        return "provider_timeout"
+    if normalized == "google_upstream_network_failure":
+        return "provider_network_failure"
+    if normalized == "google_upstream_429":
+        return "provider_rate_limited"
+    if normalized.startswith("google_upstream_5"):
+        return "provider_upstream_failure"
+    if normalized == "google_forbidden":
+        return "provider_permission_denied"
+    if normalized.startswith("google_request_failed:4"):
+        return "provider_request_rejected"
+    if normalized == "resource_not_found":
+        return "resource_unavailable"
+    if normalized == "google_invalid_payload":
+        return "provider_invalid_payload"
+    if normalized == "google_request_unreachable":
+        return "provider_unreachable"
+    return None
 
 
 def _canonical_draft_output(
@@ -2262,6 +2691,21 @@ class GoogleConnectorRuntime:
                     normalized_input=normalized_input,
                     provider_projection=projection_payload,
                 )
+            elif capability_id == "cap.drive.search":
+                output_payload = self.workspace_provider.drive_search(
+                    access_token=access_token,
+                    normalized_input=normalized_input,
+                )
+            elif capability_id == "cap.drive.read":
+                output_payload = self.workspace_provider.drive_read(
+                    access_token=access_token,
+                    normalized_input=normalized_input,
+                )
+            elif capability_id == "cap.drive.share":
+                output_payload = self.workspace_provider.drive_share(
+                    access_token=access_token,
+                    normalized_input=normalized_input,
+                )
             else:
                 output_payload = self.workspace_provider.email_send(
                     access_token=access_token,
@@ -2295,6 +2739,14 @@ class GoogleConnectorRuntime:
                     preserve_existing_blocking=True,
                 )
                 return self._typed_failure(failure_class="token_expired")
+            typed_provider_error = _classify_google_provider_failure(reason)
+            if typed_provider_error is not None:
+                return GoogleCapabilityExecutionResult(
+                    status="failed",
+                    output=None,
+                    auth_failure=None,
+                    error=typed_provider_error,
+                )
             return GoogleCapabilityExecutionResult(
                 status="failed",
                 output=None,
