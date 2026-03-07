@@ -35,6 +35,11 @@ bash scripts/agency_verify.sh
 ```
 
 `make e2e` runs high-signal smoke coverage for the phone surface timeline plus slice-1 bounded-context event auditing.
+for maps-focused acceptance during slice-6 pr-02 work, run:
+
+```bash
+.venv/bin/python -m pytest tests/integration/test_s6_pr02_acceptance.py
+```
 
 ## slice-2 action surface
 
@@ -216,6 +221,29 @@ approval boundaries:
 - drive read/search outputs stay retrieval-style with inline citations and `assistant.sources[]`,
   preserving grounded answer synthesis behavior.
 
+## slice-6 pr-02 maps read vertical (directions + nearby places)
+
+slice-6 pr-02 adds maps retrieval capabilities under explicit read-only policy and fail-closed egress:
+
+- allowlisted read capabilities (no approval path):
+  - `cap.maps.directions`
+  - `cap.maps.search_places`
+- maps execution uses server-managed provider credentials only (no google oauth reconnect/consent loop).
+- maps capability contracts remain strict and retrieval-native (citation-ready `results[]` + `retrieved_at`).
+- required-field clarification behavior is deterministic and explicit:
+  - `maps_origin_required`
+  - `maps_destination_required`
+  - `maps_location_context_required`
+- maps credential/config failures are typed and recoverable:
+  - `provider_credentials_missing`
+  - `provider_credentials_invalid`
+- maps provider/runtime failures are typed and recoverable:
+  - `provider_timeout`, `provider_network_failure`, `provider_rate_limited`,
+    `provider_upstream_failure`, `provider_permission_denied`, `provider_request_rejected`,
+    `provider_invalid_payload`, `provider_unreachable`
+- maps retrieval remains isolated from google connector readiness/consent state.
+- maps outputs stay grounded with inline citations and `assistant.sources[]` in single- and mixed-retrieval turns.
+
 google connector runtime config:
 
 - `ARIEL_GOOGLE_OAUTH_CLIENT_ID`
@@ -252,6 +280,18 @@ weather capability runtime config:
 - `ARIEL_WEATHER_DEV_ENDPOINT` (optional; defaults to `https://wttr.in`)
 - `ARIEL_WEATHER_DEV_TIMEOUT_SECONDS` (optional; defaults to `8.0`)
 - `ARIEL_WEATHER_DEFAULT_LOCATION` (optional bootstrap-only fallback; seeded once when canonical state is unset)
+
+maps capability runtime config:
+
+- `ARIEL_MAPS_PROVIDER_API_KEY_ENC` (required; encrypted maps provider api key)
+- `ARIEL_MAPS_PROVIDER_ENDPOINT` (optional; defaults to `https://maps.googleapis.com/maps/api`)
+- `ARIEL_MAPS_PROVIDER_TIMEOUT_SECONDS` (optional; defaults to `8.0`)
+
+maps encrypted key handling uses the existing connector cipher/keyring settings:
+
+- `ARIEL_CONNECTOR_ENCRYPTION_KEY_VERSION`
+- `ARIEL_CONNECTOR_ENCRYPTION_KEYS`
+- `ARIEL_CONNECTOR_ENCRYPTION_SECRET`
 
 weather default location APIs:
 
@@ -321,7 +361,8 @@ see `docs/v1/s2/s2_prs/s2_pr02_implementation_notes.md` and
 `docs/v1/s4/s4_prs/s4_pr01_implementation_notes.md` and
 `docs/v1/s4/s4_prs/s4_pr02_implementation_notes.md` and
 `docs/v1/s4/s4_prs/s4_pr03_implementation_notes.md` and
-`docs/v1/s6/s6_prs/s6_pr01_implementation_notes.md` for implementation details and tradeoffs.
+`docs/v1/s6/s6_prs/s6_pr01_implementation_notes.md` and
+`docs/v1/s6/s6_prs/s6_pr02_implementation_notes.md` for implementation details and tradeoffs.
 
 ## run locally
 

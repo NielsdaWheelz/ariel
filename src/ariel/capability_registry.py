@@ -176,6 +176,89 @@ def _validate_drive_read_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any
     return _validate_exact_text_input(raw_input, field_name="file_id", max_length=256)
 
 
+_MAPS_ALLOWED_TRAVEL_MODES = {"driving", "walking", "bicycling", "transit"}
+
+
+def _validate_maps_directions_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not set(raw_input.keys()).issubset({"origin", "destination", "travel_mode"}):
+        return None, "schema_invalid"
+
+    origin_raw = raw_input.get("origin")
+    destination_raw = raw_input.get("destination")
+    travel_mode_raw = raw_input.get("travel_mode", "driving")
+
+    if origin_raw is None:
+        origin: str | None = None
+    elif isinstance(origin_raw, str):
+        normalized_origin = origin_raw.strip()
+        if len(normalized_origin) > 320:
+            return None, "schema_invalid"
+        origin = normalized_origin or None
+    else:
+        return None, "schema_invalid"
+
+    if destination_raw is None:
+        destination: str | None = None
+    elif isinstance(destination_raw, str):
+        normalized_destination = destination_raw.strip()
+        if len(normalized_destination) > 320:
+            return None, "schema_invalid"
+        destination = normalized_destination or None
+    else:
+        return None, "schema_invalid"
+
+    if not isinstance(travel_mode_raw, str):
+        return None, "schema_invalid"
+    travel_mode = travel_mode_raw.strip().lower() or "driving"
+    if travel_mode not in _MAPS_ALLOWED_TRAVEL_MODES:
+        return None, "schema_invalid"
+
+    return {
+        "origin": origin,
+        "destination": destination,
+        "travel_mode": travel_mode,
+    }, None
+
+
+def _validate_maps_search_places_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not set(raw_input.keys()).issubset({"query", "location_context", "radius_meters"}):
+        return None, "schema_invalid"
+
+    query_raw = raw_input.get("query")
+    if not isinstance(query_raw, str):
+        return None, "schema_invalid"
+    query = query_raw.strip()
+    if not query or len(query) > 200:
+        return None, "schema_invalid"
+
+    location_context_raw = raw_input.get("location_context")
+    if location_context_raw is None:
+        location_context: str | None = None
+    elif isinstance(location_context_raw, str):
+        normalized_location_context = location_context_raw.strip()
+        if len(normalized_location_context) > 320:
+            return None, "schema_invalid"
+        location_context = normalized_location_context or None
+    else:
+        return None, "schema_invalid"
+
+    radius_meters_raw = raw_input.get("radius_meters", 2000)
+    if not isinstance(radius_meters_raw, int):
+        return None, "schema_invalid"
+    if radius_meters_raw < 100 or radius_meters_raw > 50000:
+        return None, "schema_invalid"
+
+    return {
+        "query": query,
+        "location_context": location_context,
+        "radius_meters": radius_meters_raw,
+    }, None
+
+
 def _normalize_email_recipient(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
@@ -695,6 +778,455 @@ def _search_news_allowed_destinations() -> tuple[str, ...]:
     if host is not None:
         return (host,)
     return ("api.search.brave.com",)
+
+
+def _maps_provider_endpoint() -> str:
+    default_endpoint = "https://maps.googleapis.com/maps/api"
+    configured_endpoint = os.getenv("ARIEL_MAPS_PROVIDER_ENDPOINT")
+    if configured_endpoint is None:
+        return default_endpoint
+    normalized = configured_endpoint.strip()
+    if not normalized:
+        return default_endpoint
+    parsed = urlparse(normalized)
+    if parsed.scheme:
+        return normalized
+    if "://" in normalized:
+        return default_endpoint
+    return f"https://{normalized.lstrip('/')}"
+
+
+def _maps_directions_endpoint() -> str:
+    return f"{_maps_provider_endpoint().rstrip('/')}/directions"
+
+
+def _maps_search_places_endpoint() -> str:
+    return f"{_maps_provider_endpoint().rstrip('/')}/search_places"
+
+
+def _maps_provider_timeout_seconds() -> float:
+    configured_timeout = os.getenv("ARIEL_MAPS_PROVIDER_TIMEOUT_SECONDS")
+    if configured_timeout is None:
+        return 8.0
+    normalized = configured_timeout.strip()
+    if not normalized:
+        return 8.0
+    try:
+        parsed = float(normalized)
+    except ValueError:
+        return 8.0
+    if parsed <= 0:
+        return 8.0
+    return parsed
+
+
+def _maps_provider_api_key_encrypted() -> str | None:
+    configured = os.getenv("ARIEL_MAPS_PROVIDER_API_KEY_ENC")
+    if configured is None:
+        return None
+    normalized = configured.strip()
+    return normalized or None
+
+
+def _maps_connector_encryption_secret() -> str:
+    configured = os.getenv("ARIEL_CONNECTOR_ENCRYPTION_SECRET")
+    if configured is None:
+        return "dev-local-connector-secret"
+    normalized = configured.strip()
+    return normalized or "dev-local-connector-secret"
+
+
+def _maps_connector_encryption_key_version() -> str:
+    configured = os.getenv("ARIEL_CONNECTOR_ENCRYPTION_KEY_VERSION")
+    if configured is None:
+        return "v1"
+    normalized = configured.strip()
+    return normalized or "v1"
+
+
+def _maps_connector_encryption_keys() -> str | None:
+    configured = os.getenv("ARIEL_CONNECTOR_ENCRYPTION_KEYS")
+    if configured is None:
+        return None
+    normalized = configured.strip()
+    return normalized or None
+
+
+def _maps_provider_api_key() -> str:
+    # Import lazily to avoid pulling connector runtime dependencies into registry import-time.
+    from ariel.google_connector import ConnectorTokenCipher
+
+    encrypted_api_key = _maps_provider_api_key_encrypted()
+    if encrypted_api_key is None:
+        raise RuntimeError("provider_credentials_missing")
+    try:
+        cipher = ConnectorTokenCipher.from_config(
+            active_key_version=_maps_connector_encryption_key_version(),
+            configured_keys=_maps_connector_encryption_keys(),
+            fallback_secret=_maps_connector_encryption_secret(),
+        )
+        api_key = cipher.decrypt(encrypted_api_key).strip()
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError("provider_credentials_invalid") from exc
+    if not api_key:
+        raise RuntimeError("provider_credentials_invalid")
+    return api_key
+
+
+def _maps_provider_unreachable(endpoint: str) -> bool:
+    endpoint_host = _endpoint_host(endpoint)
+    endpoint_parsed = urlparse(endpoint)
+    if endpoint_host is None:
+        return True
+    if endpoint_parsed.scheme.lower() not in {"http", "https"}:
+        return True
+    return False
+
+
+def _normalize_int_like(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    if not normalized:
+        return None
+    if normalized.endswith("s"):
+        normalized = normalized[:-1]
+    try:
+        return int(float(normalized))
+    except ValueError:
+        return None
+
+
+def _maps_route_candidate(payload: dict[str, Any]) -> dict[str, Any] | None:
+    routes_raw = payload.get("routes")
+    if isinstance(routes_raw, list):
+        for raw_route in routes_raw:
+            if isinstance(raw_route, dict):
+                return raw_route
+    if isinstance(routes_raw, dict):
+        return routes_raw
+    result_route = payload.get("route")
+    if isinstance(result_route, dict):
+        return result_route
+    return None
+
+
+def _maps_places_candidates(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    places_raw = payload.get("places")
+    if not isinstance(places_raw, list):
+        places_raw = payload.get("results")
+    if not isinstance(places_raw, list):
+        return []
+    candidates: list[dict[str, Any]] = []
+    for raw_place in places_raw:
+        if isinstance(raw_place, dict):
+            candidates.append(raw_place)
+        if len(candidates) >= 5:
+            break
+    return candidates
+
+
+def _build_maps_route_result(
+    *,
+    endpoint: str,
+    route_payload: dict[str, Any],
+    origin: str,
+    destination: str,
+    travel_mode: str,
+) -> dict[str, Any]:
+    title_raw = route_payload.get("title")
+    summary_raw = route_payload.get("summary")
+    title = (
+        title_raw.strip()
+        if isinstance(title_raw, str) and title_raw.strip()
+        else (
+            summary_raw.strip()
+            if isinstance(summary_raw, str) and summary_raw.strip()
+            else "Route guidance"
+        )
+    )
+    source_raw = route_payload.get("source")
+    route_url_raw = route_payload.get("route_url")
+    if source_raw is None:
+        source_raw = route_url_raw
+    source = (
+        source_raw.strip()
+        if isinstance(source_raw, str) and source_raw.strip()
+        else (
+            f"{endpoint}?origin={quote(origin, safe='')}"
+            f"&destination={quote(destination, safe='')}"
+            f"&mode={quote(travel_mode, safe='')}"
+        )
+    )
+    distance_meters = (
+        _normalize_int_like(route_payload.get("distance_meters"))
+        or _normalize_int_like(route_payload.get("distanceMeters"))
+        or _normalize_int_like(route_payload.get("distance"))
+    )
+    duration_seconds = (
+        _normalize_int_like(route_payload.get("duration_seconds"))
+        or _normalize_int_like(route_payload.get("durationSeconds"))
+        or _normalize_int_like(route_payload.get("duration"))
+    )
+    snippet_parts: list[str] = []
+    if distance_meters is not None:
+        snippet_parts.append(f"distance_meters={distance_meters}")
+    if duration_seconds is not None:
+        snippet_parts.append(f"duration_seconds={duration_seconds}")
+    if isinstance(summary_raw, str) and summary_raw.strip():
+        snippet_parts.append(summary_raw.strip())
+    snippet = " ".join(snippet_parts) or "route evidence available"
+    return {
+        "title": title,
+        "source": source,
+        "snippet": snippet,
+        "published_at": _normalize_optional_timestamp(route_payload.get("published_at")),
+        "distance_meters": distance_meters,
+        "duration_seconds": duration_seconds,
+    }
+
+
+def _build_maps_place_result(*, endpoint: str, place_payload: dict[str, Any]) -> dict[str, Any] | None:
+    name_raw = place_payload.get("name")
+    title_raw = place_payload.get("title")
+    title = (
+        name_raw.strip()
+        if isinstance(name_raw, str) and name_raw.strip()
+        else (title_raw.strip() if isinstance(title_raw, str) and title_raw.strip() else None)
+    )
+    if title is None:
+        return None
+    source_raw = place_payload.get("source")
+    maps_url_raw = place_payload.get("maps_url")
+    if source_raw is None:
+        source_raw = maps_url_raw
+    source = (
+        source_raw.strip()
+        if isinstance(source_raw, str) and source_raw.strip()
+        else f"{endpoint}?place={quote(title, safe='')}"
+    )
+    snippet_parts: list[str] = []
+    address_raw = place_payload.get("address")
+    if address_raw is None:
+        address_raw = place_payload.get("formatted_address")
+    if address_raw is None:
+        address_raw = place_payload.get("vicinity")
+    if isinstance(address_raw, str) and address_raw.strip():
+        snippet_parts.append(f"address={address_raw.strip()}")
+    distance_meters = (
+        _normalize_int_like(place_payload.get("distance_meters"))
+        or _normalize_int_like(place_payload.get("distanceMeters"))
+        or _normalize_int_like(place_payload.get("distance"))
+    )
+    if distance_meters is not None:
+        snippet_parts.append(f"distance_meters={distance_meters}")
+    rating_raw = place_payload.get("rating")
+    if isinstance(rating_raw, (int, float)):
+        snippet_parts.append(f"rating={rating_raw}")
+    open_now_raw = place_payload.get("open_now")
+    if isinstance(open_now_raw, bool):
+        snippet_parts.append(f"open_now={str(open_now_raw).lower()}")
+    snippet = " ".join(snippet_parts) or "place evidence available"
+    return {
+        "title": title,
+        "source": source,
+        "snippet": snippet,
+        "published_at": _normalize_optional_timestamp(place_payload.get("published_at")),
+    }
+
+
+def _execute_maps_directions(input_payload: dict[str, Any]) -> dict[str, Any]:
+    origin_raw = input_payload.get("origin")
+    destination_raw = input_payload.get("destination")
+    if not isinstance(origin_raw, str) or not origin_raw.strip():
+        raise RuntimeError("maps_origin_required")
+    if not isinstance(destination_raw, str) or not destination_raw.strip():
+        raise RuntimeError("maps_destination_required")
+    origin = origin_raw.strip()
+    destination = destination_raw.strip()
+    travel_mode_raw = input_payload.get("travel_mode")
+    travel_mode = (
+        travel_mode_raw.strip().lower()
+        if isinstance(travel_mode_raw, str) and travel_mode_raw.strip()
+        else "driving"
+    )
+
+    api_key = _maps_provider_api_key()
+    endpoint = _maps_directions_endpoint()
+    if _maps_provider_unreachable(endpoint):
+        raise RuntimeError("provider_unreachable")
+    try:
+        response = httpx.get(
+            endpoint,
+            params={
+                "origin": origin,
+                "destination": destination,
+                "mode": travel_mode,
+            },
+            headers={"accept": "application/json", "x-api-key": api_key},
+            timeout=_maps_provider_timeout_seconds(),
+        )
+    except httpx.TimeoutException as exc:
+        raise RuntimeError("provider_timeout") from exc
+    except httpx.HTTPError as exc:
+        raise RuntimeError("provider_network_failure") from exc
+
+    if response.status_code == 429:
+        raise RuntimeError("provider_rate_limited")
+    if response.status_code >= 500:
+        raise RuntimeError("provider_upstream_failure")
+    if response.status_code in {401, 403}:
+        raise RuntimeError("provider_permission_denied")
+    if response.status_code >= 400:
+        raise RuntimeError("provider_request_rejected")
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError("provider_invalid_payload") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("provider_invalid_payload")
+
+    retrieved_at = datetime.now(tz=UTC).isoformat().replace("+00:00", "Z")
+    route_payload = _maps_route_candidate(payload)
+    results: list[dict[str, Any]] = []
+    uncertainty: str | None = None
+    distance_meters: int | None = None
+    duration_seconds: int | None = None
+    if route_payload is None:
+        uncertainty = "insufficient_evidence"
+    else:
+        result = _build_maps_route_result(
+            endpoint=endpoint,
+            route_payload=route_payload,
+            origin=origin,
+            destination=destination,
+            travel_mode=travel_mode,
+        )
+        distance_meters = result.pop("distance_meters")
+        duration_seconds = result.pop("duration_seconds")
+        results.append(result)
+    return {
+        "origin": origin,
+        "destination": destination,
+        "travel_mode": travel_mode,
+        "distance_meters": distance_meters,
+        "duration_seconds": duration_seconds,
+        "retrieved_at": retrieved_at,
+        "uncertainty": uncertainty,
+        "results": results,
+    }
+
+
+def _execute_maps_search_places(input_payload: dict[str, Any]) -> dict[str, Any]:
+    query_raw = input_payload.get("query")
+    if not isinstance(query_raw, str) or not query_raw.strip():
+        raise RuntimeError("provider_request_rejected")
+    location_context_raw = input_payload.get("location_context")
+    if not isinstance(location_context_raw, str) or not location_context_raw.strip():
+        raise RuntimeError("maps_location_context_required")
+    radius_raw = input_payload.get("radius_meters")
+    radius_meters = radius_raw if isinstance(radius_raw, int) else 2000
+
+    api_key = _maps_provider_api_key()
+    endpoint = _maps_search_places_endpoint()
+    if _maps_provider_unreachable(endpoint):
+        raise RuntimeError("provider_unreachable")
+    query = query_raw.strip()
+    location_context = location_context_raw.strip()
+    try:
+        response = httpx.get(
+            endpoint,
+            params={
+                "query": query,
+                "location_context": location_context,
+                "radius_meters": radius_meters,
+            },
+            headers={"accept": "application/json", "x-api-key": api_key},
+            timeout=_maps_provider_timeout_seconds(),
+        )
+    except httpx.TimeoutException as exc:
+        raise RuntimeError("provider_timeout") from exc
+    except httpx.HTTPError as exc:
+        raise RuntimeError("provider_network_failure") from exc
+
+    if response.status_code == 429:
+        raise RuntimeError("provider_rate_limited")
+    if response.status_code >= 500:
+        raise RuntimeError("provider_upstream_failure")
+    if response.status_code in {401, 403}:
+        raise RuntimeError("provider_permission_denied")
+    if response.status_code >= 400:
+        raise RuntimeError("provider_request_rejected")
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError("provider_invalid_payload") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("provider_invalid_payload")
+
+    retrieved_at = datetime.now(tz=UTC).isoformat().replace("+00:00", "Z")
+    results: list[dict[str, Any]] = []
+    for candidate in _maps_places_candidates(payload):
+        normalized = _build_maps_place_result(endpoint=endpoint, place_payload=candidate)
+        if normalized is None:
+            continue
+        results.append(normalized)
+    uncertainty = "insufficient_evidence" if not results else None
+    return {
+        "query": query,
+        "location_context": location_context,
+        "radius_meters": radius_meters,
+        "retrieved_at": retrieved_at,
+        "uncertainty": uncertainty,
+        "results": results,
+    }
+
+
+def _declare_maps_directions_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "destination": _maps_directions_endpoint(),
+            "payload": {
+                "origin": input_payload.get("origin"),
+                "destination": input_payload.get("destination"),
+                "travel_mode": input_payload.get("travel_mode"),
+            },
+        }
+    ]
+
+
+def _declare_maps_search_places_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "destination": _maps_search_places_endpoint(),
+            "payload": {
+                "query": input_payload.get("query"),
+                "location_context": input_payload.get("location_context"),
+                "radius_meters": input_payload.get("radius_meters"),
+            },
+        }
+    ]
+
+
+def _maps_allowed_destinations() -> tuple[str, ...]:
+    directions_host = _endpoint_host(_maps_directions_endpoint())
+    places_host = _endpoint_host(_maps_search_places_endpoint())
+    hosts = {
+        host
+        for host in (directions_host, places_host)
+        if host is not None
+    }
+    if hosts:
+        return tuple(sorted(hosts))
+    return ("maps.googleapis.com",)
 
 
 def _execute_google_calendar_list(_: dict[str, Any]) -> dict[str, Any]:
@@ -1336,6 +1868,40 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         validate_input=_validate_drive_read_input,
         execute=_execute_google_drive_read,
         declare_egress_intent=_declare_google_drive_read_egress_intent,
+    ),
+    "cap.maps.directions": CapabilityDefinition(
+        capability_id="cap.maps.directions",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "maps_directions_query_v1",
+            "output_schema": "maps_directions_result_v1",
+            "idempotency": "deterministic_read",
+            "credentials_mode": "server_managed_encrypted",
+            "location_inference": "explicit_only",
+        },
+        allowed_egress_destinations=_maps_allowed_destinations(),
+        validate_input=_validate_maps_directions_input,
+        execute=_execute_maps_directions,
+        declare_egress_intent=_declare_maps_directions_egress_intent,
+    ),
+    "cap.maps.search_places": CapabilityDefinition(
+        capability_id="cap.maps.search_places",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "maps_search_places_query_v1",
+            "output_schema": "maps_search_places_result_v1",
+            "idempotency": "deterministic_read",
+            "credentials_mode": "server_managed_encrypted",
+            "location_inference": "explicit_only",
+        },
+        allowed_egress_destinations=_maps_allowed_destinations(),
+        validate_input=_validate_maps_search_places_input,
+        execute=_execute_maps_search_places,
+        declare_egress_intent=_declare_maps_search_places_egress_intent,
     ),
     "cap.calendar.create_event": CapabilityDefinition(
         capability_id="cap.calendar.create_event",
