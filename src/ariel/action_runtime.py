@@ -189,10 +189,12 @@ _MAX_CITED_SOURCES = 4
 _MAX_SNIPPET_LENGTH = 320
 _NEWS_FRESHNESS_MAX_AGE = timedelta(hours=48)
 _MAX_CONFLICT_COMPONENT_TOKENS = 8
+_MAPS_RETRIEVAL_CAPABILITY_IDS = {"cap.maps.directions", "cap.maps.search_places"}
 _GROUNDED_RETRIEVAL_CAPABILITIES = {
     "cap.search.web",
     "cap.search.news",
     "cap.weather.forecast",
+    *_MAPS_RETRIEVAL_CAPABILITY_IDS,
     *GOOGLE_READ_CAPABILITY_IDS,
 }
 
@@ -225,6 +227,49 @@ _TYPED_PROVIDER_RECOVERY: dict[str, str] = {
     "provider_invalid_payload": "Google returned an invalid payload. Retry shortly.",
     "provider_unreachable": "Google could not be reached. Retry shortly.",
 }
+
+_TYPED_MAPS_RECOVERY: dict[str, str] = {
+    "provider_credentials_missing": (
+        "maps provider credentials are missing. ask your operator to configure encrypted server credentials."
+    ),
+    "provider_credentials_invalid": (
+        "maps provider credentials are invalid. ask your operator to rotate and re-encrypt credentials."
+    ),
+    "provider_timeout": "maps provider timed out. retry shortly.",
+    "provider_network_failure": "maps provider had a network failure. retry shortly.",
+    "provider_rate_limited": "maps provider rate limited this request. wait briefly, then retry.",
+    "provider_upstream_failure": "maps provider is degraded right now. retry shortly.",
+    "provider_permission_denied": (
+        "maps provider denied access. verify key restrictions and provider permissions."
+    ),
+    "provider_request_rejected": "maps provider rejected this request. verify inputs and retry.",
+    "provider_invalid_payload": "maps provider returned an invalid payload. retry shortly.",
+    "provider_unreachable": (
+        "maps provider endpoint is unreachable. ask your operator to verify endpoint configuration."
+    ),
+}
+
+
+def _maps_recovery_hint_for_error(error: str) -> str | None:
+    typed = _TYPED_MAPS_RECOVERY.get(error)
+    if typed is not None:
+        return typed
+    if error.startswith("egress_destination_denied"):
+        return (
+            "maps egress policy blocked the configured destination before execution. "
+            "ask your operator to review the endpoint allowlist."
+        )
+    if error in {
+        "egress_preflight_missing_intent",
+        "egress_preflight_contract_invalid",
+        "egress_preflight_undeclared_intent",
+        "egress_destination_invalid",
+    }:
+        return (
+            "maps egress preflight contract is invalid. "
+            "ask your operator to review capability egress declarations."
+        )
+    return None
 
 
 def _parse_rfc3339_timestamp(value: Any) -> datetime | None:
@@ -590,6 +635,67 @@ def _synthesize_weather_retrieval_answer(
     return message, collected_sources
 
 
+def _synthesize_maps_retrieval_answer(
+    *,
+    collected_sources: list[dict[str, Any]],
+    citation_snippets: list[str],
+    retrieval_errors: list[str],
+    maps_outputs: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]]]:
+    raw_errors = list(retrieval_errors)
+    normalized_errors = _normalize_retrieval_errors(raw_errors)
+    if not collected_sources:
+        if any("maps_origin_required" in error for error in raw_errors):
+            return (
+                "i need an explicit origin before i can get directions. "
+                "i cannot infer your location from device or ip signals.",
+                [],
+            )
+        if any("maps_destination_required" in error for error in raw_errors):
+            return (
+                "i need an explicit destination before i can get directions. "
+                "i cannot infer your location from device or ip signals.",
+                [],
+            )
+        if any("maps_location_context_required" in error for error in raw_errors):
+            return (
+                "i need explicit location context for nearby-place search. "
+                "i cannot infer location from device or ip signals.",
+                [],
+            )
+        for candidate in raw_errors:
+            typed_recovery = _maps_recovery_hint_for_error(candidate)
+            if typed_recovery is not None:
+                failure_surface = "maps runtime failure" if candidate.startswith("egress_") else "maps provider failure"
+                return f"{failure_surface} ({candidate}). {typed_recovery}", []
+        if normalized_errors:
+            primary_error = normalized_errors[0]
+            return (
+                "i'm uncertain because maps retrieval failed "
+                f"({primary_error}). retry with explicit route/place context.",
+                [],
+            )
+        return (
+            "i'm uncertain because i could not retrieve maps evidence. "
+            "share explicit route fields or nearby-place location context to retry.",
+            [],
+        )
+
+    grounded_message, _ = _synthesize_grounded_retrieval_answer(
+        collected_sources=collected_sources,
+        citation_snippets=citation_snippets,
+        retrieval_errors=retrieval_errors,
+    )
+    first_output = maps_outputs[0] if maps_outputs else {}
+    uncertainty_raw = first_output.get("uncertainty")
+    if isinstance(uncertainty_raw, str) and uncertainty_raw == "insufficient_evidence":
+        grounded_message = (
+            f"{grounded_message} uncertainty: map evidence is limited; "
+            "please refine the query or provide more specific location context."
+        )
+    return grounded_message, collected_sources
+
+
 def _synthesize_google_read_answer(
     *,
     collected_sources: list[dict[str, Any]],
@@ -708,6 +814,7 @@ def process_action_proposals(
     retrieval_source_metadata: list[dict[str, Any]] = []
     retrieval_capability_ids: set[str] = set()
     weather_outputs: list[dict[str, Any]] = []
+    maps_outputs: list[dict[str, Any]] = []
     google_outputs: list[dict[str, Any]] = []
     google_auth_failures: list[TypedAuthFailure] = []
 
@@ -723,6 +830,7 @@ def process_action_proposals(
         is_google_capability_proposal = capability_id in GOOGLE_CAPABILITY_IDS
         is_retrieval_proposal = capability_id in _GROUNDED_RETRIEVAL_CAPABILITIES
         is_weather_forecast_proposal = capability_id == "cap.weather.forecast"
+        is_maps_retrieval_proposal = capability_id in _MAPS_RETRIEVAL_CAPABILITY_IDS
         if is_retrieval_proposal:
             retrieval_requested = True
             retrieval_capability_ids.add(capability_id)
@@ -1035,6 +1143,8 @@ def process_action_proposals(
                         retrieval_errors.append("insufficient_evidence")
                 if is_weather_forecast_proposal:
                     weather_outputs.append(execution_result.output)
+                if is_maps_retrieval_proposal:
+                    maps_outputs.append(execution_result.output)
             add_event(
                 "evt.action.execution.succeeded",
                 {
@@ -1078,6 +1188,13 @@ def process_action_proposals(
                 retrieval_errors=retrieval_errors,
                 source_metadata=retrieval_source_metadata,
                 now_fn=now_fn,
+            )
+        elif retrieval_capability_ids.issubset(_MAPS_RETRIEVAL_CAPABILITY_IDS):
+            final_assistant_message, assistant_sources = _synthesize_maps_retrieval_answer(
+                collected_sources=retrieval_sources,
+                citation_snippets=retrieval_snippets,
+                retrieval_errors=retrieval_errors,
+                maps_outputs=maps_outputs,
             )
         elif retrieval_capability_ids == {"cap.weather.forecast"}:
             final_assistant_message, assistant_sources = _synthesize_weather_retrieval_answer(
