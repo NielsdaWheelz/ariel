@@ -41,6 +41,12 @@ for maps-focused acceptance during slice-6 pr-02 work, run:
 .venv/bin/python -m pytest tests/integration/test_s6_pr02_acceptance.py
 ```
 
+for url-extract acceptance during slice-7 pr-01 work, run:
+
+```bash
+.venv/bin/python -m pytest tests/integration/test_s7_pr01_acceptance.py
+```
+
 ## slice-2 action surface
 
 the action engine now evaluates model proposals per turn and emits an auditable lifecycle:
@@ -101,7 +107,7 @@ contracts:
 
 slice-3 pr-03 hardens grounding safety for conflicting evidence and mixed proposal sets:
 
-- when any retrieval capability executes (`cap.search.web`, `cap.search.news`, `cap.weather.forecast`),
+- when any retrieval capability executes (`cap.search.web`, `cap.search.news`, `cap.weather.forecast`, `cap.web.extract`),
   `assistant.message` stays grounded narrative with inline citations and synchronized `assistant.sources[]`,
   even if non-retrieval proposals run in the same turn.
 - mixed-turn non-retrieval outcomes remain auditable through structured surfaces
@@ -244,6 +250,35 @@ slice-6 pr-02 adds maps retrieval capabilities under explicit read-only policy a
 - maps retrieval remains isolated from google connector readiness/consent state.
 - maps outputs stay grounded with inline citations and `assistant.sources[]` in single- and mixed-retrieval turns.
 
+## slice-7 pr-01 url extraction vertical (cap.web.extract)
+
+slice-7 pr-01 adds url extraction retrieval under strict safety preflight, fail-closed egress, and
+grounded provenance contracts:
+
+- allowlisted read capability:
+  - `cap.web.extract` (`read`, `allow_inline`)
+- url safety preflight is strict and fail-closed before extraction:
+  - invalid url -> `url_invalid`
+  - non-http(s) scheme -> `url_scheme_unsupported`
+  - unsafe destination posture -> `url_destination_unsafe`
+- extraction egress remains explicit and fail-closed:
+  - capabilities must declare outbound intent
+  - undeclared/malformed/non-allowlisted destinations are blocked before outbound dispatch
+- successful extraction returns bounded structured content with grounded citation surfacing:
+  - inline citation markers in `assistant.message`
+  - synchronized `assistant.sources[]`
+  - inspectable provenance via `GET /v1/artifacts/{artifact_id}`
+- canonical source identity remains stable across retries/redirect-normalization for dedupe-safe citation
+  and provenance linkage.
+- typed extraction/runtime failure outcomes remain explicit and actionable:
+  - `access_restricted`, `unsupported_format`
+  - `provider_timeout`, `provider_network_failure`, `provider_rate_limited`,
+    `provider_upstream_failure`, `provider_request_rejected`, `provider_invalid_payload`,
+    `provider_unreachable`
+- large/complex pages remain bounded with explicit partial disclosure (no silent degradation).
+- mixed turns containing `cap.web.extract` plus non-retrieval proposals keep retrieval-grounded
+  assistant messaging while preserving structured lifecycle inspectability for all proposals.
+
 google connector runtime config:
 
 - `ARIEL_GOOGLE_OAUTH_CLIENT_ID`
@@ -292,6 +327,13 @@ maps encrypted key handling uses the existing connector cipher/keyring settings:
 - `ARIEL_CONNECTOR_ENCRYPTION_KEY_VERSION`
 - `ARIEL_CONNECTOR_ENCRYPTION_KEYS`
 - `ARIEL_CONNECTOR_ENCRYPTION_SECRET`
+
+web extract capability runtime config:
+
+- `ARIEL_WEB_EXTRACT_PROVIDER_ENDPOINT` (optional; defaults to Brave extract endpoint)
+- `ARIEL_WEB_EXTRACT_TIMEOUT_SECONDS` (optional; defaults to `10.0`)
+- `ARIEL_WEB_EXTRACT_MAX_RETRIES` (optional; defaults to `2`, max `5`)
+- `ARIEL_WEB_EXTRACT_API_KEY` (optional; falls back to `ARIEL_SEARCH_WEB_API_KEY`)
 
 weather default location APIs:
 
@@ -362,7 +404,8 @@ see `docs/v1/s2/s2_prs/s2_pr02_implementation_notes.md` and
 `docs/v1/s4/s4_prs/s4_pr02_implementation_notes.md` and
 `docs/v1/s4/s4_prs/s4_pr03_implementation_notes.md` and
 `docs/v1/s6/s6_prs/s6_pr01_implementation_notes.md` and
-`docs/v1/s6/s6_prs/s6_pr02_implementation_notes.md` for implementation details and tradeoffs.
+`docs/v1/s6/s6_prs/s6_pr02_implementation_notes.md` and
+`docs/v1/s7/s7_prs/s7_pr01_implementation_notes.md` for implementation details and tradeoffs.
 
 ## run locally
 
