@@ -212,6 +212,20 @@ _TYPED_AUTH_RECOVERY: dict[str, str] = {
     "access_revoked": "Reconnect Google from scratch.",
 }
 
+_TYPED_PROVIDER_RECOVERY: dict[str, str] = {
+    "provider_timeout": "Google timed out. Retry shortly.",
+    "provider_network_failure": "Google had a network failure. Retry shortly.",
+    "provider_rate_limited": "Google rate limited this request. Wait briefly, then retry.",
+    "provider_upstream_failure": "Google is degraded right now. Retry shortly.",
+    "provider_permission_denied": (
+        "Google denied provider-level access. Verify file permissions and retry."
+    ),
+    "provider_request_rejected": "Google rejected this request. Verify inputs and retry.",
+    "resource_unavailable": "The file is unavailable. Verify file ID and access, then retry.",
+    "provider_invalid_payload": "Google returned an invalid payload. Retry shortly.",
+    "provider_unreachable": "Google could not be reached. Retry shortly.",
+}
+
 
 def _parse_rfc3339_timestamp(value: Any) -> datetime | None:
     if not isinstance(value, str):
@@ -600,6 +614,12 @@ def _synthesize_google_read_answer(
                 f"google connector auth failure ({candidate}). {recovery}",
                 [],
             )
+        typed_provider_recovery = _TYPED_PROVIDER_RECOVERY.get(candidate)
+        if typed_provider_recovery is not None:
+            return (
+                f"google workspace provider failure ({candidate}). {typed_provider_recovery}",
+                [],
+            )
 
     if not collected_sources:
         if retrieval_errors:
@@ -619,6 +639,8 @@ def _synthesize_google_read_answer(
         prefix = "slot options:"
     elif retrieval_capability_ids.issubset({"cap.email.search", "cap.email.read"}):
         prefix = "email results:"
+    elif retrieval_capability_ids.issubset({"cap.drive.search", "cap.drive.read"}):
+        prefix = "drive results:"
     else:
         prefix = "google workspace results:"
 

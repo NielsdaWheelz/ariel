@@ -19,6 +19,9 @@ _GOOGLE_CALENDAR_WRITE_SCOPE = "https://www.googleapis.com/auth/calendar.events"
 _GOOGLE_GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 _GOOGLE_GMAIL_COMPOSE_SCOPE = "https://www.googleapis.com/auth/gmail.compose"
 _GOOGLE_GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
+_GOOGLE_DRIVE_METADATA_READ_SCOPE = "https://www.googleapis.com/auth/drive.metadata.readonly"
+_GOOGLE_DRIVE_READ_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
+_GOOGLE_DRIVE_SHARE_SCOPE = "https://www.googleapis.com/auth/drive"
 _GOOGLE_ALLOWED_EGRESS_DESTINATIONS = (
     "www.googleapis.com",
     "gmail.googleapis.com",
@@ -165,6 +168,14 @@ def _validate_email_read_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any
     return _validate_exact_text_input(raw_input, field_name="message_id", max_length=256)
 
 
+def _validate_drive_search_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    return _validate_exact_text_input(raw_input, field_name="query", max_length=1000)
+
+
+def _validate_drive_read_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    return _validate_exact_text_input(raw_input, field_name="file_id", max_length=256)
+
+
 def _normalize_email_recipient(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
@@ -195,6 +206,38 @@ def _normalize_email_recipients(raw_value: Any) -> list[str] | None:
         seen.add(recipient)
         recipients.append(recipient)
     return recipients
+
+
+_DRIVE_ALLOWED_SHARE_ROLES = {"reader", "commenter", "writer"}
+
+
+def _validate_drive_share_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    if not set(raw_input.keys()).issubset({"file_id", "grantee_email", "role"}):
+        return None, "schema_invalid"
+
+    file_id_raw = raw_input.get("file_id")
+    grantee_raw = raw_input.get("grantee_email")
+    role_raw = raw_input.get("role", "reader")
+    if not isinstance(file_id_raw, str) or not isinstance(grantee_raw, str):
+        return None, "schema_invalid"
+    if not isinstance(role_raw, str):
+        return None, "schema_invalid"
+
+    file_id = file_id_raw.strip()
+    if not file_id or len(file_id) > 256:
+        return None, "schema_invalid"
+    grantee_email = _normalize_email_recipient(grantee_raw)
+    if grantee_email is None:
+        return None, "schema_invalid"
+    role = role_raw.strip().lower()
+    if role not in _DRIVE_ALLOWED_SHARE_ROLES:
+        return None, "schema_invalid"
+
+    return {
+        "file_id": file_id,
+        "grantee_email": grantee_email,
+        "role": role,
+    }, None
 
 
 def _validate_calendar_create_event_input(
@@ -682,6 +725,18 @@ def _execute_google_email_send(_: dict[str, Any]) -> dict[str, Any]:
     raise RuntimeError("google_runtime_not_bound")
 
 
+def _execute_google_drive_search(_: dict[str, Any]) -> dict[str, Any]:
+    raise RuntimeError("google_runtime_not_bound")
+
+
+def _execute_google_drive_read(_: dict[str, Any]) -> dict[str, Any]:
+    raise RuntimeError("google_runtime_not_bound")
+
+
+def _execute_google_drive_share(_: dict[str, Any]) -> dict[str, Any]:
+    raise RuntimeError("google_runtime_not_bound")
+
+
 def _declare_google_calendar_list_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
     return [
         {
@@ -787,6 +842,39 @@ def _declare_google_email_send_egress_intent(input_payload: dict[str, Any]) -> l
                 "cc": input_payload["cc"],
                 "bcc": input_payload["bcc"],
                 "subject": input_payload["subject"],
+            },
+        }
+    ]
+
+
+def _declare_google_drive_search_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "destination": "https://www.googleapis.com/drive/v3/files",
+            "payload": {"query": input_payload["query"]},
+        }
+    ]
+
+
+def _declare_google_drive_read_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    file_id = input_payload["file_id"]
+    return [
+        {
+            "destination": f"https://www.googleapis.com/drive/v3/files/{file_id}",
+            "payload": {"file_id": file_id},
+        }
+    ]
+
+
+def _declare_google_drive_share_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    file_id = input_payload["file_id"]
+    return [
+        {
+            "destination": f"https://www.googleapis.com/drive/v3/files/{file_id}/permissions",
+            "payload": {
+                "file_id": file_id,
+                "grantee_email": input_payload["grantee_email"],
+                "role": input_payload["role"],
             },
         }
     ]
@@ -1216,6 +1304,39 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         execute=_execute_google_email_read,
         declare_egress_intent=_declare_google_email_read_egress_intent,
     ),
+    "cap.drive.search": CapabilityDefinition(
+        capability_id="cap.drive.search",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "drive_search_query_v1",
+            "output_schema": "drive_search_results_v1",
+            "idempotency": "deterministic_read",
+            "required_scopes": [_GOOGLE_DRIVE_METADATA_READ_SCOPE],
+        },
+        allowed_egress_destinations=_GOOGLE_ALLOWED_EGRESS_DESTINATIONS,
+        validate_input=_validate_drive_search_input,
+        execute=_execute_google_drive_search,
+        declare_egress_intent=_declare_google_drive_search_egress_intent,
+    ),
+    "cap.drive.read": CapabilityDefinition(
+        capability_id="cap.drive.read",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "drive_read_v1",
+            "output_schema": "drive_read_result_v1",
+            "idempotency": "deterministic_read",
+            "required_scopes": [_GOOGLE_DRIVE_READ_SCOPE],
+            "bounded_output": "excerpt_and_typed_outcome",
+        },
+        allowed_egress_destinations=_GOOGLE_ALLOWED_EGRESS_DESTINATIONS,
+        validate_input=_validate_drive_read_input,
+        execute=_execute_google_drive_read,
+        declare_egress_intent=_declare_google_drive_read_egress_intent,
+    ),
     "cap.calendar.create_event": CapabilityDefinition(
         capability_id="cap.calendar.create_event",
         version="1.0",
@@ -1264,6 +1385,22 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         validate_input=_validate_email_send_input,
         execute=_execute_google_email_send,
         declare_egress_intent=_declare_google_email_send_egress_intent,
+    ),
+    "cap.drive.share": CapabilityDefinition(
+        capability_id="cap.drive.share",
+        version="1.0",
+        impact_level="external_send",
+        policy_decision="requires_approval",
+        contract_metadata={
+            "input_schema": "drive_share_v1",
+            "output_schema": "drive_share_result_v1",
+            "idempotency": "action_attempt_id",
+            "required_scopes": [_GOOGLE_DRIVE_SHARE_SCOPE],
+        },
+        allowed_egress_destinations=_GOOGLE_ALLOWED_EGRESS_DESTINATIONS,
+        validate_input=_validate_drive_share_input,
+        execute=_execute_google_drive_share,
+        declare_egress_intent=_declare_google_drive_share_egress_intent,
     ),
     "cap.search.web": CapabilityDefinition(
         capability_id="cap.search.web",
