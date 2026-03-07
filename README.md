@@ -189,6 +189,33 @@ slice-5 adds canonical durable memory, explicit + threshold rotation, and harden
   - `open_commitments_and_jobs`
   - `relevant_artifacts_and_signals`
 
+## slice-6 pr-01 drive vertical (search/read/share)
+
+slice-6 pr-01 adds drive capabilities and capability-scoped reconnect intent under existing policy and
+approval boundaries:
+
+- allowlisted read capabilities:
+  - `cap.drive.search` (metadata-oriented file discovery)
+  - `cap.drive.read` (bounded content retrieval with typed read outcomes)
+- approval-gated external-send capability:
+  - `cap.drive.share` (`requires_approval`, exact approved payload, exactly-once execution)
+- reconnect intent remains least-privilege by capability:
+  - `POST /v1/connectors/google/reconnect?capability_intent=cap.drive.search`
+  - `POST /v1/connectors/google/reconnect?capability_intent=cap.drive.read`
+  - `POST /v1/connectors/google/reconnect?capability_intent=cap.drive.share`
+- drive auth/scope failures remain typed:
+  - `not_connected`, `consent_required`, `scope_missing`, `token_expired`, `access_revoked`
+- drive provider failures are typed and user-recoverable:
+  - `provider_timeout`, `provider_network_failure`, `provider_rate_limited`,
+    `provider_upstream_failure`, `provider_permission_denied`, `provider_request_rejected`,
+    `resource_unavailable`, `provider_invalid_payload`, `provider_unreachable`
+- drive read typed outcomes are explicit and bounded:
+  - `unsupported` (`drive_read_unsupported`)
+  - `too_large` (`drive_read_too_large`)
+  - `unavailable` (`drive_read_unavailable`)
+- drive read/search outputs stay retrieval-style with inline citations and `assistant.sources[]`,
+  preserving grounded answer synthesis behavior.
+
 google connector runtime config:
 
 - `ARIEL_GOOGLE_OAUTH_CLIENT_ID`
@@ -293,7 +320,8 @@ see `docs/v1/s2/s2_prs/s2_pr02_implementation_notes.md` and
 `docs/v1/s3/s3_prs/s3_pr03_implementation_notes.md` and
 `docs/v1/s4/s4_prs/s4_pr01_implementation_notes.md` and
 `docs/v1/s4/s4_prs/s4_pr02_implementation_notes.md` and
-`docs/v1/s4/s4_prs/s4_pr03_implementation_notes.md` for implementation details and tradeoffs.
+`docs/v1/s4/s4_prs/s4_pr03_implementation_notes.md` and
+`docs/v1/s6/s6_prs/s6_pr01_implementation_notes.md` for implementation details and tradeoffs.
 
 ## run locally
 

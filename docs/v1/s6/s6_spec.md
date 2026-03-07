@@ -11,7 +11,7 @@ Complete key Google productivity/navigation workflows after core integration is 
 - **when**: the user asks Ariel to find files by topic/name in natural language
 - **then**: Ariel executes Drive search as `read` behavior without approval, returns relevant file results with enough metadata to disambiguate candidates, and records auditable action lifecycle events
 
-### drive inspect returns bounded readable content with provenance
+### drive inspect (`cap.drive.read`) returns bounded readable content with provenance
 - **given**: a Drive file the user can access
 - **when**: the user asks Ariel to inspect/read that file
 - **then**: Ariel returns a bounded, user-meaningful content view (not raw unbounded payload), includes user-visible source/provenance references to the file inspected, and clearly reports typed outcomes when content is unsupported, too large, or unavailable
