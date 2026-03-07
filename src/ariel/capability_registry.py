@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from ipaddress import ip_address
 import hashlib
 import json
 import os
 from typing import Any, Literal, Protocol
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
 import httpx
 
@@ -83,6 +84,10 @@ def _validate_search_web_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any
 
 def _validate_search_news_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
     return _validate_exact_text_input(raw_input, field_name="query", max_length=1000)
+
+
+def _validate_web_extract_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    return _validate_exact_text_input(raw_input, field_name="url", max_length=2048)
 
 
 def _normalize_rfc3339_like(value: Any) -> str | None:
@@ -774,6 +779,473 @@ def _declare_search_news_egress_intent(input_payload: dict[str, Any]) -> list[di
 
 def _search_news_allowed_destinations() -> tuple[str, ...]:
     endpoint = _search_news_endpoint()
+    host = _endpoint_host(endpoint)
+    if host is not None:
+        return (host,)
+    return ("api.search.brave.com",)
+
+
+_WEB_EXTRACT_TRACKING_QUERY_KEYS = frozenset(
+    {
+        "utm_source",
+        "utm_medium",
+        "utm_campaign",
+        "utm_term",
+        "utm_content",
+        "utm_id",
+        "gclid",
+        "fbclid",
+        "mc_cid",
+        "mc_eid",
+    }
+)
+_WEB_EXTRACT_BLOCKED_HOST_SUFFIXES = (
+    ".internal",
+    ".local",
+    ".localhost",
+    ".home",
+    ".lan",
+)
+_WEB_EXTRACT_MAX_BLOCKS = 8
+_WEB_EXTRACT_MAX_BLOCK_CHARS = 1200
+_WEB_EXTRACT_MAX_TOTAL_CHARS = 4000
+
+
+def _web_extract_provider_endpoint() -> str:
+    default_endpoint = "https://api.search.brave.com/res/v1/web/extract"
+    configured_endpoint = os.getenv("ARIEL_WEB_EXTRACT_PROVIDER_ENDPOINT")
+    if configured_endpoint is None:
+        return default_endpoint
+    normalized = configured_endpoint.strip()
+    if not normalized:
+        return default_endpoint
+    parsed = urlparse(normalized)
+    if parsed.scheme:
+        return normalized
+    if "://" in normalized:
+        return default_endpoint
+    return f"https://{normalized.lstrip('/')}"
+
+
+def _web_extract_timeout_seconds() -> float:
+    configured_timeout = os.getenv("ARIEL_WEB_EXTRACT_TIMEOUT_SECONDS")
+    if configured_timeout is None:
+        return 10.0
+    normalized = configured_timeout.strip()
+    if not normalized:
+        return 10.0
+    try:
+        parsed = float(normalized)
+    except ValueError:
+        return 10.0
+    if parsed <= 0:
+        return 10.0
+    return parsed
+
+
+def _web_extract_max_retries() -> int:
+    configured_retries = os.getenv("ARIEL_WEB_EXTRACT_MAX_RETRIES")
+    if configured_retries is None:
+        return 2
+    normalized = configured_retries.strip()
+    if not normalized:
+        return 2
+    try:
+        parsed = int(normalized)
+    except ValueError:
+        return 2
+    if parsed < 0:
+        return 2
+    return min(parsed, 5)
+
+
+def _web_extract_api_key() -> str | None:
+    configured_api_key = os.getenv("ARIEL_WEB_EXTRACT_API_KEY")
+    if configured_api_key is None:
+        return _search_web_api_key()
+    normalized = configured_api_key.strip()
+    return normalized or _search_web_api_key()
+
+
+def _is_unsafe_web_extract_host(host: str) -> bool:
+    normalized = host.strip().lower().rstrip(".")
+    if not normalized:
+        return True
+    if normalized == "localhost":
+        return True
+    try:
+        parsed_ip = ip_address(normalized)
+    except ValueError:
+        # single-label hosts are treated as local-only/non-public and blocked.
+        if "." not in normalized:
+            return True
+        return normalized.endswith(_WEB_EXTRACT_BLOCKED_HOST_SUFFIXES)
+    return (
+        parsed_ip.is_private
+        or parsed_ip.is_loopback
+        or parsed_ip.is_link_local
+        or parsed_ip.is_multicast
+        or parsed_ip.is_reserved
+        or parsed_ip.is_unspecified
+    )
+
+
+def _format_url_netloc(*, host: str, port: int | None) -> str:
+    rendered_host = f"[{host}]" if ":" in host else host
+    if port is None:
+        return rendered_host
+    return f"{rendered_host}:{port}"
+
+
+def _normalize_web_extract_url(raw_url: str) -> tuple[str | None, str | None]:
+    candidate = raw_url.strip()
+    if not candidate:
+        return None, "url_invalid"
+    if any(character.isspace() for character in candidate):
+        return None, "url_invalid"
+    parsed = urlparse(candidate)
+    if not parsed.scheme:
+        return None, "url_invalid"
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"}:
+        return None, "url_scheme_unsupported"
+    if parsed.hostname is None:
+        return None, "url_invalid"
+    if parsed.username is not None or parsed.password is not None:
+        return None, "url_invalid"
+    host = parsed.hostname.lower().rstrip(".")
+    if not host:
+        return None, "url_invalid"
+    try:
+        parsed_port = parsed.port
+    except ValueError:
+        return None, "url_invalid"
+    if _is_unsafe_web_extract_host(host):
+        return None, "url_destination_unsafe"
+
+    path = parsed.path or "/"
+    netloc = _format_url_netloc(host=host, port=parsed_port)
+    normalized = urlunparse(
+        (
+            scheme,
+            netloc,
+            path,
+            "",
+            parsed.query,
+            "",
+        )
+    )
+    return normalized, None
+
+
+def _canonicalize_web_extract_source_identity(raw_url: str) -> str | None:
+    parsed = urlparse(raw_url)
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"} or parsed.hostname is None:
+        return None
+
+    host = parsed.hostname.lower().rstrip(".")
+    if not host:
+        return None
+
+    try:
+        parsed_port = parsed.port
+    except ValueError:
+        return None
+
+    default_port = 443 if scheme == "https" else 80
+    if parsed_port is None or parsed_port == default_port:
+        netloc = _format_url_netloc(host=host, port=None)
+    else:
+        netloc = _format_url_netloc(host=host, port=parsed_port)
+
+    path = parsed.path or "/"
+    if path != "/":
+        path = path.rstrip("/") or "/"
+
+    filtered_query_pairs: list[tuple[str, str]] = []
+    try:
+        query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    except ValueError:
+        return None
+    for key, value in query_pairs:
+        normalized_key = key.strip()
+        if not normalized_key:
+            continue
+        if normalized_key.lower() in _WEB_EXTRACT_TRACKING_QUERY_KEYS:
+            continue
+        filtered_query_pairs.append((normalized_key, value))
+    filtered_query_pairs.sort()
+    try:
+        canonical_query = urlencode(filtered_query_pairs, doseq=True)
+    except ValueError:
+        return None
+    return urlunparse((scheme, netloc, path, "", canonical_query, ""))
+
+
+def _web_extract_content_blocks(payload: dict[str, Any]) -> list[str]:
+    raw_blocks = payload.get("content_blocks")
+    parsed_blocks: list[str] = []
+    if isinstance(raw_blocks, list):
+        for raw_block in raw_blocks:
+            if isinstance(raw_block, str):
+                parsed_blocks.append(raw_block)
+                continue
+            if isinstance(raw_block, dict):
+                text = raw_block.get("text")
+                if isinstance(text, str):
+                    parsed_blocks.append(text)
+        if parsed_blocks:
+            return parsed_blocks
+
+    content_raw = payload.get("content")
+    if isinstance(content_raw, str) and content_raw.strip():
+        normalized_content = content_raw.replace("\r\n", "\n")
+        paragraph_blocks = [chunk.strip() for chunk in normalized_content.split("\n\n") if chunk.strip()]
+        if paragraph_blocks:
+            return paragraph_blocks
+
+    excerpt_raw = payload.get("excerpt")
+    if isinstance(excerpt_raw, str) and excerpt_raw.strip():
+        return [excerpt_raw.strip()]
+
+    return []
+
+
+def _normalize_web_extract_blocks(
+    raw_blocks: list[str],
+) -> tuple[list[dict[str, Any]], bool, int]:
+    normalized_blocks: list[dict[str, Any]] = []
+    total_chars = 0
+    truncated = False
+
+    for raw_block in raw_blocks:
+        compact_block = " ".join(raw_block.split())
+        if not compact_block:
+            continue
+        if len(normalized_blocks) >= _WEB_EXTRACT_MAX_BLOCKS:
+            truncated = True
+            break
+        if total_chars >= _WEB_EXTRACT_MAX_TOTAL_CHARS:
+            truncated = True
+            break
+
+        bounded_block = compact_block
+        if len(bounded_block) > _WEB_EXTRACT_MAX_BLOCK_CHARS:
+            bounded_block = bounded_block[:_WEB_EXTRACT_MAX_BLOCK_CHARS].rstrip()
+            truncated = True
+
+        remaining_chars = _WEB_EXTRACT_MAX_TOTAL_CHARS - total_chars
+        if len(bounded_block) > remaining_chars:
+            bounded_block = bounded_block[:remaining_chars].rstrip()
+            truncated = True
+        if not bounded_block:
+            truncated = True
+            break
+
+        normalized_blocks.append(
+            {
+                "index": len(normalized_blocks) + 1,
+                "text": bounded_block,
+            }
+        )
+        total_chars += len(bounded_block)
+
+    return normalized_blocks, truncated, total_chars
+
+
+def _web_extract_snippet(content_blocks: list[dict[str, Any]]) -> str:
+    candidate_parts: list[str] = []
+    for block in content_blocks[:2]:
+        text = block.get("text")
+        if isinstance(text, str) and text.strip():
+            candidate_parts.append(text.strip())
+    if not candidate_parts:
+        return "extracted evidence available"
+    snippet = " ".join(candidate_parts).strip()
+    if len(snippet) <= 500:
+        return snippet
+    return snippet[:500].rstrip() + "..."
+
+
+def _execute_web_extract(input_payload: dict[str, Any]) -> dict[str, Any]:
+    raw_url = input_payload.get("url")
+    if not isinstance(raw_url, str):
+        raise RuntimeError("url_invalid")
+
+    normalized_url, url_error = _normalize_web_extract_url(raw_url)
+    if url_error is not None or normalized_url is None:
+        raise RuntimeError(url_error or "url_invalid")
+
+    endpoint = _web_extract_provider_endpoint()
+    endpoint_host = _endpoint_host(endpoint)
+    endpoint_parsed = urlparse(endpoint)
+    if endpoint_host is None or endpoint_parsed.scheme.lower() not in {"http", "https"}:
+        raise RuntimeError("provider_unreachable")
+
+    headers: dict[str, str] = {
+        "accept": "application/json",
+        "content-type": "application/json",
+    }
+    api_key = _web_extract_api_key()
+    if api_key is not None:
+        headers["x-subscription-token"] = api_key
+
+    response: Any = None
+    max_retries = _web_extract_max_retries()
+    base_timeout_seconds = _web_extract_timeout_seconds()
+    attempt_count = 0
+    for attempt_index in range(max_retries + 1):
+        attempt_count = attempt_index + 1
+        # bounded linear backoff: 1.0x, 1.5x, 2.0x, ... up to retry ceiling.
+        timeout_seconds = base_timeout_seconds * (1.0 + (attempt_index * 0.5))
+        try:
+            response = httpx.post(
+                endpoint,
+                json={"url": normalized_url},
+                headers=headers,
+                timeout=timeout_seconds,
+            )
+        except httpx.TimeoutException as exc:
+            if attempt_index < max_retries:
+                continue
+            raise RuntimeError("provider_timeout") from exc
+        except httpx.HTTPError as exc:
+            if attempt_index < max_retries:
+                continue
+            raise RuntimeError("provider_network_failure") from exc
+
+        if response.status_code == 429:
+            if attempt_index < max_retries:
+                continue
+            raise RuntimeError("provider_rate_limited")
+        if response.status_code in {401, 403, 451}:
+            raise RuntimeError("access_restricted")
+        if response.status_code == 415:
+            raise RuntimeError("unsupported_format")
+        if response.status_code >= 500:
+            if attempt_index < max_retries:
+                continue
+            raise RuntimeError("provider_upstream_failure")
+        if response.status_code >= 400:
+            raise RuntimeError("provider_request_rejected")
+        break
+
+    if response is None:
+        raise RuntimeError("provider_upstream_failure")
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError("provider_invalid_payload") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("provider_invalid_payload")
+
+    document_payload_raw = payload.get("document")
+    document_payload = document_payload_raw if isinstance(document_payload_raw, dict) else payload
+    final_url_raw = (
+        document_payload.get("final_url")
+        or document_payload.get("canonical_url")
+        or document_payload.get("url")
+    )
+    resolved_url = normalized_url
+    if isinstance(final_url_raw, str) and final_url_raw.strip():
+        normalized_final_url, final_url_error = _normalize_web_extract_url(final_url_raw)
+        if final_url_error is not None or normalized_final_url is None:
+            if final_url_error == "url_destination_unsafe":
+                raise RuntimeError("url_destination_unsafe")
+            raise RuntimeError("provider_invalid_payload")
+        resolved_url = normalized_final_url
+
+    canonical_url = _canonicalize_web_extract_source_identity(resolved_url)
+    if canonical_url is None:
+        raise RuntimeError("provider_invalid_payload")
+
+    canonical_host = urlparse(canonical_url).hostname
+    if canonical_host is None or _is_unsafe_web_extract_host(canonical_host):
+        raise RuntimeError("url_destination_unsafe")
+
+    retrieved_at = (
+        _normalize_optional_timestamp(document_payload.get("retrieved_at"))
+        or datetime.now(tz=UTC).isoformat().replace("+00:00", "Z")
+    )
+    published_at = _normalize_optional_timestamp(document_payload.get("published_at"))
+
+    title_raw = document_payload.get("title")
+    title = title_raw.strip() if isinstance(title_raw, str) and title_raw.strip() else "Extracted page"
+
+    raw_blocks = _web_extract_content_blocks(document_payload)
+    if not raw_blocks and document_payload is not payload:
+        raw_blocks = _web_extract_content_blocks(payload)
+    normalized_blocks, content_truncated, content_chars = _normalize_web_extract_blocks(raw_blocks)
+    if not normalized_blocks:
+        raise RuntimeError("unsupported_format")
+
+    status_raw = document_payload.get("status")
+    provider_marked_partial = (
+        (isinstance(status_raw, str) and status_raw.strip().lower() == "partial")
+        or document_payload.get("partial") is True
+        or document_payload.get("truncated") is True
+    )
+    is_partial = content_truncated or provider_marked_partial
+    reason_code = "content_truncated" if is_partial else None
+    recovery = (
+        "content was truncated. narrow scope to a specific section or shorter page and retry."
+        if is_partial
+        else None
+    )
+
+    language_raw = document_payload.get("language")
+    language = language_raw.strip().lower() if isinstance(language_raw, str) and language_raw.strip() else None
+
+    return {
+        "url": normalized_url,
+        "canonical_url": canonical_url,
+        "retrieved_at": retrieved_at,
+        "extract_outcome": {
+            "status": "partial" if is_partial else "ok",
+            "reason_code": reason_code,
+            "recovery": recovery,
+        },
+        "document": {
+            "title": title,
+            "canonical_source": canonical_url,
+            "resolved_url": resolved_url,
+            "retrieved_at": retrieved_at,
+            "published_at": published_at,
+            "language": language,
+            "truncated": is_partial,
+            "truncation_reason": reason_code,
+            "content_chars": content_chars,
+            "content_blocks": normalized_blocks,
+        },
+        "provider": {
+            "endpoint": endpoint,
+            "attempt_count": attempt_count,
+            "retry_count": attempt_count - 1,
+        },
+        "results": [
+            {
+                "title": title,
+                "source": canonical_url,
+                "snippet": _web_extract_snippet(normalized_blocks),
+                "published_at": published_at,
+            }
+        ],
+    }
+
+
+def _declare_web_extract_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "destination": _web_extract_provider_endpoint(),
+            "payload": {"url": input_payload["url"]},
+        }
+    ]
+
+
+def _web_extract_allowed_destinations() -> tuple[str, ...]:
+    endpoint = _web_extract_provider_endpoint()
     host = _endpoint_host(endpoint)
     if host is not None:
         return (host,)
@@ -1968,6 +2440,24 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         execute=_execute_google_drive_share,
         declare_egress_intent=_declare_google_drive_share_egress_intent,
     ),
+    "cap.web.extract": CapabilityDefinition(
+        capability_id="cap.web.extract",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "url_extract_v1",
+            "output_schema": "url_extract_result_v1",
+            "idempotency": "deterministic_read",
+            "execution_mode": "capability_runtime_only",
+            "bounded_output": "structured_blocks_with_partial_disclosure",
+            "safety_preflight": "strict_fail_closed",
+        },
+        allowed_egress_destinations=_web_extract_allowed_destinations(),
+        validate_input=_validate_web_extract_input,
+        execute=_execute_web_extract,
+        declare_egress_intent=_declare_web_extract_egress_intent,
+    ),
     "cap.search.web": CapabilityDefinition(
         capability_id="cap.search.web",
         version="1.0",
@@ -2092,7 +2582,20 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
 
 
 def get_capability(capability_id: str) -> CapabilityDefinition | None:
-    return _CAPABILITY_REGISTRY.get(capability_id)
+    capability = _CAPABILITY_REGISTRY.get(capability_id)
+    if capability is None:
+        return None
+    if capability_id == "cap.search.web":
+        return replace(capability, allowed_egress_destinations=_search_web_allowed_destinations())
+    if capability_id == "cap.search.news":
+        return replace(capability, allowed_egress_destinations=_search_news_allowed_destinations())
+    if capability_id in {"cap.maps.directions", "cap.maps.search_places"}:
+        return replace(capability, allowed_egress_destinations=_maps_allowed_destinations())
+    if capability_id == "cap.weather.forecast":
+        return replace(capability, allowed_egress_destinations=_weather_allowed_destinations())
+    if capability_id == "cap.web.extract":
+        return replace(capability, allowed_egress_destinations=_web_extract_allowed_destinations())
+    return capability
 
 
 def capability_contract_hash(capability: CapabilityDefinition) -> str:
