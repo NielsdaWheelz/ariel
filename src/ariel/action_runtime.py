@@ -190,11 +190,13 @@ _MAX_SNIPPET_LENGTH = 320
 _NEWS_FRESHNESS_MAX_AGE = timedelta(hours=48)
 _MAX_CONFLICT_COMPONENT_TOKENS = 8
 _MAPS_RETRIEVAL_CAPABILITY_IDS = {"cap.maps.directions", "cap.maps.search_places"}
+_WEB_EXTRACT_RETRIEVAL_CAPABILITY_IDS = {"cap.web.extract"}
 _GROUNDED_RETRIEVAL_CAPABILITIES = {
     "cap.search.web",
     "cap.search.news",
     "cap.weather.forecast",
     *_MAPS_RETRIEVAL_CAPABILITY_IDS,
+    *_WEB_EXTRACT_RETRIEVAL_CAPABILITY_IDS,
     *GOOGLE_READ_CAPABILITY_IDS,
 }
 
@@ -250,6 +252,30 @@ _TYPED_MAPS_RECOVERY: dict[str, str] = {
 }
 
 
+_TYPED_WEB_EXTRACT_RECOVERY: dict[str, str] = {
+    "url_invalid": "provide a valid public url and retry (example: https://example.com/page).",
+    "url_scheme_unsupported": "use an http(s) url. non-http schemes are blocked.",
+    "url_destination_unsafe": (
+        "this destination is blocked by url safety policy. use a public internet host."
+    ),
+    "access_restricted": (
+        "the page is access-restricted. provide a publicly readable url or share exported text."
+    ),
+    "unsupported_format": (
+        "this page format is unsupported for text extraction. try a text-first page or exported text."
+    ),
+    "provider_timeout": "url extraction timed out. retry with a narrower page or section.",
+    "provider_network_failure": "url extraction had a network failure. retry shortly.",
+    "provider_rate_limited": "url extraction is rate limited. wait briefly, then retry.",
+    "provider_upstream_failure": "url extraction provider is degraded. retry shortly.",
+    "provider_request_rejected": "url extraction request was rejected. verify the url and retry.",
+    "provider_invalid_payload": "url extraction provider returned invalid data. retry shortly.",
+    "provider_unreachable": (
+        "url extraction provider endpoint is unreachable. ask your operator to verify endpoint config."
+    ),
+}
+
+
 def _maps_recovery_hint_for_error(error: str) -> str | None:
     typed = _TYPED_MAPS_RECOVERY.get(error)
     if typed is not None:
@@ -267,6 +293,28 @@ def _maps_recovery_hint_for_error(error: str) -> str | None:
     }:
         return (
             "maps egress preflight contract is invalid. "
+            "ask your operator to review capability egress declarations."
+        )
+    return None
+
+
+def _web_extract_recovery_hint_for_error(error: str) -> str | None:
+    typed = _TYPED_WEB_EXTRACT_RECOVERY.get(error)
+    if typed is not None:
+        return typed
+    if error.startswith("egress_destination_denied"):
+        return (
+            "url extraction egress policy blocked the configured destination before execution. "
+            "ask your operator to review the endpoint allowlist."
+        )
+    if error in {
+        "egress_preflight_missing_intent",
+        "egress_preflight_contract_invalid",
+        "egress_preflight_undeclared_intent",
+        "egress_destination_invalid",
+    }:
+        return (
+            "url extraction egress preflight contract is invalid. "
             "ask your operator to review capability egress declarations."
         )
     return None
@@ -696,6 +744,52 @@ def _synthesize_maps_retrieval_answer(
     return grounded_message, collected_sources
 
 
+def _synthesize_web_extract_retrieval_answer(
+    *,
+    collected_sources: list[dict[str, Any]],
+    citation_snippets: list[str],
+    retrieval_errors: list[str],
+    web_extract_outputs: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]]]:
+    raw_errors = list(retrieval_errors)
+    normalized_errors = _normalize_retrieval_errors(raw_errors)
+    if not collected_sources:
+        for candidate in raw_errors:
+            typed_recovery = _web_extract_recovery_hint_for_error(candidate)
+            if typed_recovery is not None:
+                return f"url extraction failure ({candidate}). {typed_recovery}", []
+        if normalized_errors:
+            return (
+                "i'm uncertain because url extraction failed "
+                f"({normalized_errors[0]}). provide a public http(s) url and retry.",
+                [],
+            )
+        return (
+            "i'm uncertain because i could not extract enough url evidence. "
+            "provide a public url and retry with narrower scope.",
+            [],
+        )
+
+    grounded_message, _ = _synthesize_grounded_retrieval_answer(
+        collected_sources=collected_sources,
+        citation_snippets=citation_snippets,
+        retrieval_errors=retrieval_errors,
+    )
+    first_output = web_extract_outputs[0] if web_extract_outputs else {}
+    extract_outcome_raw = first_output.get("extract_outcome")
+    extract_outcome = extract_outcome_raw if isinstance(extract_outcome_raw, dict) else {}
+    outcome_status = extract_outcome.get("status")
+    if isinstance(outcome_status, str) and outcome_status == "partial":
+        recovery_raw = extract_outcome.get("recovery")
+        recovery = (
+            recovery_raw.strip()
+            if isinstance(recovery_raw, str) and recovery_raw.strip()
+            else "narrow scope to a specific section and retry."
+        )
+        grounded_message = f"{grounded_message} partial coverage: extraction was truncated. {recovery}"
+    return grounded_message, collected_sources
+
+
 def _synthesize_google_read_answer(
     *,
     collected_sources: list[dict[str, Any]],
@@ -815,6 +909,7 @@ def process_action_proposals(
     retrieval_capability_ids: set[str] = set()
     weather_outputs: list[dict[str, Any]] = []
     maps_outputs: list[dict[str, Any]] = []
+    web_extract_outputs: list[dict[str, Any]] = []
     google_outputs: list[dict[str, Any]] = []
     google_auth_failures: list[TypedAuthFailure] = []
 
@@ -831,6 +926,7 @@ def process_action_proposals(
         is_retrieval_proposal = capability_id in _GROUNDED_RETRIEVAL_CAPABILITIES
         is_weather_forecast_proposal = capability_id == "cap.weather.forecast"
         is_maps_retrieval_proposal = capability_id in _MAPS_RETRIEVAL_CAPABILITY_IDS
+        is_web_extract_retrieval_proposal = capability_id in _WEB_EXTRACT_RETRIEVAL_CAPABILITY_IDS
         if is_retrieval_proposal:
             retrieval_requested = True
             retrieval_capability_ids.add(capability_id)
@@ -1145,6 +1241,8 @@ def process_action_proposals(
                     weather_outputs.append(execution_result.output)
                 if is_maps_retrieval_proposal:
                     maps_outputs.append(execution_result.output)
+                if is_web_extract_retrieval_proposal:
+                    web_extract_outputs.append(execution_result.output)
             add_event(
                 "evt.action.execution.succeeded",
                 {
@@ -1195,6 +1293,13 @@ def process_action_proposals(
                 citation_snippets=retrieval_snippets,
                 retrieval_errors=retrieval_errors,
                 maps_outputs=maps_outputs,
+            )
+        elif retrieval_capability_ids.issubset(_WEB_EXTRACT_RETRIEVAL_CAPABILITY_IDS):
+            final_assistant_message, assistant_sources = _synthesize_web_extract_retrieval_answer(
+                collected_sources=retrieval_sources,
+                citation_snippets=retrieval_snippets,
+                retrieval_errors=retrieval_errors,
+                web_extract_outputs=web_extract_outputs,
             )
         elif retrieval_capability_ids == {"cap.weather.forecast"}:
             final_assistant_message, assistant_sources = _synthesize_weather_retrieval_answer(
