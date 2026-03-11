@@ -169,7 +169,7 @@ Deferred indefinitely (unscheduled): Nexus Notes Integration
   - Failure cases are surfaced with actionable next steps.
 - **Risks**: Long-running tasks and partial failures can create confusing states without clear job visibility.
 
-### Slice 11A: Notification Transport Foundation
+### Slice 11: Notification Transport Foundation
 - **Goal**: Establish production-grade, first-party notification delivery plumbing before proactive logic.
 - **Outcome**: Ariel can deliver auditable notifications through web inbox and web push with robust preference and retry behavior.
 - **Dependencies**: Slice 4, Slice 5
@@ -181,10 +181,10 @@ Deferred indefinitely (unscheduled): Nexus Notes Integration
   - User can inspect notification history and acknowledge/dismiss events in-app.
 - **Risks**: Browser/platform push behavior and permission friction can reduce delivery consistency if not handled with resilient fallback UX.
 
-### Slice 11B: Proactive Notification Layer
+### Slice 12: Proactive Notification Layer
 - **Goal**: Deliver user-configured proactive surfacing without opening autonomous side-effect risk.
 - **Outcome**: Ariel can notify users about relevant changes/events based on subscriptions and schedules.
-- **Dependencies**: Slice 4, Slice 5, Slice 11A
+- **Dependencies**: Slice 4, Slice 5, Slice 11
 - **Acceptance**:
   - User can configure recurring notification checks and notification preferences.
   - Ariel sends notifications for high-value events (for example schedule reminders; completed-job notifications when Slice 10 is enabled).
@@ -193,10 +193,10 @@ Deferred indefinitely (unscheduled): Nexus Notes Integration
   - User can mute, disable, or adjust proactive behavior.
 - **Risks**: Notification fatigue and delivery reliability can reduce product value if not tuned.
 
-### Slice 12: Provider Portability + Reliability
+### Slice 13: Provider Portability + Reliability
 - **Goal**: Make the assistant resilient to model/provider changes without user-facing regressions.
 - **Outcome**: Core conversation, capability, and proactive flows remain stable when provider configuration changes.
-- **Dependencies**: Slice 11B
+- **Dependencies**: Slice 12
 - **Acceptance**:
   - Core user journeys continue to work when switching model providers.
   - Provider outages or degraded responses fail clearly without corrupting conversation or action state.
@@ -205,10 +205,10 @@ Deferred indefinitely (unscheduled): Nexus Notes Integration
   - Cross-provider must-have workflow scorecards meet explicit release targets: task success >= 90%, schema-valid tool-call rate >= 99%, citation-compliance rate = 100% for externally grounded claims, and critical policy violations = 0.
 - **Risks**: Behavior drift between providers can reduce predictability of plans and tool usage.
 
-### Slice 13: Production Readiness Gate
+### Slice 14: Production Readiness Gate
 - **Goal**: Make Ariel safe and dependable for day-to-day personal operations.
 - **Outcome**: The system has operational safeguards, recoverability, and release confidence for ongoing use.
-- **Dependencies**: Slice 12
+- **Dependencies**: Slice 13
 - **Acceptance**:
   - User can inspect system health and recent failures.
   - Backups and restores preserve conversations, canonical memory, jobs, notifications, and audit history.
