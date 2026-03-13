@@ -225,7 +225,7 @@ class CaptureRecord(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "capture_kind IN ('text', 'url', 'unknown')",
+            "capture_kind IN ('text', 'url', 'shared_content', 'unknown')",
             name="ck_capture_kind",
         ),
         CheckConstraint(

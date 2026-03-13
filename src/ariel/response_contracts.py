@@ -108,6 +108,7 @@ class SurfaceTaintEvidenceContract(BaseModel):
         "prior_tool_output_in_context",
         "runtime_provenance_missing",
         "runtime_provenance_evidence_malformed",
+        "capture_shared_content_ingress",
     ]
     turn_id: str | None = None
     action_attempt_id: str | None = None
@@ -447,7 +448,7 @@ class SurfaceCaptureContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
-    kind: Literal["text", "url", "unknown"]
+    kind: Literal["text", "url", "shared_content", "unknown"]
     terminal_state: Literal["turn_created", "ingest_failed"]
     effective_session_id: str | None
     turn_id: str | None

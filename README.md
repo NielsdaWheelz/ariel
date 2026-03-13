@@ -285,13 +285,14 @@ grounded provenance contracts:
 - mixed turns containing `cap.web.extract` plus non-retrieval proposals keep retrieval-grounded
   assistant messaging while preserving structured lifecycle inspectability for all proposals.
 
-## slice-8 pr-01 quick capture surface (`post /v1/captures`)
+## slice-8 quick capture surface (`post /v1/captures`)
 
-slice-8 pr-01 adds first-class quick capture ingress for bounded text and url payloads:
+slice-8 adds first-class quick capture ingress for bounded text, url, and shared-content payloads:
 
 - request shape:
   - `kind="text"` requires `text`
   - `kind="url"` requires `url`
+  - `kind="shared_content"` requires `shared_content` with optional `text` and `urls[]`
   - optional `note`
   - optional `source` object (`app`, `title`, `url`)
 - client does not provide a session id; ariel resolves effective active session server-side and
