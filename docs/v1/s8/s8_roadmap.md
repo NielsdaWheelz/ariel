@@ -1,5 +1,7 @@
 # Slice 8: Quick Capture Surface — PR Roadmap
 
+current state: pr-01 and pr-02 are merged; `POST /v1/captures` now supports `text`, `url`, and `shared_content`.
+
 ### PR-01: Capture Ingress Vertical (`POST /v1/captures`) for Text + URL
 - **goal**: deliver first-class quick capture for note/text/url shares with durable capture identity, server-resolved session targeting, and replay-safe turn creation through Ariel’s existing conversation runtime.
 - **builds on**: Slice 7 PR-01 merged state (typed surfaced turn/artifact contracts, retrieval provenance, and taint-aware action runtime) and Slice 5 PR-02 merged state (one-active-session rotation and idempotent message ingress).
@@ -12,7 +14,7 @@
   - bare text/url captures are observe-first input only: they do not implicitly authorize writes, approvals, or direct memory mutation outside the normal turn/policy path.
 - **non-goals**: shared text-content captures with explicit note/source separation; capture-origin taint hardening for shared source bodies; any Ariel-owned capture-entry UX; image/audio/file capture; offline/background client queues.
 
-### PR-02: (planned after PR-01 merges) Shared-Content Capture Hardening + Source/Policy Safety
+### PR-02: Shared-Content Capture Hardening + Source/Policy Safety
 - **goal**: complete Slice 8 by hardening shared-content capture semantics and inspection/failure behavior so future share clients can use the capture ingress safely without opening a side channel around policy or memory.
 - **builds on**: PR-01.
 - **acceptance**:

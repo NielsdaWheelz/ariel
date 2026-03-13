@@ -25,6 +25,11 @@
 - preserved observe-first semantics by normalizing capture input with explicit untrusted-ingress framing,
   so bare capture content does not become an implicit memory/approval side channel.
 
+## scope follow-on note
+
+- pr-02 extended `POST /v1/captures` with `kind="shared_content"` (`shared_content.text?`,
+  `shared_content.urls[]`) while preserving pr-01 ingress/idempotency and turn-linkage guarantees.
+
 ## key hardening decisions
 
 ### idempotency race closure for concurrent same-key capture retries
