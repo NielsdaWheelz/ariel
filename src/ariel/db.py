@@ -15,6 +15,7 @@ REQUIRED_TABLES: Final[tuple[str, ...]] = (
     "session_rotations",
     "turns",
     "turn_idempotency_keys",
+    "captures",
     "events",
     "action_attempts",
     "approval_requests",
