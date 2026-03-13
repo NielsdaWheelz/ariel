@@ -106,7 +106,7 @@ class SessionRotationRecord(Base):
         index=True,
     )
     reason: Mapped[str] = mapped_column(String(32), nullable=False)
-    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     actor_id: Mapped[str] = mapped_column(String(128), nullable=False)
     trigger_snapshot: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
@@ -185,6 +185,80 @@ class TurnIdempotencyRecord(Base):
             "session_id",
             "idempotency_key",
             unique=True,
+        ),
+    )
+
+
+class CaptureRecord(Base):
+    __tablename__ = "captures"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    capture_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    original_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    normalized_turn_input: Mapped[str | None] = mapped_column(Text, nullable=True)
+    effective_session_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("sessions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    turn_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("turns.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    terminal_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    ingest_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    ingest_error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ingest_error_details: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True),
+        nullable=True,
+    )
+    ingest_error_retryable: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    status_code: Mapped[int] = mapped_column(Integer, nullable=False)
+    response_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "capture_kind IN ('text', 'url', 'unknown')",
+            name="ck_capture_kind",
+        ),
+        CheckConstraint(
+            "terminal_state IN ('turn_created', 'ingest_failed')",
+            name="ck_capture_terminal_state",
+        ),
+        CheckConstraint(
+            (
+                "(terminal_state = 'turn_created' "
+                "AND turn_id IS NOT NULL "
+                "AND effective_session_id IS NOT NULL "
+                "AND normalized_turn_input IS NOT NULL "
+                "AND ingest_error_code IS NULL "
+                "AND ingest_error_message IS NULL "
+                "AND ingest_error_details IS NULL "
+                "AND ingest_error_retryable IS NULL) "
+                "OR "
+                "(terminal_state = 'ingest_failed' "
+                "AND turn_id IS NULL "
+                "AND effective_session_id IS NULL "
+                "AND normalized_turn_input IS NULL "
+                "AND ingest_error_code IS NOT NULL "
+                "AND ingest_error_message IS NOT NULL "
+                "AND ingest_error_details IS NOT NULL "
+                "AND ingest_error_retryable IS NOT NULL)"
+            ),
+            name="ck_capture_terminal_linkage",
+        ),
+        Index(
+            "ix_captures_idempotency_key_unique",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=(idempotency_key.is_not(None)),
         ),
     )
 
@@ -549,6 +623,30 @@ def serialize_session(session: SessionRecord) -> dict[str, Any]:
         "lifecycle_state": session.lifecycle_state,
         "created_at": to_rfc3339(session.created_at),
         "updated_at": to_rfc3339(session.updated_at),
+    }
+
+
+def serialize_capture(capture: CaptureRecord) -> dict[str, Any]:
+    ingest_failure = (
+        {
+            "code": capture.ingest_error_code,
+            "message": capture.ingest_error_message,
+            "details": redact_json_value(capture.ingest_error_details or {}),
+            "retryable": bool(capture.ingest_error_retryable),
+        }
+        if capture.terminal_state == "ingest_failed"
+        else None
+    )
+    return {
+        "id": capture.id,
+        "kind": capture.capture_kind,
+        "terminal_state": capture.terminal_state,
+        "effective_session_id": capture.effective_session_id,
+        "turn_id": capture.turn_id,
+        "idempotency_key": capture.idempotency_key,
+        "ingest_failure": ingest_failure,
+        "created_at": to_rfc3339(capture.created_at),
+        "updated_at": to_rfc3339(capture.updated_at),
     }
 
 

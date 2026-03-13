@@ -47,6 +47,12 @@ for url-extract acceptance during slice-7 pr-01 work, run:
 .venv/bin/python -m pytest tests/integration/test_s7_pr01_acceptance.py
 ```
 
+for quick-capture acceptance during slice-8 pr-01 work, run:
+
+```bash
+.venv/bin/python -m pytest tests/integration/test_s8_pr01_acceptance.py
+```
+
 ## slice-2 action surface
 
 the action engine now evaluates model proposals per turn and emits an auditable lifecycle:
@@ -69,8 +75,8 @@ the phone surface renders action details directly from this surfaced projection,
 
 slice-2 pr-06 locks response boundaries for user-facing slice-2 APIs:
 
-- `POST /v1/sessions/{session_id}/message`, `GET /v1/sessions/{session_id}/events`, and
-  `POST /v1/approvals` are schema-enforced surfaced contracts.
+- `POST /v1/sessions/{session_id}/message`, `GET /v1/sessions/{session_id}/events`,
+  `POST /v1/approvals`, and `POST /v1/captures` are schema-enforced surfaced contracts.
 - message responses expose `assistant.message` only (not `assistant.provider/model`).
 - turn events use strict per-`event_type` payload schemas (no open `events[].payload` dictionaries).
 - contract drift is fail-closed with `E_RESPONSE_CONTRACT` and sanitized error details.
@@ -279,6 +285,26 @@ grounded provenance contracts:
 - mixed turns containing `cap.web.extract` plus non-retrieval proposals keep retrieval-grounded
   assistant messaging while preserving structured lifecycle inspectability for all proposals.
 
+## slice-8 pr-01 quick capture surface (`post /v1/captures`)
+
+slice-8 pr-01 adds first-class quick capture ingress for bounded text and url payloads:
+
+- request shape:
+  - `kind="text"` requires `text`
+  - `kind="url"` requires `url`
+  - optional `note`
+  - optional `source` object (`app`, `title`, `url`)
+- client does not provide a session id; ariel resolves effective active session server-side and
+  runs the same turn/orchestration/action lifecycle used by chat turns.
+- responses are strict surfaced contracts:
+  - success: `{ok, capture, session, turn, assistant}`
+  - failure: `{ok, capture, error}`
+- idempotency is request-scoped and optional via `Idempotency-Key`:
+  - same key + same payload replays prior capture/turn outcome
+  - same key + different payload returns `409 E_IDEMPOTENCY_KEY_REUSED`
+- capture ingress failures are durable and typed (`E_CAPTURE_*`) and are explicitly separated from
+  in-turn failures (`capture.terminal_state="turn_created"` with typed `error`).
+
 google connector runtime config:
 
 - `ARIEL_GOOGLE_OAUTH_CLIENT_ID`
@@ -405,7 +431,8 @@ see `docs/v1/s2/s2_prs/s2_pr02_implementation_notes.md` and
 `docs/v1/s4/s4_prs/s4_pr03_implementation_notes.md` and
 `docs/v1/s6/s6_prs/s6_pr01_implementation_notes.md` and
 `docs/v1/s6/s6_prs/s6_pr02_implementation_notes.md` and
-`docs/v1/s7/s7_prs/s7_pr01_implementation_notes.md` for implementation details and tradeoffs.
+`docs/v1/s7/s7_prs/s7_pr01_implementation_notes.md` and
+`docs/v1/s8/s8_prs/s8_pr01_implementation_notes.md` for implementation details and tradeoffs.
 
 ## run locally
 
@@ -486,6 +513,10 @@ smoke-check the key surfaces:
 ```bash
 curl -sS http://127.0.0.1:8000/v1/health
 curl -sS http://127.0.0.1:8000/v1/sessions/active
+curl -sS -X POST http://127.0.0.1:8000/v1/captures \
+  -H "content-type: application/json" \
+  -H "Idempotency-Key: smoke-capture-001" \
+  -d '{"kind":"text","text":"smoke capture"}'
 curl -sS http://127.0.0.1:8000/
 ```
 
