@@ -1,27 +1,28 @@
 # Slice 8: Quick Capture Surface — PR Roadmap
 
-current state: pr-01 and pr-02 are merged; `POST /v1/captures` now supports `text`, `url`, and `shared_content`.
+current state: pr-01 and pr-02 are merged, but Slice 8 is not complete yet.
 
-### PR-01: Capture Ingress Vertical (`POST /v1/captures`) for Text + URL
-- **goal**: deliver first-class quick capture for note/text/url shares with durable capture identity, server-resolved session targeting, and replay-safe turn creation through Ariel’s existing conversation runtime.
-- **builds on**: Slice 7 PR-01 merged state (typed surfaced turn/artifact contracts, retrieval provenance, and taint-aware action runtime) and Slice 5 PR-02 merged state (one-active-session rotation and idempotent message ingress).
-- **acceptance**:
-  - Ariel introduces authenticated `POST /v1/captures` for bounded `text` and `url` captures with optional note/source metadata and no client-supplied session id.
-  - accepted capture submissions persist durable `cpt_` identity, original payload, normalized turn input, effective session id, and terminal linkage to exactly one created turn or one typed ingest failure.
-  - successful captures resolve the effective active session server-side, execute through the same turn/orchestration/action-lifecycle path as normal chat turns, and appear in existing session timeline/message surfaces rather than a separate conversation history.
-  - capture idempotency is request-scoped across retries and session rotation: identical replays return the original capture/turn outcome, while conflicting payload reuse returns a typed idempotency conflict without duplicate turns.
-  - invalid, unsupported, or oversize capture payloads fail before turn creation with typed recovery guidance and durable capture status instead of silent drop behavior.
-  - bare text/url captures are observe-first input only: they do not implicitly authorize writes, approvals, or direct memory mutation outside the normal turn/policy path.
-- **non-goals**: shared text-content captures with explicit note/source separation; capture-origin taint hardening for shared source bodies; any Ariel-owned capture-entry UX; image/audio/file capture; offline/background client queues.
+remaining gaps in merged state:
+- capture-created turns appear in the normal turn/timeline surfaces, but those surfaced contracts do not link back to the durable `cpt_` record, so capture auditability is still only available in the immediate `POST /v1/captures` response or the database.
+- terminal capture records are durable in storage but not user-inspectable after creation, which leaves ingest failures effectively ephemeral at the API surface.
+- only `shared_content` capture ingress is runtime-tainted today; `text` and `url` captures can still drive allowlisted write-reversible capabilities without capture-origin taint escalation.
 
-### PR-02: Shared-Content Capture Hardening + Source/Policy Safety
-- **goal**: complete Slice 8 by hardening shared-content capture semantics and inspection/failure behavior so future share clients can use the capture ingress safely without opening a side channel around policy or memory.
-- **builds on**: PR-01.
+### PR-03: Capture Safety Parity for Text + URL
+- **goal**: extend capture-origin safety semantics to all capture kinds so observe-first capture input cannot auto-run allowlisted side effects while still using Ariel's normal action and approval lifecycle.
+- **builds on**: PR-02.
 - **acceptance**:
-  - `POST /v1/captures` accepts shared text-content payloads and preserves explicit separation between user-authored note and shared source material while retaining raw capture payload for audit and future multimodal extension.
-  - capture-origin shared source material is treated as untrusted ingress provenance, so side-effecting proposals influenced by it escalate or deny under Ariel’s existing taint and approval rules instead of auto-authorizing.
-  - observe-first behavior is preserved for bare shared content: source text/URLs without explicit user instruction are conversational context, not direct commands, approvals, or memory instructions.
-  - capture outcomes distinguish ingress rejection from in-turn failure in surfaced capture contracts while linking successful captures back to the normal turn/timeline surfaces.
-  - capture turns can participate in browsing/retrieval and memory workflows without bypassing citation/provenance requirements, approval policy, or candidate/validated memory lifecycle rules.
-  - regression coverage blocks release on capture-specific invariants: capture-scoped idempotency across rotation, note/source separation, taint-driven side-effect blocking, durable failure classification, and no direct capture-to-memory side channel.
-- **non-goals**: chat-page capture integration, native mobile share-target UI, binary/vision/speech capture, batched capture submission, or proactive/background clipping.
+  - `text`, `url`, and `shared_content` captures all mark shared source material as untrusted ingress provenance for runtime policy evaluation instead of relying on prompt wording alone.
+  - bare captures cannot inline write-reversible or external-send actions through allowlisted capabilities; capture-origin side-effect proposals escalate or deny under the existing taint rules.
+  - capture-origin proposals that require approval still surface the same proposal, approval, and execution lifecycle as normal chat turns and can be completed through the existing approvals flow.
+  - regression coverage blocks release on the previously-open loophole where `text` or `url` captures could auto-run allow-inline write-reversible capabilities.
+- **non-goals**: changing chat-turn policy outside capture ingress; adding chat/mobile capture UX; multimodal or batched capture.
+
+### PR-04: Capture Audit Surface Completion
+- **goal**: make durable capture records actually inspectable at the surfaced API and link capture identity into unified turn history so Slice 8 meets its auditability requirements without a second conversation-history model.
+- **builds on**: PR-03.
+- **acceptance**:
+  - turn and timeline surfaces for capture-created turns expose stable capture linkage for auditability, including capture identity and kind.
+  - Ariel adds a read-only capture inspection path so successful captures and ingest failures remain inspectable after the initial `POST /v1/captures` response.
+  - surfaced capture inspection distinguishes ingest rejection from post-turn failure while preserving stable retry and recovery guidance.
+  - regression coverage proves capture linkage in surfaced history and durable lookup of terminal capture outcomes without database access.
+- **non-goals**: capture list/search UX; background/offline mobile sync; binary, vision, or audio capture; new conversation-history surfaces separate from turns.
