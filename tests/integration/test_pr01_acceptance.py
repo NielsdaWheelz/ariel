@@ -546,7 +546,7 @@ def test_whitespace_only_message_is_rejected_with_standard_error(postgres_url: s
         assert timeline.json()["turns"] == []
 
 
-def test_phone_surface_renders_timeline_from_stored_event_chain(postgres_url: str) -> None:
+def test_root_serves_discord_primary_status_not_phone_surface(postgres_url: str) -> None:
     adapter = DeterministicModelAdapter()
     with _build_client(postgres_url, adapter) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
@@ -559,16 +559,14 @@ def test_phone_surface_renders_timeline_from_stored_event_chain(postgres_url: st
 
         surface = client.get("/")
         assert surface.status_code == 200
-        html = surface.text
-        assert "viewport" in html
-        assert "/v1/sessions/active" in html
-        assert "/v1/sessions/${sessionId}/events" in html
-        assert "formatEventDetails" in html
-        assert "provider=" in html
-        assert "model=" in html
-        assert "duration_ms=" in html
-        assert "failure_reason=" in html
-        assert "tokens(" in html
+        assert surface.headers["content-type"].startswith("application/json")
+        root_payload = surface.json()
+        assert root_payload["ok"] is True
+        assert root_payload["surface"] == "discord"
+        assert root_payload["api"]["active_session"] == "/v1/sessions/active"
+        assert "Discord" in root_payload["message"]
+        assert "chat-form" not in surface.text
+        assert "/v1/sessions/${sessionId}/events" not in surface.text
 
         timeline = client.get(f"/v1/sessions/{session_id}/events")
         turns = timeline.json()["turns"]

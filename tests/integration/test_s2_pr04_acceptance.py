@@ -165,8 +165,10 @@ def test_s2_pr04_inline_read_success_is_surface_inspectable_redacted_and_allowli
 
         surface = client.get("/")
         assert surface.status_code == 200
-        assert "surface_action_lifecycle" in surface.text
-        assert "turn.surface_action_lifecycle" in surface.text
+        surface_payload = surface.json()
+        assert surface_payload["ok"] is True
+        assert surface_payload["surface"] == "discord"
+        assert surface_payload["api"]["session_events"] == "/v1/sessions/{session_id}/events"
 
 
 def test_s2_pr04_approval_denied_is_surface_inspectable_with_redacted_reason(

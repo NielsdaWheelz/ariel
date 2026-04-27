@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from pydantic import ValidationError
 
 from ariel.app import create_app
 from ariel.config import AppSettings
+
+
+def _app_settings_without_env_files() -> AppSettings:
+    return cast(Any, AppSettings)(_env_file=None)
 
 
 def test_app_settings_load_from_project_env_files() -> None:
@@ -147,3 +152,92 @@ def test_approval_actor_id_rejects_blank_values(monkeypatch: pytest.MonkeyPatch)
 
     with pytest.raises(ValidationError):
         AppSettings()
+
+
+def test_discord_settings_default_to_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ARIEL_DISCORD_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("ARIEL_DISCORD_GUILD_ID", raising=False)
+    monkeypatch.delenv("ARIEL_DISCORD_CHANNEL_ID", raising=False)
+    monkeypatch.delenv("ARIEL_DISCORD_USER_ID", raising=False)
+    monkeypatch.delenv("ARIEL_DISCORD_ARIEL_BASE_URL", raising=False)
+
+    settings = _app_settings_without_env_files()
+    assert settings.discord_bot_token is None
+    assert settings.discord_guild_id is None
+    assert settings.discord_channel_id is None
+    assert settings.discord_user_id is None
+    assert settings.discord_ariel_base_url == "http://127.0.0.1:8000"
+    assert settings.discord_notification_timeout_seconds == 10.0
+    assert settings.agency_event_secret is None
+    assert settings.agency_event_max_skew_seconds == 300
+    assert settings.worker_poll_seconds == 1.0
+    assert settings.worker_heartbeat_timeout_seconds == 300
+
+
+def test_discord_settings_load_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARIEL_DISCORD_BOT_TOKEN", "discord-token")
+    monkeypatch.setenv("ARIEL_DISCORD_GUILD_ID", "222")
+    monkeypatch.setenv("ARIEL_DISCORD_CHANNEL_ID", "333")
+    monkeypatch.setenv("ARIEL_DISCORD_USER_ID", "444")
+    monkeypatch.setenv("ARIEL_DISCORD_ARIEL_BASE_URL", "http://127.0.0.1:9000/")
+    monkeypatch.setenv("ARIEL_DISCORD_NOTIFICATION_TIMEOUT_SECONDS", "7.5")
+    monkeypatch.setenv("ARIEL_AGENCY_EVENT_SECRET", "agency-secret")
+    monkeypatch.setenv("ARIEL_AGENCY_EVENT_MAX_SKEW_SECONDS", "120")
+    monkeypatch.setenv("ARIEL_WORKER_POLL_SECONDS", "0.25")
+    monkeypatch.setenv("ARIEL_WORKER_HEARTBEAT_TIMEOUT_SECONDS", "45")
+
+    settings = _app_settings_without_env_files()
+    assert settings.discord_bot_token == "discord-token"
+    assert settings.discord_guild_id == 222
+    assert settings.discord_channel_id == 333
+    assert settings.discord_user_id == 444
+    assert settings.discord_ariel_base_url == "http://127.0.0.1:9000"
+    assert settings.discord_notification_timeout_seconds == 7.5
+    assert settings.agency_event_secret == "agency-secret"
+    assert settings.agency_event_max_skew_seconds == 120
+    assert settings.worker_poll_seconds == 0.25
+    assert settings.worker_heartbeat_timeout_seconds == 45
+
+
+@pytest.mark.parametrize(
+    "env_name",
+    [
+        "ARIEL_DISCORD_GUILD_ID",
+        "ARIEL_DISCORD_CHANNEL_ID",
+        "ARIEL_DISCORD_USER_ID",
+    ],
+)
+def test_discord_ids_reject_non_positive_values(
+    monkeypatch: pytest.MonkeyPatch,
+    env_name: str,
+) -> None:
+    monkeypatch.setenv(env_name, "0")
+
+    with pytest.raises(ValidationError):
+        _app_settings_without_env_files()
+
+
+def test_discord_base_url_must_be_http_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARIEL_DISCORD_ARIEL_BASE_URL", "not-a-url")
+
+    with pytest.raises(ValidationError):
+        _app_settings_without_env_files()
+
+
+@pytest.mark.parametrize(
+    "env_name",
+    [
+        "ARIEL_DISCORD_NOTIFICATION_TIMEOUT_SECONDS",
+        "ARIEL_WORKER_POLL_SECONDS",
+        "ARIEL_AGENCY_EVENT_MAX_SKEW_SECONDS",
+        "ARIEL_WORKER_HEARTBEAT_TIMEOUT_SECONDS",
+    ],
+)
+def test_worker_and_agency_numeric_settings_reject_non_positive_values(
+    monkeypatch: pytest.MonkeyPatch,
+    env_name: str,
+) -> None:
+    monkeypatch.setenv(env_name, "0")
+
+    with pytest.raises(ValidationError):
+        _app_settings_without_env_files()

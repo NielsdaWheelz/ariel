@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from contextlib import asynccontextmanager
+import hmac
 import hashlib
 import json
 import re
@@ -16,8 +17,8 @@ import ulid
 from fastapi import Body, FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from sqlalchemy import (
     and_,
     create_engine,
@@ -47,11 +48,15 @@ from ariel.google_connector import (
 from ariel.persistence import (
     ActionAttemptRecord,
     ApprovalRequestRecord,
+    AgencyEventRecord,
     CaptureRecord,
     EventRecord,
     ArtifactRecord,
+    JobEventRecord,
+    JobRecord,
     MemoryItemRecord,
     MemoryRevisionRecord,
+    NotificationRecord,
     SessionRecord,
     SessionRotationRecord,
     TurnIdempotencyRecord,
@@ -60,11 +65,14 @@ from ariel.persistence import (
     serialize_capture,
     serialize_artifact,
     serialize_action_attempt,
+    serialize_agency_event,
+    serialize_job,
+    serialize_job_event,
     serialize_session,
+    serialize_notification,
     serialize_turn,
     to_rfc3339,
 )
-from ariel.phone_surface import PHONE_SURFACE_HTML
 from ariel.redaction import redact_text, safe_failure_reason
 from ariel.response_contracts import (
     ResponseContractViolation,
@@ -79,6 +87,7 @@ from ariel.response_contracts import (
     build_surface_timeline_response,
 )
 from ariel.weather_state import get_weather_default_location_state, set_weather_default_location
+from ariel.worker import enqueue_background_task
 
 
 def _utcnow() -> datetime:
@@ -262,6 +271,48 @@ class ApprovalDecisionRequest(BaseModel):
             return None
         normalized = value.strip()
         return normalized or None
+
+
+class AgencyEventRequest(BaseModel):
+    source: str = Field(min_length=1, max_length=64)
+    event_id: str = Field(min_length=1, max_length=128)
+    event_type: Literal[
+        "heartbeat",
+        "job.queued",
+        "job.started",
+        "job.progress",
+        "job.waiting",
+        "job.completed",
+        "job.failed",
+        "job.cancelled",
+        "job.timed_out",
+    ]
+    external_job_id: str | None = Field(default=None, max_length=128)
+    title: str | None = Field(default=None, max_length=500)
+    summary: str | None = Field(default=None, max_length=2000)
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("source", "event_id")
+    @classmethod
+    def _required_text_must_not_be_blank(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("value must not be blank")
+        return normalized
+
+    @field_validator("external_job_id", "title", "summary")
+    @classmethod
+    def _optional_text_must_not_be_blank(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+    @model_validator(mode="after")
+    def _job_events_need_job_id(self) -> AgencyEventRequest:
+        if self.event_type != "heartbeat" and self.external_job_id is None:
+            raise ValueError("external_job_id is required for job events")
+        return self
 
 
 class WeatherDefaultLocationRequest(BaseModel):
@@ -546,6 +597,24 @@ def _build_openai_messages(
                         "content": "open commitments:\n" + "\n".join(commitment_lines),
                     }
                 )
+        jobs_raw = open_commitments_and_jobs.get("open_jobs")
+        if isinstance(jobs_raw, list) and jobs_raw:
+            job_lines: list[str] = []
+            for job in jobs_raw:
+                if not isinstance(job, dict):
+                    continue
+                job_id = job.get("id")
+                status = job.get("status")
+                title = job.get("title") or job.get("external_job_id")
+                if isinstance(job_id, str) and isinstance(status, str) and isinstance(title, str):
+                    job_lines.append(f"- {job_id}: {status}: {title}")
+            if job_lines:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": "open jobs:\n" + "\n".join(job_lines),
+                    }
+                )
 
     relevant_artifacts_and_signals = context_bundle.get("relevant_artifacts_and_signals")
     if isinstance(relevant_artifacts_and_signals, dict):
@@ -678,6 +747,15 @@ def _estimate_context_tokens(*, context_bundle: dict[str, Any], user_message: st
                     continue
                 for key in ("memory_key", "value"):
                     raw_value = commitment.get(key)
+                    if isinstance(raw_value, str):
+                        token_total += _estimate_text_tokens(raw_value)
+        jobs_raw = open_commitments_and_jobs.get("open_jobs")
+        if isinstance(jobs_raw, list):
+            for job in jobs_raw:
+                if not isinstance(job, dict):
+                    continue
+                for key in ("id", "status", "title", "external_job_id", "summary"):
+                    raw_value = job.get(key)
                     if isinstance(raw_value, str):
                         token_total += _estimate_text_tokens(raw_value)
 
@@ -1943,6 +2021,16 @@ def _open_commitments_context(*, db: Session) -> list[dict[str, Any]]:
     return open_commitments[:_MAX_OPEN_COMMITMENTS_IN_CONTEXT]
 
 
+def _open_jobs_context(*, db: Session) -> list[dict[str, Any]]:
+    jobs = db.scalars(
+        select(JobRecord)
+        .where(JobRecord.status.in_(("queued", "running", "waiting_approval")))
+        .order_by(JobRecord.updated_at.desc(), JobRecord.id.desc())
+        .limit(12)
+    ).all()
+    return [serialize_job(job) for job in jobs]
+
+
 def _open_validated_commitment_ids(*, db: Session) -> list[str]:
     return [commitment["memory_item_id"] for commitment in _open_commitments_context(db=db)]
 
@@ -2415,6 +2503,8 @@ def create_app(
     app.state.connector_encryption_secret = settings.connector_encryption_secret
     app.state.connector_encryption_key_version = settings.connector_encryption_key_version
     app.state.connector_encryption_keys = settings.connector_encryption_keys
+    app.state.agency_event_secret = settings.agency_event_secret
+    app.state.agency_event_max_skew_seconds = settings.agency_event_max_skew_seconds
     app.state.google_oauth_client = DefaultGoogleOAuthClient(
         client_id=settings.google_oauth_client_id,
         client_secret=settings.google_oauth_client_secret,
@@ -2451,9 +2541,22 @@ def create_app(
             )
         )
 
-    @app.get("/", response_class=HTMLResponse)
-    def phone_surface() -> str:
-        return PHONE_SURFACE_HTML
+    @app.get("/", response_model=None)
+    def root() -> dict[str, Any]:
+        return {
+            "ok": True,
+            "surface": "discord",
+            "message": "Ariel is Discord-primary. Use the Discord bot for chat.",
+            "api": {
+                "health": "/v1/health",
+                "active_session": "/v1/sessions/active",
+                "session_events": "/v1/sessions/{session_id}/events",
+                "approval_decisions": "/v1/approvals",
+                "agency_events": "/v1/agency/events",
+                "jobs": "/v1/jobs/{job_id}",
+                "notifications": "/v1/notifications",
+            },
+        }
 
     def _ensure_schema_ready() -> None:
         if app.state.schema_missing_tables:
@@ -2493,6 +2596,169 @@ def create_app(
                 )
             )
         return {"ok": True}
+
+    @app.post("/v1/agency/events", response_model=None)
+    async def post_agency_event(request: Request) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        secret = app.state.agency_event_secret
+        if not isinstance(secret, str) or not secret:
+            raise ApiError(
+                status_code=503,
+                code="E_AGENCY_EVENTS_DISABLED",
+                message="agency event ingress is not configured",
+                details={"setting": "ARIEL_AGENCY_EVENT_SECRET"},
+                retryable=False,
+            )
+
+        timestamp_header = request.headers.get("X-Ariel-Agency-Timestamp")
+        signature_header = request.headers.get("X-Ariel-Agency-Signature")
+        if timestamp_header is None or signature_header is None:
+            raise ApiError(
+                status_code=401,
+                code="E_AGENCY_SIGNATURE_MISSING",
+                message="agency event signature headers are required",
+                details={},
+                retryable=False,
+            )
+        try:
+            timestamp_seconds = int(timestamp_header)
+        except ValueError as exc:
+            raise ApiError(
+                status_code=401,
+                code="E_AGENCY_TIMESTAMP_INVALID",
+                message="agency event timestamp is invalid",
+                details={},
+                retryable=False,
+            ) from exc
+        if abs(int(time.time()) - timestamp_seconds) > int(app.state.agency_event_max_skew_seconds):
+            raise ApiError(
+                status_code=401,
+                code="E_AGENCY_TIMESTAMP_EXPIRED",
+                message="agency event timestamp is outside the accepted skew window",
+                details={},
+                retryable=False,
+            )
+
+        body = await request.body()
+        expected_signature = hmac.new(
+            secret.encode("utf-8"),
+            timestamp_header.encode("utf-8") + b"." + body,
+            hashlib.sha256,
+        ).hexdigest()
+        provided_signature = signature_header.strip()
+        if provided_signature.startswith("sha256="):
+            provided_signature = provided_signature.removeprefix("sha256=")
+        if not hmac.compare_digest(expected_signature, provided_signature):
+            raise ApiError(
+                status_code=401,
+                code="E_AGENCY_SIGNATURE_INVALID",
+                message="agency event signature is invalid",
+                details={},
+                retryable=False,
+            )
+
+        try:
+            raw_payload = json.loads(body)
+        except ValueError as exc:
+            raise ApiError(
+                status_code=422,
+                code="E_AGENCY_EVENT_INVALID_JSON",
+                message="agency event payload must be valid JSON",
+                details={},
+                retryable=False,
+            ) from exc
+        if not isinstance(raw_payload, dict):
+            raise ApiError(
+                status_code=422,
+                code="E_AGENCY_EVENT_INVALID",
+                message="agency event payload must be a JSON object",
+                details={},
+                retryable=False,
+            )
+
+        try:
+            agency_event_payload = AgencyEventRequest.model_validate(raw_payload)
+        except ValidationError as exc:
+            raise ApiError(
+                status_code=422,
+                code="E_AGENCY_EVENT_INVALID",
+                message="agency event payload is invalid",
+                details={
+                    "reason": safe_failure_reason(
+                        str(exc),
+                        fallback="agency event payload validation failed",
+                    )
+                },
+                retryable=False,
+            ) from exc
+
+        with session_factory() as db:
+            with db.begin():
+                existing_event = db.scalar(
+                    select(AgencyEventRecord)
+                    .where(
+                        AgencyEventRecord.source == agency_event_payload.source,
+                        AgencyEventRecord.external_event_id == agency_event_payload.event_id,
+                    )
+                    .limit(1)
+                )
+                stored_payload = agency_event_payload.model_dump()
+                if existing_event is not None:
+                    if (
+                        existing_event.event_type != agency_event_payload.event_type
+                        or existing_event.external_job_id != agency_event_payload.external_job_id
+                        or existing_event.payload != stored_payload
+                    ):
+                        raise ApiError(
+                            status_code=409,
+                            code="E_AGENCY_EVENT_CONFLICT",
+                            message="agency event id was reused with different payload",
+                            details={
+                                "source": agency_event_payload.source,
+                                "event_id": agency_event_payload.event_id,
+                            },
+                            retryable=False,
+                        )
+                    return JSONResponse(
+                        status_code=202,
+                        content={
+                            "ok": True,
+                            "duplicate": True,
+                            "agency_event": serialize_agency_event(existing_event),
+                        },
+                    )
+
+                now = _utcnow()
+                agency_event = AgencyEventRecord(
+                    id=_new_id("age"),
+                    source=agency_event_payload.source,
+                    external_event_id=agency_event_payload.event_id,
+                    event_type=agency_event_payload.event_type,
+                    external_job_id=agency_event_payload.external_job_id,
+                    payload=stored_payload,
+                    status="accepted",
+                    error=None,
+                    received_at=now,
+                    processed_at=None,
+                )
+                db.add(agency_event)
+                db.flush()
+                task = enqueue_background_task(
+                    db,
+                    task_type="agency_event_received",
+                    payload={"agency_event_id": agency_event.id},
+                    now=now,
+                    max_attempts=5,
+                )
+                return JSONResponse(
+                    status_code=202,
+                    content={
+                        "ok": True,
+                        "duplicate": False,
+                        "agency_event": serialize_agency_event(agency_event),
+                        "task_id": task.id,
+                    },
+                )
 
     @app.post("/v1/sessions")
     def create_or_get_session() -> dict[str, Any]:
@@ -2842,7 +3108,7 @@ def create_app(
         )
         pre_rotation_open_commitments_and_jobs = {
             "open_commitments": _open_commitments_context(db=db),
-            "open_jobs": [],
+            "open_jobs": _open_jobs_context(db=db),
         }
         pre_rotation_context_bundle = _build_turn_context_bundle(
             prior_turns=prior_turns,
@@ -2900,7 +3166,7 @@ def create_app(
         )
         open_commitments_and_jobs = {
             "open_commitments": _open_commitments_context(db=db),
-            "open_jobs": [],
+            "open_jobs": _open_jobs_context(db=db),
         }
         context_bundle = _build_turn_context_bundle(
             prior_turns=prior_turns,
@@ -3828,6 +4094,90 @@ def create_app(
                     )
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/jobs/{job_id}")
+    def get_job(job_id: str) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                job = db.scalar(select(JobRecord).where(JobRecord.id == job_id).limit(1))
+                if job is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_JOB_NOT_FOUND",
+                        message="job not found",
+                        details={"job_id": job_id},
+                        retryable=False,
+                    )
+                return {"ok": True, "job": serialize_job(job)}
+
+    @app.get("/v1/jobs/{job_id}/events")
+    def get_job_events(job_id: str) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                job = db.scalar(select(JobRecord).where(JobRecord.id == job_id).limit(1))
+                if job is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_JOB_NOT_FOUND",
+                        message="job not found",
+                        details={"job_id": job_id},
+                        retryable=False,
+                    )
+                events = db.scalars(
+                    select(JobEventRecord)
+                    .where(JobEventRecord.job_id == job_id)
+                    .order_by(JobEventRecord.created_at.asc(), JobEventRecord.id.asc())
+                ).all()
+                return {
+                    "ok": True,
+                    "job_id": job_id,
+                    "events": [serialize_job_event(event) for event in events],
+                }
+
+    @app.get("/v1/notifications")
+    def get_notifications(limit: int = 50) -> dict[str, Any]:
+        _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 200))
+        with session_factory() as db:
+            with db.begin():
+                notifications = db.scalars(
+                    select(NotificationRecord)
+                    .order_by(NotificationRecord.created_at.desc(), NotificationRecord.id.desc())
+                    .limit(bounded_limit)
+                ).all()
+                return {
+                    "ok": True,
+                    "notifications": [
+                        serialize_notification(notification) for notification in notifications
+                    ],
+                }
+
+    @app.post("/v1/notifications/{notification_id}/ack")
+    def ack_notification(notification_id: str) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                notification = db.scalar(
+                    select(NotificationRecord)
+                    .where(NotificationRecord.id == notification_id)
+                    .with_for_update()
+                    .limit(1)
+                )
+                if notification is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_NOTIFICATION_NOT_FOUND",
+                        message="notification not found",
+                        details={"notification_id": notification_id},
+                        retryable=False,
+                    )
+                now = _utcnow()
+                notification.status = "acknowledged"
+                notification.acked_at = now
+                notification.updated_at = now
+                return {"ok": True, "notification": serialize_notification(notification)}
 
     @app.get("/v1/artifacts/{artifact_id}")
     def get_artifact(artifact_id: str) -> dict[str, Any]:

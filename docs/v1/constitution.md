@@ -1,41 +1,31 @@
-# ariel — constitution v3
+# ariel — constitution v4
 
 ## 1. vision
 
 ### problem
-Work and life actions are fragmented across tools and devices. Away from a desk, it is hard to execute high-leverage actions reliably.
+Personal work actions are fragmented across tools. Ariel should let the owner ask once, then track and execute bounded work reliably.
 
 ### solution
-Ariel is a private, self-hosted assistant that accepts natural language and multimodal input, uses model-led open-ended reasoning inside bounded runtime guardrails, and executes actions through typed capabilities with policy checks, approvals, and full auditability.
+Ariel is a private Discord-primary assistant backed by a FastAPI core, durable Postgres state, and explicit background workers. It accepts natural language, plans with model help, executes typed capabilities under policy, and records every turn, job, event, notification, and approval.
 
-### scope (mvp)
-- Phone-first surface (web chat plus speech-to-text/text-to-speech push-to-talk voice I/O) over Tailscale.
-- Installable web app (PWA) with first-party web push notifications and in-app notification center.
-- Core orchestrator loop: intake -> context build -> think/plan -> tool calls -> response.
-- Capability system with strict input/output schemas and policy enforcement.
-- Provider-agnostic external knowledge retrieval (web search/news/weather and URL extraction) with user-visible provenance.
-- Google Workspace integration (calendar, email, drive, maps) with approval-gated side effects.
-- `agency` integration is later-phase roadmap work (`Slice 10`) after additional MCP hardening.
-- Nexus notes integration is deferred indefinitely (unscheduled) and is not a current MVP dependency.
-- Vision-capable image understanding in conversation and capture workflows.
-- Proactive notification layer with user-configured scheduled checks and notification delivery.
-- Quick-capture entry points (share sheet, clipboard, shortcuts) that ingest into the active session.
-- Append-only event log plus structured logs with redaction.
-- Provider-agnostic model router (swap providers without core refactors).
-- Episodic conversation sessions with durable cross-session memory.
+### scope
+- Discord is the primary user surface for chat, approvals, job status, and notifications.
+- FastAPI remains the internal HTTP core for orchestration, surface adapters, health, and typed ingress.
+- Postgres is canonical for sessions, turns, memories, jobs, job events, agency events, notifications, and audit events.
+- A worker process owns durable background job execution, scheduled checks, retries, and notification delivery.
+- Agency integration uses signed HTTP ingress/events and durable job records.
+- Google Workspace, web/news/weather, maps, drive, URL extraction, and memory remain capability-driven.
+- External factual claims from web/news/weather/search require user-visible provenance.
 
-### non-scope (mvp)
-- Plugin marketplace, third-party skill auto-install, or arbitrary dynamic code loading.
-- Third-party chat platforms (Discord/Slack/Telegram) as primary interaction surfaces.
-- Generic shell/ssh capability exposed to the model.
-- Autonomous open-ended background agents; only bounded user-configured proactive checks/notifications are allowed.
-- Fully automated external sending (email/post) outside subscription-bound notification policy; draft or approval-gated only.
-- Phone-call placement/receiving (voice telephony).
-- Financial transaction or payment automation.
-- Smart-home device control.
-- Real-time always-on streaming voice conversation.
-- Multi-user tenancy or public internet hosting.
-- Unbounded "forever context replay" per turn.
+### non-scope
+- No web/PWA/phone frontend as the primary surface.
+- No legacy frontend compatibility requirement for the phone web surface.
+- No inbound MCP control plane for Ariel.
+- No plugin marketplace, arbitrary dynamic code loading, or generic model-exposed shell/ssh.
+- No autonomous unbounded background agents; background work is job/subscription bounded.
+- No public multi-user tenancy.
+- No always-on streaming voice.
+- No smart-home, payment, or financial transaction automation.
 
 ---
 
@@ -43,60 +33,67 @@ Ariel is a private, self-hosted assistant that accepts natural language and mult
 
 | concept | definition |
 |---|---|
-| **surface** | Authenticated channel where the user interacts (web now, voice/mobile later). |
-| **session** | One episodic conversation with short-term continuity. Exactly one active session per user at a time. |
-| **turn** | One user input and the resulting sequence of model/tool events. |
-| **capability** | Typed tool contract executed under schema, policy, timeout, and output guardrails. |
-| **action attempt** | Durable record for one proposed capability call and its lifecycle (`proposed -> awaiting_approval -> approved|denied|expired -> executing -> succeeded|failed`). |
+| **surface** | Authenticated adapter where the owner interacts. Discord is primary. |
+| **session** | One episodic conversation with short-term continuity. |
+| **turn** | One user input and the resulting model/tool/event sequence. |
+| **capability** | Typed tool contract executed under schema, policy, timeout, and output limits. |
+| **action attempt** | Durable lifecycle for one proposed capability call. |
+| **job** | Durable background unit of work with retry, timeout, cancellation, and event history. |
+| **agency event** | Signed external event from Agency linked to a job/action. |
+| **notification** | Durable user-visible message emitted from jobs, scheduled checks, or system events. |
 | **memory record** | Durable cross-session fact/preference/commitment with provenance and confidence. |
-| **event log** | Append-only system-of-record stream for turns, model calls, tools, approvals, and jobs. |
+| **event log** | Append-only system-of-record stream for turns, tools, approvals, jobs, agency, and notifications. |
 
 ---
 
 ## 3. architecture
 
-### components
-
 ```text
-+------------------------------------------+      HTTPS (tailnet only)      +-----------------------------+
-| surface (web, voice, capture ingress)    | -----------------------------> | core API + orchestrator     |
-| one active session                        |                                 | session/memory builder       |
-+------------------------------------------+                                 | policy + approvals           |
-                                                                             | event log writer             |
-                                                                             +-----------+-----------------+
-                                                                                         | typed internal RPC
-                                                                                         v
-                                                                             +-----------------------------+
-                                                                             | executor (cap runtime)      |
-                                                                             | schema validation            |
-                                                                             | timeout/output limits        |
-                                                                             | adapters: google/brave/      |
-                                                                             | web-extract (+agency later)  |
-                                                                             +-----------+-----------------+
-                                                                                         |
-                                                                                         v
-                                                                             +-----------------------------+
-                                                                             | local/remote services       |
-                                                                             | google apis, brave,         |
-                                                                             | secret mgr (+agency later)  |
-                                                                             +-----------------------------+
-                                                                                         ^
-                                                                                         |
-                                                                             +-----------------------------+
-                                                                             | notification scheduler      |
-                                                                             | (subscription-bound,        |
-                                                                             | read-only checks)           |
-                                                                             +-----------------------------+
+Discord
+  |
+  | bot worker / surface adapter
+  v
++----------------------------+
+| FastAPI core               |
+| sessions + orchestration   |
+| policy + approvals         |
+| signed HTTP ingress        |
+| health/admin APIs          |
++-------------+--------------+
+              |
+              v
++----------------------------+
+| Postgres                   |
+| sessions, turns, memories  |
+| jobs, job_events           |
+| agency_events              |
+| notifications, audit       |
++-------------+--------------+
+              ^
+              |
++-------------+--------------+
+| worker process             |
+| job runner, scheduler      |
+| retries, notifications     |
+| agency event processing    |
++-------------+--------------+
+              |
+              v
++----------------------------+
+| capability/runtime adapters|
+| google, search, weather    |
+| maps, drive, web, agency   |
++----------------------------+
 ```
 
 ### trust model
-- Surfaces are authenticated clients and never execute tools directly.
-- Core is the only component allowed to call model providers and authorize tool execution.
-- Executor is least privilege and only returns schema-valid structured outputs.
-- Model outputs are untrusted until schema + policy checks pass.
-- External/untrusted content is data only and cannot mutate policy, prompts, or permissions.
-- Untrusted content cannot independently authorize side effects; policy must explicitly allow, escalate to approval, or deny.
-- Proactive scheduler flows are policy-bounded and cannot authorize side effects.
+- Discord authenticates the owner-facing surface; Ariel still authorizes every action server-side.
+- Surface adapters never execute capabilities directly.
+- FastAPI core validates requests, verifies signed ingress, authorizes actions, and writes canonical events.
+- Worker processes claim durable Postgres jobs and are idempotent.
+- Model output is untrusted until schema and policy checks pass.
+- External/untrusted content is data only and cannot mutate policy, prompts, scopes, or approvals.
+- Agency ingress is signed HTTP only; unsigned or replayed events are rejected.
 
 ---
 
@@ -104,46 +101,40 @@ Ariel is a private, self-hosted assistant that accepts natural language and mult
 
 | constraint | value |
 |---|---|
-| language/runtime | Python only (`fastapi` + async workers). |
-| deployment | Single-user self-hosted home machine, reachable over private Tailscale network. |
-| remote exposure | No public ingress in MVP; service binds localhost and is proxied via Tailscale Serve. |
-| storage | Postgres is the system of truth for sessions, turns, memories, jobs, notifications, and events. |
-| memory authority | External stores (including Nexus when enabled) are projections/integrations; they are never canonical memory SoT. |
+| language/runtime | Python FastAPI core plus Python workers. |
+| primary surface | Discord. |
+| frontend posture | No web/PWA/phone frontend primary path or compatibility promise. |
+| deployment | Single-user self-hosted service. |
+| storage | Postgres is canonical for runtime and audit state. |
+| background execution | Durable Postgres jobs/events, claimed by worker processes. |
+| agency ingress | Signed HTTP callbacks/events, persisted before processing. |
+| remote control | No inbound MCP control plane. |
+| future daemons | Optional standalone Rust daemons only when a narrow runtime need justifies them. |
 | conversation model | Episodic sessions, not one unbounded forever thread. |
-| context model | Deterministic bounded context builder per turn. |
-| response policy | No hard-coded response-type state machine; the model decides assistant messaging while runtime guardrails enforce safety and limits. |
+| context model | Deterministic bounded context builder per turn/job. |
 | model providers | Pluggable adapters behind one internal interface. |
-| retrieval provider portability | External web/news retrieval runs through Ariel capability contracts independent of model-provider built-in search tools. |
-| factual grounding policy | External factual claims from web/news/weather are citation-gated: user-visible references are required, and insufficient/conflicting evidence must be disclosed as uncertainty. |
-| weather location policy | Weather location resolution order is explicit location first, configured default second, clarification otherwise; implicit IP/device geolocation inference is not used in MVP. |
-| tool execution | No generic shell/ssh capability in MVP; when code-change capabilities are enabled, they route through `cap.agency.*` only. |
+| retrieval portability | Web/news/weather runs through Ariel capabilities, not provider-locked search tools. |
+| factual grounding | External factual claims need citations/provenance or explicit uncertainty. |
+| tool execution | No generic shell/ssh capability; code work routes through `cap.agency.*`. |
 | approvals | Required for irreversible or externally visible actions. |
-| side-effect execution model | Side-effecting capability calls are serialized for deterministic safety/audit behavior in MVP. |
-| oauth connector model | External connectors use OAuth authorization-code + PKCE with short-lived state and strict callback validation; token material is encrypted at rest. |
-| proactive execution model | Proactive checks are read-only and subscription-bound; notification delivery does not require per-notification approval. |
-| notification channel model | MVP notification channels are first-party web inbox plus web push (no third-party messaging dependency). |
-| quality gate model | Capability and orchestration changes must pass regression evaluations for grounding, safety, reliability, and multimodal behavior before release. |
-| egress model | Capability execution uses explicit destination allowlists; arbitrary outbound network access is denied by default. |
-| observability | Structured JSON logs and append-only event log are mandatory. |
-| redaction | Secrets never enter prompts or logs; UI output is scrubbed by default. |
+| side effects | Serialized where needed for deterministic safety and auditability. |
+| connector secrets | Encrypted at rest; never surfaced in prompts, logs, Discord, or API responses. |
+| egress | Explicit destination allowlists; deny by default. |
+| observability | JSON logs plus append-only events are mandatory. |
 
 ---
 
 ## 5. conventions
 
-### naming
-- capability ids: `cap.<domain>.<verb>` (example: `cap.agency.run`)
-- event types: `evt.<entity>.<action>` (example: `evt.turn.started`)
+### names
+- capability ids: `cap.<domain>.<verb>`
+- event types: `evt.<entity>.<action>`
 - session ids: `ses_<ulid>`
 - turn ids: `trn_<ulid>`
 - job ids: `job_<ulid>`
+- agency event ids: `age_<ulid>`
 - memory ids: `mem_<ulid>`
-- notification subscription ids: `sub_<ulid>`
-- capture ids: `cpt_<ulid>`
-
-### ids and timestamps
-- IDs: ULID
-- timestamps: RFC3339 UTC
+- notification ids: `ntf_<ulid>`
 
 ### standard error envelope
 
@@ -159,7 +150,7 @@ Ariel is a private, self-hosted assistant that accepts natural language and mult
 }
 ```
 
-### tool contract (required fields)
+### capability contract
 
 ```json
 {
@@ -178,187 +169,148 @@ Ariel is a private, self-hosted assistant that accepts natural language and mult
 ```
 
 ### logging
-- JSON logs only (one event per line).
-- Required fields: `ts`, `level`, `component`, `event_type`, `session_id`, `turn_id`, `job_id?`, `capability?`.
-- Redact keys matching case-insensitive patterns: `token|secret|key|authorization|cookie`.
+- JSON logs only.
+- Required fields: `ts`, `level`, `component`, `event_type`, `session_id?`, `turn_id?`, `job_id?`, `capability?`.
+- Redact keys matching `token|secret|key|authorization|cookie`.
 
-### policy and approval
-- Capability impact levels: `read | write_reversible | write_irreversible | external_send`.
-- Enforcement:
-  - `read`: no approval only for explicitly allowlisted low-impact read capabilities.
-  - `write_reversible`: approval unless explicitly allowlisted.
-  - `write_irreversible` and `external_send`: always requires approval.
-- Approval token must include hash of exact action payload, actor id, and expiry.
-- Approval tokens are single-use and authorize execution of the frozen proposed payload (no re-planning at approval time).
-- Proposals derived from untrusted external/tool content cannot auto-authorize side effects; policy escalates to approval or denies.
+### policy
+- Impact levels: `read | write_reversible | write_irreversible | external_send`.
+- `read`: allowed only for explicitly allowlisted low-impact capabilities.
+- `write_reversible`: approval unless explicitly allowlisted.
+- `write_irreversible` and `external_send`: always approval-gated.
+- Approval tokens bind actor, expiry, exact payload hash, capability identity, and contract hash.
+- Approval executes the frozen proposed payload only.
 
-### proactive notifications
-- Notification delivery is subscription-bound (explicit user opt-in, schedule, and channel policy) and does not require per-notification approval.
-- Notification channel preferences are explicit and user-configurable (`in_app` and `web_push` in MVP).
-- Proactive checks can invoke `read` capabilities only.
-- Proactive flows cannot execute side-effecting capabilities unless the user initiates a normal turn and approval policy passes.
+### jobs
+- Lifecycle: `queued -> running -> waiting_approval -> running -> succeeded|failed|cancelled|timed_out`.
+- Workers claim jobs transactionally and heartbeat while running.
+- Side-effecting steps require idempotency keys.
+- Every job emits append-only `job_events`.
+- Job status is surfaced through Discord notifications and explicit status responses.
 
-### capability integrity and egress
-- Execution is bound to stable capability identity/version and contract metadata captured at proposal time.
-- Any capability identity/contract mismatch at execution time is blocked and auditable.
-- Capability outbound access is constrained to explicit policy-allowed destinations.
+### agency
+- Agency work is represented as Ariel jobs.
+- Agency callbacks use signed HTTP ingress with replay protection.
+- Agency event payloads are persisted before downstream processing.
+- External or irreversible Agency outcomes remain approval-gated before Ariel requests them.
 
-### model interface
-- Internal adapter:
-  - `respond(messages, tools, config) -> {assistant_text, tool_calls[], usage, provider_response_id}`
-- Turn orchestration may iterate model <-> tool execution until terminal assistant output or bounded failure, with global limits on attempts/tokens/wall time.
-- Invalid JSON or schema-invalid tool call is treated as planning failure, never executed.
-
-### context builder (deterministic order)
-1. System/policy instructions.
-2. Current session recent turns (bounded tail).
-3. Rolling summary of current session.
-4. Retrieved durable memories (top-k, scored by relevance/recency/confidence).
-5. Open commitments/jobs relevant to this turn.
-6. Relevant source artifacts/proactive signals for the current request context (bounded and auditable).
+### notifications
+- Notifications are durable Postgres records.
+- Discord is the primary delivery channel.
+- Delivery attempts are append-only with dedupe/idempotency keys and retry/backoff state.
+- Scheduled/proactive checks can invoke read capabilities only.
 
 ---
 
 ## 6. invariants
 
 1. No capability executes without schema validation and policy authorization.
-2. Any approval-required action must match the approved payload hash exactly.
-3. Every turn writes a complete event chain: `turn.started`, model/tool events, and terminal `turn.completed|turn.failed`.
-4. Secrets are injected only at executor runtime; they are never included in model prompts.
-5. No generic remote code execution capability exists in MVP.
-6. When repo/code modification capabilities are enabled, all such actions initiated by Ariel must route via `cap.agency.*`.
-7. Untrusted external content cannot mutate policy, capability permissions, or system prompts.
-8. Each user has at most one active session at a time; sessions rotate by policy without losing durable memory.
-9. Context assembly is deterministic, bounded, and auditable for every turn.
-10. Every capability call has timeout and max output constraints; truncation is explicit.
-11. Jobs use durable state transitions with idempotency for side-effecting operations.
-12. User can inspect executed capability calls, approvals, job status, and artifacts in the surface.
-13. Untrusted content cannot independently authorize side-effecting capability execution.
-14. Approval decisions are single-use and execute only the exact approved payload.
-15. Side-effecting capability execution is serialized in MVP.
-16. Capability identity/contract mismatch at execution time blocks execution.
-17. Capability outbound access is limited to policy-allowed destinations.
-18. Postgres is canonical memory SoT; external systems (including Nexus when enabled) are projections and cannot silently overwrite canonical memory.
-19. Proactive scheduler executions are read-only and cannot trigger side-effecting capabilities.
-20. Every proactive notification is linked to its originating subscription/check and is user-inspectable.
-21. Connector credentials/scopes are least-privilege and auditable per capability.
-22. External factual claims sourced from web/news/search responses include user-inspectable provenance artifacts.
-23. Ariel does not present externally grounded factual claims as true without user-visible citations to provenance artifacts.
-24. Weather answers resolve location deterministically (`explicit -> configured default -> clarification`) and do not rely on implicit IP/device geolocation.
-25. Releases are blocked when regression evaluations fail on grounding, policy safety, reliability, or multimodal interaction quality.
-26. OAuth connector state handles are single-use, short-lived, and replay-safe.
-27. Connector token material is never surfaced in user APIs or logs and remains encrypted at rest.
-28. Capability calls requiring connector scopes fail with typed recoverable auth/scope outcomes instead of silent fallback behavior.
-29. Each delivered notification carries a stable dedupe/idempotency key to prevent duplicate user-visible delivery.
-30. Notification delivery attempts are append-only, auditable, and include retry/backoff outcomes.
-31. Quiet-hours and mute policies are enforced before push delivery is attempted.
-32. Push-to-talk is the only voice interaction mode in MVP; always-on streaming voice remains non-scope.
+2. Approval-required actions execute only the exact approved payload.
+3. Every turn writes a complete append-only event chain.
+4. Every background job writes durable state transitions and events.
+5. Agency ingress is signed, replay-safe, and persisted before processing.
+6. Secrets never enter model prompts, logs, Discord messages, or user API responses.
+7. Discord is the primary surface; web/PWA phone compatibility is not protected.
+8. No inbound MCP control plane exists.
+9. No generic model-exposed shell/ssh exists.
+10. Code work initiated by Ariel routes through `cap.agency.*`.
+11. Context assembly is deterministic, bounded, and auditable.
+12. Postgres is canonical memory/runtime/audit state.
+13. External stores are projections, not canonical memory.
+14. Proactive work is subscription/job bounded and cannot authorize side effects by itself.
+15. External factual claims require citations/provenance or disclosed uncertainty.
+16. Capability identity or contract mismatch blocks execution.
+17. Capability outbound access is allowlisted.
+18. Connector credentials are least-privilege, encrypted, and auditable.
+19. Notification delivery is deduped, retryable, and inspectable.
+20. Optional Rust daemons remain standalone helpers, not a replacement for FastAPI core.
 
 ---
 
 ## 7. systems of truth
 
-### conversation state
-- Event log is canonical SoT.
-- Session and turn tables are materialized query views over events.
-- Provider conversation ids are cache/optimization only and can be dropped without semantic loss.
-
-### action attempts
-- Action attempt lifecycle: `proposed -> awaiting_approval -> approved|denied|expired -> executing -> succeeded|failed`.
-- Action-attempt events are canonical SoT for proposal, policy decision, approval decision, execution, and returned outcome.
-- Turn status and action-attempt status are related but separate state machines.
+### conversations
+- Event log is canonical.
+- Session/turn tables are query snapshots over events.
+- Provider conversation ids are disposable cache.
 
 ### jobs
-- Job lifecycle: `queued -> running -> waiting_approval -> running -> succeeded|failed|cancelled|timed_out`.
-- `job_events` is canonical SoT; `jobs` table is latest snapshot.
-- Side-effecting job steps require idempotency keys.
+- `job_events` is canonical.
+- `jobs` is latest state for claiming and querying.
+- Workers are restart-safe and idempotent.
+
+### agency
+- `agency_events` is canonical for signed inbound Agency events.
+- Agency events link to jobs, action attempts, artifacts, and notifications.
 
 ### memory
 - Memory classes: `profile`, `preference`, `project`, `commitment`, `episodic_summary`.
-- Each memory stores provenance (`source_turn_id`), confidence, and `last_verified_at`.
+- Each memory stores provenance, confidence, and verification time.
 - Durable memory writes are policy-gated and auditable.
-- When Nexus integration is enabled, nexus note linkage is projection metadata (reference ids + sync state), not canonical memory state.
 
 ### notifications
-- Subscription configuration and notification events are canonical in Postgres.
-- Delivery history is append-only and auditable.
-- Notification payloads reference source artifacts/check evidence.
-- Push subscription endpoints are projections over canonical notification preference/subscription state.
+- Notification records and delivery attempts are canonical in Postgres.
+- Discord delivery state is a projection.
 
 ---
 
-## 8. api overview (mvp, methods + paths only)
+## 8. API overview
 
-### surface API
+### surface/core API
 - `POST /v1/sessions`
 - `GET /v1/sessions/active`
 - `POST /v1/sessions/{session_id}/message`
 - `GET /v1/sessions/{session_id}/events?after={event_id}`
+- `POST /v1/approvals`
+- `POST /v1/captures`
+- `GET /v1/jobs/{job_id}`
+- `GET /v1/jobs/{job_id}/events`
+- `GET /v1/notifications`
+- `POST /v1/notifications/{notification_id}/ack`
+- `GET /v1/artifacts/{artifact_id}`
+
+### connector API
 - `POST /v1/connectors/google/start`
 - `GET /v1/connectors/google/callback`
 - `GET /v1/connectors/google`
 - `POST /v1/connectors/google/reconnect`
 - `DELETE /v1/connectors/google`
-- `POST /v1/captures`
-- `POST /v1/approvals`
-- `POST /v1/notifications/subscriptions`
-- `GET /v1/notifications`
-- `GET /v1/notifications/preferences`
-- `POST /v1/notifications/preferences`
-- `POST /v1/notifications/{notification_id}/ack`
-- `POST /v1/push/subscriptions`
-- `DELETE /v1/push/subscriptions/{subscription_id}`
-- `GET /v1/jobs/{job_id}`
-- `GET /v1/jobs/{job_id}/events`
-- `GET /v1/artifacts/{artifact_id}`
 
-### executor API (internal)
-- `POST /v1/exec`
+### signed ingress
+- `POST /v1/agency/events`
+
+### internal health
 - `GET /v1/health`
 
 ---
 
-## appendix: capability set (implemented + planned/deferred)
+## 9. capability set
 
-### agency (planned later-phase, roadmap slice 10)
+### agency
 - `cap.agency.run`
 - `cap.agency.status`
 - `cap.agency.artifacts`
-- `cap.agency.request_pr` (approval required if it pushes remote changes)
+- `cap.agency.request_pr` (approval required when it pushes or changes remote state)
 
-### search
-- `cap.search.web` (`read`, provider-agnostic; Brave-backed by default in MVP)
-- `cap.search.news` (`read`)
+### search/weather/web
+- `cap.search.web`
+- `cap.search.news`
+- `cap.weather.forecast`
+- `cap.web.extract`
 
-### weather
-- `cap.weather.forecast` (`read`)
-
-### web
-- `cap.web.extract` (`read`)
-
-### email
-- `cap.email.search` (`read`)
-- `cap.email.read` (`read`)
-- `cap.email.draft` (`write_reversible`)
-- `cap.email.send` (`external_send`, approval required)
-
-### calendar
-- `cap.calendar.list` (`read`)
-- `cap.calendar.propose_slots` (`read`)
-- `cap.calendar.create_event` (`write_reversible`, approval required)
-
-### drive
-- `cap.drive.search` (`read`)
-- `cap.drive.read` (`read`)
-- `cap.drive.upload` (`write_reversible`)
-- `cap.drive.share` (`external_send`, approval required)
+### google workspace
+- `cap.calendar.list`
+- `cap.calendar.propose_slots`
+- `cap.calendar.create_event`
+- `cap.email.search`
+- `cap.email.read`
+- `cap.email.draft`
+- `cap.email.send`
+- `cap.drive.search`
+- `cap.drive.read`
+- `cap.drive.upload`
+- `cap.drive.share`
 
 ### maps
-- `cap.maps.directions` (`read`)
-- `cap.maps.search_places` (`read`)
-
-### nexus (deferred indefinitely, unscheduled)
-- `cap.nexus.search` (`read`)
-- `cap.nexus.read` (`read`)
-- `cap.nexus.create` (`write_reversible`)
-- `cap.nexus.append` (`write_reversible`)
+- `cap.maps.directions`
+- `cap.maps.search_places`

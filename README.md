@@ -1,12 +1,13 @@
 # ariel
 
-slice-0 walking skeleton with:
+discord-primary Ariel runtime with:
 
 - fastapi backend
-- postgres-backed sessions/turns/events persistence
+- discord bot surface adapter
+- postgres-backed sessions/turns/events/jobs persistence
 - slice-2 action-attempt + approval persistence (`action_attempts`, `approval_requests`)
 - single active-session contract
-- phone-first web chat surface at `/`
+- durable command/event surface for worker, agency, and notification flows
 - acceptance-first integration tests using real postgres (testcontainers)
 
 ## quickstart
@@ -19,11 +20,43 @@ make bootstrap
 
 if the API key is still the placeholder, edit `.env.local` and re-run `make bootstrap`.
 
-daily development after bootstrap:
+daily API development after bootstrap:
 
 ```bash
 make dev
 ```
+
+run the Discord surface worker in a second shell:
+
+```bash
+make run-discord
+```
+
+## discord primary surface
+
+enable Message Content Intent for the bot in the Discord Developer Portal.
+
+set these env vars in `.env.local`:
+
+- `ARIEL_DISCORD_BOT_TOKEN`
+- `ARIEL_DISCORD_GUILD_ID`
+- `ARIEL_DISCORD_CHANNEL_ID`
+- `ARIEL_DISCORD_USER_ID`
+- `ARIEL_DISCORD_ARIEL_BASE_URL` (default `http://127.0.0.1:8000`)
+
+run the Discord surface worker with:
+
+```bash
+make run-discord
+# or:
+python -m ariel.discord_bot
+```
+
+the bot does not register or use slash commands. it handles:
+
+- DMs from the configured user
+- normal messages in the primary configured guild/channel
+- mention/reply-only messages in other servers
 
 ## verification gates
 
@@ -34,7 +67,7 @@ make e2e
 bash scripts/agency_verify.sh
 ```
 
-`make e2e` runs high-signal smoke coverage for the phone surface timeline plus slice-1 bounded-context event auditing.
+`make e2e` runs high-signal smoke coverage for the current timeline and slice-1 bounded-context event auditing.
 for maps-focused acceptance during slice-6 pr-02 work, run:
 
 ```bash
@@ -70,7 +103,7 @@ user-facing turn/timeline payloads now include a dedicated surfaced lifecycle pr
   - `approval` (`status`, `reference`, `reason`, `expires_at`, `decided_at`)
   - `execution` (`status`, `output`, `error`)
 
-the phone surface renders action details directly from this surfaced projection, not from raw engine records.
+Discord and API consumers render action details from this surfaced projection, not from raw engine records.
 `turn.action_attempts` is not part of the user-facing turn/timeline contract.
 
 slice-2 pr-06 locks response boundaries for user-facing slice-2 APIs:
@@ -469,10 +502,22 @@ make db-upgrade
 make run
 ```
 
-or run end-to-end with one command:
+or run API development with one command:
 
 ```bash
 make dev
+```
+
+run Discord in a second shell:
+
+```bash
+make run-discord
+```
+
+run the durable worker in another shell when Agency events or notifications are enabled:
+
+```bash
+make run-worker
 ```
 
 switch model provider cleanly:
@@ -518,7 +563,6 @@ curl -sS -X POST http://127.0.0.1:8000/v1/captures \
   -H "content-type: application/json" \
   -H "Idempotency-Key: smoke-capture-001" \
   -d '{"kind":"text","text":"smoke capture"}'
-curl -sS http://127.0.0.1:8000/
 ```
 
 ## private tailnet deployment

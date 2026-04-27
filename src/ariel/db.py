@@ -26,6 +26,12 @@ REQUIRED_TABLES: Final[tuple[str, ...]] = (
     "google_connectors",
     "google_oauth_states",
     "google_connector_events",
+    "background_tasks",
+    "agency_events",
+    "jobs",
+    "job_events",
+    "notifications",
+    "notification_deliveries",
 )
 
 

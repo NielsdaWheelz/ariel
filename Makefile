@@ -1,5 +1,5 @@
 MIN_PY := 12
-PYTHON := $(shell for v in python3.13 python3.12 python3; do \
+PYTHON := $(shell for v in .venv/bin/python python3.13 python3.12 python3; do \
   if command -v $$v >/dev/null 2>&1 && $$v -c "import sys; assert sys.version_info >= (3,$(MIN_PY))" 2>/dev/null; then \
     echo $$v; break; \
   fi; \
@@ -7,7 +7,7 @@ done)
 
 UVICORN_CMD := .venv/bin/uvicorn ariel.app:create_app --factory --host 127.0.0.1 --port 8000
 
-.PHONY: help bootstrap setup env-init check-venv db-up db-stop db-down db-destroy db-status db-logs db-config db-upgrade tailscale-serve run run-openai run-echo dev lint typecheck test verify e2e
+.PHONY: help bootstrap setup env-init check-venv db-up db-stop db-down db-destroy db-status db-logs db-config db-upgrade tailscale-serve run run-openai run-echo run-worker run-discord dev lint typecheck test verify e2e
 
 bootstrap:
 	bash scripts/bootstrap.sh
@@ -37,7 +37,9 @@ help:
 	  "run          - run ariel app (provider from .env.local/env)" \
 	  "run-openai   - run app forcing openai provider" \
 	  "run-echo     - run app forcing echo provider" \
-	  "dev          - env-init + db-up + db-upgrade + run" \
+	  "run-worker   - run durable background worker" \
+	  "run-discord  - run discord surface worker" \
+	  "dev          - env-init + db-up + db-upgrade + run API" \
 	  "verify       - lint + typecheck + tests" \
 	  "e2e          - high-signal end-to-end smoke tests"
 
@@ -118,6 +120,12 @@ run-openai: check-venv
 run-echo: check-venv
 	ARIEL_MODEL_PROVIDER=echo ARIEL_MODEL_NAME=echo-v1 $(UVICORN_CMD)
 
+run-worker: check-venv
+	.venv/bin/python -m ariel.worker
+
+run-discord: check-venv
+	.venv/bin/python -m ariel.discord_bot
+
 dev: db-up check-venv db-upgrade run
 
 lint: check-venv
@@ -132,4 +140,4 @@ test: check-venv
 verify: lint typecheck test
 
 e2e: check-venv
-	.venv/bin/python -m pytest tests/integration/test_pr01_acceptance.py -k "phone_surface_renders_timeline_from_stored_event_chain or pr01_turn_context_is_bounded_ordered_and_auditable or pr01_context_audit_is_stable_even_if_adapter_mutates_context_bundle"
+	.venv/bin/python -m pytest tests/integration/test_pr01_acceptance.py -k "pr01_turn_context_is_bounded_ordered_and_auditable or pr01_context_audit_is_stable_even_if_adapter_mutates_context_bundle"

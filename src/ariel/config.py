@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from ipaddress import ip_address
 from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -48,6 +50,16 @@ class AppSettings(BaseSettings):
     connector_encryption_secret: str = "dev-local-connector-secret"
     connector_encryption_key_version: str = "v1"
     connector_encryption_keys: str | None = None
+    discord_bot_token: str | None = None
+    discord_guild_id: int | None = None
+    discord_channel_id: int | None = None
+    discord_user_id: int | None = None
+    discord_ariel_base_url: str = "http://127.0.0.1:8000"
+    discord_notification_timeout_seconds: float = 10.0
+    agency_event_secret: str | None = None
+    agency_event_max_skew_seconds: int = 300
+    worker_poll_seconds: float = 1.0
+    worker_heartbeat_timeout_seconds: int = 300
 
     @field_validator("bind_host")
     @classmethod
@@ -185,3 +197,69 @@ class AppSettings(BaseSettings):
         if not normalized:
             raise ValueError("connector_encryption_key_version must not be blank")
         return normalized
+
+    @field_validator("discord_bot_token", mode="before")
+    @classmethod
+    def _blank_discord_bot_token_is_unset(cls, value: Any) -> Any:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("agency_event_secret", mode="before")
+    @classmethod
+    def _blank_agency_event_secret_is_unset(cls, value: Any) -> Any:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator(
+        "discord_guild_id",
+        "discord_channel_id",
+        "discord_user_id",
+        mode="before",
+    )
+    @classmethod
+    def _blank_discord_id_is_unset(cls, value: Any) -> Any:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator(
+        "discord_guild_id",
+        "discord_channel_id",
+        "discord_user_id",
+    )
+    @classmethod
+    def _discord_ids_must_be_positive(cls, value: int | None) -> int | None:
+        if value is not None and value < 1:
+            raise ValueError("discord ids must be positive integers")
+        return value
+
+    @field_validator("discord_ariel_base_url")
+    @classmethod
+    def _discord_ariel_base_url_must_be_http_url(cls, value: str) -> str:
+        normalized = value.strip().rstrip("/")
+        parsed = urlparse(normalized)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("discord_ariel_base_url must be an http(s) URL")
+        return normalized
+
+    @field_validator(
+        "discord_notification_timeout_seconds",
+        "worker_poll_seconds",
+    )
+    @classmethod
+    def _positive_float_settings_must_be_positive(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("timeout and poll settings must be > 0")
+        return value
+
+    @field_validator(
+        "agency_event_max_skew_seconds",
+        "worker_heartbeat_timeout_seconds",
+    )
+    @classmethod
+    def _positive_int_settings_must_be_positive(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("agency and worker integer settings must be >= 1")
+        return value

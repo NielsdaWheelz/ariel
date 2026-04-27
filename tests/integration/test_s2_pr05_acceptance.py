@@ -143,7 +143,7 @@ def _assert_surface_approval_response(
     assert approval["status"] == expected_status
 
 
-def test_s2_pr05_turn_timeline_and_phone_surface_use_surface_only_lifecycle_contract(
+def test_s2_pr05_turn_timeline_uses_surface_only_lifecycle_contract(
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
@@ -181,9 +181,10 @@ def test_s2_pr05_turn_timeline_and_phone_surface_use_surface_only_lifecycle_cont
 
         surface = client.get("/")
         assert surface.status_code == 200
-        assert "turn.surface_action_lifecycle" in surface.text
-        assert "approval_ref" in surface.text
-        assert "lifecycleItem.approval.reference" in surface.text
+        assert surface.json()["surface"] == "discord"
+        assert surface.json()["api"]["approval_decisions"] == "/v1/approvals"
+        assert "chat-form" not in surface.text
+        assert "lifecycleItem.approval.reference" not in surface.text
         assert "turn.action_attempts" not in surface.text
 
 

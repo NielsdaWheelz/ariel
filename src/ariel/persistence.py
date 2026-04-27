@@ -13,6 +13,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -616,6 +617,192 @@ class GoogleConnectorEventRecord(Base):
     connector: Mapped[GoogleConnectorRecord] = relationship(back_populates="events")
 
 
+class BackgroundTaskRecord(Base):
+    __tablename__ = "background_tasks"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    task_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    claimed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    run_after: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    last_heartbeat: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            (
+                "task_type IN ('agency_event_received', 'deliver_discord_notification', "
+                "'expire_approvals', 'reap_stale_tasks')"
+            ),
+            name="ck_background_task_type",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'running', 'completed', 'failed', 'dead_letter')",
+            name="ck_background_task_status",
+        ),
+        CheckConstraint("attempts >= 0", name="ck_background_task_attempts_nonnegative"),
+        CheckConstraint("max_attempts > 0", name="ck_background_task_max_attempts_positive"),
+        Index(
+            "ix_background_tasks_claimable",
+            "status",
+            "run_after",
+            "created_at",
+        ),
+    )
+
+
+class AgencyEventRecord(Base):
+    __tablename__ = "agency_events"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    external_event_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    external_job_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="accepted")
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    processed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
+
+    __table_args__ = (
+        UniqueConstraint("source", "external_event_id", name="uq_agency_event_source_external_id"),
+        CheckConstraint(
+            (
+                "event_type IN ('heartbeat', 'job.queued', 'job.started', 'job.progress', "
+                "'job.waiting', 'job.completed', 'job.failed', 'job.cancelled', 'job.timed_out')"
+            ),
+            name="ck_agency_event_type",
+        ),
+        CheckConstraint(
+            "status IN ('accepted', 'processed', 'failed')",
+            name="ck_agency_event_status",
+        ),
+    )
+
+
+class JobRecord(Base):
+    __tablename__ = "jobs"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    external_job_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    latest_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+
+    events: Mapped[list["JobEventRecord"]] = relationship(back_populates="job")
+
+    __table_args__ = (
+        UniqueConstraint("source", "external_job_id", name="uq_job_source_external_id"),
+        CheckConstraint(
+            (
+                "status IN ('queued', 'running', 'waiting_approval', 'succeeded', "
+                "'failed', 'cancelled', 'timed_out')"
+            ),
+            name="ck_job_status",
+        ),
+    )
+
+
+class JobEventRecord(Base):
+    __tablename__ = "job_events"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    job_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("jobs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    agency_event_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("agency_events.id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+
+    job: Mapped[JobRecord] = relationship(back_populates="events")
+
+
+class NotificationRecord(Base):
+    __tablename__ = "notifications"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    dedupe_key: Mapped[str] = mapped_column(String(160), nullable=False, unique=True)
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    channel: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    acked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    deliveries: Mapped[list["NotificationDeliveryRecord"]] = relationship(
+        back_populates="notification"
+    )
+
+    __table_args__ = (
+        CheckConstraint("source_type IN ('agency_event')", name="ck_notification_source_type"),
+        CheckConstraint("channel IN ('discord')", name="ck_notification_channel"),
+        CheckConstraint(
+            "status IN ('pending', 'delivered', 'failed', 'acknowledged')",
+            name="ck_notification_status",
+        ),
+    )
+
+
+class NotificationDeliveryRecord(Base):
+    __tablename__ = "notification_deliveries"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    notification_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("notifications.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    channel: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    response_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+
+    notification: Mapped[NotificationRecord] = relationship(back_populates="deliveries")
+
+    __table_args__ = (
+        CheckConstraint("channel IN ('discord')", name="ck_notification_delivery_channel"),
+        CheckConstraint(
+            "status IN ('succeeded', 'failed')",
+            name="ck_notification_delivery_status",
+        ),
+    )
+
+
 def serialize_session(session: SessionRecord) -> dict[str, Any]:
     return {
         "id": session.id,
@@ -658,6 +845,87 @@ def serialize_event(event: EventRecord) -> dict[str, Any]:
         "event_type": event.event_type,
         "payload": event.payload,
         "created_at": to_rfc3339(event.created_at),
+    }
+
+
+def serialize_background_task(task: BackgroundTaskRecord) -> dict[str, Any]:
+    return {
+        "id": task.id,
+        "task_type": task.task_type,
+        "payload": redact_json_value(task.payload),
+        "status": task.status,
+        "attempts": task.attempts,
+        "max_attempts": task.max_attempts,
+        "error": redact_text(task.error) if task.error is not None else None,
+        "claimed_by": task.claimed_by,
+        "run_after": to_rfc3339(task.run_after),
+        "last_heartbeat": (
+            to_rfc3339(task.last_heartbeat) if task.last_heartbeat is not None else None
+        ),
+        "created_at": to_rfc3339(task.created_at),
+        "updated_at": to_rfc3339(task.updated_at),
+    }
+
+
+def serialize_agency_event(event: AgencyEventRecord) -> dict[str, Any]:
+    return {
+        "id": event.id,
+        "source": event.source,
+        "external_event_id": event.external_event_id,
+        "event_type": event.event_type,
+        "external_job_id": event.external_job_id,
+        "payload": redact_json_value(event.payload),
+        "status": event.status,
+        "error": redact_text(event.error) if event.error is not None else None,
+        "received_at": to_rfc3339(event.received_at),
+        "processed_at": to_rfc3339(event.processed_at) if event.processed_at is not None else None,
+    }
+
+
+def serialize_job(job: JobRecord) -> dict[str, Any]:
+    return {
+        "id": job.id,
+        "source": job.source,
+        "external_job_id": job.external_job_id,
+        "title": redact_text(job.title) if job.title is not None else None,
+        "status": job.status,
+        "summary": redact_text(job.summary) if job.summary is not None else None,
+        "latest_payload": redact_json_value(job.latest_payload),
+        "created_at": to_rfc3339(job.created_at),
+        "updated_at": to_rfc3339(job.updated_at),
+    }
+
+
+def serialize_job_event(event: JobEventRecord) -> dict[str, Any]:
+    return {
+        "id": event.id,
+        "job_id": event.job_id,
+        "agency_event_id": event.agency_event_id,
+        "event_type": event.event_type,
+        "payload": redact_json_value(event.payload),
+        "created_at": to_rfc3339(event.created_at),
+    }
+
+
+def serialize_notification(notification: NotificationRecord) -> dict[str, Any]:
+    return {
+        "id": notification.id,
+        "dedupe_key": notification.dedupe_key,
+        "source_type": notification.source_type,
+        "source_id": notification.source_id,
+        "channel": notification.channel,
+        "status": notification.status,
+        "title": redact_text(notification.title),
+        "body": redact_text(notification.body),
+        "payload": redact_json_value(notification.payload),
+        "created_at": to_rfc3339(notification.created_at),
+        "updated_at": to_rfc3339(notification.updated_at),
+        "delivered_at": (
+            to_rfc3339(notification.delivered_at)
+            if notification.delivered_at is not None
+            else None
+        ),
+        "acked_at": to_rfc3339(notification.acked_at) if notification.acked_at is not None else None,
     }
 
 
