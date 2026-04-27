@@ -15,6 +15,7 @@ from sqlalchemy import text
 from testcontainers.postgres import PostgresContainer
 
 from ariel.app import ModelAdapter, create_app
+from tests.integration.responses_helpers import responses_message
 from ariel.config import AppSettings
 from ariel.worker import claim_next_task, enqueue_background_task, process_one_task, reap_stale_tasks
 
@@ -24,23 +25,24 @@ class DurableWorkflowAdapter:
     provider: str = "provider.discord-primary-durable"
     model: str = "model.discord-primary-durable-v1"
 
-    def respond(
+    def create_response(
         self,
-        user_message: str,
         *,
-        session_id: str,
-        turn_id: str,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        del session_id, turn_id, history, context_bundle
-        return {
-            "assistant_text": f"assistant::{user_message}",
-            "provider": self.provider,
-            "model": self.model,
-            "usage": {"prompt_tokens": 8, "completion_tokens": 5, "total_tokens": 13},
-            "provider_response_id": "resp_discord_primary_durable_123",
-        }
+        del tools, history, context_bundle
+        return responses_message(
+            assistant_text=f"assistant::{user_message}",
+            provider=self.provider,
+            model=self.model,
+            provider_response_id="resp_discord_primary_durable_123",
+            input_tokens=8,
+            output_tokens=5,
+        )
 
 
 @dataclass(frozen=True)

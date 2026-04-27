@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from testcontainers.postgres import PostgresContainer
 
 from ariel.app import ModelAdapter, ModelAdapterError, create_app
+from tests.integration.responses_helpers import responses_message
 from ariel.db import run_migrations
 
 
@@ -25,25 +26,26 @@ class DeterministicModelAdapter:
     model: str = "model.test-v1"
     fail: bool = False
 
-    def respond(
+    def create_response(
         self,
-        user_message: str,
         *,
-        session_id: str,
-        turn_id: str,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        del session_id, turn_id, history, context_bundle
+        del tools, history, context_bundle
         if self.fail:
             raise RuntimeError("simulated provider failure")
-        return {
-            "assistant_text": f"assistant::{user_message}",
-            "provider": self.provider,
-            "model": self.model,
-            "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
-            "provider_response_id": "resp_test_123",
-        }
+        return responses_message(
+            assistant_text=f"assistant::{user_message}",
+            provider=self.provider,
+            model=self.model,
+            provider_response_id="resp_test_123",
+            input_tokens=11,
+            output_tokens=7,
+        )
 
 
 @dataclass
@@ -52,16 +54,16 @@ class ContextWindowDecisionAdapter:
     model: str = "model.context-window-v1"
     context_bundles: list[dict[str, Any]] = field(default_factory=list)
 
-    def respond(
+    def create_response(
         self,
-        user_message: str,
         *,
-        session_id: str,
-        turn_id: str,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        del session_id, turn_id, history
+        del tools, history
         self.context_bundles.append(context_bundle)
 
         normalized = user_message.strip().lower()
@@ -84,13 +86,14 @@ class ContextWindowDecisionAdapter:
         else:
             assistant_text = f"direct::{user_message}"
 
-        return {
-            "assistant_text": assistant_text,
-            "provider": self.provider,
-            "model": self.model,
-            "usage": {"prompt_tokens": 9, "completion_tokens": 11, "total_tokens": 20},
-            "provider_response_id": "resp_context_window_123",
-        }
+        return responses_message(
+            assistant_text=assistant_text,
+            provider=self.provider,
+            model=self.model,
+            provider_response_id="resp_context_window_123",
+            input_tokens=9,
+            output_tokens=11,
+        )
 
     def _find_recent_codename(self, context_bundle: dict[str, Any]) -> str | None:
         recent_turns = context_bundle.get("recent_active_session_turns")
@@ -113,16 +116,16 @@ class MutatingContextAdapter:
     provider: str = "provider.mutating"
     model: str = "model.mutating-v1"
 
-    def respond(
+    def create_response(
         self,
-        user_message: str,
         *,
-        session_id: str,
-        turn_id: str,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        del user_message, session_id, turn_id, history
+        del tools, user_message, history
         section_order = context_bundle.get("section_order")
         if isinstance(section_order, list):
             section_order.append("mutated")
@@ -131,13 +134,14 @@ class MutatingContextAdapter:
             recent_window["included_turn_count"] = 999
             recent_window["included_turn_ids"] = ["mutated"]
 
-        return {
-            "assistant_text": "mutating-adapter-response",
-            "provider": self.provider,
-            "model": self.model,
-            "usage": {"prompt_tokens": 3, "completion_tokens": 3, "total_tokens": 6},
-            "provider_response_id": "resp_mutating_123",
-        }
+        return responses_message(
+            assistant_text="mutating-adapter-response",
+            provider=self.provider,
+            model=self.model,
+            provider_response_id="resp_mutating_123",
+            input_tokens=3,
+            output_tokens=3,
+        )
 
 
 @pytest.fixture(scope="session")
@@ -451,8 +455,8 @@ def test_model_timeline_includes_identity_duration_and_usage(postgres_url: str) 
         assert payload["model"] == "alpha-mini"
         assert isinstance(payload["duration_ms"], int)
         assert payload["duration_ms"] >= 0
-        assert payload["usage"]["prompt_tokens"] == 11
-        assert payload["usage"]["completion_tokens"] == 7
+        assert payload["usage"]["input_tokens"] == 11
+        assert payload["usage"]["output_tokens"] == 7
         assert payload["usage"]["total_tokens"] == 18
 
 
@@ -581,16 +585,16 @@ class SecretLeakingFailureAdapter:
     model: str = "model.leaky-v1"
     secret_value: str = "sk-live-very-secret"
 
-    def respond(
+    def create_response(
         self,
-        user_message: str,
         *,
-        session_id: str,
-        turn_id: str,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        del user_message, session_id, turn_id, history, context_bundle
+        del tools, user_message, history, context_bundle
         raise RuntimeError(f"provider rejected credential {self.secret_value}")
 
 
@@ -599,16 +603,16 @@ class NonSecretFailureAdapter:
     provider: str = "provider.non-secret"
     model: str = "model.non-secret-v1"
 
-    def respond(
+    def create_response(
         self,
-        user_message: str,
         *,
-        session_id: str,
-        turn_id: str,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        del user_message, session_id, turn_id, history, context_bundle
+        del tools, user_message, history, context_bundle
         raise RuntimeError("token limit exceeded for this request")
 
 
@@ -616,10 +620,9 @@ def test_default_runtime_model_requires_server_secret_credentials(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("ARIEL_MODEL_PROVIDER", "openai")
-    monkeypatch.setenv("ARIEL_MODEL_NAME", "gpt-4o-mini")
+    monkeypatch.setenv("ARIEL_MODEL_NAME", "gpt-5.5")
     # Force empty key so this assertion is stable even if local .env files exist.
-    monkeypatch.setenv("ARIEL_MODEL_API_KEY", "")
+    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "")
 
     app = create_app(
         database_url=postgres_url,
@@ -750,53 +753,51 @@ class LongResponseAdapter:
     model: str = "model.long-response-v1"
     response_token_count: int = 16
 
-    def respond(
+    def create_response(
         self,
-        user_message: str,
         *,
-        session_id: str,
-        turn_id: str,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        del user_message, session_id, turn_id, history, context_bundle
+        del tools, user_message, history, context_bundle
         assistant_text = " ".join(["long"] * self.response_token_count)
-        return {
-            "assistant_text": assistant_text,
-            "provider": self.provider,
-            "model": self.model,
-            "usage": {"prompt_tokens": 5, "completion_tokens": self.response_token_count, "total_tokens": 5},
-            "provider_response_id": "resp_long_123",
-        }
+        return responses_message(
+            assistant_text=assistant_text,
+            provider=self.provider,
+            model=self.model,
+            provider_response_id="resp_long_123",
+            input_tokens=5,
+            output_tokens=self.response_token_count,
+        )
 
 
 @dataclass
 class UsageDrivenResponseAdapter:
     provider: str = "provider.usage-driven"
     model: str = "model.usage-driven-v1"
-    reported_completion_tokens: int = 12
+    reported_output_tokens: int = 12
 
-    def respond(
+    def create_response(
         self,
-        user_message: str,
         *,
-        session_id: str,
-        turn_id: str,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        del user_message, session_id, turn_id, history, context_bundle
-        return {
-            "assistant_text": "ok",
-            "provider": self.provider,
-            "model": self.model,
-            "usage": {
-                "prompt_tokens": 2,
-                "completion_tokens": self.reported_completion_tokens,
-                "total_tokens": self.reported_completion_tokens + 2,
-            },
-            "provider_response_id": "resp_usage_123",
-        }
+        del tools, user_message, history, context_bundle
+        return responses_message(
+            assistant_text="ok",
+            provider=self.provider,
+            model=self.model,
+            provider_response_id="resp_usage_123",
+            input_tokens=2,
+            output_tokens=self.reported_output_tokens,
+        )
 
 
 @dataclass
@@ -805,16 +806,16 @@ class RetryableFailureAdapter:
     model: str = "model.retryable-failure-v1"
     attempts: int = 0
 
-    def respond(
+    def create_response(
         self,
-        user_message: str,
         *,
-        session_id: str,
-        turn_id: str,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        del user_message, session_id, turn_id, history, context_bundle
+        del tools, user_message, history, context_bundle
         self.attempts += 1
         raise ModelAdapterError(
             safe_reason="temporary provider timeout",
@@ -930,14 +931,14 @@ def test_pr02_response_budget_exhaustion_is_emitted_before_terminal_failed(
         assert model_completed["payload"]["model"] == adapter.model
 
 
-def test_pr02_response_budget_uses_reported_completion_tokens_when_present(
+def test_pr02_response_budget_uses_reported_output_tokens_when_present(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("ARIEL_MAX_CONTEXT_TOKENS", "20000")
     monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "5")
 
-    adapter = UsageDrivenResponseAdapter(reported_completion_tokens=9)
+    adapter = UsageDrivenResponseAdapter(reported_output_tokens=9)
     with _build_client(postgres_url, adapter) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
         send = client.post(

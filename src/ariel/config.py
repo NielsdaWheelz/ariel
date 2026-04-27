@@ -26,11 +26,11 @@ class AppSettings(BaseSettings):
     database_url: str = "postgresql+psycopg://localhost/ariel"
     bind_host: str = "127.0.0.1"
     bind_port: int = 8000
-    model_provider: str = "openai"
-    model_name: str = "gpt-4o-mini"
-    model_api_base_url: str = "https://api.openai.com/v1"
-    model_api_key: str | None = None
+    model_name: str = "gpt-5.5"
+    openai_api_key: str | None = None
     model_timeout_seconds: float = 30.0
+    model_reasoning_effort: str = "medium"
+    model_verbosity: str = "low"
     max_recent_turns: int = 12
     max_recalled_memories: int = 8
     max_context_tokens: int = 6000
@@ -56,6 +56,11 @@ class AppSettings(BaseSettings):
     discord_user_id: int | None = None
     discord_ariel_base_url: str = "http://127.0.0.1:8000"
     discord_notification_timeout_seconds: float = 10.0
+    agency_socket_path: str = "/tmp/agency-daemon.sock"
+    agency_allowed_repo_roots: str = ""
+    agency_default_base_branch: str = "main"
+    agency_default_runner: str = "codex"
+    agency_timeout_seconds: float = 30.0
     agency_event_secret: str | None = None
     agency_event_max_skew_seconds: int = 300
     worker_poll_seconds: float = 1.0
@@ -74,12 +79,27 @@ class AppSettings(BaseSettings):
             pass
         raise ValueError("bind_host must be loopback-only (localhost, 127.0.0.1, or ::1)")
 
-    @field_validator("model_provider")
+    @field_validator("openai_api_key", mode="before")
     @classmethod
-    def _model_provider_must_be_supported(cls, value: str) -> str:
+    def _blank_openai_api_key_is_unset(cls, value: Any) -> Any:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("model_reasoning_effort")
+    @classmethod
+    def _model_reasoning_effort_must_be_supported(cls, value: str) -> str:
         normalized = value.strip().lower()
-        if normalized not in {"openai", "echo"}:
-            raise ValueError("model_provider must be one of: openai, echo")
+        if normalized not in {"minimal", "low", "medium", "high"}:
+            raise ValueError("model_reasoning_effort must be one of: minimal, low, medium, high")
+        return normalized
+
+    @field_validator("model_verbosity")
+    @classmethod
+    def _model_verbosity_must_be_supported(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"low", "medium", "high"}:
+            raise ValueError("model_verbosity must be one of: low, medium, high")
         return normalized
 
     @field_validator("max_recent_turns")
@@ -212,6 +232,14 @@ class AppSettings(BaseSettings):
             return None
         return value
 
+    @field_validator("agency_socket_path", "agency_default_base_branch", "agency_default_runner")
+    @classmethod
+    def _agency_text_settings_must_not_be_blank(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("agency settings must not be blank")
+        return normalized
+
     @field_validator(
         "discord_guild_id",
         "discord_channel_id",
@@ -246,6 +274,7 @@ class AppSettings(BaseSettings):
 
     @field_validator(
         "discord_notification_timeout_seconds",
+        "agency_timeout_seconds",
         "worker_poll_seconds",
     )
     @classmethod

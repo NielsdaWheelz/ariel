@@ -698,12 +698,43 @@ class JobRecord(Base):
     __tablename__ = "jobs"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    session_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("sessions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    turn_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("turns.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    action_attempt_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("action_attempts.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     source: Mapped[str] = mapped_column(String(64), nullable=False)
     external_job_id: Mapped[str] = mapped_column(String(128), nullable=False)
     title: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     latest_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    agency_repo_root: Mapped[str | None] = mapped_column(Text, nullable=True)
+    agency_repo_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    agency_task_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    agency_invocation_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    agency_worktree_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    agency_worktree_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    agency_branch: Mapped[str | None] = mapped_column(Text, nullable=True)
+    agency_runner: Mapped[str | None] = mapped_column(Text, nullable=True)
+    agency_request_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    agency_last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    agency_pr_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    agency_pr_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    discord_thread_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
 
@@ -734,7 +765,7 @@ class JobEventRecord(Base):
     agency_event_id: Mapped[str] = mapped_column(
         String(32),
         ForeignKey("agency_events.id", ondelete="RESTRICT"),
-        nullable=False,
+        nullable=True,
         unique=True,
         index=True,
     )
@@ -885,12 +916,38 @@ def serialize_agency_event(event: AgencyEventRecord) -> dict[str, Any]:
 def serialize_job(job: JobRecord) -> dict[str, Any]:
     return {
         "id": job.id,
+        "session_id": job.session_id,
+        "turn_id": job.turn_id,
+        "action_attempt_id": job.action_attempt_id,
         "source": job.source,
         "external_job_id": job.external_job_id,
         "title": redact_text(job.title) if job.title is not None else None,
         "status": job.status,
         "summary": redact_text(job.summary) if job.summary is not None else None,
         "latest_payload": redact_json_value(job.latest_payload),
+        "agency": {
+            "repo_root": redact_text(job.agency_repo_root) if job.agency_repo_root is not None else None,
+            "repo_id": job.agency_repo_id,
+            "task_id": job.agency_task_id,
+            "invocation_id": job.agency_invocation_id,
+            "worktree_id": job.agency_worktree_id,
+            "worktree_path": (
+                redact_text(job.agency_worktree_path)
+                if job.agency_worktree_path is not None
+                else None
+            ),
+            "branch": redact_text(job.agency_branch) if job.agency_branch is not None else None,
+            "runner": redact_text(job.agency_runner) if job.agency_runner is not None else None,
+            "request_id": job.agency_request_id,
+            "last_synced_at": (
+                to_rfc3339(job.agency_last_synced_at)
+                if job.agency_last_synced_at is not None
+                else None
+            ),
+            "pr_number": job.agency_pr_number,
+            "pr_url": redact_text(job.agency_pr_url) if job.agency_pr_url is not None else None,
+        },
+        "discord_thread_id": job.discord_thread_id,
         "created_at": to_rfc3339(job.created_at),
         "updated_at": to_rfc3339(job.updated_at),
     }

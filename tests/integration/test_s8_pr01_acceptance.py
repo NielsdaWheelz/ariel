@@ -10,6 +10,7 @@ from sqlalchemy import text
 from testcontainers.postgres import PostgresContainer
 
 from ariel.app import ModelAdapter, ModelAdapterError, create_app
+from tests.integration.responses_helpers import responses_message
 
 
 @dataclass
@@ -18,24 +19,25 @@ class CaptureProbeAdapter:
     model: str = "model.s8-pr01-v1"
     seen_user_messages: list[str] = field(default_factory=list)
 
-    def respond(
+    def create_response(
         self,
-        user_message: str,
         *,
-        session_id: str,
-        turn_id: str,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        del session_id, turn_id, history, context_bundle
+        del tools, history, context_bundle
         self.seen_user_messages.append(user_message)
-        return {
-            "assistant_text": f"assistant::{user_message}",
-            "provider": self.provider,
-            "model": self.model,
-            "usage": {"prompt_tokens": 21, "completion_tokens": 13, "total_tokens": 34},
-            "provider_response_id": "resp_s8_pr01_123",
-        }
+        return responses_message(
+            assistant_text=f"assistant::{user_message}",
+            provider=self.provider,
+            model=self.model,
+            provider_response_id="resp_s8_pr01_123",
+            input_tokens=21,
+            output_tokens=13,
+        )
 
 
 @dataclass
@@ -43,16 +45,16 @@ class CaptureFailingAdapter:
     provider: str = "provider.s8-pr01"
     model: str = "model.s8-pr01-failing"
 
-    def respond(
+    def create_response(
         self,
-        user_message: str,
         *,
-        session_id: str,
-        turn_id: str,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        del user_message, session_id, turn_id, history, context_bundle
+        del tools, user_message, history, context_bundle
         raise ModelAdapterError(
             safe_reason="forced non-retryable model failure for capture acceptance test",
             status_code=503,

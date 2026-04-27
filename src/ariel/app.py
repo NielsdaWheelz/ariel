@@ -33,10 +33,12 @@ from sqlalchemy.orm import Session, sessionmaker
 from ariel.action_runtime import (
     ActionRuntimeError,
     RuntimeProvenance,
-    process_action_proposals,
+    process_response_function_calls,
     reconcile_expired_approvals_for_session,
     resolve_approval_decision,
 )
+from ariel.agency_daemon import AgencyDaemonClient, AgencyRuntime
+from ariel.capability_registry import response_tool_definitions
 from ariel.config import AppSettings
 from ariel.db import missing_required_tables, reset_schema_for_tests
 from ariel.google_connector import (
@@ -331,12 +333,12 @@ class ModelAdapter(Protocol):
     provider: str
     model: str
 
-    def respond(
+    def create_response(
         self,
-        user_message: str,
         *,
-        session_id: str,
-        turn_id: str,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]: ...
@@ -367,37 +369,6 @@ class NoopContextCompactionAdapter:
         return None
 
 
-@dataclass(slots=True)
-class EchoModelAdapter:
-    provider: str = "provider.local"
-    model: str = "echo-v1"
-
-    def respond(
-        self,
-        user_message: str,
-        *,
-        session_id: str,
-        turn_id: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        del session_id, turn_id, history, context_bundle
-        prompt_tokens = max(1, len(user_message.split()))
-        completion_text = f"echo: {user_message}"
-        completion_tokens = max(1, len(completion_text.split()))
-        return {
-            "assistant_text": completion_text,
-            "provider": self.provider,
-            "model": self.model,
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            },
-            "provider_response_id": _new_id("resp"),
-        }
-
-
 class ModelAdapterError(Exception):
     def __init__(
         self,
@@ -417,23 +388,24 @@ class ModelAdapterError(Exception):
 
 
 @dataclass(slots=True)
-class OpenAIChatCompletionsAdapter:
+class OpenAIResponsesAdapter:
     provider: str
     model: str
-    api_base_url: str
     api_key: str | None
     timeout_seconds: float = 30.0
+    reasoning_effort: str = "medium"
+    verbosity: str = "low"
 
-    def respond(
+    def create_response(
         self,
-        user_message: str,
         *,
-        session_id: str,
-        turn_id: str,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        del session_id, turn_id, history
+        del user_message, history, context_bundle
         if not self.api_key:
             raise ModelAdapterError(
                 safe_reason="model credentials are not configured",
@@ -445,17 +417,20 @@ class OpenAIChatCompletionsAdapter:
 
         try:
             response = httpx.post(
-                f"{self.api_base_url.rstrip('/')}/chat/completions",
+                "https://api.openai.com/v1/responses",
                 headers={
                     "authorization": f"Bearer {self.api_key}",
                     "content-type": "application/json",
                 },
                 json={
                     "model": self.model,
-                    "messages": _build_openai_messages(
-                        context_bundle=context_bundle,
-                        user_message=user_message,
-                    ),
+                    "input": input_items,
+                    "tools": tools,
+                    "tool_choice": "auto",
+                    "parallel_tool_calls": False,
+                    "store": False,
+                    "reasoning": {"effort": self.reasoning_effort},
+                    "text": {"verbosity": self.verbosity},
                 },
                 timeout=self.timeout_seconds,
             )
@@ -505,22 +480,12 @@ class OpenAIChatCompletionsAdapter:
                 retryable=True,
             ) from exc
 
-        assistant_text = _extract_openai_assistant_text(payload)
-        if not assistant_text:
-            raise ModelAdapterError(
-                safe_reason="model provider returned empty assistant response",
-                status_code=502,
-                code="E_MODEL_FAILURE",
-                message="model provider request failed",
-                retryable=True,
-            )
-
         usage_payload = payload.get("usage")
         usage = usage_payload if isinstance(usage_payload, dict) else None
         provider_response_id = payload.get("id")
 
         return {
-            "assistant_text": assistant_text,
+            "output": payload.get("output"),
             "provider": self.provider,
             "model": self.model,
             "usage": usage,
@@ -528,18 +493,18 @@ class OpenAIChatCompletionsAdapter:
         }
 
 
-def _build_openai_messages(
+def _build_responses_input_items(
     *,
     context_bundle: dict[str, Any],
     user_message: str,
-) -> list[dict[str, str]]:
-    messages: list[dict[str, str]] = []
+) -> list[dict[str, Any]]:
+    input_items: list[dict[str, Any]] = []
 
     policy_system_instructions = context_bundle.get("policy_system_instructions")
     if isinstance(policy_system_instructions, list):
         for instruction in policy_system_instructions:
             if isinstance(instruction, str) and instruction:
-                messages.append({"role": "system", "content": instruction})
+                input_items.append({"role": "system", "content": instruction})
 
     recent_turns = context_bundle.get("recent_active_session_turns")
     if not isinstance(recent_turns, list):
@@ -549,7 +514,7 @@ def _build_openai_messages(
     if isinstance(rolling_summary, dict):
         summary_text = rolling_summary.get("summary_text")
         if isinstance(summary_text, str) and summary_text.strip():
-            messages.append(
+            input_items.append(
                 {
                     "role": "system",
                     "content": "rolling session summary:\n" + summary_text,
@@ -571,7 +536,7 @@ def _build_openai_messages(
                 continue
             memory_lines.append(f"- {memory_class}: {key} = {value}")
         if memory_lines:
-            messages.append(
+            input_items.append(
                 {
                     "role": "system",
                     "content": "durable memory recall:\n" + "\n".join(memory_lines),
@@ -591,7 +556,7 @@ def _build_openai_messages(
                 if isinstance(memory_key, str) and isinstance(value, str):
                     commitment_lines.append(f"- {memory_key}: {value}")
             if commitment_lines:
-                messages.append(
+                input_items.append(
                     {
                         "role": "system",
                         "content": "open commitments:\n" + "\n".join(commitment_lines),
@@ -609,7 +574,7 @@ def _build_openai_messages(
                 if isinstance(job_id, str) and isinstance(status, str) and isinstance(title, str):
                     job_lines.append(f"- {job_id}: {status}: {title}")
             if job_lines:
-                messages.append(
+                input_items.append(
                     {
                         "role": "system",
                         "content": "open jobs:\n" + "\n".join(job_lines),
@@ -629,7 +594,7 @@ def _build_openai_messages(
                 if isinstance(title, str) and isinstance(source, str):
                     artifact_lines.append(f"- {title} ({source})")
             if artifact_lines:
-                messages.append(
+                input_items.append(
                     {
                         "role": "system",
                         "content": "recent artifacts:\n" + "\n".join(artifact_lines),
@@ -641,39 +606,41 @@ def _build_openai_messages(
             continue
         prior_user_message = prior_turn.get("user_message")
         if isinstance(prior_user_message, str) and prior_user_message:
-            messages.append({"role": "user", "content": prior_user_message})
+            input_items.append({"role": "user", "content": prior_user_message})
         prior_assistant_message = prior_turn.get("assistant_message")
         if isinstance(prior_assistant_message, str) and prior_assistant_message:
-            messages.append({"role": "assistant", "content": prior_assistant_message})
-    messages.append({"role": "user", "content": user_message})
-    return messages
+            input_items.append({"role": "assistant", "content": prior_assistant_message})
+    input_items.append({"role": "user", "content": user_message})
+    return input_items
 
 
-def _extract_openai_assistant_text(payload: dict[str, Any]) -> str:
-    choices = payload.get("choices")
-    if not isinstance(choices, list) or not choices:
+def _extract_responses_assistant_text(output_items: Any) -> str:
+    if not isinstance(output_items, list):
         return ""
-    first_choice = choices[0]
-    if not isinstance(first_choice, dict):
-        return ""
-    message_payload = first_choice.get("message")
-    if not isinstance(message_payload, dict):
-        return ""
-    content = message_payload.get("content")
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        text_parts: list[str] = []
-        for item in content:
-            if not isinstance(item, dict):
+    text_parts: list[str] = []
+    for output_item in output_items:
+        if not isinstance(output_item, dict) or output_item.get("type") != "message":
+            continue
+        content = output_item.get("content")
+        if not isinstance(content, list):
+            continue
+        for content_item in content:
+            if not isinstance(content_item, dict) or content_item.get("type") != "output_text":
                 continue
-            if item.get("type") != "text":
-                continue
-            text = item.get("text")
+            text = content_item.get("text")
             if isinstance(text, str) and text:
                 text_parts.append(text)
-        return "".join(text_parts).strip()
-    return ""
+    return "".join(text_parts).strip()
+
+
+def _extract_responses_function_calls(output_items: Any) -> list[dict[str, Any]]:
+    if not isinstance(output_items, list):
+        return []
+    calls: list[dict[str, Any]] = []
+    for output_item in output_items:
+        if isinstance(output_item, dict) and output_item.get("type") == "function_call":
+            calls.append(output_item)
+    return calls
 
 
 @dataclass(slots=True, frozen=True)
@@ -695,9 +662,9 @@ def _response_tokens_from_model_payload(
 ) -> int:
     usage_payload = assistant_response.get("usage")
     if isinstance(usage_payload, dict):
-        completion_tokens = usage_payload.get("completion_tokens")
-        if isinstance(completion_tokens, int) and completion_tokens >= 0:
-            return completion_tokens
+        output_tokens = usage_payload.get("output_tokens")
+        if isinstance(output_tokens, int) and output_tokens >= 0:
+            return output_tokens
     return _estimate_text_tokens(assistant_text)
 
 
@@ -835,18 +802,14 @@ def _build_turn_limit_error(
 
 
 def _build_default_model_adapter(settings: AppSettings) -> ModelAdapter:
-    if settings.model_provider == "echo":
-        return EchoModelAdapter(model=settings.model_name)
-    if settings.model_provider == "openai":
-        return OpenAIChatCompletionsAdapter(
-            provider="provider.openai",
-            model=settings.model_name,
-            api_base_url=settings.model_api_base_url,
-            api_key=settings.model_api_key,
-            timeout_seconds=settings.model_timeout_seconds,
-        )
-    msg = f"unsupported model provider: {settings.model_provider}"
-    raise RuntimeError(msg)
+    return OpenAIResponsesAdapter(
+        provider="provider.openai.responses",
+        model=settings.model_name,
+        api_key=settings.openai_api_key,
+        timeout_seconds=settings.model_timeout_seconds,
+        reasoning_effort=settings.model_reasoning_effort,
+        verbosity=settings.model_verbosity,
+    )
 
 
 @dataclass(slots=True)
@@ -2503,6 +2466,11 @@ def create_app(
     app.state.connector_encryption_secret = settings.connector_encryption_secret
     app.state.connector_encryption_key_version = settings.connector_encryption_key_version
     app.state.connector_encryption_keys = settings.connector_encryption_keys
+    app.state.agency_socket_path = settings.agency_socket_path
+    app.state.agency_allowed_repo_roots = settings.agency_allowed_repo_roots
+    app.state.agency_default_base_branch = settings.agency_default_base_branch
+    app.state.agency_default_runner = settings.agency_default_runner
+    app.state.agency_timeout_seconds = settings.agency_timeout_seconds
     app.state.agency_event_secret = settings.agency_event_secret
     app.state.agency_event_max_skew_seconds = settings.agency_event_max_skew_seconds
     app.state.google_oauth_client = DefaultGoogleOAuthClient(
@@ -2581,6 +2549,22 @@ def create_app(
                 if app.state.connector_encryption_keys is not None
                 else None
             ),
+        )
+
+    def _agency_runtime() -> AgencyRuntime:
+        allowed_roots = tuple(
+            root.strip()
+            for root in str(app.state.agency_allowed_repo_roots).split(",")
+            if root.strip()
+        )
+        return AgencyRuntime(
+            client=AgencyDaemonClient(
+                socket_path=str(app.state.agency_socket_path),
+                timeout_seconds=float(app.state.agency_timeout_seconds),
+            ),
+            allowed_repo_roots=allowed_roots,
+            default_base_branch=str(app.state.agency_default_base_branch),
+            default_runner=str(app.state.agency_default_runner),
         )
 
     @app.get("/v1/health", response_model=None)
@@ -3289,6 +3273,8 @@ def create_app(
         model_failure: ApiError | None = None
         model_failure_reason: str | None = None
         assistant_response: dict[str, Any] | None = None
+        responses_input_items: list[dict[str, Any]] = []
+        responses_tools = response_tool_definitions()
 
         context_tokens = _estimate_context_tokens(
             context_bundle=context_bundle,
@@ -3315,6 +3301,10 @@ def create_app(
                 limit=app.state.max_context_tokens,
             )
         else:
+            responses_input_items = _build_responses_input_items(
+                context_bundle=context_bundle,
+                user_message=user_message,
+            )
             turn_started_at = time.perf_counter()
             for attempt in range(1, app.state.max_model_attempts + 1):
                 if attempt > 1:
@@ -3339,10 +3329,10 @@ def create_app(
                 )
                 model_started_at = time.perf_counter()
                 try:
-                    candidate_response = app.state.model_adapter.respond(
-                        user_message,
-                        session_id=effective_session_id,
-                        turn_id=turn.id,
+                    candidate_response = app.state.model_adapter.create_response(
+                        input_items=responses_input_items,
+                        tools=responses_tools,
+                        user_message=user_message,
                         history=context_bundle["recent_active_session_turns"],
                         context_bundle=context_bundle,
                     )
@@ -3369,8 +3359,50 @@ def create_app(
                         )
                         break
 
-                    assistant_text = candidate_response.get("assistant_text")
-                    if not isinstance(assistant_text, str) or not assistant_text.strip():
+                    output_items = candidate_response.get("output")
+                    if not isinstance(output_items, list):
+                        raise RuntimeError("model response missing Responses output items")
+                    assistant_text = _extract_responses_assistant_text(output_items)
+                    function_calls = _extract_responses_function_calls(output_items)
+                    if function_calls:
+                        function_processing = process_response_function_calls(
+                            db=db,
+                            session_id=effective_session_id,
+                            turn=turn,
+                            assistant_message=assistant_text,
+                            function_calls_raw=function_calls,
+                            approval_ttl_seconds=int(app.state.approval_ttl_seconds),
+                            approval_actor_id=str(app.state.approval_actor_id),
+                            add_event=add_event,
+                            now_fn=_utcnow,
+                            new_id_fn=_new_id,
+                            runtime_provenance=runtime_provenance,
+                            google_runtime=_google_runtime(),
+                            agency_runtime=_agency_runtime(),
+                        )
+                        created_action_attempts.extend(function_processing.action_attempts)
+                        assistant_sources = function_processing.assistant_sources or assistant_sources
+                        for output_item in output_items:
+                            if isinstance(output_item, dict):
+                                responses_input_items.append(jsonable_encoder(output_item))
+                        responses_input_items.extend(function_processing.function_call_outputs)
+                        responses_input_items.append(
+                            {
+                                "role": "system",
+                                "content": (
+                                    "audited tool summary:\n"
+                                    + function_processing.assistant_message
+                                ),
+                            }
+                        )
+                        if attempt >= app.state.max_model_attempts:
+                            assistant_response = {
+                                **candidate_response,
+                                "assistant_text": function_processing.assistant_message,
+                            }
+                            break
+                        continue
+                    if not assistant_text:
                         raise RuntimeError("model response missing assistant_text")
                     response_tokens = _response_tokens_from_model_payload(
                         candidate_response,
@@ -3385,7 +3417,10 @@ def create_app(
                         )
                         break
 
-                    assistant_response = candidate_response
+                    assistant_response = {
+                        **candidate_response,
+                        "assistant_text": assistant_text,
+                    }
                     break
                 except Exception as exc:
                     duration_ms = int((time.perf_counter() - model_started_at) * 1000)
@@ -3471,21 +3506,6 @@ def create_app(
             )
         else:
             assert assistant_response is not None
-            proposal_processing = process_action_proposals(
-                db=db,
-                session_id=effective_session_id,
-                turn=turn,
-                assistant_message=assistant_response["assistant_text"],
-                proposals_raw=assistant_response.get("action_proposals"),
-                approval_ttl_seconds=int(app.state.approval_ttl_seconds),
-                approval_actor_id=str(app.state.approval_actor_id),
-                add_event=add_event,
-                now_fn=_utcnow,
-                new_id_fn=_new_id,
-                runtime_provenance=runtime_provenance,
-                google_runtime=_google_runtime(),
-            )
-            created_action_attempts.extend(proposal_processing.action_attempts)
             captured_memories = _capture_validated_memory_candidates(
                 db=db,
                 session_id=effective_session_id,
@@ -3509,11 +3529,11 @@ def create_app(
                     },
                 )
 
-            turn.assistant_message = proposal_processing.assistant_message
+            assistant_message = assistant_response["assistant_text"]
+            turn.assistant_message = assistant_message
             turn.status = "completed"
             turn.updated_at = _utcnow()
-            assistant_sources = proposal_processing.assistant_sources
-            add_event("evt.assistant.emitted", {"message": proposal_processing.assistant_message})
+            add_event("evt.assistant.emitted", {"message": assistant_message})
             add_event("evt.turn.completed", {})
 
         active_session.updated_at = _utcnow()
@@ -3926,6 +3946,7 @@ def create_app(
                         now_fn=_utcnow,
                         new_id_fn=_new_id,
                         google_runtime=_google_runtime(),
+                        agency_runtime=_agency_runtime(),
                     )
                 except ActionRuntimeError as exc:
                     return _error_response(

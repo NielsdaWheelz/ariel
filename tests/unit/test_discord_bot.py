@@ -12,14 +12,48 @@ from ariel.app import create_app
 from ariel.config import AppSettings
 from ariel.discord_bot import (
     ArielDiscordBot,
+    ArielDiscordReply,
     ArielDiscordError,
+    ArielActionView,
+    ack_notification,
     decide_approval,
     DiscordBotConfigError,
     ask_ariel,
+    ask_ariel_reply,
     configured_discord_bot,
     create_discord_bot,
     format_discord_message,
+    refresh_job,
 )
+
+
+class StaticModelAdapter:
+    provider = "test.responses"
+    model = "test-model"
+
+    def create_response(
+        self,
+        *,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
+        history: list[dict[str, Any]],
+        context_bundle: dict[str, Any],
+    ) -> dict[str, Any]:
+        del input_items, tools, user_message, history, context_bundle
+        return {
+            "provider": self.provider,
+            "model": self.model,
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            "provider_response_id": "resp_test",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "ok"}],
+                }
+            ],
+        }
 
 
 class FakeHttpClient:
@@ -105,14 +139,75 @@ class FakeDiscordMessage:
         *,
         mention_author: bool,
         allowed_mentions: discord.AllowedMentions,
+        view: discord.ui.View | None = None,
     ) -> None:
         self.replies.append(
             {
                 "content": content,
                 "mention_author": mention_author,
                 "allowed_mentions": allowed_mentions,
+                "view": view,
             }
         )
+
+
+class FakeInteractionResponse:
+    def __init__(self) -> None:
+        self.messages: list[dict[str, Any]] = []
+        self.edits: list[dict[str, Any]] = []
+        self._done = False
+
+    def is_done(self) -> bool:
+        return self._done
+
+    async def send_message(
+        self,
+        content: str,
+        *,
+        ephemeral: bool = False,
+        allowed_mentions: discord.AllowedMentions,
+    ) -> None:
+        self._done = True
+        self.messages.append(
+            {
+                "content": content,
+                "ephemeral": ephemeral,
+                "allowed_mentions": allowed_mentions,
+            }
+        )
+
+    async def edit_message(
+        self,
+        *,
+        content: str,
+        view: discord.ui.View | None,
+        allowed_mentions: discord.AllowedMentions,
+    ) -> None:
+        self._done = True
+        self.edits.append(
+            {
+                "content": content,
+                "view": view,
+                "allowed_mentions": allowed_mentions,
+            }
+        )
+
+
+class FakeInteraction:
+    def __init__(
+        self,
+        *,
+        custom_id: str,
+        user_id: int = 3,
+        guild_id: int | None = 1,
+        channel_id: int = 2,
+    ) -> None:
+        self.id = 987
+        self.data = {"custom_id": custom_id}
+        self.user = FakeUser(user_id=user_id)
+        self.guild = FakeGuild(guild_id=guild_id) if guild_id is not None else None
+        self.channel_id = channel_id
+        self.response = FakeInteractionResponse()
 
 
 def _bot() -> ArielDiscordBot:
@@ -129,27 +224,33 @@ def _bot() -> ArielDiscordBot:
 def _stub_ask_ariel(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     calls: list[dict[str, Any]] = []
 
-    def fake_ask_ariel(
+    def fake_ask_ariel_reply(
         *,
         ariel_base_url: str,
         prompt: str,
         discord_message_id: int,
-    ) -> str:
+        allowed_user_id: int | None = None,
+    ) -> ArielDiscordReply:
         calls.append(
             {
                 "ariel_base_url": ariel_base_url,
                 "prompt": prompt,
                 "discord_message_id": discord_message_id,
+                "allowed_user_id": allowed_user_id,
             }
         )
-        return f"assistant::{prompt}"
+        return ArielDiscordReply(content=f"assistant::{prompt}")
 
-    monkeypatch.setattr("ariel.discord_bot.ask_ariel", fake_ask_ariel)
+    monkeypatch.setattr("ariel.discord_bot.ask_ariel_reply", fake_ask_ariel_reply)
     return calls
 
 
 def _send_message(bot: ArielDiscordBot, message: FakeDiscordMessage) -> None:
     asyncio.run(bot.on_message(cast(discord.Message, message)))
+
+
+def _send_interaction(bot: ArielDiscordBot, interaction: FakeInteraction) -> None:
+    asyncio.run(bot.on_interaction(cast(discord.Interaction, interaction)))
 
 
 def test_configured_discord_bot_requires_discord_settings() -> None:
@@ -170,6 +271,15 @@ def test_discord_bot_enables_message_intents() -> None:
     assert bot.intents.guilds is True
     assert bot.intents.messages is True
     assert bot.intents.message_content is True
+
+
+def test_discord_bot_registers_ariel_slash_command() -> None:
+    bot = _bot()
+
+    command = bot.tree.get_command("ariel")
+
+    assert command is not None
+    assert command.description == "Ask Ariel through the local API."
 
 
 def test_format_discord_message_truncates_to_safe_size() -> None:
@@ -254,8 +364,55 @@ def test_ask_ariel_includes_pending_approval_affordance(
 
     assert "I need approval." in message
     assert "Approval pending (cap.email.send): apr_123" in message
-    assert "approve apr_123" in message
-    assert "deny apr_123" in message
+    assert "Use the buttons below." in message
+    assert "approve apr_123" not in message
+    assert "deny apr_123" not in message
+
+
+def test_ask_ariel_reply_adds_approval_buttons(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_client(*, timeout: float) -> FakeHttpClient:
+        assert timeout == 60.0
+        return FakeHttpClient(
+            responses=[
+                httpx.Response(200, json={"ok": True, "session": {"id": "ses_test"}}),
+                httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "assistant": {"message": "I need approval."},
+                        "turn": {
+                            "surface_action_lifecycle": [
+                                {
+                                    "proposal": {"capability_id": "cap.email.send"},
+                                    "approval": {
+                                        "status": "pending",
+                                        "reference": "apr_123",
+                                    },
+                                }
+                            ]
+                        },
+                    },
+                ),
+            ]
+        )
+
+    monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
+
+    reply = ask_ariel_reply(
+        ariel_base_url="http://127.0.0.1:8000",
+        prompt="send it",
+        discord_message_id=123,
+        allowed_user_id=3,
+    )
+
+    assert reply.view is not None
+    custom_ids = [cast(Any, item).custom_id for item in reply.view.children]
+    assert custom_ids == [
+        "ariel:approval:approve:apr_123",
+        "ariel:approval:deny:apr_123",
+    ]
 
 
 def test_decide_approval_posts_discord_decision(
@@ -297,6 +454,166 @@ def test_decide_approval_posts_discord_decision(
             "json": {"approval_ref": "apr_123", "decision": "approve"},
         }
     ]
+
+
+def test_refresh_job_fetches_job_and_events(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_clients: list[FakeHttpClient] = []
+
+    def fake_client(*, timeout: float) -> FakeHttpClient:
+        assert timeout == 60.0
+        client = FakeHttpClient(
+            responses=[
+                httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "job": {
+                            "id": "job_123",
+                            "status": "completed",
+                            "title": "Agency bridge",
+                            "summary": "done",
+                        },
+                    },
+                ),
+                httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "job_id": "job_123",
+                        "events": [
+                            {
+                                "event_type": "completed",
+                                "created_at": "2026-04-27T12:00:00Z",
+                            }
+                        ],
+                    },
+                ),
+            ]
+        )
+        fake_clients.append(client)
+        return client
+
+    monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
+
+    message = refresh_job(ariel_base_url="http://127.0.0.1:8000", job_id="job_123")
+
+    assert "Job job_123: completed" in message
+    assert "Agency bridge" in message
+    assert "- completed at 2026-04-27T12:00:00Z" in message
+    assert fake_clients[0].calls[:2] == [
+        {"method": "GET", "url": "http://127.0.0.1:8000/v1/jobs/job_123"},
+        {"method": "GET", "url": "http://127.0.0.1:8000/v1/jobs/job_123/events"},
+    ]
+
+
+def test_ack_notification_posts_ack_and_returns_job_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_clients: list[FakeHttpClient] = []
+
+    def fake_client(*, timeout: float) -> FakeHttpClient:
+        assert timeout == 60.0
+        client = FakeHttpClient(
+            responses=[
+                httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "notification": {
+                            "id": "ntf_123",
+                            "title": "Agency completed",
+                            "payload": {"job_id": "job_123"},
+                        },
+                    },
+                )
+            ]
+        )
+        fake_clients.append(client)
+        return client
+
+    monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
+
+    message, job_id = ack_notification(
+        ariel_base_url="http://127.0.0.1:8000",
+        notification_id="ntf_123",
+    )
+
+    assert message == "Notification acknowledged: Agency completed (ntf_123)"
+    assert job_id == "job_123"
+    assert fake_clients[0].calls == [
+        {
+            "method": "POST",
+            "url": "http://127.0.0.1:8000/v1/notifications/ntf_123/ack",
+            "headers": None,
+            "json": {},
+        }
+    ]
+
+
+def test_action_view_uses_custom_ids_for_job_refresh_and_notification_ack() -> None:
+    view = ArielActionView(
+        ariel_base_url="http://127.0.0.1:8000",
+        job_id="job_123",
+        notification_id="ntf_123",
+        allowed_user_id=3,
+    )
+
+    custom_ids = [cast(Any, item).custom_id for item in view.children]
+    assert custom_ids == [
+        "ariel:job:refresh:job_123",
+        "ariel:notification:ack:ntf_123",
+    ]
+
+
+def test_on_interaction_handles_approval_custom_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_decide_approval(
+        *,
+        ariel_base_url: str,
+        approval_ref: str,
+        decision: str,
+        reason: str | None = None,
+    ) -> str:
+        calls.append(
+            {
+                "ariel_base_url": ariel_base_url,
+                "approval_ref": approval_ref,
+                "decision": decision,
+                "reason": reason,
+            }
+        )
+        return "Approval approved: apr_123"
+
+    monkeypatch.setattr("ariel.discord_bot.decide_approval", fake_decide_approval)
+    bot = _bot()
+    interaction = FakeInteraction(custom_id="ariel:approval:approve:apr_123")
+
+    _send_interaction(bot, interaction)
+
+    assert calls == [
+        {
+            "ariel_base_url": "http://127.0.0.1:8000",
+            "approval_ref": "apr_123",
+            "decision": "approve",
+            "reason": None,
+        }
+    ]
+    assert interaction.response.edits[0]["content"] == "Approval approved: apr_123"
+    assert interaction.response.edits[0]["view"] is None
+
+
+def test_on_interaction_rejects_wrong_user() -> None:
+    bot = _bot()
+    interaction = FakeInteraction(
+        custom_id="ariel:job:refresh:job_123",
+        user_id=44,
+    )
+
+    _send_interaction(bot, interaction)
+
+    assert interaction.response.messages[0]["ephemeral"] is True
+    assert "limited to the configured Discord user" in interaction.response.messages[0]["content"]
 
 
 def test_ask_ariel_surfaces_safe_api_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -344,6 +661,7 @@ def test_on_message_answers_configured_user_dm(monkeypatch: pytest.MonkeyPatch) 
             "ariel_base_url": "http://127.0.0.1:8000",
             "prompt": "hello dm",
             "discord_message_id": 321,
+            "allowed_user_id": 3,
         }
     ]
     assert message.replies[0]["content"] == "assistant::hello dm"
@@ -367,27 +685,10 @@ def test_on_message_answers_primary_channel_message(monkeypatch: pytest.MonkeyPa
     assert message.replies[0]["content"] == "assistant::hello channel"
 
 
-def test_on_message_handles_approval_command(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[dict[str, Any]] = []
-
-    def fake_decide_approval(
-        *,
-        ariel_base_url: str,
-        approval_ref: str,
-        decision: str,
-        reason: str | None = None,
-    ) -> str:
-        calls.append(
-            {
-                "ariel_base_url": ariel_base_url,
-                "approval_ref": approval_ref,
-                "decision": decision,
-                "reason": reason,
-            }
-        )
-        return "Approval denied: apr_456"
-
-    monkeypatch.setattr("ariel.discord_bot.decide_approval", fake_decide_approval)
+def test_on_message_sends_legacy_approval_text_as_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _stub_ask_ariel(monkeypatch)
     bot = _bot()
     message = FakeDiscordMessage(
         message_id=456,
@@ -398,15 +699,8 @@ def test_on_message_handles_approval_command(monkeypatch: pytest.MonkeyPatch) ->
 
     _send_message(bot, message)
 
-    assert calls == [
-        {
-            "ariel_base_url": "http://127.0.0.1:8000",
-            "approval_ref": "apr_456",
-            "decision": "deny",
-            "reason": "not right now",
-        }
-    ]
-    assert message.replies[0]["content"] == "Approval denied: apr_456"
+    assert calls[0]["prompt"] == "deny apr_456 not right now"
+    assert message.replies[0]["content"] == "assistant::deny apr_456 not right now"
 
 
 def test_on_message_answers_other_server_direct_mention(
@@ -466,7 +760,10 @@ def test_on_message_ignores_other_server_unmentioned_message(
 
 
 def test_root_is_discord_primary_status_not_phone_chat() -> None:
-    app = create_app(database_url="sqlite+pysqlite:///:memory:")
+    app = create_app(
+        database_url="sqlite+pysqlite:///:memory:",
+        model_adapter=StaticModelAdapter(),
+    )
     with TestClient(app) as client:
         response = client.get("/")
 

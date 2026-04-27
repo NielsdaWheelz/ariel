@@ -96,8 +96,8 @@ class SurfaceContextMetadataContract(BaseModel):
 class SurfaceModelUsageContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    prompt_tokens: int | None = None
-    completion_tokens: int | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
     total_tokens: int | None = None
 
 
@@ -621,7 +621,7 @@ def _coerce_surface_model_usage(raw_usage: Any) -> dict[str, Any] | None:
     if not isinstance(raw_usage, dict):
         return None
     usage: dict[str, Any] = {}
-    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+    for key in ("input_tokens", "output_tokens", "total_tokens"):
         value = raw_usage.get(key)
         usage[key] = int(value) if isinstance(value, int) else None
     return usage

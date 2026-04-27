@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+import json
 import re
 from typing import Any, Literal
 
@@ -11,8 +12,10 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from ariel.capability_registry import (
+    AGENCY_CAPABILITY_IDS,
     CapabilityDefinition,
     canonical_action_payload,
+    capability_id_for_response_tool_name,
     capability_contract_hash,
     get_capability,
     payload_hash,
@@ -66,8 +69,9 @@ class ActionRuntimeError(Exception):
 
 
 @dataclass(slots=True)
-class ProposalProcessingResult:
+class FunctionCallProcessingResult:
     assistant_message: str
+    function_call_outputs: list[dict[str, Any]]
     action_attempts: list[ActionAttemptRecord]
     assistant_sources: list[dict[str, Any]] = field(default_factory=list)
 
@@ -881,13 +885,21 @@ def _synthesize_google_read_answer(
     return message, collected_sources
 
 
-def process_action_proposals(
+def _response_function_call_output(*, call_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "function_call_output",
+        "call_id": call_id,
+        "output": json.dumps(jsonable_encoder(payload), sort_keys=True, separators=(",", ":")),
+    }
+
+
+def process_response_function_calls(
     *,
     db: Session,
     session_id: str,
     turn: TurnRecord,
     assistant_message: str,
-    proposals_raw: Any,
+    function_calls_raw: Any,
     approval_ttl_seconds: int,
     approval_actor_id: str,
     add_event: Callable[[str, dict[str, Any]], None],
@@ -895,10 +907,12 @@ def process_action_proposals(
     new_id_fn: Callable[[str], str],
     runtime_provenance: RuntimeProvenance | None = None,
     google_runtime: GoogleConnectorRuntime | None = None,
-) -> ProposalProcessingResult:
+    agency_runtime: Any | None = None,
+) -> FunctionCallProcessingResult:
     inline_results: list[dict[str, Any]] = []
     pending_approvals: list[dict[str, Any]] = []
     blocked_reasons: list[str] = []
+    function_call_outputs: list[dict[str, Any]] = []
     created_action_attempts: list[ActionAttemptRecord] = []
     pending_approval_created = False
     retrieval_requested = False
@@ -913,26 +927,30 @@ def process_action_proposals(
     google_outputs: list[dict[str, Any]] = []
     google_auth_failures: list[TypedAuthFailure] = []
 
-    proposals = proposals_raw if isinstance(proposals_raw, list) else []
-    for proposal_index, proposal_raw in enumerate(proposals, start=1):
-        proposal_payload = proposal_raw if isinstance(proposal_raw, dict) else {}
-        capability_id_raw = proposal_payload.get("capability_id")
-        capability_id = (
-            capability_id_raw.strip()
-            if isinstance(capability_id_raw, str) and capability_id_raw.strip()
-            else "invalid.capability"
-        )
-        is_google_capability_proposal = capability_id in GOOGLE_CAPABILITY_IDS
-        is_retrieval_proposal = capability_id in _GROUNDED_RETRIEVAL_CAPABILITIES
-        is_weather_forecast_proposal = capability_id == "cap.weather.forecast"
-        is_maps_retrieval_proposal = capability_id in _MAPS_RETRIEVAL_CAPABILITY_IDS
-        is_web_extract_retrieval_proposal = capability_id in _WEB_EXTRACT_RETRIEVAL_CAPABILITY_IDS
-        if is_retrieval_proposal:
+    function_calls = function_calls_raw if isinstance(function_calls_raw, list) else []
+    for function_call_index, function_call_raw in enumerate(function_calls, start=1):
+        function_call_payload = function_call_raw if isinstance(function_call_raw, dict) else {}
+        call_id_raw = function_call_payload.get("call_id")
+        call_id = call_id_raw.strip() if isinstance(call_id_raw, str) else ""
+        tool_name_raw = function_call_payload.get("name")
+        tool_name = tool_name_raw.strip() if isinstance(tool_name_raw, str) else ""
+        capability_id = capability_id_for_response_tool_name(tool_name) or "invalid.capability"
+        is_google_capability_call = capability_id in GOOGLE_CAPABILITY_IDS
+        is_agency_capability_call = capability_id in AGENCY_CAPABILITY_IDS
+        is_retrieval_call = capability_id in _GROUNDED_RETRIEVAL_CAPABILITIES
+        is_weather_forecast_call = capability_id == "cap.weather.forecast"
+        is_maps_retrieval_call = capability_id in _MAPS_RETRIEVAL_CAPABILITY_IDS
+        is_web_extract_retrieval_call = capability_id in _WEB_EXTRACT_RETRIEVAL_CAPABILITY_IDS
+        if is_retrieval_call:
             retrieval_requested = True
             retrieval_capability_ids.add(capability_id)
-        raw_input_payload = proposal_payload.get("input")
-        input_payload = jsonable_encoder(raw_input_payload) if isinstance(raw_input_payload, dict) else {}
-        if is_weather_forecast_proposal and set(input_payload.keys()).issubset({"location", "timeframe"}):
+        raw_arguments = function_call_payload.get("arguments")
+        try:
+            decoded_arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else {}
+        except ValueError:
+            decoded_arguments = {}
+        input_payload = jsonable_encoder(decoded_arguments) if isinstance(decoded_arguments, dict) else {}
+        if is_weather_forecast_call and set(input_payload.keys()).issubset({"location", "timeframe"}):
             explicit_location_raw = input_payload.get("location")
             explicit_location = (
                 explicit_location_raw if isinstance(explicit_location_raw, str) else None
@@ -943,7 +961,7 @@ def process_action_proposals(
                 now_fn=now_fn,
             )
             input_payload["location"] = resolved_location
-        model_declared_taint_status = _model_declared_taint_status(proposal_payload)
+        model_declared_taint_status = _model_declared_taint_status(function_call_payload)
         provenance_status = _effective_provenance_status(
             runtime_provenance=runtime_provenance,
             model_declared_taint_status=model_declared_taint_status,
@@ -973,7 +991,7 @@ def process_action_proposals(
             id=new_id_fn("aat"),
             session_id=session_id,
             turn_id=turn.id,
-            proposal_index=proposal_index,
+            proposal_index=function_call_index,
             capability_id=capability_id,
             capability_version=(
                 evaluation.capability.version if evaluation.capability is not None else "unknown"
@@ -1014,6 +1032,17 @@ def process_action_proposals(
             action_attempt.policy_reason = evaluation.reason
             action_attempt.updated_at = now_fn()
             blocked_reasons.append(f"{capability_id}: {evaluation.reason}")
+            if call_id:
+                function_call_outputs.append(
+                    _response_function_call_output(
+                        call_id=call_id,
+                        payload={
+                            "status": "blocked",
+                            "capability_id": capability_id,
+                            "reason": evaluation.reason,
+                        },
+                    )
+                )
             add_event(
                 "evt.action.policy_decided",
                 {
@@ -1023,7 +1052,7 @@ def process_action_proposals(
                     "taint": taint_payload,
                 },
             )
-            if is_retrieval_proposal:
+            if is_retrieval_call:
                 retrieval_errors.append(evaluation.reason)
             continue
 
@@ -1069,6 +1098,18 @@ def process_action_proposals(
                     "expires_at": to_rfc3339(approval_request.expires_at),
                 }
             )
+            if call_id:
+                function_call_outputs.append(
+                    _response_function_call_output(
+                        call_id=call_id,
+                        payload={
+                            "status": "approval_required",
+                            "capability_id": capability_id,
+                            "approval_ref": approval_request.id,
+                            "expires_at": to_rfc3339(approval_request.expires_at),
+                        },
+                    )
+                )
             add_event(
                 "evt.action.approval.requested",
                 {
@@ -1078,7 +1119,7 @@ def process_action_proposals(
                     "expires_at": to_rfc3339(approval_request.expires_at),
                 },
             )
-            if is_retrieval_proposal:
+            if is_retrieval_call:
                 retrieval_errors.append(evaluation.reason)
             continue
 
@@ -1088,6 +1129,17 @@ def process_action_proposals(
             action_attempt.policy_reason = "policy_invariant_violation"
             action_attempt.updated_at = now_fn()
             blocked_reasons.append(f"{capability_id}: policy_invariant_violation")
+            if call_id:
+                function_call_outputs.append(
+                    _response_function_call_output(
+                        call_id=call_id,
+                        payload={
+                            "status": "blocked",
+                            "capability_id": capability_id,
+                            "reason": "policy_invariant_violation",
+                        },
+                    )
+                )
             add_event(
                 "evt.action.policy_decided",
                 {
@@ -1097,7 +1149,7 @@ def process_action_proposals(
                     "taint": taint_payload,
                 },
             )
-            if is_retrieval_proposal:
+            if is_retrieval_call:
                 retrieval_errors.append("policy_invariant_violation")
             continue
 
@@ -1125,6 +1177,17 @@ def process_action_proposals(
             action_attempt.policy_reason = "integrity_mismatch"
             action_attempt.updated_at = now_fn()
             blocked_reasons.append(f"{capability_id}: {integrity_error}")
+            if call_id:
+                function_call_outputs.append(
+                    _response_function_call_output(
+                        call_id=call_id,
+                        payload={
+                            "status": "failed",
+                            "capability_id": capability_id,
+                            "error": integrity_error,
+                        },
+                    )
+                )
             add_event(
                 "evt.action.execution.failed",
                 {
@@ -1132,7 +1195,7 @@ def process_action_proposals(
                     "error": integrity_error,
                 },
             )
-            if is_retrieval_proposal:
+            if is_retrieval_call:
                 retrieval_errors.append(integrity_error)
             continue
 
@@ -1144,7 +1207,7 @@ def process_action_proposals(
             },
         )
         execution_result: ExecutionResult | GoogleCapabilityExecutionResult
-        if is_google_capability_proposal and google_runtime is not None:
+        if is_google_capability_call and google_runtime is not None:
             _acquire_side_effect_execution_lock(
                 db=db,
                 impact_level=evaluation.capability.impact_level,
@@ -1170,6 +1233,17 @@ def process_action_proposals(
                 )
                 if google_execution_result.auth_failure is not None:
                     google_auth_failures.append(google_execution_result.auth_failure)
+                if call_id:
+                    function_call_outputs.append(
+                        _response_function_call_output(
+                            call_id=call_id,
+                            payload={
+                                "status": "failed",
+                                "capability_id": capability_id,
+                                "error": error_reason,
+                            },
+                        )
+                    )
                 action_attempt.execution_output = None
                 action_attempt.execution_error = error_reason
                 action_attempt.status = "failed"
@@ -1180,7 +1254,7 @@ def process_action_proposals(
                         f"{blocked_reason} ({google_execution_result.auth_failure.recovery})"
                     )
                 blocked_reasons.append(blocked_reason)
-                if is_retrieval_proposal:
+                if is_retrieval_call:
                     retrieval_errors.append(error_reason)
                 add_event(
                     "evt.action.execution.failed",
@@ -1190,6 +1264,21 @@ def process_action_proposals(
                     },
                 )
                 continue
+        elif is_agency_capability_call and agency_runtime is not None:
+            _acquire_side_effect_execution_lock(
+                db=db,
+                impact_level=evaluation.capability.impact_level,
+            )
+            execution_result = agency_runtime.execute_capability(
+                db=db,
+                capability_id=capability_id,
+                normalized_input=evaluation.normalized_input,
+                action_attempt=action_attempt,
+                session_id=session_id,
+                turn_id=turn.id,
+                now_fn=now_fn,
+                new_id_fn=new_id_fn,
+            )
         else:
             _acquire_side_effect_execution_lock(
                 db=db,
@@ -1210,7 +1299,18 @@ def process_action_proposals(
                     "output": execution_result.output,
                 }
             )
-            if is_retrieval_proposal:
+            if call_id:
+                function_call_outputs.append(
+                    _response_function_call_output(
+                        call_id=call_id,
+                        payload={
+                            "status": "succeeded",
+                            "capability_id": capability_id,
+                            "output": execution_result.output,
+                        },
+                    )
+                )
+            if is_retrieval_call:
                 remaining_citations = _MAX_CITED_SOURCES - len(retrieval_sources)
                 if remaining_citations > 0:
                     candidates = _extract_search_source_candidates(
@@ -1237,11 +1337,11 @@ def process_action_proposals(
                         retrieval_source_metadata.extend(persisted_metadata)
                     else:
                         retrieval_errors.append("insufficient_evidence")
-                if is_weather_forecast_proposal:
+                if is_weather_forecast_call:
                     weather_outputs.append(execution_result.output)
-                if is_maps_retrieval_proposal:
+                if is_maps_retrieval_call:
                     maps_outputs.append(execution_result.output)
-                if is_web_extract_retrieval_proposal:
+                if is_web_extract_retrieval_call:
                     web_extract_outputs.append(execution_result.output)
             add_event(
                 "evt.action.execution.succeeded",
@@ -1259,7 +1359,18 @@ def process_action_proposals(
         blocked_reasons.append(
             f"{capability_id}: {execution_result.error or 'execution_output_missing'}"
         )
-        if is_retrieval_proposal:
+        if call_id:
+            function_call_outputs.append(
+                _response_function_call_output(
+                    call_id=call_id,
+                    payload={
+                        "status": "failed",
+                        "capability_id": capability_id,
+                        "error": execution_result.error or "execution_output_missing",
+                    },
+                )
+            )
+        if is_retrieval_call:
             retrieval_errors.append(action_attempt.execution_error)
         add_event(
             "evt.action.execution.failed",
@@ -1322,8 +1433,9 @@ def process_action_proposals(
         )
         final_assistant_message = f"{assistant_message}\n{appendix}" if appendix else assistant_message
         assistant_sources = []
-    return ProposalProcessingResult(
+    return FunctionCallProcessingResult(
         assistant_message=final_assistant_message,
+        function_call_outputs=function_call_outputs,
         action_attempts=created_action_attempts,
         assistant_sources=assistant_sources,
     )
@@ -1431,6 +1543,7 @@ def resolve_approval_decision(
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
     google_runtime: GoogleConnectorRuntime | None = None,
+    agency_runtime: Any | None = None,
 ) -> ApprovalDecisionResult:
     approval = db.scalar(
         select(ApprovalRequestRecord)
@@ -1687,6 +1800,46 @@ def resolve_approval_decision(
                         )
                         if google_execution_result.auth_failure is not None:
                             typed_recovery_hint = google_execution_result.auth_failure.recovery
+                        action_attempt.updated_at = now_fn()
+                        add_approval_event(
+                            "evt.action.execution.failed",
+                            {
+                                "action_attempt_id": action_attempt.id,
+                                "error": action_attempt.execution_error,
+                            },
+                        )
+                elif action_attempt.capability_id in AGENCY_CAPABILITY_IDS and agency_runtime is not None:
+                    agency_execution_result = agency_runtime.execute_capability(
+                        db=db,
+                        capability_id=action_attempt.capability_id,
+                        normalized_input=normalized_input,
+                        action_attempt=action_attempt,
+                        session_id=action_attempt.session_id,
+                        turn_id=action_attempt.turn_id,
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
+                    if (
+                        agency_execution_result.status == "succeeded"
+                        and agency_execution_result.output is not None
+                    ):
+                        action_attempt.status = "succeeded"
+                        action_attempt.execution_output = agency_execution_result.output
+                        action_attempt.execution_error = None
+                        action_attempt.updated_at = now_fn()
+                        add_approval_event(
+                            "evt.action.execution.succeeded",
+                            {
+                                "action_attempt_id": action_attempt.id,
+                                "output": agency_execution_result.output,
+                            },
+                        )
+                    else:
+                        action_attempt.status = "failed"
+                        action_attempt.execution_output = None
+                        action_attempt.execution_error = (
+                            agency_execution_result.error or "execution_output_missing"
+                        )
                         action_attempt.updated_at = now_fn()
                         add_approval_event(
                             "evt.action.execution.failed",

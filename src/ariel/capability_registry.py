@@ -38,6 +38,12 @@ _GOOGLE_ALLOWED_EGRESS_DESTINATIONS = (
     "gmail.googleapis.com",
     "oauth2.googleapis.com",
 )
+AGENCY_CAPABILITY_IDS = {
+    "cap.agency.run",
+    "cap.agency.status",
+    "cap.agency.artifacts",
+    "cap.agency.request_pr",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -518,6 +524,152 @@ def _validate_external_notify_input(
     if len(destination) > 500 or len(message) > 500:
         return None, "schema_invalid"
     return {"destination": destination, "message": message}, None
+
+
+def _normalize_optional_text(value: Any, *, max_length: int) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    if len(normalized) > max_length:
+        return None
+    return normalized
+
+
+def _normalize_optional_string_list(value: Any, *, max_items: int, max_length: int) -> list[str] | None:
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > max_items:
+        return None
+    items: list[str] = []
+    for item_raw in value:
+        item = _normalize_optional_text(item_raw, max_length=max_length)
+        if item is None:
+            return None
+        items.append(item)
+    return items
+
+
+def _normalize_optional_env(value: Any) -> dict[str, str] | None:
+    if value is None:
+        return {}
+    if not isinstance(value, list) or len(value) > 20:
+        return None
+    env: dict[str, str] = {}
+    for item in value:
+        if not isinstance(item, dict) or set(item.keys()) != {"name", "value"}:
+            return None
+        key = _normalize_optional_text(item.get("name"), max_length=80)
+        env_value = _normalize_optional_text(item.get("value"), max_length=2000)
+        if key is None or env_value is None:
+            return None
+        env[key] = env_value
+    return env
+
+
+def _validate_agency_run_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not set(raw_input.keys()).issubset(
+        {
+            "repo_root",
+            "name",
+            "prompt",
+            "base_branch",
+            "runner",
+            "runner_args",
+            "env",
+            "no_include_untracked",
+        }
+    ):
+        return None, "schema_invalid"
+    repo_root = _normalize_optional_text(raw_input.get("repo_root"), max_length=4096)
+    name = _normalize_optional_text(raw_input.get("name"), max_length=120)
+    prompt = _normalize_optional_text(raw_input.get("prompt"), max_length=262144)
+    if repo_root is None or name is None or prompt is None:
+        return None, "schema_invalid"
+    base_branch = _normalize_optional_text(raw_input.get("base_branch"), max_length=200)
+    runner = _normalize_optional_text(raw_input.get("runner"), max_length=80)
+    runner_args = _normalize_optional_string_list(
+        raw_input.get("runner_args"), max_items=20, max_length=500
+    )
+    env = _normalize_optional_env(raw_input.get("env"))
+    if runner_args is None or env is None:
+        return None, "schema_invalid"
+    no_include_untracked_raw = raw_input.get("no_include_untracked")
+    if no_include_untracked_raw is None:
+        no_include_untracked = False
+    elif isinstance(no_include_untracked_raw, bool):
+        no_include_untracked = no_include_untracked_raw
+    else:
+        return None, "schema_invalid"
+    return {
+        "repo_root": repo_root,
+        "name": name,
+        "prompt": prompt,
+        "base_branch": base_branch,
+        "runner": runner,
+        "runner_args": runner_args,
+        "env": env,
+        "no_include_untracked": no_include_untracked,
+    }, None
+
+
+def _validate_agency_job_lookup_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not set(raw_input.keys()).issubset({"job_id", "repo_id", "task_id"}):
+        return None, "schema_invalid"
+    job_id = _normalize_optional_text(raw_input.get("job_id"), max_length=32)
+    repo_id = _normalize_optional_text(raw_input.get("repo_id"), max_length=128)
+    task_id = _normalize_optional_text(raw_input.get("task_id"), max_length=128)
+    if job_id is None and (repo_id is None or task_id is None):
+        return None, "schema_invalid"
+    return {"job_id": job_id, "repo_id": repo_id, "task_id": task_id}, None
+
+
+def _validate_agency_request_pr_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not set(raw_input.keys()).issubset(
+        {
+            "job_id",
+            "repo_id",
+            "task_id",
+            "invocation_id",
+            "worktree_id",
+            "allow_dirty",
+            "force_with_lease",
+        }
+    ):
+        return None, "schema_invalid"
+    lookup, lookup_error = _validate_agency_job_lookup_input(
+        {
+            "job_id": raw_input.get("job_id"),
+            "repo_id": raw_input.get("repo_id"),
+            "task_id": raw_input.get("task_id"),
+        }
+    )
+    if lookup_error is not None or lookup is None:
+        return None, "schema_invalid"
+    invocation_id = _normalize_optional_text(raw_input.get("invocation_id"), max_length=128)
+    worktree_id = _normalize_optional_text(raw_input.get("worktree_id"), max_length=128)
+    allow_dirty_raw = raw_input.get("allow_dirty")
+    force_with_lease_raw = raw_input.get("force_with_lease")
+    if allow_dirty_raw is not None and not isinstance(allow_dirty_raw, bool):
+        return None, "schema_invalid"
+    if force_with_lease_raw is not None and not isinstance(force_with_lease_raw, bool):
+        return None, "schema_invalid"
+    return {
+        **lookup,
+        "invocation_id": invocation_id,
+        "worktree_id": worktree_id,
+        "allow_dirty": bool(allow_dirty_raw) if allow_dirty_raw is not None else False,
+        "force_with_lease": bool(force_with_lease_raw) if force_with_lease_raw is not None else False,
+    }, None
 
 
 def _execute_read_echo(input_payload: dict[str, Any]) -> dict[str, Any]:
@@ -2265,6 +2417,10 @@ def _execute_external_notify(input_payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _execute_agency_runtime(_: dict[str, Any]) -> dict[str, Any]:
+    raise RuntimeError("agency_runtime_not_bound")
+
+
 def _declare_external_notify_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
     return [
         {
@@ -2539,6 +2695,66 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         execute=_execute_weather_forecast,
         declare_egress_intent=_declare_weather_forecast_egress_intent,
     ),
+    "cap.agency.run": CapabilityDefinition(
+        capability_id="cap.agency.run",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="requires_approval",
+        contract_metadata={
+            "input_schema": "agency_run_v1",
+            "output_schema": "agency_task_start_v1",
+            "idempotency": "action_attempt_id",
+            "execution_mode": "agency_daemon_unix_socket",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_agency_run_input,
+        execute=_execute_agency_runtime,
+    ),
+    "cap.agency.status": CapabilityDefinition(
+        capability_id="cap.agency.status",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "agency_job_lookup_v1",
+            "output_schema": "agency_status_v1",
+            "idempotency": "deterministic_read",
+            "execution_mode": "agency_daemon_unix_socket",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_agency_job_lookup_input,
+        execute=_execute_agency_runtime,
+    ),
+    "cap.agency.artifacts": CapabilityDefinition(
+        capability_id="cap.agency.artifacts",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "agency_job_lookup_v1",
+            "output_schema": "agency_artifacts_v1",
+            "idempotency": "deterministic_read",
+            "execution_mode": "agency_daemon_unix_socket",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_agency_job_lookup_input,
+        execute=_execute_agency_runtime,
+    ),
+    "cap.agency.request_pr": CapabilityDefinition(
+        capability_id="cap.agency.request_pr",
+        version="1.0",
+        impact_level="external_send",
+        policy_decision="requires_approval",
+        contract_metadata={
+            "input_schema": "agency_request_pr_v1",
+            "output_schema": "agency_request_pr_result_v1",
+            "idempotency": "action_attempt_id",
+            "execution_mode": "agency_daemon_unix_socket",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_agency_request_pr_input,
+        execute=_execute_agency_runtime,
+    ),
     "cap.framework.read_echo": CapabilityDefinition(
         capability_id="cap.framework.read_echo",
         version="1.0",
@@ -2628,6 +2844,204 @@ def get_capability(capability_id: str) -> CapabilityDefinition | None:
     if capability_id == "cap.web.extract":
         return replace(capability, allowed_egress_destinations=_web_extract_allowed_destinations())
     return capability
+
+
+def _object_schema(properties: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": list(properties.keys()),
+        "additionalProperties": False,
+    }
+
+
+_NULLABLE_STRING = {"type": ["string", "null"]}
+_STRING_LIST = {
+    "type": "array",
+    "items": {"type": "string"},
+    "maxItems": 20,
+}
+
+_RESPONSE_TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
+    "calendar_window_v1": _object_schema(
+        {
+            "window_start": {"type": "string", "description": "RFC3339 start timestamp."},
+            "window_end": {"type": "string", "description": "RFC3339 end timestamp."},
+        }
+    ),
+    "calendar_slot_planning_v1": _object_schema(
+        {
+            "window_start": {"type": "string"},
+            "window_end": {"type": "string"},
+            "duration_minutes": {"type": "integer", "minimum": 5, "maximum": 480},
+            "attendees": _STRING_LIST,
+        }
+    ),
+    "email_search_v1": _object_schema({"query": {"type": "string", "maxLength": 1000}}),
+    "email_read_v1": _object_schema({"message_id": {"type": "string", "maxLength": 256}}),
+    "drive_search_query_v1": _object_schema({"query": {"type": "string", "maxLength": 1000}}),
+    "drive_read_v1": _object_schema({"file_id": {"type": "string", "maxLength": 256}}),
+    "maps_directions_query_v1": _object_schema(
+        {
+            "origin": _NULLABLE_STRING,
+            "destination": _NULLABLE_STRING,
+            "travel_mode": {
+                "type": "string",
+                "enum": ["driving", "walking", "bicycling", "transit"],
+            },
+        }
+    ),
+    "maps_search_places_query_v1": _object_schema(
+        {
+            "query": {"type": "string", "maxLength": 200},
+            "location_context": _NULLABLE_STRING,
+            "radius_meters": {"type": "integer", "minimum": 100, "maximum": 50000},
+        }
+    ),
+    "calendar_create_event_v1": _object_schema(
+        {
+            "title": {"type": "string", "maxLength": 200},
+            "start_time": {"type": "string"},
+            "end_time": {"type": "string"},
+            "description": _NULLABLE_STRING,
+            "location": _NULLABLE_STRING,
+            "attendees": _STRING_LIST,
+        }
+    ),
+    "email_compose_v1": _object_schema(
+        {
+            "to": _STRING_LIST,
+            "cc": _STRING_LIST,
+            "bcc": _STRING_LIST,
+            "subject": {"type": "string", "maxLength": 998},
+            "body": {"type": "string", "maxLength": 20000},
+        }
+    ),
+    "drive_share_v1": _object_schema(
+        {
+            "file_id": {"type": "string", "maxLength": 256},
+            "grantee_email": {"type": "string", "maxLength": 320},
+            "role": {"type": "string", "enum": ["reader", "commenter", "writer"]},
+        }
+    ),
+    "url_extract_v1": _object_schema({"url": {"type": "string", "maxLength": 2048}}),
+    "search_query_v1": _object_schema({"query": {"type": "string", "maxLength": 1000}}),
+    "weather_forecast_query_v1": _object_schema(
+        {
+            "location": _NULLABLE_STRING,
+            "timeframe": {"type": "string", "enum": ["now", "today", "tomorrow", "next_24h"]},
+        }
+    ),
+    "agency_run_v1": _object_schema(
+        {
+            "repo_root": {"type": "string", "maxLength": 4096},
+            "name": {"type": "string", "maxLength": 120},
+            "prompt": {"type": "string", "maxLength": 262144},
+            "base_branch": _NULLABLE_STRING,
+            "runner": _NULLABLE_STRING,
+            "runner_args": _STRING_LIST,
+            "env": {
+                "type": "array",
+                "items": _object_schema(
+                    {
+                        "name": {"type": "string", "maxLength": 80},
+                        "value": {"type": "string", "maxLength": 2000},
+                    }
+                ),
+                "maxItems": 20,
+            },
+            "no_include_untracked": {"type": "boolean"},
+        }
+    ),
+    "agency_job_lookup_v1": _object_schema(
+        {
+            "job_id": _NULLABLE_STRING,
+            "repo_id": _NULLABLE_STRING,
+            "task_id": _NULLABLE_STRING,
+        }
+    ),
+    "agency_request_pr_v1": _object_schema(
+        {
+            "job_id": _NULLABLE_STRING,
+            "repo_id": _NULLABLE_STRING,
+            "task_id": _NULLABLE_STRING,
+            "invocation_id": _NULLABLE_STRING,
+            "worktree_id": _NULLABLE_STRING,
+            "allow_dirty": {"type": "boolean"},
+            "force_with_lease": {"type": "boolean"},
+        }
+    ),
+    "text_v1": _object_schema({"text": {"type": "string", "maxLength": 4000}}),
+    "note_v1": _object_schema({"note": {"type": "string", "maxLength": 500}}),
+    "external_notify_v1": _object_schema(
+        {
+            "destination": {"type": "string", "maxLength": 500},
+            "message": {"type": "string", "maxLength": 500},
+        }
+    ),
+}
+
+_RESPONSE_TOOL_DESCRIPTIONS: dict[str, str] = {
+    "cap.calendar.list": "Read the owner's primary calendar for an explicit time window.",
+    "cap.calendar.propose_slots": "Find candidate meeting slots in an explicit time window.",
+    "cap.email.search": "Search the owner's email by query.",
+    "cap.email.read": "Read one email message by provider message id.",
+    "cap.drive.search": "Search the owner's Drive metadata.",
+    "cap.drive.read": "Read a bounded Drive file excerpt.",
+    "cap.maps.directions": "Fetch directions for an explicit origin and destination.",
+    "cap.maps.search_places": "Search places with explicit location context.",
+    "cap.calendar.create_event": "Create a calendar event after approval.",
+    "cap.email.draft": "Create an email draft.",
+    "cap.email.send": "Send an email after approval.",
+    "cap.drive.share": "Share a Drive file after approval.",
+    "cap.web.extract": "Extract bounded text and provenance from a public URL.",
+    "cap.search.web": "Search the live web for grounded evidence.",
+    "cap.search.news": "Search recent news for grounded evidence.",
+    "cap.weather.forecast": "Fetch weather for an explicit or stored location.",
+    "cap.agency.run": "Start an Agency daemon task against an allowlisted repository.",
+    "cap.agency.status": "Read status for a tracked Agency job or task.",
+    "cap.agency.artifacts": "Read diff and timeline artifacts for a tracked Agency job.",
+    "cap.agency.request_pr": "Land Agency work and create or update a pull request after approval.",
+    "cap.framework.read_echo": "Test-only read echo capability.",
+    "cap.framework.read_private": "Test-only denied private read capability.",
+    "cap.framework.write_note": "Test-only approval-gated note write capability.",
+    "cap.framework.write_draft": "Test-only inline draft write capability.",
+    "cap.framework.external_notify": "Test-only external notification capability.",
+}
+
+
+def response_tool_name_for_capability_id(capability_id: str) -> str:
+    return capability_id.replace(".", "_")
+
+
+def capability_id_for_response_tool_name(tool_name: str) -> str | None:
+    for capability_id in _CAPABILITY_REGISTRY:
+        if response_tool_name_for_capability_id(capability_id) == tool_name:
+            return capability_id
+    return None
+
+
+def response_tool_definitions() -> list[dict[str, Any]]:
+    tools: list[dict[str, Any]] = []
+    for capability in _CAPABILITY_REGISTRY.values():
+        input_schema_name = capability.contract_metadata.get("input_schema")
+        parameters = (
+            _RESPONSE_TOOL_INPUT_SCHEMAS.get(input_schema_name)
+            if isinstance(input_schema_name, str)
+            else None
+        )
+        if parameters is None:
+            raise RuntimeError(f"missing Responses schema for {capability.capability_id}")
+        tools.append(
+            {
+                "type": "function",
+                "name": response_tool_name_for_capability_id(capability.capability_id),
+                "description": _RESPONSE_TOOL_DESCRIPTIONS[capability.capability_id],
+                "parameters": json.loads(json.dumps(parameters)),
+                "strict": True,
+            }
+        )
+    return tools
 
 
 def capability_contract_hash(capability: CapabilityDefinition) -> str:

@@ -13,6 +13,7 @@ from sqlalchemy import select, text
 from testcontainers.postgres import PostgresContainer
 
 from ariel.app import ModelAdapter, _session_turn_lock_id, create_app
+from tests.integration.responses_helpers import responses_message, responses_with_function_calls
 from ariel.persistence import SessionRecord
 
 
@@ -26,16 +27,16 @@ class SessionManagementProbeAdapter:
     proposals_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def respond(
+    def create_response(
         self,
-        user_message: str,
         *,
-        session_id: str,
-        turn_id: str,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        del session_id, turn_id
+        del tools
         with self._lock:
             self.history_lengths_by_message[user_message] = len(history)
             self.context_bundles.append(copy.deepcopy(context_bundle))
@@ -44,17 +45,26 @@ class SessionManagementProbeAdapter:
         if delay_seconds > 0:
             time.sleep(delay_seconds)
 
-        response: dict[str, Any] = {
-            "assistant_text": f"assistant::{user_message}",
-            "provider": self.provider,
-            "model": self.model,
-            "usage": {"prompt_tokens": 17, "completion_tokens": 12, "total_tokens": 29},
-            "provider_response_id": "resp_s5_pr02_123",
-        }
         proposals = self.proposals_by_message.get(user_message)
         if isinstance(proposals, list):
-            response["action_proposals"] = copy.deepcopy(proposals)
-        return response
+            return responses_with_function_calls(
+                input_items=input_items,
+                assistant_text=f"assistant::{user_message}",
+                proposals=copy.deepcopy(proposals),
+                provider=self.provider,
+                model=self.model,
+                provider_response_id="resp_s5_pr02_123",
+                input_tokens=17,
+                output_tokens=12,
+            )
+        return responses_message(
+            assistant_text=f"assistant::{user_message}",
+            provider=self.provider,
+            model=self.model,
+            provider_response_id="resp_s5_pr02_123",
+            input_tokens=17,
+            output_tokens=12,
+        )
 
 
 @pytest.fixture(scope="session")

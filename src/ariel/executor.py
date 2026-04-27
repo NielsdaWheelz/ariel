@@ -231,7 +231,7 @@ def build_assistant_action_appendix(
             f"expires_at={pending['expires_at']}"
         )
     if blocked_reasons:
-        lines.append("blocked action proposals: " + "; ".join(blocked_reasons))
+        lines.append("blocked function calls: " + "; ".join(blocked_reasons))
     return "\n".join(lines)
 
 

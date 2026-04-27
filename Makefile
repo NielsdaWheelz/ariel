@@ -7,7 +7,7 @@ done)
 
 UVICORN_CMD := .venv/bin/uvicorn ariel.app:create_app --factory --host 127.0.0.1 --port 8000
 
-.PHONY: help bootstrap setup env-init check-venv db-up db-stop db-down db-destroy db-status db-logs db-config db-upgrade tailscale-serve run run-openai run-echo run-worker run-discord dev lint typecheck test verify e2e
+.PHONY: help bootstrap setup env-init check-venv db-up db-stop db-down db-destroy db-status db-logs db-config db-upgrade tailscale-serve run run-worker run-discord dev lint typecheck test verify e2e
 
 bootstrap:
 	bash scripts/bootstrap.sh
@@ -34,9 +34,7 @@ help:
 	  "db-config    - print resolved docker db config from env" \
 	  "db-upgrade   - run alembic migrations" \
 	  "tailscale-serve - expose app via tailscale (https :443 → localhost:8000)" \
-	  "run          - run ariel app (provider from .env.local/env)" \
-	  "run-openai   - run app forcing openai provider" \
-	  "run-echo     - run app forcing echo provider" \
+	  "run          - run ariel app" \
 	  "run-worker   - run durable background worker" \
 	  "run-discord  - run discord surface worker" \
 	  "dev          - env-init + db-up + db-upgrade + run API" \
@@ -113,12 +111,6 @@ tailscale-serve:
 
 run: check-venv
 	$(UVICORN_CMD)
-
-run-openai: check-venv
-	ARIEL_MODEL_PROVIDER=openai $(UVICORN_CMD)
-
-run-echo: check-venv
-	ARIEL_MODEL_PROVIDER=echo ARIEL_MODEL_NAME=echo-v1 $(UVICORN_CMD)
 
 run-worker: check-venv
 	.venv/bin/python -m ariel.worker

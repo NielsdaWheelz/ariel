@@ -522,13 +522,6 @@ run the durable worker in another shell when Agency events or notifications are 
 make run-worker
 ```
 
-switch model provider cleanly:
-
-```bash
-make run-openai
-make run-echo
-```
-
 connection-string values (`user/password/database/port`) can be any values you want, as long as:
 
 - they are valid PostgreSQL credentials,

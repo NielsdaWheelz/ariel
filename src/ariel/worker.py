@@ -419,25 +419,89 @@ def _deliver_discord_notification(
             if notification.status in {"delivered", "acknowledged"}:
                 return
             content = f"**{notification.title}**\n{notification.body}"
+            payload = notification.payload if isinstance(notification.payload, dict) else {}
+            job_id = payload.get("job_id")
+            job = (
+                db.scalar(
+                    select(JobRecord)
+                    .where(JobRecord.id == job_id)
+                    .with_for_update()
+                    .limit(1)
+                )
+                if isinstance(job_id, str)
+                else None
+            )
+            discord_thread_id = job.discord_thread_id if job is not None else None
 
     if settings.discord_bot_token is None or settings.discord_channel_id is None:
         raise RuntimeError("Discord notification delivery is not configured")
 
     error: str | None = None
     response_payload: dict[str, Any] | None = None
+    created_thread_id: str | None = None
     try:
-        response = httpx.post(
-            f"https://discord.com/api/v10/channels/{settings.discord_channel_id}/messages",
-            headers={
-                "authorization": f"Bot {settings.discord_bot_token}",
-                "content-type": "application/json",
-            },
-            json={"content": content, "allowed_mentions": {"parse": []}},
-            timeout=settings.discord_notification_timeout_seconds,
-        )
-        response_payload = {"status_code": response.status_code, "body": response.text[:1000]}
-        if response.status_code < 200 or response.status_code >= 300:
-            error = f"Discord returned HTTP {response.status_code}"
+        target_channel_id = discord_thread_id or str(settings.discord_channel_id)
+        thread_payload: dict[str, Any] | None = None
+        if target_channel_id is None and job is not None:
+            thread_response = httpx.post(
+                f"https://discord.com/api/v10/channels/{settings.discord_channel_id}/threads",
+                headers={
+                    "authorization": f"Bot {settings.discord_bot_token}",
+                    "content-type": "application/json",
+                },
+                json={
+                    "name": _discord_thread_name(job),
+                    "type": 11,
+                    "auto_archive_duration": 1440,
+                },
+                timeout=settings.discord_notification_timeout_seconds,
+            )
+            thread_payload = {
+                "status_code": thread_response.status_code,
+                "body": thread_response.text[:1000],
+            }
+            if thread_response.status_code < 200 or thread_response.status_code >= 300:
+                error = f"Discord returned HTTP {thread_response.status_code} while creating thread"
+            else:
+                created_thread_payload = thread_response.json()
+                created_thread_id = (
+                    created_thread_payload.get("id")
+                    if isinstance(created_thread_payload, dict)
+                    else None
+                )
+                if isinstance(created_thread_id, str) and created_thread_id:
+                    target_channel_id = created_thread_id
+                else:
+                    error = "Discord returned invalid thread response"
+
+        message_payload: dict[str, Any] | None = None
+        if error is None:
+            response = httpx.post(
+                f"https://discord.com/api/v10/channels/{target_channel_id}/messages",
+                headers={
+                    "authorization": f"Bot {settings.discord_bot_token}",
+                    "content-type": "application/json",
+                },
+                json={
+                    "content": content,
+                    "allowed_mentions": {"parse": []},
+                    "components": _discord_notification_components(
+                        notification_id=notification_id,
+                        job_id=job.id if job is not None else None,
+                    ),
+                },
+                timeout=settings.discord_notification_timeout_seconds,
+            )
+            message_payload = {"status_code": response.status_code, "body": response.text[:1000]}
+            if response.status_code < 200 or response.status_code >= 300:
+                error = f"Discord returned HTTP {response.status_code}"
+
+        response_payload = {
+            "thread": thread_payload,
+            "message": message_payload,
+        }
+    except ValueError:
+        error = "Discord returned invalid thread JSON"
     except httpx.HTTPError as exc:
         error = safe_failure_reason(str(exc), fallback=f"unexpected {exc.__class__.__name__}")
 
@@ -451,7 +515,22 @@ def _deliver_discord_notification(
             )
             if notification is None:
                 raise RuntimeError("notification not found after delivery attempt")
+            payload = notification.payload if isinstance(notification.payload, dict) else {}
+            job_id = payload.get("job_id")
+            job = (
+                db.scalar(
+                    select(JobRecord)
+                    .where(JobRecord.id == job_id)
+                    .with_for_update()
+                    .limit(1)
+                )
+                if isinstance(job_id, str)
+                else None
+            )
             now = _utcnow()
+            if job is not None and created_thread_id is not None and error is None:
+                job.discord_thread_id = created_thread_id
+                job.updated_at = now
             db.add(
                 NotificationDeliveryRecord(
                     id=_new_id("ndl"),
@@ -469,6 +548,40 @@ def _deliver_discord_notification(
 
     if error is not None:
         raise RuntimeError(error)
+
+
+def _discord_thread_name(job: JobRecord) -> str:
+    title = job.title or job.external_job_id
+    normalized = " ".join(title.split())
+    if len(normalized) <= 80:
+        return normalized
+    return normalized[:80].rstrip()
+
+
+def _discord_notification_components(
+    *,
+    notification_id: str,
+    job_id: str | None,
+) -> list[dict[str, Any]]:
+    buttons: list[dict[str, Any]] = []
+    if job_id is not None:
+        buttons.append(
+            {
+                "type": 2,
+                "style": 2,
+                "label": "Refresh job",
+                "custom_id": f"ariel:job:refresh:{job_id}",
+            }
+        )
+    buttons.append(
+        {
+            "type": 2,
+            "style": 1,
+            "label": "Acknowledge",
+            "custom_id": f"ariel:notification:ack:{notification_id}",
+        }
+    )
+    return [{"type": 1, "components": buttons}]
 
 
 def _expire_approvals(

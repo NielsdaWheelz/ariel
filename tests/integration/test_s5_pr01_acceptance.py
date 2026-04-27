@@ -11,6 +11,7 @@ from sqlalchemy import func, select
 from testcontainers.postgres import PostgresContainer
 
 from ariel.app import ModelAdapter, create_app
+from tests.integration.responses_helpers import responses_message
 from ariel.persistence import (
     MemoryItemRecord,
     MemoryRevisionRecord,
@@ -25,16 +26,16 @@ class MemoryProbeAdapter:
     model: str = "model.s5-pr01-v1"
     context_bundles: list[dict[str, Any]] = field(default_factory=list)
 
-    def respond(
+    def create_response(
         self,
-        user_message: str,
         *,
-        session_id: str,
-        turn_id: str,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        del session_id, turn_id, history
+        del tools, history
         snapshot = copy.deepcopy(context_bundle)
         self.context_bundles.append(snapshot)
 
@@ -55,13 +56,14 @@ class MemoryProbeAdapter:
             if recalled_fragments
             else f"assistant::{user_message}"
         )
-        return {
-            "assistant_text": assistant_text,
-            "provider": self.provider,
-            "model": self.model,
-            "usage": {"prompt_tokens": 19, "completion_tokens": 14, "total_tokens": 33},
-            "provider_response_id": "resp_s5_pr01_123",
-        }
+        return responses_message(
+            assistant_text=assistant_text,
+            provider=self.provider,
+            model=self.model,
+            provider_response_id="resp_s5_pr01_123",
+            input_tokens=19,
+            output_tokens=14,
+        )
 
 
 @pytest.fixture(scope="session")

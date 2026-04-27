@@ -12,6 +12,7 @@ from testcontainers.postgres import PostgresContainer
 import ariel.action_runtime as action_runtime_module
 import ariel.policy_engine as policy_engine_module
 from ariel.app import ModelAdapter, create_app
+from tests.integration.responses_helpers import responses_with_function_calls
 from ariel.capability_registry import CapabilityDefinition, get_capability as registry_get_capability
 
 
@@ -21,25 +22,27 @@ class ActionProposalAdapter:
     model: str = "model.s3-pr02-v1"
     proposals_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
-    def respond(
+    def create_response(
         self,
-        user_message: str,
         *,
-        session_id: str,
-        turn_id: str,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        del session_id, turn_id, history, context_bundle
+        del tools, history, context_bundle
         proposals = self.proposals_by_message.get(user_message, [])
-        return {
-            "assistant_text": f"assistant::{user_message}",
-            "provider": self.provider,
-            "model": self.model,
-            "usage": {"prompt_tokens": 34, "completion_tokens": 19, "total_tokens": 53},
-            "provider_response_id": "resp_s3_pr02_123",
-            "action_proposals": copy.deepcopy(proposals),
-        }
+        return responses_with_function_calls(
+            input_items=input_items,
+            assistant_text=f"assistant::{user_message}",
+            proposals=copy.deepcopy(proposals),
+            provider=self.provider,
+            model=self.model,
+            provider_response_id="resp_s3_pr02_123",
+            input_tokens=34,
+            output_tokens=19,
+        )
 
 
 @pytest.fixture(scope="session")

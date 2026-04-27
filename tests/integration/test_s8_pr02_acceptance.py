@@ -12,6 +12,7 @@ from testcontainers.postgres import PostgresContainer
 
 import ariel.capability_registry as capability_registry_module
 from ariel.app import ModelAdapter, ModelAdapterError, create_app
+from tests.integration.responses_helpers import responses_with_function_calls
 
 
 @dataclass
@@ -22,32 +23,34 @@ class SharedContentAdapter:
     proposals_for_shared_content: list[dict[str, Any]] = field(default_factory=list)
     failure: ModelAdapterError | None = None
 
-    def respond(
+    def create_response(
         self,
-        user_message: str,
         *,
-        session_id: str,
-        turn_id: str,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        del session_id, turn_id, history, context_bundle
+        del tools, history, context_bundle
         self.seen_user_messages.append(user_message)
         if self.failure is not None:
             raise self.failure
-        action_proposals = (
+        function_calls = (
             copy.deepcopy(self.proposals_for_shared_content)
             if "capture_kind: shared_content" in user_message
             else []
         )
-        return {
-            "assistant_text": f"assistant::{user_message}",
-            "provider": self.provider,
-            "model": self.model,
-            "usage": {"prompt_tokens": 34, "completion_tokens": 21, "total_tokens": 55},
-            "provider_response_id": "resp_s8_pr02_123",
-            "action_proposals": action_proposals,
-        }
+        return responses_with_function_calls(
+            input_items=input_items,
+            assistant_text=f"assistant::{user_message}",
+            proposals=function_calls,
+            provider=self.provider,
+            model=self.model,
+            provider_response_id="resp_s8_pr02_123",
+            input_tokens=34,
+            output_tokens=21,
+        )
 
 
 @dataclass(slots=True)

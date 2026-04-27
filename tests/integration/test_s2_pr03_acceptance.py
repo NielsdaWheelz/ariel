@@ -10,6 +10,7 @@ import pytest
 from testcontainers.postgres import PostgresContainer
 
 from ariel.app import ModelAdapter, create_app
+from tests.integration.responses_helpers import responses_with_function_calls
 
 
 @dataclass
@@ -18,25 +19,27 @@ class ActionProposalAdapter:
     model: str = "model.s2-pr03-v1"
     proposals_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
-    def respond(
+    def create_response(
         self,
-        user_message: str,
         *,
-        session_id: str,
-        turn_id: str,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        del session_id, turn_id, history, context_bundle
+        del tools, history, context_bundle
         proposals = self.proposals_by_message.get(user_message, [])
-        return {
-            "assistant_text": f"assistant::{user_message}",
-            "provider": self.provider,
-            "model": self.model,
-            "usage": {"prompt_tokens": 21, "completion_tokens": 15, "total_tokens": 36},
-            "provider_response_id": "resp_s2_pr03_123",
-            "action_proposals": copy.deepcopy(proposals),
-        }
+        return responses_with_function_calls(
+            input_items=input_items,
+            assistant_text=f"assistant::{user_message}",
+            proposals=copy.deepcopy(proposals),
+            provider=self.provider,
+            model=self.model,
+            provider_response_id="resp_s2_pr03_123",
+            input_tokens=21,
+            output_tokens=15,
+        )
 
 
 @pytest.fixture(scope="session")
