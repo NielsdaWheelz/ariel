@@ -25,6 +25,7 @@ def _assistant_text_from_function_outputs(
     inline_results: list[dict[str, Any]] = []
     pending_approvals: list[dict[str, Any]] = []
     blocked_reasons: list[str] = []
+    no_response_requested = False
 
     for item in input_items:
         if not isinstance(item, dict) or item.get("type") != "function_call_output":
@@ -38,7 +39,9 @@ def _assistant_text_from_function_outputs(
         if not isinstance(capability_id, str):
             capability_id = "unknown"
         status = output.get("status")
-        if status == "succeeded":
+        if status == "succeeded" and capability_id == "cap.discord.no_response":
+            no_response_requested = True
+        elif status == "succeeded":
             inline_results.append(
                 {
                     "capability_id": capability_id,
@@ -57,6 +60,9 @@ def _assistant_text_from_function_outputs(
             blocked_reasons.append(f"{capability_id}: {output.get('reason', 'blocked')}")
         elif status == "failed":
             blocked_reasons.append(f"{capability_id}: {output.get('error', 'failed')}")
+
+    if no_response_requested:
+        return ""
 
     appendix = build_assistant_action_appendix(
         inline_results=inline_results,

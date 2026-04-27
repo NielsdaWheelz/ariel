@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from testcontainers.postgres import PostgresContainer
 
 from ariel.app import ModelAdapter, ModelAdapterError, create_app
-from tests.integration.responses_helpers import responses_message
+from tests.integration.responses_helpers import responses_message, responses_with_function_calls
 from ariel.db import run_migrations
 
 
@@ -45,6 +45,43 @@ class DeterministicModelAdapter:
             provider_response_id="resp_test_123",
             input_tokens=11,
             output_tokens=7,
+        )
+
+
+@dataclass
+class DiscordNoResponseAdapter:
+    provider: str = "provider.discord"
+    model: str = "model.discord-v1"
+    input_items: list[list[dict[str, Any]]] = field(default_factory=list)
+    context_bundles: list[dict[str, Any]] = field(default_factory=list)
+
+    def create_response(
+        self,
+        *,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
+        history: list[dict[str, Any]],
+        context_bundle: dict[str, Any],
+    ) -> dict[str, Any]:
+        del tools, history, user_message
+        self.input_items.append(input_items)
+        self.context_bundles.append(context_bundle)
+        return responses_with_function_calls(
+            input_items=input_items,
+            assistant_text="",
+            proposals=[
+                {
+                    "capability_id": "cap.discord.no_response",
+                    "input": {"reason": "nothing useful to add"},
+                    "influenced_by_untrusted_content": False,
+                }
+            ],
+            provider=self.provider,
+            model=self.model,
+            provider_response_id="resp_discord_no_response_123",
+            input_tokens=13,
+            output_tokens=2,
         )
 
 
@@ -182,7 +219,70 @@ def test_user_can_send_message_and_receive_model_backed_response(postgres_url: s
         body = response.json()
         assert body["ok"] is True
         assert body["assistant"]["message"] == "assistant::hello from phone"
+        assert body["assistant"]["silent"] is False
         assert body["turn"]["status"] == "completed"
+
+
+def test_discord_no_response_tool_completes_turn_without_visible_reply(
+    postgres_url: str,
+) -> None:
+    adapter = DiscordNoResponseAdapter()
+    with _build_client(postgres_url, adapter) as client:
+        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
+
+        response = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={
+                "message": "noted",
+                "discord": {
+                    "guild_id": 123,
+                    "guild_name": "Home",
+                    "channel_id": 456,
+                    "channel_name": "ops",
+                    "channel_type": "text",
+                    "thread_id": 789,
+                    "thread_name": "deploy",
+                    "parent_channel_id": 456,
+                    "parent_channel_name": "ops",
+                    "message_id": 101112,
+                    "message_url": "https://discord.com/channels/123/456/101112",
+                    "author_id": 131415,
+                    "author_name": "owner",
+                    "reply_to_message_id": None,
+                    "mentioned_bot": False,
+                    "attachments": [
+                        {
+                            "id": 161718,
+                            "filename": "note.txt",
+                            "content_type": "text/plain",
+                            "size": 12,
+                            "url": "https://cdn.discordapp.com/attachments/note.txt",
+                        }
+                    ],
+                },
+            },
+        )
+
+        body = response.json()
+        assert response.status_code == 200
+        assert body["assistant"]["message"] == ""
+        assert body["assistant"]["silent"] is True
+        assert body["turn"]["assistant_message"] == ""
+        lifecycle = body["turn"]["surface_action_lifecycle"]
+        assert lifecycle[0]["proposal"]["capability_id"] == "cap.discord.no_response"
+        assert lifecycle[0]["execution"]["status"] == "succeeded"
+        turn_started = [
+            event for event in body["turn"]["events"] if event["event_type"] == "evt.turn.started"
+        ][0]
+        assert turn_started["payload"]["discord"]["channel_name"] == "ops"
+        assert adapter.context_bundles[0]["discord_context"]["message_id"] == 101112
+        assert any(
+            item.get("role") == "system"
+            and isinstance(item.get("content"), str)
+            and "discord context:" in item["content"]
+            and "filename=note.txt" in item["content"]
+            for item in adapter.input_items[0]
+        )
 
 
 def test_pr01_model_led_direct_and_clarification_messages_are_emitted(postgres_url: str) -> None:

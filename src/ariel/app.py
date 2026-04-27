@@ -18,7 +18,7 @@ from fastapi import Body, FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from sqlalchemy import (
     and_,
     create_engine,
@@ -128,6 +128,7 @@ _POLICY_SYSTEM_INSTRUCTIONS = (
     "If user intent is clear, answer directly in this turn.",
     "If user intent is ambiguous or conflicting, ask for the missing details instead of guessing.",
     "If the user asks about details not present in this context, state uncertainty and ask for recovery details.",
+    "If the right Discord behavior is to listen without a visible reply, call cap.discord.no_response.",
 )
 
 _MEMORY_VALUE_MAX_CHARS = 500
@@ -233,8 +234,42 @@ class NormalizedSharedContent:
     urls: list[str]
 
 
+class DiscordAttachmentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: int | None = Field(default=None, gt=0)
+    filename: str = Field(min_length=1, max_length=512)
+    content_type: str | None = Field(default=None, max_length=256)
+    size: int | None = Field(default=None, ge=0, le=100 * 1024 * 1024)
+    url: str | None = Field(default=None, max_length=2048)
+
+
+class DiscordContextRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    guild_id: int | None = Field(default=None, gt=0)
+    guild_name: str | None = Field(default=None, max_length=256)
+    channel_id: int = Field(gt=0)
+    channel_name: str | None = Field(default=None, max_length=256)
+    channel_type: str | None = Field(default=None, max_length=80)
+    thread_id: int | None = Field(default=None, gt=0)
+    thread_name: str | None = Field(default=None, max_length=256)
+    parent_channel_id: int | None = Field(default=None, gt=0)
+    parent_channel_name: str | None = Field(default=None, max_length=256)
+    message_id: int = Field(gt=0)
+    message_url: str | None = Field(default=None, max_length=2048)
+    author_id: int = Field(gt=0)
+    author_name: str | None = Field(default=None, max_length=256)
+    reply_to_message_id: int | None = Field(default=None, gt=0)
+    mentioned_bot: bool = False
+    attachments: list[DiscordAttachmentRequest] = Field(default_factory=list, max_length=10)
+
+
 class MessageRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     message: str = Field(min_length=1, max_length=20000)
+    discord: DiscordContextRequest | None = None
 
     @field_validator("message")
     @classmethod
@@ -506,6 +541,10 @@ def _build_responses_input_items(
             if isinstance(instruction, str) and instruction:
                 input_items.append({"role": "system", "content": instruction})
 
+    discord_context_text = _discord_context_text(context_bundle.get("discord_context"))
+    if discord_context_text is not None:
+        input_items.append({"role": "system", "content": discord_context_text})
+
     recent_turns = context_bundle.get("recent_active_session_turns")
     if not isinstance(recent_turns, list):
         recent_turns = []
@@ -614,6 +653,46 @@ def _build_responses_input_items(
     return input_items
 
 
+def _discord_context_text(raw_context: Any) -> str | None:
+    if not isinstance(raw_context, dict):
+        return None
+    lines = ["discord context:"]
+    for field_name in (
+        "guild_id",
+        "guild_name",
+        "channel_id",
+        "channel_name",
+        "channel_type",
+        "thread_id",
+        "thread_name",
+        "parent_channel_id",
+        "parent_channel_name",
+        "message_id",
+        "message_url",
+        "author_id",
+        "author_name",
+        "reply_to_message_id",
+        "mentioned_bot",
+    ):
+        value = raw_context.get(field_name)
+        if value is not None:
+            lines.append(f"- {field_name}: {value}")
+    attachments = raw_context.get("attachments")
+    if isinstance(attachments, list) and attachments:
+        lines.append("- attachments:")
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            attachment_parts: list[str] = []
+            for field_name in ("id", "filename", "content_type", "size", "url"):
+                value = attachment.get(field_name)
+                if value is not None:
+                    attachment_parts.append(f"{field_name}={value}")
+            if attachment_parts:
+                lines.append("  - " + " ".join(attachment_parts))
+    return "\n".join(lines)
+
+
 def _extract_responses_assistant_text(output_items: Any) -> str:
     if not isinstance(output_items, list):
         return ""
@@ -676,6 +755,10 @@ def _estimate_context_tokens(*, context_bundle: dict[str, Any], user_message: st
         for instruction in policy_system_instructions:
             if isinstance(instruction, str):
                 token_total += _estimate_text_tokens(instruction)
+
+    discord_context_text = _discord_context_text(context_bundle.get("discord_context"))
+    if discord_context_text is not None:
+        token_total += _estimate_text_tokens(discord_context_text)
 
     recent_active_session_turns = context_bundle.get("recent_active_session_turns")
     if isinstance(recent_active_session_turns, list):
@@ -919,9 +1002,23 @@ def _normalize_idempotency_key(raw_key: str | None) -> str | None:
     return normalized
 
 
-def _message_idempotency_request_hash(*, request_session_id: str, message: str) -> str:
-    payload = f"{request_session_id}\n{message}".encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+def _message_idempotency_request_hash(
+    *,
+    request_session_id: str,
+    message: str,
+    discord_context: dict[str, Any] | None,
+) -> str:
+    encoded = json.dumps(
+        {
+            "request_session_id": request_session_id,
+            "message": message,
+            "discord": discord_context,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _capture_request_hash(*, canonical_payload: dict[str, Any]) -> str:
@@ -2242,6 +2339,7 @@ def _build_turn_context_bundle(
     *,
     prior_turns: Sequence[TurnRecord],
     max_recent_turns: int,
+    discord_context: dict[str, Any] | None,
     rolling_session_summary: dict[str, Any],
     durable_memory_recall: Sequence[dict[str, Any]],
     durable_memory_recall_window: dict[str, Any],
@@ -2261,8 +2359,12 @@ def _build_turn_context_bundle(
     omitted_turn_count = len(prior_turns) - len(recent_active_session_turns)
     included_turn_ids = [turn["turn_id"] for turn in recent_active_session_turns]
 
-    return {
-        "section_order": list(_CONTEXT_SECTION_ORDER),
+    section_order = list(_CONTEXT_SECTION_ORDER)
+    if discord_context is not None:
+        section_order.insert(1, "discord_context")
+
+    context_bundle = {
+        "section_order": section_order,
         "policy_system_instructions": list(_POLICY_SYSTEM_INSTRUCTIONS),
         "recent_active_session_turns": recent_active_session_turns,
         "rolling_session_summary": dict(rolling_session_summary),
@@ -2277,6 +2379,9 @@ def _build_turn_context_bundle(
             "included_turn_ids": included_turn_ids,
         },
     }
+    if discord_context is not None:
+        context_bundle["discord_context"] = dict(discord_context)
+    return context_bundle
 
 
 def _context_bundle_audit_metadata(context_bundle: dict[str, Any]) -> dict[str, Any]:
@@ -3061,6 +3166,7 @@ def create_app(
         db: Session,
         request_session_id: str,
         user_message: str,
+        discord_context: dict[str, Any] | None,
         ingress_runtime_provenance: RuntimeProvenance | None = None,
     ) -> TurnExecutionOutcome:
         active_session = db.scalar(
@@ -3097,6 +3203,7 @@ def create_app(
         pre_rotation_context_bundle = _build_turn_context_bundle(
             prior_turns=prior_turns,
             max_recent_turns=int(app.state.max_recent_turns),
+            discord_context=discord_context,
             rolling_session_summary=_build_rolling_session_summary(prior_turns=prior_turns),
             durable_memory_recall=pre_rotation_recall,
             durable_memory_recall_window=pre_rotation_recall_window,
@@ -3155,6 +3262,7 @@ def create_app(
         context_bundle = _build_turn_context_bundle(
             prior_turns=prior_turns,
             max_recent_turns=int(app.state.max_recent_turns),
+            discord_context=discord_context,
             rolling_session_summary=_build_rolling_session_summary(prior_turns=prior_turns),
             durable_memory_recall=durable_memory_recall,
             durable_memory_recall_window=durable_memory_recall_window,
@@ -3199,7 +3307,7 @@ def create_app(
             db.add(event)
             created_events.append(event)
 
-        add_event("evt.turn.started", {"message": user_message})
+        add_event("evt.turn.started", {"message": user_message, "discord": discord_context})
         if durable_memory_recall:
             add_event(
                 "evt.memory.recalled",
@@ -3382,6 +3490,13 @@ def create_app(
                         )
                         created_action_attempts.extend(function_processing.action_attempts)
                         assistant_sources = function_processing.assistant_sources or assistant_sources
+                        if function_processing.silent_response:
+                            assistant_response = {
+                                **candidate_response,
+                                "assistant_text": "",
+                                "assistant_silent": True,
+                            }
+                            break
                         for output_item in output_items:
                             if isinstance(output_item, dict):
                                 responses_input_items.append(jsonable_encoder(output_item))
@@ -3399,6 +3514,7 @@ def create_app(
                             assistant_response = {
                                 **candidate_response,
                                 "assistant_text": function_processing.assistant_message,
+                                "assistant_silent": False,
                             }
                             break
                         continue
@@ -3420,6 +3536,7 @@ def create_app(
                     assistant_response = {
                         **candidate_response,
                         "assistant_text": assistant_text,
+                        "assistant_silent": False,
                     }
                     break
                 except Exception as exc:
@@ -3554,6 +3671,7 @@ def create_app(
                 response_payload=_error_payload(model_failure),
             )
 
+        assert assistant_response is not None
         approvals_by_attempt_id = (
             {
                 approval.action_attempt_id: approval
@@ -3587,6 +3705,7 @@ def create_app(
                 turn=raw_turn,
                 assistant_message=turn.assistant_message,
                 assistant_sources=assistant_sources,
+                assistant_silent=bool(assistant_response.get("assistant_silent")),
             )
         except ResponseContractViolation as exc:
             raise _response_contract_error(exc) from exc
@@ -3605,11 +3724,15 @@ def create_app(
     ) -> JSONResponse | dict[str, Any]:
         _ensure_schema_ready()
         request_session_id = session_id
+        discord_context = (
+            payload.discord.model_dump(mode="json") if payload.discord is not None else None
+        )
         normalized_idempotency_key = _normalize_idempotency_key(request.headers.get("Idempotency-Key"))
         request_hash = (
             _message_idempotency_request_hash(
                 request_session_id=request_session_id,
                 message=payload.message,
+                discord_context=discord_context,
             )
             if normalized_idempotency_key is not None
             else None
@@ -3665,6 +3788,7 @@ def create_app(
                         target_hash = _message_idempotency_request_hash(
                             request_session_id=target_session_id,
                             message=payload.message,
+                            discord_context=discord_context,
                         )
                         existing_for_target = db.scalar(
                             select(TurnIdempotencyRecord)
@@ -3703,6 +3827,7 @@ def create_app(
                     db=db,
                     request_session_id=request_session_id,
                     user_message=payload.message,
+                    discord_context=discord_context,
                 )
                 persist_idempotency_result(
                     turn_id=turn_outcome.turn_id,
@@ -3851,6 +3976,7 @@ def create_app(
                     db=db,
                     request_session_id=request_session_id,
                     user_message=normalized_capture.normalized_turn_input,
+                    discord_context=None,
                     ingress_runtime_provenance=capture_ingress_runtime_provenance,
                 )
 

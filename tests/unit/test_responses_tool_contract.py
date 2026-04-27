@@ -110,3 +110,65 @@ def test_process_response_function_calls_returns_function_call_output_for_inline
     assert result.action_attempts[0].status == "succeeded"
     assert "action result (cap.framework.read_echo)" in result.assistant_message
     assert "response_function_call" not in events[0][1]
+
+
+def test_process_response_function_calls_treats_discord_no_response_as_silent() -> None:
+    fixed_now = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
+    events: list[tuple[str, dict[str, Any]]] = []
+    id_counts: dict[str, int] = {}
+
+    class Db:
+        def add(self, record: Any) -> None:
+            return None
+
+        def flush(self) -> None:
+            return None
+
+        def get_bind(self) -> None:
+            return None
+
+    def new_id(prefix: str) -> str:
+        id_counts[prefix] = id_counts.get(prefix, 0) + 1
+        return f"{prefix}_{id_counts[prefix]}"
+
+    turn = TurnRecord(
+        id="trn_1",
+        session_id="ses_1",
+        user_message="quiet",
+        assistant_message=None,
+        status="in_progress",
+        created_at=fixed_now,
+        updated_at=fixed_now,
+    )
+
+    result = process_response_function_calls(
+        db=cast(Session, Db()),
+        session_id="ses_1",
+        turn=turn,
+        assistant_message="",
+        function_calls_raw=[
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": response_tool_name_for_capability_id("cap.discord.no_response"),
+                "arguments": json.dumps({"reason": "nothing useful to add"}),
+                "influenced_by_untrusted_content": False,
+            }
+        ],
+        approval_ttl_seconds=300,
+        approval_actor_id="usr_1",
+        add_event=lambda event_type, payload: events.append((event_type, payload)),
+        now_fn=lambda: fixed_now,
+        new_id_fn=new_id,
+        runtime_provenance=RuntimeProvenance(status="clean"),
+    )
+
+    assert result.silent_response is True
+    assert result.assistant_message == ""
+    assert json.loads(result.function_call_outputs[0]["output"]) == {
+        "status": "succeeded",
+        "capability_id": "cap.discord.no_response",
+        "output": {"reason": "nothing useful to add"},
+    }
+    assert result.action_attempts[0].capability_id == "cap.discord.no_response"
+    assert result.action_attempts[0].status == "succeeded"

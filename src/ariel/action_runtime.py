@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from ariel.capability_registry import (
     AGENCY_CAPABILITY_IDS,
     CapabilityDefinition,
+    DISCORD_CAPABILITY_IDS,
     canonical_action_payload,
     capability_id_for_response_tool_name,
     capability_contract_hash,
@@ -74,6 +75,7 @@ class FunctionCallProcessingResult:
     function_call_outputs: list[dict[str, Any]]
     action_attempts: list[ActionAttemptRecord]
     assistant_sources: list[dict[str, Any]] = field(default_factory=list)
+    silent_response: bool = False
 
 
 @dataclass(slots=True)
@@ -926,6 +928,7 @@ def process_response_function_calls(
     web_extract_outputs: list[dict[str, Any]] = []
     google_outputs: list[dict[str, Any]] = []
     google_auth_failures: list[TypedAuthFailure] = []
+    silent_response = False
 
     function_calls = function_calls_raw if isinstance(function_calls_raw, list) else []
     for function_call_index, function_call_raw in enumerate(function_calls, start=1):
@@ -937,6 +940,7 @@ def process_response_function_calls(
         capability_id = capability_id_for_response_tool_name(tool_name) or "invalid.capability"
         is_google_capability_call = capability_id in GOOGLE_CAPABILITY_IDS
         is_agency_capability_call = capability_id in AGENCY_CAPABILITY_IDS
+        is_discord_capability_call = capability_id in DISCORD_CAPABILITY_IDS
         is_retrieval_call = capability_id in _GROUNDED_RETRIEVAL_CAPABILITIES
         is_weather_forecast_call = capability_id == "cap.weather.forecast"
         is_maps_retrieval_call = capability_id in _MAPS_RETRIEVAL_CAPABILITY_IDS
@@ -1293,12 +1297,15 @@ def process_response_function_calls(
             action_attempt.execution_error = None
             action_attempt.status = "succeeded"
             action_attempt.updated_at = now_fn()
-            inline_results.append(
-                {
-                    "capability_id": capability_id,
-                    "output": execution_result.output,
-                }
-            )
+            if is_discord_capability_call:
+                silent_response = True
+            else:
+                inline_results.append(
+                    {
+                        "capability_id": capability_id,
+                        "output": execution_result.output,
+                    }
+                )
             if call_id:
                 function_call_outputs.append(
                     _response_function_call_output(
@@ -1380,7 +1387,11 @@ def process_response_function_calls(
             },
         )
 
-    if retrieval_requested:
+    assistant_sources: list[dict[str, Any]]
+    if silent_response:
+        final_assistant_message = ""
+        assistant_sources = []
+    elif retrieval_requested:
         if retrieval_capability_ids and retrieval_capability_ids.issubset(GOOGLE_READ_CAPABILITY_IDS):
             final_assistant_message, assistant_sources = _synthesize_google_read_answer(
                 collected_sources=retrieval_sources,
@@ -1438,6 +1449,7 @@ def process_response_function_calls(
         function_call_outputs=function_call_outputs,
         action_attempts=created_action_attempts,
         assistant_sources=assistant_sources,
+        silent_response=silent_response,
     )
 
 

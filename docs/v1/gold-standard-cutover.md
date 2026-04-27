@@ -136,8 +136,10 @@ The bot connects outbound to Discord Gateway.
 Use Discord interactions over Gateway for slash commands and buttons. Do not require a
 public Discord interactions webhook in this cutover.
 
-Keep Message Content intent only for owner-scoped free-form chat in DMs and configured
-channels.
+Keep Message Content intent only for owner-scoped free-form chat in DMs and the configured
+home guild. The configured guild is Ariel's one home guild for guild chat, slash commands,
+approvals, job threads, and notifications. Owner DMs are always allowed. There is no
+one-channel-only chat semantic in the hard cutover.
 
 ### Keep the droplet private by default
 
@@ -156,11 +158,18 @@ Tailscale is optional. If enabled, it is an admin plane, not a dependency for Di
 
 ### Chat
 
-The owner can send a Discord DM or configured-channel message. Ariel responds with a
-concise answer. If the answer needs a tool, the model calls a real capability.
+The owner can send a Discord DM or a message in the configured home guild. Ariel responds
+with a concise answer unless the model intentionally calls `cap.discord.no_response`.
+That capability is the only model-owned silence path and produces no visible assistant
+text after the audited tool output is recorded.
 
 Read tools can execute inline when policy allows them. External factual claims include
 provenance or uncertainty.
+
+Discord message context includes the author, surface, channel, guild or DM identity,
+message idempotency key, reply or mention context, and bounded attachment metadata.
+Images, files, embeds, and links are not silently trusted; supported attachment or URL
+content is extracted through normal capabilities and surfaced with provenance.
 
 ### Approval
 
@@ -346,7 +355,11 @@ Message Content intent remains owner-scoped. The bot ignores:
 - Other users.
 - Bots.
 - Non-default messages.
-- Messages outside configured DM/channel/mention/reply rules.
+- Messages outside owner DMs or the configured home guild.
+
+Guild messages are not limited to one configured chat channel. The configured channel is
+used as the default notification and thread parent when a more specific Discord target is
+not available.
 
 ## Evals
 

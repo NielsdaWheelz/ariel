@@ -44,6 +44,7 @@ AGENCY_CAPABILITY_IDS = {
     "cap.agency.artifacts",
     "cap.agency.request_pr",
 }
+DISCORD_CAPABILITY_IDS = {"cap.discord.no_response"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +107,12 @@ def _validate_search_web_input(
     raw_input: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
     return _validate_exact_text_input(raw_input, field_name="query", max_length=1000)
+
+
+def _validate_discord_no_response_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    return _validate_exact_text_input(raw_input, field_name="reason", max_length=500)
 
 
 def _validate_search_news_input(
@@ -678,6 +685,10 @@ def _execute_read_echo(input_payload: dict[str, Any]) -> dict[str, Any]:
 
 def _execute_read_private(input_payload: dict[str, Any]) -> dict[str, Any]:
     return {"text": input_payload["text"], "classification": "private"}
+
+
+def _execute_discord_no_response(input_payload: dict[str, Any]) -> dict[str, Any]:
+    return {"reason": input_payload["reason"]}
 
 
 def _execute_write_note(input_payload: dict[str, Any]) -> dict[str, Any]:
@@ -2755,6 +2766,20 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         validate_input=_validate_agency_request_pr_input,
         execute=_execute_agency_runtime,
     ),
+    "cap.discord.no_response": CapabilityDefinition(
+        capability_id="cap.discord.no_response",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "discord_no_response_v1",
+            "output_schema": "discord_no_response_receipt_v1",
+            "idempotency": "deterministic_read",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_discord_no_response_input,
+        execute=_execute_discord_no_response,
+    ),
     "cap.framework.read_echo": CapabilityDefinition(
         capability_id="cap.framework.read_echo",
         version="1.0",
@@ -2971,6 +2996,9 @@ _RESPONSE_TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "force_with_lease": {"type": "boolean"},
         }
     ),
+    "discord_no_response_v1": _object_schema(
+        {"reason": {"type": "string", "maxLength": 500}}
+    ),
     "text_v1": _object_schema({"text": {"type": "string", "maxLength": 4000}}),
     "note_v1": _object_schema({"note": {"type": "string", "maxLength": 500}}),
     "external_notify_v1": _object_schema(
@@ -3002,6 +3030,9 @@ _RESPONSE_TOOL_DESCRIPTIONS: dict[str, str] = {
     "cap.agency.status": "Read status for a tracked Agency job or task.",
     "cap.agency.artifacts": "Read diff and timeline artifacts for a tracked Agency job.",
     "cap.agency.request_pr": "Land Agency work and create or update a pull request after approval.",
+    "cap.discord.no_response": (
+        "Use when the right Discord behavior is to read the message and send no visible reply."
+    ),
     "cap.framework.read_echo": "Test-only read echo capability.",
     "cap.framework.read_private": "Test-only denied private read capability.",
     "cap.framework.write_note": "Test-only approval-gated note write capability.",

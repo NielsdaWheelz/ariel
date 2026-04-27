@@ -30,6 +30,7 @@ _NOTIFICATION_ACK_CUSTOM_ID_PREFIX = "ariel:notification:ack:"
 class ArielDiscordReply:
     content: str
     view: discord.ui.View | None = None
+    silent: bool = False
 
 
 def format_discord_message(message: str) -> str:
@@ -58,6 +59,7 @@ def ask_ariel_reply(
     prompt: str,
     discord_message_id: int,
     allowed_user_id: int | None = None,
+    discord_context: dict[str, Any] | None = None,
 ) -> ArielDiscordReply:
     with httpx.Client(timeout=60.0) as client:
         session_response = client.get(f"{ariel_base_url}/v1/sessions/active")
@@ -70,10 +72,13 @@ def ask_ariel_reply(
         if not isinstance(session_id, str) or not session_id:
             raise ArielDiscordError("Ariel returned an invalid active session response.")
 
+        request_payload: dict[str, Any] = {"message": prompt}
+        if discord_context is not None:
+            request_payload["discord"] = discord_context
         message_response = client.post(
             f"{ariel_base_url}/v1/sessions/{session_id}/message",
             headers={"Idempotency-Key": f"discord-message-{discord_message_id}"},
-            json={"message": prompt},
+            json=request_payload,
         )
         message_payload = _json_response_payload(message_response)
         if message_response.status_code >= 400 or message_payload.get("ok") is not True:
@@ -176,7 +181,7 @@ class ArielDiscordBot(commands.Bot):
     async def _slash_ariel(self, interaction: discord.Interaction, prompt: str) -> None:
         if not self._interaction_is_allowed(interaction):
             await interaction.response.send_message(
-                "This Ariel bot is limited to the configured Discord user and channel.",
+                "This Ariel bot is limited to the configured Discord user and home server.",
                 ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -187,6 +192,8 @@ class ArielDiscordBot(commands.Bot):
             prompt=prompt,
             discord_message_id=interaction.id,
         )
+        if reply.silent:
+            return
         if reply.view is None:
             await interaction.followup.send(
                 format_discord_message(reply.content),
@@ -208,7 +215,7 @@ class ArielDiscordBot(commands.Bot):
             return
         if not self._interaction_is_allowed(interaction):
             await interaction.response.send_message(
-                "This Ariel action is limited to the configured Discord user and channel.",
+                "This Ariel action is limited to the configured Discord user and home server.",
                 ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -216,60 +223,48 @@ class ArielDiscordBot(commands.Bot):
         await self._handle_custom_id_interaction(interaction, custom_id)
 
     async def on_message(self, message: discord.Message) -> None:
-        if message.author.bot:
+        bot_user_id = self.user.id if self.user is not None else None
+        if message.author.bot or message.author.id == bot_user_id:
             return
         if message.author.id != self.ariel_user_id:
             return
         if message.type != discord.MessageType.default:
             return
 
+        attachments = getattr(message, "attachments", None) or []
         prompt = message.content.strip()
-        if not prompt:
+        if not prompt and not attachments:
             return
 
         guild_id = message.guild.id if message.guild is not None else None
-        should_answer = guild_id is None or (
-            guild_id == self.ariel_guild_id and message.channel.id == self.ariel_channel_id
-        )
+        if guild_id is not None and guild_id != self.ariel_guild_id:
+            return
 
-        bot_user_id = self.user.id if self.user is not None else None
-        mentioned_ariel = bot_user_id is not None and any(
+        if bot_user_id is not None and any(
             mention.id == bot_user_id for mention in message.mentions
-        )
-        if mentioned_ariel:
-            should_answer = True
+        ):
             prompt = (
                 prompt.replace(f"<@{bot_user_id}>", "")
                 .replace(f"<@!{bot_user_id}>", "")
                 .strip()
             )
-            if not prompt:
+            if not prompt and not attachments:
                 return
 
-        if not should_answer and bot_user_id is not None and message.reference is not None:
-            referenced_message = message.reference.resolved
-            referenced_author = getattr(referenced_message, "author", None)
-            if getattr(referenced_author, "id", None) == bot_user_id:
-                should_answer = True
-            elif message.reference.message_id is not None and hasattr(
-                message.channel, "fetch_message"
-            ):
-                try:
-                    fetched_message = await message.channel.fetch_message(
-                        message.reference.message_id
-                    )
-                except discord.HTTPException:
-                    fetched_message = None
-                if fetched_message is not None:
-                    should_answer = fetched_message.author.id == bot_user_id
+        if not prompt:
+            prompt = "Uploaded attachment(s)."
 
-        if not should_answer:
+        discord_context = _discord_context_for_message(message, bot_user_id=bot_user_id)
+
+        async with message.channel.typing():
+            reply = await self._ask_ariel_for_discord(
+                prompt=prompt,
+                discord_message_id=message.id,
+                discord_context=discord_context,
+            )
+
+        if reply.silent:
             return
-
-        reply = await self._ask_ariel_for_discord(
-            prompt=prompt,
-            discord_message_id=message.id,
-        )
 
         if reply.view is None:
             await message.reply(
@@ -290,6 +285,7 @@ class ArielDiscordBot(commands.Bot):
         *,
         prompt: str,
         discord_message_id: int,
+        discord_context: dict[str, Any] | None = None,
     ) -> ArielDiscordReply:
         try:
             return await asyncio.to_thread(
@@ -298,6 +294,7 @@ class ArielDiscordBot(commands.Bot):
                 prompt=prompt,
                 discord_message_id=discord_message_id,
                 allowed_user_id=self.ariel_user_id,
+                discord_context=discord_context,
             )
         except ArielDiscordError as exc:
             return ArielDiscordReply(content=f"Ariel request failed: {exc}")
@@ -312,7 +309,7 @@ class ArielDiscordBot(commands.Bot):
         guild_id = interaction.guild.id if interaction.guild is not None else None
         if guild_id is None:
             return True
-        return guild_id == self.ariel_guild_id and interaction.channel_id == self.ariel_channel_id
+        return guild_id == self.ariel_guild_id
 
     async def _handle_custom_id_interaction(
         self,
@@ -424,6 +421,9 @@ def _message_reply_for_discord(
     ariel_base_url: str,
     allowed_user_id: int | None = None,
 ) -> ArielDiscordReply:
+    assistant = payload.get("assistant")
+    if isinstance(assistant, dict) and assistant.get("silent") is True:
+        return ArielDiscordReply(content="", silent=True)
     content = _format_message_response_for_discord(payload)
     pending_approvals = _pending_approval_refs(payload)
     if not pending_approvals:
@@ -584,6 +584,59 @@ def _is_ariel_custom_id(custom_id: str) -> bool:
             _NOTIFICATION_ACK_CUSTOM_ID_PREFIX,
         )
     )
+
+
+def _discord_context_for_message(
+    message: discord.Message,
+    *,
+    bot_user_id: int | None,
+) -> dict[str, Any]:
+    context: dict[str, Any] = {
+        "guild_id": message.guild.id if message.guild is not None else None,
+        "channel_id": message.channel.id,
+        "message_id": message.id,
+        "author_id": message.author.id,
+        "mentioned_bot": (
+            bot_user_id is not None and any(mention.id == bot_user_id for mention in message.mentions)
+        ),
+    }
+    guild_name = getattr(message.guild, "name", None)
+    if isinstance(guild_name, str):
+        context["guild_name"] = guild_name
+    channel_name = getattr(message.channel, "name", None)
+    if isinstance(channel_name, str):
+        context["channel_name"] = channel_name
+    channel_type = getattr(message.channel, "type", None)
+    if channel_type is not None:
+        context["channel_type"] = str(channel_type)
+    jump_url = getattr(message, "jump_url", None)
+    if isinstance(jump_url, str):
+        context["message_url"] = jump_url
+    if message.reference is not None and message.reference.message_id is not None:
+        context["reply_to_message_id"] = message.reference.message_id
+    parent_channel_id = getattr(message.channel, "parent_id", None)
+    if parent_channel_id is not None:
+        context["thread_id"] = message.channel.id
+        context["parent_channel_id"] = parent_channel_id
+        if isinstance(channel_name, str):
+            context["thread_name"] = channel_name
+        parent = getattr(message.channel, "parent", None)
+        parent_name = getattr(parent, "name", None)
+        if isinstance(parent_name, str):
+            context["parent_channel_name"] = parent_name
+    attachments = getattr(message, "attachments", None) or []
+    if attachments:
+        context["attachments"] = [
+            {
+                "id": getattr(attachment, "id", None),
+                "filename": getattr(attachment, "filename", None),
+                "content_type": getattr(attachment, "content_type", None),
+                "size": getattr(attachment, "size", None),
+                "url": getattr(attachment, "url", None),
+            }
+            for attachment in attachments
+        ]
+    return context
 
 
 async def _edit_with_approval_decision(

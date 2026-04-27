@@ -89,11 +89,15 @@ Required Discord settings:
 ```sh
 ARIEL_DISCORD_BOT_TOKEN=<discord-bot-token>
 ARIEL_DISCORD_GUILD_ID=<guild-id>
-ARIEL_DISCORD_CHANNEL_ID=<channel-id>
+ARIEL_DISCORD_CHANNEL_ID=<default-notification-channel-id>
 ARIEL_DISCORD_USER_ID=<owner-user-id>
 ARIEL_DISCORD_ARIEL_BASE_URL=http://127.0.0.1:8000
 ARIEL_DISCORD_NOTIFICATION_TIMEOUT_SECONDS=10.0
 ```
+
+`ARIEL_DISCORD_GUILD_ID` is the one home guild. Owner DMs are also accepted. Do not use
+`ARIEL_DISCORD_CHANNEL_ID` as a one-channel-only chat gate; it is the default notification
+and thread parent when a message-specific Discord target is unavailable.
 
 Required Agency settings:
 
@@ -185,7 +189,7 @@ make verify
 4. Run database migrations.
 5. Restart services.
 6. Confirm health checks.
-7. Send a Discord owner-scoped smoke message.
+7. Send one owner DM smoke message and one owner home-guild smoke message.
 8. Start one approval-required `cap.agency.run` smoke task in an allowed repo.
 
 ## Health Checks
@@ -214,7 +218,12 @@ Expected state:
 
 Functional health:
 
-- Discord DM or configured-channel message receives a concise response.
+- Discord owner DM and home-guild messages receive concise responses unless the model
+  chooses `cap.discord.no_response`.
+- A `cap.discord.no_response` turn records the audited tool output and sends no visible
+  assistant text.
+- Messages with attachments preserve bounded attachment metadata in context; content
+  extraction happens only through normal capabilities with provenance.
 - Responses function calls create action attempts with audit events.
 - Approval-required actions render Discord buttons.
 - Duplicate approval clicks do not duplicate side effects.
@@ -269,6 +278,7 @@ Discord:
 
 - Restart `ariel-discord`.
 - Confirm the bot reconnects to Gateway.
+- Confirm owner DMs and the configured home guild are accepted.
 - Re-issue status messages for active jobs when needed.
 
 OpenAI:
@@ -280,7 +290,8 @@ OpenAI:
 ## Acceptance Criteria
 
 - Ariel API binds to `127.0.0.1` and is not publicly reachable.
-- Discord is the production ingress for chat, approvals, jobs, and status.
+- Discord is the production ingress for chat, approvals, jobs, and status through one
+  configured home guild plus owner DMs.
 - Responses API is the only production model path.
 - No legacy provider, Chat Completions, compatibility flag, or fallback provider is
   configured.

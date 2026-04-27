@@ -27,7 +27,7 @@ MESSAGE_RESPONSE_KEYS = {"ok", "session", "turn", "assistant"}
 TIMELINE_RESPONSE_KEYS = {"ok", "session_id", "turns"}
 APPROVAL_RESPONSE_KEYS = {"ok", "approval", "assistant"}
 SESSION_KEYS = {"id", "is_active", "lifecycle_state", "created_at", "updated_at"}
-ASSISTANT_KEYS = {"message", "sources"}
+ASSISTANT_KEYS = {"message", "sources", "silent"}
 TURN_KEYS = {
     "id",
     "session_id",
@@ -41,7 +41,7 @@ TURN_KEYS = {
 }
 EVENT_KEYS = {"id", "turn_id", "sequence", "event_type", "payload", "created_at"}
 EVENT_PAYLOAD_KEYS_BY_TYPE: dict[str, set[str]] = {
-    "evt.turn.started": {"message"},
+    "evt.turn.started": {"message", "discord"},
     "evt.turn.limit_reached": {"code", "message", "limit", "applied_limits"},
     "evt.assistant.emitted": {"message", "bounded_failure"},
     "evt.turn.failed": {"failure_reason", "error_code", "limit"},

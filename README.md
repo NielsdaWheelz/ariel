@@ -39,8 +39,8 @@ enable Message Content Intent for the bot in the Discord Developer Portal.
 set these env vars in `.env.local`:
 
 - `ARIEL_DISCORD_BOT_TOKEN`
-- `ARIEL_DISCORD_GUILD_ID`
-- `ARIEL_DISCORD_CHANNEL_ID`
+- `ARIEL_DISCORD_GUILD_ID` (the one home guild)
+- `ARIEL_DISCORD_CHANNEL_ID` (default notification/thread parent, not a chat gate)
 - `ARIEL_DISCORD_USER_ID`
 - `ARIEL_DISCORD_ARIEL_BASE_URL` (default `http://127.0.0.1:8000`)
 
@@ -52,11 +52,15 @@ make run-discord
 python -m ariel.discord_bot
 ```
 
-the bot does not register or use slash commands. it handles:
+the bot handles:
 
 - DMs from the configured user
-- normal messages in the primary configured guild/channel
-- mention/reply-only messages in other servers
+- messages from the configured user in the one configured home guild
+
+guild chat is not limited to one configured channel. attachments and links are passed as
+bounded context; content extraction and citations still flow through normal capabilities.
+when the model calls `cap.discord.no_response`, Ariel records the audited tool output and
+sends no visible assistant text.
 
 ## verification gates
 
@@ -110,7 +114,8 @@ slice-2 pr-06 locks response boundaries for user-facing slice-2 APIs:
 
 - `POST /v1/sessions/{session_id}/message`, `GET /v1/sessions/{session_id}/events`,
   `POST /v1/approvals`, and `POST /v1/captures` are schema-enforced surfaced contracts.
-- message responses expose `assistant.message` only (not `assistant.provider/model`).
+- message responses expose `assistant.message`, `assistant.sources`, and `assistant.silent`
+  (not `assistant.provider/model`).
 - turn events use strict per-`event_type` payload schemas (no open `events[].payload` dictionaries).
 - contract drift is fail-closed with `E_RESPONSE_CONTRACT` and sanitized error details.
 

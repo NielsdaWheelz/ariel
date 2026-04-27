@@ -99,15 +99,54 @@ class FakeReference:
         self.resolved = resolved
 
 
+class FakeTyping:
+    def __init__(self, channel: FakeChannel) -> None:
+        self.channel = channel
+
+    async def __aenter__(self) -> None:
+        self.channel.events.append("typing_enter")
+
+    async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.channel.events.append("typing_exit")
+
+
 class FakeChannel:
-    def __init__(self, *, channel_id: int, fetched_message: FakeDiscordMessage | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        channel_id: int,
+        fetched_message: FakeDiscordMessage | None = None,
+        parent_channel_id: int | None = None,
+    ) -> None:
         self.id = channel_id
         self.fetched_message = fetched_message
+        self.parent_id = parent_channel_id
+        self.events: list[str] = []
 
     async def fetch_message(self, message_id: int) -> FakeDiscordMessage:
         assert self.fetched_message is not None
         assert self.fetched_message.id == message_id
         return self.fetched_message
+
+    def typing(self) -> FakeTyping:
+        return FakeTyping(self)
+
+
+class FakeAttachment:
+    def __init__(
+        self,
+        *,
+        attachment_id: int = 555,
+        filename: str = "notes.txt",
+        content_type: str | None = "text/plain",
+        size: int = 12,
+        url: str = "https://cdn.example.test/notes.txt",
+    ) -> None:
+        self.id = attachment_id
+        self.filename = filename
+        self.content_type = content_type
+        self.size = size
+        self.url = url
 
 
 class FakeDiscordMessage:
@@ -121,6 +160,7 @@ class FakeDiscordMessage:
         guild: FakeGuild | None = None,
         mentions: list[FakeUser] | None = None,
         reference: FakeReference | None = None,
+        attachments: list[FakeAttachment] | None = None,
         message_type: discord.MessageType = discord.MessageType.default,
     ) -> None:
         self.id = message_id
@@ -130,6 +170,7 @@ class FakeDiscordMessage:
         self.guild = guild
         self.mentions = mentions or []
         self.reference = reference
+        self.attachments = attachments or []
         self.type = message_type
         self.replies: list[dict[str, Any]] = []
 
@@ -141,6 +182,7 @@ class FakeDiscordMessage:
         allowed_mentions: discord.AllowedMentions,
         view: discord.ui.View | None = None,
     ) -> None:
+        self.channel.events.append("reply")
         self.replies.append(
             {
                 "content": content,
@@ -230,6 +272,7 @@ def _stub_ask_ariel(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
         prompt: str,
         discord_message_id: int,
         allowed_user_id: int | None = None,
+        discord_context: dict[str, Any] | None = None,
     ) -> ArielDiscordReply:
         calls.append(
             {
@@ -237,6 +280,7 @@ def _stub_ask_ariel(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
                 "prompt": prompt,
                 "discord_message_id": discord_message_id,
                 "allowed_user_id": allowed_user_id,
+                "discord_context": discord_context,
             }
         )
         return ArielDiscordReply(content=f"assistant::{prompt}")
@@ -322,6 +366,77 @@ def test_ask_ariel_posts_message_with_discord_message_idempotency(
             "json": {"message": "status please"},
         },
     ]
+
+
+def test_ask_ariel_reply_posts_discord_context_as_separate_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_clients: list[FakeHttpClient] = []
+
+    def fake_client(*, timeout: float) -> FakeHttpClient:
+        assert timeout == 60.0
+        client = FakeHttpClient(
+            responses=[
+                httpx.Response(200, json={"ok": True, "session": {"id": "ses_test"}}),
+                httpx.Response(200, json={"ok": True, "assistant": {"message": "hello"}}),
+            ]
+        )
+        fake_clients.append(client)
+        return client
+
+    monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
+
+    reply = ask_ariel_reply(
+        ariel_base_url="http://127.0.0.1:8000",
+        prompt="status please",
+        discord_message_id=123,
+        discord_context={
+            "guild_id": 1,
+            "channel_id": 88,
+            "message_id": 123,
+            "author_id": 3,
+            "attachments": [{"filename": "report.pdf"}],
+        },
+    )
+
+    assert reply.content == "hello"
+    assert fake_clients[0].calls[1]["json"] == {
+        "message": "status please",
+        "discord": {
+            "guild_id": 1,
+            "channel_id": 88,
+            "message_id": 123,
+            "author_id": 3,
+            "attachments": [{"filename": "report.pdf"}],
+        },
+    }
+
+
+def test_ask_ariel_reply_supports_silent_assistant_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_client(*, timeout: float) -> FakeHttpClient:
+        assert timeout == 60.0
+        return FakeHttpClient(
+            responses=[
+                httpx.Response(200, json={"ok": True, "session": {"id": "ses_test"}}),
+                httpx.Response(
+                    200,
+                    json={"ok": True, "assistant": {"silent": True}},
+                ),
+            ]
+        )
+
+    monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
+
+    reply = ask_ariel_reply(
+        ariel_base_url="http://127.0.0.1:8000",
+        prompt="status please",
+        discord_message_id=123,
+    )
+
+    assert reply.silent is True
+    assert reply.content == ""
 
 
 def test_ask_ariel_includes_pending_approval_affordance(
@@ -587,7 +702,7 @@ def test_on_interaction_handles_approval_custom_id(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr("ariel.discord_bot.decide_approval", fake_decide_approval)
     bot = _bot()
-    interaction = FakeInteraction(custom_id="ariel:approval:approve:apr_123")
+    interaction = FakeInteraction(custom_id="ariel:approval:approve:apr_123", channel_id=88)
 
     _send_interaction(bot, interaction)
 
@@ -647,42 +762,96 @@ def test_ask_ariel_surfaces_safe_api_error(monkeypatch: pytest.MonkeyPatch) -> N
 def test_on_message_answers_configured_user_dm(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = _stub_ask_ariel(monkeypatch)
     bot = _bot()
+    channel = FakeChannel(channel_id=77)
     message = FakeDiscordMessage(
         message_id=321,
         content="hello dm",
         guild=None,
-        channel=FakeChannel(channel_id=77),
+        channel=channel,
     )
 
     _send_message(bot, message)
 
-    assert calls == [
-        {
-            "ariel_base_url": "http://127.0.0.1:8000",
-            "prompt": "hello dm",
-            "discord_message_id": 321,
-            "allowed_user_id": 3,
-        }
-    ]
+    assert calls[0]["ariel_base_url"] == "http://127.0.0.1:8000"
+    assert calls[0]["prompt"] == "hello dm"
+    assert calls[0]["discord_message_id"] == 321
+    assert calls[0]["allowed_user_id"] == 3
+    assert calls[0]["discord_context"] == {
+        "guild_id": None,
+        "channel_id": 77,
+        "message_id": 321,
+        "author_id": 3,
+        "mentioned_bot": False,
+    }
     assert message.replies[0]["content"] == "assistant::hello dm"
     assert message.replies[0]["mention_author"] is False
+    assert channel.events == ["typing_enter", "typing_exit", "reply"]
 
 
-def test_on_message_answers_primary_channel_message(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_on_message_answers_home_guild_message_in_any_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls = _stub_ask_ariel(monkeypatch)
     bot = _bot()
     message = FakeDiscordMessage(
         message_id=456,
         content="hello channel",
         guild=FakeGuild(guild_id=1),
-        channel=FakeChannel(channel_id=2),
+        channel=FakeChannel(channel_id=88, parent_channel_id=2),
+        attachments=[
+            FakeAttachment(
+                attachment_id=777,
+                filename="report.pdf",
+                content_type="application/pdf",
+                size=2048,
+                url="https://cdn.example.test/report.pdf",
+            )
+        ],
     )
 
     _send_message(bot, message)
 
     assert calls[0]["prompt"] == "hello channel"
+    assert calls[0]["discord_context"] == {
+        "guild_id": 1,
+        "channel_id": 88,
+        "message_id": 456,
+        "author_id": 3,
+        "mentioned_bot": False,
+        "thread_id": 88,
+        "parent_channel_id": 2,
+        "attachments": [
+            {
+                "id": 777,
+                "filename": "report.pdf",
+                "content_type": "application/pdf",
+                "size": 2048,
+                "url": "https://cdn.example.test/report.pdf",
+            }
+        ],
+    }
     assert calls[0]["discord_message_id"] == 456
     assert message.replies[0]["content"] == "assistant::hello channel"
+
+
+def test_on_message_answers_attachment_only_home_guild_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _stub_ask_ariel(monkeypatch)
+    bot = _bot()
+    message = FakeDiscordMessage(
+        message_id=654,
+        content="",
+        guild=FakeGuild(guild_id=1),
+        channel=FakeChannel(channel_id=88),
+        attachments=[FakeAttachment(filename="photo.png", content_type="image/png")],
+    )
+
+    _send_message(bot, message)
+
+    assert calls[0]["prompt"] == "Uploaded attachment(s)."
+    assert calls[0]["discord_context"]["attachments"][0]["filename"] == "photo.png"
+    assert message.replies[0]["content"] == "assistant::Uploaded attachment(s)."
 
 
 def test_on_message_sends_legacy_approval_text_as_prompt(
@@ -703,7 +872,61 @@ def test_on_message_sends_legacy_approval_text_as_prompt(
     assert message.replies[0]["content"] == "assistant::deny apr_456 not right now"
 
 
-def test_on_message_answers_other_server_direct_mention(
+def test_on_message_strips_direct_bot_mention_from_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _stub_ask_ariel(monkeypatch)
+    bot = _bot()
+    message = FakeDiscordMessage(
+        content="<@999> hello home",
+        guild=FakeGuild(guild_id=1),
+        channel=FakeChannel(channel_id=88),
+        mentions=[FakeUser(user_id=999, bot=True)],
+    )
+
+    _send_message(bot, message)
+
+    assert calls[0]["prompt"] == "hello home"
+
+
+def test_on_message_sends_no_reply_for_silent_assistant_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    async def fake_ask_ariel_for_discord(
+        *,
+        prompt: str,
+        discord_message_id: int,
+        discord_context: dict[str, Any] | None = None,
+    ) -> ArielDiscordReply:
+        calls.append(
+            {
+                "prompt": prompt,
+                "discord_message_id": discord_message_id,
+                "discord_context": discord_context,
+            }
+        )
+        return ArielDiscordReply(content="", silent=True)
+
+    bot = _bot()
+    monkeypatch.setattr(bot, "_ask_ariel_for_discord", fake_ask_ariel_for_discord)
+    channel = FakeChannel(channel_id=2)
+    message = FakeDiscordMessage(
+        message_id=789,
+        content="quietly note this",
+        guild=FakeGuild(guild_id=1),
+        channel=channel,
+    )
+
+    _send_message(bot, message)
+
+    assert calls[0]["prompt"] == "quietly note this"
+    assert message.replies == []
+    assert channel.events == ["typing_enter", "typing_exit"]
+
+
+def test_on_message_ignores_other_server_direct_mention(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = _stub_ask_ariel(monkeypatch)
@@ -717,11 +940,11 @@ def test_on_message_answers_other_server_direct_mention(
 
     _send_message(bot, message)
 
-    assert calls[0]["prompt"] == "hello elsewhere"
-    assert message.replies[0]["content"] == "assistant::hello elsewhere"
+    assert calls == []
+    assert message.replies == []
 
 
-def test_on_message_answers_other_server_reply(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_on_message_ignores_other_server_reply(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = _stub_ask_ariel(monkeypatch)
     bot = _bot()
     referenced = FakeDiscordMessage(
@@ -738,8 +961,8 @@ def test_on_message_answers_other_server_reply(monkeypatch: pytest.MonkeyPatch) 
 
     _send_message(bot, message)
 
-    assert calls[0]["prompt"] == "follow up"
-    assert message.replies[0]["content"] == "assistant::follow up"
+    assert calls == []
+    assert message.replies == []
 
 
 def test_on_message_ignores_other_server_unmentioned_message(

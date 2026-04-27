@@ -142,6 +142,7 @@ class SurfaceEventTurnStartedPayloadContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     message: str
+    discord: dict[str, Any] | None
 
 
 class SurfaceMemoryRecallExclusionContract(BaseModel):
@@ -404,6 +405,7 @@ class SurfaceAssistantContract(BaseModel):
 
     message: str
     sources: list["SurfaceAssistantSourceContract"]
+    silent: bool = False
 
 
 class SurfaceAssistantSourceContract(BaseModel):
@@ -847,6 +849,7 @@ def build_surface_message_response(
     turn: Any,
     assistant_message: Any,
     assistant_sources: Any,
+    assistant_silent: bool,
 ) -> dict[str, Any]:
     sources_payload = assistant_sources if isinstance(assistant_sources, list) else []
     return _validate_contract(
@@ -857,7 +860,11 @@ def build_surface_message_response(
             "session": _project_surface_session(session),
             "turn": _project_surface_turn(turn),
             # PR-06 deprecates assistant.provider/model for surfaced responses.
-            "assistant": {"message": assistant_message, "sources": sources_payload},
+            "assistant": {
+                "message": assistant_message,
+                "sources": sources_payload,
+                "silent": assistant_silent,
+            },
         },
     )
 
