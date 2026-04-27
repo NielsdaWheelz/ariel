@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -11,6 +12,15 @@ from typing import Any, Literal, Protocol
 from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
 import httpx
+from web_search_tool.brave import BraveSearchProvider
+from web_search_tool.types import (
+    WebSearchError,
+    WebSearchErrorCode,
+    WebSearchRequest,
+    WebSearchResponse,
+    WebSearchResultItem,
+    WebSearchResultType,
+)
 
 PolicyDecision = Literal["allow_inline", "requires_approval", "deny"]
 
@@ -62,31 +72,45 @@ def _validate_exact_text_input(
     return {field_name: normalized}, None
 
 
-def _validate_read_echo_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+def _validate_read_echo_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
     return _validate_exact_text_input(raw_input, field_name="text", max_length=4000)
 
 
-def _validate_read_private_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+def _validate_read_private_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
     return _validate_exact_text_input(raw_input, field_name="text", max_length=4000)
 
 
-def _validate_write_note_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+def _validate_write_note_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
     return _validate_exact_text_input(raw_input, field_name="note", max_length=500)
 
 
-def _validate_write_draft_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+def _validate_write_draft_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
     return _validate_exact_text_input(raw_input, field_name="note", max_length=500)
 
 
-def _validate_search_web_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+def _validate_search_web_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
     return _validate_exact_text_input(raw_input, field_name="query", max_length=1000)
 
 
-def _validate_search_news_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+def _validate_search_news_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
     return _validate_exact_text_input(raw_input, field_name="query", max_length=1000)
 
 
-def _validate_web_extract_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+def _validate_web_extract_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
     return _validate_exact_text_input(raw_input, field_name="url", max_length=2048)
 
 
@@ -105,7 +129,9 @@ def _normalize_rfc3339_like(value: Any) -> str | None:
     return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
-def _validate_calendar_list_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+def _validate_calendar_list_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
     if set(raw_input.keys()) != {"window_start", "window_end"}:
         return None, "schema_invalid"
     window_start = _normalize_rfc3339_like(raw_input.get("window_start"))
@@ -165,19 +191,27 @@ def _validate_calendar_propose_slots_input(
     }, None
 
 
-def _validate_email_search_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+def _validate_email_search_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
     return _validate_exact_text_input(raw_input, field_name="query", max_length=1000)
 
 
-def _validate_email_read_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+def _validate_email_read_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
     return _validate_exact_text_input(raw_input, field_name="message_id", max_length=256)
 
 
-def _validate_drive_search_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+def _validate_drive_search_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
     return _validate_exact_text_input(raw_input, field_name="query", max_length=1000)
 
 
-def _validate_drive_read_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+def _validate_drive_read_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
     return _validate_exact_text_input(raw_input, field_name="file_id", max_length=256)
 
 
@@ -299,7 +333,9 @@ def _normalize_email_recipients(raw_value: Any) -> list[str] | None:
 _DRIVE_ALLOWED_SHARE_ROLES = {"reader", "commenter", "writer"}
 
 
-def _validate_drive_share_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+def _validate_drive_share_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
     if not set(raw_input.keys()).issubset({"file_id", "grantee_email", "role"}):
         return None, "schema_invalid"
 
@@ -424,11 +460,15 @@ def _validate_email_composition_input(
     }, None
 
 
-def _validate_email_draft_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+def _validate_email_draft_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
     return _validate_email_composition_input(raw_input)
 
 
-def _validate_email_send_input(raw_input: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+def _validate_email_send_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
     return _validate_email_composition_input(raw_input)
 
 
@@ -496,20 +536,24 @@ def _execute_write_draft(input_payload: dict[str, Any]) -> dict[str, Any]:
     return {"status": "drafted", "note": input_payload["note"]}
 
 
-def _search_web_endpoint() -> str:
-    default_endpoint = "https://api.search.brave.com/res/v1/web/search"
-    configured_endpoint = os.getenv("ARIEL_SEARCH_WEB_ENDPOINT")
-    if configured_endpoint is None:
-        return default_endpoint
-    normalized = configured_endpoint.strip()
+def _search_brave_base_url() -> str:
+    default_base_url = "https://api.search.brave.com/res/v1"
+    configured_base_url = os.getenv("ARIEL_SEARCH_BRAVE_BASE_URL")
+    if configured_base_url is None:
+        return default_base_url
+    normalized = configured_base_url.strip().rstrip("/")
     if not normalized:
-        return default_endpoint
+        return default_base_url
     parsed = urlparse(normalized)
     if parsed.scheme:
         return normalized
     if "://" in normalized:
-        return default_endpoint
+        return default_base_url
     return f"https://{normalized.lstrip('/')}"
+
+
+def _search_web_endpoint() -> str:
+    return f"{_search_brave_base_url()}/web/search"
 
 
 def _search_web_timeout_seconds() -> float:
@@ -565,105 +609,93 @@ def _normalize_optional_timestamp(value: Any) -> str | None:
     return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
-def _normalize_search_result_item(raw_item: Any) -> dict[str, Any] | None:
-    if not isinstance(raw_item, dict):
-        return None
-    title_raw = raw_item.get("title")
-    source_raw = raw_item.get("source")
-    if source_raw is None:
-        source_raw = raw_item.get("url")
-    snippet_raw = raw_item.get("snippet")
-    if snippet_raw is None:
-        snippet_raw = raw_item.get("description")
-    if not isinstance(title_raw, str) or not isinstance(source_raw, str) or not isinstance(snippet_raw, str):
-        return None
-    title = title_raw.strip()
-    source = source_raw.strip()
-    snippet = snippet_raw.strip()
+def _normalize_search_result_item(raw_item: WebSearchResultItem) -> dict[str, Any] | None:
+    title = raw_item.title.strip()
+    source = raw_item.url.strip()
+    snippet = raw_item.snippet.strip()
     if not title or not source or not snippet:
         return None
-    published_at = (
-        _normalize_optional_timestamp(raw_item.get("published_at"))
-        or _normalize_optional_timestamp(raw_item.get("page_age"))
-        or _normalize_optional_timestamp(raw_item.get("age"))
-    )
     return {
         "title": title,
         "source": source,
         "snippet": snippet,
-        "published_at": published_at,
+        "published_at": _normalize_optional_timestamp(raw_item.published_at),
     }
 
 
-def _extract_search_results(
-    payload: dict[str, Any],
-    *,
-    container_key: str | None,
-) -> list[dict[str, Any]]:
-    raw_results: Any
-    if container_key is None:
-        raw_results = payload.get("results")
-    else:
-        container_payload = payload.get(container_key)
-        if isinstance(container_payload, dict):
-            raw_results = container_payload.get("results")
-        else:
-            raw_results = payload.get("results")
-    if not isinstance(raw_results, list):
-        return []
+def _normalize_web_search_response(response: WebSearchResponse, *, query: str) -> dict[str, Any]:
     normalized_results: list[dict[str, Any]] = []
-    for raw_item in raw_results:
+    for raw_item in response.results:
         normalized_item = _normalize_search_result_item(raw_item)
         if normalized_item is None:
             continue
         normalized_results.append(normalized_item)
         if len(normalized_results) >= 5:
             break
-    return normalized_results
+
+    return {
+        "query": query,
+        "retrieved_at": _normalize_optional_timestamp(response.retrieved_at)
+        or datetime.now(tz=UTC).isoformat().replace("+00:00", "Z"),
+        "results": normalized_results,
+    }
+
+
+def _raise_web_search_runtime_error(exc: BaseException, *, prefix: str) -> None:
+    if not isinstance(exc, WebSearchError):
+        raise RuntimeError(f"{prefix} provider failure") from exc
+    if exc.code == WebSearchErrorCode.TIMEOUT:
+        raise RuntimeError(f"{prefix} provider timeout") from exc
+    if exc.code == WebSearchErrorCode.RATE_LIMITED:
+        raise RuntimeError(f"{prefix} provider rate limited") from exc
+    if exc.code == WebSearchErrorCode.PROVIDER_DOWN:
+        raise RuntimeError(f"{prefix} provider upstream failure") from exc
+    if exc.code in {WebSearchErrorCode.INVALID_KEY, WebSearchErrorCode.INVALID_REQUEST}:
+        raise RuntimeError(f"{prefix} provider request rejected") from exc
+    if exc.code == WebSearchErrorCode.BAD_RESPONSE:
+        raise RuntimeError(f"{prefix} provider returned invalid payload") from exc
+    raise RuntimeError(f"{prefix} provider failure") from exc
+
+
+async def _run_brave_search(
+    *,
+    api_key: str,
+    query: str,
+    result_type: WebSearchResultType,
+    timeout_seconds: float,
+) -> WebSearchResponse:
+    async with httpx.AsyncClient() as client:
+        provider = BraveSearchProvider(
+            client,
+            api_key=api_key,
+            base_url=_search_brave_base_url(),
+            timeout_seconds=timeout_seconds,
+        )
+        return await provider.search(
+            WebSearchRequest(query=query, result_type=result_type, limit=5)
+        )
 
 
 def _execute_search_web(input_payload: dict[str, Any]) -> dict[str, Any]:
     api_key = _search_web_api_key()
     if api_key is None:
         raise RuntimeError("search credentials are not configured")
-    endpoint = _search_web_endpoint()
-    endpoint_parsed = urlparse(endpoint)
+    endpoint_parsed = urlparse(_search_web_endpoint())
     if endpoint_parsed.hostname is None or endpoint_parsed.scheme.lower() not in {"http", "https"}:
         raise RuntimeError("search endpoint invalid")
     try:
-        response = httpx.get(
-            endpoint,
-            params={"q": input_payload["query"], "count": 5},
-            headers={
-                "accept": "application/json",
-                "x-subscription-token": api_key,
-            },
-            timeout=_search_web_timeout_seconds(),
+        response = asyncio.run(
+            _run_brave_search(
+                api_key=api_key,
+                query=input_payload["query"],
+                result_type=WebSearchResultType.WEB,
+                timeout_seconds=_search_web_timeout_seconds(),
+            )
         )
-    except httpx.TimeoutException as exc:
-        raise RuntimeError("search provider timeout") from exc
-    except httpx.HTTPError as exc:
-        raise RuntimeError("search provider network failure") from exc
+    except WebSearchError as exc:
+        _raise_web_search_runtime_error(exc, prefix="search")
 
-    if response.status_code == 429:
-        raise RuntimeError("search provider rate limited")
-    if response.status_code >= 500:
-        raise RuntimeError("search provider upstream failure")
-    if response.status_code >= 400:
-        raise RuntimeError("search provider request rejected")
-
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise RuntimeError("search provider returned invalid json") from exc
-    if not isinstance(payload, dict):
-        raise RuntimeError("search provider returned invalid payload")
-
-    return {
-        "query": input_payload["query"],
-        "retrieved_at": datetime.now(tz=UTC).isoformat().replace("+00:00", "Z"),
-        "results": _extract_search_results(payload, container_key="web"),
-    }
+    return _normalize_web_search_response(response, query=input_payload["query"])
 
 
 def _declare_search_web_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -684,19 +716,7 @@ def _search_web_allowed_destinations() -> tuple[str, ...]:
 
 
 def _search_news_endpoint() -> str:
-    default_endpoint = "https://api.search.brave.com/res/v1/news/search"
-    configured_endpoint = os.getenv("ARIEL_SEARCH_NEWS_ENDPOINT")
-    if configured_endpoint is None:
-        return default_endpoint
-    normalized = configured_endpoint.strip()
-    if not normalized:
-        return default_endpoint
-    parsed = urlparse(normalized)
-    if parsed.scheme:
-        return normalized
-    if "://" in normalized:
-        return default_endpoint
-    return f"https://{normalized.lstrip('/')}"
+    return f"{_search_brave_base_url()}/news/search"
 
 
 def _search_news_timeout_seconds() -> float:
@@ -727,45 +747,22 @@ def _execute_search_news(input_payload: dict[str, Any]) -> dict[str, Any]:
     api_key = _search_news_api_key()
     if api_key is None:
         raise RuntimeError("news search credentials are not configured")
-    endpoint = _search_news_endpoint()
-    endpoint_host = _endpoint_host(endpoint)
-    endpoint_parsed = urlparse(endpoint)
-    if endpoint_host is None or endpoint_parsed.scheme.lower() not in {"http", "https"}:
+    endpoint_parsed = urlparse(_search_news_endpoint())
+    if endpoint_parsed.hostname is None or endpoint_parsed.scheme.lower() not in {"http", "https"}:
         raise RuntimeError("news search endpoint invalid")
     try:
-        response = httpx.get(
-            endpoint,
-            params={"q": input_payload["query"], "count": 5},
-            headers={
-                "accept": "application/json",
-                "x-subscription-token": api_key,
-            },
-            timeout=_search_news_timeout_seconds(),
+        response = asyncio.run(
+            _run_brave_search(
+                api_key=api_key,
+                query=input_payload["query"],
+                result_type=WebSearchResultType.NEWS,
+                timeout_seconds=_search_news_timeout_seconds(),
+            )
         )
-    except httpx.TimeoutException as exc:
-        raise RuntimeError("news provider timeout") from exc
-    except httpx.HTTPError as exc:
-        raise RuntimeError("news provider network failure") from exc
+    except WebSearchError as exc:
+        _raise_web_search_runtime_error(exc, prefix="news")
 
-    if response.status_code == 429:
-        raise RuntimeError("news provider rate limited")
-    if response.status_code >= 500:
-        raise RuntimeError("news provider upstream failure")
-    if response.status_code >= 400:
-        raise RuntimeError("news provider request rejected")
-
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise RuntimeError("news provider returned invalid json") from exc
-    if not isinstance(payload, dict):
-        raise RuntimeError("news provider returned invalid payload")
-
-    return {
-        "query": input_payload["query"],
-        "retrieved_at": datetime.now(tz=UTC).isoformat().replace("+00:00", "Z"),
-        "results": _extract_search_results(payload, container_key="news"),
-    }
+    return _normalize_web_search_response(response, query=input_payload["query"])
 
 
 def _declare_search_news_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1001,7 +998,9 @@ def _web_extract_content_blocks(payload: dict[str, Any]) -> list[str]:
     content_raw = payload.get("content")
     if isinstance(content_raw, str) and content_raw.strip():
         normalized_content = content_raw.replace("\r\n", "\n")
-        paragraph_blocks = [chunk.strip() for chunk in normalized_content.split("\n\n") if chunk.strip()]
+        paragraph_blocks = [
+            chunk.strip() for chunk in normalized_content.split("\n\n") if chunk.strip()
+        ]
         if paragraph_blocks:
             return paragraph_blocks
 
@@ -1165,14 +1164,15 @@ def _execute_web_extract(input_payload: dict[str, Any]) -> dict[str, Any]:
     if canonical_host is None or _is_unsafe_web_extract_host(canonical_host):
         raise RuntimeError("url_destination_unsafe")
 
-    retrieved_at = (
-        _normalize_optional_timestamp(document_payload.get("retrieved_at"))
-        or datetime.now(tz=UTC).isoformat().replace("+00:00", "Z")
-    )
+    retrieved_at = _normalize_optional_timestamp(
+        document_payload.get("retrieved_at")
+    ) or datetime.now(tz=UTC).isoformat().replace("+00:00", "Z")
     published_at = _normalize_optional_timestamp(document_payload.get("published_at"))
 
     title_raw = document_payload.get("title")
-    title = title_raw.strip() if isinstance(title_raw, str) and title_raw.strip() else "Extracted page"
+    title = (
+        title_raw.strip() if isinstance(title_raw, str) and title_raw.strip() else "Extracted page"
+    )
 
     raw_blocks = _web_extract_content_blocks(document_payload)
     if not raw_blocks and document_payload is not payload:
@@ -1196,7 +1196,11 @@ def _execute_web_extract(input_payload: dict[str, Any]) -> dict[str, Any]:
     )
 
     language_raw = document_payload.get("language")
-    language = language_raw.strip().lower() if isinstance(language_raw, str) and language_raw.strip() else None
+    language = (
+        language_raw.strip().lower()
+        if isinstance(language_raw, str) and language_raw.strip()
+        else None
+    )
 
     return {
         "url": normalized_url,
@@ -1464,7 +1468,9 @@ def _build_maps_route_result(
     }
 
 
-def _build_maps_place_result(*, endpoint: str, place_payload: dict[str, Any]) -> dict[str, Any] | None:
+def _build_maps_place_result(
+    *, endpoint: str, place_payload: dict[str, Any]
+) -> dict[str, Any] | None:
     name_raw = place_payload.get("name")
     title_raw = place_payload.get("title")
     title = (
@@ -1675,7 +1681,9 @@ def _declare_maps_directions_egress_intent(input_payload: dict[str, Any]) -> lis
     ]
 
 
-def _declare_maps_search_places_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
+def _declare_maps_search_places_egress_intent(
+    input_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
     return [
         {
             "destination": _maps_search_places_endpoint(),
@@ -1691,11 +1699,7 @@ def _declare_maps_search_places_egress_intent(input_payload: dict[str, Any]) -> 
 def _maps_allowed_destinations() -> tuple[str, ...]:
     directions_host = _endpoint_host(_maps_directions_endpoint())
     places_host = _endpoint_host(_maps_search_places_endpoint())
-    hosts = {
-        host
-        for host in (directions_host, places_host)
-        if host is not None
-    }
+    hosts = {host for host in (directions_host, places_host) if host is not None}
     if hosts:
         return tuple(sorted(hosts))
     return ("maps.googleapis.com",)
@@ -1741,7 +1745,9 @@ def _execute_google_drive_share(_: dict[str, Any]) -> dict[str, Any]:
     raise RuntimeError("google_runtime_not_bound")
 
 
-def _declare_google_calendar_list_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
+def _declare_google_calendar_list_egress_intent(
+    input_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
     return [
         {
             "destination": "https://www.googleapis.com/calendar/v3/calendars/primary/events",
@@ -1779,7 +1785,9 @@ def _declare_google_calendar_propose_slots_egress_intent(
     return declarations
 
 
-def _declare_google_email_search_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
+def _declare_google_email_search_egress_intent(
+    input_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
     return [
         {
             "destination": "https://gmail.googleapis.com/gmail/v1/users/me/messages",
@@ -1823,7 +1831,9 @@ def _declare_google_calendar_create_event_egress_intent(
     ]
 
 
-def _declare_google_email_draft_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
+def _declare_google_email_draft_egress_intent(
+    input_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
     return [
         {
             "destination": "https://gmail.googleapis.com/gmail/v1/users/me/drafts",
@@ -1851,7 +1861,9 @@ def _declare_google_email_send_egress_intent(input_payload: dict[str, Any]) -> l
     ]
 
 
-def _declare_google_drive_search_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
+def _declare_google_drive_search_egress_intent(
+    input_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
     return [
         {
             "destination": "https://www.googleapis.com/drive/v3/files",
@@ -1870,7 +1882,9 @@ def _declare_google_drive_read_egress_intent(input_payload: dict[str, Any]) -> l
     ]
 
 
-def _declare_google_drive_share_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
+def _declare_google_drive_share_egress_intent(
+    input_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
     file_id = input_payload["file_id"]
     return [
         {
@@ -1986,7 +2000,9 @@ def _build_weather_output(
     forecast_timestamp: str | None,
 ) -> dict[str, Any]:
     retrieved_at = datetime.now(tz=UTC).isoformat().replace("+00:00", "Z")
-    normalized_forecast_timestamp = _normalize_optional_timestamp(forecast_timestamp) or retrieved_at
+    normalized_forecast_timestamp = (
+        _normalize_optional_timestamp(forecast_timestamp) or retrieved_at
+    )
     normalized_summary = summary.strip() or "forecast data available"
     return {
         "provider": provider_id,
@@ -2065,7 +2081,11 @@ class _TomorrowIoWeatherAdapter:
         hourly_first: dict[str, Any] | None = None
         if isinstance(timelines, dict):
             hourly_payload = timelines.get("hourly")
-            if isinstance(hourly_payload, list) and hourly_payload and isinstance(hourly_payload[0], dict):
+            if (
+                isinstance(hourly_payload, list)
+                and hourly_payload
+                and isinstance(hourly_payload[0], dict)
+            ):
                 hourly_first = hourly_payload[0]
         values = hourly_first.get("values") if isinstance(hourly_first, dict) else None
         if not isinstance(values, dict):
@@ -2160,7 +2180,11 @@ class _WttrDevWeatherAdapter:
         summary_parts: list[str] = []
         if isinstance(current, dict):
             weather_desc = current.get("weatherDesc")
-            if isinstance(weather_desc, list) and weather_desc and isinstance(weather_desc[0], dict):
+            if (
+                isinstance(weather_desc, list)
+                and weather_desc
+                and isinstance(weather_desc[0], dict)
+            ):
                 description = weather_desc[0].get("value")
                 if isinstance(description, str) and description.strip():
                     summary_parts.append(description.strip())
@@ -2171,7 +2195,11 @@ class _WttrDevWeatherAdapter:
 
         forecast_timestamp: str | None = None
         weather_payload = payload.get("weather")
-        if isinstance(weather_payload, list) and weather_payload and isinstance(weather_payload[0], dict):
+        if (
+            isinstance(weather_payload, list)
+            and weather_payload
+            and isinstance(weather_payload[0], dict)
+        ):
             date_value = weather_payload[0].get("date")
             if isinstance(date_value, str) and date_value.strip():
                 forecast_timestamp = f"{date_value.strip()}T00:00:00Z"
@@ -2220,9 +2248,13 @@ def _execute_weather_forecast(input_payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(location_raw, str) or not location_raw.strip():
         raise RuntimeError("weather_location_required")
     timeframe_raw = input_payload.get("timeframe")
-    timeframe = timeframe_raw if isinstance(timeframe_raw, str) and timeframe_raw.strip() else "today"
+    timeframe = (
+        timeframe_raw if isinstance(timeframe_raw, str) and timeframe_raw.strip() else "today"
+    )
     adapter = _weather_provider_adapter()
-    return adapter.fetch_forecast(location=location_raw.strip(), timeframe=timeframe.strip().lower())
+    return adapter.fetch_forecast(
+        location=location_raw.strip(), timeframe=timeframe.strip().lower()
+    )
 
 
 def _execute_external_notify(input_payload: dict[str, Any]) -> dict[str, Any]:
@@ -2611,7 +2643,9 @@ def capability_contract_hash(capability: CapabilityDefinition) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def canonical_action_payload(*, capability_id: str, input_payload: dict[str, Any]) -> dict[str, Any]:
+def canonical_action_payload(
+    *, capability_id: str, input_payload: dict[str, Any]
+) -> dict[str, Any]:
     return {"capability_id": capability_id, "input": input_payload}
 
 

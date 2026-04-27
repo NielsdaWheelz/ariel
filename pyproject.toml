@@ -19,7 +19,11 @@ dependencies = [
   "sqlalchemy>=2.0.39",
   "ulid-py>=1.1.0",
   "uvicorn>=0.34.0",
+  "web-search-tool>=0.1.0",
 ]
+
+[tool.uv.sources]
+web-search-tool = { path = "../web-search-tool", editable = true }
 
 [project.optional-dependencies]
 dev = [

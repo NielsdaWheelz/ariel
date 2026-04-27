@@ -359,12 +359,14 @@ use 16/24/32-byte keys (base64url encoded). keep previous key versions configure
 
 search capability runtime config:
 
+Search execution delegates to `web-search-tool`'s Brave provider. Ariel still owns capability
+policy, egress preflight, and the `search_results_v1` output mapping.
+
 - `ARIEL_SEARCH_WEB_API_KEY` (required for live web retrieval backend)
-- `ARIEL_SEARCH_WEB_ENDPOINT` (optional; defaults to Brave web search endpoint)
-- `ARIEL_SEARCH_WEB_TIMEOUT_SECONDS` (optional; defaults to `8.0`)
+- `ARIEL_SEARCH_BRAVE_BASE_URL` (optional provider base URL; defaults to Brave Search API base)
+- `ARIEL_SEARCH_WEB_TIMEOUT_SECONDS` (optional provider timeout; defaults to `8.0`)
 - `ARIEL_SEARCH_NEWS_API_KEY` (optional; falls back to `ARIEL_SEARCH_WEB_API_KEY`)
-- `ARIEL_SEARCH_NEWS_ENDPOINT` (optional; defaults to Brave news search endpoint)
-- `ARIEL_SEARCH_NEWS_TIMEOUT_SECONDS` (optional; defaults to `8.0`)
+- `ARIEL_SEARCH_NEWS_TIMEOUT_SECONDS` (optional provider timeout; defaults to `8.0`)
 
 weather capability runtime config:
 
