@@ -30,12 +30,18 @@ def upgrade() -> None:
     op.add_column("jobs", sa.Column("agency_branch", sa.Text(), nullable=True))
     op.add_column("jobs", sa.Column("agency_runner", sa.Text(), nullable=True))
     op.add_column("jobs", sa.Column("agency_request_id", sa.String(length=128), nullable=True))
-    op.add_column("jobs", sa.Column("agency_last_synced_at", sa.DateTime(timezone=True), nullable=True))
+    op.add_column(
+        "jobs", sa.Column("agency_last_synced_at", sa.DateTime(timezone=True), nullable=True)
+    )
     op.add_column("jobs", sa.Column("agency_pr_number", sa.Integer(), nullable=True))
     op.add_column("jobs", sa.Column("agency_pr_url", sa.Text(), nullable=True))
     op.add_column("jobs", sa.Column("discord_thread_id", sa.String(length=128), nullable=True))
-    op.create_foreign_key("fk_jobs_session_id", "jobs", "sessions", ["session_id"], ["id"], ondelete="SET NULL")
-    op.create_foreign_key("fk_jobs_turn_id", "jobs", "turns", ["turn_id"], ["id"], ondelete="SET NULL")
+    op.create_foreign_key(
+        "fk_jobs_session_id", "jobs", "sessions", ["session_id"], ["id"], ondelete="SET NULL"
+    )
+    op.create_foreign_key(
+        "fk_jobs_turn_id", "jobs", "turns", ["turn_id"], ["id"], ondelete="SET NULL"
+    )
     op.create_foreign_key(
         "fk_jobs_action_attempt_id",
         "jobs",

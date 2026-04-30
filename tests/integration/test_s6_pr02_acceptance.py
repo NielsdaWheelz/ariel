@@ -183,7 +183,9 @@ def test_s6_pr02_maps_directions_execute_inline_with_citations_and_auditable_lif
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "route to airport"})
+        sent = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "route to airport"}
+        )
         assert sent.status_code == 200
         payload = sent.json()
 
@@ -253,7 +255,9 @@ def test_s6_pr02_maps_search_places_execute_inline_with_disambiguating_metadata_
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "find nearby coffee"})
+        sent = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "find nearby coffee"}
+        )
         assert sent.status_code == 200
         payload = sent.json()
 
@@ -417,30 +421,37 @@ def test_s6_pr02_maps_provider_failures_are_typed_and_recoverable(
     monkeypatch.setenv("ARIEL_MAPS_PROVIDER_TIMEOUT_SECONDS", "2.0")
 
     if failure_mode == "timeout":
+
         def fake_get(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
             del args, kwargs
             raise httpx.TimeoutException("maps timeout")
     elif failure_mode == "network":
+
         def fake_get(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
             del args, kwargs
             raise httpx.HTTPError("maps network failure")
     elif failure_mode == "rate_limited":
+
         def fake_get(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
             del args, kwargs
             return _FakeHTTPResponse(status_code=429, payload={"error": "rate_limited"})
     elif failure_mode == "upstream_failure":
+
         def fake_get(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
             del args, kwargs
             return _FakeHTTPResponse(status_code=503, payload={"error": "upstream"})
     elif failure_mode == "permission_denied":
+
         def fake_get(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
             del args, kwargs
             return _FakeHTTPResponse(status_code=403, payload={"error": "forbidden"})
     elif failure_mode == "request_rejected":
+
         def fake_get(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
             del args, kwargs
             return _FakeHTTPResponse(status_code=400, payload={"error": "bad_request"})
     elif failure_mode == "invalid_payload":
+
         def fake_get(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
             del args, kwargs
             return _FakeHTTPResponse(status_code=200, json_raises=True)
@@ -523,7 +534,9 @@ def test_s6_pr02_maps_egress_preflight_remains_fail_closed_before_execution(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "maps egress deny"})
+        sent = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "maps egress deny"}
+        )
         assert sent.status_code == 200
         payload = sent.json()
         attempt = _surface_attempt(payload["turn"])
@@ -653,7 +666,9 @@ def test_s6_pr02_maps_outputs_remain_normalized_for_mixed_retrieval_turns(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "mixed retrieval"})
+        sent = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "mixed retrieval"}
+        )
         assert sent.status_code == 200
         payload = sent.json()
         message = payload["assistant"]["message"]

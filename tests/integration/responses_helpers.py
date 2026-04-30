@@ -111,7 +111,10 @@ def responses_with_function_calls(
     input_tokens: int = 1,
     output_tokens: int = 1,
 ) -> dict[str, Any]:
-    if any(isinstance(item, dict) and item.get("type") == "function_call_output" for item in input_items):
+    if any(
+        isinstance(item, dict) and item.get("type") == "function_call_output"
+        for item in input_items
+    ):
         return responses_message(
             assistant_text=_assistant_text_from_function_outputs(
                 input_items=input_items,

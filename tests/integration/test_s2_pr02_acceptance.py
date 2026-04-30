@@ -131,7 +131,9 @@ def test_s2_pr02_tainted_side_effect_is_escalated_to_approval_with_auditable_rea
         event_types = _event_types(body["turn"])
         assert "evt.action.execution.started" not in event_types
         proposed_event = next(
-            event for event in body["turn"]["events"] if event["event_type"] == "evt.action.proposed"
+            event
+            for event in body["turn"]["events"]
+            if event["event_type"] == "evt.action.proposed"
         )
         assert proposed_event["payload"]["taint"]["influenced_by_untrusted_content"] is True
         policy_event = next(
@@ -161,7 +163,9 @@ def test_s2_pr02_tainted_external_send_is_denied_with_explicit_reason(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "tainted outbound"})
+        sent = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "tainted outbound"}
+        )
         assert sent.status_code == 200
         body = sent.json()
 
@@ -192,7 +196,9 @@ def test_s2_pr02_approval_execution_blocks_on_integrity_mismatch_before_invocati
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "integrity check"})
+        sent = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "integrity check"}
+        )
         assert sent.status_code == 200
         attempt = _surface_attempt(sent.json()["turn"])
         approval_ref = attempt["approval"]["reference"]
@@ -202,7 +208,9 @@ def test_s2_pr02_approval_execution_blocks_on_integrity_mismatch_before_invocati
         with app.state.session_factory() as db:
             with db.begin():
                 action_attempt = db.scalar(
-                    select(ActionAttemptRecord).where(ActionAttemptRecord.id == action_attempt_id).limit(1)
+                    select(ActionAttemptRecord)
+                    .where(ActionAttemptRecord.id == action_attempt_id)
+                    .limit(1)
                 )
                 assert action_attempt is not None
                 action_attempt.capability_version = "999.0"
@@ -269,7 +277,9 @@ def test_s2_pr02_non_allowlisted_egress_is_blocked_with_user_visible_auditable_r
         assert latest_attempt["execution"]["status"] == "failed"
         assert "egress_destination_denied" in (latest_attempt["execution"]["error"] or "")
         failed_event = next(
-            event for event in latest_turn["events"] if event["event_type"] == "evt.action.execution.failed"
+            event
+            for event in latest_turn["events"]
+            if event["event_type"] == "evt.action.execution.failed"
         )
         assert "egress_destination_denied" in failed_event["payload"]["error"]
 
@@ -374,7 +384,9 @@ def test_s2_pr02_approval_replay_does_not_duplicate_side_effect_execution(
 ) -> None:
     adapter = ActionProposalAdapter(
         proposals_by_message={
-            "single write": [{"capability_id": "cap.framework.write_note", "input": {"note": "once"}}]
+            "single write": [
+                {"capability_id": "cap.framework.write_note", "input": {"note": "once"}}
+            ]
         }
     )
     with _build_client(postgres_url, adapter) as client:
@@ -391,7 +403,10 @@ def test_s2_pr02_approval_replay_does_not_duplicate_side_effect_execution(
         _assert_surface_approval_response(first.json(), expected_status="approved")
         first_timeline = client.get(f"/v1/sessions/{session_id}/events")
         assert first_timeline.status_code == 200
-        assert _surface_attempt(first_timeline.json()["turns"][-1])["execution"]["status"] == "succeeded"
+        assert (
+            _surface_attempt(first_timeline.json()["turns"][-1])["execution"]["status"]
+            == "succeeded"
+        )
 
         replay = client.post(
             "/v1/approvals",

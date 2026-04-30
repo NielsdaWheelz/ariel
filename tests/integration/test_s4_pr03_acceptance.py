@@ -402,7 +402,9 @@ def test_s4_pr03_blocking_auth_failures_remap_readiness_to_reconnect_required(
         _connect_google(client, code=connect_code)
         session_id = _session_id(client)
 
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "draft follow-up"})
+        sent = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "draft follow-up"}
+        )
         assert sent.status_code == 200
         attempt = _surface_attempt(sent.json()["turn"])
         assert attempt["execution"]["status"] == "failed"
@@ -516,7 +518,9 @@ def test_s4_pr03_reconnect_required_persists_until_successful_reconnect(
         _connect_google(client, code="connect-read-only")
         session_id = _session_id(client)
 
-        first = client.post(f"/v1/sessions/{session_id}/message", json={"message": "draft follow-up"})
+        first = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "draft follow-up"}
+        )
         assert first.status_code == 200
         first_attempt = _surface_attempt(first.json()["turn"])
         assert first_attempt["execution"]["error"] == "consent_required"
@@ -734,4 +738,3 @@ def test_s4_pr03_attendee_reconnect_intent_requests_freebusy_and_closes_fallback
         after_message = after_payload["assistant"]["message"].lower()
         assert "works for all attendees" in after_message
         assert "user-calendar-only" not in after_message
-

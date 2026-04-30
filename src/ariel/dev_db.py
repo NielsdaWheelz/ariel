@@ -84,7 +84,9 @@ def resolve_local_postgres_runtime(env: Mapping[str, str]) -> LocalPostgresRunti
     password = parsed.password or "change-me-dev"
     database = parsed.path.lstrip("/") or "ariel"
 
-    container_name = env.get("ARIEL_DB_CONTAINER_NAME", "ariel-postgres").strip() or "ariel-postgres"
+    container_name = (
+        env.get("ARIEL_DB_CONTAINER_NAME", "ariel-postgres").strip() or "ariel-postgres"
+    )
     image = env.get("ARIEL_DB_DOCKER_IMAGE", "postgres:16-alpine").strip() or "postgres:16-alpine"
     volume_name = env.get("ARIEL_DB_VOLUME_NAME", f"{container_name}-data").strip()
     if not volume_name:
@@ -113,7 +115,9 @@ def _is_loopback_host(host: str) -> bool:
         return False
 
 
-def _run(cmd: list[str], *, capture: bool = False, check: bool = True) -> subprocess.CompletedProcess[str]:
+def _run(
+    cmd: list[str], *, capture: bool = False, check: bool = True
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         cmd,
         check=check,
@@ -343,13 +347,17 @@ def _default_project_root() -> Path:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Manage local Docker Postgres for Ariel development.")
+    parser = argparse.ArgumentParser(
+        description="Manage local Docker Postgres for Ariel development."
+    )
     parser.add_argument(
         "action",
         choices=["up", "stop", "down", "destroy", "status", "logs", "print-config"],
     )
     parser.add_argument("--project-root", type=Path, default=_default_project_root())
-    parser.add_argument("--follow", action="store_true", help="Follow logs stream (logs action only).")
+    parser.add_argument(
+        "--follow", action="store_true", help="Follow logs stream (logs action only)."
+    )
     return parser
 
 
@@ -383,4 +391,3 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"error: {exc}")
         return 1
-

@@ -461,8 +461,12 @@ def test_s6_pr01_drive_search_and_read_execute_inline_with_retrieval_citations(
 ) -> None:
     adapter = ActionProposalAdapter(
         proposals_by_message={
-            "find launch plan": [{"capability_id": "cap.drive.search", "input": {"query": "launch plan"}}],
-            "read launch plan": [{"capability_id": "cap.drive.read", "input": {"file_id": "drv_plan"}}],
+            "find launch plan": [
+                {"capability_id": "cap.drive.search", "input": {"query": "launch plan"}}
+            ],
+            "read launch plan": [
+                {"capability_id": "cap.drive.read", "input": {"file_id": "drv_plan"}}
+            ],
         }
     )
     oauth_client = FakeGoogleOAuthClient(
@@ -491,7 +495,9 @@ def test_s6_pr01_drive_search_and_read_execute_inline_with_retrieval_citations(
         _connect_google(client, code="connect-drive-read")
         session_id = _session_id(client)
 
-        search = client.post(f"/v1/sessions/{session_id}/message", json={"message": "find launch plan"})
+        search = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "find launch plan"}
+        )
         assert search.status_code == 200
         search_payload = search.json()
         search_attempt = _surface_attempt(search_payload["turn"])
@@ -506,7 +512,9 @@ def test_s6_pr01_drive_search_and_read_execute_inline_with_retrieval_citations(
         assert "[1]" in search_payload["assistant"]["message"]
         assert len(search_payload["assistant"]["sources"]) == 1
 
-        read = client.post(f"/v1/sessions/{session_id}/message", json={"message": "read launch plan"})
+        read = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "read launch plan"}
+        )
         assert read.status_code == 200
         read_payload = read.json()
         read_attempt = _surface_attempt(read_payload["turn"])
@@ -540,7 +548,9 @@ def test_s6_pr01_drive_read_typed_outcomes_are_explicit_and_recoverable(
     expected_hint: str,
 ) -> None:
     adapter = ActionProposalAdapter(
-        proposals_by_message={message: [{"capability_id": "cap.drive.read", "input": {"file_id": file_id}}]}
+        proposals_by_message={
+            message: [{"capability_id": "cap.drive.read", "input": {"file_id": file_id}}]
+        }
     )
     oauth_client = FakeGoogleOAuthClient(
         tokens_by_code={
@@ -689,7 +699,9 @@ def test_s6_pr01_drive_share_is_approval_gated_exact_payload_and_exactly_once(
         _connect_google(client, code="connect-drive-share")
         session_id = _session_id(client)
 
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "share launch plan"})
+        sent = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "share launch plan"}
+        )
         assert sent.status_code == 200
         turn = sent.json()["turn"]
         attempt = _surface_attempt(turn)
@@ -743,7 +755,13 @@ def test_s6_pr01_drive_share_is_approval_gated_exact_payload_and_exactly_once(
         ("not_connected", None, "ok", False, "not_connected"),
         ("consent_required", "connect-baseline", "ok", False, "consent_required"),
         ("scope_missing", "connect-drive-read", "ok", True, "scope_missing"),
-        ("token_expired", "connect-drive-read-expired", "transient_failure", False, "token_expired"),
+        (
+            "token_expired",
+            "connect-drive-read-expired",
+            "transient_failure",
+            False,
+            "token_expired",
+        ),
         ("access_revoked", "connect-drive-read-expired", "invalid_grant", False, "access_revoked"),
     ],
 )
@@ -758,7 +776,9 @@ def test_s6_pr01_drive_auth_scope_failures_are_typed_and_recoverable(
     del case_name
     adapter = ActionProposalAdapter(
         proposals_by_message={
-            "read strategy doc": [{"capability_id": "cap.drive.read", "input": {"file_id": "drv_auth"}}]
+            "read strategy doc": [
+                {"capability_id": "cap.drive.read", "input": {"file_id": "drv_auth"}}
+            ]
         }
     )
     oauth_client = FakeGoogleOAuthClient(
@@ -809,7 +829,9 @@ def test_s6_pr01_drive_auth_scope_failures_are_typed_and_recoverable(
             _connect_google(client, code=connect_code)
         session_id = _session_id(client)
 
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "read strategy doc"})
+        sent = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "read strategy doc"}
+        )
         assert sent.status_code == 200
         payload = sent.json()
         attempt = _surface_attempt(payload["turn"])
@@ -875,7 +897,9 @@ def test_s6_pr01_drive_provider_failures_are_typed_and_recoverable(
         _connect_google(client, code="connect-drive-search")
         session_id = _session_id(client)
 
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "find risk register"})
+        sent = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "find risk register"}
+        )
         assert sent.status_code == 200
         payload = sent.json()
         attempt = _surface_attempt(payload["turn"])

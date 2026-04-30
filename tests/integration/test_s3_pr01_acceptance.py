@@ -13,7 +13,10 @@ import ariel.action_runtime as action_runtime_module
 import ariel.policy_engine as policy_engine_module
 from ariel.app import ModelAdapter, create_app
 from tests.integration.responses_helpers import responses_with_function_calls
-from ariel.capability_registry import CapabilityDefinition, get_capability as registry_get_capability
+from ariel.capability_registry import (
+    CapabilityDefinition,
+    get_capability as registry_get_capability,
+)
 
 
 @dataclass
@@ -146,7 +149,9 @@ def test_s3_pr01_grounded_response_has_inline_citations_sources_and_artifacts(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "capital question"})
+        sent = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "capital question"}
+        )
         assert sent.status_code == 200
         payload = sent.json()
 
@@ -207,7 +212,9 @@ def test_s3_pr01_search_egress_fails_closed_before_capability_execute(
 
     adapter = ActionProposalAdapter(
         proposals_by_message={
-            "egress deny": [{"capability_id": "cap.search.web", "input": {"query": "capital of france"}}]
+            "egress deny": [
+                {"capability_id": "cap.search.web", "input": {"query": "capital of france"}}
+            ]
         }
     )
     with _build_client(postgres_url, adapter) as client:
@@ -373,7 +380,9 @@ def test_s3_pr01_mixed_search_and_non_search_proposals_keep_grounded_message_and
         assert "cap.search.web" in lifecycle_by_capability
         assert lifecycle_by_capability["cap.search.web"]["execution"]["status"] == "succeeded"
         assert "cap.framework.read_echo" in lifecycle_by_capability
-        assert lifecycle_by_capability["cap.framework.read_echo"]["execution"]["status"] == "succeeded"
+        assert (
+            lifecycle_by_capability["cap.framework.read_echo"]["execution"]["status"] == "succeeded"
+        )
         assert lifecycle_by_capability["cap.framework.read_echo"]["execution"]["output"] == {
             "text": "alpha"
         }

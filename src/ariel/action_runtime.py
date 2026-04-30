@@ -564,7 +564,9 @@ def _synthesize_grounded_retrieval_answer(
         conflict_details = (
             f" ({conflicting_claims[0]})" if len(conflicting_claims) == 1 else " (multiple claims)"
         )
-        evidence_summary = " ".join(citation_lines) if citation_lines else "cited evidence is inconsistent."
+        evidence_summary = (
+            " ".join(citation_lines) if citation_lines else "cited evidence is inconsistent."
+        )
         message = (
             "i'm uncertain because cited sources conflict on the same claim"
             f"{conflict_details}. {evidence_summary} "
@@ -673,8 +675,14 @@ def _synthesize_weather_retrieval_answer(
     location_raw = first_output.get("location")
     timeframe_raw = first_output.get("timeframe")
     forecast_timestamp_raw = first_output.get("forecast_timestamp")
-    location = location_raw.strip() if isinstance(location_raw, str) and location_raw.strip() else "your location"
-    timeframe = timeframe_raw.strip() if isinstance(timeframe_raw, str) and timeframe_raw.strip() else "now"
+    location = (
+        location_raw.strip()
+        if isinstance(location_raw, str) and location_raw.strip()
+        else "your location"
+    )
+    timeframe = (
+        timeframe_raw.strip() if isinstance(timeframe_raw, str) and timeframe_raw.strip() else "now"
+    )
     forecast_timestamp = (
         forecast_timestamp_raw.strip()
         if isinstance(forecast_timestamp_raw, str) and forecast_timestamp_raw.strip()
@@ -720,7 +728,11 @@ def _synthesize_maps_retrieval_answer(
         for candidate in raw_errors:
             typed_recovery = _maps_recovery_hint_for_error(candidate)
             if typed_recovery is not None:
-                failure_surface = "maps runtime failure" if candidate.startswith("egress_") else "maps provider failure"
+                failure_surface = (
+                    "maps runtime failure"
+                    if candidate.startswith("egress_")
+                    else "maps provider failure"
+                )
                 return f"{failure_surface} ({candidate}). {typed_recovery}", []
         if normalized_errors:
             primary_error = normalized_errors[0]
@@ -792,7 +804,9 @@ def _synthesize_web_extract_retrieval_answer(
             if isinstance(recovery_raw, str) and recovery_raw.strip()
             else "narrow scope to a specific section and retry."
         )
-        grounded_message = f"{grounded_message} partial coverage: extraction was truncated. {recovery}"
+        grounded_message = (
+            f"{grounded_message} partial coverage: extraction was truncated. {recovery}"
+        )
     return grounded_message, collected_sources
 
 
@@ -881,7 +895,9 @@ def _synthesize_google_read_answer(
         )
         break
 
-    non_typed_errors = [item for item in retrieval_errors if item not in _TYPED_AUTH_FAILURE_CLASSES]
+    non_typed_errors = [
+        item for item in retrieval_errors if item not in _TYPED_AUTH_FAILURE_CLASSES
+    ]
     if non_typed_errors:
         message = f"{message} partial results: {non_typed_errors[0]}. retry with narrower input."
     return message, collected_sources
@@ -953,8 +969,12 @@ def process_response_function_calls(
             decoded_arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else {}
         except ValueError:
             decoded_arguments = {}
-        input_payload = jsonable_encoder(decoded_arguments) if isinstance(decoded_arguments, dict) else {}
-        if is_weather_forecast_call and set(input_payload.keys()).issubset({"location", "timeframe"}):
+        input_payload = (
+            jsonable_encoder(decoded_arguments) if isinstance(decoded_arguments, dict) else {}
+        )
+        if is_weather_forecast_call and set(input_payload.keys()).issubset(
+            {"location", "timeframe"}
+        ):
             explicit_location_raw = input_payload.get("location")
             explicit_location = (
                 explicit_location_raw if isinstance(explicit_location_raw, str) else None
@@ -985,7 +1005,9 @@ def process_response_function_calls(
 
         now_action = now_fn()
         frozen_input_payload = (
-            evaluation.normalized_input if evaluation.normalized_input is not None else input_payload
+            evaluation.normalized_input
+            if evaluation.normalized_input is not None
+            else input_payload
         )
         frozen_payload = canonical_action_payload(
             capability_id=capability_id,
@@ -1392,7 +1414,9 @@ def process_response_function_calls(
         final_assistant_message = ""
         assistant_sources = []
     elif retrieval_requested:
-        if retrieval_capability_ids and retrieval_capability_ids.issubset(GOOGLE_READ_CAPABILITY_IDS):
+        if retrieval_capability_ids and retrieval_capability_ids.issubset(
+            GOOGLE_READ_CAPABILITY_IDS
+        ):
             final_assistant_message, assistant_sources = _synthesize_google_read_answer(
                 collected_sources=retrieval_sources,
                 citation_snippets=retrieval_snippets,
@@ -1442,7 +1466,9 @@ def process_response_function_calls(
             pending_approvals=pending_approvals,
             blocked_reasons=blocked_reasons,
         )
-        final_assistant_message = f"{assistant_message}\n{appendix}" if appendix else assistant_message
+        final_assistant_message = (
+            f"{assistant_message}\n{appendix}" if appendix else assistant_message
+        )
         assistant_sources = []
     return FunctionCallProcessingResult(
         assistant_message=final_assistant_message,
@@ -1468,7 +1494,10 @@ def _mark_approval_expired(
     if approval.action_attempt_id != action_attempt.id:
         msg = "approval/action attempt mismatch during expiry reconciliation"
         raise RuntimeError(msg)
-    if approval.session_id != action_attempt.session_id or approval.turn_id != action_attempt.turn_id:
+    if (
+        approval.session_id != action_attempt.session_id
+        or approval.turn_id != action_attempt.turn_id
+    ):
         msg = "approval/action attempt scope mismatch during expiry reconciliation"
         raise RuntimeError(msg)
 
@@ -1779,7 +1808,10 @@ def resolve_approval_decision(
                     },
                 )
             else:
-                if action_attempt.capability_id in GOOGLE_CAPABILITY_IDS and google_runtime is not None:
+                if (
+                    action_attempt.capability_id in GOOGLE_CAPABILITY_IDS
+                    and google_runtime is not None
+                ):
                     google_execution_result = google_runtime.execute_capability(
                         db=db,
                         capability_id=action_attempt.capability_id,
@@ -1820,7 +1852,10 @@ def resolve_approval_decision(
                                 "error": action_attempt.execution_error,
                             },
                         )
-                elif action_attempt.capability_id in AGENCY_CAPABILITY_IDS and agency_runtime is not None:
+                elif (
+                    action_attempt.capability_id in AGENCY_CAPABILITY_IDS
+                    and agency_runtime is not None
+                ):
                     agency_execution_result = agency_runtime.execute_capability(
                         db=db,
                         capability_id=action_attempt.capability_id,
@@ -1865,7 +1900,10 @@ def resolve_approval_decision(
                         capability=capability,
                         normalized_input=normalized_input,
                     )
-                    if execution_result.status == "succeeded" and execution_result.output is not None:
+                    if (
+                        execution_result.status == "succeeded"
+                        and execution_result.output is not None
+                    ):
                         action_attempt.status = "succeeded"
                         action_attempt.execution_output = execution_result.output
                         action_attempt.execution_error = None

@@ -292,7 +292,9 @@ def test_s2_pr05_approval_approved_execution_success_is_surface_only_and_redacte
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "approve success"})
+        sent = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "approve success"}
+        )
         assert sent.status_code == 200
         approval_ref = _approval_ref(sent.json()["turn"])
 

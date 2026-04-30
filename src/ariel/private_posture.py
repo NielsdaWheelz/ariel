@@ -126,7 +126,11 @@ def _validate_policy(
             continue
         covered_surface = True
 
-        if any(_is_wildcard_destination(_normalize_destination(value)) for value in dst if isinstance(value, str)):
+        if any(
+            _is_wildcard_destination(_normalize_destination(value))
+            for value in dst
+            if isinstance(value, str)
+        ):
             errors.append("tailnet policy destination must not expose wildcard targets")
 
         for identity in src:

@@ -30,7 +30,9 @@ def upgrade() -> None:
         ),
     )
     op.execute("UPDATE sessions SET lifecycle_state = 'closed' WHERE is_active IS FALSE")
-    op.add_column("sessions", sa.Column("rotated_from_session_id", sa.String(length=32), nullable=True))
+    op.add_column(
+        "sessions", sa.Column("rotated_from_session_id", sa.String(length=32), nullable=True)
+    )
     op.add_column("sessions", sa.Column("rotation_reason", sa.String(length=32), nullable=True))
     op.create_foreign_key(
         "fk_sessions_rotated_from_session_id",

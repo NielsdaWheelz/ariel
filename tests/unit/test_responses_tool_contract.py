@@ -44,7 +44,9 @@ def test_response_tool_names_round_trip_without_dotted_names() -> None:
         assert response_tool_name_for_capability_id(capability_id) == tool_name
 
 
-def test_process_response_function_calls_returns_function_call_output_for_inline_capability() -> None:
+def test_process_response_function_calls_returns_function_call_output_for_inline_capability() -> (
+    None
+):
     fixed_now = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
     added_records: list[Any] = []
     events: list[tuple[str, dict[str, Any]]] = []

@@ -13,7 +13,10 @@ import ariel.action_runtime as action_runtime_module
 import ariel.policy_engine as policy_engine_module
 from ariel.app import ModelAdapter, create_app
 from tests.integration.responses_helpers import responses_with_function_calls
-from ariel.capability_registry import CapabilityDefinition, get_capability as registry_get_capability
+from ariel.capability_registry import (
+    CapabilityDefinition,
+    get_capability as registry_get_capability,
+)
 
 
 @dataclass
@@ -339,7 +342,9 @@ def test_s2_pr08_missing_malformed_or_undeclared_intent_fails_closed_before_disp
         assert expected_error in (attempt["execution"]["error"] or "")
 
         failed_event = next(
-            event for event in latest_turn["events"] if event["event_type"] == "evt.action.execution.failed"
+            event
+            for event in latest_turn["events"]
+            if event["event_type"] == "evt.action.execution.failed"
         )
         assert expected_error in failed_event["payload"]["error"]
 
@@ -382,7 +387,9 @@ def test_s2_pr08_preflight_allow_does_not_dispatch_when_execution_fails(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "execution fails"})
+        sent = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "execution fails"}
+        )
         assert sent.status_code == 200
         approval_ref = _approval_ref(sent.json()["turn"])
 
@@ -399,4 +406,3 @@ def test_s2_pr08_preflight_allow_does_not_dispatch_when_execution_fails(
         assert attempt["execution"]["status"] == "failed"
         assert isinstance(attempt["execution"]["error"], str)
         assert dispatch_attempts == []
-

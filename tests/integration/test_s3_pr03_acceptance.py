@@ -13,7 +13,10 @@ import ariel.action_runtime as action_runtime_module
 import ariel.policy_engine as policy_engine_module
 from ariel.app import ModelAdapter, create_app
 from tests.integration.responses_helpers import responses_with_function_calls
-from ariel.capability_registry import CapabilityDefinition, get_capability as registry_get_capability
+from ariel.capability_registry import (
+    CapabilityDefinition,
+    get_capability as registry_get_capability,
+)
 
 
 @dataclass
@@ -34,7 +37,9 @@ class ActionProposalAdapter:
     ) -> dict[str, Any]:
         del tools, history, context_bundle
         proposals = self.proposals_by_message.get(user_message, [])
-        assistant_text = self.assistant_text_by_message.get(user_message, f"assistant::{user_message}")
+        assistant_text = self.assistant_text_by_message.get(
+            user_message, f"assistant::{user_message}"
+        )
         return responses_with_function_calls(
             input_items=input_items,
             assistant_text=assistant_text,
@@ -321,7 +326,9 @@ def test_s3_pr03_mixed_turns_keep_grounded_citations_and_sources_for_retrieval_c
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "mixed retrieval"})
+        sent = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "mixed retrieval"}
+        )
         assert sent.status_code == 200
         payload = sent.json()
         message = payload["assistant"]["message"]
@@ -346,8 +353,12 @@ def test_s3_pr03_mixed_turns_keep_grounded_citations_and_sources_for_retrieval_c
         }
         assert capability_id in lifecycle_by_capability
         assert "cap.framework.read_echo" in lifecycle_by_capability
-        assert lifecycle_by_capability["cap.framework.read_echo"]["execution"]["status"] == "succeeded"
-        assert lifecycle_by_capability["cap.framework.read_echo"]["execution"]["output"] == {"text": "alpha"}
+        assert (
+            lifecycle_by_capability["cap.framework.read_echo"]["execution"]["status"] == "succeeded"
+        )
+        assert lifecycle_by_capability["cap.framework.read_echo"]["execution"]["output"] == {
+            "text": "alpha"
+        }
 
 
 def test_s3_pr03_mixed_turn_partial_retrieval_failure_is_disclosed_and_recoverable(
@@ -460,5 +471,11 @@ def test_s3_pr03_mixed_turn_non_retrieval_denial_remains_inspectable_without_app
         }
         assert lifecycle_by_capability["cap.search.web"]["execution"]["status"] == "succeeded"
         assert lifecycle_by_capability["cap.framework.read_echo"]["policy"]["decision"] == "deny"
-        assert lifecycle_by_capability["cap.framework.read_echo"]["policy"]["reason"] == "schema_invalid"
-        assert lifecycle_by_capability["cap.framework.read_echo"]["execution"]["status"] == "not_executed"
+        assert (
+            lifecycle_by_capability["cap.framework.read_echo"]["policy"]["reason"]
+            == "schema_invalid"
+        )
+        assert (
+            lifecycle_by_capability["cap.framework.read_echo"]["execution"]["status"]
+            == "not_executed"
+        )

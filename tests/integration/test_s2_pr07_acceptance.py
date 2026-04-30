@@ -192,12 +192,16 @@ def test_s2_pr07_reconciled_expiry_is_idempotent_for_reads_and_decisions(
 
     adapter = ActionProposalAdapter(
         proposals_by_message={
-            "expire idempotently": [{"capability_id": "cap.framework.write_note", "input": {"note": "late"}}]
+            "expire idempotently": [
+                {"capability_id": "cap.framework.write_note", "input": {"note": "late"}}
+            ]
         }
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "expire idempotently"})
+        sent = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "expire idempotently"}
+        )
         assert sent.status_code == 200
         approval_ref = _approval_ref(sent.json()["turn"])
 

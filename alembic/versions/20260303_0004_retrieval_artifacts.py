@@ -44,7 +44,9 @@ def upgrade() -> None:
     )
     op.create_index("ix_artifacts_session_id", "artifacts", ["session_id"], unique=False)
     op.create_index("ix_artifacts_turn_id", "artifacts", ["turn_id"], unique=False)
-    op.create_index("ix_artifacts_action_attempt_id", "artifacts", ["action_attempt_id"], unique=False)
+    op.create_index(
+        "ix_artifacts_action_attempt_id", "artifacts", ["action_attempt_id"], unique=False
+    )
     op.create_index("ix_artifacts_retrieved_at", "artifacts", ["retrieved_at"], unique=False)
     op.create_index("ix_artifacts_created_at", "artifacts", ["created_at"], unique=False)
 

@@ -7,7 +7,7 @@ done)
 
 UVICORN_CMD := .venv/bin/uvicorn ariel.app:create_app --factory --host 127.0.0.1 --port 8000
 
-.PHONY: help bootstrap setup env-init check-venv db-up db-stop db-down db-destroy db-status db-logs db-config db-upgrade tailscale-serve run run-worker run-discord dev lint typecheck test verify e2e
+.PHONY: help bootstrap setup env-init check-venv db-up db-stop db-down db-destroy db-status db-logs db-config db-upgrade tailscale-serve run run-worker run-discord dev lint format-check typecheck test verify e2e
 
 bootstrap:
 	bash scripts/bootstrap.sh
@@ -38,7 +38,7 @@ help:
 	  "run-worker   - run durable background worker" \
 	  "run-discord  - run discord surface worker" \
 	  "dev          - env-init + db-up + db-upgrade + run API" \
-	  "verify       - lint + typecheck + tests" \
+	  "verify       - lint + format check + typecheck + tests" \
 	  "e2e          - high-signal end-to-end smoke tests"
 
 env-init:
@@ -123,13 +123,16 @@ dev: db-up check-venv db-upgrade run
 lint: check-venv
 	.venv/bin/ruff check .
 
+format-check: check-venv
+	.venv/bin/ruff format --check .
+
 typecheck: check-venv
 	.venv/bin/mypy src tests
 
 test: check-venv
 	.venv/bin/python -m pytest
 
-verify: lint typecheck test
+verify: lint format-check typecheck test
 
 e2e: check-venv
 	.venv/bin/python -m pytest tests/integration/test_pr01_acceptance.py -k "pr01_turn_context_is_bounded_ordered_and_auditable or pr01_context_audit_is_stable_even_if_adapter_mutates_context_bundle"

@@ -58,7 +58,12 @@ EVENT_PAYLOAD_KEYS_BY_TYPE: dict[str, set[str]] = {
     "evt.model.failed": {"provider", "model", "duration_ms", "failure_reason", "attempt"},
     "evt.action.proposed": {"action_attempt_id", "capability_id", "input", "taint"},
     "evt.action.policy_decided": {"action_attempt_id", "decision", "reason", "taint"},
-    "evt.action.approval.requested": {"action_attempt_id", "approval_ref", "actor_id", "expires_at"},
+    "evt.action.approval.requested": {
+        "action_attempt_id",
+        "approval_ref",
+        "actor_id",
+        "expires_at",
+    },
     "evt.action.approval.expired": {"action_attempt_id", "approval_ref", "reason"},
     "evt.action.approval.denied": {"action_attempt_id", "approval_ref", "actor_id", "reason"},
     "evt.action.approval.approved": {"action_attempt_id", "approval_ref", "actor_id"},
@@ -239,7 +244,9 @@ def _assert_surface_event_payload(event: dict[str, Any]) -> None:
         assert isinstance(evidence, list)
         for item in evidence:
             assert isinstance(item, dict)
-            _assert_keys(item, {"kind", "turn_id", "action_attempt_id", "capability_id", "impact_level"})
+            _assert_keys(
+                item, {"kind", "turn_id", "action_attempt_id", "capability_id", "impact_level"}
+            )
 
 
 def _assert_surface_turn_contract(turn_payload: dict[str, Any]) -> None:

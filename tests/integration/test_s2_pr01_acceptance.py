@@ -151,7 +151,9 @@ def test_s2_pr01_allowlisted_read_executes_inline_with_redacted_output_and_audit
         assert "sk-live-super-secret" not in str(action_attempt["execution"]["output"])
 
         event_types = _event_types(turn)
-        assert event_types.index("evt.action.proposed") < event_types.index("evt.action.policy_decided")
+        assert event_types.index("evt.action.proposed") < event_types.index(
+            "evt.action.policy_decided"
+        )
         assert event_types.index("evt.action.policy_decided") < event_types.index(
             "evt.action.execution.started"
         )
@@ -190,7 +192,9 @@ def test_s2_pr01_post_approvals_approve_executes_once_with_actor_binding_and_rep
 ) -> None:
     adapter = ActionProposalAdapter(
         proposals_by_message={
-            "do write": [{"capability_id": "cap.framework.write_note", "input": {"note": "frozen-a"}}]
+            "do write": [
+                {"capability_id": "cap.framework.write_note", "input": {"note": "frozen-a"}}
+            ]
         }
     )
     with _build_client(postgres_url, adapter) as client:
@@ -313,7 +317,9 @@ def test_s2_pr01_deny_and_expire_are_terminal_and_non_executing(
         assert denied_attempt["approval"]["status"] == "denied"
         assert denied_attempt["execution"]["status"] == "not_executed"
 
-        expire_turn = client.post(f"/v1/sessions/{session_id}/message", json={"message": "expire me"})
+        expire_turn = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "expire me"}
+        )
         assert expire_turn.status_code == 200
         expire_approval_ref = _approval_ref(expire_turn.json()["turn"])
         clock.advance_seconds(10)
@@ -401,4 +407,3 @@ def test_s2_pr01_turn_allows_multiple_inline_reads_and_only_one_pending_approval
         assert attempts[3]["policy"]["decision"] == "deny"
         assert attempts[3]["policy"]["reason"] == "pending_approval_limit_reached"
         assert sum(attempt["approval"]["status"] == "pending" for attempt in attempts) == 1
-

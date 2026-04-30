@@ -14,7 +14,10 @@ import ariel.capability_registry as capability_registry_module
 import ariel.policy_engine as policy_engine_module
 from ariel.app import ModelAdapter, create_app
 from tests.integration.responses_helpers import responses_with_function_calls
-from ariel.capability_registry import CapabilityDefinition, get_capability as registry_get_capability
+from ariel.capability_registry import (
+    CapabilityDefinition,
+    get_capability as registry_get_capability,
+)
 
 
 @dataclass
@@ -35,7 +38,9 @@ class ActionProposalAdapter:
     ) -> dict[str, Any]:
         del tools, history, context_bundle
         proposals = self.proposals_by_message.get(user_message, [])
-        assistant_text = self.assistant_text_by_message.get(user_message, f"assistant::{user_message}")
+        assistant_text = self.assistant_text_by_message.get(
+            user_message, f"assistant::{user_message}"
+        )
         return responses_with_function_calls(
             input_items=input_items,
             assistant_text=assistant_text,
@@ -131,7 +136,9 @@ def _patch_capability_lookup(
     monkeypatch.setattr(action_runtime_module, "get_capability", patched_runtime_get_capability)
 
 
-def _provider_payload(*, final_url: str, content: str, title: str = "Example article") -> dict[str, Any]:
+def _provider_payload(
+    *, final_url: str, content: str, title: str = "Example article"
+) -> dict[str, Any]:
     return {
         "final_url": final_url,
         "title": title,
@@ -193,7 +200,9 @@ def test_s7_pr01_web_extract_executes_inline_with_structured_output_citations_an
             "extract url": [
                 {
                     "capability_id": "cap.web.extract",
-                    "input": {"url": "https://example.com/research/article?utm_source=rss#section-2"},
+                    "input": {
+                        "url": "https://example.com/research/article?utm_source=rss#section-2"
+                    },
                 }
             ]
         }
@@ -219,7 +228,10 @@ def test_s7_pr01_web_extract_executes_inline_with_structured_output_citations_an
 
         assert len(outbound_calls) == 1
         assert outbound_calls[0]["url"] == "https://extract.provider.test/v1/extract"
-        assert outbound_calls[0]["json"]["url"] == "https://example.com/research/article?utm_source=rss"
+        assert (
+            outbound_calls[0]["json"]["url"]
+            == "https://example.com/research/article?utm_source=rss"
+        )
 
         assert "[1]" in payload["assistant"]["message"]
         assert len(payload["assistant"]["sources"]) == 1
@@ -630,8 +642,14 @@ def test_s7_pr01_public_ipv6_urls_remain_allowed_and_canonical(
         assert attempt["execution"]["status"] == "succeeded"
         output = attempt["execution"]["output"]
         assert output["canonical_url"] == "https://[2606:4700:4700::1111]/research/article"
-        assert output["document"]["canonical_source"] == "https://[2606:4700:4700::1111]/research/article"
-        assert output["document"]["resolved_url"] == "https://[2606:4700:4700::1111]/research/article/?utm_source=rss"
+        assert (
+            output["document"]["canonical_source"]
+            == "https://[2606:4700:4700::1111]/research/article"
+        )
+        assert (
+            output["document"]["resolved_url"]
+            == "https://[2606:4700:4700::1111]/research/article/?utm_source=rss"
+        )
         assert outbound_urls == ["https://[2606:4700:4700::1111]/research/article"]
 
 
@@ -730,5 +748,9 @@ def test_s7_pr01_mixed_turn_with_web_extract_preserves_grounding_and_lifecycle_i
             item["proposal"]["capability_id"]: item for item in lifecycle if isinstance(item, dict)
         }
         assert lifecycle_by_capability["cap.web.extract"]["execution"]["status"] == "succeeded"
-        assert lifecycle_by_capability["cap.framework.read_echo"]["execution"]["status"] == "succeeded"
-        assert lifecycle_by_capability["cap.framework.read_echo"]["execution"]["output"] == {"text": "alpha"}
+        assert (
+            lifecycle_by_capability["cap.framework.read_echo"]["execution"]["status"] == "succeeded"
+        )
+        assert lifecycle_by_capability["cap.framework.read_echo"]["execution"]["output"] == {
+            "text": "alpha"
+        }

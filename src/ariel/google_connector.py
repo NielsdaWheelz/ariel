@@ -403,7 +403,8 @@ class DefaultGoogleOAuthClient:
             "access_token": access_token_raw.strip(),
             "refresh_token": (
                 refreshed_refresh_token_raw.strip()
-                if isinstance(refreshed_refresh_token_raw, str) and refreshed_refresh_token_raw.strip()
+                if isinstance(refreshed_refresh_token_raw, str)
+                and refreshed_refresh_token_raw.strip()
                 else refresh_token
             ),
             "expires_in_seconds": expires_in_seconds,
@@ -560,6 +561,7 @@ class DefaultGoogleWorkspaceProvider:
         if not isinstance(raw_items, list):
             return []
         return [item for item in raw_items if isinstance(item, dict)]
+
     def calendar_list(
         self,
         *,
@@ -576,7 +578,11 @@ class DefaultGoogleWorkspaceProvider:
         results: list[dict[str, Any]] = []
         for item in items:
             summary_raw = item.get("summary")
-            summary = summary_raw.strip() if isinstance(summary_raw, str) and summary_raw.strip() else "event"
+            summary = (
+                summary_raw.strip()
+                if isinstance(summary_raw, str) and summary_raw.strip()
+                else "event"
+            )
             source_raw = item.get("htmlLink")
             source = (
                 source_raw.strip()
@@ -768,7 +774,11 @@ class DefaultGoogleWorkspaceProvider:
             params={"q": query, "maxResults": _MAX_GOOGLE_RESULTS},
         )
         raw_messages = payload.get("messages")
-        messages = [item for item in raw_messages if isinstance(item, dict)] if isinstance(raw_messages, list) else []
+        messages = (
+            [item for item in raw_messages if isinstance(item, dict)]
+            if isinstance(raw_messages, list)
+            else []
+        )
         results: list[dict[str, Any]] = []
         for message in messages[:_MAX_GOOGLE_RESULTS]:
             message_id_raw = message.get("id")
@@ -821,7 +831,9 @@ class DefaultGoogleWorkspaceProvider:
         subject = _gmail_header_value(payload, "Subject") or f"email {message_id}"
         snippet_raw = payload.get("snippet")
         snippet = (
-            snippet_raw.strip() if isinstance(snippet_raw, str) and snippet_raw.strip() else "(no preview)"
+            snippet_raw.strip()
+            if isinstance(snippet_raw, str) and snippet_raw.strip()
+            else "(no preview)"
         )
         return {
             "results": [
@@ -878,7 +890,11 @@ class DefaultGoogleWorkspaceProvider:
             json_payload=payload,
         )
         event_id_raw = created_payload.get("id")
-        event_id = event_id_raw.strip() if isinstance(event_id_raw, str) and event_id_raw.strip() else "unknown"
+        event_id = (
+            event_id_raw.strip()
+            if isinstance(event_id_raw, str) and event_id_raw.strip()
+            else "unknown"
+        )
         source_raw = created_payload.get("htmlLink")
         source = (
             source_raw.strip()
@@ -915,9 +931,7 @@ class DefaultGoogleWorkspaceProvider:
                 else None
             )
         draft_id = (
-            draft_id_raw.strip()
-            if isinstance(draft_id_raw, str) and draft_id_raw.strip()
-            else None
+            draft_id_raw.strip() if isinstance(draft_id_raw, str) and draft_id_raw.strip() else None
         )
         return {
             "provider_draft_ref": f"gmail://draft/{draft_id}" if draft_id is not None else None,
@@ -1054,13 +1068,25 @@ class DefaultGoogleWorkspaceProvider:
             },
         )
         raw_files = payload.get("files")
-        files = [item for item in raw_files if isinstance(item, dict)] if isinstance(raw_files, list) else []
+        files = (
+            [item for item in raw_files if isinstance(item, dict)]
+            if isinstance(raw_files, list)
+            else []
+        )
         results: list[dict[str, Any]] = []
         for item in files[:_MAX_GOOGLE_RESULTS]:
             file_id_raw = item.get("id")
-            file_id = file_id_raw.strip() if isinstance(file_id_raw, str) and file_id_raw.strip() else "unknown"
+            file_id = (
+                file_id_raw.strip()
+                if isinstance(file_id_raw, str) and file_id_raw.strip()
+                else "unknown"
+            )
             title_raw = item.get("name")
-            title = title_raw.strip() if isinstance(title_raw, str) and title_raw.strip() else f"file {file_id}"
+            title = (
+                title_raw.strip()
+                if isinstance(title_raw, str) and title_raw.strip()
+                else f"file {file_id}"
+            )
             results.append(
                 {
                     "title": title,
@@ -1094,7 +1120,10 @@ class DefaultGoogleWorkspaceProvider:
                 },
             )
         except RuntimeError as exc:
-            if safe_failure_reason(str(exc), fallback="drive_read_unavailable").lower() == "resource_not_found":
+            if (
+                safe_failure_reason(str(exc), fallback="drive_read_unavailable").lower()
+                == "resource_not_found"
+            ):
                 fallback_source = f"https://drive.google.com/file/d/{quote(file_id, safe='')}/view"
                 return self._drive_read_outcome_output(
                     file_id=file_id,
@@ -1109,11 +1138,19 @@ class DefaultGoogleWorkspaceProvider:
             raise
 
         title_raw = metadata.get("name")
-        title = title_raw.strip() if isinstance(title_raw, str) and title_raw.strip() else f"Drive file {file_id}"
+        title = (
+            title_raw.strip()
+            if isinstance(title_raw, str) and title_raw.strip()
+            else f"Drive file {file_id}"
+        )
         source = self._drive_file_source(file_id=file_id, metadata=metadata)
         published_at = _normalize_google_timestamp(metadata.get("modifiedTime"))
         mime_type_raw = metadata.get("mimeType")
-        mime_type = mime_type_raw.strip() if isinstance(mime_type_raw, str) and mime_type_raw.strip() else ""
+        mime_type = (
+            mime_type_raw.strip()
+            if isinstance(mime_type_raw, str) and mime_type_raw.strip()
+            else ""
+        )
         size_bytes = self._drive_size_bytes(metadata.get("size"))
         if size_bytes is not None and size_bytes > _MAX_DRIVE_READ_BYTES:
             return self._drive_read_outcome_output(
@@ -1160,7 +1197,10 @@ class DefaultGoogleWorkspaceProvider:
                     ),
                 )
         except RuntimeError as exc:
-            if safe_failure_reason(str(exc), fallback="drive_read_unavailable").lower() == "resource_not_found":
+            if (
+                safe_failure_reason(str(exc), fallback="drive_read_unavailable").lower()
+                == "resource_not_found"
+            ):
                 return self._drive_read_outcome_output(
                     file_id=file_id,
                     title=title,
@@ -1610,10 +1650,7 @@ class ConnectorTokenCipher:
         keys: dict[str, bytes] = {}
         if configured_keys is not None:
             entries = _parse_connector_key_entries(configured_keys)
-            keys = {
-                version: _decode_aead_key(raw_key)
-                for version, raw_key in entries.items()
-            }
+            keys = {version: _decode_aead_key(raw_key) for version, raw_key in entries.items()}
         has_configured_keyring = bool(keys)
         active = active_key_version.strip() or "v1"
         if not keys:
@@ -1646,11 +1683,7 @@ class ConnectorTokenCipher:
             except ValueError as exc:
                 raise RuntimeError("encrypted value is malformed") from exc
             key_bytes = self.keys_by_version.get(version)
-            if (
-                key_bytes is None
-                and self.allow_legacy_key_alias
-                and self.legacy_secret is not None
-            ):
+            if key_bytes is None and self.allow_legacy_key_alias and self.legacy_secret is not None:
                 # Compatibility path for single-secret environments during key-version relabeling.
                 key_bytes = _derive_secret_bytes(self.legacy_secret)
             if key_bytes is None:
@@ -1738,7 +1771,9 @@ def _pkce_challenge(verifier: str) -> str:
     return _urlsafe_b64encode(digest)
 
 
-def _readiness_failure_kind(error_code: str | None) -> Literal["none", "blocking", "transient", "other"]:
+def _readiness_failure_kind(
+    error_code: str | None,
+) -> Literal["none", "blocking", "transient", "other"]:
     if error_code is None:
         return "none"
     normalized = error_code.strip().lower()
@@ -1765,9 +1800,11 @@ def _set_connector_error(
     normalized_error_code = error_code.strip()
     if not normalized_error_code:
         return
-    if preserve_existing_blocking and _is_blocking_readiness_failure(
-        connector.last_error_code
-    ) and not _is_blocking_readiness_failure(normalized_error_code):
+    if (
+        preserve_existing_blocking
+        and _is_blocking_readiness_failure(connector.last_error_code)
+        and not _is_blocking_readiness_failure(normalized_error_code)
+    ):
         connector.updated_at = now_fn()
         return
     connector.last_error_code = normalized_error_code
@@ -1836,7 +1873,9 @@ def _connector_payload(connector: GoogleConnectorRecord | None) -> dict[str, Any
             else None
         ),
         "token_obtained_at": (
-            to_rfc3339(connector.token_obtained_at) if connector.token_obtained_at is not None else None
+            to_rfc3339(connector.token_obtained_at)
+            if connector.token_obtained_at is not None
+            else None
         ),
         "last_error_code": connector.last_error_code,
         "last_error_at": (
@@ -1864,7 +1903,9 @@ def _append_connector_event(
     db.add(event)
 
 
-def _connector_event_payload(connector: GoogleConnectorRecord, *, scopes: list[str]) -> dict[str, Any]:
+def _connector_event_payload(
+    connector: GoogleConnectorRecord, *, scopes: list[str]
+) -> dict[str, Any]:
     return {
         "connector_id": connector.id,
         "provider": connector.provider,
@@ -1957,7 +1998,11 @@ class GoogleConnectorRuntime:
                     status_code=400,
                     code="E_CONNECTOR_RECONNECT_INVALID_INTENT",
                     message="google reconnect capability intent is invalid",
-                    details={"reason": safe_failure_reason(str(exc), fallback="invalid_capability_intent")},
+                    details={
+                        "reason": safe_failure_reason(
+                            str(exc), fallback="invalid_capability_intent"
+                        )
+                    },
                     retryable=False,
                 ) from exc
         else:
@@ -2082,7 +2127,9 @@ class GoogleConnectorRuntime:
             preserve_existing_blocking=True,
         )
         failed_event_type = (
-            "evt.connector.google.reconnect.failed" if flow == "reconnect" else "evt.connector.google.connect.failed"
+            "evt.connector.google.reconnect.failed"
+            if flow == "reconnect"
+            else "evt.connector.google.connect.failed"
         )
         _append_connector_event(
             db=db,
@@ -2401,7 +2448,9 @@ class GoogleConnectorRuntime:
     ) -> list[dict[str, Any]]:
         bounded_limit = max(1, min(200, limit))
         connector = db.scalar(
-            select(GoogleConnectorRecord).where(GoogleConnectorRecord.id == GOOGLE_CONNECTOR_ID).limit(1)
+            select(GoogleConnectorRecord)
+            .where(GoogleConnectorRecord.id == GOOGLE_CONNECTOR_ID)
+            .limit(1)
         )
         if connector is None:
             return []
@@ -2496,7 +2545,9 @@ class GoogleConnectorRuntime:
         try:
             refreshed_payload = self.oauth_client.refresh_access_token(refresh_token=refresh_token)
         except Exception as exc:
-            reason = safe_failure_reason(str(exc), fallback=f"unexpected {exc.__class__.__name__}").lower()
+            reason = safe_failure_reason(
+                str(exc), fallback=f"unexpected {exc.__class__.__name__}"
+            ).lower()
             if "invalid_grant" in reason or "revoked" in reason:
                 connector.status = "revoked"
                 _set_connector_error(
@@ -2684,9 +2735,7 @@ class GoogleConnectorRuntime:
                     access_token=access_token,
                     normalized_input=normalized_input,
                 )
-                projection_payload = (
-                    draft_projection if isinstance(draft_projection, dict) else {}
-                )
+                projection_payload = draft_projection if isinstance(draft_projection, dict) else {}
                 output_payload = _canonical_draft_output(
                     normalized_input=normalized_input,
                     provider_projection=projection_payload,
@@ -2762,7 +2811,9 @@ class GoogleConnectorRuntime:
                 error="invalid_provider_output",
             )
         redacted_output = redact_json_value(output_payload)
-        output_dict = redacted_output if isinstance(redacted_output, dict) else {"value": redacted_output}
+        output_dict = (
+            redacted_output if isinstance(redacted_output, dict) else {"value": redacted_output}
+        )
         return GoogleCapabilityExecutionResult(
             status="succeeded",
             output=output_dict,

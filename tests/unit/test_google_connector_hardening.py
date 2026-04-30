@@ -175,7 +175,9 @@ def test_default_workspace_provider_retries_transient_errors_before_success(
         del method, url, headers, params, timeout
         calls.append(1)
         if len(calls) == 1:
-            return _response(status_code=503, payload={"error": {"message": "temporarily unavailable"}})
+            return _response(
+                status_code=503, payload={"error": {"message": "temporarily unavailable"}}
+            )
         return _response(
             status_code=200,
             payload={

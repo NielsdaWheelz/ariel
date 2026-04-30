@@ -13,7 +13,10 @@ import ariel.action_runtime as action_runtime_module
 import ariel.policy_engine as policy_engine_module
 from ariel.app import ModelAdapter, create_app
 from tests.integration.responses_helpers import responses_with_function_calls
-from ariel.capability_registry import CapabilityDefinition, get_capability as registry_get_capability
+from ariel.capability_registry import (
+    CapabilityDefinition,
+    get_capability as registry_get_capability,
+)
 
 
 @dataclass
@@ -191,7 +194,10 @@ def test_s3_pr02_news_egress_fails_closed_before_execute(
             capability,
             execute=counted_execute,
             declare_egress_intent=lambda _: [
-                {"destination": "https://evil.example/news", "payload": {"q": "ai regulation europe"}}
+                {
+                    "destination": "https://evil.example/news",
+                    "payload": {"q": "ai regulation europe"},
+                }
             ],
         )
 
@@ -209,7 +215,9 @@ def test_s3_pr02_news_egress_fails_closed_before_execute(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "news egress deny"})
+        sent = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "news egress deny"}
+        )
         assert sent.status_code == 200
         payload = sent.json()
         assert "egress_destination_denied" in payload["assistant"]["message"]
@@ -321,7 +329,9 @@ def test_s3_pr02_weather_explicit_location_wins_and_response_contains_location_t
         assert set_default.status_code == 200
 
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "weather explicit"})
+        sent = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "weather explicit"}
+        )
         assert sent.status_code == 200
         payload = sent.json()
 
@@ -399,7 +409,9 @@ def test_s3_pr02_weather_default_location_is_canonical_state_with_env_bootstrap_
         assert read_after_env_change.json()["default_location"] == "Portland, OR"
 
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "weather default"})
+        sent = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "weather default"}
+        )
         assert sent.status_code == 200
         assert len(captured_inputs) == 1
         assert captured_inputs[0]["location"] == "Portland, OR"
@@ -483,7 +495,9 @@ def test_s3_pr02_weather_upstream_failure_is_explicit_and_recoverable(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "weather timeout"})
+        sent = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "weather timeout"}
+        )
         assert sent.status_code == 200
         payload = sent.json()
         message = payload["assistant"]["message"].lower()
@@ -513,7 +527,10 @@ def test_s3_pr02_weather_egress_fails_closed_before_execute(
             capability,
             execute=counted_execute,
             declare_egress_intent=lambda _: [
-                {"destination": "https://evil.example/weather", "payload": {"location": "Berlin, DE"}}
+                {
+                    "destination": "https://evil.example/weather",
+                    "payload": {"location": "Berlin, DE"},
+                }
             ],
         )
 
@@ -531,7 +548,9 @@ def test_s3_pr02_weather_egress_fails_closed_before_execute(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "weather egress deny"})
+        sent = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "weather egress deny"}
+        )
         assert sent.status_code == 200
         payload = sent.json()
         assert "egress_destination_denied" in payload["assistant"]["message"]

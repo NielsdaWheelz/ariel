@@ -260,7 +260,9 @@ def append_turn_event(
 
 
 def next_turn_event_sequence(*, db: Session, turn_id: str) -> int:
-    max_sequence = db.scalar(select(func.max(EventRecord.sequence)).where(EventRecord.turn_id == turn_id))
+    max_sequence = db.scalar(
+        select(func.max(EventRecord.sequence)).where(EventRecord.turn_id == turn_id)
+    )
     if isinstance(max_sequence, int):
         return max_sequence + 1
     return 1

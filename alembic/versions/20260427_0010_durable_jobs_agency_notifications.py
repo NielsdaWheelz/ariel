@@ -83,7 +83,9 @@ def upgrade() -> None:
             name="ck_agency_event_status",
         ),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("source", "external_event_id", name="uq_agency_event_source_external_id"),
+        sa.UniqueConstraint(
+            "source", "external_event_id", name="uq_agency_event_source_external_id"
+        ),
     )
     op.create_index("ix_agency_events_external_job_id", "agency_events", ["external_job_id"])
     op.create_index("ix_agency_events_processed_at", "agency_events", ["processed_at"])
@@ -175,7 +177,9 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["notification_id"], ["notifications.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
     )
-    op.create_index("ix_notification_deliveries_created_at", "notification_deliveries", ["created_at"])
+    op.create_index(
+        "ix_notification_deliveries_created_at", "notification_deliveries", ["created_at"]
+    )
     op.create_index(
         "ix_notification_deliveries_notification_id",
         "notification_deliveries",
@@ -184,7 +188,9 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index("ix_notification_deliveries_notification_id", table_name="notification_deliveries")
+    op.drop_index(
+        "ix_notification_deliveries_notification_id", table_name="notification_deliveries"
+    )
     op.drop_index("ix_notification_deliveries_created_at", table_name="notification_deliveries")
     op.drop_table("notification_deliveries")
     op.drop_index("ix_notifications_updated_at", table_name="notifications")

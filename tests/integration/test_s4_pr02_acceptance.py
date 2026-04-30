@@ -402,7 +402,11 @@ def test_s4_pr02_write_scope_remediation_reconnect_is_capability_intent_driven_a
         first_approval_ref = _approval_ref(first_turn)
         approved_missing_scope = client.post(
             "/v1/approvals",
-            json={"approval_ref": first_approval_ref, "decision": "approve", "actor_id": "user.local"},
+            json={
+                "approval_ref": first_approval_ref,
+                "decision": "approve",
+                "actor_id": "user.local",
+            },
         )
         assert approved_missing_scope.status_code == 200
         approval_message = approved_missing_scope.json()["assistant"]["message"].lower()
@@ -443,7 +447,11 @@ def test_s4_pr02_write_scope_remediation_reconnect_is_capability_intent_driven_a
         second_approval_ref = _approval_ref(second_turn)
         approved = client.post(
             "/v1/approvals",
-            json={"approval_ref": second_approval_ref, "decision": "approve", "actor_id": "user.local"},
+            json={
+                "approval_ref": second_approval_ref,
+                "decision": "approve",
+                "actor_id": "user.local",
+            },
         )
         assert approved.status_code == 200
 
@@ -580,7 +588,9 @@ def test_s4_pr02_email_draft_executes_inline_as_draft_only_without_send_side_eff
         _connect_google(client, code="connect-compose")
         session_id = _session_id(client)
 
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "draft follow-up"})
+        sent = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "draft follow-up"}
+        )
         assert sent.status_code == 200
         payload = sent.json()
         attempt = _surface_attempt(payload["turn"])
@@ -745,7 +755,9 @@ def test_s4_pr02_draft_and_send_are_distinct_lifecycle_units_with_independent_hi
         assert draft_attempt["approval"]["status"] == "not_requested"
         assert draft_attempt["execution"]["status"] == "succeeded"
 
-        send_proposed = client.post(f"/v1/sessions/{session_id}/message", json={"message": "send note"})
+        send_proposed = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "send note"}
+        )
         assert send_proposed.status_code == 200
         send_turn = send_proposed.json()["turn"]
         send_attempt_pending = _surface_attempt(send_turn)
@@ -754,7 +766,11 @@ def test_s4_pr02_draft_and_send_are_distinct_lifecycle_units_with_independent_hi
         send_approval_ref = _approval_ref(send_turn)
         send_approved = client.post(
             "/v1/approvals",
-            json={"approval_ref": send_approval_ref, "decision": "approve", "actor_id": "user.local"},
+            json={
+                "approval_ref": send_approval_ref,
+                "decision": "approve",
+                "actor_id": "user.local",
+            },
         )
         assert send_approved.status_code == 200
 
@@ -922,7 +938,11 @@ def test_s4_pr02_write_paths_return_typed_auth_failures_with_recovery_guidance(
             approval_ref = _approval_ref(sent.json()["turn"])
             decided = client.post(
                 "/v1/approvals",
-                json={"approval_ref": approval_ref, "decision": "approve", "actor_id": "user.local"},
+                json={
+                    "approval_ref": approval_ref,
+                    "decision": "approve",
+                    "actor_id": "user.local",
+                },
             )
             assert decided.status_code == 200
             rendered_message = decided.json()["assistant"]["message"].lower()

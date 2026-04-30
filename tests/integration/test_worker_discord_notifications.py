@@ -134,11 +134,14 @@ def test_discord_notification_delivery_creates_thread_and_posts_message_to_it(
         discord_thread_id=None,
     )
 
-    assert process_one_task(
-        session_factory=session_factory,
-        settings=_discord_notification_settings(),
-        worker_id="worker-a",
-    ) is True
+    assert (
+        process_one_task(
+            session_factory=session_factory,
+            settings=_discord_notification_settings(),
+            worker_id="worker-a",
+        )
+        is True
+    )
 
     assert [call["url"] for call in calls] == [
         "https://discord.com/api/v10/channels/333/threads",
@@ -151,16 +154,20 @@ def test_discord_notification_delivery_creates_thread_and_posts_message_to_it(
 
     with session_factory() as db:
         with db.begin():
-            row = db.execute(
-                text(
-                    "SELECT j.discord_thread_id, n.status, d.status AS delivery_status "
-                    "FROM jobs j "
-                    "JOIN notifications n ON n.payload->>'job_id' = j.id "
-                    "JOIN notification_deliveries d ON d.notification_id = n.id "
-                    "WHERE n.id = :notification_id"
-                ),
-                {"notification_id": "ntf_threaded"},
-            ).mappings().one()
+            row = (
+                db.execute(
+                    text(
+                        "SELECT j.discord_thread_id, n.status, d.status AS delivery_status "
+                        "FROM jobs j "
+                        "JOIN notifications n ON n.payload->>'job_id' = j.id "
+                        "JOIN notification_deliveries d ON d.notification_id = n.id "
+                        "WHERE n.id = :notification_id"
+                    ),
+                    {"notification_id": "ntf_threaded"},
+                )
+                .mappings()
+                .one()
+            )
 
     assert row["discord_thread_id"] == "thread_123"
     assert row["status"] == "delivered"
@@ -198,11 +205,14 @@ def test_discord_notification_delivery_reuses_existing_job_thread(
         discord_thread_id="thread_existing",
     )
 
-    assert process_one_task(
-        session_factory=session_factory,
-        settings=_discord_notification_settings(),
-        worker_id="worker-a",
-    ) is True
+    assert (
+        process_one_task(
+            session_factory=session_factory,
+            settings=_discord_notification_settings(),
+            worker_id="worker-a",
+        )
+        is True
+    )
 
     assert [call["url"] for call in calls] == [
         "https://discord.com/api/v10/channels/thread_existing/messages"
@@ -213,15 +223,19 @@ def test_discord_notification_delivery_reuses_existing_job_thread(
 
     with session_factory() as db:
         with db.begin():
-            row = db.execute(
-                text(
-                    "SELECT n.status, d.status AS delivery_status "
-                    "FROM notifications n "
-                    "JOIN notification_deliveries d ON d.notification_id = n.id "
-                    "WHERE n.id = :notification_id"
-                ),
-                {"notification_id": "ntf_existing"},
-            ).mappings().one()
+            row = (
+                db.execute(
+                    text(
+                        "SELECT n.status, d.status AS delivery_status "
+                        "FROM notifications n "
+                        "JOIN notification_deliveries d ON d.notification_id = n.id "
+                        "WHERE n.id = :notification_id"
+                    ),
+                    {"notification_id": "ntf_existing"},
+                )
+                .mappings()
+                .one()
+            )
 
     assert row["status"] == "delivered"
     assert row["delivery_status"] == "succeeded"
@@ -258,11 +272,14 @@ def test_discord_notification_delivery_persists_created_thread_when_message_fail
         discord_thread_id=None,
     )
 
-    assert process_one_task(
-        session_factory=session_factory,
-        settings=_discord_notification_settings(),
-        worker_id="worker-a",
-    ) is True
+    assert (
+        process_one_task(
+            session_factory=session_factory,
+            settings=_discord_notification_settings(),
+            worker_id="worker-a",
+        )
+        is True
+    )
 
     assert calls == [
         "https://discord.com/api/v10/channels/333/threads",
@@ -270,18 +287,22 @@ def test_discord_notification_delivery_persists_created_thread_when_message_fail
     ]
     with session_factory() as db:
         with db.begin():
-            row = db.execute(
-                text(
-                    "SELECT j.discord_thread_id, n.status, d.status AS delivery_status, "
-                    "d.error, t.status AS task_status "
-                    "FROM jobs j "
-                    "JOIN notifications n ON n.payload->>'job_id' = j.id "
-                    "JOIN notification_deliveries d ON d.notification_id = n.id "
-                    "JOIN background_tasks t ON t.payload->>'notification_id' = n.id "
-                    "WHERE n.id = :notification_id"
-                ),
-                {"notification_id": "ntf_retry"},
-            ).mappings().one()
+            row = (
+                db.execute(
+                    text(
+                        "SELECT j.discord_thread_id, n.status, d.status AS delivery_status, "
+                        "d.error, t.status AS task_status "
+                        "FROM jobs j "
+                        "JOIN notifications n ON n.payload->>'job_id' = j.id "
+                        "JOIN notification_deliveries d ON d.notification_id = n.id "
+                        "JOIN background_tasks t ON t.payload->>'notification_id' = n.id "
+                        "WHERE n.id = :notification_id"
+                    ),
+                    {"notification_id": "ntf_retry"},
+                )
+                .mappings()
+                .one()
+            )
 
     assert row["discord_thread_id"] == "thread_retry"
     assert row["status"] == "failed"

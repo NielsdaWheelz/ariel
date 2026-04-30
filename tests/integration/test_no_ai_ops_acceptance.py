@@ -73,14 +73,18 @@ def _turn_count(client: TestClient) -> int:
 def _capture_storage_row(client: TestClient, capture_id: str) -> CaptureStorageRow:
     with _session_factory(client)() as db:
         with db.begin():
-            row = db.execute(
-                text(
-                    "SELECT terminal_state, turn_id, effective_session_id, status_code, "
-                    "normalized_turn_input "
-                    "FROM captures WHERE id = :capture_id"
-                ),
-                {"capture_id": capture_id},
-            ).mappings().one()
+            row = (
+                db.execute(
+                    text(
+                        "SELECT terminal_state, turn_id, effective_session_id, status_code, "
+                        "normalized_turn_input "
+                        "FROM captures WHERE id = :capture_id"
+                    ),
+                    {"capture_id": capture_id},
+                )
+                .mappings()
+                .one()
+            )
     return CaptureStorageRow(
         terminal_state=str(row["terminal_state"]),
         turn_id=cast(str | None, row["turn_id"]),

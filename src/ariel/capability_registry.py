@@ -546,7 +546,9 @@ def _normalize_optional_text(value: Any, *, max_length: int) -> str | None:
     return normalized
 
 
-def _normalize_optional_string_list(value: Any, *, max_items: int, max_length: int) -> list[str] | None:
+def _normalize_optional_string_list(
+    value: Any, *, max_items: int, max_length: int
+) -> list[str] | None:
     if value is None:
         return []
     if not isinstance(value, list) or len(value) > max_items:
@@ -675,7 +677,9 @@ def _validate_agency_request_pr_input(
         "invocation_id": invocation_id,
         "worktree_id": worktree_id,
         "allow_dirty": bool(allow_dirty_raw) if allow_dirty_raw is not None else False,
-        "force_with_lease": bool(force_with_lease_raw) if force_with_lease_raw is not None else False,
+        "force_with_lease": bool(force_with_lease_raw)
+        if force_with_lease_raw is not None
+        else False,
     }, None
 
 
@@ -2996,9 +3000,7 @@ _RESPONSE_TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "force_with_lease": {"type": "boolean"},
         }
     ),
-    "discord_no_response_v1": _object_schema(
-        {"reason": {"type": "string", "maxLength": 500}}
-    ),
+    "discord_no_response_v1": _object_schema({"reason": {"type": "string", "maxLength": 500}}),
     "text_v1": _object_schema({"text": {"type": "string", "maxLength": 4000}}),
     "note_v1": _object_schema({"note": {"type": "string", "maxLength": 500}}),
     "external_notify_v1": _object_schema(

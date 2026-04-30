@@ -149,7 +149,9 @@ def test_s2_pr03_runtime_provenance_taint_applies_to_side_effects_despite_unreli
         assert "evt.action.execution.started" not in _event_types(body["turn"])
 
         proposed_event = next(
-            event for event in body["turn"]["events"] if event["event_type"] == "evt.action.proposed"
+            event
+            for event in body["turn"]["events"]
+            if event["event_type"] == "evt.action.proposed"
         )
         taint_payload = proposed_event["payload"]["taint"]
         assert taint_payload["influenced_by_untrusted_content"] is True
@@ -254,7 +256,9 @@ def test_s2_pr03_malformed_taint_metadata_is_treated_as_provenance_ambiguous_for
         assert "evt.action.execution.started" not in _event_types(body["turn"])
 
         proposed_event = next(
-            event for event in body["turn"]["events"] if event["event_type"] == "evt.action.proposed"
+            event
+            for event in body["turn"]["events"]
+            if event["event_type"] == "evt.action.proposed"
         )
         taint_payload = proposed_event["payload"]["taint"]
         assert taint_payload["influenced_by_untrusted_content"] is True

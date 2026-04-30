@@ -45,7 +45,9 @@ def upgrade() -> None:
         sa.Column("status", sa.String(length=32), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
-        sa.CheckConstraint("status IN ('in_progress', 'completed', 'failed')", name="ck_turn_status"),
+        sa.CheckConstraint(
+            "status IN ('in_progress', 'completed', 'failed')", name="ck_turn_status"
+        ),
         sa.ForeignKeyConstraint(["session_id"], ["sessions.id"], ondelete="RESTRICT"),
         sa.PrimaryKeyConstraint("id"),
     )

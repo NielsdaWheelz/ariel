@@ -141,7 +141,9 @@ class AgencyDaemonClient:
             raise AgencyDaemonError("agency daemon returned invalid payload")
         if response.status_code < 200 or response.status_code >= 300:
             message = payload.get("message") if isinstance(payload.get("message"), str) else None
-            raise AgencyDaemonError(message or f"agency daemon returned HTTP {response.status_code}")
+            raise AgencyDaemonError(
+                message or f"agency daemon returned HTTP {response.status_code}"
+            )
         return payload
 
 
@@ -363,7 +365,9 @@ class AgencyRuntime:
             int(pr_response["pr_number"]) if isinstance(pr_response.get("pr_number"), int) else None
         )
         job.agency_pr_url = self._optional_text(pr_response, "pr_url")
-        job.agency_request_id = self._optional_text(pr_response, "request_id") or job.agency_request_id
+        job.agency_request_id = (
+            self._optional_text(pr_response, "request_id") or job.agency_request_id
+        )
         job.agency_last_synced_at = now
         job.latest_payload = {"land": land_response, "pr": pr_response}
         job.updated_at = now
@@ -410,9 +414,15 @@ class AgencyRuntime:
             return raw_value
         raise AgencyDaemonError(f"agency {input_key} is missing")
 
-    def _update_job_from_payload(self, job: JobRecord, payload: dict[str, Any], *, now: datetime) -> None:
+    def _update_job_from_payload(
+        self, job: JobRecord, payload: dict[str, Any], *, now: datetime
+    ) -> None:
         job.status = self._job_status(str(payload.get("state") or job.status))
-        job.title = self._optional_text(payload, "task_name") or self._optional_text(payload, "name") or job.title
+        job.title = (
+            self._optional_text(payload, "task_name")
+            or self._optional_text(payload, "name")
+            or job.title
+        )
         job.latest_payload = payload
         job.agency_repo_id = self._optional_text(payload, "repo_id") or job.agency_repo_id
         job.agency_task_id = self._optional_text(payload, "task_id") or job.agency_task_id
@@ -421,8 +431,12 @@ class AgencyRuntime:
             or self._optional_text(payload, "primary_invocation_id")
             or job.agency_invocation_id
         )
-        job.agency_worktree_id = self._optional_text(payload, "worktree_id") or job.agency_worktree_id
-        job.agency_worktree_path = self._optional_text(payload, "worktree_path") or job.agency_worktree_path
+        job.agency_worktree_id = (
+            self._optional_text(payload, "worktree_id") or job.agency_worktree_id
+        )
+        job.agency_worktree_path = (
+            self._optional_text(payload, "worktree_path") or job.agency_worktree_path
+        )
         job.agency_branch = self._optional_text(payload, "branch") or job.agency_branch
         job.agency_runner = self._optional_text(payload, "runner") or job.agency_runner
         job.agency_request_id = self._optional_text(payload, "request_id") or job.agency_request_id

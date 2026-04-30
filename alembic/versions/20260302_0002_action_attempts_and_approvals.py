@@ -44,10 +44,7 @@ def upgrade() -> None:
             name="ck_action_attempt_proposal_index_positive",
         ),
         sa.CheckConstraint(
-            (
-                "impact_level IN ('read', 'write_reversible', "
-                "'write_irreversible', 'external_send')"
-            ),
+            ("impact_level IN ('read', 'write_reversible', 'write_irreversible', 'external_send')"),
             name="ck_action_attempt_impact_level",
         ),
         sa.CheckConstraint(
@@ -65,9 +62,13 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["turn_id"], ["turns.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
     )
-    op.create_index("ix_action_attempts_session_id", "action_attempts", ["session_id"], unique=False)
+    op.create_index(
+        "ix_action_attempts_session_id", "action_attempts", ["session_id"], unique=False
+    )
     op.create_index("ix_action_attempts_turn_id", "action_attempts", ["turn_id"], unique=False)
-    op.create_index("ix_action_attempts_created_at", "action_attempts", ["created_at"], unique=False)
+    op.create_index(
+        "ix_action_attempts_created_at", "action_attempts", ["created_at"], unique=False
+    )
     op.create_index(
         "ix_turn_proposal_index_unique",
         "action_attempts",
@@ -104,10 +105,16 @@ def upgrade() -> None:
         ["action_attempt_id"],
         unique=True,
     )
-    op.create_index("ix_approval_requests_session_id", "approval_requests", ["session_id"], unique=False)
+    op.create_index(
+        "ix_approval_requests_session_id", "approval_requests", ["session_id"], unique=False
+    )
     op.create_index("ix_approval_requests_turn_id", "approval_requests", ["turn_id"], unique=False)
-    op.create_index("ix_approval_requests_expires_at", "approval_requests", ["expires_at"], unique=False)
-    op.create_index("ix_approval_requests_created_at", "approval_requests", ["created_at"], unique=False)
+    op.create_index(
+        "ix_approval_requests_expires_at", "approval_requests", ["expires_at"], unique=False
+    )
+    op.create_index(
+        "ix_approval_requests_created_at", "approval_requests", ["created_at"], unique=False
+    )
 
 
 def downgrade() -> None:

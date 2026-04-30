@@ -50,9 +50,15 @@ def upgrade() -> None:
         ["access_token_expires_at"],
         unique=False,
     )
-    op.create_index("ix_google_connectors_created_at", "google_connectors", ["created_at"], unique=False)
-    op.create_index("ix_google_connectors_last_error_at", "google_connectors", ["last_error_at"], unique=False)
-    op.create_index("ix_google_connectors_updated_at", "google_connectors", ["updated_at"], unique=False)
+    op.create_index(
+        "ix_google_connectors_created_at", "google_connectors", ["created_at"], unique=False
+    )
+    op.create_index(
+        "ix_google_connectors_last_error_at", "google_connectors", ["last_error_at"], unique=False
+    )
+    op.create_index(
+        "ix_google_connectors_updated_at", "google_connectors", ["updated_at"], unique=False
+    )
 
     op.create_table(
         "google_oauth_states",
@@ -70,10 +76,18 @@ def upgrade() -> None:
         sa.CheckConstraint("flow IN ('connect', 'reconnect')", name="ck_google_oauth_state_flow"),
         sa.PrimaryKeyConstraint("id"),
     )
-    op.create_index("ix_google_oauth_states_state_handle", "google_oauth_states", ["state_handle"], unique=True)
-    op.create_index("ix_google_oauth_states_expires_at", "google_oauth_states", ["expires_at"], unique=False)
-    op.create_index("ix_google_oauth_states_consumed_at", "google_oauth_states", ["consumed_at"], unique=False)
-    op.create_index("ix_google_oauth_states_created_at", "google_oauth_states", ["created_at"], unique=False)
+    op.create_index(
+        "ix_google_oauth_states_state_handle", "google_oauth_states", ["state_handle"], unique=True
+    )
+    op.create_index(
+        "ix_google_oauth_states_expires_at", "google_oauth_states", ["expires_at"], unique=False
+    )
+    op.create_index(
+        "ix_google_oauth_states_consumed_at", "google_oauth_states", ["consumed_at"], unique=False
+    )
+    op.create_index(
+        "ix_google_oauth_states_created_at", "google_oauth_states", ["created_at"], unique=False
+    )
 
     op.create_table(
         "google_connector_events",

@@ -87,7 +87,13 @@ def _assert_allowlisted_lifecycle_item(item: dict[str, Any]) -> None:
     }
     assert set(item["proposal"].keys()) == {"capability_id", "input_summary"}
     assert set(item["policy"].keys()) == {"decision", "reason"}
-    assert set(item["approval"].keys()) == {"status", "reference", "reason", "expires_at", "decided_at"}
+    assert set(item["approval"].keys()) == {
+        "status",
+        "reference",
+        "reason",
+        "expires_at",
+        "decided_at",
+    }
     assert set(item["execution"].keys()) == {"status", "output", "error"}
 
 
@@ -270,7 +276,9 @@ def test_s2_pr04_approval_approved_execution_success_is_surface_inspectable_and_
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "approve success"})
+        sent = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "approve success"}
+        )
         assert sent.status_code == 200
         approval_ref = _approval_ref(sent.json()["turn"])
 
