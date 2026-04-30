@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from contextlib import asynccontextmanager
 import hmac
 import hashlib
@@ -47,6 +47,21 @@ from ariel.google_connector import (
     GoogleConnectorError,
     GoogleConnectorRuntime,
 )
+from ariel.memory import (
+    approve_candidate,
+    build_memory_context,
+    context_text,
+    correct_assertion,
+    delete_assertion,
+    list_memory,
+    record_memory_from_user_message,
+    record_rotation_context_block,
+    reject_candidate,
+    resolve_conflict,
+    retract_assertion,
+    search_memory,
+    set_assertion_priority,
+)
 from ariel.persistence import (
     ActionAttemptRecord,
     ApprovalRequestRecord,
@@ -56,14 +71,11 @@ from ariel.persistence import (
     ArtifactRecord,
     JobEventRecord,
     JobRecord,
-    MemoryItemRecord,
-    MemoryRevisionRecord,
     NotificationRecord,
     SessionRecord,
     SessionRotationRecord,
     TurnIdempotencyRecord,
     TurnRecord,
-    serialize_memory_projection_item,
     serialize_capture,
     serialize_artifact,
     serialize_action_attempt,
@@ -82,8 +94,8 @@ from ariel.response_contracts import (
     build_surface_approval_response,
     build_surface_capture_failure_response,
     build_surface_capture_success_response,
+    build_surface_memory_response,
     build_surface_message_response,
-    build_surface_memory_projection_response,
     build_surface_rotation_list_response,
     build_surface_rotation_response,
     build_surface_timeline_response,
@@ -111,15 +123,12 @@ _ALLOWED_ROTATION_REASONS = {
 _CONTEXT_SECTION_ORDER = (
     "policy_system_instructions",
     "recent_active_session_turns",
-    "rolling_session_summary",
-    "durable_memory_recall",
+    "memory_context",
     "open_commitments_and_jobs",
     "relevant_artifacts_and_signals",
 )
 
 _CONTEXT_AUDIT_SCHEMA_VERSION = "1.0"
-_SESSION_ROLLING_SUMMARY_MAX_CHARS = 1200
-_SESSION_ROLLING_SUMMARY_MAX_TURNS = 6
 _MAX_OPEN_COMMITMENTS_IN_CONTEXT = 12
 _MAX_ARTIFACTS_IN_CONTEXT = 8
 
@@ -131,8 +140,6 @@ _POLICY_SYSTEM_INSTRUCTIONS = (
     "If the right Discord behavior is to listen without a visible reply, call cap.discord.no_response.",
 )
 
-_MEMORY_VALUE_MAX_CHARS = 500
-
 _CAPTURE_ALLOWED_KINDS = {"text", "url", "shared_content"}
 _CAPTURE_ALLOWED_SOURCE_FIELDS = {"app", "title", "url"}
 _CAPTURE_TEXT_MAX_CHARS = 12_000
@@ -140,84 +147,6 @@ _CAPTURE_URL_MAX_CHARS = 2_048
 _CAPTURE_NOTE_MAX_CHARS = 2_000
 _CAPTURE_SOURCE_FIELD_MAX_CHARS = 512
 _CAPTURE_SHARED_CONTENT_MAX_URLS = 16
-
-_MEMORY_COMMAND_REMEMBER_PATTERN = re.compile(r"^\s*remember\s+(?P<body>.+?)\s*$", re.IGNORECASE)
-_MEMORY_COMMAND_CORRECT_PATTERN = re.compile(r"^\s*correct\s+(?P<body>.+?)\s*$", re.IGNORECASE)
-_MEMORY_COMMAND_FORGET_PATTERN = re.compile(r"^\s*forget\s+(?P<body>.+?)\s*$", re.IGNORECASE)
-_MEMORY_CLASS_KEY_VALUE_PATTERN = re.compile(
-    r"^\s*(?P<memory_class>[a-z_]+):(?P<memory_key>[a-z0-9_]+)\s*=\s*(?P<value>.+?)\s*$",
-    re.IGNORECASE,
-)
-_MEMORY_CLASS_KEY_PATTERN = re.compile(
-    r"^\s*(?P<memory_class>[a-z_]+):(?P<memory_key>[a-z0-9_]+)\s*$",
-    re.IGNORECASE,
-)
-_INFERRED_NOTEBOOK_STYLE_PATTERN = re.compile(
-    r"^\s*i\s+like\s+(?P<value>.+?notebooks?)\s*[.!]?\s*$",
-    re.IGNORECASE,
-)
-_NATURAL_REMEMBER_PREFERENCE_PATTERN = re.compile(
-    r"^\s*remember that i prefer\s+(?P<value>.+?)\s*$",
-    re.IGNORECASE,
-)
-_NATURAL_REMEMBER_COMMITMENT_PATTERN = re.compile(
-    r"^\s*remember that i commit to\s+(?P<value>.+?)\s*$",
-    re.IGNORECASE,
-)
-_NATURAL_REMEMBER_PROFILE_PATTERN = re.compile(
-    r"^\s*remember that my\s+(?P<key>[a-z0-9 _-]{1,64})\s+is\s+(?P<value>.+?)\s*$",
-    re.IGNORECASE,
-)
-_NATURAL_REMEMBER_PROJECT_PATTERN = re.compile(
-    r"^\s*remember that project\s+(?P<key>[a-z0-9 _-]{1,64})\s+is\s+(?P<value>.+?)\s*$",
-    re.IGNORECASE,
-)
-
-_ALLOWED_MEMORY_CLASSES = {
-    "profile",
-    "preference",
-    "project",
-    "commitment",
-    "episodic_summary",
-}
-
-_MEMORY_CLASS_PRIORITY = {
-    "commitment": 5,
-    "profile": 4,
-    "preference": 3,
-    "project": 2,
-    "episodic_summary": 1,
-}
-
-_MEMORY_RECALL_STOPWORDS = {
-    "a",
-    "an",
-    "and",
-    "again",
-    "for",
-    "from",
-    "i",
-    "in",
-    "is",
-    "it",
-    "my",
-    "of",
-    "on",
-    "or",
-    "the",
-    "to",
-    "what",
-}
-
-
-@dataclass(slots=True, frozen=True)
-class MemoryMutationProposal:
-    action: Literal["candidate", "remember", "correct", "forget"]
-    memory_class: str
-    memory_key: str
-    value: str | None
-    confidence: float
-    evidence: dict[str, Any]
 
 
 @dataclass(slots=True, frozen=True)
@@ -277,6 +206,32 @@ class MessageRequest(BaseModel):
         if not value.strip():
             raise ValueError("message must not be blank")
         return value
+
+
+class MemoryCorrectionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    value: str = Field(min_length=1, max_length=500)
+
+    @field_validator("value")
+    @classmethod
+    def _value_must_not_be_blank(cls, value: str) -> str:
+        normalized = " ".join(value.strip().split())
+        if not normalized:
+            raise ValueError("value must not be blank")
+        return normalized
+
+
+class MemoryRejectRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class MemoryConflictResolutionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    assertion_id: str = Field(min_length=1, max_length=32)
 
 
 class ApprovalDecisionRequest(BaseModel):
@@ -545,62 +500,40 @@ def _build_responses_input_items(
     if discord_context_text is not None:
         input_items.append({"role": "system", "content": discord_context_text})
 
+    discord_channel_recent_turns = context_bundle.get("discord_channel_recent_turns")
+    if isinstance(discord_channel_recent_turns, list) and discord_channel_recent_turns:
+        channel_lines: list[str] = []
+        for prior_turn in discord_channel_recent_turns:
+            if not isinstance(prior_turn, dict):
+                continue
+            message_id = prior_turn.get("message_id")
+            prior_user_message = prior_turn.get("user_message")
+            assistant_message = prior_turn.get("assistant_message")
+            if isinstance(message_id, int) and isinstance(prior_user_message, str):
+                line = f"- message_id={message_id} user={prior_user_message}"
+                if isinstance(assistant_message, str) and assistant_message:
+                    line = f"{line} assistant={assistant_message}"
+                channel_lines.append(line)
+        if channel_lines:
+            input_items.append(
+                {
+                    "role": "system",
+                    "content": "recent Discord channel context:\n" + "\n".join(channel_lines),
+                }
+            )
+
     recent_turns = context_bundle.get("recent_active_session_turns")
     if not isinstance(recent_turns, list):
         recent_turns = []
 
-    rolling_summary = context_bundle.get("rolling_session_summary")
-    if isinstance(rolling_summary, dict):
-        summary_text = rolling_summary.get("summary_text")
-        if isinstance(summary_text, str) and summary_text.strip():
-            input_items.append(
-                {
-                    "role": "system",
-                    "content": "rolling session summary:\n" + summary_text,
-                }
-            )
-
-    durable_memory_recall = context_bundle.get("durable_memory_recall")
-    if isinstance(durable_memory_recall, list) and durable_memory_recall:
-        memory_lines: list[str] = []
-        for memory in durable_memory_recall:
-            if not isinstance(memory, dict):
-                continue
-            memory_class = memory.get("memory_class")
-            key = memory.get("key")
-            value = memory.get("value")
-            if not (
-                isinstance(memory_class, str) and isinstance(key, str) and isinstance(value, str)
-            ):
-                continue
-            memory_lines.append(f"- {memory_class}: {key} = {value}")
-        if memory_lines:
-            input_items.append(
-                {
-                    "role": "system",
-                    "content": "durable memory recall:\n" + "\n".join(memory_lines),
-                }
-            )
+    memory_context = context_bundle.get("memory_context")
+    if isinstance(memory_context, dict):
+        rendered_memory_context = context_text(memory_context)
+        if rendered_memory_context.strip():
+            input_items.append({"role": "system", "content": rendered_memory_context})
 
     open_commitments_and_jobs = context_bundle.get("open_commitments_and_jobs")
     if isinstance(open_commitments_and_jobs, dict):
-        commitments_raw = open_commitments_and_jobs.get("open_commitments")
-        if isinstance(commitments_raw, list) and commitments_raw:
-            commitment_lines: list[str] = []
-            for commitment in commitments_raw:
-                if not isinstance(commitment, dict):
-                    continue
-                memory_key = commitment.get("memory_key")
-                value = commitment.get("value")
-                if isinstance(memory_key, str) and isinstance(value, str):
-                    commitment_lines.append(f"- {memory_key}: {value}")
-            if commitment_lines:
-                input_items.append(
-                    {
-                        "role": "system",
-                        "content": "open commitments:\n" + "\n".join(commitment_lines),
-                    }
-                )
         jobs_raw = open_commitments_and_jobs.get("open_jobs")
         if isinstance(jobs_raw, list) and jobs_raw:
             job_lines: list[str] = []
@@ -760,6 +693,18 @@ def _estimate_context_tokens(*, context_bundle: dict[str, Any], user_message: st
     if discord_context_text is not None:
         token_total += _estimate_text_tokens(discord_context_text)
 
+    discord_channel_recent_turns = context_bundle.get("discord_channel_recent_turns")
+    if isinstance(discord_channel_recent_turns, list):
+        for prior_turn in discord_channel_recent_turns:
+            if not isinstance(prior_turn, dict):
+                continue
+            prior_user_message = prior_turn.get("user_message")
+            if isinstance(prior_user_message, str):
+                token_total += _estimate_text_tokens(prior_user_message)
+            prior_assistant_message = prior_turn.get("assistant_message")
+            if isinstance(prior_assistant_message, str):
+                token_total += _estimate_text_tokens(prior_assistant_message)
+
     recent_active_session_turns = context_bundle.get("recent_active_session_turns")
     if isinstance(recent_active_session_turns, list):
         for prior_turn in recent_active_session_turns:
@@ -772,33 +717,12 @@ def _estimate_context_tokens(*, context_bundle: dict[str, Any], user_message: st
             if isinstance(prior_assistant_message, str):
                 token_total += _estimate_text_tokens(prior_assistant_message)
 
-    rolling_session_summary = context_bundle.get("rolling_session_summary")
-    if isinstance(rolling_session_summary, dict):
-        summary_text = rolling_session_summary.get("summary_text")
-        if isinstance(summary_text, str):
-            token_total += _estimate_text_tokens(summary_text)
-
-    durable_memory_recall = context_bundle.get("durable_memory_recall")
-    if isinstance(durable_memory_recall, list):
-        for memory in durable_memory_recall:
-            if not isinstance(memory, dict):
-                continue
-            for key in ("memory_class", "key", "value"):
-                raw_value = memory.get(key)
-                if isinstance(raw_value, str):
-                    token_total += _estimate_text_tokens(raw_value)
+    memory_context = context_bundle.get("memory_context")
+    if isinstance(memory_context, dict):
+        token_total += _estimate_text_tokens(context_text(memory_context))
 
     open_commitments_and_jobs = context_bundle.get("open_commitments_and_jobs")
     if isinstance(open_commitments_and_jobs, dict):
-        commitments_raw = open_commitments_and_jobs.get("open_commitments")
-        if isinstance(commitments_raw, list):
-            for commitment in commitments_raw:
-                if not isinstance(commitment, dict):
-                    continue
-                for key in ("memory_key", "value"):
-                    raw_value = commitment.get(key)
-                    if isinstance(raw_value, str):
-                        token_total += _estimate_text_tokens(raw_value)
         jobs_raw = open_commitments_and_jobs.get("open_jobs")
         if isinstance(jobs_raw, list):
             for job in jobs_raw:
@@ -926,7 +850,11 @@ def _sanitize_response_contract_errors(errors: list[Any]) -> list[dict[str, Any]
         if not isinstance(item, dict):
             continue
         loc_raw = item.get("loc")
-        loc = [part for part in loc_raw if isinstance(part, (str, int))] if isinstance(loc_raw, (list, tuple)) else []
+        loc = (
+            [part for part in loc_raw if isinstance(part, (str, int))]
+            if isinstance(loc_raw, (list, tuple))
+            else []
+        )
         error_type = item.get("type")
         if not isinstance(error_type, str):
             error_type = "unknown"
@@ -1092,7 +1020,9 @@ def _normalize_capture_source(raw_source: Any) -> dict[str, str] | None:
         )
 
     extra_fields = sorted(
-        field_name for field_name in raw_source.keys() if field_name not in _CAPTURE_ALLOWED_SOURCE_FIELDS
+        field_name
+        for field_name in raw_source.keys()
+        if field_name not in _CAPTURE_ALLOWED_SOURCE_FIELDS
     )
     if extra_fields:
         raise _capture_ingest_error(
@@ -1385,7 +1315,9 @@ def _build_shared_content_capture_turn_input(
 
 def _normalize_capture_envelope(payload: dict[str, Any]) -> NormalizedCaptureEnvelope:
     allowed_fields = {"kind", "text", "url", "note", "source", "shared_content"}
-    extra_fields = sorted(field_name for field_name in payload.keys() if field_name not in allowed_fields)
+    extra_fields = sorted(
+        field_name for field_name in payload.keys() if field_name not in allowed_fields
+    )
     if extra_fields:
         raise _capture_ingest_error(
             status_code=422,
@@ -1556,531 +1488,6 @@ class TurnExecutionOutcome:
     response_payload: dict[str, Any]
 
 
-@dataclass(slots=True, frozen=True)
-class MemoryMutationResult:
-    event_type: str
-    item: MemoryItemRecord
-    revision: MemoryRevisionRecord
-
-
-def _normalize_memory_key(value: str, *, fallback: str) -> str:
-    normalized = re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
-    return normalized or fallback
-
-
-def _normalize_memory_value(value: str) -> str:
-    normalized = " ".join(value.strip().split())
-    return normalized[:_MEMORY_VALUE_MAX_CHARS]
-
-
-def _normalized_terms(text: str) -> set[str]:
-    return {
-        token
-        for token in re.findall(r"[a-z0-9]+", text.lower())
-        if token and token not in _MEMORY_RECALL_STOPWORDS
-    }
-
-
-def _parse_memory_class_key_value(body: str) -> tuple[str, str, str] | None:
-    match = _MEMORY_CLASS_KEY_VALUE_PATTERN.match(body)
-    if match is None:
-        return None
-    memory_class = match.group("memory_class").strip().lower()
-    if memory_class not in _ALLOWED_MEMORY_CLASSES:
-        return None
-    key = _normalize_memory_key(match.group("memory_key"), fallback="general")
-    value = _normalize_memory_value(match.group("value"))
-    if not value:
-        return None
-    return memory_class, f"{memory_class}:{key}", value
-
-
-def _parse_memory_class_key(body: str) -> tuple[str, str] | None:
-    match = _MEMORY_CLASS_KEY_PATTERN.match(body)
-    if match is None:
-        return None
-    memory_class = match.group("memory_class").strip().lower()
-    if memory_class not in _ALLOWED_MEMORY_CLASSES:
-        return None
-    key = _normalize_memory_key(match.group("memory_key"), fallback="general")
-    return memory_class, f"{memory_class}:{key}"
-
-
-def _extract_memory_mutation_proposal(user_message: str) -> MemoryMutationProposal | None:
-    remember_match = _MEMORY_COMMAND_REMEMBER_PATTERN.match(user_message)
-    if remember_match is not None:
-        parsed = _parse_memory_class_key_value(remember_match.group("body"))
-        if parsed is None:
-            return None
-        memory_class, memory_key, value = parsed
-        return MemoryMutationProposal(
-            action="remember",
-            memory_class=memory_class,
-            memory_key=memory_key,
-            value=value,
-            confidence=1.0,
-            evidence={"capture_mode": "explicit_memory_command", "command": "remember"},
-        )
-
-    correct_match = _MEMORY_COMMAND_CORRECT_PATTERN.match(user_message)
-    if correct_match is not None:
-        parsed = _parse_memory_class_key_value(correct_match.group("body"))
-        if parsed is None:
-            return None
-        memory_class, memory_key, value = parsed
-        return MemoryMutationProposal(
-            action="correct",
-            memory_class=memory_class,
-            memory_key=memory_key,
-            value=value,
-            confidence=1.0,
-            evidence={"capture_mode": "explicit_memory_command", "command": "correct"},
-        )
-
-    forget_match = _MEMORY_COMMAND_FORGET_PATTERN.match(user_message)
-    if forget_match is not None:
-        parsed_key = _parse_memory_class_key(forget_match.group("body"))
-        if parsed_key is None:
-            return None
-        memory_class, memory_key = parsed_key
-        return MemoryMutationProposal(
-            action="forget",
-            memory_class=memory_class,
-            memory_key=memory_key,
-            value=None,
-            confidence=1.0,
-            evidence={"capture_mode": "explicit_memory_command", "command": "forget"},
-        )
-
-    natural_preference_match = _NATURAL_REMEMBER_PREFERENCE_PATTERN.match(user_message)
-    if natural_preference_match is not None:
-        value = _normalize_memory_value(natural_preference_match.group("value"))
-        if value:
-            return MemoryMutationProposal(
-                action="remember",
-                memory_class="preference",
-                memory_key="preference:general",
-                value=value,
-                confidence=1.0,
-                evidence={"capture_mode": "explicit_user_statement", "command": "remember"},
-            )
-
-    natural_commitment_match = _NATURAL_REMEMBER_COMMITMENT_PATTERN.match(user_message)
-    if natural_commitment_match is not None:
-        value = _normalize_memory_value(natural_commitment_match.group("value"))
-        if value:
-            commitment_key = _normalize_memory_key(value, fallback="commitment")
-            return MemoryMutationProposal(
-                action="remember",
-                memory_class="commitment",
-                memory_key=f"commitment:{commitment_key}",
-                value=value,
-                confidence=1.0,
-                evidence={
-                    "capture_mode": "explicit_user_statement",
-                    "command": "remember",
-                    "status": "open",
-                },
-            )
-
-    natural_profile_match = _NATURAL_REMEMBER_PROFILE_PATTERN.match(user_message)
-    if natural_profile_match is not None:
-        profile_key = _normalize_memory_key(natural_profile_match.group("key"), fallback="profile")
-        value = _normalize_memory_value(natural_profile_match.group("value"))
-        if value:
-            return MemoryMutationProposal(
-                action="remember",
-                memory_class="profile",
-                memory_key=f"profile:{profile_key}",
-                value=value,
-                confidence=1.0,
-                evidence={"capture_mode": "explicit_user_statement", "command": "remember"},
-            )
-
-    natural_project_match = _NATURAL_REMEMBER_PROJECT_PATTERN.match(user_message)
-    if natural_project_match is not None:
-        project_key = _normalize_memory_key(natural_project_match.group("key"), fallback="project")
-        value = _normalize_memory_value(natural_project_match.group("value"))
-        if value:
-            return MemoryMutationProposal(
-                action="remember",
-                memory_class="project",
-                memory_key=f"project:{project_key}",
-                value=value,
-                confidence=1.0,
-                evidence={"capture_mode": "explicit_user_statement", "command": "remember"},
-            )
-
-    inferred_match = _INFERRED_NOTEBOOK_STYLE_PATTERN.match(user_message)
-    if inferred_match is not None:
-        value = _normalize_memory_value(inferred_match.group("value"))
-        if value:
-            return MemoryMutationProposal(
-                action="candidate",
-                memory_class="preference",
-                memory_key="preference:notebook_style",
-                value=value,
-                confidence=0.55,
-                evidence={"capture_mode": "inferred_statement"},
-            )
-
-    return None
-
-
-def _get_or_create_memory_item(
-    *,
-    db: Session,
-    memory_class: str,
-    memory_key: str,
-    now_fn: Callable[[], datetime],
-    new_id_fn: Callable[[str], str],
-) -> MemoryItemRecord:
-    existing = db.scalar(
-        select(MemoryItemRecord)
-        .where(
-            MemoryItemRecord.memory_class == memory_class,
-            MemoryItemRecord.memory_key == memory_key,
-        )
-        .limit(1)
-    )
-    if existing is not None:
-        return existing
-    now = now_fn()
-    created = MemoryItemRecord(
-        id=new_id_fn("mit"),
-        memory_class=memory_class,
-        memory_key=memory_key,
-        active_revision_id=None,
-        created_at=now,
-        updated_at=now,
-    )
-    db.add(created)
-    db.flush()
-    return created
-
-
-def _active_revision_for_item(db: Session, item: MemoryItemRecord) -> MemoryRevisionRecord | None:
-    if not isinstance(item.active_revision_id, str):
-        return None
-    return db.scalar(
-        select(MemoryRevisionRecord).where(MemoryRevisionRecord.id == item.active_revision_id).limit(1)
-    )
-
-
-def _append_memory_revision(
-    *,
-    db: Session,
-    item: MemoryItemRecord,
-    lifecycle_state: str,
-    value: str | None,
-    confidence: float,
-    source_turn_id: str | None,
-    source_session_id: str,
-    evidence: dict[str, Any],
-    now_fn: Callable[[], datetime],
-    new_id_fn: Callable[[str], str],
-) -> MemoryRevisionRecord:
-    now = now_fn()
-    prior_active_revision = _active_revision_for_item(db, item)
-    if (
-        prior_active_revision is not None
-        and prior_active_revision.lifecycle_state in {"candidate", "validated"}
-    ):
-        prior_active_revision.lifecycle_state = "superseded"
-
-    revision = MemoryRevisionRecord(
-        id=new_id_fn("mrv"),
-        memory_item_id=item.id,
-        lifecycle_state=lifecycle_state,
-        value=value,
-        confidence=confidence,
-        source_turn_id=source_turn_id,
-        source_session_id=source_session_id,
-        evidence=evidence,
-        last_verified_at=now,
-        created_at=now,
-    )
-    db.add(revision)
-    item.active_revision_id = revision.id
-    item.updated_at = now
-    db.flush()
-    return revision
-
-
-def _capture_validated_memory_candidates(
-    *,
-    db: Session,
-    session_id: str,
-    source_turn_id: str,
-    user_message: str,
-    now_fn: Callable[[], datetime],
-    new_id_fn: Callable[[str], str],
-) -> list[MemoryMutationResult]:
-    proposal = _extract_memory_mutation_proposal(user_message)
-    if proposal is None:
-        return []
-
-    item = _get_or_create_memory_item(
-        db=db,
-        memory_class=proposal.memory_class,
-        memory_key=proposal.memory_key,
-        now_fn=now_fn,
-        new_id_fn=new_id_fn,
-    )
-    active_revision = _active_revision_for_item(db, item)
-    value = proposal.value
-
-    if proposal.action == "candidate":
-        if value is None:
-            return []
-        if (
-            active_revision is not None
-            and active_revision.lifecycle_state in {"candidate", "validated"}
-            and active_revision.value == value
-        ):
-            return []
-        candidate_revision = _append_memory_revision(
-            db=db,
-            item=item,
-            lifecycle_state="candidate",
-            value=value,
-            confidence=proposal.confidence,
-            source_turn_id=source_turn_id,
-            source_session_id=session_id,
-            evidence=proposal.evidence,
-            now_fn=now_fn,
-            new_id_fn=new_id_fn,
-        )
-        return [
-            MemoryMutationResult(
-                event_type="evt.memory.candidate_proposed",
-                item=item,
-                revision=candidate_revision,
-            )
-        ]
-
-    if proposal.action == "remember":
-        if value is None:
-            return []
-        if (
-            active_revision is not None
-            and active_revision.lifecycle_state == "validated"
-            and active_revision.value == value
-        ):
-            return []
-        event_type = "evt.memory.captured"
-        if active_revision is not None and active_revision.lifecycle_state == "candidate":
-            event_type = "evt.memory.promoted"
-        remembered_revision = _append_memory_revision(
-            db=db,
-            item=item,
-            lifecycle_state="validated",
-            value=value,
-            confidence=proposal.confidence,
-            source_turn_id=source_turn_id,
-            source_session_id=session_id,
-            evidence=proposal.evidence,
-            now_fn=now_fn,
-            new_id_fn=new_id_fn,
-        )
-        return [MemoryMutationResult(event_type=event_type, item=item, revision=remembered_revision)]
-
-    if proposal.action == "correct":
-        if value is None:
-            return []
-        if (
-            active_revision is not None
-            and active_revision.lifecycle_state == "validated"
-            and active_revision.value == value
-        ):
-            return []
-        corrected_revision = _append_memory_revision(
-            db=db,
-            item=item,
-            lifecycle_state="validated",
-            value=value,
-            confidence=proposal.confidence,
-            source_turn_id=source_turn_id,
-            source_session_id=session_id,
-            evidence=proposal.evidence,
-            now_fn=now_fn,
-            new_id_fn=new_id_fn,
-        )
-        return [
-            MemoryMutationResult(
-                event_type="evt.memory.corrected",
-                item=item,
-                revision=corrected_revision,
-            )
-        ]
-
-    if proposal.action == "forget":
-        if active_revision is None:
-            return []
-        if active_revision.lifecycle_state == "retracted":
-            return []
-        retracted_revision = _append_memory_revision(
-            db=db,
-            item=item,
-            lifecycle_state="retracted",
-            value=None,
-            confidence=proposal.confidence,
-            source_turn_id=source_turn_id,
-            source_session_id=session_id,
-            evidence=proposal.evidence,
-            now_fn=now_fn,
-            new_id_fn=new_id_fn,
-        )
-        return [
-            MemoryMutationResult(
-                event_type="evt.memory.retracted",
-                item=item,
-                revision=retracted_revision,
-            )
-        ]
-
-    return []
-
-
-def _is_open_commitment(*, item: MemoryItemRecord, revision: MemoryRevisionRecord) -> bool:
-    if item.memory_class != "commitment":
-        return False
-    evidence_payload = revision.evidence if isinstance(revision.evidence, dict) else {}
-    status = evidence_payload.get("status")
-    if isinstance(status, str) and status in {"completed", "cancelled", "closed"}:
-        return False
-    return True
-
-
-def _active_item_revision_pairs(db: Session) -> list[tuple[MemoryItemRecord, MemoryRevisionRecord]]:
-    items = db.scalars(
-        select(MemoryItemRecord)
-        .where(MemoryItemRecord.active_revision_id.is_not(None))
-        .order_by(MemoryItemRecord.updated_at.desc(), MemoryItemRecord.id.asc())
-    ).all()
-    revision_ids = [
-        item.active_revision_id
-        for item in items
-        if isinstance(item.active_revision_id, str) and item.active_revision_id
-    ]
-    if not revision_ids:
-        return []
-    revisions = db.scalars(
-        select(MemoryRevisionRecord).where(MemoryRevisionRecord.id.in_(revision_ids))
-    ).all()
-    revisions_by_id = {revision.id: revision for revision in revisions}
-    pairs: list[tuple[MemoryItemRecord, MemoryRevisionRecord]] = []
-    for item in items:
-        if not isinstance(item.active_revision_id, str):
-            continue
-        active_revision = revisions_by_id.get(item.active_revision_id)
-        if active_revision is None:
-            continue
-        pairs.append((item, active_revision))
-    return pairs
-
-
-def _recall_validated_memory_for_turn(
-    *,
-    db: Session,
-    user_message: str,
-    max_recalled_memories: int,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    query_terms = _normalized_terms(user_message)
-    ranked: list[tuple[int, int, float, float, str, MemoryItemRecord, MemoryRevisionRecord]] = []
-    for item, revision in _active_item_revision_pairs(db):
-        if item.memory_class == "episodic_summary":
-            continue
-        if revision.lifecycle_state != "validated":
-            continue
-        memory_terms = _normalized_terms(f"{item.memory_key} {revision.value or ''}")
-        overlap_count = len(query_terms.intersection(memory_terms))
-        if _is_open_commitment(item=item, revision=revision):
-            overlap_count += 1
-        if overlap_count <= 0:
-            continue
-        class_priority = _MEMORY_CLASS_PRIORITY.get(item.memory_class, 0)
-        ranked.append(
-            (
-                overlap_count,
-                class_priority,
-                revision.last_verified_at.timestamp(),
-                revision.created_at.timestamp(),
-                item.id,
-                item,
-                revision,
-            )
-        )
-
-    ranked.sort(key=lambda row: (-row[0], -row[1], -row[2], -row[3], row[4]))
-    selected = ranked[:max_recalled_memories]
-    excluded = ranked[max_recalled_memories:]
-
-    recalled_memory = [
-        {
-            "memory_id": item.id,
-            "memory_class": item.memory_class,
-            "key": item.memory_key,
-            "value": revision.value or "",
-            "confidence": revision.confidence,
-            "last_verified_at": to_rfc3339(revision.last_verified_at),
-        }
-        for _, _, _, _, _, item, revision in selected
-    ]
-    excluded_memories = [
-        {"memory_id": item.id, "reason": "top_k_bounded"}
-        for _, _, _, _, _, item, _ in excluded
-    ]
-    recall_window = {
-        "max_recalled_memories": max_recalled_memories,
-        "included_memory_count": len(recalled_memory),
-        "omitted_memory_count": len(excluded_memories),
-        "included_memory_ids": [memory["memory_id"] for memory in recalled_memory],
-        "excluded_memories": excluded_memories,
-    }
-    return recalled_memory, recall_window
-
-
-def _build_episodic_continuity_summary(*, prior_turns: Sequence[TurnRecord]) -> str:
-    if not prior_turns:
-        return "session rotated with no prior turns."
-    snippets: list[str] = []
-    for turn in prior_turns[-3:]:
-        user_text = _normalize_memory_value(turn.user_message)
-        assistant_text = (
-            _normalize_memory_value(turn.assistant_message)
-            if isinstance(turn.assistant_message, str)
-            else ""
-        )
-        if assistant_text:
-            snippets.append(f"user: {user_text} | assistant: {assistant_text}")
-        else:
-            snippets.append(f"user: {user_text}")
-    return _normalize_memory_value(" || ".join(snippets))
-
-
-def _open_commitments_context(*, db: Session) -> list[dict[str, Any]]:
-    open_commitments: list[dict[str, Any]] = []
-    for item, revision in _active_item_revision_pairs(db):
-        if item.memory_class != "commitment":
-            continue
-        if revision.lifecycle_state != "validated":
-            continue
-        if not _is_open_commitment(item=item, revision=revision):
-            continue
-        open_commitments.append(
-            {
-                "memory_item_id": item.id,
-                "memory_key": item.memory_key,
-                "value": revision.value or "",
-                "confidence": revision.confidence,
-                "last_verified_at": to_rfc3339(revision.last_verified_at),
-            }
-        )
-    open_commitments.sort(key=lambda row: (row["last_verified_at"], row["memory_item_id"]), reverse=True)
-    return open_commitments[:_MAX_OPEN_COMMITMENTS_IN_CONTEXT]
-
-
 def _open_jobs_context(*, db: Session) -> list[dict[str, Any]]:
     jobs = db.scalars(
         select(JobRecord)
@@ -2089,48 +1496,6 @@ def _open_jobs_context(*, db: Session) -> list[dict[str, Any]]:
         .limit(12)
     ).all()
     return [serialize_job(job) for job in jobs]
-
-
-def _open_validated_commitment_ids(*, db: Session) -> list[str]:
-    return [commitment["memory_item_id"] for commitment in _open_commitments_context(db=db)]
-
-
-def _build_rolling_session_summary(
-    *,
-    prior_turns: Sequence[TurnRecord],
-    max_summary_turns: int = _SESSION_ROLLING_SUMMARY_MAX_TURNS,
-) -> dict[str, Any]:
-    if not prior_turns:
-        return {
-            "summary_text": "",
-            "source_turn_ids": [],
-            "included_turn_count": 0,
-            "max_chars": _SESSION_ROLLING_SUMMARY_MAX_CHARS,
-        }
-
-    turns_for_summary = prior_turns[-max_summary_turns:]
-    snippets: list[str] = []
-    source_turn_ids: list[str] = []
-    for turn in turns_for_summary:
-        source_turn_ids.append(turn.id)
-        user_text = _normalize_memory_value(turn.user_message)
-        assistant_text = (
-            _normalize_memory_value(turn.assistant_message)
-            if isinstance(turn.assistant_message, str)
-            else ""
-        )
-        if assistant_text:
-            snippets.append(f"user={user_text}; assistant={assistant_text}")
-        else:
-            snippets.append(f"user={user_text}")
-    summary_text = _normalize_memory_value(" | ".join(snippets))
-    summary_text = summary_text[:_SESSION_ROLLING_SUMMARY_MAX_CHARS]
-    return {
-        "summary_text": summary_text,
-        "source_turn_ids": source_turn_ids,
-        "included_turn_count": len(source_turn_ids),
-        "max_chars": _SESSION_ROLLING_SUMMARY_MAX_CHARS,
-    }
 
 
 def _relevant_artifacts_and_signals_context(
@@ -2154,51 +1519,6 @@ def _relevant_artifacts_and_signals_context(
         "artifacts": [serialize_artifact(artifact) for artifact in artifacts],
         "proactive_signals": [],
     }
-
-
-def _record_rotation_continuity_artifact(
-    *,
-    db: Session,
-    prior_session_id: str,
-    new_session_id: str,
-    rotation_reason: str,
-    now_fn: Callable[[], datetime],
-    new_id_fn: Callable[[str], str],
-) -> None:
-    prior_turns = db.scalars(
-        select(TurnRecord)
-        .where(TurnRecord.session_id == prior_session_id)
-        .order_by(TurnRecord.created_at.asc(), TurnRecord.id.asc())
-    ).all()
-    source_turn_id = prior_turns[-1].id if prior_turns else None
-    continuity_summary = _build_episodic_continuity_summary(prior_turns=prior_turns)
-    open_commitment_ids = _open_validated_commitment_ids(db=db)[:12]
-
-    item = _get_or_create_memory_item(
-        db=db,
-        memory_class="episodic_summary",
-        memory_key=f"episodic_summary:rotation_{prior_session_id}",
-        now_fn=now_fn,
-        new_id_fn=new_id_fn,
-    )
-    _append_memory_revision(
-        db=db,
-        item=item,
-        lifecycle_state="validated",
-        value=continuity_summary,
-        confidence=0.9,
-        source_turn_id=source_turn_id,
-        source_session_id=prior_session_id,
-        evidence={
-            "capture_mode": "session_rotation",
-            "rotation_reason": rotation_reason,
-            "prior_session_id": prior_session_id,
-            "new_session_id": new_session_id,
-            "open_commitment_memory_ids": open_commitment_ids,
-        },
-        now_fn=now_fn,
-        new_id_fn=new_id_fn,
-    )
 
 
 def _rotate_active_session(
@@ -2292,11 +1612,17 @@ def _rotate_active_session(
     db.add(rotation_record)
     db.flush()
 
-    _record_rotation_continuity_artifact(
+    prior_turns = db.scalars(
+        select(TurnRecord)
+        .where(TurnRecord.session_id == prior_session_id)
+        .order_by(TurnRecord.created_at.asc(), TurnRecord.id.asc())
+    ).all()
+    record_rotation_context_block(
         db=db,
         prior_session_id=prior_session_id,
         new_session_id=rotated_session.id,
         rotation_reason=reason,
+        prior_turns=prior_turns,
         now_fn=_utcnow,
         new_id_fn=_new_id,
     )
@@ -2340,9 +1666,7 @@ def _build_turn_context_bundle(
     prior_turns: Sequence[TurnRecord],
     max_recent_turns: int,
     discord_context: dict[str, Any] | None,
-    rolling_session_summary: dict[str, Any],
-    durable_memory_recall: Sequence[dict[str, Any]],
-    durable_memory_recall_window: dict[str, Any],
+    memory_context: dict[str, Any],
     open_commitments_and_jobs: dict[str, Any],
     relevant_artifacts_and_signals: dict[str, Any],
 ) -> dict[str, Any]:
@@ -2356,20 +1680,45 @@ def _build_turn_context_bundle(
         }
         for turn in recent_turns
     ]
+    discord_channel_recent_turns: list[dict[str, Any]] = []
+    discord_channel_id = (
+        discord_context.get("channel_id") if discord_context is not None else None
+    )
+    if isinstance(discord_channel_id, int):
+        for turn in prior_turns:
+            for event in turn.events:
+                if event.event_type != "evt.turn.started":
+                    continue
+                event_discord = event.payload.get("discord")
+                if not isinstance(event_discord, dict):
+                    continue
+                if event_discord.get("channel_id") != discord_channel_id:
+                    continue
+                discord_channel_recent_turns.append(
+                    {
+                        "turn_id": turn.id,
+                        "message_id": event_discord.get("message_id"),
+                        "user_message": turn.user_message,
+                        "assistant_message": turn.assistant_message,
+                        "status": turn.status,
+                    }
+                )
+                break
+        discord_channel_recent_turns = discord_channel_recent_turns[-max_recent_turns:]
     omitted_turn_count = len(prior_turns) - len(recent_active_session_turns)
     included_turn_ids = [turn["turn_id"] for turn in recent_active_session_turns]
 
     section_order = list(_CONTEXT_SECTION_ORDER)
     if discord_context is not None:
         section_order.insert(1, "discord_context")
+    if discord_channel_recent_turns:
+        section_order.insert(2, "discord_channel_recent_turns")
 
     context_bundle = {
         "section_order": section_order,
         "policy_system_instructions": list(_POLICY_SYSTEM_INSTRUCTIONS),
         "recent_active_session_turns": recent_active_session_turns,
-        "rolling_session_summary": dict(rolling_session_summary),
-        "durable_memory_recall": list(durable_memory_recall),
-        "durable_memory_recall_window": dict(durable_memory_recall_window),
+        "memory_context": dict(memory_context),
         "open_commitments_and_jobs": dict(open_commitments_and_jobs),
         "relevant_artifacts_and_signals": dict(relevant_artifacts_and_signals),
         "recent_window": {
@@ -2381,6 +1730,8 @@ def _build_turn_context_bundle(
     }
     if discord_context is not None:
         context_bundle["discord_context"] = dict(discord_context)
+    if discord_channel_recent_turns:
+        context_bundle["discord_channel_recent_turns"] = discord_channel_recent_turns
     return context_bundle
 
 
@@ -2417,7 +1768,9 @@ def _context_bundle_audit_metadata(context_bundle: dict[str, Any]) -> dict[str, 
         "policy_instruction_count": len(policy_system_instructions),
         "recent_window": {
             "max_recent_turns": max_recent_turns if isinstance(max_recent_turns, int) else 0,
-            "included_turn_count": included_turn_count if isinstance(included_turn_count, int) else 0,
+            "included_turn_count": included_turn_count
+            if isinstance(included_turn_count, int)
+            else 0,
             "omitted_turn_count": omitted_turn_count if isinstance(omitted_turn_count, int) else 0,
             "included_turn_ids": included_turn_ids,
         },
@@ -2434,7 +1787,9 @@ def _runtime_provenance_for_turn(
     recent_turn_ids = [turn.id for turn in recent_turns]
     if not recent_turn_ids:
         return RuntimeProvenance(status="clean", evidence=())
-    attempts_by_turn: dict[str, list[ActionAttemptRecord]] = {turn_id: [] for turn_id in recent_turn_ids}
+    attempts_by_turn: dict[str, list[ActionAttemptRecord]] = {
+        turn_id: [] for turn_id in recent_turn_ids
+    }
     for action_attempt in db.scalars(
         select(ActionAttemptRecord)
         .where(
@@ -2476,9 +1831,7 @@ def _merge_runtime_provenance(
     if ingress is None:
         return baseline
     merged_status: Literal["clean", "tainted"] = (
-        "tainted"
-        if baseline.status == "tainted" or ingress.status == "tainted"
-        else "clean"
+        "tainted" if baseline.status == "tainted" or ingress.status == "tainted" else "clean"
     )
     merged_evidence = tuple([*baseline.evidence, *ingress.evidence])
     return RuntimeProvenance(status=merged_status, evidence=merged_evidence)
@@ -2555,7 +1908,7 @@ def create_app(
     app.state.bind_host = settings.bind_host
     app.state.bind_port = settings.bind_port
     app.state.max_recent_turns = settings.max_recent_turns
-    app.state.max_recalled_memories = settings.max_recalled_memories
+    app.state.max_recalled_assertions = settings.max_recalled_assertions
     app.state.max_context_tokens = settings.max_context_tokens
     app.state.auto_rotate_max_turns = settings.auto_rotate_max_turns
     app.state.auto_rotate_max_age_seconds = settings.auto_rotate_max_age_seconds
@@ -2626,7 +1979,8 @@ def create_app(
                 "session_events": "/v1/sessions/{session_id}/events",
                 "approval_decisions": "/v1/approvals",
                 "agency_events": "/v1/agency/events",
-                "jobs": "/v1/jobs/{job_id}",
+                "jobs": "/v1/jobs",
+                "capture_records": "/v1/captures/record",
                 "notifications": "/v1/notifications",
             },
         }
@@ -2924,53 +2278,239 @@ def create_app(
                     raise _response_contract_error(exc) from exc
 
     @app.get("/v1/memory", response_model=None)
-    def get_memory_projection() -> JSONResponse | dict[str, Any]:
+    def get_memory() -> JSONResponse | dict[str, Any]:
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
-                memory_items = db.scalars(
-                    select(MemoryItemRecord).order_by(
-                        MemoryItemRecord.updated_at.desc(),
-                        MemoryItemRecord.id.asc(),
-                    )
-                ).all()
-                memory_item_ids = [item.id for item in memory_items]
-                revision_counts: dict[str, int] = {}
-                if memory_item_ids:
-                    for memory_item_id, count in db.execute(
-                        select(
-                            MemoryRevisionRecord.memory_item_id,
-                            func.count(MemoryRevisionRecord.id),
-                        )
-                        .where(MemoryRevisionRecord.memory_item_id.in_(memory_item_ids))
-                        .group_by(MemoryRevisionRecord.memory_item_id)
-                    ).all():
-                        if isinstance(memory_item_id, str):
-                            revision_counts[memory_item_id] = int(count)
+                payload = list_memory(db)
+                try:
+                    return build_surface_memory_response(**payload)
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
 
-                active_revision_ids = [
-                    item.active_revision_id
-                    for item in memory_items
-                    if isinstance(item.active_revision_id, str)
-                ]
-                active_revisions = db.scalars(
-                    select(MemoryRevisionRecord).where(MemoryRevisionRecord.id.in_(active_revision_ids))
-                ).all()
-                active_revisions_by_id = {revision.id: revision for revision in active_revisions}
-                projection = [
-                    serialize_memory_projection_item(
-                        item=item,
-                        active_revision=(
-                            active_revisions_by_id.get(item.active_revision_id)
-                            if isinstance(item.active_revision_id, str)
-                            else None
-                        ),
-                        revision_count=revision_counts.get(item.id, 0),
+    @app.get("/v1/memory/search", response_model=None)
+    def get_memory_search(q: str, limit: int = 20) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 100))
+        with session_factory() as db:
+            with db.begin():
+                payload = {
+                    "assertions": search_memory(db, query=q, limit=bounded_limit),
+                    "candidates": [],
+                    "conflicts": [],
+                    "project_state": [],
+                }
+                try:
+                    return build_surface_memory_response(**payload)
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/memory/candidates", response_model=None)
+    def get_memory_candidates() -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                payload = list_memory(db)
+                try:
+                    return build_surface_memory_response(
+                        assertions=[],
+                        candidates=payload["candidates"],
+                        conflicts=payload["conflicts"],
+                        project_state=[],
                     )
-                    for item in memory_items
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.post("/v1/memory/candidates/{assertion_id}/approve", response_model=None)
+    def post_memory_candidate_approve(assertion_id: str) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                approve_candidate(
+                    db,
+                    assertion_id=assertion_id,
+                    actor_id=str(app.state.approval_actor_id),
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+                payload = list_memory(db)
+                try:
+                    return build_surface_memory_response(**payload)
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.post("/v1/memory/candidates/{assertion_id}/reject", response_model=None)
+    def post_memory_candidate_reject(
+        assertion_id: str,
+        payload: MemoryRejectRequest | None = None,
+    ) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                reject_candidate(
+                    db,
+                    assertion_id=assertion_id,
+                    actor_id=str(app.state.approval_actor_id),
+                    reason=payload.reason if payload is not None else None,
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+                memory_payload = list_memory(db)
+                try:
+                    return build_surface_memory_response(**memory_payload)
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.post("/v1/memory/assertions/{assertion_id}/correct", response_model=None)
+    def post_memory_assertion_correct(
+        assertion_id: str,
+        payload: MemoryCorrectionRequest,
+    ) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                active_session = _get_or_create_active_session(db)
+                correct_assertion(
+                    db,
+                    assertion_id=assertion_id,
+                    value=payload.value,
+                    source_session_id=active_session.id,
+                    actor_id=str(app.state.approval_actor_id),
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+                memory_payload = list_memory(db)
+                try:
+                    return build_surface_memory_response(**memory_payload)
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.post("/v1/memory/assertions/{assertion_id}/retract", response_model=None)
+    def post_memory_assertion_retract(assertion_id: str) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                retract_assertion(
+                    db,
+                    assertion_id=assertion_id,
+                    actor_id=str(app.state.approval_actor_id),
+                    now_fn=_utcnow,
+                )
+                payload = list_memory(db)
+                try:
+                    return build_surface_memory_response(**payload)
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.delete("/v1/memory/assertions/{assertion_id}", response_model=None)
+    def delete_memory_assertion(assertion_id: str) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                delete_assertion(
+                    db,
+                    assertion_id=assertion_id,
+                    actor_id=str(app.state.approval_actor_id),
+                    now_fn=_utcnow,
+                )
+                payload = list_memory(db)
+                try:
+                    return build_surface_memory_response(**payload)
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.post("/v1/memory/assertions/{assertion_id}/prioritize", response_model=None)
+    def post_memory_assertion_prioritize(assertion_id: str) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                set_assertion_priority(
+                    db,
+                    assertion_id=assertion_id,
+                    priority="pinned",
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+                payload = list_memory(db)
+                try:
+                    return build_surface_memory_response(**payload)
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.post("/v1/memory/assertions/{assertion_id}/deprioritize", response_model=None)
+    def post_memory_assertion_deprioritize(assertion_id: str) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                set_assertion_priority(
+                    db,
+                    assertion_id=assertion_id,
+                    priority="deprioritized",
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+                payload = list_memory(db)
+                try:
+                    return build_surface_memory_response(**payload)
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/memory/conflicts/{conflict_set_id}", response_model=None)
+    def get_memory_conflict(conflict_set_id: str) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                payload = list_memory(db)
+                conflict = [
+                    item
+                    for item in payload["conflicts"]
+                    if item["conflict_set_id"] == conflict_set_id
                 ]
                 try:
-                    return build_surface_memory_projection_response(items=projection)
+                    return build_surface_memory_response(
+                        assertions=[],
+                        candidates=[],
+                        conflicts=conflict,
+                        project_state=[],
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.post("/v1/memory/conflicts/{conflict_set_id}/resolve", response_model=None)
+    def post_memory_conflict_resolve(
+        conflict_set_id: str,
+        payload: MemoryConflictResolutionRequest,
+    ) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                resolve_conflict(
+                    db,
+                    conflict_set_id=conflict_set_id,
+                    assertion_id=payload.assertion_id,
+                    actor_id=str(app.state.approval_actor_id),
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+                memory_payload = list_memory(db)
+                try:
+                    return build_surface_memory_response(**memory_payload)
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/memory/project-state", response_model=None)
+    def get_memory_project_state() -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                payload = list_memory(db)
+                try:
+                    return build_surface_memory_response(
+                        assertions=[],
+                        candidates=[],
+                        conflicts=[],
+                        project_state=payload["project_state"],
+                    )
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
 
@@ -2988,7 +2528,9 @@ def create_app(
                 "ok": True,
                 "default_location": state.location,
                 "source": state.source,
-                "updated_at": to_rfc3339(state.updated_at) if state.updated_at is not None else None,
+                "updated_at": to_rfc3339(state.updated_at)
+                if state.updated_at is not None
+                else None,
             }
 
     @app.put("/v1/weather/default-location")
@@ -3005,7 +2547,9 @@ def create_app(
                 "ok": True,
                 "default_location": state.location,
                 "source": state.source,
-                "updated_at": to_rfc3339(state.updated_at) if state.updated_at is not None else None,
+                "updated_at": to_rfc3339(state.updated_at)
+                if state.updated_at is not None
+                else None,
             }
 
     @app.get("/v1/connectors/google", response_model=None)
@@ -3191,22 +2735,19 @@ def create_app(
             .where(TurnRecord.session_id == active_session.id)
             .order_by(TurnRecord.created_at.asc(), TurnRecord.id.asc())
         ).all()
-        pre_rotation_recall, pre_rotation_recall_window = _recall_validated_memory_for_turn(
-            db=db,
+        pre_rotation_memory_context, _ = build_memory_context(
+            db,
             user_message=user_message,
-            max_recalled_memories=int(app.state.max_recalled_memories),
+            max_recalled_assertions=int(app.state.max_recalled_assertions),
         )
         pre_rotation_open_commitments_and_jobs = {
-            "open_commitments": _open_commitments_context(db=db),
             "open_jobs": _open_jobs_context(db=db),
         }
         pre_rotation_context_bundle = _build_turn_context_bundle(
             prior_turns=prior_turns,
             max_recent_turns=int(app.state.max_recent_turns),
             discord_context=discord_context,
-            rolling_session_summary=_build_rolling_session_summary(prior_turns=prior_turns),
-            durable_memory_recall=pre_rotation_recall,
-            durable_memory_recall_window=pre_rotation_recall_window,
+            memory_context=pre_rotation_memory_context,
             open_commitments_and_jobs=pre_rotation_open_commitments_and_jobs,
             relevant_artifacts_and_signals=_relevant_artifacts_and_signals_context(
                 db=db,
@@ -3250,22 +2791,19 @@ def create_app(
             baseline=runtime_provenance,
             ingress=ingress_runtime_provenance,
         )
-        durable_memory_recall, durable_memory_recall_window = _recall_validated_memory_for_turn(
-            db=db,
+        memory_context, memory_recall_event_payload = build_memory_context(
+            db,
             user_message=user_message,
-            max_recalled_memories=int(app.state.max_recalled_memories),
+            max_recalled_assertions=int(app.state.max_recalled_assertions),
         )
         open_commitments_and_jobs = {
-            "open_commitments": _open_commitments_context(db=db),
             "open_jobs": _open_jobs_context(db=db),
         }
         context_bundle = _build_turn_context_bundle(
             prior_turns=prior_turns,
             max_recent_turns=int(app.state.max_recent_turns),
             discord_context=discord_context,
-            rolling_session_summary=_build_rolling_session_summary(prior_turns=prior_turns),
-            durable_memory_recall=durable_memory_recall,
-            durable_memory_recall_window=durable_memory_recall_window,
+            memory_context=memory_context,
             open_commitments_and_jobs=open_commitments_and_jobs,
             relevant_artifacts_and_signals=_relevant_artifacts_and_signals_context(
                 db=db,
@@ -3308,17 +2846,11 @@ def create_app(
             created_events.append(event)
 
         add_event("evt.turn.started", {"message": user_message, "discord": discord_context})
-        if durable_memory_recall:
-            add_event(
-                "evt.memory.recalled",
-                {
-                    "max_recalled_memories": durable_memory_recall_window["max_recalled_memories"],
-                    "included_memory_count": durable_memory_recall_window["included_memory_count"],
-                    "omitted_memory_count": durable_memory_recall_window["omitted_memory_count"],
-                    "included_memory_ids": durable_memory_recall_window["included_memory_ids"],
-                    "excluded_memories": durable_memory_recall_window["excluded_memories"],
-                },
-            )
+        if (
+            memory_recall_event_payload["included_assertion_count"]
+            or memory_recall_event_payload["conflict_set_ids"]
+        ):
+            add_event("evt.memory.recalled", memory_recall_event_payload)
         applied_limits = _applied_turn_limits(app)
 
         def elapsed_turn_ms(started_at: float) -> int:
@@ -3489,7 +3021,9 @@ def create_app(
                             agency_runtime=_agency_runtime(),
                         )
                         created_action_attempts.extend(function_processing.action_attempts)
-                        assistant_sources = function_processing.assistant_sources or assistant_sources
+                        assistant_sources = (
+                            function_processing.assistant_sources or assistant_sources
+                        )
                         if function_processing.silent_response:
                             assistant_response = {
                                 **candidate_response,
@@ -3623,28 +3157,20 @@ def create_app(
             )
         else:
             assert assistant_response is not None
-            captured_memories = _capture_validated_memory_candidates(
-                db=db,
+            memory_events = record_memory_from_user_message(
+                db,
                 session_id=effective_session_id,
                 source_turn_id=turn.id,
                 user_message=user_message,
+                actor_id=str(app.state.approval_actor_id),
                 now_fn=_utcnow,
                 new_id_fn=_new_id,
             )
-            for captured_memory in captured_memories:
-                add_event(
-                    captured_memory.event_type,
-                    {
-                        "memory_item_id": captured_memory.item.id,
-                        "revision_id": captured_memory.revision.id,
-                        "memory_class": captured_memory.item.memory_class,
-                        "lifecycle_state": captured_memory.revision.lifecycle_state,
-                        "memory_key": captured_memory.item.memory_key,
-                        "value_preview": redact_text(captured_memory.revision.value or ""),
-                        "confidence": captured_memory.revision.confidence,
-                        "source_turn_id": captured_memory.revision.source_turn_id,
-                    },
-                )
+            for memory_event in memory_events:
+                event_type = memory_event.get("event_type")
+                payload_data = memory_event.get("payload")
+                if isinstance(event_type, str) and isinstance(payload_data, dict):
+                    add_event(event_type, payload_data)
 
             assistant_message = assistant_response["assistant_text"]
             turn.assistant_message = assistant_message
@@ -3727,7 +3253,9 @@ def create_app(
         discord_context = (
             payload.discord.model_dump(mode="json") if payload.discord is not None else None
         )
-        normalized_idempotency_key = _normalize_idempotency_key(request.headers.get("Idempotency-Key"))
+        normalized_idempotency_key = _normalize_idempotency_key(
+            request.headers.get("Idempotency-Key")
+        )
         request_hash = (
             _message_idempotency_request_hash(
                 request_session_id=request_session_id,
@@ -3842,13 +3370,148 @@ def create_app(
                     content=turn_outcome.response_payload,
                 )
 
+    @app.post("/v1/captures/record", response_model=None)
+    def post_capture_record(
+        request: Request,
+        payload: Any = Body(...),
+    ) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        normalized_idempotency_key = _normalize_idempotency_key(
+            request.headers.get("Idempotency-Key")
+        )
+        if not isinstance(payload, dict):
+            raise _capture_ingest_error(
+                status_code=422,
+                code="E_CAPTURE_PAYLOAD_INVALID",
+                message="capture payload is invalid",
+                details={
+                    "field": "payload",
+                    "hint": "capture payload must be a JSON object",
+                },
+            )
+
+        normalized_capture = _normalize_capture_envelope(dict(payload))
+        request_hash = _capture_request_hash(
+            canonical_payload={
+                "mode": "record",
+                "capture": normalized_capture.canonical_payload,
+            },
+        )
+
+        with session_factory() as db:
+            with db.begin():
+                if normalized_idempotency_key is not None:
+                    _acquire_capture_idempotency_lock(
+                        db,
+                        idempotency_key=normalized_idempotency_key,
+                    )
+                existing_capture = (
+                    db.scalar(
+                        select(CaptureRecord)
+                        .where(CaptureRecord.idempotency_key == normalized_idempotency_key)
+                        .limit(1)
+                    )
+                    if normalized_idempotency_key is not None
+                    else None
+                )
+                if existing_capture is not None:
+                    if existing_capture.request_hash != request_hash:
+                        raise ApiError(
+                            status_code=409,
+                            code="E_IDEMPOTENCY_KEY_REUSED",
+                            message="idempotency key reused with different request payload",
+                            details={"capture_id": existing_capture.id},
+                            retryable=False,
+                        )
+                    if existing_capture.status_code == 200:
+                        return existing_capture.response_payload
+                    return JSONResponse(
+                        status_code=existing_capture.status_code,
+                        content=existing_capture.response_payload,
+                    )
+
+                now = _utcnow()
+                active_session = _get_or_create_active_session(db)
+                _acquire_session_turn_lock(db, session_id=active_session.id)
+                turn = TurnRecord(
+                    id=_new_id("trn"),
+                    session_id=active_session.id,
+                    user_message=normalized_capture.normalized_turn_input,
+                    assistant_message=None,
+                    status="completed",
+                    created_at=now,
+                    updated_at=now,
+                )
+                db.add(turn)
+                db.flush()
+
+                events = [
+                    EventRecord(
+                        id=_new_id("evn"),
+                        session_id=active_session.id,
+                        turn_id=turn.id,
+                        sequence=1,
+                        event_type="evt.turn.started",
+                        payload=jsonable_encoder(
+                            {
+                                "message": normalized_capture.normalized_turn_input,
+                                "discord": None,
+                            },
+                        ),
+                        created_at=_utcnow(),
+                    ),
+                    EventRecord(
+                        id=_new_id("evn"),
+                        session_id=active_session.id,
+                        turn_id=turn.id,
+                        sequence=2,
+                        event_type="evt.turn.completed",
+                        payload={},
+                        created_at=_utcnow(),
+                    ),
+                ]
+                db.add_all(events)
+
+                active_session.updated_at = _utcnow()
+                capture_record = CaptureRecord(
+                    id=_new_id("cpt"),
+                    capture_kind=normalized_capture.kind,
+                    idempotency_key=normalized_idempotency_key,
+                    request_hash=request_hash,
+                    original_payload=normalized_capture.original_payload,
+                    normalized_turn_input=normalized_capture.normalized_turn_input,
+                    effective_session_id=active_session.id,
+                    turn_id=turn.id,
+                    terminal_state="turn_created",
+                    ingest_error_code=None,
+                    ingest_error_message=None,
+                    ingest_error_details=None,
+                    ingest_error_retryable=None,
+                    status_code=200,
+                    response_payload={},
+                    created_at=now,
+                    updated_at=now,
+                )
+                db.add(capture_record)
+                db.flush()
+                response_payload = {
+                    "ok": True,
+                    "capture": serialize_capture(capture_record),
+                }
+                capture_record.response_payload = response_payload
+                capture_record.updated_at = _utcnow()
+                db.flush()
+                return response_payload
+
     @app.post("/v1/captures", response_model=None)
     def post_capture(
         request: Request,
         payload: Any = Body(...),
     ) -> JSONResponse | dict[str, Any]:
         _ensure_schema_ready()
-        normalized_idempotency_key = _normalize_idempotency_key(request.headers.get("Idempotency-Key"))
+        normalized_idempotency_key = _normalize_idempotency_key(
+            request.headers.get("Idempotency-Key")
+        )
 
         ingest_error: ApiError | None = None
         normalized_capture: NormalizedCaptureEnvelope | None = None
@@ -3958,7 +3621,9 @@ def create_app(
                     capture_record.response_payload = failure_payload
                     capture_record.updated_at = _utcnow()
                     db.flush()
-                    return JSONResponse(status_code=ingest_error.status_code, content=failure_payload)
+                    return JSONResponse(
+                        status_code=ingest_error.status_code, content=failure_payload
+                    )
 
                 assert normalized_capture is not None
                 active_session = _get_or_create_active_session(db)
@@ -4148,7 +3813,9 @@ def create_app(
                 if isinstance(after, str) and after.strip():
                     cursor_event = db.scalar(
                         select(EventRecord)
-                        .where(EventRecord.id == after.strip(), EventRecord.session_id == session_id)
+                        .where(
+                            EventRecord.id == after.strip(), EventRecord.session_id == session_id
+                        )
                         .limit(1)
                     )
                     if cursor_event is None:
@@ -4181,7 +3848,9 @@ def create_app(
                     for event in db.scalars(events_query).all():
                         events_by_turn[event.turn_id].append(event)
                     for turn_events in events_by_turn.values():
-                        turn_events.sort(key=lambda event: (event.sequence, event.created_at, event.id))
+                        turn_events.sort(
+                            key=lambda event: (event.sequence, event.created_at, event.id)
+                        )
 
                     turn_ids_with_visible_events = (
                         [turn_id for turn_id, turn_events in events_by_turn.items() if turn_events]
@@ -4212,11 +3881,7 @@ def create_app(
                         }
 
                 turns_to_serialize = (
-                    [
-                        turn
-                        for turn in turns
-                        if events_by_turn.get(turn.id)
-                    ]
+                    [turn for turn in turns if events_by_turn.get(turn.id)]
                     if cursor_event is not None
                     else turns
                 )
@@ -4241,6 +3906,19 @@ def create_app(
                     )
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/jobs")
+    def get_jobs(limit: int = 50) -> dict[str, Any]:
+        _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 200))
+        with session_factory() as db:
+            with db.begin():
+                jobs = db.scalars(
+                    select(JobRecord)
+                    .order_by(JobRecord.updated_at.desc(), JobRecord.id.desc())
+                    .limit(bounded_limit)
+                ).all()
+                return {"ok": True, "jobs": [serialize_job(job) for job in jobs]}
 
     @app.get("/v1/jobs/{job_id}")
     def get_job(job_id: str) -> dict[str, Any]:

@@ -105,9 +105,7 @@ class ContextWindowDecisionAdapter:
 
         normalized = user_message.strip().lower()
         if normalized == "book me travel":
-            assistant_text = (
-                "i need your destination and travel dates before i can plan this trip."
-            )
+            assistant_text = "i need your destination and travel dates before i can plan this trip."
         elif normalized.startswith("project codename is "):
             declared_codename = normalized.replace("project codename is ", "", 1).strip()
             assistant_text = f"noted. project codename set to {declared_codename}."
@@ -285,6 +283,64 @@ def test_discord_no_response_tool_completes_turn_without_visible_reply(
         )
 
 
+def test_discord_turn_context_includes_bounded_same_channel_history(
+    postgres_url: str,
+) -> None:
+    adapter = DiscordNoResponseAdapter()
+    with _build_client(postgres_url, adapter) as client:
+        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
+
+        first = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={
+                "message": "channel note one",
+                "discord": {
+                    "guild_id": 123,
+                    "channel_id": 456,
+                    "message_id": 1001,
+                    "author_id": 131415,
+                    "mentioned_bot": False,
+                    "attachments": [],
+                },
+            },
+        )
+        assert first.status_code == 200
+
+        second = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={
+                "message": "what was the note?",
+                "discord": {
+                    "guild_id": 123,
+                    "channel_id": 456,
+                    "message_id": 1002,
+                    "author_id": 131415,
+                    "mentioned_bot": False,
+                    "attachments": [],
+                },
+            },
+        )
+        assert second.status_code == 200
+
+        channel_turns = adapter.context_bundles[1]["discord_channel_recent_turns"]
+        assert channel_turns == [
+            {
+                "turn_id": first.json()["turn"]["id"],
+                "message_id": 1001,
+                "user_message": "channel note one",
+                "assistant_message": "",
+                "status": "completed",
+            }
+        ]
+        assert any(
+            item.get("role") == "system"
+            and isinstance(item.get("content"), str)
+            and "recent Discord channel context:" in item["content"]
+            and "message_id=1001 user=channel note one" in item["content"]
+            for item in adapter.input_items[1]
+        )
+
+
 def test_pr01_model_led_direct_and_clarification_messages_are_emitted(postgres_url: str) -> None:
     adapter = ContextWindowDecisionAdapter()
     with _build_client(postgres_url, adapter) as client:
@@ -354,21 +410,20 @@ def test_pr01_turn_context_is_bounded_ordered_and_auditable(
             assert context_bundle["section_order"] == [
                 "policy_system_instructions",
                 "recent_active_session_turns",
-                "rolling_session_summary",
-                "durable_memory_recall",
+                "memory_context",
                 "open_commitments_and_jobs",
                 "relevant_artifacts_and_signals",
             ]
 
         second_turn_context = adapter.context_bundles[1]
-        assert [turn["user_message"] for turn in second_turn_context["recent_active_session_turns"]] == [
-            "project codename is aurora"
-        ]
+        assert [
+            turn["user_message"] for turn in second_turn_context["recent_active_session_turns"]
+        ] == ["project codename is aurora"]
 
         fourth_turn_context = adapter.context_bundles[3]
-        assert [turn["user_message"] for turn in fourth_turn_context["recent_active_session_turns"]] == [
-            "let's move on"
-        ]
+        assert [
+            turn["user_message"] for turn in fourth_turn_context["recent_active_session_turns"]
+        ] == ["let's move on"]
 
         timeline = client.get(f"/v1/sessions/{session_id}/events")
         assert timeline.status_code == 200
@@ -383,8 +438,7 @@ def test_pr01_turn_context_is_bounded_ordered_and_auditable(
         assert second_context_meta["section_order"] == [
             "policy_system_instructions",
             "recent_active_session_turns",
-            "rolling_session_summary",
-            "durable_memory_recall",
+            "memory_context",
             "open_commitments_and_jobs",
             "relevant_artifacts_and_signals",
         ]
@@ -438,8 +492,7 @@ def test_pr01_context_audit_is_stable_even_if_adapter_mutates_context_bundle(
         assert context_meta["section_order"] == [
             "policy_system_instructions",
             "recent_active_session_turns",
-            "rolling_session_summary",
-            "durable_memory_recall",
+            "memory_context",
             "open_commitments_and_jobs",
             "relevant_artifacts_and_signals",
         ]
@@ -549,7 +602,9 @@ def test_model_timeline_includes_identity_duration_and_usage(postgres_url: str) 
         timeline = client.get(f"/v1/sessions/{session_id}/events")
         assert timeline.status_code == 200
         events = timeline.json()["turns"][0]["events"]
-        model_completed = next(event for event in events if event["event_type"] == "evt.model.completed")
+        model_completed = next(
+            event for event in events if event["event_type"] == "evt.model.completed"
+        )
         payload = model_completed["payload"]
         assert payload["provider"] == "provider.alpha"
         assert payload["model"] == "alpha-mini"
@@ -587,7 +642,9 @@ def test_model_failure_is_auditable_and_turn_terminates_failed(postgres_url: str
             "evt.model.failed",
             "evt.turn.failed",
         ]
-        model_failed = next(event for event in turn["events"] if event["event_type"] == "evt.model.failed")
+        model_failed = next(
+            event for event in turn["events"] if event["event_type"] == "evt.model.failed"
+        )
         assert "failure_reason" in model_failed["payload"]
         assert not any(saved_turn["status"] == "in_progress" for saved_turn in turns)
 
@@ -815,7 +872,9 @@ def test_restart_preserves_history_and_appends_to_same_active_session(postgres_u
 
         timeline_before = first_client.get(f"/v1/sessions/{session_id}/events")
         assert timeline_before.status_code == 200
-        assert [turn["user_message"] for turn in timeline_before.json()["turns"]] == ["before restart"]
+        assert [turn["user_message"] for turn in timeline_before.json()["turns"]] == [
+            "before restart"
+        ]
 
     restarted_app = create_app(
         database_url=postgres_url,
@@ -1108,7 +1167,9 @@ def test_pr02_model_attempt_budget_exhaustion_uses_limit_error_not_model_error(
             "evt.assistant.emitted",
             "evt.turn.failed",
         ]
-        assert not any(saved_turn["status"] == "in_progress" for saved_turn in timeline.json()["turns"])
+        assert not any(
+            saved_turn["status"] == "in_progress" for saved_turn in timeline.json()["turns"]
+        )
 
 
 def test_pr02_wall_time_budget_takes_precedence_if_multiple_limits_exhaust(
@@ -1204,4 +1265,6 @@ def test_pr02_wall_time_budget_exhaustion_is_bounded_and_auditable(
             "evt.turn.failed",
         ]
         assert turn["status"] == "failed"
-        assert not any(saved_turn["status"] == "in_progress" for saved_turn in timeline.json()["turns"])
+        assert not any(
+            saved_turn["status"] == "in_progress" for saved_turn in timeline.json()["turns"]
+        )

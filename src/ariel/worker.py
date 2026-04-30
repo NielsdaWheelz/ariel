@@ -431,7 +431,9 @@ def _deliver_discord_notification(
                 if isinstance(job_id, str)
                 else None
             )
-            discord_thread_id = job.discord_thread_id if job is not None else None
+            discord_thread_id = (
+                job.discord_thread_id if job is not None and job.discord_thread_id else None
+            )
 
     if settings.discord_bot_token is None or settings.discord_channel_id is None:
         raise RuntimeError("Discord notification delivery is not configured")
@@ -440,7 +442,7 @@ def _deliver_discord_notification(
     response_payload: dict[str, Any] | None = None
     created_thread_id: str | None = None
     try:
-        target_channel_id = discord_thread_id or str(settings.discord_channel_id)
+        target_channel_id = discord_thread_id
         thread_payload: dict[str, Any] | None = None
         if target_channel_id is None and job is not None:
             thread_response = httpx.post(
@@ -476,6 +478,8 @@ def _deliver_discord_notification(
 
         message_payload: dict[str, Any] | None = None
         if error is None:
+            if target_channel_id is None:
+                target_channel_id = str(settings.discord_channel_id)
             response = httpx.post(
                 f"https://discord.com/api/v10/channels/{target_channel_id}/messages",
                 headers={
@@ -528,7 +532,7 @@ def _deliver_discord_notification(
                 else None
             )
             now = _utcnow()
-            if job is not None and created_thread_id is not None and error is None:
+            if job is not None and created_thread_id is not None:
                 job.discord_thread_id = created_thread_id
                 job.updated_at = now
             db.add(

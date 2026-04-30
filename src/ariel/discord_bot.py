@@ -40,20 +40,7 @@ def format_discord_message(message: str) -> str:
     return f"{normalized[:1886].rstrip()}\n[truncated]"
 
 
-def ask_ariel(
-    *,
-    ariel_base_url: str,
-    prompt: str,
-    discord_message_id: int,
-) -> str:
-    return ask_ariel_reply(
-        ariel_base_url=ariel_base_url,
-        prompt=prompt,
-        discord_message_id=discord_message_id,
-    ).content
-
-
-def ask_ariel_reply(
+def submit_discord_turn(
     *,
     ariel_base_url: str,
     prompt: str,
@@ -89,6 +76,99 @@ def ask_ariel_reply(
             ariel_base_url=ariel_base_url,
             allowed_user_id=allowed_user_id,
         )
+
+
+def get_status(
+    *,
+    ariel_base_url: str,
+) -> str:
+    with httpx.Client(timeout=60.0) as client:
+        health_response = client.get(f"{ariel_base_url}/v1/health")
+        health_payload = _json_response_payload(health_response)
+        if health_response.status_code >= 400 or health_payload.get("ok") is not True:
+            raise ArielDiscordError(_safe_ariel_error_message(health_payload))
+
+        session_response = client.get(f"{ariel_base_url}/v1/sessions/active")
+        session_payload = _json_response_payload(session_response)
+        if session_response.status_code >= 400 or session_payload.get("ok") is not True:
+            raise ArielDiscordError(_safe_ariel_error_message(session_payload))
+
+        jobs_response = client.get(f"{ariel_base_url}/v1/jobs?limit=5")
+        jobs_payload = _json_response_payload(jobs_response)
+        if jobs_response.status_code >= 400 or jobs_payload.get("ok") is not True:
+            raise ArielDiscordError(_safe_ariel_error_message(jobs_payload))
+
+        notifications_response = client.get(f"{ariel_base_url}/v1/notifications?limit=5")
+        notifications_payload = _json_response_payload(notifications_response)
+        if notifications_response.status_code >= 400 or notifications_payload.get("ok") is not True:
+            raise ArielDiscordError(_safe_ariel_error_message(notifications_payload))
+
+    session = session_payload.get("session")
+    if not isinstance(session, dict):
+        raise ArielDiscordError("Ariel returned an invalid active session response.")
+
+    jobs = jobs_payload.get("jobs")
+    notifications = notifications_payload.get("notifications")
+    return _format_status_for_discord(
+        session=session,
+        jobs=jobs if isinstance(jobs, list) else [],
+        notifications=notifications if isinstance(notifications, list) else [],
+    )
+
+
+def list_jobs(
+    *,
+    ariel_base_url: str,
+) -> str:
+    with httpx.Client(timeout=60.0) as client:
+        response = client.get(f"{ariel_base_url}/v1/jobs?limit=10")
+        payload = _json_response_payload(response)
+        if response.status_code >= 400 or payload.get("ok") is not True:
+            raise ArielDiscordError(_safe_ariel_error_message(payload))
+    jobs = payload.get("jobs")
+    if not isinstance(jobs, list):
+        raise ArielDiscordError("Ariel returned an invalid jobs response.")
+    return _format_jobs_for_discord(jobs)
+
+
+def list_memory(
+    *,
+    ariel_base_url: str,
+) -> str:
+    with httpx.Client(timeout=60.0) as client:
+        response = client.get(f"{ariel_base_url}/v1/memory")
+        payload = _json_response_payload(response)
+        if response.status_code >= 400 or payload.get("ok") is not True:
+            raise ArielDiscordError(_safe_ariel_error_message(payload))
+    assertions = payload.get("assertions")
+    if not isinstance(assertions, list):
+        raise ArielDiscordError("Ariel returned an invalid memory response.")
+    return _format_memory_for_discord(assertions)
+
+
+def record_capture(
+    *,
+    ariel_base_url: str,
+    text: str,
+    discord_interaction_id: int,
+) -> str:
+    with httpx.Client(timeout=60.0) as client:
+        response = client.post(
+            f"{ariel_base_url}/v1/captures/record",
+            headers={"Idempotency-Key": f"discord-capture-{discord_interaction_id}"},
+            json={"kind": "text", "text": text},
+        )
+        payload = _json_response_payload(response)
+        if response.status_code >= 400 or payload.get("ok") is not True:
+            raise ArielDiscordError(_safe_ariel_error_message(payload))
+    capture = payload.get("capture")
+    if not isinstance(capture, dict):
+        raise ArielDiscordError("Ariel returned an invalid capture response.")
+    capture_id = capture.get("id")
+    terminal_state = capture.get("terminal_state")
+    if not isinstance(capture_id, str) or not isinstance(terminal_state, str):
+        raise ArielDiscordError("Ariel returned an invalid capture response.")
+    return f"Capture recorded: {capture_id} ({terminal_state})"
 
 
 def decide_approval(
@@ -168,9 +248,30 @@ class ArielDiscordBot(commands.Bot):
         self.ariel_base_url = ariel_base_url
         self.tree.add_command(
             app_commands.Command(
-                name="ariel",
-                description="Ask Ariel through the local API.",
-                callback=self._slash_ariel,
+                name="status",
+                description="Show Ariel runtime status.",
+                callback=self._slash_status,
+            )
+        )
+        self.tree.add_command(
+            app_commands.Command(
+                name="jobs",
+                description="List recent Ariel jobs.",
+                callback=self._slash_jobs,
+            )
+        )
+        self.tree.add_command(
+            app_commands.Command(
+                name="memory",
+                description="List Ariel memory.",
+                callback=self._slash_memory,
+            )
+        )
+        self.tree.add_command(
+            app_commands.Command(
+                name="capture",
+                description="Record a text capture without invoking the assistant.",
+                callback=self._slash_capture,
             )
         )
 
@@ -178,33 +279,92 @@ class ArielDiscordBot(commands.Bot):
         self.tree.copy_global_to(guild=discord.Object(id=self.ariel_guild_id))
         await self.tree.sync(guild=discord.Object(id=self.ariel_guild_id))
 
-    async def _slash_ariel(self, interaction: discord.Interaction, prompt: str) -> None:
+    async def on_ready(self) -> None:
+        await self.change_presence(
+            status=discord.Status.online,
+            activity=discord.Activity(
+                type=discord.ActivityType.listening,
+                name="ambient messages",
+            ),
+        )
+
+    async def _slash_status(self, interaction: discord.Interaction) -> None:
         if not self._interaction_is_allowed(interaction):
             await interaction.response.send_message(
-                "This Ariel bot is limited to the configured Discord user and home server.",
+                "This Ariel command is limited to the configured Discord user and home server.",
                 ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             return
 
-        await interaction.response.defer(thinking=True)
-        reply = await self._ask_ariel_for_discord(
-            prompt=prompt,
-            discord_message_id=interaction.id,
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        content = await self._run_discord_ops_command(get_status)
+        await interaction.followup.send(
+            format_discord_message(content),
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
         )
-        if reply.silent:
+
+    async def _slash_jobs(self, interaction: discord.Interaction) -> None:
+        if not self._interaction_is_allowed(interaction):
+            await interaction.response.send_message(
+                "This Ariel command is limited to the configured Discord user and home server.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
             return
-        if reply.view is None:
-            await interaction.followup.send(
-                format_discord_message(reply.content),
+
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        content = await self._run_discord_ops_command(list_jobs)
+        await interaction.followup.send(
+            format_discord_message(content),
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def _slash_memory(self, interaction: discord.Interaction) -> None:
+        if not self._interaction_is_allowed(interaction):
+            await interaction.response.send_message(
+                "This Ariel command is limited to the configured Discord user and home server.",
+                ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
-        else:
-            await interaction.followup.send(
-                format_discord_message(reply.content),
-                view=reply.view,
+            return
+
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        content = await self._run_discord_ops_command(list_memory)
+        await interaction.followup.send(
+            format_discord_message(content),
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def _slash_capture(self, interaction: discord.Interaction, text: str) -> None:
+        if not self._interaction_is_allowed(interaction):
+            await interaction.response.send_message(
+                "This Ariel command is limited to the configured Discord user and home server.",
+                ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
+            return
+
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        try:
+            content = await asyncio.to_thread(
+                record_capture,
+                ariel_base_url=self.ariel_base_url,
+                text=text,
+                discord_interaction_id=interaction.id,
+            )
+        except ArielDiscordError as exc:
+            content = f"Ariel request failed: {exc}"
+        except httpx.HTTPError:
+            content = "Ariel request failed: could not reach the local Ariel API."
+        await interaction.followup.send(
+            format_discord_message(content),
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     async def on_interaction(self, interaction: discord.Interaction) -> None:
         data = interaction.data
@@ -244,9 +404,7 @@ class ArielDiscordBot(commands.Bot):
             mention.id == bot_user_id for mention in message.mentions
         ):
             prompt = (
-                prompt.replace(f"<@{bot_user_id}>", "")
-                .replace(f"<@!{bot_user_id}>", "")
-                .strip()
+                prompt.replace(f"<@{bot_user_id}>", "").replace(f"<@!{bot_user_id}>", "").strip()
             )
             if not prompt and not attachments:
                 return
@@ -257,7 +415,7 @@ class ArielDiscordBot(commands.Bot):
         discord_context = _discord_context_for_message(message, bot_user_id=bot_user_id)
 
         async with message.channel.typing():
-            reply = await self._ask_ariel_for_discord(
+            reply = await self._submit_ambient_turn(
                 prompt=prompt,
                 discord_message_id=message.id,
                 discord_context=discord_context,
@@ -280,7 +438,7 @@ class ArielDiscordBot(commands.Bot):
                 view=reply.view,
             )
 
-    async def _ask_ariel_for_discord(
+    async def _submit_ambient_turn(
         self,
         *,
         prompt: str,
@@ -289,7 +447,7 @@ class ArielDiscordBot(commands.Bot):
     ) -> ArielDiscordReply:
         try:
             return await asyncio.to_thread(
-                ask_ariel_reply,
+                submit_discord_turn,
                 ariel_base_url=self.ariel_base_url,
                 prompt=prompt,
                 discord_message_id=discord_message_id,
@@ -302,6 +460,17 @@ class ArielDiscordBot(commands.Bot):
             return ArielDiscordReply(
                 content="Ariel request failed: could not reach the local Ariel API."
             )
+
+    async def _run_discord_ops_command(
+        self,
+        command: Any,
+    ) -> str:
+        try:
+            return await asyncio.to_thread(command, ariel_base_url=self.ariel_base_url)
+        except ArielDiscordError as exc:
+            return f"Ariel request failed: {exc}"
+        except httpx.HTTPError:
+            return "Ariel request failed: could not reach the local Ariel API."
 
     def _interaction_is_allowed(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.ariel_user_id:
@@ -558,6 +727,84 @@ def _format_notification_ack_for_discord(notification: dict[str, Any]) -> str:
     return f"Notification acknowledged: {title} ({notification_id})"
 
 
+def _format_status_for_discord(
+    *,
+    session: dict[str, Any],
+    jobs: list[Any],
+    notifications: list[Any],
+) -> str:
+    session_id = session.get("id")
+    session_state = session.get("lifecycle_state")
+    if not isinstance(session_id, str) or not isinstance(session_state, str):
+        raise ArielDiscordError("Ariel returned an invalid active session response.")
+
+    running_jobs = 0
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        if job.get("status") in {"queued", "running", "waiting_approval"}:
+            running_jobs += 1
+
+    pending_notifications = 0
+    for notification in notifications:
+        if not isinstance(notification, dict):
+            continue
+        if notification.get("status") in {"pending", "delivered", "failed"}:
+            pending_notifications += 1
+
+    return "\n".join(
+        [
+            "Ariel status: ok",
+            f"Active session: {session_id} ({session_state})",
+            f"Recent jobs: {len(jobs)} total, {running_jobs} active",
+            f"Notifications needing attention: {pending_notifications}",
+        ]
+    )
+
+
+def _format_jobs_for_discord(jobs: list[Any]) -> str:
+    if not jobs:
+        return "No recent jobs."
+
+    lines = ["Recent jobs:"]
+    for job in jobs[:10]:
+        if not isinstance(job, dict):
+            continue
+        job_id = job.get("id")
+        status = job.get("status")
+        title = job.get("title") or job.get("external_job_id")
+        if isinstance(job_id, str) and isinstance(status, str) and isinstance(title, str):
+            lines.append(f"- {job_id}: {status}: {title}")
+    if len(lines) == 1:
+        raise ArielDiscordError("Ariel returned an invalid jobs response.")
+    return "\n".join(lines)
+
+
+def _format_memory_for_discord(items: list[Any]) -> str:
+    active_items = []
+    for item in items:
+        if not isinstance(item, dict) or item.get("lifecycle_state") != "active":
+            continue
+        subject_key = item.get("subject_key")
+        predicate = item.get("predicate")
+        value = item.get("value")
+        if (
+            isinstance(subject_key, str)
+            and isinstance(predicate, str)
+            and isinstance(value, str)
+            and value.strip()
+        ):
+            active_items.append((f"{subject_key} {predicate}", value.strip()))
+
+    if not active_items:
+        return "No active memory."
+
+    lines = ["Active memory:"]
+    for assertion_label, value in active_items[:10]:
+        lines.append(f"- {assertion_label}: {value}")
+    return "\n".join(lines)
+
+
 def _notification_job_id(notification: dict[str, Any]) -> str | None:
     payload = notification.get("payload")
     job_id = payload.get("job_id") if isinstance(payload, dict) else None
@@ -597,7 +844,8 @@ def _discord_context_for_message(
         "message_id": message.id,
         "author_id": message.author.id,
         "mentioned_bot": (
-            bot_user_id is not None and any(mention.id == bot_user_id for mention in message.mentions)
+            bot_user_id is not None
+            and any(mention.id == bot_user_id for mention in message.mentions)
         ),
     }
     guild_name = getattr(message.guild, "name", None)

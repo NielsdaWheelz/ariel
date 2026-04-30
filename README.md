@@ -52,7 +52,7 @@ make run-discord
 python -m ariel.discord_bot
 ```
 
-the bot handles:
+ambient messages are the Discord AI surface. the bot handles:
 
 - DMs from the configured user
 - messages from the configured user in the one configured home guild
@@ -61,6 +61,9 @@ guild chat is not limited to one configured channel. attachments and links are p
 bounded context; content extraction and citations still flow through normal capabilities.
 when the model calls `cap.discord.no_response`, Ariel records the audited tool output and
 sends no visible assistant text.
+
+`/ariel` and `/ask` are gone. `/status`, `/jobs`, `/memory`, and `/capture` are
+deterministic operational commands only and do not route free-form prompts to the model.
 
 ## verification gates
 
@@ -239,8 +242,7 @@ slice-5 adds canonical durable memory, explicit + threshold rotation, and harden
 - context assembly contract (deterministic order):
   - `policy_system_instructions`
   - `recent_active_session_turns`
-  - `rolling_session_summary`
-  - `durable_memory_recall`
+  - `memory_context`
   - `open_commitments_and_jobs`
   - `relevant_artifacts_and_signals`
 

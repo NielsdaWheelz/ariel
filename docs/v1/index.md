@@ -39,12 +39,13 @@ This directory is the canonical home for repository documentation.
 - [codebase.md](codebase.md): tech stack, repo structure, imports, and module boundaries
 - [database.md](database.md): PostgreSQL schema, queries, and transactions
 
-### Product cutovers
+### Product operations
 
-- [gold-standard-cutover.md](gold-standard-cutover.md): hard cutover to Responses API,
-  Agency capabilities, Discord interactions, evals, and production deployment
+- [proactive-assistant-cutover.md](proactive-assistant-cutover.md): hard cutover to
+  bounded proactive noticing, prioritization, check-ins, and follow-up
 - [production-runbook.md](production-runbook.md): production deployment, operations,
-  health checks, recovery, and acceptance criteria
+  ambient Discord chat, deterministic slash operations, health checks, recovery,
+  and acceptance criteria
 
 ### Modules
 

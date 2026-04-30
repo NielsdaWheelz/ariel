@@ -8,7 +8,6 @@ from fastapi.testclient import TestClient
 import httpx
 import pytest
 
-from ariel.app import create_app
 from ariel.config import AppSettings
 from ariel.discord_bot import (
     ArielDiscordBot,
@@ -18,12 +17,15 @@ from ariel.discord_bot import (
     ack_notification,
     decide_approval,
     DiscordBotConfigError,
-    ask_ariel,
-    ask_ariel_reply,
     configured_discord_bot,
     create_discord_bot,
     format_discord_message,
+    get_status,
+    list_jobs,
+    list_memory,
+    record_capture,
     refresh_job,
+    submit_discord_turn,
 )
 
 
@@ -197,10 +199,15 @@ class FakeInteractionResponse:
     def __init__(self) -> None:
         self.messages: list[dict[str, Any]] = []
         self.edits: list[dict[str, Any]] = []
+        self.deferrals: list[dict[str, Any]] = []
         self._done = False
 
     def is_done(self) -> bool:
         return self._done
+
+    async def defer(self, *, thinking: bool = False, ephemeral: bool = False) -> None:
+        self._done = True
+        self.deferrals.append({"thinking": thinking, "ephemeral": ephemeral})
 
     async def send_message(
         self,
@@ -235,11 +242,31 @@ class FakeInteractionResponse:
         )
 
 
+class FakeFollowup:
+    def __init__(self) -> None:
+        self.messages: list[dict[str, Any]] = []
+
+    async def send(
+        self,
+        content: str,
+        *,
+        ephemeral: bool = False,
+        allowed_mentions: discord.AllowedMentions,
+    ) -> None:
+        self.messages.append(
+            {
+                "content": content,
+                "ephemeral": ephemeral,
+                "allowed_mentions": allowed_mentions,
+            }
+        )
+
+
 class FakeInteraction:
     def __init__(
         self,
         *,
-        custom_id: str,
+        custom_id: str = "",
         user_id: int = 3,
         guild_id: int | None = 1,
         channel_id: int = 2,
@@ -250,6 +277,7 @@ class FakeInteraction:
         self.guild = FakeGuild(guild_id=guild_id) if guild_id is not None else None
         self.channel_id = channel_id
         self.response = FakeInteractionResponse()
+        self.followup = FakeFollowup()
 
 
 def _bot() -> ArielDiscordBot:
@@ -263,10 +291,10 @@ def _bot() -> ArielDiscordBot:
     return bot
 
 
-def _stub_ask_ariel(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+def _stub_discord_turn(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     calls: list[dict[str, Any]] = []
 
-    def fake_ask_ariel_reply(
+    def fake_submit_discord_turn(
         *,
         ariel_base_url: str,
         prompt: str,
@@ -285,7 +313,7 @@ def _stub_ask_ariel(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
         )
         return ArielDiscordReply(content=f"assistant::{prompt}")
 
-    monkeypatch.setattr("ariel.discord_bot.ask_ariel_reply", fake_ask_ariel_reply)
+    monkeypatch.setattr("ariel.discord_bot.submit_discord_turn", fake_submit_discord_turn)
     return calls
 
 
@@ -317,13 +345,16 @@ def test_discord_bot_enables_message_intents() -> None:
     assert bot.intents.message_content is True
 
 
-def test_discord_bot_registers_ariel_slash_command() -> None:
+def test_discord_bot_registers_only_deterministic_ops_slash_commands() -> None:
     bot = _bot()
 
-    command = bot.tree.get_command("ariel")
+    assert bot.tree.get_command("ariel") is None
+    assert bot.tree.get_command("ask") is None
 
-    assert command is not None
-    assert command.description == "Ask Ariel through the local API."
+    assert bot.tree.get_command("status") is not None
+    assert bot.tree.get_command("jobs") is not None
+    assert bot.tree.get_command("memory") is not None
+    assert bot.tree.get_command("capture") is not None
 
 
 def test_format_discord_message_truncates_to_safe_size() -> None:
@@ -332,7 +363,7 @@ def test_format_discord_message_truncates_to_safe_size() -> None:
     assert len(formatted) <= 1900
 
 
-def test_ask_ariel_posts_message_with_discord_message_idempotency(
+def test_submit_discord_turn_posts_message_with_discord_message_idempotency(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake_clients: list[FakeHttpClient] = []
@@ -350,13 +381,13 @@ def test_ask_ariel_posts_message_with_discord_message_idempotency(
 
     monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
 
-    message = ask_ariel(
+    reply = submit_discord_turn(
         ariel_base_url="http://127.0.0.1:8000",
         prompt="status please",
         discord_message_id=123,
     )
 
-    assert message == "hello"
+    assert reply.content == "hello"
     assert fake_clients[0].calls == [
         {"method": "GET", "url": "http://127.0.0.1:8000/v1/sessions/active"},
         {
@@ -368,7 +399,7 @@ def test_ask_ariel_posts_message_with_discord_message_idempotency(
     ]
 
 
-def test_ask_ariel_reply_posts_discord_context_as_separate_field(
+def test_submit_discord_turn_posts_discord_context_as_separate_field(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake_clients: list[FakeHttpClient] = []
@@ -386,7 +417,7 @@ def test_ask_ariel_reply_posts_discord_context_as_separate_field(
 
     monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
 
-    reply = ask_ariel_reply(
+    reply = submit_discord_turn(
         ariel_base_url="http://127.0.0.1:8000",
         prompt="status please",
         discord_message_id=123,
@@ -412,7 +443,7 @@ def test_ask_ariel_reply_posts_discord_context_as_separate_field(
     }
 
 
-def test_ask_ariel_reply_supports_silent_assistant_response(
+def test_submit_discord_turn_supports_silent_assistant_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def fake_client(*, timeout: float) -> FakeHttpClient:
@@ -429,7 +460,7 @@ def test_ask_ariel_reply_supports_silent_assistant_response(
 
     monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
 
-    reply = ask_ariel_reply(
+    reply = submit_discord_turn(
         ariel_base_url="http://127.0.0.1:8000",
         prompt="status please",
         discord_message_id=123,
@@ -439,7 +470,7 @@ def test_ask_ariel_reply_supports_silent_assistant_response(
     assert reply.content == ""
 
 
-def test_ask_ariel_includes_pending_approval_affordance(
+def test_submit_discord_turn_includes_pending_approval_affordance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def fake_client(*, timeout: float) -> FakeHttpClient:
@@ -471,12 +502,13 @@ def test_ask_ariel_includes_pending_approval_affordance(
 
     monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
 
-    message = ask_ariel(
+    reply = submit_discord_turn(
         ariel_base_url="http://127.0.0.1:8000",
         prompt="send it",
         discord_message_id=123,
     )
 
+    message = reply.content
     assert "I need approval." in message
     assert "Approval pending (cap.email.send): apr_123" in message
     assert "Use the buttons below." in message
@@ -484,7 +516,7 @@ def test_ask_ariel_includes_pending_approval_affordance(
     assert "deny apr_123" not in message
 
 
-def test_ask_ariel_reply_adds_approval_buttons(
+def test_submit_discord_turn_adds_approval_buttons(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def fake_client(*, timeout: float) -> FakeHttpClient:
@@ -515,7 +547,7 @@ def test_ask_ariel_reply_adds_approval_buttons(
 
     monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
 
-    reply = ask_ariel_reply(
+    reply = submit_discord_turn(
         ariel_base_url="http://127.0.0.1:8000",
         prompt="send it",
         discord_message_id=123,
@@ -665,6 +697,242 @@ def test_ack_notification_posts_ack_and_returns_job_id(
     ]
 
 
+def test_status_command_fetches_only_deterministic_ops_endpoints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_clients: list[FakeHttpClient] = []
+
+    def fake_client(*, timeout: float) -> FakeHttpClient:
+        assert timeout == 60.0
+        client = FakeHttpClient(
+            responses=[
+                httpx.Response(200, json={"ok": True}),
+                httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "session": {"id": "ses_123", "lifecycle_state": "active"},
+                    },
+                ),
+                httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "jobs": [
+                            {"id": "job_1", "status": "running", "title": "Do work"},
+                            {"id": "job_2", "status": "succeeded", "title": "Done"},
+                        ],
+                    },
+                ),
+                httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "notifications": [
+                            {"id": "ntf_1", "status": "delivered", "title": "Review"},
+                            {"id": "ntf_2", "status": "acknowledged", "title": "Done"},
+                        ],
+                    },
+                ),
+            ]
+        )
+        fake_clients.append(client)
+        return client
+
+    monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
+
+    message = get_status(ariel_base_url="http://127.0.0.1:8000")
+
+    assert "Ariel status: ok" in message
+    assert "Active session: ses_123 (active)" in message
+    assert "Recent jobs: 2 total, 1 active" in message
+    assert "Notifications needing attention: 1" in message
+    assert fake_clients[0].calls == [
+        {"method": "GET", "url": "http://127.0.0.1:8000/v1/health"},
+        {"method": "GET", "url": "http://127.0.0.1:8000/v1/sessions/active"},
+        {"method": "GET", "url": "http://127.0.0.1:8000/v1/jobs?limit=5"},
+        {"method": "GET", "url": "http://127.0.0.1:8000/v1/notifications?limit=5"},
+    ]
+
+
+def test_jobs_command_fetches_job_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_clients: list[FakeHttpClient] = []
+
+    def fake_client(*, timeout: float) -> FakeHttpClient:
+        assert timeout == 60.0
+        client = FakeHttpClient(
+            responses=[
+                httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "jobs": [{"id": "job_123", "status": "running", "title": "Agency bridge"}],
+                    },
+                )
+            ]
+        )
+        fake_clients.append(client)
+        return client
+
+    monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
+
+    message = list_jobs(ariel_base_url="http://127.0.0.1:8000")
+
+    assert message == "Recent jobs:\n- job_123: running: Agency bridge"
+    assert fake_clients[0].calls == [
+        {"method": "GET", "url": "http://127.0.0.1:8000/v1/jobs?limit=10"}
+    ]
+
+
+def test_memory_command_fetches_memory_projection(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_clients: list[FakeHttpClient] = []
+
+    def fake_client(*, timeout: float) -> FakeHttpClient:
+        assert timeout == 60.0
+        client = FakeHttpClient(
+            responses=[
+                httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "assertions": [
+                            {
+                                "subject_key": "user:default",
+                                "predicate": "preference.notebook_style",
+                                "lifecycle_state": "active",
+                                "value": "short bullets",
+                            },
+                            {
+                                "subject_key": "user:default",
+                                "predicate": "profile.timezone",
+                                "lifecycle_state": "candidate",
+                                "value": "America/Los_Angeles",
+                            },
+                        ],
+                        "candidates": [],
+                        "conflicts": [],
+                        "project_state": [],
+                    },
+                )
+            ]
+        )
+        fake_clients.append(client)
+        return client
+
+    monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
+
+    message = list_memory(ariel_base_url="http://127.0.0.1:8000")
+
+    assert message == "Active memory:\n- user:default preference.notebook_style: short bullets"
+    assert fake_clients[0].calls == [{"method": "GET", "url": "http://127.0.0.1:8000/v1/memory"}]
+
+
+def test_capture_command_records_capture_without_message_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_clients: list[FakeHttpClient] = []
+
+    def fake_client(*, timeout: float) -> FakeHttpClient:
+        assert timeout == 60.0
+        client = FakeHttpClient(
+            responses=[
+                httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "capture": {"id": "cpt_123", "terminal_state": "turn_created"},
+                    },
+                )
+            ]
+        )
+        fake_clients.append(client)
+        return client
+
+    monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
+
+    message = record_capture(
+        ariel_base_url="http://127.0.0.1:8000",
+        text="save this",
+        discord_interaction_id=987,
+    )
+
+    assert message == "Capture recorded: cpt_123 (turn_created)"
+    assert fake_clients[0].calls == [
+        {
+            "method": "POST",
+            "url": "http://127.0.0.1:8000/v1/captures/record",
+            "headers": {"Idempotency-Key": "discord-capture-987"},
+            "json": {"kind": "text", "text": "save this"},
+        }
+    ]
+
+
+def test_slash_status_sends_ephemeral_deterministic_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_get_status(*, ariel_base_url: str) -> str:
+        assert ariel_base_url == "http://127.0.0.1:8000"
+        return "Ariel status: ok"
+
+    monkeypatch.setattr("ariel.discord_bot.get_status", fake_get_status)
+    bot = _bot()
+    interaction = FakeInteraction()
+
+    asyncio.run(bot._slash_status(cast(discord.Interaction, interaction)))
+
+    assert interaction.response.deferrals == [{"thinking": True, "ephemeral": True}]
+    assert interaction.followup.messages[0]["content"] == "Ariel status: ok"
+    assert interaction.followup.messages[0]["ephemeral"] is True
+
+
+def test_slash_status_rejects_wrong_user() -> None:
+    bot = _bot()
+    interaction = FakeInteraction(user_id=44)
+
+    asyncio.run(bot._slash_status(cast(discord.Interaction, interaction)))
+
+    assert interaction.response.messages[0]["ephemeral"] is True
+    assert "limited to the configured Discord user" in interaction.response.messages[0]["content"]
+
+
+def test_slash_capture_sends_ephemeral_deterministic_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_record_capture(
+        *,
+        ariel_base_url: str,
+        text: str,
+        discord_interaction_id: int,
+    ) -> str:
+        calls.append(
+            {
+                "ariel_base_url": ariel_base_url,
+                "text": text,
+                "discord_interaction_id": discord_interaction_id,
+            }
+        )
+        return "Capture recorded: cpt_123 (turn_created)"
+
+    monkeypatch.setattr("ariel.discord_bot.record_capture", fake_record_capture)
+    bot = _bot()
+    interaction = FakeInteraction()
+
+    asyncio.run(bot._slash_capture(cast(discord.Interaction, interaction), "save this"))
+
+    assert calls == [
+        {
+            "ariel_base_url": "http://127.0.0.1:8000",
+            "text": "save this",
+            "discord_interaction_id": 987,
+        }
+    ]
+    assert interaction.response.deferrals == [{"thinking": True, "ephemeral": True}]
+    assert interaction.followup.messages[0]["content"] == "Capture recorded: cpt_123 (turn_created)"
+    assert interaction.followup.messages[0]["ephemeral"] is True
+
+
 def test_action_view_uses_custom_ids_for_job_refresh_and_notification_ack() -> None:
     view = ArielActionView(
         ariel_base_url="http://127.0.0.1:8000",
@@ -731,7 +999,7 @@ def test_on_interaction_rejects_wrong_user() -> None:
     assert "limited to the configured Discord user" in interaction.response.messages[0]["content"]
 
 
-def test_ask_ariel_surfaces_safe_api_error(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_submit_discord_turn_surfaces_safe_api_error(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_client(*, timeout: float) -> FakeHttpClient:
         assert timeout == 60.0
         return FakeHttpClient(
@@ -752,7 +1020,7 @@ def test_ask_ariel_surfaces_safe_api_error(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
 
     with pytest.raises(ArielDiscordError, match="model provider unavailable"):
-        ask_ariel(
+        submit_discord_turn(
             ariel_base_url="http://127.0.0.1:8000",
             prompt="status please",
             discord_message_id=123,
@@ -760,7 +1028,7 @@ def test_ask_ariel_surfaces_safe_api_error(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 def test_on_message_answers_configured_user_dm(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = _stub_ask_ariel(monkeypatch)
+    calls = _stub_discord_turn(monkeypatch)
     bot = _bot()
     channel = FakeChannel(channel_id=77)
     message = FakeDiscordMessage(
@@ -791,7 +1059,7 @@ def test_on_message_answers_configured_user_dm(monkeypatch: pytest.MonkeyPatch) 
 def test_on_message_answers_home_guild_message_in_any_channel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls = _stub_ask_ariel(monkeypatch)
+    calls = _stub_discord_turn(monkeypatch)
     bot = _bot()
     message = FakeDiscordMessage(
         message_id=456,
@@ -837,7 +1105,7 @@ def test_on_message_answers_home_guild_message_in_any_channel(
 def test_on_message_answers_attachment_only_home_guild_message(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls = _stub_ask_ariel(monkeypatch)
+    calls = _stub_discord_turn(monkeypatch)
     bot = _bot()
     message = FakeDiscordMessage(
         message_id=654,
@@ -857,7 +1125,7 @@ def test_on_message_answers_attachment_only_home_guild_message(
 def test_on_message_sends_legacy_approval_text_as_prompt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls = _stub_ask_ariel(monkeypatch)
+    calls = _stub_discord_turn(monkeypatch)
     bot = _bot()
     message = FakeDiscordMessage(
         message_id=456,
@@ -875,7 +1143,7 @@ def test_on_message_sends_legacy_approval_text_as_prompt(
 def test_on_message_strips_direct_bot_mention_from_prompt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls = _stub_ask_ariel(monkeypatch)
+    calls = _stub_discord_turn(monkeypatch)
     bot = _bot()
     message = FakeDiscordMessage(
         content="<@999> hello home",
@@ -894,7 +1162,7 @@ def test_on_message_sends_no_reply_for_silent_assistant_response(
 ) -> None:
     calls: list[dict[str, Any]] = []
 
-    async def fake_ask_ariel_for_discord(
+    async def fake_submit_ambient_turn(
         *,
         prompt: str,
         discord_message_id: int,
@@ -910,7 +1178,7 @@ def test_on_message_sends_no_reply_for_silent_assistant_response(
         return ArielDiscordReply(content="", silent=True)
 
     bot = _bot()
-    monkeypatch.setattr(bot, "_ask_ariel_for_discord", fake_ask_ariel_for_discord)
+    monkeypatch.setattr(bot, "_submit_ambient_turn", fake_submit_ambient_turn)
     channel = FakeChannel(channel_id=2)
     message = FakeDiscordMessage(
         message_id=789,
@@ -929,7 +1197,7 @@ def test_on_message_sends_no_reply_for_silent_assistant_response(
 def test_on_message_ignores_other_server_direct_mention(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls = _stub_ask_ariel(monkeypatch)
+    calls = _stub_discord_turn(monkeypatch)
     bot = _bot()
     message = FakeDiscordMessage(
         content="<@999> hello elsewhere",
@@ -945,7 +1213,7 @@ def test_on_message_ignores_other_server_direct_mention(
 
 
 def test_on_message_ignores_other_server_reply(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = _stub_ask_ariel(monkeypatch)
+    calls = _stub_discord_turn(monkeypatch)
     bot = _bot()
     referenced = FakeDiscordMessage(
         message_id=777,
@@ -968,7 +1236,7 @@ def test_on_message_ignores_other_server_reply(monkeypatch: pytest.MonkeyPatch) 
 def test_on_message_ignores_other_server_unmentioned_message(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls = _stub_ask_ariel(monkeypatch)
+    calls = _stub_discord_turn(monkeypatch)
     bot = _bot()
     message = FakeDiscordMessage(
         content="ambient chatter",
@@ -983,6 +1251,8 @@ def test_on_message_ignores_other_server_unmentioned_message(
 
 
 def test_root_is_discord_primary_status_not_phone_chat() -> None:
+    from ariel.app import create_app
+
     app = create_app(
         database_url="sqlite+pysqlite:///:memory:",
         model_adapter=StaticModelAdapter(),
@@ -1014,7 +1284,7 @@ def test_on_message_ignores_unsupported_messages(
     monkeypatch: pytest.MonkeyPatch,
     message: FakeDiscordMessage,
 ) -> None:
-    calls = _stub_ask_ariel(monkeypatch)
+    calls = _stub_discord_turn(monkeypatch)
     bot = _bot()
 
     _send_message(bot, message)
