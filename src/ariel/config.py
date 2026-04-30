@@ -32,7 +32,7 @@ class AppSettings(BaseSettings):
     model_reasoning_effort: str = "medium"
     model_verbosity: str = "low"
     max_recent_turns: int = 12
-    max_recalled_memories: int = 8
+    max_recalled_assertions: int = 8
     max_context_tokens: int = 6000
     auto_rotate_max_turns: int = 120
     auto_rotate_max_age_seconds: int = 172800
@@ -109,11 +109,11 @@ class AppSettings(BaseSettings):
             raise ValueError("max_recent_turns must be >= 1")
         return value
 
-    @field_validator("max_recalled_memories")
+    @field_validator("max_recalled_assertions")
     @classmethod
-    def _max_recalled_memories_must_be_positive(cls, value: int) -> int:
+    def _max_recalled_assertions_must_be_positive(cls, value: int) -> int:
         if value < 1:
-            raise ValueError("max_recalled_memories must be >= 1")
+            raise ValueError("max_recalled_assertions must be >= 1")
         return value
 
     @field_validator("max_context_tokens")

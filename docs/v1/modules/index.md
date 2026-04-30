@@ -7,4 +7,5 @@ This directory contains docs owned by specific infrastructure modules or feature
 ## Docs
 
 - [coordination.md](coordination.md): coordination module
+- [memory.md](memory.md): semantic memory hard cutover
 - [transport.md](transport.md): transport lifecycle ownership

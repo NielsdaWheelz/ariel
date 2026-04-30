@@ -96,15 +96,19 @@ def _turn_count(client: TestClient) -> int:
 def _capture_row(client: TestClient, capture_id: str) -> dict[str, Any]:
     with cast(Any, client.app).state.session_factory() as db:
         with db.begin():
-            row = db.execute(
-                text(
-                    "SELECT id, capture_kind, terminal_state, effective_session_id, turn_id, "
-                    "idempotency_key, request_hash, original_payload, normalized_turn_input, "
-                    "ingest_error_code, status_code "
-                    "FROM captures WHERE id = :capture_id"
-                ),
-                {"capture_id": capture_id},
-            ).mappings().first()
+            row = (
+                db.execute(
+                    text(
+                        "SELECT id, capture_kind, terminal_state, effective_session_id, turn_id, "
+                        "idempotency_key, request_hash, original_payload, normalized_turn_input, "
+                        "ingest_error_code, status_code "
+                        "FROM captures WHERE id = :capture_id"
+                    ),
+                    {"capture_id": capture_id},
+                )
+                .mappings()
+                .first()
+            )
             assert row is not None
             return dict(row)
 
@@ -112,14 +116,18 @@ def _capture_row(client: TestClient, capture_id: str) -> dict[str, Any]:
 def _capture_ids_for_idempotency_key(client: TestClient, idempotency_key: str) -> list[str]:
     with cast(Any, client.app).state.session_factory() as db:
         with db.begin():
-            rows = db.execute(
-                text(
-                    "SELECT id FROM captures "
-                    "WHERE idempotency_key = :idempotency_key "
-                    "ORDER BY created_at ASC"
-                ),
-                {"idempotency_key": idempotency_key},
-            ).mappings().all()
+            rows = (
+                db.execute(
+                    text(
+                        "SELECT id FROM captures "
+                        "WHERE idempotency_key = :idempotency_key "
+                        "ORDER BY created_at ASC"
+                    ),
+                    {"idempotency_key": idempotency_key},
+                )
+                .mappings()
+                .all()
+            )
             return [str(row["id"]) for row in rows]
 
 
@@ -416,17 +424,19 @@ def test_s8_pr01_bare_text_capture_is_observe_first_and_not_direct_memory_comman
     with _build_client(postgres_url, adapter) as client:
         response = client.post(
             "/v1/captures",
-            json={"kind": "text", "text": "remember project:phoenix=ship tomorrow"},
+            json={"kind": "text", "text": "remember project phoenix = ship tomorrow"},
         )
         assert response.status_code == 200
         payload = response.json()
 
         memory_projection = client.get("/v1/memory")
         assert memory_projection.status_code == 200
-        assert memory_projection.json()["items"] == []
+        memory_payload = memory_projection.json()
+        assert memory_payload["assertions"] == []
+        assert memory_payload["candidates"] == []
 
         event_types = [event["event_type"] for event in payload["turn"]["events"]]
-        assert "evt.memory.captured" not in event_types
-        assert "evt.memory.promoted" not in event_types
+        assert "evt.memory.candidate_proposed" not in event_types
+        assert "evt.memory.assertion_activated" not in event_types
         assert adapter.seen_user_messages
         assert not adapter.seen_user_messages[0].strip().lower().startswith("remember ")

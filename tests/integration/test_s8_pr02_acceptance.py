@@ -98,15 +98,19 @@ def _turn_count(client: TestClient) -> int:
 def _capture_row(client: TestClient, capture_id: str) -> dict[str, Any]:
     with cast(Any, client.app).state.session_factory() as db:
         with db.begin():
-            row = db.execute(
-                text(
-                    "SELECT id, capture_kind, terminal_state, effective_session_id, turn_id, "
-                    "idempotency_key, request_hash, original_payload, normalized_turn_input, "
-                    "ingest_error_code, status_code "
-                    "FROM captures WHERE id = :capture_id"
-                ),
-                {"capture_id": capture_id},
-            ).mappings().first()
+            row = (
+                db.execute(
+                    text(
+                        "SELECT id, capture_kind, terminal_state, effective_session_id, turn_id, "
+                        "idempotency_key, request_hash, original_payload, normalized_turn_input, "
+                        "ingest_error_code, status_code "
+                        "FROM captures WHERE id = :capture_id"
+                    ),
+                    {"capture_id": capture_id},
+                )
+                .mappings()
+                .first()
+            )
             assert row is not None
             return dict(row)
 
@@ -114,14 +118,18 @@ def _capture_row(client: TestClient, capture_id: str) -> dict[str, Any]:
 def _capture_ids_for_idempotency_key(client: TestClient, idempotency_key: str) -> list[str]:
     with cast(Any, client.app).state.session_factory() as db:
         with db.begin():
-            rows = db.execute(
-                text(
-                    "SELECT id FROM captures "
-                    "WHERE idempotency_key = :idempotency_key "
-                    "ORDER BY created_at ASC"
-                ),
-                {"idempotency_key": idempotency_key},
-            ).mappings().all()
+            rows = (
+                db.execute(
+                    text(
+                        "SELECT id FROM captures "
+                        "WHERE idempotency_key = :idempotency_key "
+                        "ORDER BY created_at ASC"
+                    ),
+                    {"idempotency_key": idempotency_key},
+                )
+                .mappings()
+                .all()
+            )
             return [str(row["id"]) for row in rows]
 
 
@@ -145,9 +153,13 @@ def test_s8_pr02_shared_content_capture_preserves_note_source_separation_and_obs
     payload = {
         "kind": "shared_content",
         "note": "summarize blockers and risks",
-        "source": {"app": "ios.share", "title": "Design review", "url": "https://example.com/review"},
+        "source": {
+            "app": "ios.share",
+            "title": "Design review",
+            "url": "https://example.com/review",
+        },
         "shared_content": {
-            "text": "remember project:phoenix=ship tomorrow",
+            "text": "remember project phoenix = ship tomorrow",
             "urls": ["https://example.com/review", "https://example.com/rfc"],
         },
     }
@@ -172,7 +184,7 @@ def test_s8_pr02_shared_content_capture_preserves_note_source_separation_and_obs
         assert "user_note:" in normalized_input
         assert "summarize blockers and risks" in normalized_input
         assert "shared_source_text:" in normalized_input
-        assert "remember project:phoenix=ship tomorrow" in normalized_input
+        assert "remember project phoenix = ship tomorrow" in normalized_input
         assert "shared_source_urls:" in normalized_input
         assert "- https://example.com/review" in normalized_input
         assert "- https://example.com/rfc" in normalized_input
@@ -183,11 +195,13 @@ def test_s8_pr02_shared_content_capture_preserves_note_source_separation_and_obs
 
         memory_projection = client.get("/v1/memory")
         assert memory_projection.status_code == 200
-        assert memory_projection.json()["items"] == []
+        memory_payload = memory_projection.json()
+        assert memory_payload["assertions"] == []
+        assert memory_payload["candidates"] == []
 
         event_types = _event_types(body["turn"])
-        assert "evt.memory.captured" not in event_types
-        assert "evt.memory.promoted" not in event_types
+        assert "evt.memory.candidate_proposed" not in event_types
+        assert "evt.memory.assertion_activated" not in event_types
 
 
 def test_s8_pr02_shared_content_origin_taint_denies_external_side_effect_even_when_model_declares_clean(
@@ -387,7 +401,9 @@ def test_s8_pr02_shared_content_capture_preserves_retrieval_citations_and_artifa
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("ARIEL_WEB_EXTRACT_PROVIDER_ENDPOINT", "https://extract.provider.test/v1/extract")
+    monkeypatch.setenv(
+        "ARIEL_WEB_EXTRACT_PROVIDER_ENDPOINT", "https://extract.provider.test/v1/extract"
+    )
 
     def fake_post(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
         del args, kwargs

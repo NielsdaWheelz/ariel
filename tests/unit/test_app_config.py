@@ -27,7 +27,9 @@ def test_app_settings_load_from_project_env_files() -> None:
 
 
 def test_create_app_uses_ariel_database_url_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ARIEL_DATABASE_URL", "postgresql+psycopg://env-user:env-pass@localhost/env-db")
+    monkeypatch.setenv(
+        "ARIEL_DATABASE_URL", "postgresql+psycopg://env-user:env-pass@localhost/env-db"
+    )
 
     app = create_app()
     try:
@@ -72,7 +74,7 @@ def test_max_recent_turns_rejects_non_positive_values(monkeypatch: pytest.Monkey
 
 def test_slice1_turn_budget_defaults_are_configured(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("ARIEL_MAX_RECENT_TURNS", raising=False)
-    monkeypatch.delenv("ARIEL_MAX_RECALLED_MEMORIES", raising=False)
+    monkeypatch.delenv("ARIEL_MAX_RECALLED_ASSERTIONS", raising=False)
     monkeypatch.delenv("ARIEL_MAX_CONTEXT_TOKENS", raising=False)
     monkeypatch.delenv("ARIEL_AUTO_ROTATE_MAX_TURNS", raising=False)
     monkeypatch.delenv("ARIEL_AUTO_ROTATE_MAX_AGE_SECONDS", raising=False)
@@ -85,7 +87,7 @@ def test_slice1_turn_budget_defaults_are_configured(monkeypatch: pytest.MonkeyPa
 
     settings = AppSettings.model_validate({})
     assert settings.max_recent_turns == 12
-    assert settings.max_recalled_memories == 8
+    assert settings.max_recalled_assertions == 8
     assert settings.max_context_tokens == 6000
     assert settings.auto_rotate_max_turns == 120
     assert settings.auto_rotate_max_age_seconds == 172800
@@ -98,7 +100,7 @@ def test_slice1_turn_budget_defaults_are_configured(monkeypatch: pytest.MonkeyPa
 
 
 def test_turn_budget_env_overrides_are_loaded(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ARIEL_MAX_RECALLED_MEMORIES", "11")
+    monkeypatch.setenv("ARIEL_MAX_RECALLED_ASSERTIONS", "11")
     monkeypatch.setenv("ARIEL_MAX_CONTEXT_TOKENS", "4321")
     monkeypatch.setenv("ARIEL_AUTO_ROTATE_MAX_TURNS", "77")
     monkeypatch.setenv("ARIEL_AUTO_ROTATE_MAX_AGE_SECONDS", "2222")
@@ -110,7 +112,7 @@ def test_turn_budget_env_overrides_are_loaded(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("ARIEL_APPROVAL_ACTOR_ID", "user.integration")
 
     settings = AppSettings()
-    assert settings.max_recalled_memories == 11
+    assert settings.max_recalled_assertions == 11
     assert settings.max_context_tokens == 4321
     assert settings.auto_rotate_max_turns == 77
     assert settings.auto_rotate_max_age_seconds == 2222
@@ -125,7 +127,7 @@ def test_turn_budget_env_overrides_are_loaded(monkeypatch: pytest.MonkeyPatch) -
 @pytest.mark.parametrize(
     ("env_name", "env_value"),
     [
-        ("ARIEL_MAX_RECALLED_MEMORIES", "0"),
+        ("ARIEL_MAX_RECALLED_ASSERTIONS", "0"),
         ("ARIEL_MAX_CONTEXT_TOKENS", "0"),
         ("ARIEL_AUTO_ROTATE_MAX_TURNS", "0"),
         ("ARIEL_AUTO_ROTATE_MAX_AGE_SECONDS", "0"),

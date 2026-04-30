@@ -110,7 +110,9 @@ class SessionRotationRecord(Base):
     idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     actor_id: Mapped[str] = mapped_column(String(128), nullable=False)
     trigger_snapshot: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
 
     __table_args__ = (
         CheckConstraint(
@@ -142,7 +144,9 @@ class TurnRecord(Base):
     user_message: Mapped[str] = mapped_column(Text, nullable=False)
     assistant_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     session: Mapped[SessionRecord] = relationship(back_populates="turns")
@@ -177,8 +181,12 @@ class TurnIdempotencyRecord(Base):
     )
     status_code: Mapped[int] = mapped_column(Integer, nullable=False)
     response_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
 
     __table_args__ = (
         Index(
@@ -221,8 +229,12 @@ class CaptureRecord(Base):
     ingest_error_retryable: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     status_code: Mapped[int] = mapped_column(Integer, nullable=False)
     response_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
 
     __table_args__ = (
         CheckConstraint(
@@ -283,7 +295,9 @@ class EventRecord(Base):
     sequence: Mapped[int] = mapped_column(Integer, nullable=False)
     event_type: Mapped[str] = mapped_column(String(64), nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
 
     turn: Mapped[TurnRecord] = relationship(back_populates="events")
 
@@ -322,7 +336,9 @@ class ActionAttemptRecord(Base):
     approval_required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     execution_output: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     execution_error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     turn: Mapped[TurnRecord] = relationship(back_populates="action_attempts")
@@ -335,10 +351,7 @@ class ActionAttemptRecord(Base):
     __table_args__ = (
         CheckConstraint("proposal_index > 0", name="ck_action_attempt_proposal_index_positive"),
         CheckConstraint(
-            (
-                "impact_level IN ('read', 'write_reversible', 'write_irreversible', "
-                "'external_send')"
-            ),
+            ("impact_level IN ('read', 'write_reversible', 'write_irreversible', 'external_send')"),
             name="ck_action_attempt_impact_level",
         ),
         CheckConstraint(
@@ -382,10 +395,14 @@ class ApprovalRequestRecord(Base):
     actor_id: Mapped[str] = mapped_column(String(128), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
     decision_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     action_attempt: Mapped[ActionAttemptRecord] = relationship(back_populates="approval_request")
@@ -424,9 +441,13 @@ class ArtifactRecord(Base):
     title: Mapped[str] = mapped_column(Text, nullable=False)
     source: Mapped[str] = mapped_column(Text, nullable=False)
     snippet: Mapped[str | None] = mapped_column(Text, nullable=True)
-    retrieved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    retrieved_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     action_attempt: Mapped[ActionAttemptRecord] = relationship(back_populates="artifacts")
@@ -439,46 +460,10 @@ class ArtifactRecord(Base):
     )
 
 
-class MemoryItemRecord(Base):
-    __tablename__ = "memory_items"
+class MemoryEvidenceRecord(Base):
+    __tablename__ = "memory_evidence"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    memory_class: Mapped[str] = mapped_column(String(32), nullable=False)
-    memory_key: Mapped[str] = mapped_column(Text, nullable=False)
-    active_revision_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
-
-    __table_args__ = (
-        CheckConstraint(
-            (
-                "memory_class IN "
-                "('profile', 'preference', 'project', 'commitment', 'episodic_summary')"
-            ),
-            name="ck_memory_item_class",
-        ),
-        Index(
-            "ix_memory_items_class_key_unique",
-            "memory_class",
-            "memory_key",
-            unique=True,
-        ),
-    )
-
-
-class MemoryRevisionRecord(Base):
-    __tablename__ = "memory_revisions"
-
-    id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    memory_item_id: Mapped[str] = mapped_column(
-        String(32),
-        ForeignKey("memory_items.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False)
-    value: Mapped[str | None] = mapped_column(Text, nullable=True)
-    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
     source_turn_id: Mapped[str | None] = mapped_column(
         String(32),
         ForeignKey("turns.id", ondelete="SET NULL"),
@@ -491,31 +476,400 @@ class MemoryRevisionRecord(Base):
         nullable=False,
         index=True,
     )
-    evidence: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    last_verified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    actor_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    content_class: Mapped[str] = mapped_column(String(32), nullable=False)
+    trust_boundary: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_text: Mapped[str] = mapped_column(Text, nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
 
     __table_args__ = (
         CheckConstraint(
-            "lifecycle_state IN ('candidate', 'validated', 'superseded', 'retracted')",
-            name="ck_memory_revision_lifecycle_state",
+            "content_class IN "
+            "('user_message', 'assistant_message', 'tool_output', 'web_content', "
+            "'file_content', 'system', 'rotation')",
+            name="ck_memory_evidence_content_class",
+        ),
+        CheckConstraint(
+            "trust_boundary IN "
+            "('trusted_user', 'system', 'assistant', 'untrusted_tool', "
+            "'untrusted_web', 'untrusted_file')",
+            name="ck_memory_evidence_trust_boundary",
+        ),
+    )
+
+
+class MemoryEntityRecord(Base):
+    __tablename__ = "memory_entities"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    entity_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    entity_key: Mapped[str] = mapped_column(Text, nullable=False)
+    display_name: Mapped[str] = mapped_column(Text, nullable=False)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "entity_type IN "
+            "('user', 'project', 'repo', 'artifact', 'task', 'commitment', "
+            "'preference', 'procedure', 'assertion_subject')",
+            name="ck_memory_entity_type",
+        ),
+        Index(
+            "ix_memory_entities_type_key_unique",
+            "entity_type",
+            "entity_key",
+            unique=True,
+        ),
+    )
+
+
+class MemoryAssertionRecord(Base):
+    __tablename__ = "memory_assertions"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    subject_entity_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("memory_entities.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    subject_key: Mapped[str] = mapped_column(Text, nullable=False)
+    predicate: Mapped[str] = mapped_column(Text, nullable=False)
+    scope_key: Mapped[str] = mapped_column(Text, nullable=False)
+    object_value: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    assertion_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    scope: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    valid_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    superseded_by_assertion_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("memory_assertions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    last_verified_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "assertion_type IN "
+            "('fact', 'preference', 'commitment', 'decision', 'project_state', 'procedure')",
+            name="ck_memory_assertion_type",
+        ),
+        CheckConstraint(
+            "lifecycle_state IN "
+            "('candidate', 'active', 'conflicted', 'superseded', 'retracted', "
+            "'rejected', 'deleted')",
+            name="ck_memory_assertion_lifecycle_state",
         ),
         CheckConstraint(
             "confidence >= 0.0 AND confidence <= 1.0",
-            name="ck_memory_revision_confidence_range",
+            name="ck_memory_assertion_confidence_range",
         ),
         CheckConstraint(
-            (
-                "(lifecycle_state = 'retracted' AND value IS NULL) OR "
-                "(lifecycle_state <> 'retracted' AND value IS NOT NULL)"
-            ),
-            name="ck_memory_revision_value_presence",
+            "(valid_to IS NULL) OR (valid_from IS NULL) OR (valid_from < valid_to)",
+            name="ck_memory_assertion_valid_interval",
         ),
         Index(
-            "ix_memory_revisions_item_created",
-            "memory_item_id",
-            "created_at",
+            "ix_memory_assertions_subject_predicate_state",
+            "subject_entity_id",
+            "predicate",
+            "lifecycle_state",
         ),
+        Index(
+            "ix_memory_assertions_scope_key",
+            "scope_key",
+        ),
+    )
+
+
+class MemoryAssertionEvidenceRecord(Base):
+    __tablename__ = "memory_assertion_evidence"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    assertion_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("memory_assertions.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    evidence_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("memory_evidence.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "assertion_id",
+            "evidence_id",
+            name="uq_memory_assertion_evidence_pair",
+        ),
+    )
+
+
+class MemoryReviewRecord(Base):
+    __tablename__ = "memory_reviews"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    assertion_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("memory_assertions.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    decision: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    actor_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "decision IN "
+            "('pending', 'approved', 'rejected', 'auto_approved', "
+            "'needs_user_review', 'needs_operator_review')",
+            name="ck_memory_review_decision",
+        ),
+    )
+
+
+class MemoryConflictSetRecord(Base):
+    __tablename__ = "memory_conflict_sets"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    subject_entity_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("memory_entities.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    predicate: Mapped[str] = mapped_column(Text, nullable=False)
+    scope_key: Mapped[str] = mapped_column(Text, nullable=False)
+    lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    resolution_assertion_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("memory_assertions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "lifecycle_state IN ('open', 'resolved')",
+            name="ck_memory_conflict_set_lifecycle_state",
+        ),
+        Index(
+            "ix_memory_conflict_sets_open_unique",
+            "subject_entity_id",
+            "predicate",
+            "scope_key",
+            unique=True,
+            postgresql_where=(lifecycle_state == "open"),
+        ),
+    )
+
+
+class MemoryConflictMemberRecord(Base):
+    __tablename__ = "memory_conflict_members"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    conflict_set_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("memory_conflict_sets.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    assertion_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("memory_assertions.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "conflict_set_id",
+            "assertion_id",
+            name="uq_memory_conflict_member_pair",
+        ),
+    )
+
+
+class MemorySalienceRecord(Base):
+    __tablename__ = "memory_salience"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    assertion_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("memory_assertions.id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    user_priority: Mapped[str] = mapped_column(String(32), nullable=False, default="none")
+    score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    signals: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "user_priority IN ('none', 'pinned', 'deprioritized')",
+            name="ck_memory_salience_user_priority",
+        ),
+        CheckConstraint(
+            "score >= 0.0",
+            name="ck_memory_salience_score_non_negative",
+        ),
+    )
+
+
+class MemoryProjectionJobRecord(Base):
+    __tablename__ = "memory_projection_jobs"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    projection_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    target_table: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_retries: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    run_after: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "projection_kind IN ('embedding', 'context_block', 'graph_cache', 'project_state')",
+            name="ck_memory_projection_job_kind",
+        ),
+        CheckConstraint(
+            "lifecycle_state IN ('pending', 'running', 'completed', 'failed', 'dead_letter')",
+            name="ck_memory_projection_job_lifecycle_state",
+        ),
+        CheckConstraint("attempts >= 0", name="ck_memory_projection_job_attempts"),
+        CheckConstraint("max_retries >= 0", name="ck_memory_projection_job_max_retries"),
+    )
+
+
+class MemoryEmbeddingProjectionRecord(Base):
+    __tablename__ = "memory_embedding_projections"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    assertion_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("memory_assertions.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    projection_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    search_text: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_memory_embedding_projection_unique",
+            "assertion_id",
+            "projection_version",
+            unique=True,
+        ),
+    )
+
+
+class MemoryContextBlockRecord(Base):
+    __tablename__ = "memory_context_blocks"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    block_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    scope_key: Mapped[str] = mapped_column(Text, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    source_assertion_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    projection_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "block_type IN ('pinned_core', 'project_state', 'procedure')",
+            name="ck_memory_context_block_type",
+        ),
+        Index(
+            "ix_memory_context_blocks_unique",
+            "block_type",
+            "scope_key",
+            "projection_version",
+            unique=True,
+        ),
+    )
+
+
+class ProjectStateSnapshotRecord(Base):
+    __tablename__ = "project_state_snapshots"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    project_key: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    source_assertion_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
     )
 
 
@@ -525,8 +879,12 @@ class WeatherDefaultLocationRecord(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     default_location: Mapped[str] = mapped_column(Text, nullable=False)
     source: Mapped[str] = mapped_column(String(32), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
 
     __table_args__ = (
         CheckConstraint(
@@ -552,7 +910,9 @@ class GoogleConnectorRecord(Base):
         nullable=True,
         index=True,
     )
-    token_obtained_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    token_obtained_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     encryption_key_version: Mapped[str] = mapped_column(String(32), nullable=False, default="v1")
     last_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     last_error_at: Mapped[datetime | None] = mapped_column(
@@ -560,8 +920,12 @@ class GoogleConnectorRecord(Base):
         nullable=True,
         index=True,
     )
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
 
     events: Mapped[list["GoogleConnectorEventRecord"]] = relationship(back_populates="connector")
 
@@ -587,9 +951,15 @@ class GoogleOAuthStateRecord(Base):
     pkce_verifier_enc: Mapped[str] = mapped_column(Text, nullable=False)
     pkce_challenge: Mapped[str] = mapped_column(String(128), nullable=False)
     redirect_uri: Mapped[str] = mapped_column(Text, nullable=False)
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
-    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    consumed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     __table_args__ = (
@@ -612,7 +982,9 @@ class GoogleConnectorEventRecord(Base):
     )
     event_type: Mapped[str] = mapped_column(String(96), nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
 
     connector: Mapped[GoogleConnectorRecord] = relationship(back_populates="events")
 
@@ -634,8 +1006,12 @@ class BackgroundTaskRecord(Base):
         nullable=True,
         index=True,
     )
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
 
     __table_args__ = (
         CheckConstraint(
@@ -671,7 +1047,9 @@ class AgencyEventRecord(Base):
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="accepted")
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
     processed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
@@ -731,12 +1109,18 @@ class JobRecord(Base):
     agency_branch: Mapped[str | None] = mapped_column(Text, nullable=True)
     agency_runner: Mapped[str | None] = mapped_column(Text, nullable=True)
     agency_request_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    agency_last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    agency_last_synced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     agency_pr_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     agency_pr_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     discord_thread_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
 
     events: Mapped[list["JobEventRecord"]] = relationship(back_populates="job")
 
@@ -771,7 +1155,9 @@ class JobEventRecord(Base):
     )
     event_type: Mapped[str] = mapped_column(String(64), nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
 
     job: Mapped[JobRecord] = relationship(back_populates="events")
 
@@ -788,8 +1174,12 @@ class NotificationRecord(Base):
     title: Mapped[str] = mapped_column(Text, nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     acked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -821,7 +1211,9 @@ class NotificationDeliveryRecord(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     response_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
 
     notification: Mapped[NotificationRecord] = relationship(back_populates="deliveries")
 
@@ -926,7 +1318,9 @@ def serialize_job(job: JobRecord) -> dict[str, Any]:
         "summary": redact_text(job.summary) if job.summary is not None else None,
         "latest_payload": redact_json_value(job.latest_payload),
         "agency": {
-            "repo_root": redact_text(job.agency_repo_root) if job.agency_repo_root is not None else None,
+            "repo_root": redact_text(job.agency_repo_root)
+            if job.agency_repo_root is not None
+            else None,
             "repo_id": job.agency_repo_id,
             "task_id": job.agency_task_id,
             "invocation_id": job.agency_invocation_id,
@@ -978,11 +1372,11 @@ def serialize_notification(notification: NotificationRecord) -> dict[str, Any]:
         "created_at": to_rfc3339(notification.created_at),
         "updated_at": to_rfc3339(notification.updated_at),
         "delivered_at": (
-            to_rfc3339(notification.delivered_at)
-            if notification.delivered_at is not None
-            else None
+            to_rfc3339(notification.delivered_at) if notification.delivered_at is not None else None
         ),
-        "acked_at": to_rfc3339(notification.acked_at) if notification.acked_at is not None else None,
+        "acked_at": to_rfc3339(notification.acked_at)
+        if notification.acked_at is not None
+        else None,
     }
 
 
@@ -1053,48 +1447,9 @@ def serialize_artifact(artifact: ArtifactRecord) -> dict[str, Any]:
         "title": redact_text(artifact.title),
         "source": redact_text(artifact.source),
         "retrieved_at": to_rfc3339(artifact.retrieved_at),
-        "published_at": to_rfc3339(artifact.published_at) if artifact.published_at is not None else None,
-    }
-
-
-def serialize_memory_projection_item(
-    *,
-    item: MemoryItemRecord,
-    active_revision: MemoryRevisionRecord | None,
-    revision_count: int,
-) -> dict[str, Any]:
-    if active_revision is None:
-        return {
-            "memory_item_id": item.id,
-            "memory_key": item.memory_key,
-            "memory_class": item.memory_class,
-            "revision_id": None,
-            "revision_count": revision_count,
-            "lifecycle_state": "retracted",
-            "value": "",
-            "confidence": 0.0,
-            "source_turn_id": None,
-            "source_session_id": None,
-            "evidence": {},
-            "last_verified_at": to_rfc3339(item.updated_at),
-            "created_at": to_rfc3339(item.created_at),
-            "updated_at": to_rfc3339(item.updated_at),
-        }
-    return {
-        "memory_item_id": item.id,
-        "memory_key": item.memory_key,
-        "memory_class": item.memory_class,
-        "revision_id": active_revision.id,
-        "revision_count": revision_count,
-        "lifecycle_state": active_revision.lifecycle_state,
-        "value": redact_text(active_revision.value or ""),
-        "confidence": active_revision.confidence,
-        "source_turn_id": active_revision.source_turn_id,
-        "source_session_id": active_revision.source_session_id,
-        "evidence": redact_json_value(active_revision.evidence),
-        "last_verified_at": to_rfc3339(active_revision.last_verified_at),
-        "created_at": to_rfc3339(item.created_at),
-        "updated_at": to_rfc3339(item.updated_at),
+        "published_at": to_rfc3339(artifact.published_at)
+        if artifact.published_at is not None
+        else None,
     }
 
 
@@ -1124,7 +1479,9 @@ def _serialize_surface_action_lifecycle(
         proposal_index = action_attempt.get("proposal_index")
         capability_id = action_attempt.get("capability_id")
         policy_decision = action_attempt.get("policy_decision")
-        policy_reason = policy_reasons.get(action_attempt_id) if isinstance(action_attempt_id, str) else None
+        policy_reason = (
+            policy_reasons.get(action_attempt_id) if isinstance(action_attempt_id, str) else None
+        )
         if policy_reason is None:
             policy_reason = action_attempt.get("policy_reason")
 
@@ -1170,7 +1527,9 @@ def _serialize_surface_action_lifecycle(
 
         lifecycle_items.append(
             {
-                "action_attempt_id": action_attempt_id if isinstance(action_attempt_id, str) else "",
+                "action_attempt_id": action_attempt_id
+                if isinstance(action_attempt_id, str)
+                else "",
                 "proposal_index": proposal_index if isinstance(proposal_index, int) else 0,
                 "proposal": {
                     "capability_id": (

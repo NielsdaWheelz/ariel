@@ -106,7 +106,7 @@ def test_s5_pr02_message_idempotency_key_replays_same_turn_and_blocks_conflictin
         first = client.post(
             f"/v1/sessions/{session_id}/message",
             headers={"Idempotency-Key": "msg-idem-001"},
-            json={"message": "remember project:phoenix=planning kickoff on monday"},
+            json={"message": "remember project phoenix = planning kickoff on monday"},
         )
         assert first.status_code == 200
         first_turn_id = first.json()["turn"]["id"]
@@ -114,7 +114,7 @@ def test_s5_pr02_message_idempotency_key_replays_same_turn_and_blocks_conflictin
         replay = client.post(
             f"/v1/sessions/{session_id}/message",
             headers={"Idempotency-Key": "msg-idem-001"},
-            json={"message": "remember project:phoenix=planning kickoff on monday"},
+            json={"message": "remember project phoenix = planning kickoff on monday"},
         )
         assert replay.status_code == 200
         assert replay.json()["turn"]["id"] == first_turn_id
@@ -125,7 +125,7 @@ def test_s5_pr02_message_idempotency_key_replays_same_turn_and_blocks_conflictin
         conflict = client.post(
             f"/v1/sessions/{session_id}/message",
             headers={"Idempotency-Key": "msg-idem-001"},
-            json={"message": "remember project:phoenix=kickoff on tuesday instead"},
+            json={"message": "remember project phoenix = kickoff on tuesday instead"},
         )
         assert conflict.status_code == 409
         assert conflict.json()["error"]["code"] == "E_IDEMPOTENCY_KEY_REUSED"
@@ -260,7 +260,7 @@ def test_s5_pr02_context_bundle_follows_constitution_section_order_and_includes_
         assert (
             client.post(
                 f"/v1/sessions/{session_id}/message",
-                json={"message": "remember commitment:invoice=send invoice before friday"},
+                json={"message": "remember commitment invoice = send invoice before friday"},
             ).status_code
             == 200
         )
@@ -274,21 +274,18 @@ def test_s5_pr02_context_bundle_follows_constitution_section_order_and_includes_
         assert bundle["section_order"] == [
             "policy_system_instructions",
             "recent_active_session_turns",
-            "rolling_session_summary",
-            "durable_memory_recall",
+            "memory_context",
             "open_commitments_and_jobs",
             "relevant_artifacts_and_signals",
         ]
 
-        summary_section = bundle["rolling_session_summary"]
-        assert isinstance(summary_section, dict)
-        assert isinstance(summary_section["summary_text"], str)
-        assert summary_section["summary_text"].strip()
+        memory_context = bundle["memory_context"]
+        assert isinstance(memory_context, dict)
+        assert isinstance(memory_context["active_commitments"], list)
+        assert memory_context["active_commitments"]
 
         commitments_jobs = bundle["open_commitments_and_jobs"]
         assert isinstance(commitments_jobs, dict)
-        assert isinstance(commitments_jobs["open_commitments"], list)
-        assert commitments_jobs["open_commitments"]
         assert isinstance(commitments_jobs["open_jobs"], list)
 
         signals = bundle["relevant_artifacts_and_signals"]
@@ -376,7 +373,9 @@ def test_s5_pr02_timeline_after_cursor_omits_turns_with_action_attempts_and_no_n
         assert all(turn["events"] for turn in delta["turns"])
 
 
-def test_s5_pr02_session_turn_lock_blocks_parallel_writes_to_same_session(postgres_url: str) -> None:
+def test_s5_pr02_session_turn_lock_blocks_parallel_writes_to_same_session(
+    postgres_url: str,
+) -> None:
     adapter = SessionManagementProbeAdapter()
     with _build_client(postgres_url, adapter, reset_database=True) as client:
         session_id = _session_id(client)

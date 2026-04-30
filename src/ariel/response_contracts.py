@@ -25,11 +25,19 @@ class SurfaceSessionContract(BaseModel):
 SurfaceEventType = Literal[
     "evt.turn.started",
     "evt.memory.recalled",
+    "evt.memory.evidence_recorded",
     "evt.memory.candidate_proposed",
-    "evt.memory.captured",
-    "evt.memory.promoted",
-    "evt.memory.corrected",
-    "evt.memory.retracted",
+    "evt.memory.review_required",
+    "evt.memory.candidate_approved",
+    "evt.memory.candidate_rejected",
+    "evt.memory.assertion_activated",
+    "evt.memory.assertion_superseded",
+    "evt.memory.assertion_retracted",
+    "evt.memory.assertion_deleted",
+    "evt.memory.conflict_opened",
+    "evt.memory.conflict_resolved",
+    "evt.memory.projection_rebuilt",
+    "evt.memory.recall_omitted_item",
     "evt.turn.limit_reached",
     "evt.assistant.emitted",
     "evt.turn.failed",
@@ -148,18 +156,19 @@ class SurfaceEventTurnStartedPayloadContract(BaseModel):
 class SurfaceMemoryRecallExclusionContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    memory_id: str
+    assertion_id: str
     reason: str
 
 
 class SurfaceEventMemoryRecalledPayloadContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    max_recalled_memories: int
-    included_memory_count: int
-    omitted_memory_count: int
-    included_memory_ids: list[str]
-    excluded_memories: list[SurfaceMemoryRecallExclusionContract]
+    max_recalled_assertions: int
+    included_assertion_count: int
+    omitted_assertion_count: int
+    included_assertion_ids: list[str]
+    omitted_assertions: list[SurfaceMemoryRecallExclusionContract]
+    conflict_set_ids: list[str]
 
 
 class SurfaceEventTurnLimitReachedPayloadContract(BaseModel):
@@ -294,17 +303,8 @@ class SurfaceEventActionExecutionFailedPayloadContract(BaseModel):
     approval_ref: str | None = None
 
 
-class SurfaceEventMemoryLifecyclePayloadContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    memory_item_id: str
-    revision_id: str
-    memory_class: str
-    lifecycle_state: str
-    memory_key: str
-    value_preview: str
-    confidence: float
-    source_turn_id: str | None
+class SurfaceEventMemoryPayloadContract(BaseModel):
+    model_config = ConfigDict(extra="allow")
 
 
 class SurfaceEventEnvelopeContract(BaseModel):
@@ -541,30 +541,63 @@ class SurfaceArtifactResponseContract(BaseModel):
     artifact: SurfaceArtifactContract
 
 
-class SurfaceMemoryProjectionItemContract(BaseModel):
+class SurfaceMemoryAssertionContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    memory_item_id: str
-    memory_key: str
-    memory_class: str
-    revision_id: str | None
-    revision_count: int
+    assertion_id: str
+    subject_key: str
+    predicate: str
+    assertion_type: str
     lifecycle_state: str
     value: str
     confidence: float
-    source_turn_id: str | None
-    source_session_id: str | None
-    evidence: Any
+    scope: Any
+    scope_key: str
+    valid_from: str | None
+    valid_to: str | None
     last_verified_at: str
+    created_at: str
+    updated_at: str
+    superseded_by_assertion_id: str | None
+    evidence_ids: list[str]
+    rank_reason: str | None = None
+    rank_score: float | None = None
+
+
+class SurfaceMemoryConflictContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    conflict_set_id: str
+    subject_entity_id: str
+    predicate: str
+    scope_key: str
+    lifecycle_state: str
+    resolution_assertion_id: str | None
+    reason: str | None
     created_at: str
     updated_at: str
 
 
-class SurfaceMemoryProjectionResponseContract(BaseModel):
+class SurfaceProjectStateContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    snapshot_id: str
+    project_key: str
+    summary: str
+    state: Any | None = None
+    source_assertion_ids: list[str]
+    created_at: str
+    updated_at: str
+
+
+class SurfaceMemoryResponseContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     ok: bool
-    items: list[SurfaceMemoryProjectionItemContract]
+    assertions: list[SurfaceMemoryAssertionContract]
+    candidates: list[SurfaceMemoryAssertionContract]
+    conflicts: list[SurfaceMemoryConflictContract]
+    project_state: list[SurfaceProjectStateContract]
 
 
 class SurfaceCaptureSuccessResponseContract(BaseModel):
@@ -608,6 +641,9 @@ def _default_surface_context_metadata() -> dict[str, Any]:
         "section_order": [
             "policy_system_instructions",
             "recent_active_session_turns",
+            "memory_context",
+            "open_commitments_and_jobs",
+            "relevant_artifacts_and_signals",
         ],
         "policy_instruction_count": 0,
         "recent_window": {
@@ -629,7 +665,9 @@ def _coerce_surface_model_usage(raw_usage: Any) -> dict[str, Any] | None:
     return usage
 
 
-def _project_surface_event_payload(event_type: SurfaceEventType, raw_payload: Any) -> dict[str, Any]:
+def _project_surface_event_payload(
+    event_type: SurfaceEventType, raw_payload: Any
+) -> dict[str, Any]:
     payload = raw_payload if isinstance(raw_payload, dict) else {}
     if event_type == "evt.turn.started":
         return _validate_contract(
@@ -752,16 +790,10 @@ def _project_surface_event_payload(event_type: SurfaceEventType, raw_payload: An
             SurfaceEventActionExecutionFailedPayloadContract,
             payload,
         )
-    if event_type in {
-        "evt.memory.candidate_proposed",
-        "evt.memory.captured",
-        "evt.memory.promoted",
-        "evt.memory.corrected",
-        "evt.memory.retracted",
-    }:
+    if event_type.startswith("evt.memory."):
         return _validate_contract(
             f"surface_event_payload.{event_type}",
-            SurfaceEventMemoryLifecyclePayloadContract,
+            SurfaceEventMemoryPayloadContract,
             payload,
         )
     raise ResponseContractViolation(
@@ -801,7 +833,9 @@ def _project_surface_event(raw_event: Any) -> dict[str, Any]:
 
 def _project_surface_lifecycle_item(raw_item: Any) -> dict[str, Any]:
     lifecycle_payload = raw_item if isinstance(raw_item, dict) else {}
-    return _validate_contract("surface_lifecycle_item", SurfaceLifecycleItemContract, lifecycle_payload)
+    return _validate_contract(
+        "surface_lifecycle_item", SurfaceLifecycleItemContract, lifecycle_payload
+    )
 
 
 def _project_surface_turn(raw_turn: Any) -> dict[str, Any]:
@@ -974,14 +1008,22 @@ def build_surface_approval_response(
     )
 
 
-def build_surface_memory_projection_response(*, items: Any) -> dict[str, Any]:
-    items_payload = items if isinstance(items, list) else []
+def build_surface_memory_response(
+    *,
+    assertions: Any,
+    candidates: Any,
+    conflicts: Any,
+    project_state: Any,
+) -> dict[str, Any]:
     return _validate_contract(
-        "surface_memory_projection_response",
-        SurfaceMemoryProjectionResponseContract,
+        "surface_memory_response",
+        SurfaceMemoryResponseContract,
         {
             "ok": True,
-            "items": items_payload,
+            "assertions": assertions if isinstance(assertions, list) else [],
+            "candidates": candidates if isinstance(candidates, list) else [],
+            "conflicts": conflicts if isinstance(conflicts, list) else [],
+            "project_state": project_state if isinstance(project_state, list) else [],
         },
     )
 
