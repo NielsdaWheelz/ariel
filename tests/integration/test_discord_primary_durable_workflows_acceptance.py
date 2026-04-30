@@ -17,7 +17,13 @@ from testcontainers.postgres import PostgresContainer
 from ariel.app import ModelAdapter, create_app
 from tests.integration.responses_helpers import responses_message
 from ariel.config import AppSettings
-from ariel.worker import claim_next_task, enqueue_background_task, process_one_task, reap_stale_tasks
+from ariel.persistence import JobRecord
+from ariel.worker import (
+    claim_next_task,
+    enqueue_background_task,
+    process_one_task,
+    reap_stale_tasks,
+)
 
 
 @dataclass
@@ -82,11 +88,15 @@ def _session_factory(client: TestClient) -> Any:
 def _count_rows(client: TestClient, table_name: str) -> int:
     with _session_factory(client)() as db:
         with db.begin():
-            result = db.execute(text(f"SELECT COUNT(*) AS count FROM {table_name}")).mappings().one()
+            result = (
+                db.execute(text(f"SELECT COUNT(*) AS count FROM {table_name}")).mappings().one()
+            )
             return int(result["count"])
 
 
-def _signed_agency_body(payload: dict[str, Any], *, secret: str, timestamp: int) -> SignedAgencyBody:
+def _signed_agency_body(
+    payload: dict[str, Any], *, secret: str, timestamp: int
+) -> SignedAgencyBody:
     body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     signature = hmac.new(
         secret.encode(),
@@ -101,6 +111,24 @@ def _signed_agency_body(payload: dict[str, Any], *, secret: str, timestamp: int)
             "X-Ariel-Agency-Signature": f"sha256={signature}",
         },
     )
+
+
+def _seed_job(client: TestClient, *, job_id: str, status: str, now: datetime) -> None:
+    with _session_factory(client)() as db:
+        with db.begin():
+            db.add(
+                JobRecord(
+                    id=job_id,
+                    source="agency.local",
+                    external_job_id=f"external-{job_id}",
+                    title="Proactive cutover",
+                    status=status,
+                    summary="Proactive worker should notice this job.",
+                    latest_payload={"status": status},
+                    created_at=now - timedelta(minutes=5),
+                    updated_at=now,
+                )
+            )
 
 
 def test_background_tasks_claim_retry_and_reap_are_durable_and_worker_safe(
@@ -132,7 +160,12 @@ def test_background_tasks_claim_retry_and_reap_are_durable_and_worker_safe(
                 assert claim_next_task(db, worker_id="worker-b", now=now) is None
 
             with db.begin():
-                assert reap_stale_tasks(db, now=now + timedelta(minutes=10), heartbeat_timeout_seconds=60) == 1
+                assert (
+                    reap_stale_tasks(
+                        db, now=now + timedelta(minutes=10), heartbeat_timeout_seconds=60
+                    )
+                    == 1
+                )
 
             with db.begin():
                 retried = claim_next_task(db, worker_id="worker-c", now=now + timedelta(minutes=10))
@@ -209,16 +242,22 @@ def test_agency_event_worker_creates_job_event_and_discord_notification_once(
         assert response.status_code == 202
 
         settings = cast(Any, AppSettings)(_env_file=None)
-        assert process_one_task(
-            session_factory=_session_factory(client),
-            settings=settings,
-            worker_id="worker-a",
-        ) is True
-        assert process_one_task(
-            session_factory=_session_factory(client),
-            settings=settings,
-            worker_id="worker-a",
-        ) is True
+        assert (
+            process_one_task(
+                session_factory=_session_factory(client),
+                settings=settings,
+                worker_id="worker-a",
+            )
+            is True
+        )
+        assert (
+            process_one_task(
+                session_factory=_session_factory(client),
+                settings=settings,
+                worker_id="worker-a",
+            )
+            is True
+        )
 
         assert _count_rows(client, "jobs") == 1
         assert _count_rows(client, "job_events") == 1
@@ -239,4 +278,141 @@ def test_agency_event_worker_creates_job_event_and_discord_notification_once(
 
         notifications = client.get("/v1/notifications")
         assert notifications.status_code == 200
-        assert notifications.json()["notifications"][0]["title"] == "Agency completed: Agency bridge"
+        assert (
+            notifications.json()["notifications"][0]["title"] == "Agency completed: Agency bridge"
+        )
+
+
+def test_proactive_open_job_check_creates_attention_notification_and_acknowledges_both(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 4, 30, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr("ariel.app._utcnow", lambda: now)
+    monkeypatch.setattr("ariel.worker._utcnow", lambda: now)
+
+    with _build_client(postgres_url, DurableWorkflowAdapter()) as client:
+        _seed_job(client, job_id="job_proactive_ack", status="waiting_approval", now=now)
+
+        created = client.post(
+            "/v1/proactive/subscriptions",
+            json={
+                "source_type": "open_jobs",
+                "label": "Open job review",
+                "check_interval_seconds": 3600,
+            },
+        )
+        assert created.status_code == 200
+        subscription_id = created.json()["subscription"]["id"]
+
+        settings = cast(Any, AppSettings)(_env_file=None)
+        assert process_one_task(
+            session_factory=_session_factory(client),
+            settings=settings,
+            worker_id="worker-proactive",
+        )
+
+        attention = client.get("/v1/attention-items", params={"status": "notified"})
+        assert attention.status_code == 200
+        attention_item = attention.json()["attention_items"][0]
+        assert attention_item["subscription_id"] == subscription_id
+        assert attention_item["source_type"] == "job"
+        assert attention_item["priority"] == "high"
+        assert attention_item["evidence"]["job_id"] == "job_proactive_ack"
+
+        checks = client.get(f"/v1/proactive/subscriptions/{subscription_id}/checks")
+        assert checks.status_code == 200
+        assert checks.json()["check_runs"][0]["status"] == "succeeded"
+        assert checks.json()["check_runs"][0]["created_attention_count"] == 1
+
+        notifications = client.get("/v1/notifications")
+        assert notifications.status_code == 200
+        notification = notifications.json()["notifications"][0]
+        assert notification["source_type"] == "attention_item"
+        assert notification["payload"]["attention_item_id"] == attention_item["id"]
+
+        acked = client.post(f"/v1/notifications/{notification['id']}/ack")
+        assert acked.status_code == 200
+
+        item_after_ack = client.get(f"/v1/attention-items/{attention_item['id']}")
+        assert item_after_ack.status_code == 200
+        assert item_after_ack.json()["attention_item"]["status"] == "acknowledged"
+
+        events = client.get(f"/v1/attention-items/{attention_item['id']}/events")
+        assert events.status_code == 200
+        assert [event["event_type"] for event in events.json()["events"]] == [
+            "detected",
+            "notified",
+            "acknowledged",
+        ]
+
+
+def test_attention_item_snooze_schedules_durable_follow_up(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 4, 30, 13, 0, tzinfo=UTC)
+    snooze_until = now + timedelta(days=1)
+    monkeypatch.setattr("ariel.app._utcnow", lambda: now)
+    monkeypatch.setattr("ariel.worker._utcnow", lambda: now)
+
+    with _build_client(postgres_url, DurableWorkflowAdapter()) as client:
+        _seed_job(client, job_id="job_proactive_snooze", status="waiting_approval", now=now)
+        created = client.post(
+            "/v1/proactive/subscriptions",
+            json={
+                "source_type": "open_jobs",
+                "label": "Open job snooze",
+                "check_interval_seconds": 3600,
+            },
+        )
+        assert created.status_code == 200
+
+        settings = cast(Any, AppSettings)(_env_file=None)
+        assert process_one_task(
+            session_factory=_session_factory(client),
+            settings=settings,
+            worker_id="worker-proactive",
+        )
+
+        attention_item_id = client.get("/v1/attention-items", params={"status": "notified"}).json()[
+            "attention_items"
+        ][0]["id"]
+        snoozed = client.post(
+            f"/v1/attention-items/{attention_item_id}/snooze",
+            json={"snooze_until": snooze_until.isoformat()},
+        )
+        assert snoozed.status_code == 200
+        assert snoozed.json()["attention_item"]["status"] == "snoozed"
+
+        with _session_factory(client)() as db:
+            with db.begin():
+                db.execute(
+                    text(
+                        "UPDATE background_tasks "
+                        "SET status = 'completed' "
+                        "WHERE status = 'pending' "
+                        "AND task_type IN ('deliver_discord_notification', 'proactive_check_due')"
+                    )
+                )
+
+        monkeypatch.setattr("ariel.worker._utcnow", lambda: snooze_until + timedelta(seconds=1))
+        assert process_one_task(
+            session_factory=_session_factory(client),
+            settings=settings,
+            worker_id="worker-proactive",
+        )
+
+        item_after_follow_up = client.get(f"/v1/attention-items/{attention_item_id}")
+        assert item_after_follow_up.status_code == 200
+        assert item_after_follow_up.json()["attention_item"]["status"] == "notified"
+        assert item_after_follow_up.json()["attention_item"]["next_follow_up_after"] is None
+
+        notifications = client.get("/v1/notifications")
+        assert notifications.status_code == 200
+        assert [
+            notification["status"] for notification in notifications.json()["notifications"]
+        ] == [
+            "pending",
+            "acknowledged",
+        ]

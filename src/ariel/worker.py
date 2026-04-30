@@ -20,6 +20,7 @@ from .persistence import (
     NotificationRecord,
     SessionRecord,
 )
+from .proactivity import process_attention_item_follow_up_due, process_proactive_check_due
 from .redaction import safe_failure_reason
 
 
@@ -157,6 +158,20 @@ def process_one_task(
                                 resolved_settings.worker_heartbeat_timeout_seconds
                             ),
                         )
+            case "proactive_check_due":
+                process_proactive_check_due(
+                    session_factory=session_factory,
+                    task_payload=task_payload,
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+            case "attention_item_follow_up_due":
+                process_attention_item_follow_up_due(
+                    session_factory=session_factory,
+                    task_payload=task_payload,
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
             case _:
                 raise RuntimeError(f"unsupported task type: {task_type}")
     except Exception as exc:
@@ -223,7 +238,7 @@ def _mark_task_failed(
             task.error = error
             task.claimed_by = None
             task.last_heartbeat = None
-            task.run_after = now + timedelta(seconds=min(300, 2**max(task.attempts - 1, 0)))
+            task.run_after = now + timedelta(seconds=min(300, 2 ** max(task.attempts - 1, 0)))
             task.updated_at = now
 
 
@@ -421,12 +436,10 @@ def _deliver_discord_notification(
             content = f"**{notification.title}**\n{notification.body}"
             payload = notification.payload if isinstance(notification.payload, dict) else {}
             job_id = payload.get("job_id")
+            attention_item_id = payload.get("attention_item_id")
             job = (
                 db.scalar(
-                    select(JobRecord)
-                    .where(JobRecord.id == job_id)
-                    .with_for_update()
-                    .limit(1)
+                    select(JobRecord).where(JobRecord.id == job_id).with_for_update().limit(1)
                 )
                 if isinstance(job_id, str)
                 else None
@@ -492,6 +505,9 @@ def _deliver_discord_notification(
                     "components": _discord_notification_components(
                         notification_id=notification_id,
                         job_id=job.id if job is not None else None,
+                        attention_item_id=attention_item_id
+                        if isinstance(attention_item_id, str)
+                        else None,
                     ),
                 },
                 timeout=settings.discord_notification_timeout_seconds,
@@ -523,10 +539,7 @@ def _deliver_discord_notification(
             job_id = payload.get("job_id")
             job = (
                 db.scalar(
-                    select(JobRecord)
-                    .where(JobRecord.id == job_id)
-                    .with_for_update()
-                    .limit(1)
+                    select(JobRecord).where(JobRecord.id == job_id).with_for_update().limit(1)
                 )
                 if isinstance(job_id, str)
                 else None
@@ -566,6 +579,7 @@ def _discord_notification_components(
     *,
     notification_id: str,
     job_id: str | None,
+    attention_item_id: str | None,
 ) -> list[dict[str, Any]]:
     buttons: list[dict[str, Any]] = []
     if job_id is not None:
@@ -577,6 +591,40 @@ def _discord_notification_components(
                 "custom_id": f"ariel:job:refresh:{job_id}",
             }
         )
+    if attention_item_id is not None:
+        buttons.append(
+            {
+                "type": 2,
+                "style": 1,
+                "label": "Acknowledge",
+                "custom_id": f"ariel:attention:ack:{attention_item_id}",
+            }
+        )
+        buttons.append(
+            {
+                "type": 2,
+                "style": 2,
+                "label": "Snooze",
+                "custom_id": f"ariel:attention:snooze:{attention_item_id}",
+            }
+        )
+        buttons.append(
+            {
+                "type": 2,
+                "style": 2,
+                "label": "Resolve",
+                "custom_id": f"ariel:attention:resolve:{attention_item_id}",
+            }
+        )
+        buttons.append(
+            {
+                "type": 2,
+                "style": 2,
+                "label": "Refresh",
+                "custom_id": f"ariel:attention:refresh:{attention_item_id}",
+            }
+        )
+        return [{"type": 1, "components": buttons}]
     buttons.append(
         {
             "type": 2,

@@ -121,6 +121,10 @@ ARIEL_WORKER_POLL_SECONDS=1.0
 ARIEL_WORKER_HEARTBEAT_TIMEOUT_SECONDS=300
 ```
 
+The same `ariel-worker` service owns proactive subscription checks, attention-item
+follow-ups, approval expiry, Agency event ingestion, and Discord notification delivery.
+There is no separate scheduler process.
+
 Set provider keys only for enabled capabilities:
 
 ```sh
@@ -197,6 +201,19 @@ make verify
 8. Start one approval-required `cap.agency.run` smoke task in an allowed repo.
 
 ## Health Checks
+
+Inspect proactive state through the typed API:
+
+```sh
+curl -s http://127.0.0.1:8000/v1/proactive/subscriptions
+curl -s http://127.0.0.1:8000/v1/attention-items
+```
+
+Force a subscription check only through the explicit mutation endpoint:
+
+```sh
+curl -X POST http://127.0.0.1:8000/v1/proactive/subscriptions/<subscription_id>/check
+```
 
 System health:
 

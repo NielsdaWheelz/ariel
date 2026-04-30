@@ -65,6 +65,22 @@ sends no visible assistant text.
 `/ariel` and `/ask` are gone. `/status`, `/jobs`, `/memory`, and `/capture` are
 deterministic operational commands only and do not route free-form prompts to the model.
 
+## proactive attention
+
+The durable worker owns proactive checks and follow-ups. Subscriptions are explicit API
+records, checks create deduped attention items, and Discord notifications carry
+acknowledge, snooze, resolve, and refresh buttons.
+
+Core inspection and mutation routes:
+
+- `POST /v1/proactive/subscriptions`
+- `GET /v1/proactive/subscriptions`
+- `POST /v1/proactive/subscriptions/{subscription_id}/check`
+- `GET /v1/proactive/subscriptions/{subscription_id}/checks`
+- `GET /v1/attention-items`
+- `GET /v1/attention-items/{attention_item_id}/events`
+- `POST /v1/attention-items/{attention_item_id}/ack|snooze|resolve|cancel|refresh`
+
 ## verification gates
 
 ```bash

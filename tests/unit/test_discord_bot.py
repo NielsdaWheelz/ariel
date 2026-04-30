@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, cast
+from datetime import datetime, timezone, tzinfo
+from typing import Any, Self, cast
 
 import discord
 from fastapi.testclient import TestClient
@@ -15,17 +16,22 @@ from ariel.discord_bot import (
     ArielDiscordError,
     ArielActionView,
     ack_notification,
+    ack_attention_item,
     decide_approval,
     DiscordBotConfigError,
     configured_discord_bot,
     create_discord_bot,
     format_discord_message,
     get_status,
+    refresh_attention_item,
     list_jobs,
     list_memory,
     record_capture,
     refresh_job,
+    resolve_attention_item,
+    snooze_attention_item,
     submit_discord_turn,
+    _is_ariel_custom_id,
 )
 
 
@@ -697,6 +703,167 @@ def test_ack_notification_posts_ack_and_returns_job_id(
     ]
 
 
+def test_ack_attention_item_posts_ack(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_clients: list[FakeHttpClient] = []
+
+    def fake_client(*, timeout: float) -> FakeHttpClient:
+        assert timeout == 60.0
+        client = FakeHttpClient(
+            responses=[
+                httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "attention_item": {
+                            "id": "ati_123",
+                            "title": "Review inbox conflict",
+                        },
+                    },
+                )
+            ]
+        )
+        fake_clients.append(client)
+        return client
+
+    monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
+
+    message = ack_attention_item(
+        ariel_base_url="http://127.0.0.1:8000",
+        attention_item_id="ati_123",
+    )
+
+    assert message == "Attention item acknowledged: Review inbox conflict (ati_123)"
+    assert fake_clients[0].calls == [
+        {
+            "method": "POST",
+            "url": "http://127.0.0.1:8000/v1/attention-items/ati_123/ack",
+            "headers": None,
+            "json": {},
+        }
+    ]
+
+
+def test_snooze_attention_item_posts_24_hour_snooze(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_clients: list[FakeHttpClient] = []
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> Self:
+            assert tz is timezone.utc
+            return cls(2026, 4, 30, 12, 0, tzinfo=timezone.utc)
+
+    def fake_client(*, timeout: float) -> FakeHttpClient:
+        assert timeout == 60.0
+        client = FakeHttpClient(
+            responses=[
+                httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "attention_item": {
+                            "id": "ati_123",
+                            "title": "Review inbox conflict",
+                        },
+                    },
+                )
+            ]
+        )
+        fake_clients.append(client)
+        return client
+
+    monkeypatch.setattr("ariel.discord_bot.datetime", FrozenDateTime)
+    monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
+
+    message = snooze_attention_item(
+        ariel_base_url="http://127.0.0.1:8000",
+        attention_item_id="ati_123",
+    )
+
+    assert message == "Attention item snoozed: Review inbox conflict (ati_123)"
+    assert fake_clients[0].calls == [
+        {
+            "method": "POST",
+            "url": "http://127.0.0.1:8000/v1/attention-items/ati_123/snooze",
+            "headers": None,
+            "json": {"snooze_until": "2026-05-01T12:00:00+00:00"},
+        }
+    ]
+
+
+def test_resolve_attention_item_posts_resolve(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_clients: list[FakeHttpClient] = []
+
+    def fake_client(*, timeout: float) -> FakeHttpClient:
+        assert timeout == 60.0
+        client = FakeHttpClient(
+            responses=[
+                httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "attention_item": {
+                            "id": "ati_123",
+                            "reason": "Calendar conflict was handled",
+                        },
+                    },
+                )
+            ]
+        )
+        fake_clients.append(client)
+        return client
+
+    monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
+
+    message = resolve_attention_item(
+        ariel_base_url="http://127.0.0.1:8000",
+        attention_item_id="ati_123",
+    )
+
+    assert message == "Attention item resolved: Calendar conflict was handled (ati_123)"
+    assert fake_clients[0].calls[0]["url"] == (
+        "http://127.0.0.1:8000/v1/attention-items/ati_123/resolve"
+    )
+    assert fake_clients[0].calls[0]["json"] == {}
+
+
+def test_refresh_attention_item_posts_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_clients: list[FakeHttpClient] = []
+
+    def fake_client(*, timeout: float) -> FakeHttpClient:
+        assert timeout == 60.0
+        client = FakeHttpClient(
+            responses=[
+                httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "attention_item": {
+                            "id": "ati_123",
+                            "title": "Review inbox conflict",
+                        },
+                    },
+                )
+            ]
+        )
+        fake_clients.append(client)
+        return client
+
+    monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
+
+    message = refresh_attention_item(
+        ariel_base_url="http://127.0.0.1:8000",
+        attention_item_id="ati_123",
+    )
+
+    assert message == "Attention item refreshed: Review inbox conflict (ati_123)"
+    assert fake_clients[0].calls[0]["url"] == (
+        "http://127.0.0.1:8000/v1/attention-items/ati_123/refresh"
+    )
+    assert fake_clients[0].calls[0]["json"] == {}
+
+
 def test_status_command_fetches_only_deterministic_ops_endpoints(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -948,6 +1115,42 @@ def test_action_view_uses_custom_ids_for_job_refresh_and_notification_ack() -> N
     ]
 
 
+def test_action_view_uses_custom_ids_for_attention_item_actions() -> None:
+    view = ArielActionView(
+        ariel_base_url="http://127.0.0.1:8000",
+        attention_item_id="ati_123",
+        allowed_user_id=3,
+    )
+
+    custom_ids = [cast(Any, item).custom_id for item in view.children]
+    assert custom_ids == [
+        "ariel:attention:ack:ati_123",
+        "ariel:attention:snooze:ati_123",
+        "ariel:attention:resolve:ati_123",
+        "ariel:attention:refresh:ati_123",
+    ]
+
+
+@pytest.mark.parametrize(
+    "custom_id",
+    [
+        "ariel:approval:approve:apr_123",
+        "ariel:job:refresh:job_123",
+        "ariel:notification:ack:ntf_123",
+        "ariel:attention:ack:ati_123",
+        "ariel:attention:snooze:ati_123",
+        "ariel:attention:resolve:ati_123",
+        "ariel:attention:refresh:ati_123",
+    ],
+)
+def test_is_ariel_custom_id_recognizes_supported_action_prefixes(custom_id: str) -> None:
+    assert _is_ariel_custom_id(custom_id) is True
+
+
+def test_is_ariel_custom_id_rejects_unknown_attention_action() -> None:
+    assert _is_ariel_custom_id("ariel:attention:delete:ati_123") is False
+
+
 def test_on_interaction_handles_approval_custom_id(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[dict[str, Any]] = []
 
@@ -984,6 +1187,82 @@ def test_on_interaction_handles_approval_custom_id(monkeypatch: pytest.MonkeyPat
     ]
     assert interaction.response.edits[0]["content"] == "Approval approved: apr_123"
     assert interaction.response.edits[0]["view"] is None
+
+
+@pytest.mark.parametrize(
+    ("custom_id", "function_name", "expected_content", "expected_view"),
+    [
+        (
+            "ariel:attention:ack:ati_123",
+            "ack_attention_item",
+            "Attention item acknowledged: ati_123",
+            None,
+        ),
+        (
+            "ariel:attention:snooze:ati_123",
+            "snooze_attention_item",
+            "Attention item snoozed: ati_123",
+            None,
+        ),
+        (
+            "ariel:attention:resolve:ati_123",
+            "resolve_attention_item",
+            "Attention item resolved: ati_123",
+            None,
+        ),
+        (
+            "ariel:attention:refresh:ati_123",
+            "refresh_attention_item",
+            "Attention item refreshed: ati_123",
+            "refresh_view",
+        ),
+    ],
+)
+def test_on_interaction_handles_attention_item_custom_ids(
+    monkeypatch: pytest.MonkeyPatch,
+    custom_id: str,
+    function_name: str,
+    expected_content: str,
+    expected_view: str | None,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_attention_action(*, ariel_base_url: str, attention_item_id: str) -> str:
+        calls.append(
+            {
+                "ariel_base_url": ariel_base_url,
+                "attention_item_id": attention_item_id,
+                "function_name": function_name,
+            }
+        )
+        return expected_content
+
+    monkeypatch.setattr(f"ariel.discord_bot.{function_name}", fake_attention_action)
+    bot = _bot()
+    interaction = FakeInteraction(custom_id=custom_id, channel_id=88)
+
+    _send_interaction(bot, interaction)
+
+    assert calls == [
+        {
+            "ariel_base_url": "http://127.0.0.1:8000",
+            "attention_item_id": "ati_123",
+            "function_name": function_name,
+        }
+    ]
+    assert interaction.response.edits[0]["content"] == expected_content
+    if expected_view is None:
+        assert interaction.response.edits[0]["view"] is None
+    else:
+        view = interaction.response.edits[0]["view"]
+        assert view is not None
+        custom_ids = [cast(Any, item).custom_id for item in view.children]
+        assert custom_ids == [
+            "ariel:attention:ack:ati_123",
+            "ariel:attention:snooze:ati_123",
+            "ariel:attention:resolve:ati_123",
+            "ariel:attention:refresh:ati_123",
+        ]
 
 
 def test_on_interaction_rejects_wrong_user() -> None:

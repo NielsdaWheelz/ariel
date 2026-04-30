@@ -66,22 +66,31 @@ from ariel.persistence import (
     ActionAttemptRecord,
     ApprovalRequestRecord,
     AgencyEventRecord,
+    AttentionItemEventRecord,
+    AttentionItemRecord,
+    BackgroundTaskRecord,
     CaptureRecord,
     EventRecord,
     ArtifactRecord,
     JobEventRecord,
     JobRecord,
     NotificationRecord,
+    ProactiveCheckRunRecord,
+    ProactiveSubscriptionRecord,
     SessionRecord,
     SessionRotationRecord,
     TurnIdempotencyRecord,
     TurnRecord,
+    serialize_attention_item,
+    serialize_attention_item_event,
     serialize_capture,
     serialize_artifact,
     serialize_action_attempt,
     serialize_agency_event,
     serialize_job,
     serialize_job_event,
+    serialize_proactive_check_run,
+    serialize_proactive_subscription,
     serialize_session,
     serialize_notification,
     serialize_turn,
@@ -90,12 +99,18 @@ from ariel.persistence import (
 from ariel.redaction import redact_text, safe_failure_reason
 from ariel.response_contracts import (
     ResponseContractViolation,
+    build_surface_attention_item_event_list_response,
+    build_surface_attention_item_list_response,
+    build_surface_attention_item_response,
     build_surface_artifact_response,
     build_surface_approval_response,
     build_surface_capture_failure_response,
     build_surface_capture_success_response,
     build_surface_memory_response,
     build_surface_message_response,
+    build_surface_proactive_check_run_list_response,
+    build_surface_proactive_subscription_list_response,
+    build_surface_proactive_subscription_response,
     build_surface_rotation_list_response,
     build_surface_rotation_response,
     build_surface_timeline_response,
@@ -305,6 +320,46 @@ class AgencyEventRequest(BaseModel):
         if self.event_type != "heartbeat" and self.external_job_id is None:
             raise ValueError("external_job_id is required for job events")
         return self
+
+
+class ProactiveSubscriptionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_type: Literal[
+        "open_jobs",
+        "pending_approvals",
+        "memory_commitments",
+        "connector_health",
+        "quick_capture_review",
+        "calendar_watch",
+        "email_watch",
+        "drive_watch",
+    ]
+    label: str = Field(min_length=1, max_length=500)
+    check_interval_seconds: int = Field(default=3600, ge=60, le=2_592_000)
+    check_payload: dict[str, Any] = Field(default_factory=dict)
+    notification_policy: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("label")
+    @classmethod
+    def _label_must_not_be_blank(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("label must not be blank")
+        return normalized
+
+
+class AttentionSnoozeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    snooze_until: datetime
+
+    @field_validator("snooze_until")
+    @classmethod
+    def _snooze_until_must_have_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("snooze_until must include a timezone")
+        return value
 
 
 class WeatherDefaultLocationRequest(BaseModel):
@@ -1681,9 +1736,7 @@ def _build_turn_context_bundle(
         for turn in recent_turns
     ]
     discord_channel_recent_turns: list[dict[str, Any]] = []
-    discord_channel_id = (
-        discord_context.get("channel_id") if discord_context is not None else None
-    )
+    discord_channel_id = discord_context.get("channel_id") if discord_context is not None else None
     if isinstance(discord_channel_id, int):
         for turn in prior_turns:
             for event in turn.events:
@@ -1979,6 +2032,8 @@ def create_app(
                 "session_events": "/v1/sessions/{session_id}/events",
                 "approval_decisions": "/v1/approvals",
                 "agency_events": "/v1/agency/events",
+                "proactive_subscriptions": "/v1/proactive/subscriptions",
+                "attention_items": "/v1/attention-items",
                 "jobs": "/v1/jobs",
                 "capture_records": "/v1/captures/record",
                 "notifications": "/v1/notifications",
@@ -3907,6 +3962,593 @@ def create_app(
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
 
+    @app.post("/v1/proactive/subscriptions")
+    def create_proactive_subscription(
+        request: ProactiveSubscriptionRequest,
+    ) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                now = _utcnow()
+                subscription = ProactiveSubscriptionRecord(
+                    id=_new_id("psb"),
+                    source_type=request.source_type,
+                    label=request.label,
+                    status="active",
+                    check_interval_seconds=request.check_interval_seconds,
+                    next_run_after=now,
+                    last_checked_at=None,
+                    check_payload=request.check_payload,
+                    notification_policy=request.notification_policy,
+                    created_at=now,
+                    updated_at=now,
+                )
+                db.add(subscription)
+                db.flush()
+                enqueue_background_task(
+                    db,
+                    task_type="proactive_check_due",
+                    payload={
+                        "subscription_id": subscription.id,
+                        "scheduled_for": to_rfc3339(now),
+                    },
+                    now=now,
+                )
+                try:
+                    return build_surface_proactive_subscription_response(
+                        subscription=serialize_proactive_subscription(subscription)
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/proactive/subscriptions")
+    def get_proactive_subscriptions(limit: int = 50) -> dict[str, Any]:
+        _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 200))
+        with session_factory() as db:
+            with db.begin():
+                subscriptions = db.scalars(
+                    select(ProactiveSubscriptionRecord)
+                    .order_by(
+                        ProactiveSubscriptionRecord.updated_at.desc(),
+                        ProactiveSubscriptionRecord.id.desc(),
+                    )
+                    .limit(bounded_limit)
+                ).all()
+                try:
+                    return build_surface_proactive_subscription_list_response(
+                        subscriptions=[
+                            serialize_proactive_subscription(subscription)
+                            for subscription in subscriptions
+                        ]
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.post("/v1/proactive/subscriptions/{subscription_id}/check")
+    def check_proactive_subscription(subscription_id: str) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                subscription = db.scalar(
+                    select(ProactiveSubscriptionRecord)
+                    .where(ProactiveSubscriptionRecord.id == subscription_id)
+                    .with_for_update()
+                    .limit(1)
+                )
+                if subscription is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_PROACTIVE_SUBSCRIPTION_NOT_FOUND",
+                        message="proactive subscription not found",
+                        details={"subscription_id": subscription_id},
+                        retryable=False,
+                    )
+                if subscription.status != "active":
+                    raise ApiError(
+                        status_code=409,
+                        code="E_PROACTIVE_SUBSCRIPTION_NOT_ACTIVE",
+                        message="proactive subscription is not active",
+                        details={
+                            "subscription_id": subscription_id,
+                            "status": subscription.status,
+                        },
+                        retryable=False,
+                    )
+                now = _utcnow()
+                subscription.next_run_after = now
+                subscription.updated_at = now
+                enqueue_background_task(
+                    db,
+                    task_type="proactive_check_due",
+                    payload={
+                        "subscription_id": subscription.id,
+                        "scheduled_for": to_rfc3339(now),
+                    },
+                    now=now,
+                )
+                try:
+                    return build_surface_proactive_subscription_response(
+                        subscription=serialize_proactive_subscription(subscription)
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/proactive/subscriptions/{subscription_id}/checks")
+    def get_proactive_check_runs(subscription_id: str, limit: int = 50) -> dict[str, Any]:
+        _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 200))
+        with session_factory() as db:
+            with db.begin():
+                subscription = db.scalar(
+                    select(ProactiveSubscriptionRecord)
+                    .where(ProactiveSubscriptionRecord.id == subscription_id)
+                    .limit(1)
+                )
+                if subscription is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_PROACTIVE_SUBSCRIPTION_NOT_FOUND",
+                        message="proactive subscription not found",
+                        details={"subscription_id": subscription_id},
+                        retryable=False,
+                    )
+                check_runs = db.scalars(
+                    select(ProactiveCheckRunRecord)
+                    .where(ProactiveCheckRunRecord.subscription_id == subscription_id)
+                    .order_by(
+                        ProactiveCheckRunRecord.scheduled_for.desc(),
+                        ProactiveCheckRunRecord.id.desc(),
+                    )
+                    .limit(bounded_limit)
+                ).all()
+                try:
+                    return build_surface_proactive_check_run_list_response(
+                        subscription_id=subscription_id,
+                        check_runs=[
+                            serialize_proactive_check_run(check_run) for check_run in check_runs
+                        ],
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/attention-items")
+    def get_attention_items(
+        status: Literal[
+            "open",
+            "notified",
+            "acknowledged",
+            "snoozed",
+            "resolved",
+            "expired",
+            "cancelled",
+            "superseded",
+        ]
+        | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 200))
+        with session_factory() as db:
+            with db.begin():
+                query = select(AttentionItemRecord)
+                if status is not None:
+                    query = query.where(AttentionItemRecord.status == status)
+                attention_items = db.scalars(
+                    query.order_by(
+                        AttentionItemRecord.updated_at.desc(),
+                        AttentionItemRecord.id.desc(),
+                    ).limit(bounded_limit)
+                ).all()
+                try:
+                    return build_surface_attention_item_list_response(
+                        attention_items=[
+                            serialize_attention_item(attention_item)
+                            for attention_item in attention_items
+                        ]
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/attention-items/{attention_item_id}")
+    def get_attention_item(attention_item_id: str) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                attention_item = db.scalar(
+                    select(AttentionItemRecord)
+                    .where(AttentionItemRecord.id == attention_item_id)
+                    .limit(1)
+                )
+                if attention_item is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_ATTENTION_ITEM_NOT_FOUND",
+                        message="attention item not found",
+                        details={"attention_item_id": attention_item_id},
+                        retryable=False,
+                    )
+                try:
+                    return build_surface_attention_item_response(
+                        attention_item=serialize_attention_item(attention_item)
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/attention-items/{attention_item_id}/events")
+    def get_attention_item_events(attention_item_id: str, limit: int = 50) -> dict[str, Any]:
+        _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 200))
+        with session_factory() as db:
+            with db.begin():
+                attention_item = db.scalar(
+                    select(AttentionItemRecord)
+                    .where(AttentionItemRecord.id == attention_item_id)
+                    .limit(1)
+                )
+                if attention_item is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_ATTENTION_ITEM_NOT_FOUND",
+                        message="attention item not found",
+                        details={"attention_item_id": attention_item_id},
+                        retryable=False,
+                    )
+                events = db.scalars(
+                    select(AttentionItemEventRecord)
+                    .where(AttentionItemEventRecord.attention_item_id == attention_item_id)
+                    .order_by(
+                        AttentionItemEventRecord.created_at.asc(),
+                        AttentionItemEventRecord.id.asc(),
+                    )
+                    .limit(bounded_limit)
+                ).all()
+                try:
+                    return build_surface_attention_item_event_list_response(
+                        attention_item_id=attention_item_id,
+                        events=[serialize_attention_item_event(event) for event in events],
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.post("/v1/attention-items/{attention_item_id}/ack")
+    def ack_attention_item(attention_item_id: str) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                attention_item = db.scalar(
+                    select(AttentionItemRecord)
+                    .where(AttentionItemRecord.id == attention_item_id)
+                    .with_for_update()
+                    .limit(1)
+                )
+                if attention_item is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_ATTENTION_ITEM_NOT_FOUND",
+                        message="attention item not found",
+                        details={"attention_item_id": attention_item_id},
+                        retryable=False,
+                    )
+                if attention_item.status not in {"open", "notified", "snoozed", "acknowledged"}:
+                    raise ApiError(
+                        status_code=409,
+                        code="E_ATTENTION_ITEM_NOT_ACTIONABLE",
+                        message="attention item is not actionable",
+                        details={
+                            "attention_item_id": attention_item_id,
+                            "status": attention_item.status,
+                        },
+                        retryable=False,
+                    )
+                now = _utcnow()
+                if attention_item.status != "acknowledged":
+                    attention_item.status = "acknowledged"
+                    attention_item.next_follow_up_after = None
+                    attention_item.updated_at = now
+                    db.add(
+                        AttentionItemEventRecord(
+                            id=_new_id("aie"),
+                            attention_item_id=attention_item.id,
+                            event_type="acknowledged",
+                            payload={},
+                            created_at=now,
+                        )
+                    )
+                notifications = db.scalars(
+                    select(NotificationRecord)
+                    .where(
+                        NotificationRecord.source_type == "attention_item",
+                        NotificationRecord.source_id == attention_item.id,
+                        NotificationRecord.status != "acknowledged",
+                    )
+                    .with_for_update()
+                ).all()
+                for notification in notifications:
+                    notification.status = "acknowledged"
+                    notification.acked_at = now
+                    notification.updated_at = now
+                try:
+                    return build_surface_attention_item_response(
+                        attention_item=serialize_attention_item(attention_item)
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.post("/v1/attention-items/{attention_item_id}/snooze")
+    def snooze_attention_item(
+        attention_item_id: str,
+        request: AttentionSnoozeRequest,
+    ) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                attention_item = db.scalar(
+                    select(AttentionItemRecord)
+                    .where(AttentionItemRecord.id == attention_item_id)
+                    .with_for_update()
+                    .limit(1)
+                )
+                if attention_item is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_ATTENTION_ITEM_NOT_FOUND",
+                        message="attention item not found",
+                        details={"attention_item_id": attention_item_id},
+                        retryable=False,
+                    )
+                if attention_item.status not in {"open", "notified", "snoozed"}:
+                    raise ApiError(
+                        status_code=409,
+                        code="E_ATTENTION_ITEM_NOT_ACTIONABLE",
+                        message="attention item is not actionable",
+                        details={
+                            "attention_item_id": attention_item_id,
+                            "status": attention_item.status,
+                        },
+                        retryable=False,
+                    )
+                now = _utcnow()
+                snooze_until = request.snooze_until.astimezone(UTC)
+                if snooze_until <= now:
+                    raise ApiError(
+                        status_code=422,
+                        code="E_ATTENTION_SNOOZE_IN_PAST",
+                        message="snooze_until must be in the future",
+                        details={"attention_item_id": attention_item_id},
+                        retryable=False,
+                    )
+                attention_item.status = "snoozed"
+                attention_item.next_follow_up_after = snooze_until
+                attention_item.updated_at = now
+                db.add(
+                    AttentionItemEventRecord(
+                        id=_new_id("aie"),
+                        attention_item_id=attention_item.id,
+                        event_type="snoozed",
+                        payload={"snooze_until": to_rfc3339(snooze_until)},
+                        created_at=now,
+                    )
+                )
+                db.add(
+                    BackgroundTaskRecord(
+                        id=_new_id("tsk"),
+                        task_type="attention_item_follow_up_due",
+                        payload={
+                            "attention_item_id": attention_item.id,
+                            "scheduled_for": to_rfc3339(snooze_until),
+                        },
+                        status="pending",
+                        attempts=0,
+                        max_attempts=3,
+                        error=None,
+                        claimed_by=None,
+                        run_after=snooze_until,
+                        last_heartbeat=None,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                db.add(
+                    AttentionItemEventRecord(
+                        id=_new_id("aie"),
+                        attention_item_id=attention_item.id,
+                        event_type="follow_up_queued",
+                        payload={"scheduled_for": to_rfc3339(snooze_until)},
+                        created_at=now,
+                    )
+                )
+                notifications = db.scalars(
+                    select(NotificationRecord)
+                    .where(
+                        NotificationRecord.source_type == "attention_item",
+                        NotificationRecord.source_id == attention_item.id,
+                        NotificationRecord.status != "acknowledged",
+                    )
+                    .with_for_update()
+                ).all()
+                for notification in notifications:
+                    notification.status = "acknowledged"
+                    notification.acked_at = now
+                    notification.updated_at = now
+                try:
+                    return build_surface_attention_item_response(
+                        attention_item=serialize_attention_item(attention_item)
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.post("/v1/attention-items/{attention_item_id}/resolve")
+    def resolve_attention_item(attention_item_id: str) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                attention_item = db.scalar(
+                    select(AttentionItemRecord)
+                    .where(AttentionItemRecord.id == attention_item_id)
+                    .with_for_update()
+                    .limit(1)
+                )
+                if attention_item is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_ATTENTION_ITEM_NOT_FOUND",
+                        message="attention item not found",
+                        details={"attention_item_id": attention_item_id},
+                        retryable=False,
+                    )
+                if attention_item.status not in {"open", "notified", "snoozed", "acknowledged"}:
+                    raise ApiError(
+                        status_code=409,
+                        code="E_ATTENTION_ITEM_NOT_ACTIONABLE",
+                        message="attention item is not actionable",
+                        details={
+                            "attention_item_id": attention_item_id,
+                            "status": attention_item.status,
+                        },
+                        retryable=False,
+                    )
+                now = _utcnow()
+                attention_item.status = "resolved"
+                attention_item.next_follow_up_after = None
+                attention_item.updated_at = now
+                db.add(
+                    AttentionItemEventRecord(
+                        id=_new_id("aie"),
+                        attention_item_id=attention_item.id,
+                        event_type="resolved",
+                        payload={},
+                        created_at=now,
+                    )
+                )
+                notifications = db.scalars(
+                    select(NotificationRecord)
+                    .where(
+                        NotificationRecord.source_type == "attention_item",
+                        NotificationRecord.source_id == attention_item.id,
+                        NotificationRecord.status != "acknowledged",
+                    )
+                    .with_for_update()
+                ).all()
+                for notification in notifications:
+                    notification.status = "acknowledged"
+                    notification.acked_at = now
+                    notification.updated_at = now
+                try:
+                    return build_surface_attention_item_response(
+                        attention_item=serialize_attention_item(attention_item)
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.post("/v1/attention-items/{attention_item_id}/cancel")
+    def cancel_attention_item(attention_item_id: str) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                attention_item = db.scalar(
+                    select(AttentionItemRecord)
+                    .where(AttentionItemRecord.id == attention_item_id)
+                    .with_for_update()
+                    .limit(1)
+                )
+                if attention_item is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_ATTENTION_ITEM_NOT_FOUND",
+                        message="attention item not found",
+                        details={"attention_item_id": attention_item_id},
+                        retryable=False,
+                    )
+                if attention_item.status in {"resolved", "expired", "cancelled", "superseded"}:
+                    raise ApiError(
+                        status_code=409,
+                        code="E_ATTENTION_ITEM_NOT_ACTIONABLE",
+                        message="attention item is not actionable",
+                        details={
+                            "attention_item_id": attention_item_id,
+                            "status": attention_item.status,
+                        },
+                        retryable=False,
+                    )
+                now = _utcnow()
+                attention_item.status = "cancelled"
+                attention_item.next_follow_up_after = None
+                attention_item.updated_at = now
+                db.add(
+                    AttentionItemEventRecord(
+                        id=_new_id("aie"),
+                        attention_item_id=attention_item.id,
+                        event_type="cancelled",
+                        payload={},
+                        created_at=now,
+                    )
+                )
+                try:
+                    return build_surface_attention_item_response(
+                        attention_item=serialize_attention_item(attention_item)
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.post("/v1/attention-items/{attention_item_id}/refresh")
+    def refresh_attention_item(attention_item_id: str) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                attention_item = db.scalar(
+                    select(AttentionItemRecord)
+                    .where(AttentionItemRecord.id == attention_item_id)
+                    .with_for_update()
+                    .limit(1)
+                )
+                if attention_item is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_ATTENTION_ITEM_NOT_FOUND",
+                        message="attention item not found",
+                        details={"attention_item_id": attention_item_id},
+                        retryable=False,
+                    )
+                if attention_item.status in {"resolved", "expired", "cancelled", "superseded"}:
+                    raise ApiError(
+                        status_code=409,
+                        code="E_ATTENTION_ITEM_NOT_ACTIONABLE",
+                        message="attention item is not actionable",
+                        details={
+                            "attention_item_id": attention_item_id,
+                            "status": attention_item.status,
+                        },
+                        retryable=False,
+                    )
+                now = _utcnow()
+                attention_item.updated_at = now
+                db.add(
+                    AttentionItemEventRecord(
+                        id=_new_id("aie"),
+                        attention_item_id=attention_item.id,
+                        event_type="refreshed",
+                        payload={},
+                        created_at=now,
+                    )
+                )
+                if attention_item.subscription_id is not None:
+                    enqueue_background_task(
+                        db,
+                        task_type="proactive_check_due",
+                        payload={
+                            "subscription_id": attention_item.subscription_id,
+                            "scheduled_for": to_rfc3339(now),
+                        },
+                        now=now,
+                    )
+                try:
+                    return build_surface_attention_item_response(
+                        attention_item=serialize_attention_item(attention_item)
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
     @app.get("/v1/jobs")
     def get_jobs(limit: int = 50) -> dict[str, Any]:
         _ensure_schema_ready()
@@ -4002,6 +4644,32 @@ def create_app(
                 notification.status = "acknowledged"
                 notification.acked_at = now
                 notification.updated_at = now
+                payload = notification.payload if isinstance(notification.payload, dict) else {}
+                attention_item_id = payload.get("attention_item_id")
+                if isinstance(attention_item_id, str):
+                    attention_item = db.scalar(
+                        select(AttentionItemRecord)
+                        .where(AttentionItemRecord.id == attention_item_id)
+                        .with_for_update()
+                        .limit(1)
+                    )
+                    if attention_item is not None and attention_item.status in {
+                        "open",
+                        "notified",
+                        "snoozed",
+                    }:
+                        attention_item.status = "acknowledged"
+                        attention_item.next_follow_up_after = None
+                        attention_item.updated_at = now
+                        db.add(
+                            AttentionItemEventRecord(
+                                id=_new_id("aie"),
+                                attention_item_id=attention_item.id,
+                                event_type="acknowledged",
+                                payload={"notification_id": notification.id},
+                                created_at=now,
+                            )
+                        )
                 return {"ok": True, "notification": serialize_notification(notification)}
 
     @app.get("/v1/artifacts/{artifact_id}")

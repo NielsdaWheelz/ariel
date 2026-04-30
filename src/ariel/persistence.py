@@ -989,6 +989,193 @@ class GoogleConnectorEventRecord(Base):
     connector: Mapped[GoogleConnectorRecord] = relationship(back_populates="events")
 
 
+class ProactiveSubscriptionRecord(Base):
+    __tablename__ = "proactive_subscriptions"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    label: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    check_interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    next_run_after: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    last_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    check_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    notification_policy: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            (
+                "source_type IN ('open_jobs', 'pending_approvals', 'memory_commitments', "
+                "'connector_health', 'quick_capture_review', 'calendar_watch', "
+                "'email_watch', 'drive_watch')"
+            ),
+            name="ck_proactive_subscription_source_type",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'paused', 'cancelled')",
+            name="ck_proactive_subscription_status",
+        ),
+        CheckConstraint(
+            "check_interval_seconds >= 60",
+            name="ck_proactive_subscription_interval_seconds",
+        ),
+        Index("ix_proactive_subscriptions_due", "status", "next_run_after", "id"),
+    )
+
+
+class ProactiveCheckRunRecord(Base):
+    __tablename__ = "proactive_check_runs"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    subscription_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("proactive_subscriptions.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    scheduled_for: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_attention_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "subscription_id",
+            "scheduled_for",
+            name="uq_proactive_check_run_subscription_window",
+        ),
+        CheckConstraint(
+            "status IN ('running', 'succeeded', 'failed')",
+            name="ck_proactive_check_run_status",
+        ),
+        CheckConstraint(
+            "created_attention_count >= 0",
+            name="ck_proactive_check_run_attention_count",
+        ),
+    )
+
+
+class AttentionItemRecord(Base):
+    __tablename__ = "attention_items"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    subscription_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("proactive_subscriptions.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    dedupe_key: Mapped[str] = mapped_column(String(160), nullable=False, unique=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    priority: Mapped[str] = mapped_column(String(32), nullable=False)
+    urgency: Mapped[str] = mapped_column(String(32), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    next_follow_up_after: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    last_notified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    events: Mapped[list["AttentionItemEventRecord"]] = relationship(back_populates="item")
+
+    __table_args__ = (
+        CheckConstraint(
+            (
+                "source_type IN ('job', 'approval_request', 'memory_assertion', "
+                "'google_connector', 'capture', 'calendar_watch', 'email_watch', "
+                "'drive_watch', 'manual_signal')"
+            ),
+            name="ck_attention_item_source_type",
+        ),
+        CheckConstraint(
+            (
+                "status IN ('open', 'notified', 'acknowledged', 'snoozed', 'resolved', "
+                "'expired', 'cancelled', 'superseded')"
+            ),
+            name="ck_attention_item_status",
+        ),
+        CheckConstraint(
+            "priority IN ('critical', 'high', 'normal', 'low')",
+            name="ck_attention_item_priority",
+        ),
+        CheckConstraint(
+            "urgency IN ('critical', 'high', 'normal', 'low')",
+            name="ck_attention_item_urgency",
+        ),
+        CheckConstraint(
+            "confidence >= 0.0 AND confidence <= 1.0",
+            name="ck_attention_item_confidence",
+        ),
+        Index("ix_attention_items_status_priority", "status", "priority", "updated_at"),
+        Index("ix_attention_items_follow_up_due", "status", "next_follow_up_after", "id"),
+        Index("ix_attention_items_source", "source_type", "source_id"),
+    )
+
+
+class AttentionItemEventRecord(Base):
+    __tablename__ = "attention_item_events"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    attention_item_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("attention_items.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    item: Mapped[AttentionItemRecord] = relationship(back_populates="events")
+
+    __table_args__ = (
+        CheckConstraint(
+            (
+                "event_type IN ('detected', 'updated', 'notified', 'acknowledged', "
+                "'snoozed', 'resolved', 'cancelled', 'expired', 'follow_up_queued', "
+                "'refreshed')"
+            ),
+            name="ck_attention_item_event_type",
+        ),
+    )
+
+
 class BackgroundTaskRecord(Base):
     __tablename__ = "background_tasks"
 
@@ -1017,7 +1204,8 @@ class BackgroundTaskRecord(Base):
         CheckConstraint(
             (
                 "task_type IN ('agency_event_received', 'deliver_discord_notification', "
-                "'expire_approvals', 'reap_stale_tasks')"
+                "'expire_approvals', 'reap_stale_tasks', 'proactive_check_due', "
+                "'attention_item_follow_up_due')"
             ),
             name="ck_background_task_type",
         ),
@@ -1188,7 +1376,10 @@ class NotificationRecord(Base):
     )
 
     __table_args__ = (
-        CheckConstraint("source_type IN ('agency_event')", name="ck_notification_source_type"),
+        CheckConstraint(
+            "source_type IN ('agency_event', 'attention_item', 'approval', 'connector_event')",
+            name="ck_notification_source_type",
+        ),
         CheckConstraint("channel IN ('discord')", name="ck_notification_channel"),
         CheckConstraint(
             "status IN ('pending', 'delivered', 'failed', 'acknowledged')",
@@ -1352,6 +1543,82 @@ def serialize_job_event(event: JobEventRecord) -> dict[str, Any]:
         "id": event.id,
         "job_id": event.job_id,
         "agency_event_id": event.agency_event_id,
+        "event_type": event.event_type,
+        "payload": redact_json_value(event.payload),
+        "created_at": to_rfc3339(event.created_at),
+    }
+
+
+def serialize_proactive_subscription(subscription: ProactiveSubscriptionRecord) -> dict[str, Any]:
+    return {
+        "id": subscription.id,
+        "source_type": subscription.source_type,
+        "label": redact_text(subscription.label),
+        "status": subscription.status,
+        "check_interval_seconds": subscription.check_interval_seconds,
+        "next_run_after": to_rfc3339(subscription.next_run_after),
+        "last_checked_at": (
+            to_rfc3339(subscription.last_checked_at)
+            if subscription.last_checked_at is not None
+            else None
+        ),
+        "check_payload": redact_json_value(subscription.check_payload),
+        "notification_policy": redact_json_value(subscription.notification_policy),
+        "created_at": to_rfc3339(subscription.created_at),
+        "updated_at": to_rfc3339(subscription.updated_at),
+    }
+
+
+def serialize_proactive_check_run(check_run: ProactiveCheckRunRecord) -> dict[str, Any]:
+    return {
+        "id": check_run.id,
+        "subscription_id": check_run.subscription_id,
+        "scheduled_for": to_rfc3339(check_run.scheduled_for),
+        "status": check_run.status,
+        "started_at": (
+            to_rfc3339(check_run.started_at) if check_run.started_at is not None else None
+        ),
+        "completed_at": (
+            to_rfc3339(check_run.completed_at) if check_run.completed_at is not None else None
+        ),
+        "created_attention_count": check_run.created_attention_count,
+        "error": redact_text(check_run.error) if check_run.error is not None else None,
+        "result_payload": redact_json_value(check_run.result_payload),
+        "created_at": to_rfc3339(check_run.created_at),
+    }
+
+
+def serialize_attention_item(item: AttentionItemRecord) -> dict[str, Any]:
+    return {
+        "id": item.id,
+        "subscription_id": item.subscription_id,
+        "source_type": item.source_type,
+        "source_id": item.source_id,
+        "dedupe_key": item.dedupe_key,
+        "status": item.status,
+        "priority": item.priority,
+        "urgency": item.urgency,
+        "confidence": item.confidence,
+        "title": redact_text(item.title),
+        "body": redact_text(item.body),
+        "reason": redact_text(item.reason),
+        "evidence": redact_json_value(item.evidence),
+        "expires_at": to_rfc3339(item.expires_at) if item.expires_at is not None else None,
+        "next_follow_up_after": (
+            to_rfc3339(item.next_follow_up_after) if item.next_follow_up_after is not None else None
+        ),
+        "last_notified_at": (
+            to_rfc3339(item.last_notified_at) if item.last_notified_at is not None else None
+        ),
+        "created_at": to_rfc3339(item.created_at),
+        "updated_at": to_rfc3339(item.updated_at),
+    }
+
+
+def serialize_attention_item_event(event: AttentionItemEventRecord) -> dict[str, Any]:
+    return {
+        "id": event.id,
+        "attention_item_id": event.attention_item_id,
         "event_type": event.event_type,
         "payload": redact_json_value(event.payload),
         "created_at": to_rfc3339(event.created_at),

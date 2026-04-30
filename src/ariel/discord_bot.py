@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 import logging
 from typing import Any
 
@@ -24,6 +25,10 @@ class ArielDiscordError(Exception):
 _APPROVAL_CUSTOM_ID_PREFIX = "ariel:approval:"
 _JOB_REFRESH_CUSTOM_ID_PREFIX = "ariel:job:refresh:"
 _NOTIFICATION_ACK_CUSTOM_ID_PREFIX = "ariel:notification:ack:"
+_ATTENTION_ACK_CUSTOM_ID_PREFIX = "ariel:attention:ack:"
+_ATTENTION_SNOOZE_CUSTOM_ID_PREFIX = "ariel:attention:snooze:"
+_ATTENTION_RESOLVE_CUSTOM_ID_PREFIX = "ariel:attention:resolve:"
+_ATTENTION_REFRESH_CUSTOM_ID_PREFIX = "ariel:attention:refresh:"
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +227,71 @@ def ack_notification(
     if not isinstance(notification, dict):
         raise ArielDiscordError("Ariel returned an invalid notification response.")
     return _format_notification_ack_for_discord(notification), _notification_job_id(notification)
+
+
+def ack_attention_item(
+    *,
+    ariel_base_url: str,
+    attention_item_id: str,
+) -> str:
+    with httpx.Client(timeout=60.0) as client:
+        response = client.post(
+            f"{ariel_base_url}/v1/attention-items/{attention_item_id}/ack",
+            json={},
+        )
+        payload = _json_response_payload(response)
+        if response.status_code >= 400 or payload.get("ok") is not True:
+            raise ArielDiscordError(_safe_ariel_error_message(payload))
+    return _format_attention_item_action_for_discord(payload, action="acknowledged")
+
+
+def snooze_attention_item(
+    *,
+    ariel_base_url: str,
+    attention_item_id: str,
+) -> str:
+    snooze_until = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+    with httpx.Client(timeout=60.0) as client:
+        response = client.post(
+            f"{ariel_base_url}/v1/attention-items/{attention_item_id}/snooze",
+            json={"snooze_until": snooze_until},
+        )
+        payload = _json_response_payload(response)
+        if response.status_code >= 400 or payload.get("ok") is not True:
+            raise ArielDiscordError(_safe_ariel_error_message(payload))
+    return _format_attention_item_action_for_discord(payload, action="snoozed")
+
+
+def resolve_attention_item(
+    *,
+    ariel_base_url: str,
+    attention_item_id: str,
+) -> str:
+    with httpx.Client(timeout=60.0) as client:
+        response = client.post(
+            f"{ariel_base_url}/v1/attention-items/{attention_item_id}/resolve",
+            json={},
+        )
+        payload = _json_response_payload(response)
+        if response.status_code >= 400 or payload.get("ok") is not True:
+            raise ArielDiscordError(_safe_ariel_error_message(payload))
+    return _format_attention_item_action_for_discord(payload, action="resolved")
+
+
+def refresh_attention_item(
+    *,
+    ariel_base_url: str,
+    attention_item_id: str,
+) -> str:
+    with httpx.Client(timeout=60.0) as client:
+        response = client.post(
+            f"{ariel_base_url}/v1/attention-items/{attention_item_id}/refresh",
+            json={},
+        )
+        payload = _json_response_payload(response)
+        if response.status_code >= 400 or payload.get("ok") is not True:
+            raise ArielDiscordError(_safe_ariel_error_message(payload))
+    return _format_attention_item_action_for_discord(payload, action="refreshed")
 
 
 class ArielDiscordBot(commands.Bot):
@@ -516,6 +586,43 @@ class ArielDiscordBot(commands.Bot):
                     allowed_user_id=self.ariel_user_id,
                 )
                 return
+        elif custom_id.startswith(_ATTENTION_ACK_CUSTOM_ID_PREFIX):
+            attention_item_id = custom_id.removeprefix(_ATTENTION_ACK_CUSTOM_ID_PREFIX)
+            if attention_item_id:
+                await _edit_with_attention_ack(
+                    interaction=interaction,
+                    ariel_base_url=self.ariel_base_url,
+                    attention_item_id=attention_item_id,
+                )
+                return
+        elif custom_id.startswith(_ATTENTION_SNOOZE_CUSTOM_ID_PREFIX):
+            attention_item_id = custom_id.removeprefix(_ATTENTION_SNOOZE_CUSTOM_ID_PREFIX)
+            if attention_item_id:
+                await _edit_with_attention_snooze(
+                    interaction=interaction,
+                    ariel_base_url=self.ariel_base_url,
+                    attention_item_id=attention_item_id,
+                )
+                return
+        elif custom_id.startswith(_ATTENTION_RESOLVE_CUSTOM_ID_PREFIX):
+            attention_item_id = custom_id.removeprefix(_ATTENTION_RESOLVE_CUSTOM_ID_PREFIX)
+            if attention_item_id:
+                await _edit_with_attention_resolve(
+                    interaction=interaction,
+                    ariel_base_url=self.ariel_base_url,
+                    attention_item_id=attention_item_id,
+                )
+                return
+        elif custom_id.startswith(_ATTENTION_REFRESH_CUSTOM_ID_PREFIX):
+            attention_item_id = custom_id.removeprefix(_ATTENTION_REFRESH_CUSTOM_ID_PREFIX)
+            if attention_item_id:
+                await _edit_with_attention_refresh(
+                    interaction=interaction,
+                    ariel_base_url=self.ariel_base_url,
+                    attention_item_id=attention_item_id,
+                    allowed_user_id=self.ariel_user_id,
+                )
+                return
         await interaction.response.send_message(
             "Ariel action failed: invalid Discord action id.",
             ephemeral=True,
@@ -727,6 +834,21 @@ def _format_notification_ack_for_discord(notification: dict[str, Any]) -> str:
     return f"Notification acknowledged: {title} ({notification_id})"
 
 
+def _format_attention_item_action_for_discord(payload: dict[str, Any], *, action: str) -> str:
+    attention_item = payload.get("attention_item")
+    if not isinstance(attention_item, dict):
+        raise ArielDiscordError("Ariel returned an invalid attention item response.")
+    attention_item_id = attention_item.get("id")
+    if not isinstance(attention_item_id, str) or not attention_item_id:
+        raise ArielDiscordError("Ariel returned an invalid attention item response.")
+    title = attention_item.get("title")
+    if not isinstance(title, str) or not title.strip():
+        title = attention_item.get("reason")
+    if isinstance(title, str) and title.strip():
+        return f"Attention item {action}: {title.strip()} ({attention_item_id})"
+    return f"Attention item {action}: {attention_item_id}"
+
+
 def _format_status_for_discord(
     *,
     session: dict[str, Any],
@@ -823,12 +945,32 @@ def _notification_ack_custom_id(notification_id: str) -> str:
     return f"{_NOTIFICATION_ACK_CUSTOM_ID_PREFIX}{notification_id}"
 
 
+def _attention_ack_custom_id(attention_item_id: str) -> str:
+    return f"{_ATTENTION_ACK_CUSTOM_ID_PREFIX}{attention_item_id}"
+
+
+def _attention_snooze_custom_id(attention_item_id: str) -> str:
+    return f"{_ATTENTION_SNOOZE_CUSTOM_ID_PREFIX}{attention_item_id}"
+
+
+def _attention_resolve_custom_id(attention_item_id: str) -> str:
+    return f"{_ATTENTION_RESOLVE_CUSTOM_ID_PREFIX}{attention_item_id}"
+
+
+def _attention_refresh_custom_id(attention_item_id: str) -> str:
+    return f"{_ATTENTION_REFRESH_CUSTOM_ID_PREFIX}{attention_item_id}"
+
+
 def _is_ariel_custom_id(custom_id: str) -> bool:
     return custom_id.startswith(
         (
             _APPROVAL_CUSTOM_ID_PREFIX,
             _JOB_REFRESH_CUSTOM_ID_PREFIX,
             _NOTIFICATION_ACK_CUSTOM_ID_PREFIX,
+            _ATTENTION_ACK_CUSTOM_ID_PREFIX,
+            _ATTENTION_SNOOZE_CUSTOM_ID_PREFIX,
+            _ATTENTION_RESOLVE_CUSTOM_ID_PREFIX,
+            _ATTENTION_REFRESH_CUSTOM_ID_PREFIX,
         )
     )
 
@@ -974,6 +1116,103 @@ async def _edit_with_notification_ack(
     )
 
 
+async def _edit_with_attention_ack(
+    *,
+    interaction: discord.Interaction,
+    ariel_base_url: str,
+    attention_item_id: str,
+) -> None:
+    try:
+        content = await asyncio.to_thread(
+            ack_attention_item,
+            ariel_base_url=ariel_base_url,
+            attention_item_id=attention_item_id,
+        )
+    except ArielDiscordError as exc:
+        content = f"Ariel request failed: {exc}"
+    except httpx.HTTPError:
+        content = "Ariel request failed: could not reach the local Ariel API."
+    await interaction.response.edit_message(
+        content=format_discord_message(content),
+        view=None,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+async def _edit_with_attention_snooze(
+    *,
+    interaction: discord.Interaction,
+    ariel_base_url: str,
+    attention_item_id: str,
+) -> None:
+    try:
+        content = await asyncio.to_thread(
+            snooze_attention_item,
+            ariel_base_url=ariel_base_url,
+            attention_item_id=attention_item_id,
+        )
+    except ArielDiscordError as exc:
+        content = f"Ariel request failed: {exc}"
+    except httpx.HTTPError:
+        content = "Ariel request failed: could not reach the local Ariel API."
+    await interaction.response.edit_message(
+        content=format_discord_message(content),
+        view=None,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+async def _edit_with_attention_resolve(
+    *,
+    interaction: discord.Interaction,
+    ariel_base_url: str,
+    attention_item_id: str,
+) -> None:
+    try:
+        content = await asyncio.to_thread(
+            resolve_attention_item,
+            ariel_base_url=ariel_base_url,
+            attention_item_id=attention_item_id,
+        )
+    except ArielDiscordError as exc:
+        content = f"Ariel request failed: {exc}"
+    except httpx.HTTPError:
+        content = "Ariel request failed: could not reach the local Ariel API."
+    await interaction.response.edit_message(
+        content=format_discord_message(content),
+        view=None,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+async def _edit_with_attention_refresh(
+    *,
+    interaction: discord.Interaction,
+    ariel_base_url: str,
+    attention_item_id: str,
+    allowed_user_id: int | None,
+) -> None:
+    try:
+        content = await asyncio.to_thread(
+            refresh_attention_item,
+            ariel_base_url=ariel_base_url,
+            attention_item_id=attention_item_id,
+        )
+    except ArielDiscordError as exc:
+        content = f"Ariel request failed: {exc}"
+    except httpx.HTTPError:
+        content = "Ariel request failed: could not reach the local Ariel API."
+    await interaction.response.edit_message(
+        content=format_discord_message(content),
+        view=ArielActionView(
+            ariel_base_url=ariel_base_url,
+            attention_item_id=attention_item_id,
+            allowed_user_id=allowed_user_id,
+        ),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
 class ArielActionView(discord.ui.View):
     def __init__(
         self,
@@ -982,6 +1221,7 @@ class ArielActionView(discord.ui.View):
         approval_refs: list[str] | None = None,
         job_id: str | None = None,
         notification_id: str | None = None,
+        attention_item_id: str | None = None,
         allowed_user_id: int | None = None,
     ) -> None:
         super().__init__(timeout=None)
@@ -1017,6 +1257,35 @@ class ArielActionView(discord.ui.View):
                 custom_id=_notification_ack_custom_id(notification_id),
             )
             self.add_item(ack_button)
+
+        if attention_item_id is not None:
+            attention_ack_button: discord.ui.Button[ArielActionView] = discord.ui.Button(
+                label="Acknowledge",
+                style=discord.ButtonStyle.primary,
+                custom_id=_attention_ack_custom_id(attention_item_id),
+            )
+            self.add_item(attention_ack_button)
+
+            snooze_button: discord.ui.Button[ArielActionView] = discord.ui.Button(
+                label="Snooze 24h",
+                style=discord.ButtonStyle.secondary,
+                custom_id=_attention_snooze_custom_id(attention_item_id),
+            )
+            self.add_item(snooze_button)
+
+            resolve_button: discord.ui.Button[ArielActionView] = discord.ui.Button(
+                label="Resolve",
+                style=discord.ButtonStyle.success,
+                custom_id=_attention_resolve_custom_id(attention_item_id),
+            )
+            self.add_item(resolve_button)
+
+            attention_refresh_button: discord.ui.Button[ArielActionView] = discord.ui.Button(
+                label="Refresh",
+                style=discord.ButtonStyle.secondary,
+                custom_id=_attention_refresh_custom_id(attention_item_id),
+            )
+            self.add_item(attention_refresh_button)
 
 
 def main() -> None:

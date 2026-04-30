@@ -600,6 +600,153 @@ class SurfaceMemoryResponseContract(BaseModel):
     project_state: list[SurfaceProjectStateContract]
 
 
+class SurfaceProactiveSubscriptionContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    source_type: Literal[
+        "open_jobs",
+        "pending_approvals",
+        "memory_commitments",
+        "connector_health",
+        "quick_capture_review",
+        "calendar_watch",
+        "email_watch",
+        "drive_watch",
+    ]
+    label: str
+    status: Literal["active", "paused", "cancelled"]
+    check_interval_seconds: int
+    next_run_after: str
+    last_checked_at: str | None
+    check_payload: dict[str, Any]
+    notification_policy: dict[str, Any]
+    created_at: str
+    updated_at: str
+
+
+class SurfaceProactiveCheckRunContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    subscription_id: str
+    scheduled_for: str
+    status: Literal["running", "succeeded", "failed"]
+    started_at: str | None
+    completed_at: str | None
+    created_attention_count: int
+    error: str | None
+    result_payload: dict[str, Any]
+    created_at: str
+
+
+class SurfaceAttentionItemContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    subscription_id: str | None
+    source_type: Literal[
+        "job",
+        "approval_request",
+        "memory_assertion",
+        "google_connector",
+        "capture",
+        "calendar_watch",
+        "email_watch",
+        "drive_watch",
+        "manual_signal",
+    ]
+    source_id: str
+    dedupe_key: str
+    status: Literal[
+        "open",
+        "notified",
+        "acknowledged",
+        "snoozed",
+        "resolved",
+        "expired",
+        "cancelled",
+        "superseded",
+    ]
+    priority: Literal["critical", "high", "normal", "low"]
+    urgency: Literal["critical", "high", "normal", "low"]
+    confidence: float
+    title: str
+    body: str
+    reason: str
+    evidence: dict[str, Any]
+    expires_at: str | None
+    next_follow_up_after: str | None
+    last_notified_at: str | None
+    created_at: str
+    updated_at: str
+
+
+class SurfaceAttentionItemEventContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    attention_item_id: str
+    event_type: Literal[
+        "detected",
+        "updated",
+        "notified",
+        "acknowledged",
+        "snoozed",
+        "resolved",
+        "cancelled",
+        "expired",
+        "follow_up_queued",
+        "refreshed",
+    ]
+    payload: dict[str, Any]
+    created_at: str
+
+
+class SurfaceProactiveSubscriptionResponseContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    subscription: SurfaceProactiveSubscriptionContract
+
+
+class SurfaceProactiveSubscriptionListResponseContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    subscriptions: list[SurfaceProactiveSubscriptionContract]
+
+
+class SurfaceProactiveCheckRunListResponseContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    subscription_id: str
+    check_runs: list[SurfaceProactiveCheckRunContract]
+
+
+class SurfaceAttentionItemResponseContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    attention_item: SurfaceAttentionItemContract
+
+
+class SurfaceAttentionItemListResponseContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    attention_items: list[SurfaceAttentionItemContract]
+
+
+class SurfaceAttentionItemEventListResponseContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    attention_item_id: str
+    events: list[SurfaceAttentionItemEventContract]
+
+
 class SurfaceCaptureSuccessResponseContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1024,6 +1171,81 @@ def build_surface_memory_response(
             "candidates": candidates if isinstance(candidates, list) else [],
             "conflicts": conflicts if isinstance(conflicts, list) else [],
             "project_state": project_state if isinstance(project_state, list) else [],
+        },
+    )
+
+
+def build_surface_proactive_subscription_response(*, subscription: Any) -> dict[str, Any]:
+    subscription_payload = subscription if isinstance(subscription, dict) else {}
+    return _validate_contract(
+        "surface_proactive_subscription_response",
+        SurfaceProactiveSubscriptionResponseContract,
+        {"ok": True, "subscription": subscription_payload},
+    )
+
+
+def build_surface_proactive_subscription_list_response(
+    *,
+    subscriptions: Any,
+) -> dict[str, Any]:
+    return _validate_contract(
+        "surface_proactive_subscription_list_response",
+        SurfaceProactiveSubscriptionListResponseContract,
+        {
+            "ok": True,
+            "subscriptions": subscriptions if isinstance(subscriptions, list) else [],
+        },
+    )
+
+
+def build_surface_proactive_check_run_list_response(
+    *,
+    subscription_id: Any,
+    check_runs: Any,
+) -> dict[str, Any]:
+    return _validate_contract(
+        "surface_proactive_check_run_list_response",
+        SurfaceProactiveCheckRunListResponseContract,
+        {
+            "ok": True,
+            "subscription_id": subscription_id,
+            "check_runs": check_runs if isinstance(check_runs, list) else [],
+        },
+    )
+
+
+def build_surface_attention_item_response(*, attention_item: Any) -> dict[str, Any]:
+    attention_item_payload = attention_item if isinstance(attention_item, dict) else {}
+    return _validate_contract(
+        "surface_attention_item_response",
+        SurfaceAttentionItemResponseContract,
+        {"ok": True, "attention_item": attention_item_payload},
+    )
+
+
+def build_surface_attention_item_list_response(*, attention_items: Any) -> dict[str, Any]:
+    return _validate_contract(
+        "surface_attention_item_list_response",
+        SurfaceAttentionItemListResponseContract,
+        {
+            "ok": True,
+            "attention_items": attention_items if isinstance(attention_items, list) else [],
+        },
+    )
+
+
+def build_surface_attention_item_event_list_response(
+    *,
+    attention_item_id: Any,
+    events: Any,
+) -> dict[str, Any]:
+    return _validate_contract(
+        "surface_attention_item_event_list_response",
+        SurfaceAttentionItemEventListResponseContract,
+        {
+            "ok": True,
+            "attention_item_id": attention_item_id,
+            "events": events if isinstance(events, list) else [],
         },
     )
 
