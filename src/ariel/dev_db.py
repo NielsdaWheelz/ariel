@@ -87,7 +87,9 @@ def resolve_local_postgres_runtime(env: Mapping[str, str]) -> LocalPostgresRunti
     container_name = (
         env.get("ARIEL_DB_CONTAINER_NAME", "ariel-postgres").strip() or "ariel-postgres"
     )
-    image = env.get("ARIEL_DB_DOCKER_IMAGE", "postgres:16-alpine").strip() or "postgres:16-alpine"
+    image = env.get("ARIEL_DB_DOCKER_IMAGE", "pgvector/pgvector:pg16").strip()
+    if not image:
+        image = "pgvector/pgvector:pg16"
     volume_name = env.get("ARIEL_DB_VOLUME_NAME", f"{container_name}-data").strip()
     if not volume_name:
         volume_name = f"{container_name}-data"

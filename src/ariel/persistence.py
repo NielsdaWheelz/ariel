@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
+from pgvector.sqlalchemy import Vector  # type: ignore[import-untyped]
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
@@ -20,6 +21,9 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from ariel.redaction import redact_json_value, redact_text
+
+
+MEMORY_EMBEDDING_DIMENSIONS = 1536
 
 
 def to_rfc3339(timestamp: datetime) -> str:
@@ -1244,13 +1248,15 @@ class MemoryEmbeddingProjectionRecord(Base):
         nullable=False,
         index=True,
     )
-    projection_version: Mapped[str] = mapped_column(
-        String(32),
-        nullable=False,
-        default="semantic-v2",
-    )
+    projection_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    embedding_provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    embedding_model: Mapped[str] = mapped_column(String(128), nullable=False)
+    embedding_dimensions: Mapped[int] = mapped_column(Integer, nullable=False)
     search_text: Mapped[str] = mapped_column(Text, nullable=False)
-    embedding: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    embedding: Mapped[list[float]] = mapped_column(
+        Vector(MEMORY_EMBEDDING_DIMENSIONS),
+        nullable=False,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )
@@ -1259,6 +1265,10 @@ class MemoryEmbeddingProjectionRecord(Base):
     )
 
     __table_args__ = (
+        CheckConstraint(
+            f"embedding_dimensions = {MEMORY_EMBEDDING_DIMENSIONS}",
+            name="ck_memory_embedding_projection_dimensions",
+        ),
         Index(
             "ix_memory_embedding_projection_unique",
             "assertion_id",
@@ -1274,11 +1284,7 @@ class MemoryKeywordProjectionRecord(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     canonical_table: Mapped[str] = mapped_column(String(64), nullable=False)
     canonical_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
-    projection_version: Mapped[str] = mapped_column(
-        String(32),
-        nullable=False,
-        default="semantic-v2",
-    )
+    projection_version: Mapped[str] = mapped_column(String(32), nullable=False)
     search_text: Mapped[str] = mapped_column(Text, nullable=False)
     weighted_terms: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(
@@ -1438,11 +1444,7 @@ class ProjectStateSnapshotRecord(Base):
     source_episode_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     source_evidence_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
-    projection_version: Mapped[str] = mapped_column(
-        String(32),
-        nullable=False,
-        default="semantic-v2",
-    )
+    projection_version: Mapped[str] = mapped_column(String(32), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )

@@ -10,6 +10,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
+MEMORY_EMBEDDING_DIMENSIONS = 1536
 
 
 class AppSettings(BaseSettings):
@@ -34,6 +35,9 @@ class AppSettings(BaseSettings):
     max_recent_turns: int = 12
     max_recalled_assertions: int = 8
     max_context_tokens: int = 6000
+    memory_embedding_provider: str = "openai"
+    memory_embedding_model: str = "text-embedding-3-small"
+    memory_embedding_dimensions: int = MEMORY_EMBEDDING_DIMENSIONS
     auto_rotate_max_turns: int = 120
     auto_rotate_max_age_seconds: int = 172800
     auto_rotate_context_pressure_tokens: int = 5400
@@ -137,6 +141,24 @@ class AppSettings(BaseSettings):
     def _max_context_tokens_must_be_positive(cls, value: int) -> int:
         if value < 1:
             raise ValueError("max_context_tokens must be >= 1")
+        return value
+
+    @field_validator(
+        "memory_embedding_provider",
+        "memory_embedding_model",
+    )
+    @classmethod
+    def _memory_projection_text_settings_must_not_be_blank(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("memory projection settings must not be blank")
+        return normalized
+
+    @field_validator("memory_embedding_dimensions")
+    @classmethod
+    def _memory_embedding_dimensions_must_match_schema(cls, value: int) -> int:
+        if value != MEMORY_EMBEDDING_DIMENSIONS:
+            raise ValueError(f"memory_embedding_dimensions must be {MEMORY_EMBEDDING_DIMENSIONS}")
         return value
 
     @field_validator("auto_rotate_max_turns")

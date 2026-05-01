@@ -5,6 +5,8 @@ import threading
 import time
 from collections.abc import Generator
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from itertools import count
 from typing import Any, cast
 
 from fastapi.testclient import TestClient
@@ -13,8 +15,38 @@ from sqlalchemy import select, text
 from testcontainers.postgres import PostgresContainer
 
 from ariel.app import ModelAdapter, _session_turn_lock_id, create_app
+from ariel.config import AppSettings
+import ariel.memory as memory
+from ariel.memory import MEMORY_PROJECTION_VERSION, process_memory_projection_job
 from tests.integration.responses_helpers import responses_message, responses_with_function_calls
 from ariel.persistence import SessionRecord
+
+
+_projection_id_counter = count(1)
+
+
+def _fake_memory_embedding(text: str, *, settings: AppSettings) -> list[float]:
+    vector = [0.0] * settings.memory_embedding_dimensions
+    lowered = text.lower()
+    if "invoice" in lowered or "open" in lowered:
+        vector[0] = 1.0
+    if not any(vector):
+        vector[1] = 1.0
+    return vector
+
+
+def _use_fake_embeddings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(memory, "embed_memory_text", _fake_memory_embedding)
+
+
+def _process_projection(client: TestClient) -> None:
+    processed = process_memory_projection_job(
+        session_factory=cast(Any, client.app).state.session_factory,
+        settings=AppSettings(),
+        now_fn=lambda: datetime.now(tz=UTC),
+        new_id_fn=lambda prefix: f"{prefix}_test_{next(_projection_id_counter)}",
+    )
+    assert processed is True
 
 
 @dataclass
@@ -69,7 +101,7 @@ class SessionManagementProbeAdapter:
 
 @pytest.fixture(scope="session")
 def postgres_url() -> Generator[str, None, None]:
-    with PostgresContainer("postgres:16-alpine") as postgres:
+    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
         url = postgres.get_connection_url()
         yield url.replace("psycopg2", "psycopg")
 
@@ -253,7 +285,9 @@ def test_s5_pr02_rotation_falls_back_on_turn_count_threshold_with_typed_reason(
 
 def test_s5_pr02_context_bundle_follows_constitution_section_order_and_includes_required_sections(
     postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _use_fake_embeddings(monkeypatch)
     adapter = SessionManagementProbeAdapter()
     with _build_client(postgres_url, adapter, reset_database=True) as client:
         session_id = _session_id(client)
@@ -271,6 +305,7 @@ def test_s5_pr02_context_bundle_follows_constitution_section_order_and_includes_
         assert candidate.status_code == 200
         candidate_id = candidate.json()["candidates"][0]["id"]
         assert client.post(f"/v1/memory/candidates/{candidate_id}/approve").status_code == 200
+        _process_projection(client)
         second = client.post(
             f"/v1/sessions/{session_id}/message",
             json={"message": "what is still open?"},
@@ -288,6 +323,10 @@ def test_s5_pr02_context_bundle_follows_constitution_section_order_and_includes_
 
         memory_context = bundle["memory_context"]
         assert isinstance(memory_context, dict)
+        assert memory_context["projection_version"] == MEMORY_PROJECTION_VERSION
+        assert (
+            memory_context["projection_health"]["projection_version"] == MEMORY_PROJECTION_VERSION
+        )
         assert isinstance(memory_context["commitments_and_decisions"], list)
         assert memory_context["commitments_and_decisions"]
 

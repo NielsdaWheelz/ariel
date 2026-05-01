@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 from collections.abc import Generator
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from itertools import count
 from typing import Any, cast
 
 from fastapi.testclient import TestClient
@@ -11,6 +13,9 @@ from sqlalchemy import func, select
 from testcontainers.postgres import PostgresContainer
 
 from ariel.app import ModelAdapter, create_app
+from ariel.config import AppSettings
+import ariel.memory as memory
+from ariel.memory import MEMORY_PROJECTION_VERSION, process_memory_projection_job
 from ariel.persistence import (
     BackgroundTaskRecord,
     MemoryAssertionRecord,
@@ -19,6 +24,43 @@ from ariel.persistence import (
     MemorySalienceRecord,
 )
 from tests.integration.responses_helpers import responses_message
+
+
+_projection_id_counter = count(1)
+
+
+def _fake_memory_embedding(text: str, *, settings: AppSettings) -> list[float]:
+    vector = [0.0] * settings.memory_embedding_dimensions
+    lowered = text.lower()
+    for index, words in (
+        (0, ("notebook", "notebooks")),
+        (1, ("apollo",)),
+        (2, ("milestone", "latest", "status", "state")),
+        (3, ("risk", "vendor", "latency")),
+        (4, ("archive", "drive")),
+        (5, ("invoice", "open")),
+        (6, ("coffee", "espresso", "pour-over")),
+    ):
+        if any(word in lowered for word in words):
+            vector[index] = 1.0
+    if not any(vector):
+        vector[7] = 1.0
+    norm = sum(component * component for component in vector) ** 0.5
+    return [component / norm for component in vector]
+
+
+def _use_fake_embeddings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(memory, "embed_memory_text", _fake_memory_embedding)
+
+
+def _process_projection(client: TestClient) -> None:
+    processed = process_memory_projection_job(
+        session_factory=cast(Any, client.app).state.session_factory,
+        settings=AppSettings(),
+        now_fn=lambda: datetime.now(tz=UTC),
+        new_id_fn=lambda prefix: f"{prefix}_test_{next(_projection_id_counter)}",
+    )
+    assert processed is True
 
 
 @dataclass
@@ -73,7 +115,7 @@ class MemoryProbeAdapter:
 
 @pytest.fixture(scope="session")
 def postgres_url() -> Generator[str, None, None]:
-    with PostgresContainer("postgres:16-alpine") as postgres:
+    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
         yield postgres.get_connection_url().replace("psycopg2", "psycopg")
 
 
@@ -188,7 +230,9 @@ def test_s5_pr01_turns_record_evidence_and_queue_extraction_without_command_pars
 
 def test_s5_pr01_reviewed_candidate_is_recalled_with_evidence_snippet(
     postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _use_fake_embeddings(monkeypatch)
     adapter = MemoryProbeAdapter()
     with _build_client(postgres_url, adapter, reset_database=True) as client:
         session_id = _session_id(client)
@@ -215,6 +259,7 @@ def test_s5_pr01_reviewed_candidate_is_recalled_with_evidence_snippet(
         active = approve.json()["active_assertions"]
         assert [item["value"] for item in active] == ["matte black notebooks"]
         assert active[0]["evidence_refs"][0]["snippet"]
+        _process_projection(client)
 
         recall_after = client.post(
             f"/v1/sessions/{session_id}/message",
@@ -226,7 +271,9 @@ def test_s5_pr01_reviewed_candidate_is_recalled_with_evidence_snippet(
 
 def test_s5_pr01_correction_retraction_and_projection_invalidation(
     postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _use_fake_embeddings(monkeypatch)
     adapter = MemoryProbeAdapter()
     with _build_client(postgres_url, adapter, reset_database=True) as client:
         candidate = _candidate(
@@ -238,6 +285,7 @@ def test_s5_pr01_correction_retraction_and_projection_invalidation(
             evidence_text="The user prefers pour-over coffee.",
         )
         assert client.post(f"/v1/memory/candidates/{candidate['id']}/approve").status_code == 200
+        _process_projection(client)
 
         correction = client.post(
             f"/v1/memory/assertions/{candidate['id']}/correct",
@@ -246,6 +294,7 @@ def test_s5_pr01_correction_retraction_and_projection_invalidation(
         assert correction.status_code == 200
         active = correction.json()["active_assertions"]
         assert [item["value"] for item in active] == ["espresso"]
+        _process_projection(client)
 
         with cast(Any, client.app).state.session_factory() as db:
             rows = db.scalars(
@@ -263,6 +312,27 @@ def test_s5_pr01_correction_retraction_and_projection_invalidation(
                 )
                 == 0
             )
+            replacement_embedding = db.scalar(
+                select(MemoryEmbeddingProjectionRecord).where(
+                    MemoryEmbeddingProjectionRecord.assertion_id == rows[1].id,
+                    MemoryEmbeddingProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
+                )
+            )
+            replacement_keyword = db.scalar(
+                select(MemoryKeywordProjectionRecord).where(
+                    MemoryKeywordProjectionRecord.canonical_id == rows[1].id,
+                    MemoryKeywordProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
+                )
+            )
+            assert replacement_embedding is not None
+            assert replacement_embedding.embedding_provider == "openai"
+            assert replacement_embedding.embedding_model == "text-embedding-3-small"
+            assert (
+                replacement_embedding.embedding_dimensions
+                == AppSettings().memory_embedding_dimensions
+            )
+            assert len(replacement_embedding.embedding) == AppSettings().memory_embedding_dimensions
+            assert replacement_keyword is not None
             assert (
                 db.scalar(
                     select(func.count())
@@ -279,7 +349,9 @@ def test_s5_pr01_correction_retraction_and_projection_invalidation(
 
 def test_s5_pr01_projections_are_vector_and_keyword_not_legacy_terms(
     postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _use_fake_embeddings(monkeypatch)
     adapter = MemoryProbeAdapter()
     with _build_client(postgres_url, adapter, reset_database=True) as client:
         candidate = _candidate(
@@ -291,6 +363,7 @@ def test_s5_pr01_projections_are_vector_and_keyword_not_legacy_terms(
             evidence_text="Apollo project milestone is in May.",
         )
         assert client.post(f"/v1/memory/candidates/{candidate['id']}/approve").status_code == 200
+        _process_projection(client)
 
         with cast(Any, client.app).state.session_factory() as db:
             embedding = db.scalar(
@@ -305,8 +378,17 @@ def test_s5_pr01_projections_are_vector_and_keyword_not_legacy_terms(
             )
             assert embedding is not None
             assert keyword is not None
-            assert "vector" in embedding.embedding
-            assert "terms" not in embedding.embedding
+            assert embedding.projection_version == MEMORY_PROJECTION_VERSION
+            assert embedding.embedding_provider == "openai"
+            assert embedding.embedding_model == "text-embedding-3-small"
+            assert embedding.embedding_dimensions == AppSettings().memory_embedding_dimensions
+            assert len(embedding.embedding) == AppSettings().memory_embedding_dimensions
+            assert len(embedding.embedding) != 64
+            assert (
+                len([float(item) for item in embedding.embedding])
+                == AppSettings().memory_embedding_dimensions
+            )
+            assert keyword.projection_version == MEMORY_PROJECTION_VERSION
             assert keyword.weighted_terms
 
 
@@ -315,6 +397,7 @@ def test_s5_pr01_recall_is_bounded_deterministic_and_reports_omissions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("ARIEL_MAX_RECALLED_ASSERTIONS", "2")
+    _use_fake_embeddings(monkeypatch)
     adapter = MemoryProbeAdapter()
     with _build_client(postgres_url, adapter, reset_database=True) as client:
         session_id = _session_id(client)
@@ -334,6 +417,7 @@ def test_s5_pr01_recall_is_bounded_deterministic_and_reports_omissions(
             assert (
                 client.post(f"/v1/memory/candidates/{candidate['id']}/approve").status_code == 200
             )
+            _process_projection(client)
 
         first = client.post(
             f"/v1/sessions/{session_id}/message",
@@ -357,6 +441,12 @@ def test_s5_pr01_recall_is_bounded_deterministic_and_reports_omissions(
 
         assert first_ids == second_ids
         assert len(first_ids) == 2
+        first_reasons = [
+            item["rank_reason"]
+            for item in adapter.context_bundles[-2]["memory_context"]["semantic_assertions"]
+        ]
+        assert any("semantic_vector" in reason for reason in first_reasons)
+        assert any("keyword" in reason for reason in first_reasons)
 
         recalled_event_payload = next(
             event["payload"]

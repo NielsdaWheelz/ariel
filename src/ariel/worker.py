@@ -22,7 +22,7 @@ from .persistence import (
     NotificationRecord,
     SessionRecord,
 )
-from .memory import process_memory_extract_turn
+from .memory import process_memory_extract_turn, process_memory_projection_job
 from .proactivity import (
     process_attention_item_follow_up_due,
     process_attention_review_due,
@@ -131,6 +131,14 @@ def process_one_task(
                 now=_utcnow(),
                 heartbeat_timeout_seconds=resolved_settings.worker_heartbeat_timeout_seconds,
             )
+
+    if process_memory_projection_job(
+        session_factory=session_factory,
+        settings=resolved_settings,
+        now_fn=_utcnow,
+        new_id_fn=_new_id,
+    ):
+        return True
 
     with session_factory() as db:
         with db.begin():

@@ -614,7 +614,7 @@ def upgrade() -> None:
             "projection_version",
             sa.String(length=32),
             nullable=False,
-            server_default="semantic-v2",
+            server_default="embedding-v1",
         ),
     )
     op.create_check_constraint(

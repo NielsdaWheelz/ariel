@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from datetime import datetime
-import hashlib
+from datetime import datetime, timedelta
 import json
-import math
 from typing import Any
 
 import httpx
@@ -39,7 +37,7 @@ from .redaction import redact_text
 
 
 MEMORY_CONTEXT_SCHEMA_VERSION = "memory.sota.v1"
-MEMORY_PROJECTION_VERSION = "semantic-v2"
+MEMORY_PROJECTION_VERSION = "embedding-v1"
 USER_SUBJECT_KEY = "user:default"
 
 _STOPWORDS = {
@@ -119,25 +117,49 @@ def _weighted_terms(value: str) -> dict[str, float]:
     return weights
 
 
-def _text_vector(value: str) -> list[float]:
-    vector = [0.0] * 64
-    for term in _terms(value):
-        grams = (
-            [term] if len(term) < 4 else [term[index : index + 4] for index in range(len(term) - 3)]
+def embed_memory_text(text: str, *, settings: AppSettings) -> list[float]:
+    if settings.memory_embedding_provider != "openai":
+        raise RuntimeError(
+            f"unsupported memory embedding provider: {settings.memory_embedding_provider}"
         )
-        for gram in grams:
-            digest = hashlib.blake2b(gram.encode("utf-8"), digest_size=4).digest()
-            vector[int.from_bytes(digest, "big") % len(vector)] += 1.0
-    norm = math.sqrt(sum(component * component for component in vector))
-    if norm == 0.0:
-        return vector
-    return [component / norm for component in vector]
+    if settings.openai_api_key is None:
+        raise RuntimeError("ARIEL_OPENAI_API_KEY is required for memory embeddings")
 
+    response = httpx.post(
+        "https://api.openai.com/v1/embeddings",
+        headers={
+            "Authorization": f"Bearer {settings.openai_api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": settings.memory_embedding_model,
+            "input": " ".join(text.split()),
+            "dimensions": settings.memory_embedding_dimensions,
+            "encoding_format": "float",
+        },
+        timeout=settings.model_timeout_seconds,
+    )
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise RuntimeError(
+            f"memory embedding request failed: HTTP {exc.response.status_code}"
+        ) from exc
 
-def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
-    if len(left) != len(right):
-        return 0.0
-    return sum(left[index] * right[index] for index in range(len(left)))
+    payload = response.json()
+    data = payload.get("data") if isinstance(payload, dict) else None
+    first = data[0] if isinstance(data, list) and data else None
+    vector = first.get("embedding") if isinstance(first, dict) else None
+    if not isinstance(vector, list):
+        raise RuntimeError("memory embedding response missing vector")
+    if len(vector) != settings.memory_embedding_dimensions:
+        raise RuntimeError(
+            "memory embedding response dimension mismatch: "
+            f"expected {settings.memory_embedding_dimensions}, got {len(vector)}"
+        )
+    if not all(isinstance(item, int | float) for item in vector):
+        raise RuntimeError("memory embedding response vector must be numeric")
+    return [float(item) for item in vector]
 
 
 def _assertion_text(assertion: MemoryAssertionRecord) -> str:
@@ -351,6 +373,12 @@ def _delete_projection_rows(db: Session, *, assertion_id: str) -> None:
         )
     )
     db.execute(
+        delete(MemoryProjectionJobRecord).where(
+            MemoryProjectionJobRecord.target_table == "memory_assertions",
+            MemoryProjectionJobRecord.target_id == assertion_id,
+        )
+    )
+    db.execute(
         delete(MemoryKeywordProjectionRecord).where(
             MemoryKeywordProjectionRecord.canonical_table == "memory_assertions",
             MemoryKeywordProjectionRecord.canonical_id == assertion_id,
@@ -377,17 +405,6 @@ def _record_projection_rows(
 ) -> None:
     _delete_projection_rows(db, assertion_id=assertion.id)
     search_text = _assertion_search_text(assertion)
-    db.add(
-        MemoryEmbeddingProjectionRecord(
-            id=new_id_fn("mep"),
-            assertion_id=assertion.id,
-            projection_version=MEMORY_PROJECTION_VERSION,
-            search_text=search_text,
-            embedding={"vector": _text_vector(search_text)},
-            created_at=now,
-            updated_at=now,
-        )
-    )
     db.add(
         MemoryKeywordProjectionRecord(
             id=new_id_fn("mkp"),
@@ -419,8 +436,8 @@ def _record_projection_rows(
             projection_kind="embedding",
             target_table="memory_assertions",
             target_id=assertion.id,
-            lifecycle_state="completed",
-            attempts=1,
+            lifecycle_state="pending",
+            attempts=0,
             max_retries=3,
             error=None,
             run_after=now,
@@ -428,6 +445,119 @@ def _record_projection_rows(
             updated_at=now,
         )
     )
+
+
+def process_memory_projection_job(
+    *,
+    session_factory: sessionmaker[Session],
+    settings: AppSettings,
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> bool:
+    with session_factory() as db:
+        with db.begin():
+            now = now_fn()
+            job = db.scalar(
+                select(MemoryProjectionJobRecord)
+                .where(
+                    MemoryProjectionJobRecord.projection_kind == "embedding",
+                    MemoryProjectionJobRecord.lifecycle_state == "pending",
+                    MemoryProjectionJobRecord.run_after <= now,
+                )
+                .order_by(
+                    MemoryProjectionJobRecord.run_after.asc(),
+                    MemoryProjectionJobRecord.created_at.asc(),
+                    MemoryProjectionJobRecord.id.asc(),
+                )
+                .limit(1)
+                .with_for_update(skip_locked=True)
+            )
+            if job is None:
+                return False
+
+            job.lifecycle_state = "running"
+            job.attempts += 1
+            job.updated_at = now
+            job_id = job.id
+            assertion = db.get(MemoryAssertionRecord, job.target_id)
+            if (
+                job.target_table != "memory_assertions"
+                or assertion is None
+                or assertion.lifecycle_state != "active"
+            ):
+                job.lifecycle_state = "completed"
+                job.error = None
+                return True
+            assertion_id = assertion.id
+            search_text = _assertion_search_text(assertion)
+
+    try:
+        vector = embed_memory_text(search_text, settings=settings)
+    except Exception as exc:
+        with session_factory() as db:
+            with db.begin():
+                job = db.get(MemoryProjectionJobRecord, job_id)
+                if job is not None:
+                    now = now_fn()
+                    job.lifecycle_state = (
+                        "dead_letter" if job.attempts >= job.max_retries else "pending"
+                    )
+                    job.error = _clean_text(str(exc), max_chars=500)
+                    job.run_after = (
+                        now if job.lifecycle_state == "dead_letter" else now + timedelta(seconds=30)
+                    )
+                    job.updated_at = now
+        return True
+
+    with session_factory() as db:
+        with db.begin():
+            now = now_fn()
+            job = db.get(MemoryProjectionJobRecord, job_id)
+            assertion = db.get(MemoryAssertionRecord, assertion_id)
+            if job is None:
+                return True
+            if assertion is None or assertion.lifecycle_state != "active":
+                job.lifecycle_state = "completed"
+                job.error = None
+                job.updated_at = now
+                return True
+
+            search_text = _assertion_search_text(assertion)
+            row = db.scalar(
+                select(MemoryEmbeddingProjectionRecord)
+                .where(
+                    MemoryEmbeddingProjectionRecord.assertion_id == assertion.id,
+                    MemoryEmbeddingProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
+                )
+                .limit(1)
+            )
+            if row is None:
+                db.add(
+                    MemoryEmbeddingProjectionRecord(
+                        id=new_id_fn("mep"),
+                        assertion_id=assertion.id,
+                        projection_version=MEMORY_PROJECTION_VERSION,
+                        embedding_provider=settings.memory_embedding_provider,
+                        embedding_model=settings.memory_embedding_model,
+                        embedding_dimensions=settings.memory_embedding_dimensions,
+                        search_text=search_text,
+                        embedding=vector,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+            else:
+                row.embedding_provider = settings.memory_embedding_provider
+                row.embedding_model = settings.memory_embedding_model
+                row.embedding_dimensions = settings.memory_embedding_dimensions
+                row.search_text = search_text
+                row.embedding = vector
+                row.updated_at = now
+
+            job.lifecycle_state = "completed"
+            job.error = None
+            job.updated_at = now
+    return True
 
 
 def _record_salience(
@@ -807,7 +937,8 @@ def _activate_assertion(
             "payload": {
                 "assertion_id": assertion.id,
                 "projection_version": MEMORY_PROJECTION_VERSION,
-                "projection_kinds": ["embedding", "keyword", "entity", "salience"],
+                "projection_kinds": ["keyword", "entity", "salience"],
+                "queued_projection_kinds": ["embedding"],
             },
         }
     )
@@ -1568,8 +1699,19 @@ def list_memory(db: Session) -> dict[str, Any]:
     }
 
 
-def search_memory(db: Session, *, query: str, limit: int) -> list[dict[str, Any]]:
-    memory_context, _ = build_memory_context(db, user_message=query, max_recalled_assertions=limit)
+def search_memory(
+    db: Session,
+    *,
+    query: str,
+    limit: int,
+    settings: AppSettings | None = None,
+) -> list[dict[str, Any]]:
+    memory_context, _ = build_memory_context(
+        db,
+        user_message=query,
+        max_recalled_assertions=limit,
+        settings=settings,
+    )
     return list(memory_context["semantic_assertions"])
 
 
@@ -1578,33 +1720,9 @@ def build_memory_context(
     *,
     user_message: str,
     max_recalled_assertions: int,
+    settings: AppSettings | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    query_vector = _text_vector(user_message)
     query_terms = set(_terms(user_message))
-    active_assertions = db.scalars(
-        select(MemoryAssertionRecord)
-        .where(MemoryAssertionRecord.lifecycle_state == "active")
-        .order_by(MemoryAssertionRecord.updated_at.desc(), MemoryAssertionRecord.id.asc())
-    ).all()
-    assertion_ids = [assertion.id for assertion in active_assertions]
-    salience = {row.assertion_id: row for row in db.scalars(select(MemorySalienceRecord)).all()}
-    embeddings = {
-        row.assertion_id: row
-        for row in db.scalars(
-            select(MemoryEmbeddingProjectionRecord).where(
-                MemoryEmbeddingProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION
-            )
-        ).all()
-    }
-    keywords = {
-        row.canonical_id: row
-        for row in db.scalars(
-            select(MemoryKeywordProjectionRecord).where(
-                MemoryKeywordProjectionRecord.canonical_table == "memory_assertions",
-                MemoryKeywordProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
-            )
-        ).all()
-    }
     entity_rows = db.scalars(select(MemoryEntityRecord)).all()
     matching_entity_ids = {
         entity.id
@@ -1629,60 +1747,164 @@ def build_memory_context(
         ).all()
     }
 
+    active_assertions: Sequence[MemoryAssertionRecord] = ()
     ranked: list[tuple[float, str, MemoryAssertionRecord, str]] = []
-    for assertion in active_assertions:
-        reasons: list[str] = []
-        score = assertion.confidence
-        projection = embeddings.get(assertion.id)
-        raw_vector = projection.embedding.get("vector") if projection is not None else None
-        if isinstance(raw_vector, list) and all(
-            isinstance(item, int | float) for item in raw_vector
-        ):
-            semantic_score = _cosine(query_vector, [float(item) for item in raw_vector])
-            if semantic_score > 0.0:
-                score += semantic_score * 6.0
-                reasons.append("semantic_vector")
-
-        keyword = keywords.get(assertion.id)
-        weighted = (
-            keyword.weighted_terms
-            if keyword is not None
-            else _weighted_terms(_assertion_search_text(assertion))
+    resolved_settings = settings or AppSettings()
+    embedding_count = (
+        db.scalar(
+            select(func.count())
+            .select_from(MemoryEmbeddingProjectionRecord)
+            .where(
+                MemoryEmbeddingProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
+                MemoryEmbeddingProjectionRecord.embedding_provider
+                == resolved_settings.memory_embedding_provider,
+                MemoryEmbeddingProjectionRecord.embedding_model
+                == resolved_settings.memory_embedding_model,
+                MemoryEmbeddingProjectionRecord.embedding_dimensions
+                == resolved_settings.memory_embedding_dimensions,
+            )
         )
-        if isinstance(weighted, dict):
-            keyword_score = sum(float(weighted.get(term, 0.0)) for term in query_terms)
-            if keyword_score > 0.0:
-                score += keyword_score * 1.5
-                reasons.append("keyword")
+        or 0
+    )
+    if embedding_count:
+        query_vector = embed_memory_text(user_message, settings=resolved_settings)
+        vector_distance = MemoryEmbeddingProjectionRecord.embedding.cosine_distance(query_vector)
+        vector_rows = db.execute(
+            select(
+                MemoryEmbeddingProjectionRecord.assertion_id,
+                vector_distance.label("distance"),
+            )
+            .where(
+                MemoryEmbeddingProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
+                MemoryEmbeddingProjectionRecord.embedding_provider
+                == resolved_settings.memory_embedding_provider,
+                MemoryEmbeddingProjectionRecord.embedding_model
+                == resolved_settings.memory_embedding_model,
+                MemoryEmbeddingProjectionRecord.embedding_dimensions
+                == resolved_settings.memory_embedding_dimensions,
+            )
+            .order_by(vector_distance.asc(), MemoryEmbeddingProjectionRecord.assertion_id.asc())
+            .limit(max(50, max_recalled_assertions * 8))
+        ).all()
+        semantic_scores = {
+            assertion_id: max(0.0, 1.0 - float(distance))
+            for assertion_id, distance in vector_rows
+            if distance is not None
+        }
+        keywords = {
+            row.canonical_id: row
+            for row in db.scalars(
+                select(MemoryKeywordProjectionRecord).where(
+                    MemoryKeywordProjectionRecord.canonical_table == "memory_assertions",
+                    MemoryKeywordProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
+                )
+            ).all()
+        }
+        keyword_candidate_ids = {
+            assertion_id
+            for assertion_id, keyword in keywords.items()
+            if query_terms.intersection(set(keyword.weighted_terms))
+        }
+        entity_candidate_ids = {
+            row.canonical_id
+            for row in db.scalars(
+                select(MemoryEntityProjectionRecord).where(
+                    MemoryEntityProjectionRecord.canonical_table == "memory_assertions",
+                    MemoryEntityProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
+                    MemoryEntityProjectionRecord.entity_id.in_(
+                        matching_entity_ids | graph_neighbors or {""}
+                    ),
+                )
+            ).all()
+        }
+        missing_score_ids = (keyword_candidate_ids | entity_candidate_ids) - set(semantic_scores)
+        if missing_score_ids:
+            distance_rows = db.execute(
+                select(
+                    MemoryEmbeddingProjectionRecord.assertion_id,
+                    vector_distance.label("distance"),
+                ).where(
+                    MemoryEmbeddingProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
+                    MemoryEmbeddingProjectionRecord.embedding_provider
+                    == resolved_settings.memory_embedding_provider,
+                    MemoryEmbeddingProjectionRecord.embedding_model
+                    == resolved_settings.memory_embedding_model,
+                    MemoryEmbeddingProjectionRecord.embedding_dimensions
+                    == resolved_settings.memory_embedding_dimensions,
+                    MemoryEmbeddingProjectionRecord.assertion_id.in_(missing_score_ids),
+                )
+            ).all()
+            for assertion_id, distance in distance_rows:
+                if distance is not None:
+                    semantic_scores[assertion_id] = max(0.0, 1.0 - float(distance))
 
-        if assertion.subject_entity_id in matching_entity_ids:
-            score += 3.0
-            reasons.append("entity")
-        if assertion.subject_entity_id in graph_neighbors:
-            score += 2.0
-            reasons.append("graph")
-        if assertion.assertion_type in {"commitment", "decision"}:
-            score += 2.0
-            reasons.append("commitment_or_decision")
-        if assertion.assertion_type == "project_state" and "project" in user_message.lower():
-            score += 2.0
-            reasons.append("project_state")
-        salience_row = salience.get(assertion.id)
-        if salience_row is not None:
-            score += salience_row.score
-            if salience_row.user_priority == "pinned":
-                reasons.append("pinned")
-            if salience_row.user_priority == "deprioritized":
-                score -= 100.0
-                reasons.append("deprioritized")
-        if score <= 1.0 and not reasons:
-            continue
-        ranked.append((score, assertion.id, assertion, "+".join(reasons) or "salience"))
+        candidate_ids = set(semantic_scores)
+        if candidate_ids:
+            active_assertions = db.scalars(
+                select(MemoryAssertionRecord)
+                .where(
+                    MemoryAssertionRecord.lifecycle_state == "active",
+                    MemoryAssertionRecord.id.in_(candidate_ids),
+                )
+                .order_by(MemoryAssertionRecord.updated_at.desc(), MemoryAssertionRecord.id.asc())
+            ).all()
+            salience = {
+                row.assertion_id: row
+                for row in db.scalars(
+                    select(MemorySalienceRecord).where(
+                        MemorySalienceRecord.assertion_id.in_(candidate_ids)
+                    )
+                ).all()
+            }
+            for assertion in active_assertions:
+                reasons: list[str] = []
+                score = assertion.confidence
+                semantic_score = semantic_scores.get(assertion.id, 0.0)
+                if semantic_score > 0.0:
+                    score += semantic_score * 6.0
+                    reasons.append("semantic_vector")
+
+                keyword = keywords.get(assertion.id)
+                if keyword is not None:
+                    keyword_score = sum(
+                        float(keyword.weighted_terms.get(term, 0.0)) for term in query_terms
+                    )
+                    if keyword_score > 0.0:
+                        score += keyword_score * 1.5
+                        reasons.append("keyword")
+
+                if assertion.subject_entity_id in matching_entity_ids:
+                    score += 3.0
+                    reasons.append("entity")
+                if assertion.subject_entity_id in graph_neighbors:
+                    score += 2.0
+                    reasons.append("graph")
+                if assertion.assertion_type in {"commitment", "decision"}:
+                    score += 2.0
+                    reasons.append("commitment_or_decision")
+                if (
+                    assertion.assertion_type == "project_state"
+                    and "project" in user_message.lower()
+                ):
+                    score += 2.0
+                    reasons.append("project_state")
+                salience_row = salience.get(assertion.id)
+                if salience_row is not None:
+                    score += salience_row.score
+                    if salience_row.user_priority == "pinned":
+                        reasons.append("pinned")
+                    if salience_row.user_priority == "deprioritized":
+                        score -= 100.0
+                        reasons.append("deprioritized")
+                if score <= 1.0 and not reasons:
+                    continue
+                ranked.append((score, assertion.id, assertion, "+".join(reasons) or "salience"))
 
     ranked.sort(key=lambda row: (-row[0], row[1]))
     selected = ranked[:max_recalled_assertions]
     omitted = ranked[max_recalled_assertions:]
     selected_ids = [assertion.id for _, _, assertion, _ in selected]
+    assertion_ids = [assertion.id for assertion in active_assertions]
     evidence_refs = _evidence_refs_by_assertion(db, selected_ids + assertion_ids)
     semantic_assertions = [
         serialize_assertion(

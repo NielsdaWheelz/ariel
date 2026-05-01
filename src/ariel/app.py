@@ -2467,7 +2467,7 @@ def create_app(
         bounded_limit = max(1, min(limit, 100))
         with session_factory() as db:
             with db.begin():
-                results = search_memory(db, query=q, limit=bounded_limit)
+                results = search_memory(db, query=q, limit=bounded_limit, settings=settings)
                 try:
                     return build_surface_memory_search_response(
                         schema_version="memory.sota.v1",
@@ -2986,6 +2986,7 @@ def create_app(
             db,
             user_message=user_message,
             max_recalled_assertions=int(app.state.max_recalled_assertions),
+            settings=settings,
         )
         pre_rotation_open_commitments_and_jobs = {
             "open_jobs": _open_jobs_context(db=db),
@@ -3042,6 +3043,7 @@ def create_app(
             db,
             user_message=user_message,
             max_recalled_assertions=int(app.state.max_recalled_assertions),
+            settings=settings,
         )
         open_commitments_and_jobs = {
             "open_jobs": _open_jobs_context(db=db),

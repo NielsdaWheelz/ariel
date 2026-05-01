@@ -977,7 +977,7 @@ def test_memory_command_fetches_memory_projection(monkeypatch: pytest.MonkeyPatc
                         "evidence": [],
                         "procedures": [],
                         "projection_health": {
-                            "projection_version": "semantic-v2",
+                            "projection_version": "embedding-v1",
                             "pending_jobs": 0,
                             "failed_jobs": 0,
                         },
