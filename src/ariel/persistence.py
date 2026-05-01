@@ -1863,10 +1863,173 @@ class AttentionSignalRecord(Base):
     )
 
 
+class AttentionGroupRecord(Base):
+    __tablename__ = "attention_groups"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    group_key: Mapped[str] = mapped_column(String(160), nullable=False, unique=True)
+    group_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    group_metadata: Mapped[dict[str, Any]] = mapped_column(
+        "metadata",
+        JSONB,
+        nullable=False,
+        default=dict,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "group_type IN ('approval', 'job', 'connector', 'memory', 'capture', 'workspace')",
+            name="ck_attention_group_type",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'suppressed', 'resolved')",
+            name="ck_attention_group_status",
+        ),
+        Index("ix_attention_groups_status_updated", "status", "updated_at"),
+    )
+
+
+class AttentionGroupMemberRecord(Base):
+    __tablename__ = "attention_group_members"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    group_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("attention_groups.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    attention_signal_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("attention_signals.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    grouping_reason: Mapped[str] = mapped_column(Text, nullable=False)
+    ranking_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "group_id",
+            "attention_signal_id",
+            name="uq_attention_group_member_signal",
+        ),
+    )
+
+
+class AttentionRankFeatureRecord(Base):
+    __tablename__ = "attention_rank_features"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    attention_signal_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("attention_signals.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    feature_set_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    features: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    score_components: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "attention_signal_id",
+            "feature_set_version",
+            name="uq_attention_rank_feature_signal_version",
+        ),
+    )
+
+
+class AttentionRankSnapshotRecord(Base):
+    __tablename__ = "attention_rank_snapshots"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    group_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("attention_groups.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    snapshot_key: Mapped[str] = mapped_column(String(160), nullable=False, unique=True)
+    ranker_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_signal_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    rank_score: Mapped[float] = mapped_column(Float, nullable=False)
+    rank_inputs: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    rank_reason: Mapped[str] = mapped_column(Text, nullable=False)
+    delivery_decision: Mapped[str] = mapped_column(String(32), nullable=False)
+    delivery_reason: Mapped[str] = mapped_column(Text, nullable=False)
+    suppression_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    next_follow_up_after: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    priority: Mapped[str] = mapped_column(String(32), nullable=False)
+    urgency: Mapped[str] = mapped_column(String(32), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    taint: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "rank_score >= 0.0 AND rank_score <= 1.0",
+            name="ck_attention_rank_snapshot_score",
+        ),
+        CheckConstraint(
+            "delivery_decision IN ('interrupt_now', 'queue', 'digest', 'suppress')",
+            name="ck_attention_rank_snapshot_delivery_decision",
+        ),
+        CheckConstraint(
+            "priority IN ('critical', 'high', 'normal', 'low')",
+            name="ck_attention_rank_snapshot_priority",
+        ),
+        CheckConstraint(
+            "urgency IN ('critical', 'high', 'normal', 'low')",
+            name="ck_attention_rank_snapshot_urgency",
+        ),
+        CheckConstraint(
+            "confidence >= 0.0 AND confidence <= 1.0",
+            name="ck_attention_rank_snapshot_confidence",
+        ),
+        Index("ix_attention_rank_snapshots_group_created", "group_id", "created_at"),
+        Index("ix_attention_rank_snapshots_delivery", "delivery_decision", "created_at"),
+    )
+
+
 class AttentionItemRecord(Base):
     __tablename__ = "attention_items"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    group_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("attention_groups.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    rank_snapshot_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("attention_rank_snapshots.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
     source_type: Mapped[str] = mapped_column(String(32), nullable=False)
     source_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     source_signal_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
@@ -1880,6 +2043,12 @@ class AttentionItemRecord(Base):
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     evidence: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     taint: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    rank_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    rank_inputs: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    rank_reason: Mapped[str] = mapped_column(Text, nullable=False)
+    delivery_decision: Mapped[str] = mapped_column(String(32), nullable=False)
+    delivery_reason: Mapped[str] = mapped_column(Text, nullable=False)
+    suppression_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, index=True
     )
@@ -1900,7 +2069,7 @@ class AttentionItemRecord(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "source_type IN ('attention_signal')",
+            "source_type IN ('attention_group')",
             name="ck_attention_item_source_type",
         ),
         CheckConstraint(
@@ -1922,8 +2091,18 @@ class AttentionItemRecord(Base):
             "confidence >= 0.0 AND confidence <= 1.0",
             name="ck_attention_item_confidence",
         ),
+        CheckConstraint(
+            "rank_score >= 0.0 AND rank_score <= 1.0",
+            name="ck_attention_item_rank_score",
+        ),
+        CheckConstraint(
+            "delivery_decision IN ('interrupt_now', 'queue', 'digest', 'suppress')",
+            name="ck_attention_item_delivery_decision",
+        ),
         Index("ix_attention_items_status_priority", "status", "priority", "updated_at"),
+        Index("ix_attention_items_status_rank", "status", "rank_score", "updated_at"),
         Index("ix_attention_items_follow_up_due", "status", "next_follow_up_after", "id"),
+        Index("ix_attention_items_delivery", "delivery_decision", "status", "updated_at"),
         Index("ix_attention_items_source", "source_type", "source_id"),
     )
 
@@ -1979,6 +2158,37 @@ class ProactiveFeedbackRecord(Base):
             "feedback_type IN ('important', 'noise', 'wrong', 'useful')",
             name="ck_proactive_feedback_type",
         ),
+    )
+
+
+class ProactiveFeedbackRuleRecord(Base):
+    __tablename__ = "proactive_feedback_rules"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    rule_key: Mapped[str] = mapped_column(String(160), nullable=False, unique=True)
+    rule_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+    conditions: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    effect: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "rule_type IN ('ranking', 'grouping', 'delivery', 'suppression')",
+            name="ck_proactive_feedback_rule_type",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'paused', 'archived')",
+            name="ck_proactive_feedback_rule_status",
+        ),
+        CheckConstraint("priority >= 0", name="ck_proactive_feedback_rule_priority"),
+        Index("ix_proactive_feedback_rules_status_priority", "status", "priority", "updated_at"),
     )
 
 
@@ -2045,7 +2255,9 @@ class BackgroundTaskRecord(Base):
                 "'provider_subscription_renewal_due', 'provider_event_received', "
                 "'provider_sync_due', 'memory_extract_turn', "
                 "'workspace_signal_derivation_due', "
-                "'attention_review_due', 'attention_item_follow_up_due', "
+                "'attention_feature_extraction_due', 'attention_grouping_due', "
+                "'attention_ranking_due', 'attention_review_due', 'attention_delivery_due', "
+                "'attention_item_follow_up_due', 'proactive_feedback_review_due', "
                 "'action_proposal_review_due')"
             ),
             name="ck_background_task_type",
@@ -2517,6 +2729,64 @@ def serialize_attention_signal(signal: AttentionSignalRecord) -> dict[str, Any]:
     }
 
 
+def serialize_attention_group(group: AttentionGroupRecord) -> dict[str, Any]:
+    return {
+        "id": group.id,
+        "group_key": group.group_key,
+        "group_type": group.group_type,
+        "status": group.status,
+        "title": redact_text(group.title),
+        "summary": redact_text(group.summary),
+        "metadata": redact_json_value(group.group_metadata),
+        "created_at": to_rfc3339(group.created_at),
+        "updated_at": to_rfc3339(group.updated_at),
+    }
+
+
+def serialize_attention_rank_feature(feature: AttentionRankFeatureRecord) -> dict[str, Any]:
+    return {
+        "id": feature.id,
+        "attention_signal_id": feature.attention_signal_id,
+        "feature_set_version": feature.feature_set_version,
+        "features": redact_json_value(feature.features),
+        "score_components": redact_json_value(feature.score_components),
+        "created_at": to_rfc3339(feature.created_at),
+    }
+
+
+def serialize_attention_rank_snapshot(snapshot: AttentionRankSnapshotRecord) -> dict[str, Any]:
+    return {
+        "id": snapshot.id,
+        "group_id": snapshot.group_id,
+        "snapshot_key": snapshot.snapshot_key,
+        "ranker_version": snapshot.ranker_version,
+        "source_signal_ids": snapshot.source_signal_ids,
+        "rank_score": snapshot.rank_score,
+        "rank_inputs": redact_json_value(snapshot.rank_inputs),
+        "rank_reason": redact_text(snapshot.rank_reason),
+        "delivery_decision": snapshot.delivery_decision,
+        "delivery_reason": redact_text(snapshot.delivery_reason),
+        "suppression_reason": (
+            redact_text(snapshot.suppression_reason)
+            if snapshot.suppression_reason is not None
+            else None
+        ),
+        "next_follow_up_after": (
+            to_rfc3339(snapshot.next_follow_up_after)
+            if snapshot.next_follow_up_after is not None
+            else None
+        ),
+        "priority": snapshot.priority,
+        "urgency": snapshot.urgency,
+        "confidence": snapshot.confidence,
+        "title": redact_text(snapshot.title),
+        "body": redact_text(snapshot.body),
+        "evidence": redact_json_value(snapshot.evidence),
+        "taint": redact_json_value(snapshot.taint),
+        "created_at": to_rfc3339(snapshot.created_at),
+    }
+
+
 def serialize_action_proposal(proposal: ActionProposalRecord) -> dict[str, Any]:
     return {
         "id": proposal.id,
@@ -2542,9 +2812,25 @@ def serialize_proactive_feedback(feedback: ProactiveFeedbackRecord) -> dict[str,
     }
 
 
+def serialize_proactive_feedback_rule(rule: ProactiveFeedbackRuleRecord) -> dict[str, Any]:
+    return {
+        "id": rule.id,
+        "rule_key": rule.rule_key,
+        "rule_type": rule.rule_type,
+        "status": rule.status,
+        "priority": rule.priority,
+        "conditions": redact_json_value(rule.conditions),
+        "effect": redact_json_value(rule.effect),
+        "created_at": to_rfc3339(rule.created_at),
+        "updated_at": to_rfc3339(rule.updated_at),
+    }
+
+
 def serialize_attention_item(item: AttentionItemRecord) -> dict[str, Any]:
     return {
         "id": item.id,
+        "group_id": item.group_id,
+        "rank_snapshot_id": item.rank_snapshot_id,
         "source_type": item.source_type,
         "source_id": item.source_id,
         "source_signal_ids": item.source_signal_ids,
@@ -2558,6 +2844,14 @@ def serialize_attention_item(item: AttentionItemRecord) -> dict[str, Any]:
         "reason": redact_text(item.reason),
         "evidence": redact_json_value(item.evidence),
         "taint": redact_json_value(item.taint),
+        "rank_score": item.rank_score,
+        "rank_inputs": redact_json_value(item.rank_inputs),
+        "rank_reason": redact_text(item.rank_reason),
+        "delivery_decision": item.delivery_decision,
+        "delivery_reason": redact_text(item.delivery_reason),
+        "suppression_reason": (
+            redact_text(item.suppression_reason) if item.suppression_reason is not None else None
+        ),
         "expires_at": to_rfc3339(item.expires_at) if item.expires_at is not None else None,
         "next_follow_up_after": (
             to_rfc3339(item.next_follow_up_after) if item.next_follow_up_after is not None else None

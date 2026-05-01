@@ -9,25 +9,14 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from ariel.persistence import (
     ApprovalRequestRecord,
-    AttentionItemEventRecord,
-    AttentionItemRecord,
     AttentionSignalRecord,
     BackgroundTaskRecord,
     CaptureRecord,
     GoogleConnectorRecord,
     JobRecord,
     MemoryAssertionRecord,
-    NotificationRecord,
     to_rfc3339,
 )
-
-
-def _payload_text(payload: dict[str, Any], key: str) -> str | None:
-    value = payload.get(key)
-    if not isinstance(value, str):
-        return None
-    normalized = value.strip()
-    return normalized or None
 
 
 def process_workspace_signal_derivation_due(
@@ -207,7 +196,7 @@ def process_workspace_signal_derivation_due(
                 db.add(
                     BackgroundTaskRecord(
                         id=new_id_fn("tsk"),
-                        task_type="attention_review_due",
+                        task_type="attention_feature_extraction_due",
                         payload={},
                         status="pending",
                         attempts=0,
@@ -220,119 +209,6 @@ def process_workspace_signal_derivation_due(
                         updated_at=now,
                     )
                 )
-
-
-def process_attention_review_due(
-    *,
-    session_factory: sessionmaker[Session],
-    task_payload: dict[str, Any],
-    now_fn: Callable[[], datetime],
-    new_id_fn: Callable[[str], str],
-) -> None:
-    del task_payload
-    with session_factory() as db:
-        with db.begin():
-            now = now_fn()
-            signals = db.scalars(
-                select(AttentionSignalRecord)
-                .where(AttentionSignalRecord.status == "new")
-                .order_by(
-                    AttentionSignalRecord.updated_at.asc(),
-                    AttentionSignalRecord.id.asc(),
-                )
-                .limit(50)
-                .with_for_update()
-            ).all()
-            for signal in signals:
-                _upsert_attention_item(db, signal=signal, now=now, new_id_fn=new_id_fn)
-                signal.status = "reviewed"
-                signal.updated_at = now
-
-
-def process_attention_item_follow_up_due(
-    *,
-    session_factory: sessionmaker[Session],
-    task_payload: dict[str, Any],
-    now_fn: Callable[[], datetime],
-    new_id_fn: Callable[[str], str],
-) -> None:
-    attention_item_id = _payload_text(task_payload, "attention_item_id")
-    if attention_item_id is None:
-        raise RuntimeError("attention_item_follow_up_due task missing attention_item_id")
-
-    with session_factory() as db:
-        with db.begin():
-            item = db.scalar(
-                select(AttentionItemRecord)
-                .where(AttentionItemRecord.id == attention_item_id)
-                .with_for_update()
-                .limit(1)
-            )
-            if item is None:
-                raise RuntimeError("attention item not found")
-            if item.status not in {"open", "notified", "snoozed"}:
-                return
-
-            now = now_fn()
-            if item.next_follow_up_after is not None and item.next_follow_up_after > now:
-                return
-
-            scheduled_for = _payload_text(task_payload, "scheduled_for") or to_rfc3339(now)
-            notification = db.scalar(
-                select(NotificationRecord)
-                .where(
-                    NotificationRecord.dedupe_key
-                    == f"attention-item:{item.id}:follow-up:{scheduled_for}"
-                )
-                .with_for_update()
-                .limit(1)
-            )
-            if notification is None:
-                notification = NotificationRecord(
-                    id=new_id_fn("ntf"),
-                    dedupe_key=f"attention-item:{item.id}:follow-up:{scheduled_for}",
-                    source_type="attention_item",
-                    source_id=item.id,
-                    channel="discord",
-                    status="pending",
-                    title=item.title,
-                    body=item.body,
-                    payload={"attention_item_id": item.id},
-                    created_at=now,
-                    updated_at=now,
-                )
-                db.add(notification)
-                db.flush()
-                db.add(
-                    BackgroundTaskRecord(
-                        id=new_id_fn("tsk"),
-                        task_type="deliver_discord_notification",
-                        payload={"notification_id": notification.id},
-                        status="pending",
-                        attempts=0,
-                        max_attempts=5,
-                        error=None,
-                        claimed_by=None,
-                        run_after=now,
-                        last_heartbeat=None,
-                        created_at=now,
-                        updated_at=now,
-                    )
-                )
-
-            item.status = "notified"
-            item.last_notified_at = now
-            item.next_follow_up_after = None
-            item.updated_at = now
-            db.add(
-                AttentionItemEventRecord(
-                    id=new_id_fn("aie"),
-                    attention_item_id=item.id,
-                    event_type="notified",
-                    payload={"notification_id": notification.id, "kind": "follow_up"},
-                    created_at=now,
-                )
-            )
 
 
 def upsert_attention_signal(
@@ -398,128 +274,3 @@ def upsert_attention_signal(
         signal.updated_at = now
         return 1
     return 0
-
-
-def _upsert_attention_item(
-    db: Session,
-    *,
-    signal: AttentionSignalRecord,
-    now: datetime,
-    new_id_fn: Callable[[str], str],
-) -> None:
-    item = db.scalar(
-        select(AttentionItemRecord)
-        .where(AttentionItemRecord.dedupe_key == f"attention-signal:{signal.id}")
-        .with_for_update()
-        .limit(1)
-    )
-    evidence = {
-        "attention_signal_ids": [signal.id],
-        "signal_evidence": signal.evidence,
-        "taint": signal.taint,
-    }
-    if item is None:
-        item = AttentionItemRecord(
-            id=new_id_fn("att"),
-            source_type="attention_signal",
-            source_id=signal.id,
-            source_signal_ids=[signal.id],
-            dedupe_key=f"attention-signal:{signal.id}",
-            status="open",
-            priority=signal.priority,
-            urgency=signal.urgency,
-            confidence=signal.confidence,
-            title=signal.title,
-            body=signal.body,
-            reason=signal.reason,
-            evidence=evidence,
-            taint=signal.taint,
-            expires_at=None,
-            next_follow_up_after=None,
-            last_notified_at=None,
-            created_at=now,
-            updated_at=now,
-        )
-        db.add(item)
-        db.flush()
-        db.add(
-            AttentionItemEventRecord(
-                id=new_id_fn("aie"),
-                attention_item_id=item.id,
-                event_type="detected",
-                payload={"attention_signal_ids": [signal.id]},
-                created_at=now,
-            )
-        )
-    elif item.status in {"open", "notified", "acknowledged", "snoozed"}:
-        item.source_signal_ids = [signal.id]
-        item.priority = signal.priority
-        item.urgency = signal.urgency
-        item.confidence = signal.confidence
-        item.title = signal.title
-        item.body = signal.body
-        item.reason = signal.reason
-        item.evidence = evidence
-        item.taint = signal.taint
-        item.updated_at = now
-        db.add(
-            AttentionItemEventRecord(
-                id=new_id_fn("aie"),
-                attention_item_id=item.id,
-                event_type="updated",
-                payload={"attention_signal_ids": [signal.id]},
-                created_at=now,
-            )
-        )
-
-    if item.status == "open" and item.priority in {"critical", "high", "normal"}:
-        notification = db.scalar(
-            select(NotificationRecord)
-            .where(NotificationRecord.dedupe_key == f"attention-item:{item.id}:initial")
-            .with_for_update()
-            .limit(1)
-        )
-        if notification is None:
-            notification = NotificationRecord(
-                id=new_id_fn("ntf"),
-                dedupe_key=f"attention-item:{item.id}:initial",
-                source_type="attention_item",
-                source_id=item.id,
-                channel="discord",
-                status="pending",
-                title=item.title,
-                body=item.body,
-                payload={"attention_item_id": item.id},
-                created_at=now,
-                updated_at=now,
-            )
-            db.add(notification)
-            db.flush()
-            db.add(
-                BackgroundTaskRecord(
-                    id=new_id_fn("tsk"),
-                    task_type="deliver_discord_notification",
-                    payload={"notification_id": notification.id},
-                    status="pending",
-                    attempts=0,
-                    max_attempts=5,
-                    error=None,
-                    claimed_by=None,
-                    run_after=now,
-                    last_heartbeat=None,
-                    created_at=now,
-                    updated_at=now,
-                )
-            )
-        item.status = "notified"
-        item.last_notified_at = now
-        item.updated_at = now
-        db.add(
-            AttentionItemEventRecord(
-                id=new_id_fn("aie"),
-                attention_item_id=item.id,
-                event_type="notified",
-                payload={"notification_id": notification.id, "kind": "initial"},
-                created_at=now,
-            )
-        )

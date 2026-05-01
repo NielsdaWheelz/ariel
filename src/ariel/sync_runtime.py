@@ -321,7 +321,7 @@ def process_provider_sync_due(
                 db.add(
                     BackgroundTaskRecord(
                         id=new_id_fn("tsk"),
-                        task_type="attention_review_due",
+                        task_type="attention_feature_extraction_due",
                         payload={},
                         status="pending",
                         attempts=0,

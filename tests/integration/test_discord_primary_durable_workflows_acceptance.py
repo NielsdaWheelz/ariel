@@ -410,6 +410,17 @@ def test_google_calendar_sync_creates_workspace_state_and_attention_signal(
         assert signal["source_type"] == "workspace_item"
         assert signal["workspace_item_id"] == workspace_item["id"]
 
+        with _session_factory(client)() as db:
+            with db.begin():
+                task_type = db.execute(
+                    text(
+                        "SELECT task_type FROM background_tasks "
+                        "WHERE status = 'pending' "
+                        "ORDER BY created_at DESC LIMIT 1"
+                    )
+                ).scalar_one()
+                assert task_type == "attention_feature_extraction_due"
+
 
 def test_proactive_open_job_check_creates_attention_notification_and_acknowledges_both(
     postgres_url: str,
@@ -426,16 +437,12 @@ def test_proactive_open_job_check_creates_attention_notification_and_acknowledge
         assert derive.status_code == 200
 
         settings = cast(Any, AppSettings)(_env_file=None)
-        assert process_one_task(
-            session_factory=_session_factory(client),
-            settings=settings,
-            worker_id="worker-proactive",
-        )
-        assert process_one_task(
-            session_factory=_session_factory(client),
-            settings=settings,
-            worker_id="worker-proactive",
-        )
+        for _ in range(6):
+            assert process_one_task(
+                session_factory=_session_factory(client),
+                settings=settings,
+                worker_id="worker-proactive",
+            )
 
         signals = client.get("/v1/attention-signals", params={"status": "reviewed"})
         assert signals.status_code == 200
@@ -443,14 +450,40 @@ def test_proactive_open_job_check_creates_attention_notification_and_acknowledge
         assert signal["source_type"] == "job"
         assert signal["evidence"]["job_id"] == "job_proactive_ack"
 
+        rank_features = client.get("/v1/attention-rank-features")
+        assert rank_features.status_code == 200
+        assert (
+            rank_features.json()["attention_rank_features"][0]["attention_signal_id"]
+            == signal["id"]
+        )
+
+        groups = client.get("/v1/attention-groups")
+        assert groups.status_code == 200
+        group = groups.json()["attention_groups"][0]
+        assert group["group_type"] == "job"
+        assert group["metadata"]["source_type"] == "job"
+
+        rank_snapshots = client.get("/v1/attention-rank-snapshots")
+        assert rank_snapshots.status_code == 200
+        rank_snapshot = rank_snapshots.json()["attention_rank_snapshots"][0]
+        assert rank_snapshot["group_id"] == group["id"]
+        assert rank_snapshot["delivery_decision"] == "interrupt_now"
+        assert rank_snapshot["rank_reason"] == "job_waiting_on_user"
+
         attention = client.get("/v1/attention-items", params={"status": "notified"})
         assert attention.status_code == 200
         attention_item = attention.json()["attention_items"][0]
         assert "subscription_id" not in attention_item
-        assert attention_item["source_type"] == "attention_signal"
+        assert attention_item["source_type"] == "attention_group"
+        assert attention_item["group_id"] == group["id"]
+        assert attention_item["rank_snapshot_id"] == rank_snapshot["id"]
         assert attention_item["source_signal_ids"] == [signal["id"]]
         assert attention_item["priority"] == "high"
-        assert attention_item["evidence"]["signal_evidence"]["job_id"] == "job_proactive_ack"
+        assert attention_item["rank_score"] == 0.85
+        assert attention_item["rank_reason"] == "job_waiting_on_user"
+        assert attention_item["rank_inputs"]["source_types"] == ["job"]
+        assert attention_item["delivery_decision"] == "interrupt_now"
+        assert attention_item["evidence"]["signal_evidence"][0]["job_id"] == "job_proactive_ack"
 
         notifications = client.get("/v1/notifications")
         assert notifications.status_code == 200
@@ -489,16 +522,12 @@ def test_attention_item_snooze_schedules_durable_follow_up(
         assert derive.status_code == 200
 
         settings = cast(Any, AppSettings)(_env_file=None)
-        assert process_one_task(
-            session_factory=_session_factory(client),
-            settings=settings,
-            worker_id="worker-proactive",
-        )
-        assert process_one_task(
-            session_factory=_session_factory(client),
-            settings=settings,
-            worker_id="worker-proactive",
-        )
+        for _ in range(6):
+            assert process_one_task(
+                session_factory=_session_factory(client),
+                settings=settings,
+                worker_id="worker-proactive",
+            )
 
         attention_item_id = client.get("/v1/attention-items", params={"status": "notified"}).json()[
             "attention_items"
@@ -522,11 +551,12 @@ def test_attention_item_snooze_schedules_durable_follow_up(
                 )
 
         monkeypatch.setattr("ariel.worker._utcnow", lambda: snooze_until + timedelta(seconds=1))
-        assert process_one_task(
-            session_factory=_session_factory(client),
-            settings=settings,
-            worker_id="worker-proactive",
-        )
+        for _ in range(4):
+            assert process_one_task(
+                session_factory=_session_factory(client),
+                settings=settings,
+                worker_id="worker-proactive",
+            )
 
         item_after_follow_up = client.get(f"/v1/attention-items/{attention_item_id}")
         assert item_after_follow_up.status_code == 200
@@ -541,3 +571,62 @@ def test_attention_item_snooze_schedules_durable_follow_up(
             "pending",
             "acknowledged",
         ]
+
+
+def test_attention_feedback_creates_durable_ranking_rule(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 4, 30, 14, 0, tzinfo=UTC)
+    monkeypatch.setattr("ariel.app._utcnow", lambda: now)
+    monkeypatch.setattr("ariel.worker._utcnow", lambda: now)
+
+    with _build_client(postgres_url, DurableWorkflowAdapter()) as client:
+        _seed_job(client, job_id="job_proactive_feedback", status="running", now=now)
+        derive = client.post("/v1/attention-signals/derive")
+        assert derive.status_code == 200
+
+        settings = cast(Any, AppSettings)(_env_file=None)
+        for _ in range(5):
+            assert process_one_task(
+                session_factory=_session_factory(client),
+                settings=settings,
+                worker_id="worker-proactive",
+            )
+
+        attention_item = client.get("/v1/attention-items", params={"status": "open"}).json()[
+            "attention_items"
+        ][0]
+        assert attention_item["delivery_decision"] == "queue"
+
+        feedback = client.post(
+            f"/v1/attention-items/{attention_item['id']}/feedback",
+            json={"feedback_type": "noise", "note": "not worth interrupting"},
+        )
+        assert feedback.status_code == 200
+
+        assert process_one_task(
+            session_factory=_session_factory(client),
+            settings=settings,
+            worker_id="worker-proactive",
+        )
+
+        rules = client.get("/v1/proactive-feedback-rules")
+        assert rules.status_code == 200
+        rule = rules.json()["proactive_feedback_rules"][0]
+        assert rule["rule_type"] == "suppression"
+        assert rule["conditions"]["source_type"] == "job"
+        assert rule["effect"]["delivery_decision"] == "suppress"
+
+        for _ in range(2):
+            assert process_one_task(
+                session_factory=_session_factory(client),
+                settings=settings,
+                worker_id="worker-proactive",
+            )
+
+        updated = client.get(f"/v1/attention-items/{attention_item['id']}")
+        assert updated.status_code == 200
+        updated_item = updated.json()["attention_item"]
+        assert updated_item["delivery_decision"] == "suppress"
+        assert updated_item["suppression_reason"] == "user_feedback_noise"

@@ -800,11 +800,74 @@ class SurfaceAttentionSignalContract(BaseModel):
     updated_at: str
 
 
+class SurfaceAttentionGroupContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    group_key: str
+    group_type: Literal["approval", "job", "connector", "memory", "capture", "workspace"]
+    status: Literal["active", "suppressed", "resolved"]
+    title: str
+    summary: str
+    metadata: dict[str, Any]
+    created_at: str
+    updated_at: str
+
+
+class SurfaceAttentionGroupMemberContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    group_id: str
+    attention_signal_id: str
+    grouping_reason: str
+    ranking_version: str
+    created_at: str
+
+
+class SurfaceAttentionRankFeatureContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    attention_signal_id: str
+    feature_set_version: str
+    features: dict[str, Any]
+    score_components: dict[str, Any]
+    created_at: str
+
+
+class SurfaceAttentionRankSnapshotContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    group_id: str
+    snapshot_key: str
+    ranker_version: str
+    source_signal_ids: list[str]
+    rank_score: float
+    rank_inputs: dict[str, Any]
+    rank_reason: str
+    delivery_decision: Literal["interrupt_now", "queue", "digest", "suppress"]
+    delivery_reason: str
+    suppression_reason: str | None
+    next_follow_up_after: str | None
+    priority: Literal["critical", "high", "normal", "low"]
+    urgency: Literal["critical", "high", "normal", "low"]
+    confidence: float
+    title: str
+    body: str
+    evidence: dict[str, Any]
+    taint: dict[str, Any]
+    created_at: str
+
+
 class SurfaceAttentionItemContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
-    source_type: Literal["attention_signal"]
+    group_id: str
+    rank_snapshot_id: str
+    source_type: Literal["attention_group"]
     source_id: str
     source_signal_ids: list[str]
     dedupe_key: str
@@ -826,6 +889,12 @@ class SurfaceAttentionItemContract(BaseModel):
     reason: str
     evidence: dict[str, Any]
     taint: dict[str, Any]
+    rank_score: float
+    rank_inputs: dict[str, Any]
+    rank_reason: str
+    delivery_decision: Literal["interrupt_now", "queue", "digest", "suppress"]
+    delivery_reason: str
+    suppression_reason: str | None
     expires_at: str | None
     next_follow_up_after: str | None
     last_notified_at: str | None
@@ -902,6 +971,48 @@ class SurfaceAttentionSignalListResponseContract(BaseModel):
 
     ok: bool
     attention_signals: list[SurfaceAttentionSignalContract]
+
+
+class SurfaceAttentionGroupListResponseContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    attention_groups: list[SurfaceAttentionGroupContract]
+
+
+class SurfaceAttentionRankFeatureListResponseContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    attention_rank_features: list[SurfaceAttentionRankFeatureContract]
+
+
+class SurfaceAttentionRankSnapshotListResponseContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    attention_rank_snapshots: list[SurfaceAttentionRankSnapshotContract]
+
+
+class SurfaceProactiveFeedbackRuleContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    rule_key: str
+    rule_type: Literal["ranking", "grouping", "delivery", "suppression"]
+    status: Literal["active", "paused", "archived"]
+    priority: int
+    conditions: dict[str, Any]
+    effect: dict[str, Any]
+    created_at: str
+    updated_at: str
+
+
+class SurfaceProactiveFeedbackRuleListResponseContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    proactive_feedback_rules: list[SurfaceProactiveFeedbackRuleContract]
 
 
 class SurfaceActionProposalContract(BaseModel):
@@ -1492,6 +1603,65 @@ def build_surface_attention_signal_list_response(*, attention_signals: Any) -> d
         {
             "ok": True,
             "attention_signals": attention_signals if isinstance(attention_signals, list) else [],
+        },
+    )
+
+
+def build_surface_attention_group_list_response(*, attention_groups: Any) -> dict[str, Any]:
+    return _validate_contract(
+        "surface_attention_group_list_response",
+        SurfaceAttentionGroupListResponseContract,
+        {
+            "ok": True,
+            "attention_groups": attention_groups if isinstance(attention_groups, list) else [],
+        },
+    )
+
+
+def build_surface_attention_rank_feature_list_response(
+    *,
+    attention_rank_features: Any,
+) -> dict[str, Any]:
+    return _validate_contract(
+        "surface_attention_rank_feature_list_response",
+        SurfaceAttentionRankFeatureListResponseContract,
+        {
+            "ok": True,
+            "attention_rank_features": (
+                attention_rank_features if isinstance(attention_rank_features, list) else []
+            ),
+        },
+    )
+
+
+def build_surface_attention_rank_snapshot_list_response(
+    *,
+    attention_rank_snapshots: Any,
+) -> dict[str, Any]:
+    return _validate_contract(
+        "surface_attention_rank_snapshot_list_response",
+        SurfaceAttentionRankSnapshotListResponseContract,
+        {
+            "ok": True,
+            "attention_rank_snapshots": (
+                attention_rank_snapshots if isinstance(attention_rank_snapshots, list) else []
+            ),
+        },
+    )
+
+
+def build_surface_proactive_feedback_rule_list_response(
+    *,
+    proactive_feedback_rules: Any,
+) -> dict[str, Any]:
+    return _validate_contract(
+        "surface_proactive_feedback_rule_list_response",
+        SurfaceProactiveFeedbackRuleListResponseContract,
+        {
+            "ok": True,
+            "proactive_feedback_rules": (
+                proactive_feedback_rules if isinstance(proactive_feedback_rules, list) else []
+            ),
         },
     )
 

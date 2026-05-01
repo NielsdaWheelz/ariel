@@ -69,9 +69,10 @@ deterministic operational commands only and do not route free-form prompts to th
 
 ## proactive attention
 
-The durable worker owns provider event sync, workspace signal derivation, attention
-review, and follow-ups. Provider deltas and internal state create durable attention
-signals; reviewed signals create deduped attention items. Discord notifications carry
+The durable worker owns provider event sync, workspace signal derivation, ranking,
+grouping, attention review, delivery, feedback review, and follow-ups. Provider deltas
+and internal state create durable attention signals; signals become rank features,
+groups, rank snapshots, and then ranked attention items. Discord notifications carry
 acknowledge, snooze, resolve, and refresh buttons.
 
 Core inspection and mutation routes:
@@ -84,10 +85,14 @@ Core inspection and mutation routes:
 - `GET /v1/sync-runs`
 - `GET /v1/workspace-items`
 - `GET /v1/attention-signals`
+- `GET /v1/attention-rank-features`
+- `GET /v1/attention-groups`
+- `GET /v1/attention-rank-snapshots`
 - `POST /v1/attention-signals/derive`
 - `GET /v1/attention-items`
 - `GET /v1/attention-items/{attention_item_id}/events`
 - `POST /v1/attention-items/{attention_item_id}/ack|snooze|resolve|cancel|refresh|feedback`
+- `GET /v1/proactive-feedback-rules`
 
 ## verification gates
 

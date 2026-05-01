@@ -128,8 +128,9 @@ ARIEL_GOOGLE_PROVIDER_EVENT_TOKEN=<shared-google-callback-token>
 ```
 
 The same `ariel-worker` service owns provider event sync, workspace signal derivation,
-attention review, attention-item follow-ups, approval expiry, Agency event ingestion, and
-Discord notification delivery. There is no separate scheduler process.
+attention feature extraction, grouping, ranking, review, delivery, feedback review,
+attention-item follow-ups, approval expiry, Agency event ingestion, and Discord
+notification delivery. There is no separate scheduler process.
 
 Set provider keys only for enabled capabilities:
 
@@ -217,10 +218,14 @@ curl -s http://127.0.0.1:8000/v1/provider-events
 curl -s http://127.0.0.1:8000/v1/sync-runs
 curl -s http://127.0.0.1:8000/v1/workspace-items
 curl -s http://127.0.0.1:8000/v1/attention-signals
+curl -s http://127.0.0.1:8000/v1/attention-rank-features
+curl -s http://127.0.0.1:8000/v1/attention-groups
+curl -s http://127.0.0.1:8000/v1/attention-rank-snapshots
 curl -s http://127.0.0.1:8000/v1/attention-items
+curl -s http://127.0.0.1:8000/v1/proactive-feedback-rules
 ```
 
-Force sync and signal review only through explicit mutation endpoints:
+Force sync and signal derivation only through explicit mutation endpoints:
 
 ```sh
 curl -X POST 'http://127.0.0.1:8000/v1/connectors/google/sync?resource_type=calendar&resource_id=primary'

@@ -71,8 +71,11 @@ from ariel.persistence import (
     ApprovalRequestRecord,
     AgencyEventRecord,
     ArtifactRecord,
+    AttentionGroupRecord,
     AttentionItemEventRecord,
     AttentionItemRecord,
+    AttentionRankFeatureRecord,
+    AttentionRankSnapshotRecord,
     AttentionSignalRecord,
     BackgroundTaskRecord,
     CaptureRecord,
@@ -82,6 +85,7 @@ from ariel.persistence import (
     JobRecord,
     NotificationRecord,
     ProactiveFeedbackRecord,
+    ProactiveFeedbackRuleRecord,
     ProviderEventRecord,
     SessionRecord,
     SessionRotationRecord,
@@ -94,8 +98,11 @@ from ariel.persistence import (
     serialize_action_proposal,
     serialize_agency_event,
     serialize_artifact,
+    serialize_attention_group,
     serialize_attention_item,
     serialize_attention_item_event,
+    serialize_attention_rank_feature,
+    serialize_attention_rank_snapshot,
     serialize_attention_signal,
     serialize_capture,
     serialize_connector_subscription,
@@ -104,6 +111,7 @@ from ariel.persistence import (
     serialize_job_event,
     serialize_notification,
     serialize_proactive_feedback,
+    serialize_proactive_feedback_rule,
     serialize_provider_event,
     serialize_session,
     serialize_sync_cursor,
@@ -118,9 +126,12 @@ from ariel.response_contracts import (
     ResponseContractViolation,
     build_surface_action_proposal_list_response,
     build_surface_attention_feedback_response,
+    build_surface_attention_group_list_response,
     build_surface_attention_item_event_list_response,
     build_surface_attention_item_list_response,
     build_surface_attention_item_response,
+    build_surface_attention_rank_feature_list_response,
+    build_surface_attention_rank_snapshot_list_response,
     build_surface_attention_signal_list_response,
     build_surface_artifact_response,
     build_surface_approval_response,
@@ -131,6 +142,7 @@ from ariel.response_contracts import (
     build_surface_memory_search_response,
     build_surface_message_response,
     build_surface_provider_event_list_response,
+    build_surface_proactive_feedback_rule_list_response,
     build_surface_rotation_list_response,
     build_surface_rotation_response,
     build_surface_sync_cursor_list_response,
@@ -2151,7 +2163,11 @@ def create_app(
                 "sync_runs": "/v1/sync-runs",
                 "workspace_items": "/v1/workspace-items",
                 "attention_signals": "/v1/attention-signals",
+                "attention_rank_features": "/v1/attention-rank-features",
+                "attention_groups": "/v1/attention-groups",
+                "attention_rank_snapshots": "/v1/attention-rank-snapshots",
                 "attention_items": "/v1/attention-items",
+                "proactive_feedback_rules": "/v1/proactive-feedback-rules",
                 "jobs": "/v1/jobs",
                 "capture_records": "/v1/captures/record",
                 "notifications": "/v1/notifications",
@@ -4681,6 +4697,96 @@ def create_app(
                 )
                 return {"ok": True, "task_id": task.id}
 
+    @app.get("/v1/attention-rank-features")
+    def get_attention_rank_features(limit: int = 50) -> dict[str, Any]:
+        _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 200))
+        with session_factory() as db:
+            with db.begin():
+                features = db.scalars(
+                    select(AttentionRankFeatureRecord)
+                    .order_by(
+                        AttentionRankFeatureRecord.created_at.desc(),
+                        AttentionRankFeatureRecord.id.desc(),
+                    )
+                    .limit(bounded_limit)
+                ).all()
+                try:
+                    return build_surface_attention_rank_feature_list_response(
+                        attention_rank_features=[
+                            serialize_attention_rank_feature(feature) for feature in features
+                        ]
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/attention-groups")
+    def get_attention_groups(limit: int = 50) -> dict[str, Any]:
+        _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 200))
+        with session_factory() as db:
+            with db.begin():
+                groups = db.scalars(
+                    select(AttentionGroupRecord)
+                    .order_by(
+                        AttentionGroupRecord.updated_at.desc(), AttentionGroupRecord.id.desc()
+                    )
+                    .limit(bounded_limit)
+                ).all()
+                try:
+                    return build_surface_attention_group_list_response(
+                        attention_groups=[serialize_attention_group(group) for group in groups]
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/attention-rank-snapshots")
+    def get_attention_rank_snapshots(limit: int = 50) -> dict[str, Any]:
+        _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 200))
+        with session_factory() as db:
+            with db.begin():
+                snapshots = db.scalars(
+                    select(AttentionRankSnapshotRecord)
+                    .order_by(
+                        AttentionRankSnapshotRecord.created_at.desc(),
+                        AttentionRankSnapshotRecord.id.desc(),
+                    )
+                    .limit(bounded_limit)
+                ).all()
+                try:
+                    return build_surface_attention_rank_snapshot_list_response(
+                        attention_rank_snapshots=[
+                            serialize_attention_rank_snapshot(snapshot) for snapshot in snapshots
+                        ]
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/proactive-feedback-rules")
+    def get_proactive_feedback_rules(limit: int = 50) -> dict[str, Any]:
+        _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 200))
+        with session_factory() as db:
+            with db.begin():
+                rules = db.scalars(
+                    select(ProactiveFeedbackRuleRecord)
+                    .order_by(
+                        ProactiveFeedbackRuleRecord.priority.asc(),
+                        ProactiveFeedbackRuleRecord.updated_at.desc(),
+                        ProactiveFeedbackRuleRecord.id.desc(),
+                    )
+                    .limit(bounded_limit)
+                ).all()
+                try:
+                    return build_surface_proactive_feedback_rule_list_response(
+                        proactive_feedback_rules=[
+                            serialize_proactive_feedback_rule(rule) for rule in rules
+                        ]
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
     @app.get("/v1/action-proposals")
     def get_action_proposals(
         status: Literal["proposed", "approved", "rejected", "superseded"] | None = None,
@@ -4732,8 +4838,9 @@ def create_app(
                     query = query.where(AttentionItemRecord.status == status)
                 attention_items = db.scalars(
                     query.order_by(
+                        AttentionItemRecord.rank_score.desc(),
                         AttentionItemRecord.updated_at.desc(),
-                        AttentionItemRecord.id.desc(),
+                        AttentionItemRecord.id.asc(),
                     ).limit(bounded_limit)
                 ).all()
                 try:
@@ -5080,6 +5187,19 @@ def create_app(
                         created_at=now,
                     )
                 )
+                notifications = db.scalars(
+                    select(NotificationRecord)
+                    .where(
+                        NotificationRecord.source_type == "attention_item",
+                        NotificationRecord.source_id == attention_item.id,
+                        NotificationRecord.status != "acknowledged",
+                    )
+                    .with_for_update()
+                ).all()
+                for notification in notifications:
+                    notification.status = "acknowledged"
+                    notification.acked_at = now
+                    notification.updated_at = now
                 try:
                     return build_surface_attention_item_response(
                         attention_item=serialize_attention_item(attention_item)
@@ -5130,11 +5250,8 @@ def create_app(
                 )
                 enqueue_background_task(
                     db,
-                    task_type="attention_review_due",
-                    payload={
-                        "attention_item_id": attention_item.id,
-                        "source_signal_ids": attention_item.source_signal_ids,
-                    },
+                    task_type="attention_ranking_due",
+                    payload={"attention_group_id": attention_item.group_id},
                     now=now,
                 )
                 try:
@@ -5182,6 +5299,12 @@ def create_app(
                         payload={"feedback_type": request.feedback_type},
                         created_at=now,
                     )
+                )
+                enqueue_background_task(
+                    db,
+                    task_type="proactive_feedback_review_due",
+                    payload={"feedback_id": feedback.id},
+                    now=now,
                 )
                 try:
                     return build_surface_attention_feedback_response(

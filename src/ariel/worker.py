@@ -22,12 +22,17 @@ from .persistence import (
     NotificationRecord,
     SessionRecord,
 )
-from .memory import process_memory_extract_turn, process_memory_projection_job
-from .proactivity import (
+from .attention_ranking import (
+    process_attention_delivery_due,
+    process_attention_feature_extraction_due,
+    process_attention_grouping_due,
     process_attention_item_follow_up_due,
+    process_attention_ranking_due,
     process_attention_review_due,
-    process_workspace_signal_derivation_due,
+    process_proactive_feedback_review_due,
 )
+from .memory import process_memory_extract_turn, process_memory_projection_job
+from .proactivity import process_workspace_signal_derivation_due
 from .redaction import safe_failure_reason
 from .sync_runtime import process_provider_event_received, process_provider_sync_due
 
@@ -209,6 +214,27 @@ def process_one_task(
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                 )
+            case "attention_feature_extraction_due":
+                process_attention_feature_extraction_due(
+                    session_factory=session_factory,
+                    task_payload=task_payload,
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+            case "attention_grouping_due":
+                process_attention_grouping_due(
+                    session_factory=session_factory,
+                    task_payload=task_payload,
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+            case "attention_ranking_due":
+                process_attention_ranking_due(
+                    session_factory=session_factory,
+                    task_payload=task_payload,
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
             case "attention_review_due":
                 process_attention_review_due(
                     session_factory=session_factory,
@@ -223,10 +249,24 @@ def process_one_task(
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                 )
+            case "attention_delivery_due":
+                process_attention_delivery_due(
+                    session_factory=session_factory,
+                    task_payload=task_payload,
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
             case "action_proposal_review_due":
                 _process_action_proposal_review_due(
                     session_factory=session_factory,
                     task_payload=task_payload,
+                )
+            case "proactive_feedback_review_due":
+                process_proactive_feedback_review_due(
+                    session_factory=session_factory,
+                    task_payload=task_payload,
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
                 )
             case _:
                 raise RuntimeError(f"unsupported task type: {task_type}")
