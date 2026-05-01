@@ -480,7 +480,7 @@ class ArielDiscordBot(commands.Bot):
                 return
 
         if not prompt:
-            prompt = "Uploaded attachment(s)."
+            prompt = "What would you like me to do with the attachment(s)?"
 
         discord_context = _discord_context_for_message(message, bot_user_id=bot_user_id)
 
@@ -1016,16 +1016,30 @@ def _discord_context_for_message(
             context["parent_channel_name"] = parent_name
     attachments = getattr(message, "attachments", None) or []
     if attachments:
-        context["attachments"] = [
-            {
-                "id": getattr(attachment, "id", None),
-                "filename": getattr(attachment, "filename", None),
-                "content_type": getattr(attachment, "content_type", None),
-                "size": getattr(attachment, "size", None),
-                "url": getattr(attachment, "url", None),
-            }
-            for attachment in attachments
-        ]
+        attachment_context: list[dict[str, Any]] = []
+        for attachment in attachments:
+            source_attachment_id = getattr(attachment, "id", None)
+            filename = getattr(attachment, "filename", None)
+            download_url = getattr(attachment, "url", None)
+            if (
+                not isinstance(source_attachment_id, int)
+                or not isinstance(filename, str)
+                or not isinstance(download_url, str)
+            ):
+                continue
+            attachment_context.append(
+                {
+                    "source": "discord",
+                    "source_attachment_id": source_attachment_id,
+                    "filename": filename,
+                    "content_type": getattr(attachment, "content_type", None),
+                    "size_bytes": getattr(attachment, "size", None),
+                    "attachment_ref": f"discord:{source_attachment_id}",
+                    "download_url": download_url,
+                }
+            )
+        if attachment_context:
+            context["attachments"] = attachment_context
     return context
 
 

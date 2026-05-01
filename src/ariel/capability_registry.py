@@ -45,6 +45,7 @@ AGENCY_CAPABILITY_IDS = {
     "cap.agency.request_pr",
 }
 DISCORD_CAPABILITY_IDS = {"cap.discord.no_response"}
+ATTACHMENT_CAPABILITY_IDS = {"cap.attachment.read"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +114,30 @@ def _validate_discord_no_response_input(
     raw_input: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
     return _validate_exact_text_input(raw_input, field_name="reason", max_length=500)
+
+
+def _validate_attachment_read_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {"attachment_ref", "intent"}:
+        return None, "schema_invalid"
+    attachment_ref = raw_input.get("attachment_ref")
+    intent = raw_input.get("intent")
+    if not isinstance(attachment_ref, str) or not isinstance(intent, str):
+        return None, "schema_invalid"
+    normalized_ref = attachment_ref.strip()
+    normalized_intent = intent.strip().lower()
+    if (
+        not normalized_ref
+        or len(normalized_ref) > 256
+        or "://" in normalized_ref
+        or "/" in normalized_ref
+        or "\\" in normalized_ref
+    ):
+        return None, "schema_invalid"
+    if normalized_intent not in {"summarize", "ocr", "transcribe", "extract_text", "answer"}:
+        return None, "schema_invalid"
+    return {"attachment_ref": normalized_ref, "intent": normalized_intent}, None
 
 
 def _validate_search_news_input(
@@ -2436,6 +2461,10 @@ def _execute_agency_runtime(_: dict[str, Any]) -> dict[str, Any]:
     raise RuntimeError("agency_runtime_not_bound")
 
 
+def _execute_attachment_runtime(_: dict[str, Any]) -> dict[str, Any]:
+    raise RuntimeError("attachment_runtime_not_bound")
+
+
 def _declare_external_notify_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
     return [
         {
@@ -2710,6 +2739,22 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         execute=_execute_weather_forecast,
         declare_egress_intent=_declare_weather_forecast_egress_intent,
     ),
+    "cap.attachment.read": CapabilityDefinition(
+        capability_id="cap.attachment.read",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "attachment_read_v1",
+            "output_schema": "attachment_read_result_v1",
+            "idempotency": "deterministic_read",
+            "execution_mode": "attachment_runtime_only",
+            "bounded_output": "structured_blocks_with_typed_outcome",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_attachment_read_input,
+        execute=_execute_attachment_runtime,
+    ),
     "cap.agency.run": CapabilityDefinition(
         capability_id="cap.agency.run",
         version="1.0",
@@ -2954,6 +2999,15 @@ _RESPONSE_TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
         }
     ),
     "url_extract_v1": _object_schema({"url": {"type": "string", "maxLength": 2048}}),
+    "attachment_read_v1": _object_schema(
+        {
+            "attachment_ref": {"type": "string", "maxLength": 256},
+            "intent": {
+                "type": "string",
+                "enum": ["summarize", "ocr", "transcribe", "extract_text", "answer"],
+            },
+        }
+    ),
     "search_query_v1": _object_schema({"query": {"type": "string", "maxLength": 1000}}),
     "weather_forecast_query_v1": _object_schema(
         {
@@ -3025,6 +3079,9 @@ _RESPONSE_TOOL_DESCRIPTIONS: dict[str, str] = {
     "cap.email.send": "Send an email after approval.",
     "cap.drive.share": "Share a Drive file after approval.",
     "cap.web.extract": "Extract bounded text and provenance from a public URL.",
+    "cap.attachment.read": (
+        "Read bounded content from a Discord attachment by attachment_ref for a specific intent."
+    ),
     "cap.search.web": "Search the live web for grounded evidence.",
     "cap.search.news": "Search recent news for grounded evidence.",
     "cap.weather.forecast": "Fetch weather for an explicit or stored location.",

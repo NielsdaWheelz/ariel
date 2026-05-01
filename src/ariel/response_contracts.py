@@ -117,11 +117,15 @@ class SurfaceTaintEvidenceContract(BaseModel):
         "runtime_provenance_missing",
         "runtime_provenance_evidence_malformed",
         "capture_shared_content_ingress",
+        "attachment_content_read",
     ]
     turn_id: str | None = None
     action_attempt_id: str | None = None
     capability_id: str | None = None
     impact_level: str | None = None
+    attachment_ref: str | None = None
+    filename: str | None = None
+    modality: str | None = None
 
 
 class SurfaceRuntimeProvenanceContract(BaseModel):

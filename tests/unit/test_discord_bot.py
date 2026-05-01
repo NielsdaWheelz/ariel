@@ -1369,11 +1369,13 @@ def test_on_message_answers_home_guild_message_in_any_channel(
         "parent_channel_id": 2,
         "attachments": [
             {
-                "id": 777,
+                "source": "discord",
+                "source_attachment_id": 777,
                 "filename": "report.pdf",
                 "content_type": "application/pdf",
-                "size": 2048,
-                "url": "https://cdn.example.test/report.pdf",
+                "size_bytes": 2048,
+                "attachment_ref": "discord:777",
+                "download_url": "https://cdn.example.test/report.pdf",
             }
         ],
     }
@@ -1396,9 +1398,13 @@ def test_on_message_answers_attachment_only_home_guild_message(
 
     _send_message(bot, message)
 
-    assert calls[0]["prompt"] == "Uploaded attachment(s)."
+    assert calls[0]["prompt"] == "What would you like me to do with the attachment(s)?"
     assert calls[0]["discord_context"]["attachments"][0]["filename"] == "photo.png"
-    assert message.replies[0]["content"] == "assistant::Uploaded attachment(s)."
+    assert "Uploaded attachment(s)." not in calls[0]["prompt"]
+    assert (
+        message.replies[0]["content"]
+        == "assistant::What would you like me to do with the attachment(s)?"
+    )
 
 
 def test_on_message_sends_legacy_approval_text_as_prompt(

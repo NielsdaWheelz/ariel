@@ -11,8 +11,10 @@ from fastapi.encoders import jsonable_encoder
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
+from ariel.attachment_content import AttachmentContentRuntime
 from ariel.capability_registry import (
     AGENCY_CAPABILITY_IDS,
+    ATTACHMENT_CAPABILITY_IDS,
     CapabilityDefinition,
     DISCORD_CAPABILITY_IDS,
     canonical_action_payload,
@@ -76,6 +78,7 @@ class FunctionCallProcessingResult:
     action_attempts: list[ActionAttemptRecord]
     assistant_sources: list[dict[str, Any]] = field(default_factory=list)
     silent_response: bool = False
+    runtime_provenance: RuntimeProvenance | None = None
 
 
 @dataclass(slots=True)
@@ -203,6 +206,7 @@ _GROUNDED_RETRIEVAL_CAPABILITIES = {
     "cap.weather.forecast",
     *_MAPS_RETRIEVAL_CAPABILITY_IDS,
     *_WEB_EXTRACT_RETRIEVAL_CAPABILITY_IDS,
+    *ATTACHMENT_CAPABILITY_IDS,
     *GOOGLE_READ_CAPABILITY_IDS,
 }
 
@@ -279,6 +283,19 @@ _TYPED_WEB_EXTRACT_RECOVERY: dict[str, str] = {
     "provider_unreachable": (
         "url extraction provider endpoint is unreachable. ask your operator to verify endpoint config."
     ),
+}
+
+_TYPED_ATTACHMENT_RECOVERY: dict[str, str] = {
+    "unsupported_type": "upload a text, PDF, image, or audio attachment.",
+    "too_large": "upload a smaller attachment or paste the relevant excerpt.",
+    "expired": "re-upload the attachment and ask again.",
+    "unavailable": "re-upload the attachment or verify Discord still exposes it.",
+    "unsafe": "the attachment was blocked by safety scanning.",
+    "scan_failed": "attachment scanning is unavailable; ask the operator to configure it.",
+    "extract_failed": "try a clearer export or paste the text directly.",
+    "provider_timeout": "retry shortly; extraction provider timed out.",
+    "provider_unavailable": "ask the operator to configure attachment extraction provider access.",
+    "resource_limit": "ask for a narrower read of the attachment.",
 }
 
 
@@ -810,6 +827,50 @@ def _synthesize_web_extract_retrieval_answer(
     return grounded_message, collected_sources
 
 
+def _synthesize_attachment_read_answer(
+    *,
+    collected_sources: list[dict[str, Any]],
+    citation_snippets: list[str],
+    retrieval_errors: list[str],
+    attachment_outputs: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]]]:
+    for output in attachment_outputs:
+        read_outcome_raw = output.get("read_outcome")
+        read_outcome = read_outcome_raw if isinstance(read_outcome_raw, dict) else {}
+        status_raw = read_outcome.get("status")
+        if not isinstance(status_raw, str) or status_raw == "ok":
+            continue
+        recovery = _TYPED_ATTACHMENT_RECOVERY.get(
+            status_raw,
+            "retry with a different attachment.",
+        )
+        return f"attachment read failed ({status_raw}). {recovery}", []
+
+    if not collected_sources:
+        if retrieval_errors:
+            return (
+                "i'm uncertain because attachment reading failed "
+                f"({retrieval_errors[0]}). re-upload the attachment or retry.",
+                [],
+            )
+        return (
+            "i'm uncertain because i could not read enough attachment content. "
+            "re-upload the attachment or paste the relevant text.",
+            [],
+        )
+
+    bounded_snippets = citation_snippets[: len(collected_sources)]
+    rendered_snippets: list[str] = []
+    for index, snippet in enumerate(bounded_snippets, start=1):
+        normalized = snippet.strip()
+        if not normalized:
+            continue
+        rendered_snippets.append(f"{normalized} [{index}]")
+    if not rendered_snippets:
+        rendered_snippets.append("attachment content was read. [1]")
+    return f"attachment content: {' '.join(rendered_snippets)}", collected_sources
+
+
 def _synthesize_google_read_answer(
     *,
     collected_sources: list[dict[str, Any]],
@@ -926,6 +987,7 @@ def process_response_function_calls(
     runtime_provenance: RuntimeProvenance | None = None,
     google_runtime: GoogleConnectorRuntime | None = None,
     agency_runtime: Any | None = None,
+    attachment_runtime: AttachmentContentRuntime | None = None,
 ) -> FunctionCallProcessingResult:
     inline_results: list[dict[str, Any]] = []
     pending_approvals: list[dict[str, Any]] = []
@@ -944,6 +1006,8 @@ def process_response_function_calls(
     web_extract_outputs: list[dict[str, Any]] = []
     google_outputs: list[dict[str, Any]] = []
     google_auth_failures: list[TypedAuthFailure] = []
+    attachment_outputs: list[dict[str, Any]] = []
+    result_runtime_provenance: RuntimeProvenance | None = None
     silent_response = False
 
     function_calls = function_calls_raw if isinstance(function_calls_raw, list) else []
@@ -957,6 +1021,7 @@ def process_response_function_calls(
         is_google_capability_call = capability_id in GOOGLE_CAPABILITY_IDS
         is_agency_capability_call = capability_id in AGENCY_CAPABILITY_IDS
         is_discord_capability_call = capability_id in DISCORD_CAPABILITY_IDS
+        is_attachment_capability_call = capability_id in ATTACHMENT_CAPABILITY_IDS
         is_retrieval_call = capability_id in _GROUNDED_RETRIEVAL_CAPABILITIES
         is_weather_forecast_call = capability_id == "cap.weather.forecast"
         is_maps_retrieval_call = capability_id in _MAPS_RETRIEVAL_CAPABILITY_IDS
@@ -1305,6 +1370,21 @@ def process_response_function_calls(
                 now_fn=now_fn,
                 new_id_fn=new_id_fn,
             )
+        elif is_attachment_capability_call and attachment_runtime is not None:
+            execution_result = attachment_runtime.execute_read(
+                db=db,
+                session_id=session_id,
+                turn_id=turn.id,
+                normalized_input=evaluation.normalized_input,
+                now_fn=now_fn,
+                new_id_fn=new_id_fn,
+            )
+        elif is_attachment_capability_call:
+            execution_result = ExecutionResult(
+                status="failed",
+                output=None,
+                error="attachment_runtime_not_bound",
+            )
         else:
             _acquire_side_effect_execution_lock(
                 db=db,
@@ -1340,6 +1420,23 @@ def process_response_function_calls(
                     )
                 )
             if is_retrieval_call:
+                if is_attachment_capability_call:
+                    attachment_outputs.append(execution_result.output)
+                    read_outcome_raw = execution_result.output.get("read_outcome")
+                    read_outcome = read_outcome_raw if isinstance(read_outcome_raw, dict) else {}
+                    read_status = read_outcome.get("status")
+                    if isinstance(read_status, str) and read_status != "ok":
+                        retrieval_errors.append(read_status)
+                    provenance_raw = execution_result.output.get("runtime_provenance")
+                    provenance = provenance_raw if isinstance(provenance_raw, dict) else {}
+                    attachment_provenance_status = provenance.get("status")
+                    evidence_raw = provenance.get("evidence")
+                    if attachment_provenance_status == "tainted" and isinstance(evidence_raw, list):
+                        evidence = [item for item in evidence_raw if isinstance(item, dict)]
+                        result_runtime_provenance = RuntimeProvenance(
+                            status="tainted",
+                            evidence=tuple(evidence),
+                        )
                 remaining_citations = _MAX_CITED_SOURCES - len(retrieval_sources)
                 if remaining_citations > 0:
                     candidates = _extract_search_source_candidates(
@@ -1447,6 +1544,13 @@ def process_response_function_calls(
                 retrieval_errors=retrieval_errors,
                 web_extract_outputs=web_extract_outputs,
             )
+        elif retrieval_capability_ids.issubset(ATTACHMENT_CAPABILITY_IDS):
+            final_assistant_message, assistant_sources = _synthesize_attachment_read_answer(
+                collected_sources=retrieval_sources,
+                citation_snippets=retrieval_snippets,
+                retrieval_errors=retrieval_errors,
+                attachment_outputs=attachment_outputs,
+            )
         elif retrieval_capability_ids == {"cap.weather.forecast"}:
             final_assistant_message, assistant_sources = _synthesize_weather_retrieval_answer(
                 collected_sources=retrieval_sources,
@@ -1476,6 +1580,7 @@ def process_response_function_calls(
         action_attempts=created_action_attempts,
         assistant_sources=assistant_sources,
         silent_response=silent_response,
+        runtime_provenance=result_runtime_provenance,
     )
 
 

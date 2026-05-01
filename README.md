@@ -57,8 +57,10 @@ ambient messages are the Discord AI surface. the bot handles:
 - DMs from the configured user
 - messages from the configured user in the one configured home guild
 
-guild chat is not limited to one configured channel. attachments and links are passed as
-bounded context; content extraction and citations still flow through normal capabilities.
+guild chat is not limited to one configured channel. attachments are passed as
+bounded references without raw Discord download URLs; content reads flow through
+`cap.attachment.read` with typed failures, provenance, and citation artifacts.
+links still flow through normal URL extraction/search capabilities.
 when the model calls `cap.discord.no_response`, Ariel records the audited tool output and
 sends no visible assistant text.
 

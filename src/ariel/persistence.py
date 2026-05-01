@@ -460,6 +460,136 @@ class ArtifactRecord(Base):
     )
 
 
+class AttachmentBlobRecord(Base):
+    __tablename__ = "attachment_blobs"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    storage_key: Mapped[str] = mapped_column(Text, nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    sniffed_mime_type: Mapped[str] = mapped_column(String(256), nullable=False)
+    scan_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    scanner_version: Mapped[str] = mapped_column(String(80), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("size_bytes >= 0", name="ck_attachment_blob_size_nonnegative"),
+        CheckConstraint(
+            "scan_status IN ('clean', 'unsafe', 'scan_failed')",
+            name="ck_attachment_blob_scan_status",
+        ),
+    )
+
+
+class AttachmentSourceRecord(Base):
+    __tablename__ = "attachment_sources"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    session_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("sessions.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    turn_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("turns.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    source_transport: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_message_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_channel_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_guild_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_author_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_attachment_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    attachment_ref: Mapped[str] = mapped_column(String(256), nullable=False)
+    filename: Mapped[str] = mapped_column(Text, nullable=False)
+    declared_content_type: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    declared_size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    acquisition_url_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    acquisition_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    blob_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("attachment_blobs.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("source_transport IN ('discord')", name="ck_attachment_source_transport"),
+        CheckConstraint(
+            "(declared_size_bytes IS NULL) OR (declared_size_bytes >= 0)",
+            name="ck_attachment_source_declared_size_nonnegative",
+        ),
+        Index(
+            "ix_attachment_sources_session_turn_ref",
+            "session_id",
+            "turn_id",
+            "attachment_ref",
+            unique=True,
+        ),
+    )
+
+
+class AttachmentExtractionRecord(Base):
+    __tablename__ = "attachment_extractions"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    source_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("attachment_sources.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    blob_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("attachment_blobs.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    modality: Mapped[str] = mapped_column(String(32), nullable=False)
+    extractor: Mapped[str] = mapped_column(String(64), nullable=False)
+    extractor_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    outcome: Mapped[str] = mapped_column(String(32), nullable=False)
+    blocks: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    citations: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    provider_metadata: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "modality IN ('text', 'document', 'image', 'audio', 'unknown')",
+            name="ck_attachment_extraction_modality",
+        ),
+        CheckConstraint(
+            "status IN ('succeeded', 'failed')", name="ck_attachment_extraction_status"
+        ),
+        CheckConstraint(
+            (
+                "outcome IN ('ok', 'unsupported_type', 'too_large', 'expired', "
+                "'unavailable', 'unsafe', 'scan_failed', 'extract_failed', "
+                "'provider_timeout', 'provider_unavailable', 'resource_limit')"
+            ),
+            name="ck_attachment_extraction_outcome",
+        ),
+    )
+
+
 class MemoryEvidenceRecord(Base):
     __tablename__ = "memory_evidence"
 

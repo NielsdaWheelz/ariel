@@ -56,6 +56,14 @@ class AppSettings(BaseSettings):
     discord_user_id: int | None = None
     discord_ariel_base_url: str = "http://127.0.0.1:8000"
     discord_notification_timeout_seconds: float = 10.0
+    attachment_blob_store_path: str = ".ariel/attachment-blobs"
+    attachment_max_bytes: int = 25 * 1024 * 1024
+    attachment_fetch_timeout_seconds: float = 10.0
+    attachment_handle_ttl_seconds: int = 3600
+    attachment_scanner_mode: str = "fail_closed"
+    attachment_openai_model: str = "gpt-5.5"
+    attachment_openai_audio_model: str = "gpt-4o-transcribe"
+    attachment_openai_timeout_seconds: float = 30.0
     agency_socket_path: str = "/tmp/agency-daemon.sock"
     agency_allowed_repo_roots: str = ""
     agency_default_base_branch: str = "main"
@@ -274,21 +282,45 @@ class AppSettings(BaseSettings):
 
     @field_validator(
         "discord_notification_timeout_seconds",
+        "attachment_fetch_timeout_seconds",
+        "attachment_openai_timeout_seconds",
         "agency_timeout_seconds",
         "worker_poll_seconds",
     )
     @classmethod
     def _positive_float_settings_must_be_positive(cls, value: float) -> float:
         if value <= 0:
-            raise ValueError("timeout and poll settings must be > 0")
+            raise ValueError("timeout, poll, and attachment settings must be > 0")
         return value
 
     @field_validator(
+        "attachment_max_bytes",
+        "attachment_handle_ttl_seconds",
         "agency_event_max_skew_seconds",
         "worker_heartbeat_timeout_seconds",
     )
     @classmethod
     def _positive_int_settings_must_be_positive(cls, value: int) -> int:
         if value < 1:
-            raise ValueError("agency and worker integer settings must be >= 1")
+            raise ValueError("agency, attachment, and worker integer settings must be >= 1")
         return value
+
+    @field_validator(
+        "attachment_blob_store_path",
+        "attachment_openai_model",
+        "attachment_openai_audio_model",
+    )
+    @classmethod
+    def _attachment_text_settings_must_not_be_blank(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("attachment settings must not be blank")
+        return normalized
+
+    @field_validator("attachment_scanner_mode")
+    @classmethod
+    def _attachment_scanner_mode_must_be_supported(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"disabled", "fail_closed"}:
+            raise ValueError("attachment_scanner_mode must be one of: disabled, fail_closed")
+        return normalized

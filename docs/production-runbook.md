@@ -243,8 +243,9 @@ Functional health:
   the model chooses `cap.discord.no_response`.
 - A `cap.discord.no_response` turn records the audited tool output and sends no visible
   assistant text.
-- Messages with attachments preserve bounded attachment metadata in context; content
-  extraction happens only through normal capabilities with provenance.
+- Messages with attachments preserve bounded attachment references in context; raw
+  Discord download URLs are not model-visible, and content extraction happens only
+  through `cap.attachment.read` with provenance and typed failures.
 - Responses function calls create action attempts with audit events.
 - Approval-required actions render Discord buttons.
 - Duplicate approval clicks do not duplicate side effects.

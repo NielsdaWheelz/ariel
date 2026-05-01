@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Generator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -82,6 +84,70 @@ class DiscordNoResponseAdapter:
             provider_response_id="resp_discord_no_response_123",
             input_tokens=13,
             output_tokens=2,
+        )
+
+
+@dataclass
+class CapturingAttachmentAdapter:
+    provider: str = "provider.attachments"
+    model: str = "model.attachments-v1"
+    input_items: list[list[dict[str, Any]]] = field(default_factory=list)
+    context_bundles: list[dict[str, Any]] = field(default_factory=list)
+
+    def create_response(
+        self,
+        *,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
+        history: list[dict[str, Any]],
+        context_bundle: dict[str, Any],
+    ) -> dict[str, Any]:
+        del tools, history
+        self.input_items.append(input_items)
+        self.context_bundles.append(context_bundle)
+        return responses_message(
+            assistant_text=f"ack::{user_message}",
+            provider=self.provider,
+            model=self.model,
+            provider_response_id="resp_attachment_acceptance_123",
+            input_tokens=5,
+            output_tokens=3,
+        )
+
+
+@dataclass
+class AttachmentReadAdapter:
+    provider: str = "provider.attachment-read"
+    model: str = "model.attachment-read-v1"
+    input_items: list[list[dict[str, Any]]] = field(default_factory=list)
+
+    def create_response(
+        self,
+        *,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
+        history: list[dict[str, Any]],
+        context_bundle: dict[str, Any],
+    ) -> dict[str, Any]:
+        del tools, user_message, history, context_bundle
+        self.input_items.append(input_items)
+        return responses_with_function_calls(
+            input_items=input_items,
+            assistant_text="",
+            proposals=[
+                {
+                    "capability_id": "cap.attachment.read",
+                    "input": {"attachment_ref": "discord:131415", "intent": "summarize"},
+                    "influenced_by_untrusted_content": False,
+                }
+            ],
+            provider=self.provider,
+            model=self.model,
+            provider_response_id="resp_attachment_read_123",
+            input_tokens=7,
+            output_tokens=5,
         )
 
 
@@ -250,11 +316,13 @@ def test_discord_no_response_tool_completes_turn_without_visible_reply(
                     "mentioned_bot": False,
                     "attachments": [
                         {
-                            "id": 161718,
+                            "source": "discord",
+                            "source_attachment_id": 161718,
                             "filename": "note.txt",
                             "content_type": "text/plain",
-                            "size": 12,
-                            "url": "https://cdn.discordapp.com/attachments/note.txt",
+                            "size_bytes": 12,
+                            "attachment_ref": "discord:161718",
+                            "download_url": "https://cdn.discordapp.com/attachments/note.txt",
                         }
                     ],
                 },
@@ -279,8 +347,147 @@ def test_discord_no_response_tool_completes_turn_without_visible_reply(
             and isinstance(item.get("content"), str)
             and "discord context:" in item["content"]
             and "filename=note.txt" in item["content"]
+            and "attachment_ref=discord:161718" in item["content"]
+            and "url=" not in item["content"]
+            and "https://cdn.discordapp.com/attachments/note.txt" not in item["content"]
             for item in adapter.input_items[0]
         )
+
+
+def test_discord_attachment_content_is_referenced_without_raw_cdn_url(
+    postgres_url: str,
+) -> None:
+    adapter = CapturingAttachmentAdapter()
+    with _build_client(postgres_url, adapter) as client:
+        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
+        response = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={
+                "message": "please summarize this",
+                "discord": {
+                    "guild_id": 123,
+                    "channel_id": 456,
+                    "message_id": 789,
+                    "author_id": 101112,
+                    "mentioned_bot": False,
+                    "attachments": [
+                        {
+                            "source": "discord",
+                            "source_attachment_id": 131415,
+                            "filename": "quarterly.pdf",
+                            "content_type": "application/pdf",
+                            "size_bytes": 2048,
+                            "attachment_ref": "discord:131415",
+                            "download_url": "https://cdn.discordapp.com/attachments/raw.pdf",
+                        }
+                    ],
+                },
+            },
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+
+    assert body["ok"] is True
+
+    context_attachment = adapter.context_bundles[0]["discord_context"]["attachments"][0]
+    assert context_attachment == {
+        "source": "discord",
+        "source_attachment_id": 131415,
+        "filename": "quarterly.pdf",
+        "content_type": "application/pdf",
+        "size_bytes": 2048,
+        "attachment_ref": "discord:131415",
+    }
+
+    model_payload = json.dumps(adapter.input_items, sort_keys=True)
+    durable_payload = json.dumps(body, sort_keys=True)
+    assert "attachment_ref=discord:131415" in model_payload
+    assert "filename=quarterly.pdf" in model_payload
+    assert "url=" not in model_payload
+    assert "download_url" not in model_payload
+    assert "https://cdn.discordapp.com/attachments/raw.pdf" not in model_payload
+    assert "https://cdn.discordapp.com/attachments/raw.pdf" not in durable_payload
+
+
+def test_discord_attachment_read_tool_reads_text_attachment(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class FakeStreamResponse:
+        status_code = 200
+        headers = {"content-length": "28"}
+
+        def __enter__(self) -> "FakeStreamResponse":
+            return self
+
+        def __exit__(self, *_: Any) -> None:
+            return None
+
+        def iter_bytes(self) -> list[bytes]:
+            return [b"quarterly revenue increased"]
+
+    class FakeHttpClient:
+        def __init__(self, *_: Any, **__: Any) -> None:
+            return None
+
+        def __enter__(self) -> "FakeHttpClient":
+            return self
+
+        def __exit__(self, *_: Any) -> None:
+            return None
+
+        def stream(self, method: str, url: str) -> FakeStreamResponse:
+            assert method == "GET"
+            assert url == "https://cdn.discordapp.com/attachments/report.txt"
+            return FakeStreamResponse()
+
+    monkeypatch.setenv("ARIEL_ATTACHMENT_SCANNER_MODE", "disabled")
+    monkeypatch.setenv("ARIEL_ATTACHMENT_BLOB_STORE_PATH", str(tmp_path / "attachments"))
+    monkeypatch.setattr("ariel.attachment_content.httpx.Client", FakeHttpClient)
+
+    adapter = AttachmentReadAdapter()
+    with _build_client(postgres_url, adapter) as client:
+        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
+        response = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={
+                "message": "please summarize this",
+                "discord": {
+                    "guild_id": 123,
+                    "channel_id": 456,
+                    "message_id": 789,
+                    "author_id": 101112,
+                    "mentioned_bot": False,
+                    "attachments": [
+                        {
+                            "source": "discord",
+                            "source_attachment_id": 131415,
+                            "filename": "report.txt",
+                            "content_type": "text/plain",
+                            "size_bytes": 28,
+                            "attachment_ref": "discord:131415",
+                            "download_url": "https://cdn.discordapp.com/attachments/report.txt",
+                        }
+                    ],
+                },
+            },
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+
+    assert body["assistant"]["message"] == "attachment content: quarterly revenue increased [1]"
+    assert body["assistant"]["sources"][0]["title"] == "report.txt"
+    lifecycle = body["turn"]["surface_action_lifecycle"]
+    assert lifecycle[0]["proposal"]["capability_id"] == "cap.attachment.read"
+    assert lifecycle[0]["execution"]["output"]["blocks"] == [
+        {"kind": "text", "text": "quarterly revenue increased"}
+    ]
+    durable_payload = json.dumps(body, sort_keys=True)
+    assert "https://cdn.discordapp.com/attachments/report.txt" not in durable_payload
+    assert "download_url" not in durable_payload
 
 
 def test_discord_turn_context_includes_bounded_same_channel_history(

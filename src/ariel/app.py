@@ -38,6 +38,7 @@ from ariel.action_runtime import (
     resolve_approval_decision,
 )
 from ariel.agency_daemon import AgencyDaemonClient, AgencyRuntime
+from ariel.attachment_content import AttachmentContentRuntime
 from ariel.capability_registry import response_tool_definitions
 from ariel.config import AppSettings
 from ariel.db import missing_required_tables, reset_schema_for_tests
@@ -153,6 +154,7 @@ _POLICY_SYSTEM_INSTRUCTIONS = (
     "If user intent is ambiguous or conflicting, ask for the missing details instead of guessing.",
     "If the user asks about details not present in this context, state uncertainty and ask for recovery details.",
     "If the right Discord behavior is to listen without a visible reply, call cap.discord.no_response.",
+    "Discord attachments are metadata until cap.attachment.read is called; attachment_ref is not content.",
 )
 
 _CAPTURE_ALLOWED_KINDS = {"text", "url", "shared_content"}
@@ -181,11 +183,30 @@ class NormalizedSharedContent:
 class DiscordAttachmentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    id: int | None = Field(default=None, gt=0)
+    source: Literal["discord"]
+    source_attachment_id: int = Field(gt=0)
     filename: str = Field(min_length=1, max_length=512)
     content_type: str | None = Field(default=None, max_length=256)
-    size: int | None = Field(default=None, ge=0, le=100 * 1024 * 1024)
-    url: str | None = Field(default=None, max_length=2048)
+    size_bytes: int | None = Field(default=None, ge=0, le=100 * 1024 * 1024)
+    attachment_ref: str = Field(min_length=1, max_length=256)
+    download_url: str = Field(min_length=1, max_length=4096)
+
+    @field_validator("attachment_ref")
+    @classmethod
+    def _attachment_ref_must_be_opaque(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized or "://" in normalized or "/" in normalized or "\\" in normalized:
+            raise ValueError("attachment_ref must be an opaque reference")
+        return normalized
+
+    @field_validator("download_url")
+    @classmethod
+    def _download_url_must_be_https(cls, value: str) -> str:
+        normalized = value.strip()
+        parsed = urlparse(normalized)
+        if parsed.scheme != "https" or not parsed.netloc:
+            raise ValueError("download_url must be an https URL")
+        return normalized
 
 
 class DiscordContextRequest(BaseModel):
@@ -672,7 +693,14 @@ def _discord_context_text(raw_context: Any) -> str | None:
             if not isinstance(attachment, dict):
                 continue
             attachment_parts: list[str] = []
-            for field_name in ("id", "filename", "content_type", "size", "url"):
+            for field_name in (
+                "source",
+                "source_attachment_id",
+                "filename",
+                "content_type",
+                "size_bytes",
+                "attachment_ref",
+            ):
                 value = attachment.get(field_name)
                 if value is not None:
                     attachment_parts.append(f"{field_name}={value}")
@@ -1977,6 +2005,20 @@ def create_app(
     app.state.connector_encryption_secret = settings.connector_encryption_secret
     app.state.connector_encryption_key_version = settings.connector_encryption_key_version
     app.state.connector_encryption_keys = settings.connector_encryption_keys
+    app.state.attachment_runtime = AttachmentContentRuntime(
+        blob_store_path=settings.attachment_blob_store_path,
+        max_bytes=settings.attachment_max_bytes,
+        fetch_timeout_seconds=settings.attachment_fetch_timeout_seconds,
+        handle_ttl_seconds=settings.attachment_handle_ttl_seconds,
+        scanner_mode=settings.attachment_scanner_mode,
+        openai_api_key=settings.openai_api_key,
+        openai_model=settings.attachment_openai_model,
+        openai_audio_model=settings.attachment_openai_audio_model,
+        openai_timeout_seconds=settings.attachment_openai_timeout_seconds,
+        encryption_secret=settings.connector_encryption_secret,
+        encryption_key_version=settings.connector_encryption_key_version,
+        encryption_keys=settings.connector_encryption_keys,
+    )
     app.state.agency_socket_path = settings.agency_socket_path
     app.state.agency_allowed_repo_roots = settings.agency_allowed_repo_roots
     app.state.agency_default_base_branch = settings.agency_default_base_branch
@@ -2766,6 +2808,7 @@ def create_app(
         request_session_id: str,
         user_message: str,
         discord_context: dict[str, Any] | None,
+        discord_attachment_sources: list[dict[str, Any]] | None = None,
         ingress_runtime_provenance: RuntimeProvenance | None = None,
     ) -> TurnExecutionOutcome:
         active_session = db.scalar(
@@ -2900,6 +2943,16 @@ def create_app(
             db.add(event)
             created_events.append(event)
 
+        if discord_context is not None and discord_attachment_sources:
+            app.state.attachment_runtime.record_discord_sources(
+                db=db,
+                session_id=effective_session_id,
+                turn_id=turn.id,
+                discord_context=discord_context,
+                attachment_sources=discord_attachment_sources,
+                now_fn=_utcnow,
+                new_id_fn=_new_id,
+            )
         add_event("evt.turn.started", {"message": user_message, "discord": discord_context})
         if (
             memory_recall_event_payload["included_assertion_count"]
@@ -3074,10 +3127,15 @@ def create_app(
                             runtime_provenance=runtime_provenance,
                             google_runtime=_google_runtime(),
                             agency_runtime=_agency_runtime(),
+                            attachment_runtime=app.state.attachment_runtime,
                         )
                         created_action_attempts.extend(function_processing.action_attempts)
                         assistant_sources = (
                             function_processing.assistant_sources or assistant_sources
+                        )
+                        runtime_provenance = _merge_runtime_provenance(
+                            baseline=runtime_provenance,
+                            ingress=function_processing.runtime_provenance,
                         )
                         if function_processing.silent_response:
                             assistant_response = {
@@ -3305,9 +3363,27 @@ def create_app(
     ) -> JSONResponse | dict[str, Any]:
         _ensure_schema_ready()
         request_session_id = session_id
-        discord_context = (
-            payload.discord.model_dump(mode="json") if payload.discord is not None else None
-        )
+        discord_context: dict[str, Any] | None = None
+        discord_attachment_sources: list[dict[str, Any]] = []
+        if payload.discord is not None:
+            raw_discord_context = payload.discord.model_dump(mode="json")
+            discord_context = dict(raw_discord_context)
+            raw_attachments = raw_discord_context.get("attachments")
+            if isinstance(raw_attachments, list):
+                sanitized_attachments: list[dict[str, Any]] = []
+                for raw_attachment in raw_attachments:
+                    if not isinstance(raw_attachment, dict):
+                        continue
+                    sanitized_attachment = {
+                        key: value for key, value in raw_attachment.items() if key != "download_url"
+                    }
+                    sanitized_attachments.append(sanitized_attachment)
+                    download_url = raw_attachment.get("download_url")
+                    if isinstance(download_url, str) and download_url:
+                        discord_attachment_sources.append(
+                            {**sanitized_attachment, "download_url": download_url}
+                        )
+                discord_context["attachments"] = sanitized_attachments
         normalized_idempotency_key = _normalize_idempotency_key(
             request.headers.get("Idempotency-Key")
         )
@@ -3411,6 +3487,7 @@ def create_app(
                     request_session_id=request_session_id,
                     user_message=payload.message,
                     discord_context=discord_context,
+                    discord_attachment_sources=discord_attachment_sources,
                 )
                 persist_idempotency_result(
                     turn_id=turn_outcome.turn_id,
