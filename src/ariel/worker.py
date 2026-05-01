@@ -12,16 +12,23 @@ from sqlalchemy.orm import Session, sessionmaker
 from .action_runtime import reconcile_expired_approvals_for_session
 from .config import AppSettings
 from .persistence import (
+    ActionProposalRecord,
     AgencyEventRecord,
     BackgroundTaskRecord,
+    ConnectorSubscriptionRecord,
     JobEventRecord,
     JobRecord,
     NotificationDeliveryRecord,
     NotificationRecord,
     SessionRecord,
 )
-from .proactivity import process_attention_item_follow_up_due, process_proactive_check_due
+from .proactivity import (
+    process_attention_item_follow_up_due,
+    process_attention_review_due,
+    process_workspace_signal_derivation_due,
+)
 from .redaction import safe_failure_reason
+from .sync_runtime import process_provider_event_received, process_provider_sync_due
 
 
 def _utcnow() -> datetime:
@@ -158,8 +165,35 @@ def process_one_task(
                                 resolved_settings.worker_heartbeat_timeout_seconds
                             ),
                         )
-            case "proactive_check_due":
-                process_proactive_check_due(
+            case "provider_event_received":
+                process_provider_event_received(
+                    session_factory=session_factory,
+                    task_payload=task_payload,
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+            case "provider_subscription_renewal_due":
+                _process_provider_subscription_renewal_due(
+                    session_factory=session_factory,
+                    task_payload=task_payload,
+                )
+            case "provider_sync_due":
+                process_provider_sync_due(
+                    session_factory=session_factory,
+                    task_payload=task_payload,
+                    settings=resolved_settings,
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+            case "workspace_signal_derivation_due":
+                process_workspace_signal_derivation_due(
+                    session_factory=session_factory,
+                    task_payload=task_payload,
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+            case "attention_review_due":
+                process_attention_review_due(
                     session_factory=session_factory,
                     task_payload=task_payload,
                     now_fn=_utcnow,
@@ -171,6 +205,11 @@ def process_one_task(
                     task_payload=task_payload,
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
+                )
+            case "action_proposal_review_due":
+                _process_action_proposal_review_due(
+                    session_factory=session_factory,
+                    task_payload=task_payload,
                 )
             case _:
                 raise RuntimeError(f"unsupported task type: {task_type}")
@@ -248,6 +287,46 @@ def _payload_text(payload: dict[str, Any], key: str) -> str | None:
         return None
     normalized = value.strip()
     return normalized or None
+
+
+def _process_provider_subscription_renewal_due(
+    *,
+    session_factory: sessionmaker[Session],
+    task_payload: dict[str, Any],
+) -> None:
+    subscription_id = _payload_text(task_payload, "subscription_id")
+    if subscription_id is None:
+        raise RuntimeError("provider_subscription_renewal_due task missing subscription_id")
+    with session_factory() as db:
+        with db.begin():
+            subscription = db.scalar(
+                select(ConnectorSubscriptionRecord)
+                .where(ConnectorSubscriptionRecord.id == subscription_id)
+                .with_for_update()
+                .limit(1)
+            )
+            if subscription is None:
+                raise RuntimeError("connector subscription not found")
+            now = _utcnow()
+            subscription.status = "renewal_due"
+            subscription.renew_after = now
+            subscription.updated_at = now
+
+
+def _process_action_proposal_review_due(
+    *,
+    session_factory: sessionmaker[Session],
+    task_payload: dict[str, Any],
+) -> None:
+    proposal_id = _payload_text(task_payload, "action_proposal_id")
+    with session_factory() as db:
+        with db.begin():
+            query = select(ActionProposalRecord).where(ActionProposalRecord.status == "proposed")
+            if proposal_id is not None:
+                query = query.where(ActionProposalRecord.id == proposal_id)
+            now = _utcnow()
+            for proposal in db.scalars(query.with_for_update()).all():
+                proposal.updated_at = now
 
 
 def _job_status_for_event(event_type: str) -> str:

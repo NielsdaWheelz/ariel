@@ -69,19 +69,25 @@ deterministic operational commands only and do not route free-form prompts to th
 
 ## proactive attention
 
-The durable worker owns proactive checks and follow-ups. Subscriptions are explicit API
-records, checks create deduped attention items, and Discord notifications carry
+The durable worker owns provider event sync, workspace signal derivation, attention
+review, and follow-ups. Provider deltas and internal state create durable attention
+signals; reviewed signals create deduped attention items. Discord notifications carry
 acknowledge, snooze, resolve, and refresh buttons.
 
 Core inspection and mutation routes:
 
-- `POST /v1/proactive/subscriptions`
-- `GET /v1/proactive/subscriptions`
-- `POST /v1/proactive/subscriptions/{subscription_id}/check`
-- `GET /v1/proactive/subscriptions/{subscription_id}/checks`
+- `POST /v1/providers/google/events`
+- `GET /v1/connectors/google/subscriptions`
+- `GET /v1/connectors/google/sync-cursors`
+- `POST /v1/connectors/google/sync`
+- `GET /v1/provider-events`
+- `GET /v1/sync-runs`
+- `GET /v1/workspace-items`
+- `GET /v1/attention-signals`
+- `POST /v1/attention-signals/derive`
 - `GET /v1/attention-items`
 - `GET /v1/attention-items/{attention_item_id}/events`
-- `POST /v1/attention-items/{attention_item_id}/ack|snooze|resolve|cancel|refresh`
+- `POST /v1/attention-items/{attention_item_id}/ack|snooze|resolve|cancel|refresh|feedback`
 
 ## verification gates
 

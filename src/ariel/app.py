@@ -65,56 +65,76 @@ from ariel.memory import (
 )
 from ariel.persistence import (
     ActionAttemptRecord,
+    ActionProposalRecord,
     ApprovalRequestRecord,
     AgencyEventRecord,
+    ArtifactRecord,
     AttentionItemEventRecord,
     AttentionItemRecord,
+    AttentionSignalRecord,
     BackgroundTaskRecord,
     CaptureRecord,
+    ConnectorSubscriptionRecord,
     EventRecord,
-    ArtifactRecord,
     JobEventRecord,
     JobRecord,
     NotificationRecord,
-    ProactiveCheckRunRecord,
-    ProactiveSubscriptionRecord,
+    ProactiveFeedbackRecord,
+    ProviderEventRecord,
     SessionRecord,
     SessionRotationRecord,
+    SyncCursorRecord,
+    SyncRunRecord,
     TurnIdempotencyRecord,
     TurnRecord,
+    WorkspaceItemEventRecord,
+    WorkspaceItemRecord,
+    serialize_action_proposal,
+    serialize_agency_event,
+    serialize_artifact,
     serialize_attention_item,
     serialize_attention_item_event,
+    serialize_attention_signal,
     serialize_capture,
-    serialize_artifact,
+    serialize_connector_subscription,
     serialize_action_attempt,
-    serialize_agency_event,
     serialize_job,
     serialize_job_event,
-    serialize_proactive_check_run,
-    serialize_proactive_subscription,
-    serialize_session,
     serialize_notification,
+    serialize_proactive_feedback,
+    serialize_provider_event,
+    serialize_session,
+    serialize_sync_cursor,
+    serialize_sync_run,
     serialize_turn,
+    serialize_workspace_item,
+    serialize_workspace_item_event,
     to_rfc3339,
 )
 from ariel.redaction import redact_text, safe_failure_reason
 from ariel.response_contracts import (
     ResponseContractViolation,
+    build_surface_action_proposal_list_response,
+    build_surface_attention_feedback_response,
     build_surface_attention_item_event_list_response,
     build_surface_attention_item_list_response,
     build_surface_attention_item_response,
+    build_surface_attention_signal_list_response,
     build_surface_artifact_response,
     build_surface_approval_response,
     build_surface_capture_failure_response,
     build_surface_capture_success_response,
+    build_surface_connector_subscription_list_response,
     build_surface_memory_response,
     build_surface_message_response,
-    build_surface_proactive_check_run_list_response,
-    build_surface_proactive_subscription_list_response,
-    build_surface_proactive_subscription_response,
+    build_surface_provider_event_list_response,
     build_surface_rotation_list_response,
     build_surface_rotation_response,
+    build_surface_sync_cursor_list_response,
+    build_surface_sync_run_list_response,
     build_surface_timeline_response,
+    build_surface_workspace_item_event_list_response,
+    build_surface_workspace_item_list_response,
 )
 from ariel.weather_state import get_weather_default_location_state, set_weather_default_location
 from ariel.worker import enqueue_background_task
@@ -343,33 +363,6 @@ class AgencyEventRequest(BaseModel):
         return self
 
 
-class ProactiveSubscriptionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    source_type: Literal[
-        "open_jobs",
-        "pending_approvals",
-        "memory_commitments",
-        "connector_health",
-        "quick_capture_review",
-        "calendar_watch",
-        "email_watch",
-        "drive_watch",
-    ]
-    label: str = Field(min_length=1, max_length=500)
-    check_interval_seconds: int = Field(default=3600, ge=60, le=2_592_000)
-    check_payload: dict[str, Any] = Field(default_factory=dict)
-    notification_policy: dict[str, Any] = Field(default_factory=dict)
-
-    @field_validator("label")
-    @classmethod
-    def _label_must_not_be_blank(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("label must not be blank")
-        return normalized
-
-
 class AttentionSnoozeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -381,6 +374,21 @@ class AttentionSnoozeRequest(BaseModel):
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("snooze_until must include a timezone")
         return value
+
+
+class AttentionFeedbackRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    feedback_type: Literal["important", "noise", "wrong", "useful"]
+    note: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("note")
+    @classmethod
+    def _note_must_not_be_blank(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
 
 
 class WeatherDefaultLocationRequest(BaseModel):
@@ -2026,6 +2034,7 @@ def create_app(
     app.state.agency_timeout_seconds = settings.agency_timeout_seconds
     app.state.agency_event_secret = settings.agency_event_secret
     app.state.agency_event_max_skew_seconds = settings.agency_event_max_skew_seconds
+    app.state.google_provider_event_token = settings.google_provider_event_token
     app.state.google_oauth_client = DefaultGoogleOAuthClient(
         client_id=settings.google_oauth_client_id,
         client_secret=settings.google_oauth_client_secret,
@@ -2074,7 +2083,10 @@ def create_app(
                 "session_events": "/v1/sessions/{session_id}/events",
                 "approval_decisions": "/v1/approvals",
                 "agency_events": "/v1/agency/events",
-                "proactive_subscriptions": "/v1/proactive/subscriptions",
+                "provider_events": "/v1/provider-events",
+                "sync_runs": "/v1/sync-runs",
+                "workspace_items": "/v1/workspace-items",
+                "attention_signals": "/v1/attention-signals",
                 "attention_items": "/v1/attention-items",
                 "jobs": "/v1/jobs",
                 "capture_records": "/v1/captures/record",
@@ -4039,152 +4051,501 @@ def create_app(
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
 
-    @app.post("/v1/proactive/subscriptions")
-    def create_proactive_subscription(
-        request: ProactiveSubscriptionRequest,
-    ) -> dict[str, Any]:
+    @app.post("/v1/providers/google/events", response_model=None)
+    async def post_google_provider_event(
+        request: Request,
+        resource_type: Literal["calendar", "gmail", "drive"],
+        resource_id: str = "primary",
+    ) -> JSONResponse:
         _ensure_schema_ready()
+        configured_token = app.state.google_provider_event_token
+        if not isinstance(configured_token, str) or not configured_token:
+            raise ApiError(
+                status_code=503,
+                code="E_PROVIDER_EVENTS_DISABLED",
+                message="google provider event ingress is not configured",
+                details={"setting": "ARIEL_GOOGLE_PROVIDER_EVENT_TOKEN"},
+                retryable=False,
+            )
+
+        provided_token = request.headers.get("X-Goog-Channel-Token")
+        if provided_token is None or not hmac.compare_digest(
+            provided_token,
+            configured_token,
+        ):
+            raise ApiError(
+                status_code=401,
+                code="E_PROVIDER_EVENT_TOKEN_INVALID",
+                message="google provider event token is invalid",
+                details={},
+                retryable=False,
+            )
+
+        required_headers = {
+            "X-Goog-Channel-ID": request.headers.get("X-Goog-Channel-ID"),
+            "X-Goog-Message-Number": request.headers.get("X-Goog-Message-Number"),
+            "X-Goog-Resource-State": request.headers.get("X-Goog-Resource-State"),
+        }
+        missing_headers = [
+            name for name, value in required_headers.items() if value is None or not value.strip()
+        ]
+        if missing_headers:
+            raise ApiError(
+                status_code=422,
+                code="E_PROVIDER_EVENT_HEADERS_MISSING",
+                message="google provider event headers are missing",
+                details={"headers": missing_headers},
+                retryable=False,
+            )
+
+        body = await request.body()
+        body_digest = hashlib.sha256(body).hexdigest() if body else None
+        payload: dict[str, Any] = {}
+        if body:
+            try:
+                raw_payload = json.loads(body)
+            except ValueError as exc:
+                raise ApiError(
+                    status_code=422,
+                    code="E_PROVIDER_EVENT_INVALID_JSON",
+                    message="google provider event payload must be valid JSON",
+                    details={},
+                    retryable=False,
+                ) from exc
+            if not isinstance(raw_payload, dict):
+                raise ApiError(
+                    status_code=422,
+                    code="E_PROVIDER_EVENT_INVALID",
+                    message="google provider event payload must be a JSON object",
+                    details={},
+                    retryable=False,
+                )
+            payload = raw_payload
+
+        channel_id = str(required_headers["X-Goog-Channel-ID"]).strip()
+        message_number = str(required_headers["X-Goog-Message-Number"]).strip()
+        resource_state = str(required_headers["X-Goog-Resource-State"]).strip()
+        normalized_resource_id = resource_id.strip() or "primary"
+        headers: dict[str, Any] = {
+            "channel_id": channel_id,
+            "message_number": message_number,
+            "resource_state": resource_state,
+        }
+        for source_header, target_key in (
+            ("X-Goog-Resource-ID", "provider_resource_id"),
+            ("X-Goog-Changed", "changed"),
+            ("X-Goog-Channel-Expiration", "channel_expiration"),
+        ):
+            header_value = request.headers.get(source_header)
+            if header_value is not None and header_value.strip():
+                headers[target_key] = header_value.strip()
+
+        dedupe_input = (
+            f"google:{resource_type}:{normalized_resource_id}:{channel_id}:{message_number}"
+        )
+        dedupe_key = "google:" + hashlib.sha256(dedupe_input.encode("utf-8")).hexdigest()
+        external_event_id = f"{channel_id}:{message_number}"
+        if len(external_event_id) > 160:
+            external_event_id = dedupe_key
+
         with session_factory() as db:
             with db.begin():
-                now = _utcnow()
-                subscription = ProactiveSubscriptionRecord(
-                    id=_new_id("psb"),
-                    source_type=request.source_type,
-                    label=request.label,
-                    status="active",
-                    check_interval_seconds=request.check_interval_seconds,
-                    next_run_after=now,
-                    last_checked_at=None,
-                    check_payload=request.check_payload,
-                    notification_policy=request.notification_policy,
-                    created_at=now,
-                    updated_at=now,
+                existing_event = db.scalar(
+                    select(ProviderEventRecord)
+                    .where(ProviderEventRecord.dedupe_key == dedupe_key)
+                    .with_for_update()
+                    .limit(1)
                 )
-                db.add(subscription)
-                db.flush()
-                enqueue_background_task(
-                    db,
-                    task_type="proactive_check_due",
-                    payload={
-                        "subscription_id": subscription.id,
-                        "scheduled_for": to_rfc3339(now),
-                    },
-                    now=now,
-                )
-                try:
-                    return build_surface_proactive_subscription_response(
-                        subscription=serialize_proactive_subscription(subscription)
+                if existing_event is not None:
+                    if (
+                        existing_event.resource_type != resource_type
+                        or existing_event.resource_id != normalized_resource_id
+                        or existing_event.event_type != resource_state
+                        or existing_event.body_digest != body_digest
+                        or existing_event.payload != payload
+                    ):
+                        raise ApiError(
+                            status_code=409,
+                            code="E_PROVIDER_EVENT_CONFLICT",
+                            message="provider event id was reused with different payload",
+                            details={"external_event_id": external_event_id},
+                            retryable=False,
+                        )
+                    return JSONResponse(
+                        status_code=202,
+                        content={
+                            "ok": True,
+                            "duplicate": True,
+                            "provider_event": serialize_provider_event(existing_event),
+                        },
                     )
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
 
-    @app.get("/v1/proactive/subscriptions")
-    def get_proactive_subscriptions(limit: int = 50) -> dict[str, Any]:
+                now = _utcnow()
+                provider_event = ProviderEventRecord(
+                    id=_new_id("pev"),
+                    provider="google",
+                    resource_type=resource_type,
+                    resource_id=normalized_resource_id,
+                    external_event_id=external_event_id,
+                    dedupe_key=dedupe_key,
+                    event_type=resource_state,
+                    headers=headers,
+                    payload=payload,
+                    body_digest=body_digest,
+                    status="accepted",
+                    error=None,
+                    received_at=now,
+                    processed_at=None,
+                )
+                db.add(provider_event)
+                db.flush()
+                task = enqueue_background_task(
+                    db,
+                    task_type="provider_event_received",
+                    payload={"provider_event_id": provider_event.id},
+                    now=now,
+                    max_attempts=5,
+                )
+                return JSONResponse(
+                    status_code=202,
+                    content={
+                        "ok": True,
+                        "duplicate": False,
+                        "provider_event": serialize_provider_event(provider_event),
+                        "task_id": task.id,
+                    },
+                )
+
+    @app.get("/v1/connectors/{provider}/subscriptions")
+    def get_connector_subscriptions(
+        provider: Literal["google"],
+        resource_type: Literal["calendar", "gmail", "drive"] | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
         _ensure_schema_ready()
         bounded_limit = max(1, min(limit, 200))
         with session_factory() as db:
             with db.begin():
+                query = select(ConnectorSubscriptionRecord).where(
+                    ConnectorSubscriptionRecord.provider == provider
+                )
+                if resource_type is not None:
+                    query = query.where(ConnectorSubscriptionRecord.resource_type == resource_type)
                 subscriptions = db.scalars(
-                    select(ProactiveSubscriptionRecord)
-                    .order_by(
-                        ProactiveSubscriptionRecord.updated_at.desc(),
-                        ProactiveSubscriptionRecord.id.desc(),
-                    )
-                    .limit(bounded_limit)
+                    query.order_by(
+                        ConnectorSubscriptionRecord.updated_at.desc(),
+                        ConnectorSubscriptionRecord.id.desc(),
+                    ).limit(bounded_limit)
                 ).all()
                 try:
-                    return build_surface_proactive_subscription_list_response(
+                    return build_surface_connector_subscription_list_response(
                         subscriptions=[
-                            serialize_proactive_subscription(subscription)
+                            serialize_connector_subscription(subscription)
                             for subscription in subscriptions
                         ]
                     )
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
 
-    @app.post("/v1/proactive/subscriptions/{subscription_id}/check")
-    def check_proactive_subscription(subscription_id: str) -> dict[str, Any]:
+    @app.post("/v1/connectors/{provider}/subscriptions/{subscription_id}/renew")
+    def renew_connector_subscription(
+        provider: Literal["google"],
+        subscription_id: str,
+    ) -> dict[str, Any]:
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
                 subscription = db.scalar(
-                    select(ProactiveSubscriptionRecord)
-                    .where(ProactiveSubscriptionRecord.id == subscription_id)
+                    select(ConnectorSubscriptionRecord)
+                    .where(
+                        ConnectorSubscriptionRecord.provider == provider,
+                        ConnectorSubscriptionRecord.id == subscription_id,
+                    )
                     .with_for_update()
                     .limit(1)
                 )
                 if subscription is None:
                     raise ApiError(
                         status_code=404,
-                        code="E_PROACTIVE_SUBSCRIPTION_NOT_FOUND",
-                        message="proactive subscription not found",
+                        code="E_CONNECTOR_SUBSCRIPTION_NOT_FOUND",
+                        message="connector subscription not found",
                         details={"subscription_id": subscription_id},
                         retryable=False,
                     )
-                if subscription.status != "active":
-                    raise ApiError(
-                        status_code=409,
-                        code="E_PROACTIVE_SUBSCRIPTION_NOT_ACTIVE",
-                        message="proactive subscription is not active",
-                        details={
-                            "subscription_id": subscription_id,
-                            "status": subscription.status,
-                        },
-                        retryable=False,
-                    )
                 now = _utcnow()
-                subscription.next_run_after = now
+                subscription.status = "renewal_due"
+                subscription.renew_after = now
                 subscription.updated_at = now
-                enqueue_background_task(
+                task = enqueue_background_task(
                     db,
-                    task_type="proactive_check_due",
-                    payload={
-                        "subscription_id": subscription.id,
-                        "scheduled_for": to_rfc3339(now),
-                    },
+                    task_type="provider_subscription_renewal_due",
+                    payload={"subscription_id": subscription.id},
                     now=now,
+                    max_attempts=5,
                 )
-                try:
-                    return build_surface_proactive_subscription_response(
-                        subscription=serialize_proactive_subscription(subscription)
-                    )
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
+                return {
+                    "ok": True,
+                    "subscription": serialize_connector_subscription(subscription),
+                    "task_id": task.id,
+                }
 
-    @app.get("/v1/proactive/subscriptions/{subscription_id}/checks")
-    def get_proactive_check_runs(subscription_id: str, limit: int = 50) -> dict[str, Any]:
+    @app.get("/v1/connectors/{provider}/sync-cursors")
+    def get_sync_cursors(
+        provider: Literal["google"],
+        resource_type: Literal["calendar", "gmail", "drive"] | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
         _ensure_schema_ready()
         bounded_limit = max(1, min(limit, 200))
         with session_factory() as db:
             with db.begin():
-                subscription = db.scalar(
-                    select(ProactiveSubscriptionRecord)
-                    .where(ProactiveSubscriptionRecord.id == subscription_id)
-                    .limit(1)
+                query = select(SyncCursorRecord).where(SyncCursorRecord.provider == provider)
+                if resource_type is not None:
+                    query = query.where(SyncCursorRecord.resource_type == resource_type)
+                cursors = db.scalars(
+                    query.order_by(
+                        SyncCursorRecord.updated_at.desc(),
+                        SyncCursorRecord.id.desc(),
+                    ).limit(bounded_limit)
+                ).all()
+                try:
+                    return build_surface_sync_cursor_list_response(
+                        cursors=[serialize_sync_cursor(cursor) for cursor in cursors]
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.post("/v1/connectors/{provider}/sync")
+    def force_provider_sync(
+        provider: Literal["google"],
+        resource_type: Literal["calendar", "gmail", "drive"],
+        resource_id: str = "primary",
+    ) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                now = _utcnow()
+                task = enqueue_background_task(
+                    db,
+                    task_type="provider_sync_due",
+                    payload={
+                        "provider": provider,
+                        "resource_type": resource_type,
+                        "resource_id": resource_id.strip() or "primary",
+                    },
+                    now=now,
+                    max_attempts=5,
                 )
-                if subscription is None:
+                return {"ok": True, "task_id": task.id}
+
+    @app.get("/v1/provider-events")
+    def get_provider_events(
+        provider: Literal["google"] | None = None,
+        resource_type: Literal["calendar", "gmail", "drive"] | None = None,
+        status: Literal["accepted", "processed", "failed"] | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 200))
+        with session_factory() as db:
+            with db.begin():
+                query = select(ProviderEventRecord)
+                if provider is not None:
+                    query = query.where(ProviderEventRecord.provider == provider)
+                if resource_type is not None:
+                    query = query.where(ProviderEventRecord.resource_type == resource_type)
+                if status is not None:
+                    query = query.where(ProviderEventRecord.status == status)
+                events = db.scalars(
+                    query.order_by(
+                        ProviderEventRecord.received_at.desc(),
+                        ProviderEventRecord.id.desc(),
+                    ).limit(bounded_limit)
+                ).all()
+                try:
+                    return build_surface_provider_event_list_response(
+                        events=[serialize_provider_event(event) for event in events]
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/sync-runs")
+    def get_sync_runs(
+        provider: Literal["google"] | None = None,
+        resource_type: Literal["calendar", "gmail", "drive"] | None = None,
+        status: Literal["running", "succeeded", "failed"] | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 200))
+        with session_factory() as db:
+            with db.begin():
+                query = select(SyncRunRecord)
+                if provider is not None:
+                    query = query.where(SyncRunRecord.provider == provider)
+                if resource_type is not None:
+                    query = query.where(SyncRunRecord.resource_type == resource_type)
+                if status is not None:
+                    query = query.where(SyncRunRecord.status == status)
+                sync_runs = db.scalars(
+                    query.order_by(
+                        SyncRunRecord.created_at.desc(),
+                        SyncRunRecord.id.desc(),
+                    ).limit(bounded_limit)
+                ).all()
+                try:
+                    return build_surface_sync_run_list_response(
+                        sync_runs=[serialize_sync_run(sync_run) for sync_run in sync_runs]
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/workspace-items")
+    def get_workspace_items(
+        provider: Literal["google", "ariel"] | None = None,
+        item_type: Literal[
+            "calendar_event",
+            "email_message",
+            "drive_file",
+            "internal_state",
+        ]
+        | None = None,
+        status: Literal["active", "deleted"] | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 200))
+        with session_factory() as db:
+            with db.begin():
+                query = select(WorkspaceItemRecord)
+                if provider is not None:
+                    query = query.where(WorkspaceItemRecord.provider == provider)
+                if item_type is not None:
+                    query = query.where(WorkspaceItemRecord.item_type == item_type)
+                if status is not None:
+                    query = query.where(WorkspaceItemRecord.status == status)
+                workspace_items = db.scalars(
+                    query.order_by(
+                        WorkspaceItemRecord.updated_at.desc(),
+                        WorkspaceItemRecord.id.desc(),
+                    ).limit(bounded_limit)
+                ).all()
+                try:
+                    return build_surface_workspace_item_list_response(
+                        workspace_items=[
+                            serialize_workspace_item(workspace_item)
+                            for workspace_item in workspace_items
+                        ]
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/workspace-items/{workspace_item_id}/events")
+    def get_workspace_item_events(workspace_item_id: str, limit: int = 50) -> dict[str, Any]:
+        _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 200))
+        with session_factory() as db:
+            with db.begin():
+                workspace_item = db.get(WorkspaceItemRecord, workspace_item_id)
+                if workspace_item is None:
                     raise ApiError(
                         status_code=404,
-                        code="E_PROACTIVE_SUBSCRIPTION_NOT_FOUND",
-                        message="proactive subscription not found",
-                        details={"subscription_id": subscription_id},
+                        code="E_WORKSPACE_ITEM_NOT_FOUND",
+                        message="workspace item not found",
+                        details={"workspace_item_id": workspace_item_id},
                         retryable=False,
                     )
-                check_runs = db.scalars(
-                    select(ProactiveCheckRunRecord)
-                    .where(ProactiveCheckRunRecord.subscription_id == subscription_id)
+                events = db.scalars(
+                    select(WorkspaceItemEventRecord)
+                    .where(WorkspaceItemEventRecord.workspace_item_id == workspace_item_id)
                     .order_by(
-                        ProactiveCheckRunRecord.scheduled_for.desc(),
-                        ProactiveCheckRunRecord.id.desc(),
+                        WorkspaceItemEventRecord.created_at.asc(),
+                        WorkspaceItemEventRecord.id.asc(),
                     )
                     .limit(bounded_limit)
                 ).all()
                 try:
-                    return build_surface_proactive_check_run_list_response(
-                        subscription_id=subscription_id,
-                        check_runs=[
-                            serialize_proactive_check_run(check_run) for check_run in check_runs
-                        ],
+                    return build_surface_workspace_item_event_list_response(
+                        workspace_item_id=workspace_item_id,
+                        events=[serialize_workspace_item_event(event) for event in events],
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/attention-signals")
+    def get_attention_signals(
+        status: Literal["new", "reviewed", "dismissed", "superseded"] | None = None,
+        source_type: Literal[
+            "workspace_item",
+            "job",
+            "approval_request",
+            "memory_assertion",
+            "google_connector",
+            "capture",
+        ]
+        | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 200))
+        with session_factory() as db:
+            with db.begin():
+                query = select(AttentionSignalRecord)
+                if status is not None:
+                    query = query.where(AttentionSignalRecord.status == status)
+                if source_type is not None:
+                    query = query.where(AttentionSignalRecord.source_type == source_type)
+                signals = db.scalars(
+                    query.order_by(
+                        AttentionSignalRecord.updated_at.desc(),
+                        AttentionSignalRecord.id.desc(),
+                    ).limit(bounded_limit)
+                ).all()
+                try:
+                    return build_surface_attention_signal_list_response(
+                        attention_signals=[serialize_attention_signal(signal) for signal in signals]
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.post("/v1/attention-signals/derive")
+    def derive_attention_signals() -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                now = _utcnow()
+                task = enqueue_background_task(
+                    db,
+                    task_type="workspace_signal_derivation_due",
+                    payload={},
+                    now=now,
+                    max_attempts=3,
+                )
+                return {"ok": True, "task_id": task.id}
+
+    @app.get("/v1/action-proposals")
+    def get_action_proposals(
+        status: Literal["proposed", "approved", "rejected", "superseded"] | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 200))
+        with session_factory() as db:
+            with db.begin():
+                query = select(ActionProposalRecord)
+                if status is not None:
+                    query = query.where(ActionProposalRecord.status == status)
+                proposals = db.scalars(
+                    query.order_by(
+                        ActionProposalRecord.updated_at.desc(),
+                        ActionProposalRecord.id.desc(),
+                    ).limit(bounded_limit)
+                ).all()
+                try:
+                    return build_surface_action_proposal_list_response(
+                        action_proposals=[
+                            serialize_action_proposal(proposal) for proposal in proposals
+                        ]
                     )
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
@@ -4609,19 +4970,65 @@ def create_app(
                         created_at=now,
                     )
                 )
-                if attention_item.subscription_id is not None:
-                    enqueue_background_task(
-                        db,
-                        task_type="proactive_check_due",
-                        payload={
-                            "subscription_id": attention_item.subscription_id,
-                            "scheduled_for": to_rfc3339(now),
-                        },
-                        now=now,
-                    )
+                enqueue_background_task(
+                    db,
+                    task_type="attention_review_due",
+                    payload={
+                        "attention_item_id": attention_item.id,
+                        "source_signal_ids": attention_item.source_signal_ids,
+                    },
+                    now=now,
+                )
                 try:
                     return build_surface_attention_item_response(
                         attention_item=serialize_attention_item(attention_item)
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.post("/v1/attention-items/{attention_item_id}/feedback")
+    def record_attention_feedback(
+        attention_item_id: str,
+        request: AttentionFeedbackRequest,
+    ) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                attention_item = db.scalar(
+                    select(AttentionItemRecord)
+                    .where(AttentionItemRecord.id == attention_item_id)
+                    .limit(1)
+                )
+                if attention_item is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_ATTENTION_ITEM_NOT_FOUND",
+                        message="attention item not found",
+                        details={"attention_item_id": attention_item_id},
+                        retryable=False,
+                    )
+                now = _utcnow()
+                feedback = ProactiveFeedbackRecord(
+                    id=_new_id("pfb"),
+                    attention_item_id=attention_item.id,
+                    feedback_type=request.feedback_type,
+                    note=request.note,
+                    created_at=now,
+                )
+                db.add(feedback)
+                db.add(
+                    AttentionItemEventRecord(
+                        id=_new_id("aie"),
+                        attention_item_id=attention_item.id,
+                        event_type="updated",
+                        payload={"feedback_type": request.feedback_type},
+                        created_at=now,
+                    )
+                )
+                try:
+                    return build_surface_attention_feedback_response(
+                        attention_item=serialize_attention_item(attention_item),
+                        feedback=serialize_proactive_feedback(feedback),
                     )
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc

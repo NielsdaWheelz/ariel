@@ -47,6 +47,7 @@ class AppSettings(BaseSettings):
     google_oauth_redirect_uri: str = "http://127.0.0.1:8000/v1/connectors/google/callback"
     google_oauth_state_ttl_seconds: int = 600
     google_oauth_timeout_seconds: float = 10.0
+    google_provider_event_token: str | None = None
     connector_encryption_secret: str = "dev-local-connector-secret"
     connector_encryption_key_version: str = "v1"
     connector_encryption_keys: str | None = None
@@ -90,6 +91,13 @@ class AppSettings(BaseSettings):
     @field_validator("openai_api_key", mode="before")
     @classmethod
     def _blank_openai_api_key_is_unset(cls, value: Any) -> Any:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("google_provider_event_token", mode="before")
+    @classmethod
+    def _blank_google_provider_event_token_is_unset(cls, value: Any) -> Any:
         if isinstance(value, str) and not value.strip():
             return None
         return value

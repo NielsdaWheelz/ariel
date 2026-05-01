@@ -175,6 +175,17 @@ class GoogleWorkspaceProvider(Protocol):
         normalized_input: dict[str, Any],
     ) -> dict[str, Any]: ...
 
+    def calendar_list_event_deltas(
+        self,
+        *,
+        access_token: str,
+        calendar_id: str = "primary",
+        sync_token: str | None = None,
+        time_min: str | None = None,
+        page_token: str | None = None,
+        max_results: int | None = None,
+    ) -> dict[str, Any]: ...
+
     def calendar_propose_slots(
         self,
         *,
@@ -195,6 +206,18 @@ class GoogleWorkspaceProvider(Protocol):
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+    ) -> dict[str, Any]: ...
+
+    def email_list_history(
+        self,
+        *,
+        access_token: str,
+        start_history_id: str | None = None,
+        user_id: str = "me",
+        page_token: str | None = None,
+        max_results: int | None = None,
+        history_types: list[str] | None = None,
+        label_id: str | None = None,
     ) -> dict[str, Any]: ...
 
     def calendar_create_event(
@@ -230,6 +253,23 @@ class GoogleWorkspaceProvider(Protocol):
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+    ) -> dict[str, Any]: ...
+
+    def drive_get_start_page_token(
+        self,
+        *,
+        access_token: str,
+        drive_id: str | None = None,
+    ) -> dict[str, Any]: ...
+
+    def drive_list_changes(
+        self,
+        *,
+        access_token: str,
+        page_token: str | None = None,
+        drive_id: str | None = None,
+        page_size: int | None = None,
+        spaces: str | None = None,
     ) -> dict[str, Any]: ...
 
     def drive_share(
@@ -612,6 +652,37 @@ class DefaultGoogleWorkspaceProvider:
             "window_end": window_end,
         }
 
+    def calendar_list_event_deltas(
+        self,
+        *,
+        access_token: str,
+        calendar_id: str = "primary",
+        sync_token: str | None = None,
+        time_min: str | None = None,
+        page_token: str | None = None,
+        max_results: int | None = None,
+    ) -> dict[str, Any]:
+        if not calendar_id:
+            calendar_id = "primary"
+
+        params: dict[str, Any] = {"showDeleted": "true"}
+        if sync_token is not None:
+            params["syncToken"] = sync_token
+        elif time_min is not None:
+            params["timeMin"] = time_min
+            params["singleEvents"] = "true"
+        if page_token is not None:
+            params["pageToken"] = page_token
+        if max_results is not None and max_results > 0:
+            params["maxResults"] = max_results
+
+        return self._request_json(
+            method="GET",
+            url=f"{self.calendar_api_base_url}/calendars/{quote(calendar_id, safe='')}/events",
+            access_token=access_token,
+            params=params,
+        )
+
     def calendar_propose_slots(
         self,
         *,
@@ -846,6 +917,39 @@ class DefaultGoogleWorkspaceProvider:
             ],
             "retrieved_at": to_rfc3339(_utcnow()),
         }
+
+    def email_list_history(
+        self,
+        *,
+        access_token: str,
+        start_history_id: str | None = None,
+        user_id: str = "me",
+        page_token: str | None = None,
+        max_results: int | None = None,
+        history_types: list[str] | None = None,
+        label_id: str | None = None,
+    ) -> dict[str, Any]:
+        start_history_id = (start_history_id or "").strip()
+        user_id = user_id.strip() or "me"
+        if not start_history_id:
+            raise RuntimeError("schema_invalid")
+
+        params: dict[str, Any] = {"startHistoryId": start_history_id}
+        if page_token is not None:
+            params["pageToken"] = page_token
+        if max_results is not None and max_results > 0:
+            params["maxResults"] = max_results
+        if history_types:
+            params["historyTypes"] = history_types
+        if label_id:
+            params["labelId"] = label_id
+
+        return self._request_json(
+            method="GET",
+            url=f"{self.gmail_api_base_url}/users/{quote(user_id, safe='')}/history",
+            access_token=access_token,
+            params=params,
+        )
 
     def _compose_raw_email_message(self, *, normalized_input: dict[str, Any]) -> str:
         message = EmailMessage()
@@ -1239,6 +1343,55 @@ class DefaultGoogleWorkspaceProvider:
                 }
             ],
         }
+
+    def drive_get_start_page_token(
+        self,
+        *,
+        access_token: str,
+        drive_id: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"supportsAllDrives": "true"}
+        if drive_id:
+            params["driveId"] = drive_id
+        return self._request_json(
+            method="GET",
+            url=f"{self.drive_api_base_url}/changes/startPageToken",
+            access_token=access_token,
+            params=params,
+        )
+
+    def drive_list_changes(
+        self,
+        *,
+        access_token: str,
+        page_token: str | None = None,
+        drive_id: str | None = None,
+        page_size: int | None = None,
+        spaces: str | None = None,
+    ) -> dict[str, Any]:
+        page_token = (page_token or "").strip()
+        if not page_token:
+            raise RuntimeError("schema_invalid")
+
+        params: dict[str, Any] = {
+            "pageToken": page_token,
+            "supportsAllDrives": "true",
+            "includeItemsFromAllDrives": "true",
+            "includeRemoved": "true",
+        }
+        if drive_id:
+            params["driveId"] = drive_id
+        if page_size is not None and page_size > 0:
+            params["pageSize"] = page_size
+        if spaces:
+            params["spaces"] = spaces
+
+        return self._request_json(
+            method="GET",
+            url=f"{self.drive_api_base_url}/changes",
+            access_token=access_token,
+            params=params,
+        )
 
     def drive_share(
         self,
@@ -2820,6 +2973,30 @@ class GoogleConnectorRuntime:
             auth_failure=None,
             error=None,
         )
+
+    def access_token_for_background_sync(
+        self,
+        *,
+        db: Session,
+        now_fn: Callable[[], datetime],
+        new_id_fn: Callable[[str], str],
+    ) -> str:
+        connector = self._connector_for_update(db=db)
+        if connector is None or connector.status == "not_connected":
+            raise RuntimeError("not_connected")
+        if connector.status == "revoked":
+            raise RuntimeError("access_revoked")
+        access_token, refresh_failure = self._refresh_access_token_if_needed(
+            db=db,
+            connector=connector,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        if refresh_failure is not None:
+            raise RuntimeError(refresh_failure.error or "token_refresh_failed")
+        if access_token is None:
+            raise RuntimeError("token_expired")
+        return access_token
 
     def execute_read_capability(
         self,

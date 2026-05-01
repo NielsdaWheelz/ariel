@@ -1119,22 +1119,257 @@ class GoogleConnectorEventRecord(Base):
     connector: Mapped[GoogleConnectorRecord] = relationship(back_populates="events")
 
 
-class ProactiveSubscriptionRecord(Base):
-    __tablename__ = "proactive_subscriptions"
+class ConnectorSubscriptionRecord(Base):
+    __tablename__ = "connector_subscriptions"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    source_type: Mapped[str] = mapped_column(String(32), nullable=False)
-    label: Mapped[str] = mapped_column(Text, nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    resource_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    resource_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    channel_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    channel_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    provider_subscription_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
-    check_interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
-    next_run_after: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, index=True
-    )
-    last_checked_at: Mapped[datetime | None] = mapped_column(
+    expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, index=True
     )
-    check_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    notification_policy: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    renew_after: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    last_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_error_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "provider", "resource_type", "resource_id", name="uq_subscription_resource"
+        ),
+        CheckConstraint("provider IN ('google')", name="ck_connector_subscription_provider"),
+        CheckConstraint(
+            "resource_type IN ('calendar', 'gmail', 'drive')",
+            name="ck_connector_subscription_resource_type",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'renewal_due', 'expired', 'error', 'revoked')",
+            name="ck_connector_subscription_status",
+        ),
+        Index("ix_connector_subscriptions_renewal", "status", "renew_after", "id"),
+    )
+
+
+class SyncCursorRecord(Base):
+    __tablename__ = "sync_cursors"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    resource_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    resource_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    cursor_value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cursor_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    last_successful_sync_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    last_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_error_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "provider", "resource_type", "resource_id", name="uq_sync_cursor_resource"
+        ),
+        CheckConstraint("provider IN ('google')", name="ck_sync_cursor_provider"),
+        CheckConstraint(
+            "resource_type IN ('calendar', 'gmail', 'drive')",
+            name="ck_sync_cursor_resource_type",
+        ),
+        CheckConstraint(
+            "status IN ('ready', 'syncing', 'invalid', 'error', 'revoked')",
+            name="ck_sync_cursor_status",
+        ),
+    )
+
+
+class ProviderEventRecord(Base):
+    __tablename__ = "provider_events"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    resource_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    resource_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    external_event_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    dedupe_key: Mapped[str] = mapped_column(String(220), nullable=False, unique=True)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    headers: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    body_digest: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    processed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint("provider IN ('google')", name="ck_provider_event_provider"),
+        CheckConstraint(
+            "resource_type IN ('calendar', 'gmail', 'drive')",
+            name="ck_provider_event_resource_type",
+        ),
+        CheckConstraint(
+            "status IN ('accepted', 'processed', 'failed')",
+            name="ck_provider_event_status",
+        ),
+        Index("ix_provider_events_resource", "provider", "resource_type", "resource_id"),
+    )
+
+
+class SyncRunRecord(Base):
+    __tablename__ = "sync_runs"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    resource_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    resource_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    provider_event_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("provider_events.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    cursor_before: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cursor_after: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    item_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    signal_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint("provider IN ('google')", name="ck_sync_run_provider"),
+        CheckConstraint(
+            "resource_type IN ('calendar', 'gmail', 'drive')",
+            name="ck_sync_run_resource_type",
+        ),
+        CheckConstraint("status IN ('running', 'succeeded', 'failed')", name="ck_sync_run_status"),
+        CheckConstraint("item_count >= 0", name="ck_sync_run_item_count"),
+        CheckConstraint("signal_count >= 0", name="ck_sync_run_signal_count"),
+    )
+
+
+class WorkspaceItemRecord(Base):
+    __tablename__ = "workspace_items"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    item_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    external_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    source_uri: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    item_metadata: Mapped[dict[str, Any]] = mapped_column(
+        "metadata",
+        JSONB,
+        nullable=False,
+        default=dict,
+    )
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        UniqueConstraint("provider", "item_type", "external_id", name="uq_workspace_item_external"),
+        CheckConstraint("provider IN ('google', 'ariel')", name="ck_workspace_item_provider"),
+        CheckConstraint(
+            "item_type IN ('calendar_event', 'email_message', 'drive_file', 'internal_state')",
+            name="ck_workspace_item_type",
+        ),
+        CheckConstraint("status IN ('active', 'deleted')", name="ck_workspace_item_status"),
+        Index("ix_workspace_items_provider_type", "provider", "item_type", "updated_at"),
+    )
+
+
+class WorkspaceItemEventRecord(Base):
+    __tablename__ = "workspace_item_events"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    workspace_item_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("workspace_items.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    dedupe_key: Mapped[str] = mapped_column(String(220), nullable=False, unique=True)
+    provider_event_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("provider_events.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "event_type IN ('created', 'updated', 'deleted', 'restored')",
+            name="ck_workspace_item_event_type",
+        ),
+    )
+
+
+class AttentionSignalRecord(Base):
+    __tablename__ = "attention_signals"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    workspace_item_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("workspace_items.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    dedupe_key: Mapped[str] = mapped_column(String(220), nullable=False, unique=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    priority: Mapped[str] = mapped_column(String(32), nullable=False)
+    urgency: Mapped[str] = mapped_column(String(32), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    taint: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )
@@ -1145,61 +1380,29 @@ class ProactiveSubscriptionRecord(Base):
     __table_args__ = (
         CheckConstraint(
             (
-                "source_type IN ('open_jobs', 'pending_approvals', 'memory_commitments', "
-                "'connector_health', 'quick_capture_review', 'calendar_watch', "
-                "'email_watch', 'drive_watch')"
+                "source_type IN ('workspace_item', 'job', 'approval_request', "
+                "'memory_assertion', 'google_connector', 'capture')"
             ),
-            name="ck_proactive_subscription_source_type",
+            name="ck_attention_signal_source_type",
         ),
         CheckConstraint(
-            "status IN ('active', 'paused', 'cancelled')",
-            name="ck_proactive_subscription_status",
+            "status IN ('new', 'reviewed', 'dismissed', 'superseded')",
+            name="ck_attention_signal_status",
         ),
         CheckConstraint(
-            "check_interval_seconds >= 60",
-            name="ck_proactive_subscription_interval_seconds",
-        ),
-        Index("ix_proactive_subscriptions_due", "status", "next_run_after", "id"),
-    )
-
-
-class ProactiveCheckRunRecord(Base):
-    __tablename__ = "proactive_check_runs"
-
-    id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    subscription_id: Mapped[str] = mapped_column(
-        String(32),
-        ForeignKey("proactive_subscriptions.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
-    scheduled_for: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, index=True
-    )
-    status: Mapped[str] = mapped_column(String(32), nullable=False)
-    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    created_attention_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    result_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, index=True
-    )
-
-    __table_args__ = (
-        UniqueConstraint(
-            "subscription_id",
-            "scheduled_for",
-            name="uq_proactive_check_run_subscription_window",
+            "priority IN ('critical', 'high', 'normal', 'low')",
+            name="ck_attention_signal_priority",
         ),
         CheckConstraint(
-            "status IN ('running', 'succeeded', 'failed')",
-            name="ck_proactive_check_run_status",
+            "urgency IN ('critical', 'high', 'normal', 'low')",
+            name="ck_attention_signal_urgency",
         ),
         CheckConstraint(
-            "created_attention_count >= 0",
-            name="ck_proactive_check_run_attention_count",
+            "confidence >= 0.0 AND confidence <= 1.0",
+            name="ck_attention_signal_confidence",
         ),
+        Index("ix_attention_signals_status_priority", "status", "priority", "updated_at"),
+        Index("ix_attention_signals_source", "source_type", "source_id"),
     )
 
 
@@ -1207,14 +1410,9 @@ class AttentionItemRecord(Base):
     __tablename__ = "attention_items"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    subscription_id: Mapped[str | None] = mapped_column(
-        String(32),
-        ForeignKey("proactive_subscriptions.id", ondelete="RESTRICT"),
-        nullable=True,
-        index=True,
-    )
     source_type: Mapped[str] = mapped_column(String(32), nullable=False)
     source_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    source_signal_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     dedupe_key: Mapped[str] = mapped_column(String(160), nullable=False, unique=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     priority: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -1224,6 +1422,7 @@ class AttentionItemRecord(Base):
     body: Mapped[str] = mapped_column(Text, nullable=False)
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     evidence: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    taint: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, index=True
     )
@@ -1244,11 +1443,7 @@ class AttentionItemRecord(Base):
 
     __table_args__ = (
         CheckConstraint(
-            (
-                "source_type IN ('job', 'approval_request', 'memory_assertion', "
-                "'google_connector', 'capture', 'calendar_watch', 'email_watch', "
-                "'drive_watch', 'manual_signal')"
-            ),
+            "source_type IN ('attention_signal')",
             name="ck_attention_item_source_type",
         ),
         CheckConstraint(
@@ -1306,6 +1501,61 @@ class AttentionItemEventRecord(Base):
     )
 
 
+class ProactiveFeedbackRecord(Base):
+    __tablename__ = "proactive_feedback"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    attention_item_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("attention_items.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    feedback_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "feedback_type IN ('important', 'noise', 'wrong', 'useful')",
+            name="ck_proactive_feedback_type",
+        ),
+    )
+
+
+class ActionProposalRecord(Base):
+    __tablename__ = "action_proposals"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    attention_item_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("attention_items.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    capability_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    payload_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    policy_state: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('proposed', 'approved', 'rejected', 'superseded')",
+            name="ck_action_proposal_status",
+        ),
+    )
+
+
 class BackgroundTaskRecord(Base):
     __tablename__ = "background_tasks"
 
@@ -1334,8 +1584,11 @@ class BackgroundTaskRecord(Base):
         CheckConstraint(
             (
                 "task_type IN ('agency_event_received', 'deliver_discord_notification', "
-                "'expire_approvals', 'reap_stale_tasks', 'proactive_check_due', "
-                "'attention_item_follow_up_due')"
+                "'expire_approvals', 'reap_stale_tasks', "
+                "'provider_subscription_renewal_due', 'provider_event_received', "
+                "'provider_sync_due', 'workspace_signal_derivation_due', "
+                "'attention_review_due', 'attention_item_follow_up_due', "
+                "'action_proposal_review_due')"
             ),
             name="ck_background_task_type",
         ),
@@ -1679,51 +1932,164 @@ def serialize_job_event(event: JobEventRecord) -> dict[str, Any]:
     }
 
 
-def serialize_proactive_subscription(subscription: ProactiveSubscriptionRecord) -> dict[str, Any]:
+def serialize_connector_subscription(subscription: ConnectorSubscriptionRecord) -> dict[str, Any]:
     return {
         "id": subscription.id,
-        "source_type": subscription.source_type,
-        "label": redact_text(subscription.label),
+        "provider": subscription.provider,
+        "resource_type": subscription.resource_type,
+        "resource_id": subscription.resource_id,
+        "channel_id": subscription.channel_id,
+        "provider_subscription_id": subscription.provider_subscription_id,
         "status": subscription.status,
-        "check_interval_seconds": subscription.check_interval_seconds,
-        "next_run_after": to_rfc3339(subscription.next_run_after),
-        "last_checked_at": (
-            to_rfc3339(subscription.last_checked_at)
-            if subscription.last_checked_at is not None
-            else None
+        "expires_at": to_rfc3339(subscription.expires_at) if subscription.expires_at else None,
+        "renew_after": to_rfc3339(subscription.renew_after) if subscription.renew_after else None,
+        "last_error_code": subscription.last_error_code,
+        "last_error_at": (
+            to_rfc3339(subscription.last_error_at) if subscription.last_error_at else None
         ),
-        "check_payload": redact_json_value(subscription.check_payload),
-        "notification_policy": redact_json_value(subscription.notification_policy),
         "created_at": to_rfc3339(subscription.created_at),
         "updated_at": to_rfc3339(subscription.updated_at),
     }
 
 
-def serialize_proactive_check_run(check_run: ProactiveCheckRunRecord) -> dict[str, Any]:
+def serialize_sync_cursor(cursor: SyncCursorRecord) -> dict[str, Any]:
     return {
-        "id": check_run.id,
-        "subscription_id": check_run.subscription_id,
-        "scheduled_for": to_rfc3339(check_run.scheduled_for),
-        "status": check_run.status,
-        "started_at": (
-            to_rfc3339(check_run.started_at) if check_run.started_at is not None else None
+        "id": cursor.id,
+        "provider": cursor.provider,
+        "resource_type": cursor.resource_type,
+        "resource_id": cursor.resource_id,
+        "cursor_value": redact_text(cursor.cursor_value) if cursor.cursor_value else None,
+        "cursor_version": cursor.cursor_version,
+        "status": cursor.status,
+        "last_successful_sync_at": (
+            to_rfc3339(cursor.last_successful_sync_at) if cursor.last_successful_sync_at else None
         ),
-        "completed_at": (
-            to_rfc3339(check_run.completed_at) if check_run.completed_at is not None else None
-        ),
-        "created_attention_count": check_run.created_attention_count,
-        "error": redact_text(check_run.error) if check_run.error is not None else None,
-        "result_payload": redact_json_value(check_run.result_payload),
-        "created_at": to_rfc3339(check_run.created_at),
+        "last_error_code": cursor.last_error_code,
+        "last_error_at": to_rfc3339(cursor.last_error_at) if cursor.last_error_at else None,
+        "created_at": to_rfc3339(cursor.created_at),
+        "updated_at": to_rfc3339(cursor.updated_at),
+    }
+
+
+def serialize_provider_event(event: ProviderEventRecord) -> dict[str, Any]:
+    return {
+        "id": event.id,
+        "provider": event.provider,
+        "resource_type": event.resource_type,
+        "resource_id": event.resource_id,
+        "external_event_id": event.external_event_id,
+        "event_type": event.event_type,
+        "headers": redact_json_value(event.headers),
+        "payload": redact_json_value(event.payload),
+        "body_digest": event.body_digest,
+        "status": event.status,
+        "error": redact_text(event.error) if event.error is not None else None,
+        "received_at": to_rfc3339(event.received_at),
+        "processed_at": to_rfc3339(event.processed_at) if event.processed_at else None,
+    }
+
+
+def serialize_sync_run(run: SyncRunRecord) -> dict[str, Any]:
+    return {
+        "id": run.id,
+        "provider": run.provider,
+        "resource_type": run.resource_type,
+        "resource_id": run.resource_id,
+        "provider_event_id": run.provider_event_id,
+        "cursor_before": redact_text(run.cursor_before) if run.cursor_before else None,
+        "cursor_after": redact_text(run.cursor_after) if run.cursor_after else None,
+        "status": run.status,
+        "item_count": run.item_count,
+        "signal_count": run.signal_count,
+        "error": redact_text(run.error) if run.error is not None else None,
+        "started_at": to_rfc3339(run.started_at) if run.started_at is not None else None,
+        "completed_at": to_rfc3339(run.completed_at) if run.completed_at is not None else None,
+        "created_at": to_rfc3339(run.created_at),
+    }
+
+
+def serialize_workspace_item(item: WorkspaceItemRecord) -> dict[str, Any]:
+    return {
+        "id": item.id,
+        "provider": item.provider,
+        "item_type": item.item_type,
+        "external_id": item.external_id,
+        "title": redact_text(item.title),
+        "summary": redact_text(item.summary),
+        "source_uri": redact_text(item.source_uri) if item.source_uri else None,
+        "status": item.status,
+        "metadata": redact_json_value(item.item_metadata),
+        "observed_at": to_rfc3339(item.observed_at),
+        "deleted_at": to_rfc3339(item.deleted_at) if item.deleted_at else None,
+        "created_at": to_rfc3339(item.created_at),
+        "updated_at": to_rfc3339(item.updated_at),
+    }
+
+
+def serialize_workspace_item_event(event: WorkspaceItemEventRecord) -> dict[str, Any]:
+    return {
+        "id": event.id,
+        "workspace_item_id": event.workspace_item_id,
+        "dedupe_key": event.dedupe_key,
+        "provider_event_id": event.provider_event_id,
+        "event_type": event.event_type,
+        "payload": redact_json_value(event.payload),
+        "created_at": to_rfc3339(event.created_at),
+    }
+
+
+def serialize_attention_signal(signal: AttentionSignalRecord) -> dict[str, Any]:
+    return {
+        "id": signal.id,
+        "workspace_item_id": signal.workspace_item_id,
+        "source_type": signal.source_type,
+        "source_id": signal.source_id,
+        "dedupe_key": signal.dedupe_key,
+        "status": signal.status,
+        "priority": signal.priority,
+        "urgency": signal.urgency,
+        "confidence": signal.confidence,
+        "title": redact_text(signal.title),
+        "body": redact_text(signal.body),
+        "reason": redact_text(signal.reason),
+        "evidence": redact_json_value(signal.evidence),
+        "taint": redact_json_value(signal.taint),
+        "created_at": to_rfc3339(signal.created_at),
+        "updated_at": to_rfc3339(signal.updated_at),
+    }
+
+
+def serialize_action_proposal(proposal: ActionProposalRecord) -> dict[str, Any]:
+    return {
+        "id": proposal.id,
+        "attention_item_id": proposal.attention_item_id,
+        "capability_id": proposal.capability_id,
+        "payload": redact_json_value(proposal.payload),
+        "payload_hash": proposal.payload_hash,
+        "status": proposal.status,
+        "policy_state": redact_json_value(proposal.policy_state),
+        "evidence": redact_json_value(proposal.evidence),
+        "created_at": to_rfc3339(proposal.created_at),
+        "updated_at": to_rfc3339(proposal.updated_at),
+    }
+
+
+def serialize_proactive_feedback(feedback: ProactiveFeedbackRecord) -> dict[str, Any]:
+    return {
+        "id": feedback.id,
+        "attention_item_id": feedback.attention_item_id,
+        "feedback_type": feedback.feedback_type,
+        "note": redact_text(feedback.note) if feedback.note is not None else None,
+        "created_at": to_rfc3339(feedback.created_at),
     }
 
 
 def serialize_attention_item(item: AttentionItemRecord) -> dict[str, Any]:
     return {
         "id": item.id,
-        "subscription_id": item.subscription_id,
         "source_type": item.source_type,
         "source_id": item.source_id,
+        "source_signal_ids": item.source_signal_ids,
         "dedupe_key": item.dedupe_key,
         "status": item.status,
         "priority": item.priority,
@@ -1733,6 +2099,7 @@ def serialize_attention_item(item: AttentionItemRecord) -> dict[str, Any]:
         "body": redact_text(item.body),
         "reason": redact_text(item.reason),
         "evidence": redact_json_value(item.evidence),
+        "taint": redact_json_value(item.taint),
         "expires_at": to_rfc3339(item.expires_at) if item.expires_at is not None else None,
         "next_follow_up_after": (
             to_rfc3339(item.next_follow_up_after) if item.next_follow_up_after is not None else None
