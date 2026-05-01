@@ -56,6 +56,14 @@ EVENT_PAYLOAD_KEYS_BY_TYPE: dict[str, set[str]] = {
         "attempt",
     },
     "evt.model.failed": {"provider", "model", "duration_ms", "failure_reason", "attempt"},
+    "evt.memory.evidence_recorded": {
+        "evidence_id",
+        "source_turn_id",
+        "source_session_id",
+        "content_class",
+        "trust_boundary",
+    },
+    "evt.memory.extraction_queued": {"task_id", "turn_id", "evidence_id"},
     "evt.action.proposed": {"action_attempt_id", "capability_id", "input", "taint"},
     "evt.action.policy_decided": {"action_attempt_id", "decision", "reason", "taint"},
     "evt.action.approval.requested": {

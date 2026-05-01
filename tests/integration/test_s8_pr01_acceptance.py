@@ -432,7 +432,7 @@ def test_s8_pr01_bare_text_capture_is_observe_first_and_not_direct_memory_comman
         memory_projection = client.get("/v1/memory")
         assert memory_projection.status_code == 200
         memory_payload = memory_projection.json()
-        assert memory_payload["assertions"] == []
+        assert memory_payload["active_assertions"] == []
         assert memory_payload["candidates"] == []
 
         event_types = [event["event_type"] for event in payload["turn"]["events"]]

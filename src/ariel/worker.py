@@ -22,6 +22,7 @@ from .persistence import (
     NotificationRecord,
     SessionRecord,
 )
+from .memory import process_memory_extract_turn
 from .proactivity import (
     process_attention_item_follow_up_due,
     process_attention_review_due,
@@ -179,6 +180,14 @@ def process_one_task(
                 )
             case "provider_sync_due":
                 process_provider_sync_due(
+                    session_factory=session_factory,
+                    task_payload=task_payload,
+                    settings=resolved_settings,
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+            case "memory_extract_turn":
+                process_memory_extract_turn(
                     session_factory=session_factory,
                     task_payload=task_payload,
                     settings=resolved_settings,

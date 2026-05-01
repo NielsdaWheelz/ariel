@@ -145,7 +145,7 @@ def list_memory(
         payload = _json_response_payload(response)
         if response.status_code >= 400 or payload.get("ok") is not True:
             raise ArielDiscordError(_safe_ariel_error_message(payload))
-    assertions = payload.get("assertions")
+    assertions = payload.get("active_assertions")
     if not isinstance(assertions, list):
         raise ArielDiscordError("Ariel returned an invalid memory response.")
     return _format_memory_for_discord(assertions)
@@ -905,7 +905,7 @@ def _format_jobs_for_discord(jobs: list[Any]) -> str:
 def _format_memory_for_discord(items: list[Any]) -> str:
     active_items = []
     for item in items:
-        if not isinstance(item, dict) or item.get("lifecycle_state") != "active":
+        if not isinstance(item, dict) or item.get("state") != "active":
             continue
         subject_key = item.get("subject_key")
         predicate = item.get("predicate")

@@ -9,6 +9,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    func,
     Index,
     Integer,
     String,
@@ -596,7 +597,7 @@ class MemoryEvidenceRecord(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     source_turn_id: Mapped[str | None] = mapped_column(
         String(32),
-        ForeignKey("turns.id", ondelete="SET NULL"),
+        ForeignKey("turns.id", ondelete="RESTRICT"),
         nullable=True,
         index=True,
     )
@@ -609,10 +610,27 @@ class MemoryEvidenceRecord(Base):
     actor_id: Mapped[str] = mapped_column(String(128), nullable=False)
     content_class: Mapped[str] = mapped_column(String(32), nullable=False)
     trust_boundary: Mapped[str] = mapped_column(String(32), nullable=False)
+    lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False, default="available")
+    source_uri: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_artifact_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("artifacts.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
     source_text: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence_snippet: Mapped[str | None] = mapped_column(Text, nullable=True)
+    redaction_posture: Mapped[str] = mapped_column(String(32), nullable=False, default="none")
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=func.now(),
+        onupdate=func.now(),
+        index=True,
     )
 
     __table_args__ = (
@@ -627,6 +645,14 @@ class MemoryEvidenceRecord(Base):
             "('trusted_user', 'system', 'assistant', 'untrusted_tool', "
             "'untrusted_web', 'untrusted_file')",
             name="ck_memory_evidence_trust_boundary",
+        ),
+        CheckConstraint(
+            "lifecycle_state IN ('available', 'redacted', 'privacy_deleted')",
+            name="ck_memory_evidence_lifecycle_state",
+        ),
+        CheckConstraint(
+            "redaction_posture IN ('none', 'redacted', 'privacy_deleted')",
+            name="ck_memory_evidence_redaction_posture",
         ),
     )
 
@@ -651,7 +677,8 @@ class MemoryEntityRecord(Base):
         CheckConstraint(
             "entity_type IN "
             "('user', 'project', 'repo', 'artifact', 'task', 'commitment', "
-            "'preference', 'procedure', 'assertion_subject')",
+            "'decision', 'risk', 'preference', 'procedure', 'person', "
+            "'organization', 'domain_concept', 'assertion_subject')",
             name="ck_memory_entity_type",
         ),
         Index(
@@ -659,6 +686,59 @@ class MemoryEntityRecord(Base):
             "entity_type",
             "entity_key",
             unique=True,
+        ),
+    )
+
+
+class MemoryRelationshipRecord(Base):
+    __tablename__ = "memory_relationships"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    source_entity_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("memory_entities.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    target_entity_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("memory_entities.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    relationship_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    scope_key: Mapped[str] = mapped_column(Text, nullable=False)
+    lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    valid_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    evidence_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("memory_evidence.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "lifecycle_state IN ('candidate', 'active', 'superseded', 'retracted', "
+            "'rejected', 'deleted')",
+            name="ck_memory_relationship_lifecycle_state",
+        ),
+        CheckConstraint(
+            "confidence >= 0.0 AND confidence <= 1.0",
+            name="ck_memory_relationship_confidence_range",
+        ),
+        CheckConstraint(
+            "(valid_to IS NULL) OR (valid_from IS NULL) OR (valid_from < valid_to)",
+            name="ck_memory_relationship_valid_interval",
         ),
     )
 
@@ -678,6 +758,7 @@ class MemoryAssertionRecord(Base):
     scope_key: Mapped[str] = mapped_column(Text, nullable=False)
     object_value: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     assertion_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    is_multi_valued: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     scope: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False)
     confidence: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
@@ -685,10 +766,12 @@ class MemoryAssertionRecord(Base):
     valid_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     superseded_by_assertion_id: Mapped[str | None] = mapped_column(
         String(32),
-        ForeignKey("memory_assertions.id", ondelete="SET NULL"),
+        ForeignKey("memory_assertions.id", ondelete="RESTRICT"),
         nullable=True,
         index=True,
     )
+    extraction_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    extraction_prompt_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     last_verified_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )
@@ -702,7 +785,8 @@ class MemoryAssertionRecord(Base):
     __table_args__ = (
         CheckConstraint(
             "assertion_type IN "
-            "('fact', 'preference', 'commitment', 'decision', 'project_state', 'procedure')",
+            "('fact', 'profile', 'preference', 'commitment', 'decision', "
+            "'project_state', 'procedure', 'domain_concept')",
             name="ck_memory_assertion_type",
         ),
         CheckConstraint(
@@ -719,6 +803,10 @@ class MemoryAssertionRecord(Base):
             "(valid_to IS NULL) OR (valid_from IS NULL) OR (valid_from < valid_to)",
             name="ck_memory_assertion_valid_interval",
         ),
+        CheckConstraint(
+            "(lifecycle_state != 'superseded') OR (superseded_by_assertion_id IS NOT NULL)",
+            name="ck_memory_assertion_superseded_link",
+        ),
         Index(
             "ix_memory_assertions_subject_predicate_state",
             "subject_entity_id",
@@ -728,6 +816,14 @@ class MemoryAssertionRecord(Base):
         Index(
             "ix_memory_assertions_scope_key",
             "scope_key",
+        ),
+        Index(
+            "ix_memory_assertions_single_active_unique",
+            "subject_entity_id",
+            "predicate",
+            "scope_key",
+            unique=True,
+            postgresql_where=((lifecycle_state == "active") & (is_multi_valued.is_(False))),
         ),
     )
 
@@ -757,6 +853,157 @@ class MemoryAssertionEvidenceRecord(Base):
             "assertion_id",
             "evidence_id",
             name="uq_memory_assertion_evidence_pair",
+        ),
+    )
+
+
+class MemoryEpisodeRecord(Base):
+    __tablename__ = "memory_episodes"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    episode_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    scope_key: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    outcome: Mapped[str | None] = mapped_column(Text, nullable=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    valid_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    primary_evidence_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("memory_evidence.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    related_entity_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    related_assertion_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "episode_type IN ('source_snippet', 'task_event', 'action_outcome', "
+            "'decision_history', 'project_update')",
+            name="ck_memory_episode_type",
+        ),
+        CheckConstraint(
+            "lifecycle_state IN ('active', 'superseded', 'retracted', 'deleted')",
+            name="ck_memory_episode_lifecycle_state",
+        ),
+        CheckConstraint(
+            "(valid_to IS NULL) OR (valid_from IS NULL) OR (valid_from < valid_to)",
+            name="ck_memory_episode_valid_interval",
+        ),
+    )
+
+
+class MemoryReasoningTraceRecord(Base):
+    __tablename__ = "memory_reasoning_traces"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    trace_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    scope_key: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    task_summary: Mapped[str] = mapped_column(Text, nullable=False)
+    trace_summary: Mapped[str] = mapped_column(Text, nullable=False)
+    outcome: Mapped[str] = mapped_column(String(32), nullable=False)
+    primary_evidence_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("memory_evidence.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    source_turn_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("turns.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    related_entity_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    related_assertion_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "trace_type IN ('action_path', 'failure', 'user_correction', "
+            "'successful_pattern', 'diagnostic')",
+            name="ck_memory_reasoning_trace_type",
+        ),
+        CheckConstraint(
+            "outcome IN ('succeeded', 'failed', 'corrected', 'unknown')",
+            name="ck_memory_reasoning_trace_outcome",
+        ),
+        CheckConstraint(
+            "lifecycle_state IN ('active', 'superseded', 'retracted', 'deleted')",
+            name="ck_memory_reasoning_trace_lifecycle_state",
+        ),
+    )
+
+
+class MemoryProcedureRecord(Base):
+    __tablename__ = "memory_procedures"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    procedure_key: Mapped[str] = mapped_column(Text, nullable=False)
+    scope_key: Mapped[str] = mapped_column(Text, nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    instruction: Mapped[str] = mapped_column(Text, nullable=False)
+    lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    review_state: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    source_assertion_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("memory_assertions.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    primary_evidence_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("memory_evidence.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    valid_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "lifecycle_state IN ('candidate', 'active', 'superseded', 'retracted', "
+            "'rejected', 'deleted')",
+            name="ck_memory_procedure_lifecycle_state",
+        ),
+        CheckConstraint(
+            "review_state IN ('pending', 'approved', 'rejected', 'auto_approved', "
+            "'needs_user_review', 'needs_operator_review')",
+            name="ck_memory_procedure_review_state",
+        ),
+        CheckConstraint(
+            "(valid_to IS NULL) OR (valid_from IS NULL) OR (valid_from < valid_to)",
+            name="ck_memory_procedure_valid_interval",
+        ),
+        Index(
+            "ix_memory_procedures_key_scope_unique",
+            "procedure_key",
+            "scope_key",
+            unique=True,
         ),
     )
 
@@ -803,7 +1050,7 @@ class MemoryConflictSetRecord(Base):
     lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False)
     resolution_assertion_id: Mapped[str | None] = mapped_column(
         String(32),
-        ForeignKey("memory_assertions.id", ondelete="SET NULL"),
+        ForeignKey("memory_assertions.id", ondelete="RESTRICT"),
         nullable=True,
         index=True,
     )
@@ -893,6 +1140,66 @@ class MemorySalienceRecord(Base):
     )
 
 
+class MemoryVersionRecord(Base):
+    __tablename__ = "memory_versions"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    canonical_table: Mapped[str] = mapped_column(String(64), nullable=False)
+    canonical_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    change_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    actor_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    prior_state: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True),
+        nullable=True,
+    )
+    new_state: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True),
+        nullable=True,
+    )
+    redaction_posture: Mapped[str] = mapped_column(String(32), nullable=False, default="none")
+    projection_invalidation: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "canonical_table IN ('memory_evidence', 'memory_entities', "
+            "'memory_relationships', 'memory_assertions', 'memory_episodes', "
+            "'memory_reasoning_traces', 'memory_procedures', "
+            "'project_state_snapshots')",
+            name="ck_memory_version_canonical_table",
+        ),
+        CheckConstraint(
+            "version > 0",
+            name="ck_memory_version_positive",
+        ),
+        CheckConstraint(
+            "change_type IN ('created', 'updated', 'reviewed', 'superseded', "
+            "'retracted', 'deleted', 'redacted', 'privacy_deleted', "
+            "'projection_invalidated', 'imported', 'exported')",
+            name="ck_memory_version_change_type",
+        ),
+        CheckConstraint(
+            "redaction_posture IN ('none', 'redacted', 'privacy_deleted')",
+            name="ck_memory_version_redaction_posture",
+        ),
+        Index(
+            "ix_memory_versions_target_version_unique",
+            "canonical_table",
+            "canonical_id",
+            "version",
+            unique=True,
+        ),
+    )
+
+
 class MemoryProjectionJobRecord(Base):
     __tablename__ = "memory_projection_jobs"
 
@@ -914,7 +1221,8 @@ class MemoryProjectionJobRecord(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "projection_kind IN ('embedding', 'context_block', 'graph_cache', 'project_state')",
+            "projection_kind IN ('embedding', 'keyword', 'entity', 'graph', "
+            "'context_block', 'project_state')",
             name="ck_memory_projection_job_kind",
         ),
         CheckConstraint(
@@ -936,7 +1244,11 @@ class MemoryEmbeddingProjectionRecord(Base):
         nullable=False,
         index=True,
     )
-    projection_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    projection_version: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="semantic-v2",
+    )
     search_text: Mapped[str] = mapped_column(Text, nullable=False)
     embedding: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(
@@ -956,6 +1268,126 @@ class MemoryEmbeddingProjectionRecord(Base):
     )
 
 
+class MemoryKeywordProjectionRecord(Base):
+    __tablename__ = "memory_keyword_projections"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    canonical_table: Mapped[str] = mapped_column(String(64), nullable=False)
+    canonical_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    projection_version: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="semantic-v2",
+    )
+    search_text: Mapped[str] = mapped_column(Text, nullable=False)
+    weighted_terms: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "canonical_table IN ('memory_assertions', 'memory_evidence', "
+            "'memory_episodes', 'memory_reasoning_traces', 'memory_procedures')",
+            name="ck_memory_keyword_projection_canonical_table",
+        ),
+        Index(
+            "ix_memory_keyword_projection_unique",
+            "canonical_table",
+            "canonical_id",
+            "projection_version",
+            unique=True,
+        ),
+    )
+
+
+class MemoryEntityProjectionRecord(Base):
+    __tablename__ = "memory_entity_projections"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    canonical_table: Mapped[str] = mapped_column(String(64), nullable=False)
+    canonical_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    entity_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("memory_entities.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    projection_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    mention_text: Mapped[str] = mapped_column(Text, nullable=False)
+    features: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "canonical_table IN ('memory_assertions', 'memory_evidence', "
+            "'memory_relationships', 'memory_episodes', 'memory_reasoning_traces', "
+            "'memory_procedures', 'project_state_snapshots')",
+            name="ck_memory_entity_projection_canonical_table",
+        ),
+        Index(
+            "ix_memory_entity_projection_unique",
+            "canonical_table",
+            "canonical_id",
+            "entity_id",
+            "projection_version",
+            unique=True,
+        ),
+    )
+
+
+class MemoryGraphProjectionRecord(Base):
+    __tablename__ = "memory_graph_projections"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    source_entity_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("memory_entities.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    target_entity_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("memory_entities.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    projection_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    relationship_path: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=list,
+    )
+    distance: Mapped[int] = mapped_column(Integer, nullable=False)
+    score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint("distance >= 0", name="ck_memory_graph_projection_distance"),
+        CheckConstraint("score >= 0.0", name="ck_memory_graph_projection_score"),
+        Index(
+            "ix_memory_graph_projection_unique",
+            "source_entity_id",
+            "target_entity_id",
+            "projection_version",
+            unique=True,
+        ),
+    )
+
+
 class MemoryContextBlockRecord(Base):
     __tablename__ = "memory_context_blocks"
 
@@ -964,6 +1396,14 @@ class MemoryContextBlockRecord(Base):
     scope_key: Mapped[str] = mapped_column(Text, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     source_assertion_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    source_episode_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    source_trace_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    source_procedure_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    source_project_state_snapshot_ids: Mapped[list[str]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=list,
+    )
     projection_version: Mapped[str] = mapped_column(String(32), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
@@ -974,7 +1414,7 @@ class MemoryContextBlockRecord(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "block_type IN ('pinned_core', 'project_state', 'procedure')",
+            "block_type IN ('pinned_core', 'project_state', 'procedure', 'episodic', 'reasoning')",
             name="ck_memory_context_block_type",
         ),
         Index(
@@ -995,11 +1435,26 @@ class ProjectStateSnapshotRecord(Base):
     summary: Mapped[str] = mapped_column(Text, nullable=False)
     state: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     source_assertion_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    source_episode_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    source_evidence_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    projection_version: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="semantic-v2",
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "lifecycle_state IN ('active', 'superseded', 'retracted', 'deleted')",
+            name="ck_project_state_snapshot_lifecycle_state",
+        ),
     )
 
 
@@ -1586,7 +2041,8 @@ class BackgroundTaskRecord(Base):
                 "task_type IN ('agency_event_received', 'deliver_discord_notification', "
                 "'expire_approvals', 'reap_stale_tasks', "
                 "'provider_subscription_renewal_due', 'provider_event_received', "
-                "'provider_sync_due', 'workspace_signal_derivation_due', "
+                "'provider_sync_due', 'memory_extract_turn', "
+                "'workspace_signal_derivation_due', "
                 "'attention_review_due', 'attention_item_follow_up_due', "
                 "'action_proposal_review_due')"
             ),

@@ -257,13 +257,20 @@ def test_s5_pr02_context_bundle_follows_constitution_section_order_and_includes_
     adapter = SessionManagementProbeAdapter()
     with _build_client(postgres_url, adapter, reset_database=True) as client:
         session_id = _session_id(client)
-        assert (
-            client.post(
-                f"/v1/sessions/{session_id}/message",
-                json={"message": "remember commitment invoice = send invoice before friday"},
-            ).status_code
-            == 200
+        candidate = client.post(
+            "/v1/memory/candidates",
+            json={
+                "subject_key": "user:default",
+                "predicate": "commitment.invoice",
+                "assertion_type": "commitment",
+                "value": "send invoice before friday",
+                "evidence_text": "The user committed to send invoice before Friday.",
+                "confidence": 1.0,
+            },
         )
+        assert candidate.status_code == 200
+        candidate_id = candidate.json()["candidates"][0]["id"]
+        assert client.post(f"/v1/memory/candidates/{candidate_id}/approve").status_code == 200
         second = client.post(
             f"/v1/sessions/{session_id}/message",
             json={"message": "what is still open?"},
@@ -281,8 +288,8 @@ def test_s5_pr02_context_bundle_follows_constitution_section_order_and_includes_
 
         memory_context = bundle["memory_context"]
         assert isinstance(memory_context, dict)
-        assert isinstance(memory_context["active_commitments"], list)
-        assert memory_context["active_commitments"]
+        assert isinstance(memory_context["commitments_and_decisions"], list)
+        assert memory_context["commitments_and_decisions"]
 
         commitments_jobs = bundle["open_commitments_and_jobs"]
         assert isinstance(commitments_jobs, dict)

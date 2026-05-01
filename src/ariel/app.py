@@ -53,10 +53,12 @@ from ariel.memory import (
     build_memory_context,
     context_text,
     correct_assertion,
+    create_relationship,
     delete_assertion,
     list_memory,
-    record_memory_from_user_message,
+    propose_memory_candidate,
     record_rotation_context_block,
+    record_turn_memory_evidence,
     reject_candidate,
     resolve_conflict,
     retract_assertion,
@@ -126,6 +128,7 @@ from ariel.response_contracts import (
     build_surface_capture_success_response,
     build_surface_connector_subscription_list_response,
     build_surface_memory_response,
+    build_surface_memory_search_response,
     build_surface_message_response,
     build_surface_provider_event_list_response,
     build_surface_rotation_list_response,
@@ -288,6 +291,67 @@ class MemoryConflictResolutionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     assertion_id: str = Field(min_length=1, max_length=32)
+
+
+class MemoryCandidateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    subject_key: str = Field(min_length=1, max_length=200)
+    predicate: str = Field(min_length=1, max_length=200)
+    assertion_type: Literal[
+        "fact",
+        "profile",
+        "preference",
+        "commitment",
+        "decision",
+        "project_state",
+        "procedure",
+        "domain_concept",
+    ]
+    value: str = Field(min_length=1, max_length=700)
+    evidence_text: str = Field(min_length=1, max_length=12_000)
+    confidence: float = Field(ge=0.0, le=1.0)
+    scope_key: str = Field(default="global", min_length=1, max_length=200)
+    is_multi_valued: bool = False
+    valid_from: datetime | None = None
+    valid_to: datetime | None = None
+
+    @field_validator("subject_key", "predicate", "value", "evidence_text", "scope_key")
+    @classmethod
+    def _memory_text_must_not_be_blank(cls, value: str) -> str:
+        normalized = " ".join(value.strip().split())
+        if not normalized:
+            raise ValueError("memory text fields must not be blank")
+        return normalized
+
+    @model_validator(mode="after")
+    def _valid_interval_must_be_right_open(self) -> MemoryCandidateRequest:
+        if (
+            self.valid_from is not None
+            and self.valid_to is not None
+            and self.valid_from >= self.valid_to
+        ):
+            raise ValueError("valid_from must be before valid_to")
+        return self
+
+
+class MemoryRelationshipRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_entity_id: str = Field(min_length=1, max_length=32)
+    target_entity_id: str = Field(min_length=1, max_length=32)
+    relationship_type: str = Field(min_length=1, max_length=64)
+    evidence_id: str = Field(min_length=1, max_length=32)
+    scope_key: str = Field(default="global", min_length=1, max_length=200)
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+
+    @field_validator("relationship_type", "scope_key")
+    @classmethod
+    def _relationship_text_must_not_be_blank(cls, value: str) -> str:
+        normalized = " ".join(value.strip().split())
+        if not normalized:
+            raise ValueError("relationship fields must not be blank")
+        return normalized
 
 
 class ApprovalDecisionRequest(BaseModel):
@@ -2403,14 +2467,43 @@ def create_app(
         bounded_limit = max(1, min(limit, 100))
         with session_factory() as db:
             with db.begin():
-                payload = {
-                    "assertions": search_memory(db, query=q, limit=bounded_limit),
-                    "candidates": [],
-                    "conflicts": [],
-                    "project_state": [],
-                }
+                results = search_memory(db, query=q, limit=bounded_limit)
                 try:
-                    return build_surface_memory_response(**payload)
+                    return build_surface_memory_search_response(
+                        schema_version="memory.sota.v1",
+                        results=results,
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.post("/v1/memory/candidates", response_model=None)
+    def post_memory_candidate(payload: MemoryCandidateRequest) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                active_session = _get_or_create_active_session(db)
+                propose_memory_candidate(
+                    db,
+                    source_session_id=active_session.id,
+                    actor_id=str(app.state.approval_actor_id),
+                    evidence_text=payload.evidence_text,
+                    subject_key=payload.subject_key,
+                    predicate=payload.predicate,
+                    assertion_type=payload.assertion_type,
+                    value=payload.value,
+                    confidence=payload.confidence,
+                    scope_key=payload.scope_key,
+                    is_multi_valued=payload.is_multi_valued,
+                    valid_from=payload.valid_from,
+                    valid_to=payload.valid_to,
+                    extraction_model=None,
+                    extraction_prompt_version=None,
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+                memory_payload = list_memory(db)
+                try:
+                    return build_surface_memory_response(**memory_payload)
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
 
@@ -2422,10 +2515,14 @@ def create_app(
                 payload = list_memory(db)
                 try:
                     return build_surface_memory_response(
-                        assertions=[],
+                        schema_version=payload["schema_version"],
+                        active_assertions=[],
                         candidates=payload["candidates"],
                         conflicts=payload["conflicts"],
                         project_state=[],
+                        evidence=[],
+                        procedures=[],
+                        projection_health=payload["projection_health"],
                     )
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
@@ -2504,6 +2601,7 @@ def create_app(
                     assertion_id=assertion_id,
                     actor_id=str(app.state.approval_actor_id),
                     now_fn=_utcnow,
+                    new_id_fn=_new_id,
                 )
                 payload = list_memory(db)
                 try:
@@ -2521,6 +2619,7 @@ def create_app(
                     assertion_id=assertion_id,
                     actor_id=str(app.state.approval_actor_id),
                     now_fn=_utcnow,
+                    new_id_fn=_new_id,
                 )
                 payload = list_memory(db)
                 try:
@@ -2570,17 +2669,17 @@ def create_app(
         with session_factory() as db:
             with db.begin():
                 payload = list_memory(db)
-                conflict = [
-                    item
-                    for item in payload["conflicts"]
-                    if item["conflict_set_id"] == conflict_set_id
-                ]
+                conflict = [item for item in payload["conflicts"] if item["id"] == conflict_set_id]
                 try:
                     return build_surface_memory_response(
-                        assertions=[],
+                        schema_version=payload["schema_version"],
+                        active_assertions=[],
                         candidates=[],
                         conflicts=conflict,
                         project_state=[],
+                        evidence=[],
+                        procedures=[],
+                        projection_health=payload["projection_health"],
                     )
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
@@ -2615,13 +2714,51 @@ def create_app(
                 payload = list_memory(db)
                 try:
                     return build_surface_memory_response(
-                        assertions=[],
+                        schema_version=payload["schema_version"],
+                        active_assertions=[],
                         candidates=[],
                         conflicts=[],
                         project_state=payload["project_state"],
+                        evidence=[],
+                        procedures=[],
+                        projection_health=payload["projection_health"],
                     )
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
+
+    @app.post("/v1/memory/relationships", response_model=None)
+    def post_memory_relationship(
+        payload: MemoryRelationshipRequest,
+    ) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                relationship = create_relationship(
+                    db,
+                    source_entity_id=payload.source_entity_id,
+                    target_entity_id=payload.target_entity_id,
+                    relationship_type=payload.relationship_type,
+                    evidence_id=payload.evidence_id,
+                    scope_key=payload.scope_key,
+                    confidence=payload.confidence,
+                    actor_id=str(app.state.approval_actor_id),
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+                if relationship is None:
+                    return JSONResponse(
+                        status_code=404,
+                        content={
+                            "ok": False,
+                            "error": {
+                                "code": "E_MEMORY_RELATIONSHIP_TARGET_NOT_FOUND",
+                                "message": "memory relationship target not found",
+                                "details": {},
+                                "retryable": False,
+                            },
+                        },
+                    )
+                return {"ok": True, "relationship": relationship}
 
     @app.get("/v1/weather/default-location")
     def get_weather_default_location() -> dict[str, Any]:
@@ -2967,8 +3104,8 @@ def create_app(
             )
         add_event("evt.turn.started", {"message": user_message, "discord": discord_context})
         if (
-            memory_recall_event_payload["included_assertion_count"]
-            or memory_recall_event_payload["conflict_set_ids"]
+            memory_recall_event_payload["included_memory_count"]
+            or memory_recall_event_payload["conflict_ids"]
         ):
             add_event("evt.memory.recalled", memory_recall_event_payload)
         applied_limits = _applied_turn_limits(app)
@@ -3282,11 +3419,14 @@ def create_app(
             )
         else:
             assert assistant_response is not None
-            memory_events = record_memory_from_user_message(
+            assistant_message = assistant_response["assistant_text"]
+            turn.assistant_message = assistant_message
+            memory_events, user_evidence_id = record_turn_memory_evidence(
                 db,
                 session_id=effective_session_id,
                 source_turn_id=turn.id,
                 user_message=user_message,
+                assistant_message=assistant_message,
                 actor_id=str(app.state.approval_actor_id),
                 now_fn=_utcnow,
                 new_id_fn=_new_id,
@@ -3296,9 +3436,25 @@ def create_app(
                 payload_data = memory_event.get("payload")
                 if isinstance(event_type, str) and isinstance(payload_data, dict):
                     add_event(event_type, payload_data)
+            task = enqueue_background_task(
+                db,
+                task_type="memory_extract_turn",
+                payload={
+                    "session_id": effective_session_id,
+                    "turn_id": turn.id,
+                    "evidence_id": user_evidence_id,
+                },
+                now=_utcnow(),
+            )
+            add_event(
+                "evt.memory.extraction_queued",
+                {
+                    "task_id": task.id,
+                    "turn_id": turn.id,
+                    "evidence_id": user_evidence_id,
+                },
+            )
 
-            assistant_message = assistant_response["assistant_text"]
-            turn.assistant_message = assistant_message
             turn.status = "completed"
             turn.updated_at = _utcnow()
             add_event("evt.assistant.emitted", {"message": assistant_message})

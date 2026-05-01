@@ -38,6 +38,7 @@ SurfaceEventType = Literal[
     "evt.memory.conflict_resolved",
     "evt.memory.projection_rebuilt",
     "evt.memory.recall_omitted_item",
+    "evt.memory.extraction_queued",
     "evt.turn.limit_reached",
     "evt.assistant.emitted",
     "evt.turn.failed",
@@ -160,19 +161,22 @@ class SurfaceEventTurnStartedPayloadContract(BaseModel):
 class SurfaceMemoryRecallExclusionContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    assertion_id: str
+    id: str
+    kind: str
     reason: str
 
 
 class SurfaceEventMemoryRecalledPayloadContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    max_recalled_assertions: int
-    included_assertion_count: int
-    omitted_assertion_count: int
-    included_assertion_ids: list[str]
-    omitted_assertions: list[SurfaceMemoryRecallExclusionContract]
-    conflict_set_ids: list[str]
+    schema_version: str
+    projection_version: str
+    max_recalled_items: int
+    included_memory_count: int
+    omitted_memory_count: int
+    included_memory_ids: list[str]
+    omitted_memories: list[SurfaceMemoryRecallExclusionContract]
+    conflict_ids: list[str]
 
 
 class SurfaceEventTurnLimitReachedPayloadContract(BaseModel):
@@ -545,25 +549,38 @@ class SurfaceArtifactResponseContract(BaseModel):
     artifact: SurfaceArtifactContract
 
 
+class SurfaceMemoryEvidenceRefContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_id: str
+    snippet: str
+    source_turn_id: str | None
+    source_session_id: str
+    content_class: str
+    trust_boundary: str
+    created_at: str
+
+
 class SurfaceMemoryAssertionContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    assertion_id: str
+    id: str
     subject_key: str
     predicate: str
-    assertion_type: str
-    lifecycle_state: str
+    type: str
+    state: str
     value: str
     confidence: float
-    scope: Any
     scope_key: str
+    is_multi_valued: bool
     valid_from: str | None
     valid_to: str | None
     last_verified_at: str
     created_at: str
     updated_at: str
-    superseded_by_assertion_id: str | None
-    evidence_ids: list[str]
+    superseded_by_id: str | None
+    evidence_refs: list[SurfaceMemoryEvidenceRefContract]
+    projection_version: str
     rank_reason: str | None = None
     rank_score: float | None = None
 
@@ -571,11 +588,11 @@ class SurfaceMemoryAssertionContract(BaseModel):
 class SurfaceMemoryConflictContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    conflict_set_id: str
+    id: str
     subject_entity_id: str
     predicate: str
     scope_key: str
-    lifecycle_state: str
+    state: str
     resolution_assertion_id: str | None
     reason: str | None
     created_at: str
@@ -585,23 +602,72 @@ class SurfaceMemoryConflictContract(BaseModel):
 class SurfaceProjectStateContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    snapshot_id: str
+    id: str
     project_key: str
     summary: str
     state: Any | None = None
     source_assertion_ids: list[str]
+    source_evidence_ids: list[str]
     created_at: str
     updated_at: str
+
+
+class SurfaceMemoryEvidenceContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    source_turn_id: str | None
+    source_session_id: str
+    content_class: str
+    trust_boundary: str
+    state: str
+    snippet: str
+    created_at: str
+
+
+class SurfaceMemoryProcedureContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    procedure_key: str
+    scope_key: str
+    title: str
+    instruction: str
+    state: str
+    review_state: str
+    source_assertion_id: str | None
+    created_at: str
+    updated_at: str
+
+
+class SurfaceMemoryProjectionHealthContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    projection_version: str
+    pending_jobs: int
+    failed_jobs: int
 
 
 class SurfaceMemoryResponseContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     ok: bool
-    assertions: list[SurfaceMemoryAssertionContract]
+    schema_version: str
+    active_assertions: list[SurfaceMemoryAssertionContract]
     candidates: list[SurfaceMemoryAssertionContract]
     conflicts: list[SurfaceMemoryConflictContract]
     project_state: list[SurfaceProjectStateContract]
+    evidence: list[SurfaceMemoryEvidenceContract]
+    procedures: list[SurfaceMemoryProcedureContract]
+    projection_health: SurfaceMemoryProjectionHealthContract
+
+
+class SurfaceMemorySearchResponseContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    schema_version: str
+    results: list[SurfaceMemoryAssertionContract]
 
 
 class SurfaceConnectorSubscriptionContract(BaseModel):
@@ -1310,20 +1376,40 @@ def build_surface_approval_response(
 
 def build_surface_memory_response(
     *,
-    assertions: Any,
+    schema_version: Any,
+    active_assertions: Any,
     candidates: Any,
     conflicts: Any,
     project_state: Any,
+    evidence: Any,
+    procedures: Any,
+    projection_health: Any,
 ) -> dict[str, Any]:
     return _validate_contract(
         "surface_memory_response",
         SurfaceMemoryResponseContract,
         {
             "ok": True,
-            "assertions": assertions if isinstance(assertions, list) else [],
+            "schema_version": schema_version,
+            "active_assertions": active_assertions if isinstance(active_assertions, list) else [],
             "candidates": candidates if isinstance(candidates, list) else [],
             "conflicts": conflicts if isinstance(conflicts, list) else [],
             "project_state": project_state if isinstance(project_state, list) else [],
+            "evidence": evidence if isinstance(evidence, list) else [],
+            "procedures": procedures if isinstance(procedures, list) else [],
+            "projection_health": projection_health if isinstance(projection_health, dict) else {},
+        },
+    )
+
+
+def build_surface_memory_search_response(*, schema_version: Any, results: Any) -> dict[str, Any]:
+    return _validate_contract(
+        "surface_memory_search_response",
+        SurfaceMemorySearchResponseContract,
+        {
+            "ok": True,
+            "schema_version": schema_version,
+            "results": results if isinstance(results, list) else [],
         },
     )
 

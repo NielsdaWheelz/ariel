@@ -784,12 +784,17 @@ def test_single_active_session_and_ordered_turn_event_chain(postgres_url: str) -
             "evt.turn.started",
             "evt.model.started",
             "evt.model.completed",
+            "evt.memory.evidence_recorded",
+            "evt.memory.evidence_recorded",
+            "evt.memory.extraction_queued",
             "evt.assistant.emitted",
             "evt.turn.completed",
         ]
         for turn in turns:
             assert [event["event_type"] for event in turn["events"]] == expected_types
-            assert [event["sequence"] for event in turn["events"]] == [1, 2, 3, 4, 5]
+            assert [event["sequence"] for event in turn["events"]] == list(
+                range(1, len(expected_types) + 1)
+            )
 
         first_turn_ts = _parse_utc_rfc3339(turns[0]["created_at"])
         second_turn_ts = _parse_utc_rfc3339(turns[1]["created_at"])

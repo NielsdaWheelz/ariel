@@ -196,7 +196,7 @@ def test_s8_pr02_shared_content_capture_preserves_note_source_separation_and_obs
         memory_projection = client.get("/v1/memory")
         assert memory_projection.status_code == 200
         memory_payload = memory_projection.json()
-        assert memory_payload["assertions"] == []
+        assert memory_payload["active_assertions"] == []
         assert memory_payload["candidates"] == []
 
         event_types = _event_types(body["turn"])

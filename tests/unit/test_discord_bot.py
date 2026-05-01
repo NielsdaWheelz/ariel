@@ -962,23 +962,25 @@ def test_memory_command_fetches_memory_projection(monkeypatch: pytest.MonkeyPatc
                     200,
                     json={
                         "ok": True,
-                        "assertions": [
+                        "schema_version": "memory.sota.v1",
+                        "active_assertions": [
                             {
                                 "subject_key": "user:default",
                                 "predicate": "preference.notebook_style",
-                                "lifecycle_state": "active",
+                                "state": "active",
                                 "value": "short bullets",
-                            },
-                            {
-                                "subject_key": "user:default",
-                                "predicate": "profile.timezone",
-                                "lifecycle_state": "candidate",
-                                "value": "America/Los_Angeles",
                             },
                         ],
                         "candidates": [],
                         "conflicts": [],
                         "project_state": [],
+                        "evidence": [],
+                        "procedures": [],
+                        "projection_health": {
+                            "projection_version": "semantic-v2",
+                            "pending_jobs": 0,
+                            "failed_jobs": 0,
+                        },
                     },
                 )
             ]
