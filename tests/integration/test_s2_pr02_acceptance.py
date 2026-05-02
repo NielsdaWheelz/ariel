@@ -259,21 +259,14 @@ def test_s2_pr02_non_allowlisted_egress_is_blocked_with_user_visible_auditable_r
         session_id = _session_id(client)
         sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "egress deny"})
         assert sent.status_code == 200
-        approval_ref = _approval_ref(sent.json()["turn"])
-
-        approved = client.post(
-            "/v1/approvals",
-            json={"approval_ref": approval_ref, "decision": "approve", "actor_id": "user.local"},
-        )
-        assert approved.status_code == 200
-        body = approved.json()
-        _assert_surface_approval_response(body, expected_status="approved")
+        body = sent.json()
         assert "egress_destination_denied" in body["assistant"]["message"]
 
         timeline = client.get(f"/v1/sessions/{session_id}/events")
         assert timeline.status_code == 200
         latest_turn = timeline.json()["turns"][-1]
         latest_attempt = _surface_attempt(latest_turn)
+        assert latest_attempt["approval"]["status"] == "not_requested"
         assert latest_attempt["execution"]["status"] == "failed"
         assert "egress_destination_denied" in (latest_attempt["execution"]["error"] or "")
         failed_event = next(
@@ -284,7 +277,7 @@ def test_s2_pr02_non_allowlisted_egress_is_blocked_with_user_visible_auditable_r
         assert "egress_destination_denied" in failed_event["payload"]["error"]
 
 
-def test_s2_pr02_allowlisted_egress_executes_and_does_not_surface_internal_egress_metadata(
+def test_s2_pr02_allowlisted_generic_egress_fails_closed_without_connector(
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
@@ -315,12 +308,9 @@ def test_s2_pr02_allowlisted_egress_executes_and_does_not_surface_internal_egres
         timeline = client.get(f"/v1/sessions/{session_id}/events")
         assert timeline.status_code == 200
         latest_attempt = _surface_attempt(timeline.json()["turns"][-1])
-        assert latest_attempt["execution"]["status"] == "succeeded"
-        output = latest_attempt["execution"]["output"]
-        assert output is not None
-        assert output["status"] == "sent"
-        assert output["destination"] == "https://api.framework.local/notify"
-        assert "__egress__" not in output
+        assert latest_attempt["execution"]["status"] == "failed"
+        assert latest_attempt["execution"]["error"] == "egress_adapter_not_bound"
+        assert "__egress__" not in str(latest_attempt)
 
 
 def test_s2_pr02_pre_execution_guardrail_blocks_unsafe_input_before_side_effects(
@@ -340,14 +330,11 @@ def test_s2_pr02_pre_execution_guardrail_blocks_unsafe_input_before_side_effects
         session_id = _session_id(client)
         sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "unsafe write"})
         assert sent.status_code == 200
-        approval_ref = _approval_ref(sent.json()["turn"])
+        sent_attempt = _surface_attempt(sent.json()["turn"])
+        assert sent_attempt["approval"]["status"] == "not_requested"
+        assert sent_attempt["execution"]["status"] == "failed"
+        assert "guardrail_pre_input_blocked" in (sent_attempt["execution"]["error"] or "")
 
-        approved = client.post(
-            "/v1/approvals",
-            json={"approval_ref": approval_ref, "decision": "approve", "actor_id": "user.local"},
-        )
-        assert approved.status_code == 200
-        _assert_surface_approval_response(approved.json(), expected_status="approved")
         timeline = client.get(f"/v1/sessions/{session_id}/events")
         assert timeline.status_code == 200
         latest_attempt = _surface_attempt(timeline.json()["turns"][-1])

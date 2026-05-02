@@ -161,8 +161,10 @@ def _preflight_egress_requests(
     capability: CapabilityDefinition,
     normalized_input: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], str | None]:
-    requires_preflight = capability.declare_egress_intent is not None or bool(
-        capability.allowed_egress_destinations
+    requires_preflight = (
+        capability.impact_level == "external_send"
+        or capability.declare_egress_intent is not None
+        or bool(capability.allowed_egress_destinations)
     )
     if not requires_preflight:
         return [], None
@@ -188,10 +190,28 @@ def _preflight_egress_requests(
     return egress_requests, None
 
 
+def preflight_capability_execution(
+    *,
+    capability: CapabilityDefinition,
+    normalized_input: dict[str, Any],
+) -> str | None:
+    pre_guardrail_error = _pre_execution_guardrail_error(
+        capability=capability,
+        normalized_input=normalized_input,
+    )
+    if pre_guardrail_error is not None:
+        return pre_guardrail_error
+
+    _, egress_preflight_error = _preflight_egress_requests(
+        capability=capability,
+        normalized_input=normalized_input,
+    )
+    return egress_preflight_error
+
+
 def _dispatch_egress_request(*, destination: str, payload: dict[str, Any]) -> str | None:
-    # Centralized outbound dispatch boundary for external side effects.
     del destination, payload
-    return None
+    return "egress_adapter_not_bound"
 
 
 def _dispatch_egress_requests(*, egress_requests: list[dict[str, Any]]) -> str | None:

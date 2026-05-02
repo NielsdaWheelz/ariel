@@ -9,8 +9,14 @@ import ulid
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from .action_runtime import reconcile_expired_approvals_for_session
+from .action_runtime import process_action_execution_task, reconcile_expired_approvals_for_session
+from .agency_daemon import AgencyDaemonClient, AgencyRuntime
 from .config import AppSettings
+from .google_connector import (
+    DefaultGoogleOAuthClient,
+    DefaultGoogleWorkspaceProvider,
+    GoogleConnectorRuntime,
+)
 from .persistence import (
     ActionProposalRecord,
     AgencyEventRecord,
@@ -120,6 +126,36 @@ def reap_stale_tasks(db: Session, *, now: datetime, heartbeat_timeout_seconds: i
     return len(stale_tasks)
 
 
+def _google_runtime(settings: AppSettings) -> GoogleConnectorRuntime:
+    return GoogleConnectorRuntime(
+        oauth_client=DefaultGoogleOAuthClient(
+            client_id=settings.google_oauth_client_id,
+            client_secret=settings.google_oauth_client_secret,
+            timeout_seconds=settings.google_oauth_timeout_seconds,
+        ),
+        workspace_provider=DefaultGoogleWorkspaceProvider(),
+        redirect_uri=settings.google_oauth_redirect_uri,
+        oauth_state_ttl_seconds=settings.google_oauth_state_ttl_seconds,
+        encryption_secret=settings.connector_encryption_secret,
+        encryption_key_version=settings.connector_encryption_key_version,
+        encryption_keys=settings.connector_encryption_keys,
+    )
+
+
+def _agency_runtime(settings: AppSettings) -> AgencyRuntime:
+    return AgencyRuntime(
+        client=AgencyDaemonClient(
+            socket_path=settings.agency_socket_path,
+            timeout_seconds=settings.agency_timeout_seconds,
+        ),
+        allowed_repo_roots=tuple(
+            root.strip() for root in settings.agency_allowed_repo_roots.split(",") if root.strip()
+        ),
+        default_base_branch=settings.agency_default_base_branch,
+        default_runner=settings.agency_default_runner,
+    )
+
+
 def process_one_task(
     *,
     session_factory: sessionmaker[Session],
@@ -166,6 +202,18 @@ def process_one_task(
                     session_factory=session_factory,
                     task_payload=task_payload,
                     settings=resolved_settings,
+                )
+            case "execute_action_attempt":
+                action_attempt_id = _payload_text(task_payload, "action_attempt_id")
+                if action_attempt_id is None:
+                    raise RuntimeError("execute_action_attempt task missing action_attempt_id")
+                process_action_execution_task(
+                    session_factory=session_factory,
+                    action_attempt_id=action_attempt_id,
+                    google_runtime=_google_runtime(resolved_settings),
+                    agency_runtime=_agency_runtime(resolved_settings),
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
                 )
             case "expire_approvals":
                 _expire_approvals(session_factory=session_factory, task_payload=task_payload)

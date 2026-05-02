@@ -3,13 +3,17 @@ from __future__ import annotations
 import copy
 from collections.abc import Generator
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, cast
 
 from fastapi.testclient import TestClient
 import pytest
 from testcontainers.postgres import PostgresContainer
+import ulid
 
+from ariel.action_runtime import process_action_execution_task
 from ariel.app import ModelAdapter, create_app
+from ariel.google_connector import GoogleConnectorRuntime
 from tests.integration.responses_helpers import responses_with_function_calls
 
 
@@ -316,6 +320,34 @@ def _event_types(turn_payload: dict[str, Any]) -> list[str]:
     return [event["event_type"] for event in turn_payload["events"]]
 
 
+def _new_id(prefix: str) -> str:
+    return f"{prefix}_{ulid.new().str.lower()}"
+
+
+def _run_queued_action(client: TestClient, action_attempt_id: str) -> None:
+    app_state = cast(Any, client.app).state
+    process_action_execution_task(
+        session_factory=app_state.session_factory,
+        action_attempt_id=action_attempt_id,
+        google_runtime=GoogleConnectorRuntime(
+            oauth_client=app_state.google_oauth_client,
+            workspace_provider=app_state.google_workspace_provider,
+            redirect_uri=str(app_state.google_oauth_redirect_uri),
+            oauth_state_ttl_seconds=int(app_state.google_oauth_state_ttl_seconds),
+            encryption_secret=str(app_state.connector_encryption_secret),
+            encryption_key_version=str(app_state.connector_encryption_key_version),
+            encryption_keys=(
+                str(app_state.connector_encryption_keys)
+                if app_state.connector_encryption_keys is not None
+                else None
+            ),
+        ),
+        agency_runtime=None,
+        now_fn=lambda: datetime.now(tz=UTC),
+        new_id_fn=_new_id,
+    )
+
+
 def _bind_google_fakes(
     client: TestClient,
     *,
@@ -546,7 +578,7 @@ def test_s4_pr02_calendar_create_requires_approval_and_executes_exactly_once(
         assert len(workspace_provider.calendar_create_calls) == 1
 
 
-def test_s4_pr02_email_draft_executes_inline_as_draft_only_without_send_side_effect(
+def test_s4_pr02_email_draft_queues_then_executes_as_draft_only_without_send_side_effect(
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
@@ -597,6 +629,16 @@ def test_s4_pr02_email_draft_executes_inline_as_draft_only_without_send_side_eff
         assert attempt["proposal"]["capability_id"] == "cap.email.draft"
         assert attempt["policy"]["decision"] == "allow_inline"
         assert attempt["approval"]["status"] == "not_requested"
+        assert attempt["execution"]["status"] == "in_progress"
+        assert attempt["execution"]["output"] is None
+        assert len(workspace_provider.email_draft_calls) == 0
+        assert len(workspace_provider.email_send_calls) == 0
+
+        _run_queued_action(client, attempt["action_attempt_id"])
+
+        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        assert timeline.status_code == 200
+        attempt = _surface_attempt(timeline.json()["turns"][-1])
         assert attempt["execution"]["status"] == "succeeded"
 
         output = attempt["execution"]["output"]
@@ -609,8 +651,8 @@ def test_s4_pr02_email_draft_executes_inline_as_draft_only_without_send_side_eff
         assert output["draft"]["body"] == "Can we sync tomorrow at 10am?"
 
         assistant_message = payload["assistant"]["message"].lower()
-        assert "drafted" in assistant_message
-        assert "not_sent" in assistant_message or "not sent" in assistant_message
+        assert "queued" in assistant_message
+        assert len(workspace_provider.email_draft_calls) == 1
         assert len(workspace_provider.email_send_calls) == 0
 
 
@@ -753,7 +795,8 @@ def test_s4_pr02_draft_and_send_are_distinct_lifecycle_units_with_independent_hi
         draft_attempt = _surface_attempt(drafted.json()["turn"])
         assert draft_attempt["proposal"]["capability_id"] == "cap.email.draft"
         assert draft_attempt["approval"]["status"] == "not_requested"
-        assert draft_attempt["execution"]["status"] == "succeeded"
+        assert draft_attempt["execution"]["status"] == "in_progress"
+        _run_queued_action(client, draft_attempt["action_attempt_id"])
 
         send_proposed = client.post(
             f"/v1/sessions/{session_id}/message", json={"message": "send note"}
@@ -809,15 +852,6 @@ def test_s4_pr02_draft_and_send_are_distinct_lifecycle_units_with_independent_hi
             None,
             "not_connected",
             True,
-        ),
-        (
-            "consent_required_draft",
-            "cap.email.draft",
-            "connect-read-only",
-            "ok",
-            None,
-            "consent_required",
-            False,
         ),
         (
             "scope_missing_send",

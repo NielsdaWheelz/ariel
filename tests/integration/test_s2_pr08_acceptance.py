@@ -107,17 +107,10 @@ def _patch_external_notify_capability_lookup(
     monkeypatch.setattr(action_runtime_module, "get_capability", patched_get_capability)
 
 
-def test_s2_pr08_allowlisted_path_dispatches_once_and_keeps_surface_contract_clean(
+def test_s2_pr08_allowlisted_generic_external_send_fails_closed_without_connector(
     postgres_url: str,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dispatch_attempts: list[dict[str, Any]] = []
-
-    def fake_dispatch(*, destination: str, payload: dict[str, Any]) -> str | None:
-        dispatch_attempts.append({"destination": destination, "payload": payload})
-        return None
-
-    monkeypatch.setattr("ariel.executor._dispatch_egress_request", fake_dispatch, raising=False)
 
     adapter = ActionProposalAdapter(
         proposals_by_message={
@@ -152,22 +145,15 @@ def test_s2_pr08_allowlisted_path_dispatches_once_and_keeps_surface_contract_cle
         latest_turn = timeline.json()["turns"][-1]
         attempt = _surface_attempt(latest_turn)
 
-        assert attempt["execution"]["status"] == "succeeded"
-        assert attempt["execution"]["output"]["status"] == "sent"
-        assert attempt["execution"]["output"]["destination"] == "https://api.framework.local/notify"
-        assert attempt["execution"]["output"]["message"] == "safe payload"
+        assert attempt["execution"]["status"] == "failed"
+        assert attempt["execution"]["error"] == "egress_adapter_not_bound"
         assert "__egress__" not in str(attempt)
-
-        assert len(dispatch_attempts) == 1
-        assert dispatch_attempts[0] == {
-            "destination": "https://api.framework.local/notify",
-            "payload": {"message": "safe payload"},
-        }
+        assert dispatch_attempts == []
 
         event_types = _event_types(latest_turn)
         assert event_types.count("evt.action.execution.started") == 1
-        assert event_types.count("evt.action.execution.succeeded") == 1
-        assert "evt.action.execution.failed" not in event_types
+        assert event_types.count("evt.action.execution.failed") == 1
+        assert "evt.action.execution.succeeded" not in event_types
 
 
 def test_s2_pr08_non_allowlisted_preflight_denies_before_capability_execution(
@@ -213,14 +199,7 @@ def test_s2_pr08_non_allowlisted_preflight_denies_before_capability_execution(
         session_id = _session_id(client)
         sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "deny outbound"})
         assert sent.status_code == 200
-        approval_ref = _approval_ref(sent.json()["turn"])
-
-        approved = client.post(
-            "/v1/approvals",
-            json={"approval_ref": approval_ref, "decision": "approve"},
-        )
-        assert approved.status_code == 200
-        assert "egress_destination_denied" in approved.json()["assistant"]["message"]
+        assert "egress_destination_denied" in sent.json()["assistant"]["message"]
 
         timeline = client.get(f"/v1/sessions/{session_id}/events")
         assert timeline.status_code == 200
@@ -229,12 +208,13 @@ def test_s2_pr08_non_allowlisted_preflight_denies_before_capability_execution(
 
         assert attempt["execution"]["status"] == "failed"
         assert "egress_destination_denied" in (attempt["execution"]["error"] or "")
+        assert attempt["approval"]["status"] == "not_requested"
         assert capability_execute_attempts == 0
         assert dispatch_attempts == []
 
         event_types = _event_types(latest_turn)
-        assert event_types.count("evt.action.execution.started") == 1
         assert event_types.count("evt.action.execution.failed") == 1
+        assert "evt.action.execution.started" not in event_types
         assert "evt.action.execution.succeeded" not in event_types
 
 
@@ -325,14 +305,7 @@ def test_s2_pr08_missing_malformed_or_undeclared_intent_fails_closed_before_disp
         session_id = _session_id(client)
         sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "intent failure"})
         assert sent.status_code == 200
-        approval_ref = _approval_ref(sent.json()["turn"])
-
-        approved = client.post(
-            "/v1/approvals",
-            json={"approval_ref": approval_ref, "decision": "approve"},
-        )
-        assert approved.status_code == 200
-        assert expected_error in approved.json()["assistant"]["message"]
+        assert expected_error in sent.json()["assistant"]["message"]
 
         timeline = client.get(f"/v1/sessions/{session_id}/events")
         assert timeline.status_code == 200
@@ -340,6 +313,7 @@ def test_s2_pr08_missing_malformed_or_undeclared_intent_fails_closed_before_disp
         attempt = _surface_attempt(latest_turn)
         assert attempt["execution"]["status"] == "failed"
         assert expected_error in (attempt["execution"]["error"] or "")
+        assert attempt["approval"]["status"] == "not_requested"
 
         failed_event = next(
             event
@@ -404,5 +378,5 @@ def test_s2_pr08_preflight_allow_does_not_dispatch_when_execution_fails(
         latest_turn = timeline.json()["turns"][-1]
         attempt = _surface_attempt(latest_turn)
         assert attempt["execution"]["status"] == "failed"
-        assert isinstance(attempt["execution"]["error"], str)
+        assert attempt["execution"]["error"] == "egress_adapter_not_bound"
         assert dispatch_attempts == []

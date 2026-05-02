@@ -265,11 +265,8 @@ def test_s2_pr04_approval_approved_execution_success_is_surface_inspectable_and_
         proposals_by_message={
             "approve success": [
                 {
-                    "capability_id": "cap.framework.external_notify",
-                    "input": {
-                        "destination": "https://api.framework.local/notify",
-                        "message": "notify sk-live-approved-secret",
-                    },
+                    "capability_id": "cap.framework.write_note",
+                    "input": {"note": "notify sk-live-approved-secret"},
                 }
             ]
         }
@@ -296,9 +293,8 @@ def test_s2_pr04_approval_approved_execution_success_is_surface_inspectable_and_
         assert item["policy"]["reason"] == "approval_required"
         assert item["approval"]["status"] == "approved"
         assert item["execution"]["status"] == "succeeded"
-        assert item["execution"]["output"]["status"] == "sent"
-        assert item["execution"]["output"]["destination"] == "https://api.framework.local/notify"
-        assert item["execution"]["output"]["message"] == "notify [REDACTED]"
+        assert item["execution"]["output"]["status"] == "recorded"
+        assert item["execution"]["output"]["note"] == "notify [REDACTED]"
         assert "__egress__" not in str(item)
         _assert_redacted(item)
 
@@ -323,21 +319,18 @@ def test_s2_pr04_approval_approved_execution_failure_is_surface_inspectable(
         session_id = _session_id(client)
         sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "approve fail"})
         assert sent.status_code == 200
-        approval_ref = _approval_ref(sent.json()["turn"])
-
-        approved = client.post(
-            "/v1/approvals",
-            json={"approval_ref": approval_ref, "decision": "approve", "actor_id": "user.local"},
-        )
-        assert approved.status_code == 200
-        _assert_surface_approval_response(approved.json(), expected_status="approved")
+        sent_item = _surface_attempt(sent.json()["turn"])
+        assert sent_item["approval"]["status"] == "not_requested"
+        assert sent_item["execution"]["status"] == "failed"
+        assert isinstance(sent_item["execution"]["error"], str)
+        assert "egress_destination_denied" in sent_item["execution"]["error"]
 
         timeline = client.get(f"/v1/sessions/{session_id}/events")
         assert timeline.status_code == 200
         item = _surface_attempt(timeline.json()["turns"][-1])
-        assert item["policy"]["decision"] == "requires_approval"
-        assert item["policy"]["reason"] == "approval_required"
-        assert item["approval"]["status"] == "approved"
+        assert item["policy"]["decision"] == "deny"
+        assert item["policy"]["reason"] == "egress_destination_denied:evil.example"
+        assert item["approval"]["status"] == "not_requested"
         assert item["execution"]["status"] == "failed"
         assert isinstance(item["execution"]["error"], str)
         assert "egress_destination_denied" in item["execution"]["error"]

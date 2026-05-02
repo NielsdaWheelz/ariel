@@ -294,6 +294,7 @@ class SurfaceEventActionExecutionStartedPayloadContract(BaseModel):
 
     action_attempt_id: str
     capability_id: str
+    task_id: str | None = None
 
 
 class SurfaceEventActionExecutionSucceededPayloadContract(BaseModel):

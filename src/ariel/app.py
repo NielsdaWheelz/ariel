@@ -33,6 +33,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from ariel.action_runtime import (
     ActionRuntimeError,
     RuntimeProvenance,
+    approval_execution_failure_message,
+    process_action_execution_task,
     process_response_function_calls,
     reconcile_expired_approvals_for_session,
     resolve_approval_decision,
@@ -4042,6 +4044,7 @@ def create_app(
         payload: ApprovalDecisionRequest,
     ) -> JSONResponse | dict[str, Any]:
         _ensure_schema_ready()
+        decision_result = None
         with session_factory() as db:
             with db.begin():
                 try:
@@ -4054,8 +4057,6 @@ def create_app(
                         reason=payload.reason,
                         now_fn=_utcnow,
                         new_id_fn=_new_id,
-                        google_runtime=_google_runtime(),
-                        agency_runtime=_agency_runtime(),
                     )
                 except ActionRuntimeError as exc:
                     return _error_response(
@@ -4067,6 +4068,49 @@ def create_app(
                             retryable=exc.retryable,
                         )
                     )
+
+        assert decision_result is not None
+        if payload.decision == "approve" and decision_result.action_attempt.status == "executing":
+            process_action_execution_task(
+                session_factory=session_factory,
+                action_attempt_id=decision_result.action_attempt.id,
+                google_runtime=_google_runtime(),
+                agency_runtime=_agency_runtime(),
+                now_fn=_utcnow,
+                new_id_fn=_new_id,
+            )
+            with session_factory() as db:
+                with db.begin():
+                    refreshed_approval = db.scalar(
+                        select(ApprovalRequestRecord)
+                        .where(ApprovalRequestRecord.id == decision_result.approval.id)
+                        .limit(1)
+                    )
+                    refreshed_attempt = db.scalar(
+                        select(ActionAttemptRecord)
+                        .where(ActionAttemptRecord.id == decision_result.action_attempt.id)
+                        .limit(1)
+                    )
+                    if refreshed_approval is not None:
+                        decision_result.approval = refreshed_approval
+                    if refreshed_attempt is not None:
+                        decision_result.action_attempt = refreshed_attempt
+            if decision_result.action_attempt.status == "succeeded":
+                decision_result.assistant_message = "approved action executed successfully."
+            elif decision_result.action_attempt.status == "failed":
+                decision_result.assistant_message = approval_execution_failure_message(
+                    decision_result.action_attempt.execution_error or "execution_failed"
+                )
+
+        with session_factory() as db:
+            with db.begin():
+                approval_record = db.scalar(
+                    select(ApprovalRequestRecord)
+                    .where(ApprovalRequestRecord.id == decision_result.approval.id)
+                    .limit(1)
+                )
+                if approval_record is not None:
+                    decision_result.approval = approval_record
 
                 raw_approval = {
                     "reference": decision_result.approval.id,

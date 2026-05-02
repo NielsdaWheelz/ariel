@@ -3,13 +3,17 @@ from __future__ import annotations
 import copy
 from collections.abc import Generator
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, cast
 
 from fastapi.testclient import TestClient
 import pytest
 from testcontainers.postgres import PostgresContainer
+import ulid
 
+from ariel.action_runtime import process_action_execution_task
 from ariel.app import ModelAdapter, create_app
+from ariel.google_connector import GoogleConnectorRuntime
 from tests.integration.responses_helpers import responses_with_function_calls
 
 
@@ -312,6 +316,34 @@ def _surface_attempt(turn_payload: dict[str, Any], *, proposal_index: int = 1) -
     return item
 
 
+def _new_id(prefix: str) -> str:
+    return f"{prefix}_{ulid.new().str.lower()}"
+
+
+def _run_queued_action(client: TestClient, action_attempt_id: str) -> None:
+    app_state = cast(Any, client.app).state
+    process_action_execution_task(
+        session_factory=app_state.session_factory,
+        action_attempt_id=action_attempt_id,
+        google_runtime=GoogleConnectorRuntime(
+            oauth_client=app_state.google_oauth_client,
+            workspace_provider=app_state.google_workspace_provider,
+            redirect_uri=str(app_state.google_oauth_redirect_uri),
+            oauth_state_ttl_seconds=int(app_state.google_oauth_state_ttl_seconds),
+            encryption_secret=str(app_state.connector_encryption_secret),
+            encryption_key_version=str(app_state.connector_encryption_key_version),
+            encryption_keys=(
+                str(app_state.connector_encryption_keys)
+                if app_state.connector_encryption_keys is not None
+                else None
+            ),
+        ),
+        agency_runtime=None,
+        now_fn=lambda: datetime.now(tz=UTC),
+        new_id_fn=_new_id,
+    )
+
+
 def _connect_google(client: TestClient, *, code: str) -> dict[str, Any]:
     started = client.post("/v1/connectors/google/start")
     assert started.status_code == 200
@@ -407,6 +439,12 @@ def test_s4_pr03_blocking_auth_failures_remap_readiness_to_reconnect_required(
         )
         assert sent.status_code == 200
         attempt = _surface_attempt(sent.json()["turn"])
+        assert attempt["execution"]["status"] == "in_progress"
+        _run_queued_action(client, attempt["action_attempt_id"])
+
+        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        assert timeline.status_code == 200
+        attempt = _surface_attempt(timeline.json()["turns"][-1])
         assert attempt["execution"]["status"] == "failed"
         assert attempt["execution"]["error"] == expected_failure
 
@@ -523,6 +561,12 @@ def test_s4_pr03_reconnect_required_persists_until_successful_reconnect(
         )
         assert first.status_code == 200
         first_attempt = _surface_attempt(first.json()["turn"])
+        assert first_attempt["execution"]["status"] == "in_progress"
+        _run_queued_action(client, first_attempt["action_attempt_id"])
+
+        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        assert timeline.status_code == 200
+        first_attempt = _surface_attempt(timeline.json()["turns"][-1])
         assert first_attempt["execution"]["error"] == "consent_required"
 
         blocked_status = client.get("/v1/connectors/google")
@@ -615,6 +659,12 @@ def test_s4_pr03_blocking_readiness_state_is_not_downgraded_by_later_transient_f
         )
         assert blocking_failure.status_code == 200
         blocking_attempt = _surface_attempt(blocking_failure.json()["turn"])
+        assert blocking_attempt["execution"]["status"] == "in_progress"
+        _run_queued_action(client, blocking_attempt["action_attempt_id"])
+
+        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        assert timeline.status_code == 200
+        blocking_attempt = _surface_attempt(timeline.json()["turns"][-1])
         assert blocking_attempt["execution"]["error"] == "consent_required"
 
         transient_failure = client.post(

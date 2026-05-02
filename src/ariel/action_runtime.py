@@ -9,7 +9,7 @@ from typing import Any, Literal
 
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy import select, text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from ariel.attachment_content import AttachmentContentRuntime
 from ariel.capability_registry import (
@@ -29,6 +29,7 @@ from ariel.executor import (
     build_assistant_action_appendix,
     execute_capability,
     next_turn_event_sequence,
+    preflight_capability_execution,
 )
 from ariel.google_connector import (
     GOOGLE_CAPABILITY_IDS,
@@ -41,6 +42,7 @@ from ariel.persistence import (
     ActionAttemptRecord,
     ApprovalRequestRecord,
     ArtifactRecord,
+    BackgroundTaskRecord,
     TurnRecord,
     to_rfc3339,
 )
@@ -132,6 +134,100 @@ def _acquire_side_effect_execution_lock(
         text("SELECT pg_advisory_xact_lock(:lock_id)"),
         {"lock_id": _SIDE_EFFECT_EXECUTION_LOCK_ID},
     )
+
+
+def _enqueue_action_execution_task(
+    *,
+    db: Session,
+    action_attempt: ActionAttemptRecord,
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> BackgroundTaskRecord:
+    now = now_fn()
+    task = BackgroundTaskRecord(
+        id=new_id_fn("tsk"),
+        task_type="execute_action_attempt",
+        payload={"action_attempt_id": action_attempt.id},
+        status="pending",
+        attempts=0,
+        max_attempts=3,
+        error=None,
+        claimed_by=None,
+        run_after=now,
+        last_heartbeat=None,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(task)
+    db.flush()
+    return task
+
+
+def _append_action_execution_event(
+    *,
+    db: Session,
+    action_attempt: ActionAttemptRecord,
+    event_type: str,
+    payload_data: dict[str, Any],
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> None:
+    append_turn_event(
+        db=db,
+        session_id=action_attempt.session_id,
+        turn_id=action_attempt.turn_id,
+        sequence=next_turn_event_sequence(db=db, turn_id=action_attempt.turn_id),
+        event_type=event_type,
+        payload_data=payload_data,
+        new_id_fn=new_id_fn,
+        now_fn=now_fn,
+    )
+
+
+def _fail_action_execution(
+    *,
+    db: Session,
+    action_attempt: ActionAttemptRecord,
+    error: str,
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> None:
+    action_attempt.status = "failed"
+    action_attempt.execution_output = None
+    action_attempt.execution_error = error
+    action_attempt.updated_at = now_fn()
+    approval = db.scalar(
+        select(ApprovalRequestRecord)
+        .where(ApprovalRequestRecord.action_attempt_id == action_attempt.id)
+        .limit(1)
+    )
+    _append_action_execution_event(
+        db=db,
+        action_attempt=action_attempt,
+        event_type="evt.action.execution.failed",
+        payload_data={
+            "action_attempt_id": action_attempt.id,
+            "error": error,
+            "approval_ref": approval.id if approval is not None else None,
+        },
+        now_fn=now_fn,
+        new_id_fn=new_id_fn,
+    )
+
+
+def approval_execution_failure_message(error: str) -> str:
+    failure_reason = error.strip() or "execution_failed"
+    if failure_reason.startswith("integrity_mismatch"):
+        failure_reason = failure_reason.replace("integrity_mismatch", "integrity mismatch", 1)
+
+    recovery = _TYPED_AUTH_RECOVERY.get(failure_reason)
+    if recovery is None:
+        recovery = _TYPED_PROVIDER_RECOVERY.get(failure_reason)
+
+    message = f"approval recorded, but action execution failed: {failure_reason}"
+    if recovery is not None:
+        return f"{message}. {recovery}"
+    return message
 
 
 def _model_declared_taint_status(proposal_payload: dict[str, Any]) -> ModelDeclaredTaintStatus:
@@ -1148,6 +1244,75 @@ def process_response_function_calls(
             continue
 
         if evaluation.decision == "requires_approval":
+            if evaluation.capability is None or evaluation.normalized_input is None:
+                action_attempt.status = "rejected"
+                action_attempt.policy_decision = "deny"
+                action_attempt.policy_reason = "policy_invariant_violation"
+                action_attempt.updated_at = now_fn()
+                blocked_reasons.append(f"{capability_id}: policy_invariant_violation")
+                if call_id:
+                    function_call_outputs.append(
+                        _response_function_call_output(
+                            call_id=call_id,
+                            payload={
+                                "status": "blocked",
+                                "capability_id": capability_id,
+                                "reason": "policy_invariant_violation",
+                            },
+                        )
+                    )
+                add_event(
+                    "evt.action.policy_decided",
+                    {
+                        "action_attempt_id": action_attempt.id,
+                        "decision": "deny",
+                        "reason": "policy_invariant_violation",
+                        "taint": taint_payload,
+                    },
+                )
+                continue
+
+            preflight_error = preflight_capability_execution(
+                capability=evaluation.capability,
+                normalized_input=evaluation.normalized_input,
+            )
+            if preflight_error is not None:
+                action_attempt.status = "failed"
+                action_attempt.policy_decision = "deny"
+                action_attempt.policy_reason = preflight_error
+                action_attempt.execution_error = preflight_error
+                action_attempt.updated_at = now_fn()
+                blocked_reasons.append(f"{capability_id}: {preflight_error}")
+                if call_id:
+                    function_call_outputs.append(
+                        _response_function_call_output(
+                            call_id=call_id,
+                            payload={
+                                "status": "failed",
+                                "capability_id": capability_id,
+                                "error": preflight_error,
+                            },
+                        )
+                    )
+                add_event(
+                    "evt.action.policy_decided",
+                    {
+                        "action_attempt_id": action_attempt.id,
+                        "decision": "deny",
+                        "reason": preflight_error,
+                        "taint": taint_payload,
+                    },
+                )
+                add_event(
+                    "evt.action.execution.failed",
+                    {
+                        "action_attempt_id": action_attempt.id,
+                        "error": preflight_error,
+                        "approval_ref": None,
+                    },
+                )
+                continue
+
             action_attempt.status = "awaiting_approval"
             action_attempt.policy_decision = "requires_approval"
             action_attempt.policy_reason = evaluation.reason
@@ -1288,6 +1453,69 @@ def process_response_function_calls(
             )
             if is_retrieval_call:
                 retrieval_errors.append(integrity_error)
+            continue
+
+        preflight_error = preflight_capability_execution(
+            capability=evaluation.capability,
+            normalized_input=evaluation.normalized_input,
+        )
+        if preflight_error is not None:
+            action_attempt.execution_output = None
+            action_attempt.execution_error = preflight_error
+            action_attempt.status = "failed"
+            action_attempt.policy_reason = preflight_error
+            action_attempt.updated_at = now_fn()
+            blocked_reasons.append(f"{capability_id}: {preflight_error}")
+            if call_id:
+                function_call_outputs.append(
+                    _response_function_call_output(
+                        call_id=call_id,
+                        payload={
+                            "status": "failed",
+                            "capability_id": capability_id,
+                            "error": preflight_error,
+                        },
+                    )
+                )
+            add_event(
+                "evt.action.execution.failed",
+                {
+                    "action_attempt_id": action_attempt.id,
+                    "error": preflight_error,
+                },
+            )
+            if is_retrieval_call:
+                retrieval_errors.append(preflight_error)
+            continue
+
+        if evaluation.capability.impact_level != "read":
+            task = _enqueue_action_execution_task(
+                db=db,
+                action_attempt=action_attempt,
+                now_fn=now_fn,
+                new_id_fn=new_id_fn,
+            )
+            add_event(
+                "evt.action.execution.started",
+                {
+                    "action_attempt_id": action_attempt.id,
+                    "capability_id": capability_id,
+                    "task_id": task.id,
+                },
+            )
+            queued_output = {"status": "queued", "task_id": task.id}
+            inline_results.append({"capability_id": capability_id, "output": queued_output})
+            if call_id:
+                function_call_outputs.append(
+                    _response_function_call_output(
+                        call_id=call_id,
+                        payload={
+                            "status": "queued",
+                            "capability_id": capability_id,
+                            "task_id": task.id,
+                        },
+                    )
+                )
             continue
 
         add_event(
@@ -1688,8 +1916,6 @@ def resolve_approval_decision(
     reason: str | None,
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
-    google_runtime: GoogleConnectorRuntime | None = None,
-    agency_runtime: Any | None = None,
 ) -> ApprovalDecisionResult:
     approval = db.scalar(
         select(ApprovalRequestRecord)
@@ -1853,17 +2079,6 @@ def resolve_approval_decision(
         },
     )
 
-    action_attempt.status = "executing"
-    action_attempt.updated_at = now_fn()
-    add_approval_event(
-        "evt.action.execution.started",
-        {
-            "action_attempt_id": action_attempt.id,
-            "capability_id": action_attempt.capability_id,
-        },
-    )
-
-    typed_recovery_hint: str | None = None
     capability = get_capability(action_attempt.capability_id)
     if capability is None:
         action_attempt.status = "failed"
@@ -1895,10 +2110,6 @@ def resolve_approval_decision(
                 },
             )
         else:
-            _acquire_side_effect_execution_lock(
-                db=db,
-                impact_level=action_attempt.impact_level,
-            )
             normalized_input, input_error = capability.validate_input(action_attempt.proposed_input)
             if input_error is not None or normalized_input is None:
                 action_attempt.status = "failed"
@@ -1913,140 +2124,375 @@ def resolve_approval_decision(
                     },
                 )
             else:
-                if (
-                    action_attempt.capability_id in GOOGLE_CAPABILITY_IDS
-                    and google_runtime is not None
-                ):
-                    google_execution_result = google_runtime.execute_capability(
-                        db=db,
-                        capability_id=action_attempt.capability_id,
-                        normalized_input=normalized_input,
-                        now_fn=now_fn,
-                        new_id_fn=new_id_fn,
+                preflight_error = preflight_capability_execution(
+                    capability=capability,
+                    normalized_input=normalized_input,
+                )
+                if preflight_error is not None:
+                    action_attempt.status = "failed"
+                    action_attempt.execution_error = preflight_error
+                    action_attempt.policy_reason = preflight_error
+                    action_attempt.updated_at = now_fn()
+                    add_approval_event(
+                        "evt.action.execution.failed",
+                        {
+                            "action_attempt_id": action_attempt.id,
+                            "error": preflight_error,
+                        },
                     )
-                    if (
-                        google_execution_result.status == "succeeded"
-                        and google_execution_result.output is not None
-                    ):
-                        action_attempt.status = "succeeded"
-                        action_attempt.execution_output = google_execution_result.output
-                        action_attempt.execution_error = None
-                        action_attempt.updated_at = now_fn()
-                        add_approval_event(
-                            "evt.action.execution.succeeded",
-                            {
-                                "action_attempt_id": action_attempt.id,
-                                "output": google_execution_result.output,
-                            },
-                        )
-                    else:
-                        action_attempt.status = "failed"
-                        action_attempt.execution_output = None
-                        action_attempt.execution_error = (
-                            google_execution_result.auth_failure.failure_class
-                            if google_execution_result.auth_failure is not None
-                            else (google_execution_result.error or "execution_output_missing")
-                        )
-                        if google_execution_result.auth_failure is not None:
-                            typed_recovery_hint = google_execution_result.auth_failure.recovery
-                        action_attempt.updated_at = now_fn()
-                        add_approval_event(
-                            "evt.action.execution.failed",
-                            {
-                                "action_attempt_id": action_attempt.id,
-                                "error": action_attempt.execution_error,
-                            },
-                        )
-                elif (
-                    action_attempt.capability_id in AGENCY_CAPABILITY_IDS
-                    and agency_runtime is not None
-                ):
-                    agency_execution_result = agency_runtime.execute_capability(
-                        db=db,
-                        capability_id=action_attempt.capability_id,
-                        normalized_input=normalized_input,
-                        action_attempt=action_attempt,
-                        session_id=action_attempt.session_id,
-                        turn_id=action_attempt.turn_id,
-                        now_fn=now_fn,
-                        new_id_fn=new_id_fn,
-                    )
-                    if (
-                        agency_execution_result.status == "succeeded"
-                        and agency_execution_result.output is not None
-                    ):
-                        action_attempt.status = "succeeded"
-                        action_attempt.execution_output = agency_execution_result.output
-                        action_attempt.execution_error = None
-                        action_attempt.updated_at = now_fn()
-                        add_approval_event(
-                            "evt.action.execution.succeeded",
-                            {
-                                "action_attempt_id": action_attempt.id,
-                                "output": agency_execution_result.output,
-                            },
-                        )
-                    else:
-                        action_attempt.status = "failed"
-                        action_attempt.execution_output = None
-                        action_attempt.execution_error = (
-                            agency_execution_result.error or "execution_output_missing"
-                        )
-                        action_attempt.updated_at = now_fn()
-                        add_approval_event(
-                            "evt.action.execution.failed",
-                            {
-                                "action_attempt_id": action_attempt.id,
-                                "error": action_attempt.execution_error,
-                            },
-                        )
                 else:
-                    execution_result = execute_capability(
-                        capability=capability,
-                        normalized_input=normalized_input,
+                    action_attempt.status = "executing"
+                    action_attempt.updated_at = now_fn()
+                    task = _enqueue_action_execution_task(
+                        db=db,
+                        action_attempt=action_attempt,
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
                     )
-                    if (
-                        execution_result.status == "succeeded"
-                        and execution_result.output is not None
-                    ):
-                        action_attempt.status = "succeeded"
-                        action_attempt.execution_output = execution_result.output
-                        action_attempt.execution_error = None
-                        action_attempt.updated_at = now_fn()
-                        add_approval_event(
-                            "evt.action.execution.succeeded",
-                            {
-                                "action_attempt_id": action_attempt.id,
-                                "output": execution_result.output,
-                            },
-                        )
-                    else:
-                        action_attempt.status = "failed"
-                        action_attempt.execution_output = None
-                        action_attempt.execution_error = (
-                            execution_result.error or "execution_output_missing"
-                        )
-                        action_attempt.updated_at = now_fn()
-                        add_approval_event(
-                            "evt.action.execution.failed",
-                            {
-                                "action_attempt_id": action_attempt.id,
-                                "error": action_attempt.execution_error,
-                            },
-                        )
+                    add_approval_event(
+                        "evt.action.execution.started",
+                        {
+                            "action_attempt_id": action_attempt.id,
+                            "capability_id": action_attempt.capability_id,
+                            "task_id": task.id,
+                        },
+                    )
 
     db.flush()
-    if action_attempt.status == "succeeded":
-        assistant_message = "approved action executed successfully."
+    if action_attempt.status == "executing":
+        assistant_message = "approval recorded. action execution queued."
+    elif action_attempt.status == "failed":
+        assistant_message = approval_execution_failure_message(
+            action_attempt.execution_error or "execution_failed"
+        )
     else:
-        failure_reason = action_attempt.execution_error or "execution_failed"
-        if failure_reason.startswith("integrity_mismatch"):
-            failure_reason = failure_reason.replace("integrity_mismatch", "integrity mismatch", 1)
-        assistant_message = f"approval recorded, but action execution failed: {failure_reason}"
-        if typed_recovery_hint is not None:
-            assistant_message = f"{assistant_message}. {typed_recovery_hint}"
+        assistant_message = "approval recorded."
     return ApprovalDecisionResult(
         approval=approval,
         action_attempt=action_attempt,
         assistant_message=assistant_message,
     )
+
+
+def process_action_execution_task(
+    *,
+    session_factory: sessionmaker[Session],
+    action_attempt_id: str,
+    google_runtime: GoogleConnectorRuntime | None,
+    agency_runtime: Any | None,
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> bool:
+    provider_call: tuple[str, dict[str, Any], str, set[str]] | None = None
+    agency_call: tuple[str, dict[str, Any], dict[str, Any]] | None = None
+    agency_result: tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]] | None = None
+    local_call: tuple[CapabilityDefinition, dict[str, Any]] | None = None
+    execution_result: ExecutionResult | GoogleCapabilityExecutionResult | None = None
+
+    with session_factory() as db:
+        with db.begin():
+            action_attempt = db.scalar(
+                select(ActionAttemptRecord)
+                .where(ActionAttemptRecord.id == action_attempt_id)
+                .with_for_update()
+                .limit(1)
+            )
+            if action_attempt is None:
+                raise RuntimeError("action attempt not found")
+            if action_attempt.status in {"succeeded", "failed", "rejected", "denied", "expired"}:
+                return False
+            if action_attempt.status != "executing":
+                _fail_action_execution(
+                    db=db,
+                    action_attempt=action_attempt,
+                    error="action_not_executable",
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
+                return True
+            if (
+                isinstance(action_attempt.execution_output, dict)
+                and action_attempt.execution_output.get("dispatch_state") == "provider_call_started"
+            ):
+                _fail_action_execution(
+                    db=db,
+                    action_attempt=action_attempt,
+                    error="provider_result_unknown",
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
+                return True
+
+            capability = get_capability(action_attempt.capability_id)
+            if capability is None:
+                _fail_action_execution(
+                    db=db,
+                    action_attempt=action_attempt,
+                    error="unknown_capability",
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
+                return True
+            integrity_error = _execution_integrity_error(
+                action_attempt=action_attempt,
+                capability=capability,
+            )
+            if integrity_error is not None:
+                _fail_action_execution(
+                    db=db,
+                    action_attempt=action_attempt,
+                    error=integrity_error,
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
+                return True
+            normalized_input, input_error = capability.validate_input(action_attempt.proposed_input)
+            if input_error is not None or normalized_input is None:
+                _fail_action_execution(
+                    db=db,
+                    action_attempt=action_attempt,
+                    error="schema_invalid",
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
+                return True
+            preflight_error = preflight_capability_execution(
+                capability=capability,
+                normalized_input=normalized_input,
+            )
+            if preflight_error is not None:
+                _fail_action_execution(
+                    db=db,
+                    action_attempt=action_attempt,
+                    error=preflight_error,
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
+                return True
+
+            if action_attempt.capability_id in GOOGLE_CAPABILITY_IDS:
+                if google_runtime is None:
+                    _fail_action_execution(
+                        db=db,
+                        action_attempt=action_attempt,
+                        error="google_runtime_not_bound",
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
+                    return True
+                access_token, granted_scopes, access_failure = (
+                    google_runtime.prepare_capability_access(
+                        db=db,
+                        capability_id=action_attempt.capability_id,
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
+                )
+                if access_failure is not None:
+                    _fail_action_execution(
+                        db=db,
+                        action_attempt=action_attempt,
+                        error=(
+                            access_failure.auth_failure.failure_class
+                            if access_failure.auth_failure is not None
+                            else (access_failure.error or "google_access_failed")
+                        ),
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
+                    return True
+                if access_token is None:
+                    _fail_action_execution(
+                        db=db,
+                        action_attempt=action_attempt,
+                        error="token_expired",
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
+                    return True
+                action_attempt.execution_output = {"dispatch_state": "provider_call_started"}
+                action_attempt.updated_at = now_fn()
+                provider_call = (
+                    action_attempt.capability_id,
+                    normalized_input,
+                    access_token,
+                    granted_scopes,
+                )
+            elif action_attempt.capability_id in AGENCY_CAPABILITY_IDS:
+                if agency_runtime is None:
+                    _fail_action_execution(
+                        db=db,
+                        action_attempt=action_attempt,
+                        error="agency_runtime_not_bound",
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
+                    return True
+                agency_context = {
+                    "action_attempt_id": action_attempt.id,
+                }
+                if action_attempt.capability_id == "cap.agency.request_pr":
+                    try:
+                        agency_context = agency_runtime.prepare_request_pr(
+                            db=db,
+                            input_payload=normalized_input,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        _fail_action_execution(
+                            db=db,
+                            action_attempt=action_attempt,
+                            error=str(exc) or "agency_prepare_failed",
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        return True
+                elif action_attempt.capability_id != "cap.agency.run":
+                    _fail_action_execution(
+                        db=db,
+                        action_attempt=action_attempt,
+                        error="unknown_agency_capability",
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
+                    return True
+                action_attempt.execution_output = {"dispatch_state": "provider_call_started"}
+                action_attempt.updated_at = now_fn()
+                agency_call = (action_attempt.capability_id, normalized_input, agency_context)
+            elif capability.impact_level == "external_send":
+                _fail_action_execution(
+                    db=db,
+                    action_attempt=action_attempt,
+                    error="egress_adapter_not_bound",
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
+                return True
+            else:
+                local_call = (capability, normalized_input)
+
+    if provider_call is not None:
+        capability_id, normalized_input, access_token, granted_scopes = provider_call
+        assert google_runtime is not None
+        execution_result = google_runtime.execute_provider_capability(
+            capability_id=capability_id,
+            normalized_input=normalized_input,
+            access_token=access_token,
+            granted_scopes=granted_scopes,
+        )
+    elif agency_call is not None:
+        capability_id, normalized_input, agency_context = agency_call
+        assert agency_runtime is not None
+        try:
+            if capability_id == "cap.agency.run":
+                result = agency_runtime.start_run(
+                    input_payload=normalized_input,
+                    action_attempt_id=agency_context["action_attempt_id"],
+                )
+            elif capability_id == "cap.agency.request_pr":
+                result = agency_runtime.request_pr(prepared=agency_context)
+            else:
+                execution_result = ExecutionResult(
+                    status="failed",
+                    output=None,
+                    error="unknown_agency_capability",
+                )
+                result = None
+        except Exception as exc:  # noqa: BLE001
+            execution_result = ExecutionResult(status="failed", output=None, error=str(exc))
+        else:
+            if result is not None:
+                agency_result = (capability_id, normalized_input, agency_context, result)
+                execution_result = ExecutionResult(status="succeeded", output={}, error=None)
+    elif local_call is not None:
+        capability, normalized_input = local_call
+        execution_result = execute_capability(
+            capability=capability,
+            normalized_input=normalized_input,
+        )
+    else:
+        return True
+    if execution_result is None:
+        execution_result = ExecutionResult(
+            status="failed",
+            output=None,
+            error="execution_result_missing",
+        )
+
+    with session_factory() as db:
+        with db.begin():
+            action_attempt = db.scalar(
+                select(ActionAttemptRecord)
+                .where(ActionAttemptRecord.id == action_attempt_id)
+                .with_for_update()
+                .limit(1)
+            )
+            if action_attempt is None:
+                raise RuntimeError("action attempt not found")
+            if action_attempt.status in {"succeeded", "failed", "rejected", "denied", "expired"}:
+                return False
+            if agency_result is not None:
+                capability_id, normalized_input, agency_context, result = agency_result
+                assert agency_runtime is not None
+                if capability_id == "cap.agency.run":
+                    execution_result = ExecutionResult(
+                        status="succeeded",
+                        output=agency_runtime.record_run_started(
+                            db=db,
+                            started=result,
+                            input_payload=normalized_input,
+                            action_attempt=action_attempt,
+                            session_id=action_attempt.session_id,
+                            turn_id=action_attempt.turn_id,
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        ),
+                        error=None,
+                    )
+                elif capability_id == "cap.agency.request_pr":
+                    execution_result = ExecutionResult(
+                        status="succeeded",
+                        output=agency_runtime.record_request_pr(
+                            db=db,
+                            prepared=agency_context,
+                            result=result,
+                            now_fn=now_fn,
+                        ),
+                        error=None,
+                    )
+            if execution_result.status == "succeeded" and execution_result.output is not None:
+                action_attempt.status = "succeeded"
+                action_attempt.execution_output = execution_result.output
+                action_attempt.execution_error = None
+                action_attempt.updated_at = now_fn()
+                _append_action_execution_event(
+                    db=db,
+                    action_attempt=action_attempt,
+                    event_type="evt.action.execution.succeeded",
+                    payload_data={
+                        "action_attempt_id": action_attempt.id,
+                        "output": execution_result.output,
+                    },
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
+            else:
+                error = execution_result.error or "execution_output_missing"
+                if (
+                    isinstance(execution_result, GoogleCapabilityExecutionResult)
+                    and execution_result.auth_failure is not None
+                ):
+                    error = execution_result.auth_failure.failure_class
+                    if google_runtime is not None:
+                        google_runtime.record_capability_failure(
+                            db=db,
+                            execution_result=execution_result,
+                            now_fn=now_fn,
+                        )
+                _fail_action_execution(
+                    db=db,
+                    action_attempt=action_attempt,
+                    error=error,
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
+    return True

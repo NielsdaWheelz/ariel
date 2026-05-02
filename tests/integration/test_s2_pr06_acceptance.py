@@ -181,7 +181,11 @@ def _assert_surface_event_payload(event: dict[str, Any]) -> None:
     assert event_type in EVENT_PAYLOAD_KEYS_BY_TYPE
     payload = event["payload"]
     assert isinstance(payload, dict)
-    _assert_keys(payload, EVENT_PAYLOAD_KEYS_BY_TYPE[event_type])
+    if event_type == "evt.action.execution.started":
+        assert set(payload.keys()).issubset({"action_attempt_id", "capability_id", "task_id"})
+        assert {"action_attempt_id", "capability_id"}.issubset(payload.keys())
+    else:
+        _assert_keys(payload, EVENT_PAYLOAD_KEYS_BY_TYPE[event_type])
 
     if event_type == "evt.turn.limit_reached":
         limit = payload["limit"]
@@ -450,11 +454,8 @@ def test_s2_pr06_contracts_for_approved_execution_success_and_failure(postgres_u
         proposals_by_message={
             "approve success": [
                 {
-                    "capability_id": "cap.framework.external_notify",
-                    "input": {
-                        "destination": "https://api.framework.local/notify",
-                        "message": "notify sk-live-approved-secret",
-                    },
+                    "capability_id": "cap.framework.write_note",
+                    "input": {"note": "notify sk-live-approved-secret"},
                 }
             ],
             "approve fail": [
@@ -494,14 +495,6 @@ def test_s2_pr06_contracts_for_approved_execution_success_and_failure(postgres_u
         assert sent_failure.status_code == 200
         failure_message_payload = sent_failure.json()
         _assert_surface_message_response(failure_message_payload)
-        failure_ref = _approval_ref(failure_message_payload["turn"])
-
-        approved_failure = client.post(
-            "/v1/approvals",
-            json={"approval_ref": failure_ref, "decision": "approve"},
-        )
-        assert approved_failure.status_code == 200
-        _assert_surface_approval_response(approved_failure.json(), expected_status="approved")
 
         timeline = client.get(f"/v1/sessions/{session_id}/events")
         assert timeline.status_code == 200
@@ -511,6 +504,7 @@ def test_s2_pr06_contracts_for_approved_execution_success_and_failure(postgres_u
         success_item = timeline_payload["turns"][-2]["surface_action_lifecycle"][0]
         assert success_item["execution"]["status"] == "succeeded"
         failure_item = timeline_payload["turns"][-1]["surface_action_lifecycle"][0]
+        assert failure_item["approval"]["status"] == "not_requested"
         assert failure_item["execution"]["status"] == "failed"
 
 

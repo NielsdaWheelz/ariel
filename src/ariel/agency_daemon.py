@@ -170,8 +170,12 @@ class AgencyRuntime:
             if capability_id == "cap.agency.run":
                 return ExecutionResult(
                     status="succeeded",
-                    output=self._run(
+                    output=self.record_run_started(
                         db=db,
+                        started=self.start_run(
+                            input_payload=normalized_input,
+                            action_attempt_id=action_attempt.id,
+                        ),
                         input_payload=normalized_input,
                         action_attempt=action_attempt,
                         session_id=session_id,
@@ -194,25 +198,26 @@ class AgencyRuntime:
                     error=None,
                 )
             if capability_id == "cap.agency.request_pr":
+                prepared_request = self.prepare_request_pr(db=db, input_payload=normalized_input)
                 return ExecutionResult(
                     status="succeeded",
-                    output=self._request_pr(db=db, input_payload=normalized_input, now_fn=now_fn),
+                    output=self.record_request_pr(
+                        db=db,
+                        prepared=prepared_request,
+                        result=self.request_pr(prepared=prepared_request),
+                        now_fn=now_fn,
+                    ),
                     error=None,
                 )
         except AgencyDaemonError as exc:
             return ExecutionResult(status="failed", output=None, error=str(exc))
         return ExecutionResult(status="failed", output=None, error="unknown_agency_capability")
 
-    def _run(
+    def start_run(
         self,
         *,
-        db: Session,
         input_payload: dict[str, Any],
-        action_attempt: ActionAttemptRecord,
-        session_id: str,
-        turn_id: str,
-        now_fn: Callable[[], datetime],
-        new_id_fn: Callable[[str], str],
+        action_attempt_id: str,
     ) -> dict[str, Any]:
         repo_root = self._allowed_repo_root(input_payload["repo_root"])
         response = self.client.task_start(
@@ -226,10 +231,29 @@ class AgencyRuntime:
                 "invocation_name": input_payload["name"],
                 "runner_args": input_payload.get("runner_args", []),
                 "env": input_payload.get("env", {}),
-                "client_request_id": action_attempt.id,
+                "client_request_id": action_attempt_id,
                 "no_include_untracked": input_payload.get("no_include_untracked", False),
             }
         )
+        return {"repo_root": repo_root, "response": response}
+
+    def record_run_started(
+        self,
+        *,
+        db: Session,
+        started: dict[str, Any],
+        input_payload: dict[str, Any],
+        action_attempt: ActionAttemptRecord,
+        session_id: str,
+        turn_id: str,
+        now_fn: Callable[[], datetime],
+        new_id_fn: Callable[[str], str],
+    ) -> dict[str, Any]:
+        repo_root = self._required_text(started, "repo_root")
+        response_raw = started.get("response")
+        if not isinstance(response_raw, dict):
+            raise AgencyDaemonError("agency daemon returned invalid task start")
+        response = response_raw
         task_id = self._required_text(response, "task_id")
         now = now_fn()
         job = db.scalar(
@@ -328,12 +352,11 @@ class AgencyRuntime:
             ),
         }
 
-    def _request_pr(
+    def prepare_request_pr(
         self,
         *,
         db: Session,
         input_payload: dict[str, Any],
-        now_fn: Callable[[], datetime],
     ) -> dict[str, Any]:
         job = self._job_for_input(db=db, input_payload=input_payload)
         if job is None:
@@ -347,6 +370,19 @@ class AgencyRuntime:
             raise AgencyDaemonError("agency worktree id is missing")
         if job.agency_repo_root is not None:
             self._allowed_repo_root(job.agency_repo_root)
+        return {
+            "job_id": job.id,
+            "repo_id": repo_id,
+            "invocation_id": invocation_id,
+            "worktree_id": worktree_id,
+            "allow_dirty": bool(input_payload.get("allow_dirty")),
+            "force_with_lease": bool(input_payload.get("force_with_lease")),
+        }
+
+    def request_pr(self, *, prepared: dict[str, Any]) -> dict[str, Any]:
+        repo_id = self._required_text(prepared, "repo_id")
+        invocation_id = self._required_text(prepared, "invocation_id")
+        worktree_id = self._required_text(prepared, "worktree_id")
         invocation = self.client.get_invocation(repo_id=repo_id, invocation_ref=invocation_id)
         land_response = None
         if invocation.get("landing_status") == "pending":
@@ -357,9 +393,32 @@ class AgencyRuntime:
         pr_response = self.client.worktree_pr_sync(
             repo_id=repo_id,
             worktree_ref=worktree_id,
-            allow_dirty=bool(input_payload.get("allow_dirty")),
-            force_with_lease=bool(input_payload.get("force_with_lease")),
+            allow_dirty=bool(prepared.get("allow_dirty")),
+            force_with_lease=bool(prepared.get("force_with_lease")),
         )
+        return {
+            "job_id": prepared["job_id"],
+            "land": land_response,
+            "pr": pr_response,
+        }
+
+    def record_request_pr(
+        self,
+        *,
+        db: Session,
+        prepared: dict[str, Any],
+        result: dict[str, Any],
+        now_fn: Callable[[], datetime],
+    ) -> dict[str, Any]:
+        job_id = self._required_text(prepared, "job_id")
+        job = db.scalar(select(JobRecord).where(JobRecord.id == job_id).with_for_update().limit(1))
+        if job is None:
+            raise AgencyDaemonError("agency job is not tracked")
+        land_response = result.get("land")
+        pr_response_raw = result.get("pr")
+        if not isinstance(pr_response_raw, dict):
+            raise AgencyDaemonError("agency daemon returned invalid pull request sync")
+        pr_response = pr_response_raw
         now = now_fn()
         job.agency_pr_number = (
             int(pr_response["pr_number"]) if isinstance(pr_response.get("pr_number"), int) else None

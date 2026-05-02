@@ -2812,19 +2812,48 @@ class GoogleConnectorRuntime:
         now_fn: Callable[[], datetime],
         new_id_fn: Callable[[str], str],
     ) -> GoogleCapabilityExecutionResult:
+        access_token, granted_scopes, access_failure = self.prepare_capability_access(
+            db=db,
+            capability_id=capability_id,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        if access_failure is not None:
+            return access_failure
+        if access_token is None:
+            return self._typed_failure(failure_class="token_expired")
+        return self.execute_provider_capability(
+            capability_id=capability_id,
+            normalized_input=normalized_input,
+            access_token=access_token,
+            granted_scopes=granted_scopes,
+        )
+
+    def prepare_capability_access(
+        self,
+        *,
+        db: Session,
+        capability_id: str,
+        now_fn: Callable[[], datetime],
+        new_id_fn: Callable[[str], str],
+    ) -> tuple[str | None, set[str], GoogleCapabilityExecutionResult | None]:
         required_scopes = GOOGLE_CAPABILITY_SCOPES.get(capability_id)
         if required_scopes is None:
-            return GoogleCapabilityExecutionResult(
-                status="failed",
-                output=None,
-                auth_failure=None,
-                error="unknown_capability",
+            return (
+                None,
+                set(),
+                GoogleCapabilityExecutionResult(
+                    status="failed",
+                    output=None,
+                    auth_failure=None,
+                    error="unknown_capability",
+                ),
             )
         connector = self._connector_for_update(db=db)
         if connector is None or connector.status == "not_connected":
-            return self._typed_failure(failure_class="not_connected")
+            return None, set(), self._typed_failure(failure_class="not_connected")
         if connector.status == "revoked":
-            return self._typed_failure(failure_class="access_revoked")
+            return None, set(), self._typed_failure(failure_class="access_revoked")
         granted_scopes = set(_normalize_scope_list(connector.granted_scopes))
         if not required_scopes.issubset(granted_scopes):
             _set_connector_error(
@@ -2833,7 +2862,7 @@ class GoogleConnectorRuntime:
                 now_fn=now_fn,
                 preserve_existing_blocking=True,
             )
-            return self._typed_failure(failure_class="consent_required")
+            return None, granted_scopes, self._typed_failure(failure_class="consent_required")
 
         try:
             access_token, refresh_failure = self._refresh_access_token_if_needed(
@@ -2844,17 +2873,30 @@ class GoogleConnectorRuntime:
             )
         except Exception as exc:
             reason = safe_failure_reason(str(exc), fallback=f"unexpected {exc.__class__.__name__}")
-            return GoogleCapabilityExecutionResult(
-                status="failed",
-                output=None,
-                auth_failure=None,
-                error=reason,
+            return (
+                None,
+                granted_scopes,
+                GoogleCapabilityExecutionResult(
+                    status="failed",
+                    output=None,
+                    auth_failure=None,
+                    error=reason,
+                ),
             )
         if refresh_failure is not None:
-            return refresh_failure
+            return None, granted_scopes, refresh_failure
         if access_token is None:
-            return self._typed_failure(failure_class="token_expired")
+            return None, granted_scopes, self._typed_failure(failure_class="token_expired")
+        return access_token, granted_scopes, None
 
+    def execute_provider_capability(
+        self,
+        *,
+        capability_id: str,
+        normalized_input: dict[str, Any],
+        access_token: str,
+        granted_scopes: set[str],
+    ) -> GoogleCapabilityExecutionResult:
         attendee_intersection_enabled = GOOGLE_CALENDAR_FREEBUSY_SCOPE in granted_scopes
         try:
             if capability_id == "cap.calendar.list":
@@ -2908,38 +2950,26 @@ class GoogleConnectorRuntime:
                     access_token=access_token,
                     normalized_input=normalized_input,
                 )
-            else:
+            elif capability_id == "cap.email.send":
                 output_payload = self.workspace_provider.email_send(
                     access_token=access_token,
                     normalized_input=normalized_input,
+                )
+            else:
+                return GoogleCapabilityExecutionResult(
+                    status="failed",
+                    output=None,
+                    auth_failure=None,
+                    error="unknown_capability",
                 )
         except Exception as exc:
             reason = safe_failure_reason(str(exc), fallback=f"unexpected {exc.__class__.__name__}")
             lowered = reason.lower()
             if "insufficient" in lowered or "permission" in lowered:
-                _set_connector_error(
-                    connector=connector,
-                    error_code="scope_missing",
-                    now_fn=now_fn,
-                    preserve_existing_blocking=True,
-                )
                 return self._typed_failure(failure_class="scope_missing")
             if "invalid_grant" in lowered or "revoked" in lowered:
-                connector.status = "revoked"
-                _set_connector_error(
-                    connector=connector,
-                    error_code="access_revoked",
-                    now_fn=now_fn,
-                    preserve_existing_blocking=True,
-                )
                 return self._typed_failure(failure_class="access_revoked")
             if "token" in lowered and "expired" in lowered:
-                _set_connector_error(
-                    connector=connector,
-                    error_code="token_expired",
-                    now_fn=now_fn,
-                    preserve_existing_blocking=True,
-                )
                 return self._typed_failure(failure_class="token_expired")
             typed_provider_error = _classify_google_provider_failure(reason)
             if typed_provider_error is not None:
@@ -2972,6 +3002,28 @@ class GoogleConnectorRuntime:
             output=output_dict,
             auth_failure=None,
             error=None,
+        )
+
+    def record_capability_failure(
+        self,
+        *,
+        db: Session,
+        execution_result: GoogleCapabilityExecutionResult,
+        now_fn: Callable[[], datetime],
+    ) -> None:
+        if execution_result.auth_failure is None:
+            return
+        connector = self._connector_for_update(db=db)
+        if connector is None:
+            return
+        failure_class = execution_result.auth_failure.failure_class
+        if failure_class == "access_revoked":
+            connector.status = "revoked"
+        _set_connector_error(
+            connector=connector,
+            error_code=failure_class,
+            now_fn=now_fn,
+            preserve_existing_blocking=True,
         )
 
     def access_token_for_background_sync(

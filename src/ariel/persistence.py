@@ -2258,7 +2258,7 @@ class BackgroundTaskRecord(Base):
                 "'attention_feature_extraction_due', 'attention_grouping_due', "
                 "'attention_ranking_due', 'attention_review_due', 'attention_delivery_due', "
                 "'attention_item_follow_up_due', 'proactive_feedback_review_due', "
-                "'action_proposal_review_due')"
+                "'action_proposal_review_due', 'execute_action_attempt')"
             ),
             name="ck_background_task_type",
         ),

@@ -2461,6 +2461,37 @@ def _execute_agency_runtime(_: dict[str, Any]) -> dict[str, Any]:
     raise RuntimeError("agency_runtime_not_bound")
 
 
+def _declare_agency_run_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "destination": "agency.daemon.local",
+            "payload": {
+                "repo_root": input_payload["repo_root"],
+                "name": input_payload["name"],
+                "base_branch": input_payload.get("base_branch"),
+                "runner": input_payload.get("runner"),
+            },
+        }
+    ]
+
+
+def _declare_agency_request_pr_egress_intent(
+    input_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "destination": "agency.daemon.local",
+            "payload": {
+                "job_id": input_payload.get("job_id"),
+                "repo_id": input_payload.get("repo_id"),
+                "task_id": input_payload.get("task_id"),
+                "invocation_id": input_payload.get("invocation_id"),
+                "worktree_id": input_payload.get("worktree_id"),
+            },
+        }
+    ]
+
+
 def _execute_attachment_runtime(_: dict[str, Any]) -> dict[str, Any]:
     raise RuntimeError("attachment_runtime_not_bound")
 
@@ -2766,9 +2797,10 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
             "idempotency": "action_attempt_id",
             "execution_mode": "agency_daemon_unix_socket",
         },
-        allowed_egress_destinations=(),
+        allowed_egress_destinations=("agency.daemon.local",),
         validate_input=_validate_agency_run_input,
         execute=_execute_agency_runtime,
+        declare_egress_intent=_declare_agency_run_egress_intent,
     ),
     "cap.agency.status": CapabilityDefinition(
         capability_id="cap.agency.status",
@@ -2811,9 +2843,10 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
             "idempotency": "action_attempt_id",
             "execution_mode": "agency_daemon_unix_socket",
         },
-        allowed_egress_destinations=(),
+        allowed_egress_destinations=("agency.daemon.local",),
         validate_input=_validate_agency_request_pr_input,
         execute=_execute_agency_runtime,
+        declare_egress_intent=_declare_agency_request_pr_egress_intent,
     ),
     "cap.discord.no_response": CapabilityDefinition(
         capability_id="cap.discord.no_response",
