@@ -78,6 +78,9 @@ class AppSettings(BaseSettings):
     agency_event_max_skew_seconds: int = 300
     worker_poll_seconds: float = 1.0
     worker_heartbeat_timeout_seconds: int = 300
+    proactive_ambient_interval_seconds: int = 60
+    proactive_worker_max_attempts: int = 5
+    proactive_deliberation_tool_rounds: int = 2
 
     @field_validator("bind_host")
     @classmethod
@@ -328,11 +331,14 @@ class AppSettings(BaseSettings):
         "attachment_handle_ttl_seconds",
         "agency_event_max_skew_seconds",
         "worker_heartbeat_timeout_seconds",
+        "proactive_ambient_interval_seconds",
+        "proactive_worker_max_attempts",
+        "proactive_deliberation_tool_rounds",
     )
     @classmethod
     def _positive_int_settings_must_be_positive(cls, value: int) -> int:
         if value < 1:
-            raise ValueError("agency, attachment, and worker integer settings must be >= 1")
+            raise ValueError("agency, attachment, worker, and proactive settings must be >= 1")
         return value
 
     @field_validator(

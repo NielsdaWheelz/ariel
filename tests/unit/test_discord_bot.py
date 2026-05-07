@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone, tzinfo
-from typing import Any, Self, cast
+from typing import Any, cast
 
 import discord
 from fastapi.testclient import TestClient
@@ -16,21 +15,23 @@ from ariel.discord_bot import (
     ArielDiscordError,
     ArielActionView,
     ack_notification,
-    ack_attention_item,
+    ack_proactive_case,
+    correct_proactive_case,
     decide_approval,
     DiscordBotConfigError,
     configured_discord_bot,
     create_discord_bot,
     format_discord_message,
     get_status,
-    refresh_attention_item,
+    inspect_proactive_case,
     list_jobs,
     list_memory,
+    more_aggressive_proactive_pattern,
     record_capture,
     refresh_job,
-    resolve_attention_item,
-    snooze_attention_item,
+    stop_proactive_pattern,
     submit_discord_turn,
+    undo_proactive_case,
     _is_ariel_custom_id,
 )
 
@@ -703,7 +704,7 @@ def test_ack_notification_posts_ack_and_returns_job_id(
     ]
 
 
-def test_ack_attention_item_posts_ack(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ack_proactive_case_posts_ack(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_clients: list[FakeHttpClient] = []
 
     def fake_client(*, timeout: float) -> FakeHttpClient:
@@ -714,10 +715,11 @@ def test_ack_attention_item_posts_ack(monkeypatch: pytest.MonkeyPatch) -> None:
                     200,
                     json={
                         "ok": True,
-                        "attention_item": {
-                            "id": "ati_123",
+                        "case": {
+                            "id": "case_123",
                             "title": "Review inbox conflict",
                         },
+                        "feedback": {"feedback_type": "ack"},
                     },
                 )
             ]
@@ -727,32 +729,24 @@ def test_ack_attention_item_posts_ack(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
 
-    message = ack_attention_item(
+    message = ack_proactive_case(
         ariel_base_url="http://127.0.0.1:8000",
-        attention_item_id="ati_123",
+        case_id="case_123",
     )
 
-    assert message == "Attention item acknowledged: Review inbox conflict (ati_123)"
+    assert message == "Proactive case acknowledged: Review inbox conflict (case_123)"
     assert fake_clients[0].calls == [
         {
             "method": "POST",
-            "url": "http://127.0.0.1:8000/v1/attention-items/ati_123/ack",
+            "url": "http://127.0.0.1:8000/v1/proactive/cases/case_123/ack",
             "headers": None,
             "json": {},
         }
     ]
 
 
-def test_snooze_attention_item_posts_24_hour_snooze(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_correct_proactive_case_posts_correction(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_clients: list[FakeHttpClient] = []
-
-    class FrozenDateTime(datetime):
-        @classmethod
-        def now(cls, tz: tzinfo | None = None) -> Self:
-            assert tz is timezone.utc
-            return cls(2026, 4, 30, 12, 0, tzinfo=timezone.utc)
 
     def fake_client(*, timeout: float) -> FakeHttpClient:
         assert timeout == 60.0
@@ -762,10 +756,11 @@ def test_snooze_attention_item_posts_24_hour_snooze(
                     200,
                     json={
                         "ok": True,
-                        "attention_item": {
-                            "id": "ati_123",
+                        "case": {
+                            "id": "case_123",
                             "title": "Review inbox conflict",
                         },
+                        "feedback": {"feedback_type": "correct"},
                     },
                 )
             ]
@@ -773,26 +768,25 @@ def test_snooze_attention_item_posts_24_hour_snooze(
         fake_clients.append(client)
         return client
 
-    monkeypatch.setattr("ariel.discord_bot.datetime", FrozenDateTime)
     monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
 
-    message = snooze_attention_item(
+    message = correct_proactive_case(
         ariel_base_url="http://127.0.0.1:8000",
-        attention_item_id="ati_123",
+        case_id="case_123",
     )
 
-    assert message == "Attention item snoozed: Review inbox conflict (ati_123)"
+    assert message == "Proactive case marked incorrect: Review inbox conflict (case_123)"
     assert fake_clients[0].calls == [
         {
             "method": "POST",
-            "url": "http://127.0.0.1:8000/v1/attention-items/ati_123/snooze",
+            "url": "http://127.0.0.1:8000/v1/proactive/cases/case_123/correct",
             "headers": None,
-            "json": {"snooze_until": "2026-05-01T12:00:00+00:00"},
+            "json": {"feedback_type": "correct"},
         }
     ]
 
 
-def test_resolve_attention_item_posts_resolve(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_stop_proactive_pattern_posts_feedback(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_clients: list[FakeHttpClient] = []
 
     def fake_client(*, timeout: float) -> FakeHttpClient:
@@ -803,46 +797,11 @@ def test_resolve_attention_item_posts_resolve(monkeypatch: pytest.MonkeyPatch) -
                     200,
                     json={
                         "ok": True,
-                        "attention_item": {
-                            "id": "ati_123",
-                            "reason": "Calendar conflict was handled",
-                        },
-                    },
-                )
-            ]
-        )
-        fake_clients.append(client)
-        return client
-
-    monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
-
-    message = resolve_attention_item(
-        ariel_base_url="http://127.0.0.1:8000",
-        attention_item_id="ati_123",
-    )
-
-    assert message == "Attention item resolved: Calendar conflict was handled (ati_123)"
-    assert fake_clients[0].calls[0]["url"] == (
-        "http://127.0.0.1:8000/v1/attention-items/ati_123/resolve"
-    )
-    assert fake_clients[0].calls[0]["json"] == {}
-
-
-def test_refresh_attention_item_posts_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_clients: list[FakeHttpClient] = []
-
-    def fake_client(*, timeout: float) -> FakeHttpClient:
-        assert timeout == 60.0
-        client = FakeHttpClient(
-            responses=[
-                httpx.Response(
-                    200,
-                    json={
-                        "ok": True,
-                        "attention_item": {
-                            "id": "ati_123",
+                        "case": {
+                            "id": "case_123",
                             "title": "Review inbox conflict",
                         },
+                        "feedback": {"feedback_type": "stop_pattern"},
                     },
                 )
             ]
@@ -852,16 +811,151 @@ def test_refresh_attention_item_posts_refresh(monkeypatch: pytest.MonkeyPatch) -
 
     monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
 
-    message = refresh_attention_item(
+    message = stop_proactive_pattern(
         ariel_base_url="http://127.0.0.1:8000",
-        attention_item_id="ati_123",
+        case_id="case_123",
     )
 
-    assert message == "Attention item refreshed: Review inbox conflict (ati_123)"
+    assert message == "Proactive case muted pattern: Review inbox conflict (case_123)"
     assert fake_clients[0].calls[0]["url"] == (
-        "http://127.0.0.1:8000/v1/attention-items/ati_123/refresh"
+        "http://127.0.0.1:8000/v1/proactive/cases/case_123/stop-pattern"
     )
     assert fake_clients[0].calls[0]["json"] == {}
+
+
+def test_more_aggressive_proactive_pattern_posts_feedback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_clients: list[FakeHttpClient] = []
+
+    def fake_client(*, timeout: float) -> FakeHttpClient:
+        assert timeout == 60.0
+        client = FakeHttpClient(
+            responses=[
+                httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "case": {
+                            "id": "case_123",
+                            "title": "Review inbox conflict",
+                        },
+                        "feedback": {"feedback_type": "more_aggressive"},
+                    },
+                )
+            ]
+        )
+        fake_clients.append(client)
+        return client
+
+    monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
+
+    message = more_aggressive_proactive_pattern(
+        ariel_base_url="http://127.0.0.1:8000",
+        case_id="case_123",
+    )
+
+    assert message == "Proactive case made more aggressive: Review inbox conflict (case_123)"
+    assert fake_clients[0].calls[0]["url"] == (
+        "http://127.0.0.1:8000/v1/proactive/cases/case_123/more-aggressive"
+    )
+    assert fake_clients[0].calls[0]["json"] == {}
+
+
+def test_inspect_proactive_case_fetches_why(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_clients: list[FakeHttpClient] = []
+
+    def fake_client(*, timeout: float) -> FakeHttpClient:
+        assert timeout == 60.0
+        client = FakeHttpClient(
+            responses=[
+                httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "case": {
+                            "id": "case_123",
+                            "title": "Review inbox conflict",
+                        },
+                        "why": {
+                            "decision": {
+                                "decision_type": "speak_now",
+                                "urgency": "normal",
+                                "rationale": "The case was important enough to surface.",
+                            },
+                            "trigger": {"summary": "Inbox conflict detected."},
+                        },
+                    },
+                )
+            ]
+        )
+        fake_clients.append(client)
+        return client
+
+    monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
+
+    message = inspect_proactive_case(
+        ariel_base_url="http://127.0.0.1:8000",
+        case_id="case_123",
+    )
+
+    assert message == "\n".join(
+        [
+            "Proactive case inspected: Review inbox conflict (case_123)",
+            "Why: The case was important enough to surface.",
+            "Decision: speak_now urgency=normal",
+            "Trigger: Inbox conflict detected.",
+        ]
+    )
+    assert fake_clients[0].calls == [
+        {
+            "method": "GET",
+            "url": "http://127.0.0.1:8000/v1/proactive/cases/case_123/inspect-why",
+        }
+    ]
+
+
+def test_undo_proactive_case_posts_only_to_undo_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_clients: list[FakeHttpClient] = []
+
+    def fake_client(*, timeout: float) -> FakeHttpClient:
+        assert timeout == 60.0
+        client = FakeHttpClient(
+            responses=[
+                httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "case": {
+                            "id": "case_123",
+                            "title": "Review inbox conflict",
+                        },
+                        "undo": {"status": "requested"},
+                    },
+                )
+            ]
+        )
+        fake_clients.append(client)
+        return client
+
+    monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
+
+    message = undo_proactive_case(
+        ariel_base_url="http://127.0.0.1:8000",
+        case_id="case_123",
+    )
+
+    assert message == "Proactive case undo requested: Review inbox conflict (case_123)"
+    assert fake_clients[0].calls == [
+        {
+            "method": "POST",
+            "url": "http://127.0.0.1:8000/v1/proactive/cases/case_123/undo",
+            "headers": None,
+            "json": {},
+        }
+    ]
 
 
 def test_status_command_fetches_only_deterministic_ops_endpoints(
@@ -1117,19 +1211,39 @@ def test_action_view_uses_custom_ids_for_job_refresh_and_notification_ack() -> N
     ]
 
 
-def test_action_view_uses_custom_ids_for_attention_item_actions() -> None:
+def test_action_view_uses_custom_ids_for_proactive_case_actions() -> None:
     view = ArielActionView(
         ariel_base_url="http://127.0.0.1:8000",
-        attention_item_id="ati_123",
+        proactive_case_id="case_123",
         allowed_user_id=3,
     )
 
     custom_ids = [cast(Any, item).custom_id for item in view.children]
     assert custom_ids == [
-        "ariel:attention:ack:ati_123",
-        "ariel:attention:snooze:ati_123",
-        "ariel:attention:resolve:ati_123",
-        "ariel:attention:refresh:ati_123",
+        "ariel:proactive:ack:case_123",
+        "ariel:proactive:correct:case_123",
+        "ariel:proactive:stop:case_123",
+        "ariel:proactive:more:case_123",
+        "ariel:proactive:inspect:case_123",
+    ]
+
+
+def test_action_view_adds_proactive_undo_only_when_supported() -> None:
+    view = ArielActionView(
+        ariel_base_url="http://127.0.0.1:8000",
+        proactive_case_id="case_123",
+        proactive_can_undo=True,
+        allowed_user_id=3,
+    )
+
+    custom_ids = [cast(Any, item).custom_id for item in view.children]
+    assert custom_ids == [
+        "ariel:proactive:ack:case_123",
+        "ariel:proactive:correct:case_123",
+        "ariel:proactive:stop:case_123",
+        "ariel:proactive:more:case_123",
+        "ariel:proactive:inspect:case_123",
+        "ariel:proactive:undo:case_123",
     ]
 
 
@@ -1139,18 +1253,20 @@ def test_action_view_uses_custom_ids_for_attention_item_actions() -> None:
         "ariel:approval:approve:apr_123",
         "ariel:job:refresh:job_123",
         "ariel:notification:ack:ntf_123",
-        "ariel:attention:ack:ati_123",
-        "ariel:attention:snooze:ati_123",
-        "ariel:attention:resolve:ati_123",
-        "ariel:attention:refresh:ati_123",
+        "ariel:proactive:ack:case_123",
+        "ariel:proactive:correct:case_123",
+        "ariel:proactive:stop:case_123",
+        "ariel:proactive:more:case_123",
+        "ariel:proactive:inspect:case_123",
+        "ariel:proactive:undo:case_123",
     ],
 )
 def test_is_ariel_custom_id_recognizes_supported_action_prefixes(custom_id: str) -> None:
     assert _is_ariel_custom_id(custom_id) is True
 
 
-def test_is_ariel_custom_id_rejects_unknown_attention_action() -> None:
-    assert _is_ariel_custom_id("ariel:attention:delete:ati_123") is False
+def test_is_ariel_custom_id_rejects_unknown_proactive_action() -> None:
+    assert _is_ariel_custom_id("ariel:proactive:snooze:case_123") is False
 
 
 def test_on_interaction_handles_approval_custom_id(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1192,54 +1308,59 @@ def test_on_interaction_handles_approval_custom_id(monkeypatch: pytest.MonkeyPat
 
 
 @pytest.mark.parametrize(
-    ("custom_id", "function_name", "expected_content", "expected_view"),
+    ("custom_id", "function_name", "expected_content"),
     [
         (
-            "ariel:attention:ack:ati_123",
-            "ack_attention_item",
-            "Attention item acknowledged: ati_123",
-            None,
+            "ariel:proactive:ack:case_123",
+            "ack_proactive_case",
+            "Proactive case acknowledged: case_123",
         ),
         (
-            "ariel:attention:snooze:ati_123",
-            "snooze_attention_item",
-            "Attention item snoozed: ati_123",
-            None,
+            "ariel:proactive:correct:case_123",
+            "correct_proactive_case",
+            "Proactive case marked incorrect: case_123",
         ),
         (
-            "ariel:attention:resolve:ati_123",
-            "resolve_attention_item",
-            "Attention item resolved: ati_123",
-            None,
+            "ariel:proactive:stop:case_123",
+            "stop_proactive_pattern",
+            "Proactive case muted pattern: case_123",
         ),
         (
-            "ariel:attention:refresh:ati_123",
-            "refresh_attention_item",
-            "Attention item refreshed: ati_123",
-            "refresh_view",
+            "ariel:proactive:more:case_123",
+            "more_aggressive_proactive_pattern",
+            "Proactive case made more aggressive: case_123",
+        ),
+        (
+            "ariel:proactive:inspect:case_123",
+            "inspect_proactive_case",
+            "Proactive case inspected: case_123",
+        ),
+        (
+            "ariel:proactive:undo:case_123",
+            "undo_proactive_case",
+            "Proactive case undo requested: case_123",
         ),
     ],
 )
-def test_on_interaction_handles_attention_item_custom_ids(
+def test_on_interaction_handles_proactive_case_custom_ids(
     monkeypatch: pytest.MonkeyPatch,
     custom_id: str,
     function_name: str,
     expected_content: str,
-    expected_view: str | None,
 ) -> None:
     calls: list[dict[str, Any]] = []
 
-    def fake_attention_action(*, ariel_base_url: str, attention_item_id: str) -> str:
+    def fake_proactive_action(*, ariel_base_url: str, case_id: str) -> str:
         calls.append(
             {
                 "ariel_base_url": ariel_base_url,
-                "attention_item_id": attention_item_id,
+                "case_id": case_id,
                 "function_name": function_name,
             }
         )
         return expected_content
 
-    monkeypatch.setattr(f"ariel.discord_bot.{function_name}", fake_attention_action)
+    monkeypatch.setattr(f"ariel.discord_bot.{function_name}", fake_proactive_action)
     bot = _bot()
     interaction = FakeInteraction(custom_id=custom_id, channel_id=88)
 
@@ -1248,23 +1369,12 @@ def test_on_interaction_handles_attention_item_custom_ids(
     assert calls == [
         {
             "ariel_base_url": "http://127.0.0.1:8000",
-            "attention_item_id": "ati_123",
+            "case_id": "case_123",
             "function_name": function_name,
         }
     ]
     assert interaction.response.edits[0]["content"] == expected_content
-    if expected_view is None:
-        assert interaction.response.edits[0]["view"] is None
-    else:
-        view = interaction.response.edits[0]["view"]
-        assert view is not None
-        custom_ids = [cast(Any, item).custom_id for item in view.children]
-        assert custom_ids == [
-            "ariel:attention:ack:ati_123",
-            "ariel:attention:snooze:ati_123",
-            "ariel:attention:resolve:ati_123",
-            "ariel:attention:refresh:ati_123",
-        ]
+    assert interaction.response.edits[0]["view"] is None
 
 
 def test_on_interaction_rejects_wrong_user() -> None:

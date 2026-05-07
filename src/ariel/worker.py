@@ -18,7 +18,6 @@ from .google_connector import (
     GoogleConnectorRuntime,
 )
 from .persistence import (
-    ActionProposalRecord,
     AgencyEventRecord,
     BackgroundTaskRecord,
     ConnectorSubscriptionRecord,
@@ -28,19 +27,26 @@ from .persistence import (
     NotificationRecord,
     SessionRecord,
 )
-from .attention_ranking import (
-    process_attention_delivery_due,
-    process_attention_feature_extraction_due,
-    process_attention_grouping_due,
-    process_attention_item_follow_up_due,
-    process_attention_ranking_due,
-    process_attention_review_due,
-    process_proactive_feedback_review_due,
-)
 from .memory import process_memory_extract_turn, process_memory_projection_job
-from .proactivity import process_workspace_signal_derivation_due
+from .proactivity import (
+    mark_proactive_turn_delivered,
+    process_proactive_action_execution_due,
+    process_proactive_deliberation_due,
+    process_proactive_feedback_learning_due,
+    process_proactive_follow_up_due,
+    process_workspace_observation_derivation_due,
+)
 from .redaction import safe_failure_reason
 from .sync_runtime import process_provider_event_received, process_provider_sync_due
+
+
+PROACTIVE_RECOVERABLE_TASK_TYPES = (
+    "workspace_observation_derivation_due",
+    "proactive_deliberation_due",
+    "proactive_follow_up_due",
+    "proactive_feedback_learning_due",
+    "proactive_action_execution_due",
+)
 
 
 def _utcnow() -> datetime:
@@ -121,9 +127,66 @@ def reap_stale_tasks(db: Session, *, now: datetime, heartbeat_timeout_seconds: i
         task.last_heartbeat = None
         task.run_after = now
         task.updated_at = now
-    if stale_tasks:
+    recoverable_failed_tasks = db.scalars(
+        select(BackgroundTaskRecord)
+        .where(
+            BackgroundTaskRecord.status == "failed",
+            BackgroundTaskRecord.task_type.in_(PROACTIVE_RECOVERABLE_TASK_TYPES),
+            BackgroundTaskRecord.attempts < BackgroundTaskRecord.max_attempts,
+            BackgroundTaskRecord.run_after <= now,
+        )
+        .with_for_update(skip_locked=True)
+    ).all()
+    for task in recoverable_failed_tasks:
+        task.status = "pending"
+        task.claimed_by = None
+        task.last_heartbeat = None
+        task.updated_at = now
+    if stale_tasks or recoverable_failed_tasks:
         db.flush()
-    return len(stale_tasks)
+    return len(stale_tasks) + len(recoverable_failed_tasks)
+
+
+def enqueue_due_worker_owned_ambient_task(
+    db: Session,
+    *,
+    settings: AppSettings,
+    now: datetime,
+) -> BackgroundTaskRecord | None:
+    due_task_id = db.scalar(
+        select(BackgroundTaskRecord.id)
+        .where(
+            BackgroundTaskRecord.status == "pending",
+            BackgroundTaskRecord.run_after <= now,
+        )
+        .with_for_update(skip_locked=True)
+        .limit(1)
+    )
+    if due_task_id is not None:
+        return None
+    latest = db.scalar(
+        select(BackgroundTaskRecord)
+        .where(BackgroundTaskRecord.task_type == "workspace_observation_derivation_due")
+        .order_by(
+            BackgroundTaskRecord.run_after.desc(),
+            BackgroundTaskRecord.created_at.desc(),
+            BackgroundTaskRecord.id.desc(),
+        )
+        .with_for_update(skip_locked=True)
+        .limit(1)
+    )
+    if latest is not None and latest.status in {"pending", "running"}:
+        return None
+    due_after = now - timedelta(seconds=settings.proactive_ambient_interval_seconds)
+    if latest is not None and latest.run_after > due_after:
+        return None
+    return enqueue_background_task(
+        db,
+        task_type="workspace_observation_derivation_due",
+        payload={"origin": "worker_ambient"},
+        now=now,
+        max_attempts=settings.proactive_worker_max_attempts,
+    )
 
 
 def _google_runtime(settings: AppSettings) -> GoogleConnectorRuntime:
@@ -161,17 +224,20 @@ def process_one_task(
     session_factory: sessionmaker[Session],
     settings: AppSettings | None = None,
     worker_id: str | None = None,
+    model_adapter: Any | None = None,
 ) -> bool:
     resolved_settings = settings or AppSettings()
     resolved_worker_id = worker_id or f"worker-{ulid.new().str.lower()}"
 
     with session_factory() as db:
         with db.begin():
+            now = _utcnow()
             reap_stale_tasks(
                 db,
-                now=_utcnow(),
+                now=now,
                 heartbeat_timeout_seconds=resolved_settings.worker_heartbeat_timeout_seconds,
             )
+            enqueue_due_worker_owned_ambient_task(db, settings=resolved_settings, now=now)
 
     if process_memory_projection_job(
         session_factory=session_factory,
@@ -238,6 +304,7 @@ def process_one_task(
                 _process_provider_subscription_renewal_due(
                     session_factory=session_factory,
                     task_payload=task_payload,
+                    settings=resolved_settings,
                 )
             case "provider_sync_due":
                 process_provider_sync_due(
@@ -255,64 +322,41 @@ def process_one_task(
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                 )
-            case "workspace_signal_derivation_due":
-                process_workspace_signal_derivation_due(
+            case "workspace_observation_derivation_due":
+                process_workspace_observation_derivation_due(
                     session_factory=session_factory,
                     task_payload=task_payload,
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                 )
-            case "attention_feature_extraction_due":
-                process_attention_feature_extraction_due(
+            case "proactive_deliberation_due":
+                process_proactive_deliberation_due(
+                    session_factory=session_factory,
+                    task_payload=task_payload,
+                    settings=resolved_settings,
+                    model_adapter=model_adapter,
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+            case "proactive_follow_up_due":
+                process_proactive_follow_up_due(
                     session_factory=session_factory,
                     task_payload=task_payload,
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                 )
-            case "attention_grouping_due":
-                process_attention_grouping_due(
+            case "proactive_feedback_learning_due":
+                process_proactive_feedback_learning_due(
                     session_factory=session_factory,
                     task_payload=task_payload,
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                 )
-            case "attention_ranking_due":
-                process_attention_ranking_due(
+            case "proactive_action_execution_due":
+                process_proactive_action_execution_due(
                     session_factory=session_factory,
                     task_payload=task_payload,
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                )
-            case "attention_review_due":
-                process_attention_review_due(
-                    session_factory=session_factory,
-                    task_payload=task_payload,
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                )
-            case "attention_item_follow_up_due":
-                process_attention_item_follow_up_due(
-                    session_factory=session_factory,
-                    task_payload=task_payload,
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                )
-            case "attention_delivery_due":
-                process_attention_delivery_due(
-                    session_factory=session_factory,
-                    task_payload=task_payload,
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                )
-            case "action_proposal_review_due":
-                _process_action_proposal_review_due(
-                    session_factory=session_factory,
-                    task_payload=task_payload,
-                )
-            case "proactive_feedback_review_due":
-                process_proactive_feedback_review_due(
-                    session_factory=session_factory,
-                    task_payload=task_payload,
+                    google_runtime=_google_runtime(resolved_settings),
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                 )
@@ -398,6 +442,7 @@ def _process_provider_subscription_renewal_due(
     *,
     session_factory: sessionmaker[Session],
     task_payload: dict[str, Any],
+    settings: AppSettings,
 ) -> None:
     subscription_id = _payload_text(task_payload, "subscription_id")
     if subscription_id is None:
@@ -416,22 +461,19 @@ def _process_provider_subscription_renewal_due(
             subscription.status = "renewal_due"
             subscription.renew_after = now
             subscription.updated_at = now
-
-
-def _process_action_proposal_review_due(
-    *,
-    session_factory: sessionmaker[Session],
-    task_payload: dict[str, Any],
-) -> None:
-    proposal_id = _payload_text(task_payload, "action_proposal_id")
-    with session_factory() as db:
-        with db.begin():
-            query = select(ActionProposalRecord).where(ActionProposalRecord.status == "proposed")
-            if proposal_id is not None:
-                query = query.where(ActionProposalRecord.id == proposal_id)
-            now = _utcnow()
-            for proposal in db.scalars(query.with_for_update()).all():
-                proposal.updated_at = now
+            enqueue_background_task(
+                db,
+                task_type="provider_sync_due",
+                payload={
+                    "provider": subscription.provider,
+                    "resource_type": subscription.resource_type,
+                    "resource_id": subscription.resource_id,
+                    "subscription_id": subscription.id,
+                    "reason": "subscription_renewal_due",
+                },
+                now=now,
+                max_attempts=settings.proactive_worker_max_attempts,
+            )
 
 
 def _job_status_for_event(event_type: str) -> str:
@@ -538,61 +580,16 @@ def _process_agency_event_received(
                 "job.cancelled",
                 "job.timed_out",
             }:
-                notification = db.scalar(
-                    select(NotificationRecord)
-                    .where(NotificationRecord.dedupe_key == f"agency-event:{agency_event.id}")
-                    .with_for_update()
-                    .limit(1)
+                enqueue_background_task(
+                    db,
+                    task_type="workspace_observation_derivation_due",
+                    payload={"origin": "agency_event", "agency_event_id": agency_event.id},
+                    now=now,
+                    max_attempts=3,
                 )
-                if notification is None:
-                    notification = NotificationRecord(
-                        id=_new_id("ntf"),
-                        dedupe_key=f"agency-event:{agency_event.id}",
-                        source_type="agency_event",
-                        source_id=agency_event.id,
-                        channel="discord",
-                        status="pending",
-                        title=_notification_title(agency_event.event_type, job),
-                        body=_notification_body(agency_event.event_type, job),
-                        payload={"job_id": job.id, "agency_event_id": agency_event.id},
-                        created_at=now,
-                        updated_at=now,
-                    )
-                    db.add(notification)
-                    db.flush()
-                    enqueue_background_task(
-                        db,
-                        task_type="deliver_discord_notification",
-                        payload={"notification_id": notification.id},
-                        now=now,
-                        max_attempts=5,
-                    )
 
             agency_event.status = "processed"
             agency_event.processed_at = now
-
-
-def _notification_title(event_type: str, job: JobRecord) -> str:
-    title = job.title or job.external_job_id
-    match event_type:
-        case "job.waiting":
-            return f"Agency waiting: {title}"
-        case "job.completed":
-            return f"Agency completed: {title}"
-        case "job.failed":
-            return f"Agency failed: {title}"
-        case "job.cancelled":
-            return f"Agency cancelled: {title}"
-        case "job.timed_out":
-            return f"Agency timed out: {title}"
-        case _:
-            return f"Agency update: {title}"
-
-
-def _notification_body(event_type: str, job: JobRecord) -> str:
-    if job.summary is not None and job.summary.strip():
-        return job.summary.strip()
-    return f"{job.external_job_id} is {job.status} after {event_type}."
 
 
 def _deliver_discord_notification(
@@ -620,7 +617,8 @@ def _deliver_discord_notification(
             content = f"**{notification.title}**\n{notification.body}"
             payload = notification.payload if isinstance(notification.payload, dict) else {}
             job_id = payload.get("job_id")
-            attention_item_id = payload.get("attention_item_id")
+            proactive_turn_id = payload.get("proactive_turn_id")
+            proactive_case_id = payload.get("case_id")
             job = (
                 db.scalar(
                     select(JobRecord).where(JobRecord.id == job_id).with_for_update().limit(1)
@@ -689,9 +687,9 @@ def _deliver_discord_notification(
                     "components": _discord_notification_components(
                         notification_id=notification_id,
                         job_id=job.id if job is not None else None,
-                        attention_item_id=attention_item_id
-                        if isinstance(attention_item_id, str)
-                        else None,
+                        proactive_case_id=(
+                            proactive_case_id if isinstance(proactive_case_id, str) else None
+                        ),
                     ),
                 },
                 timeout=settings.discord_notification_timeout_seconds,
@@ -732,6 +730,13 @@ def _deliver_discord_notification(
             if job is not None and created_thread_id is not None:
                 job.discord_thread_id = created_thread_id
                 job.updated_at = now
+            proactive_turn_id = payload.get("proactive_turn_id")
+            if error is None and isinstance(proactive_turn_id, str):
+                mark_proactive_turn_delivered(
+                    db=db,
+                    proactive_turn_id=proactive_turn_id,
+                    now=now,
+                )
             db.add(
                 NotificationDeliveryRecord(
                     id=_new_id("ndl"),
@@ -763,7 +768,7 @@ def _discord_notification_components(
     *,
     notification_id: str,
     job_id: str | None,
-    attention_item_id: str | None,
+    proactive_case_id: str | None,
 ) -> list[dict[str, Any]]:
     buttons: list[dict[str, Any]] = []
     if job_id is not None:
@@ -775,37 +780,37 @@ def _discord_notification_components(
                 "custom_id": f"ariel:job:refresh:{job_id}",
             }
         )
-    if attention_item_id is not None:
+    if proactive_case_id is not None:
         buttons.append(
             {
                 "type": 2,
                 "style": 1,
                 "label": "Acknowledge",
-                "custom_id": f"ariel:attention:ack:{attention_item_id}",
+                "custom_id": f"ariel:proactive:ack:{proactive_case_id}",
             }
         )
         buttons.append(
             {
                 "type": 2,
                 "style": 2,
-                "label": "Snooze",
-                "custom_id": f"ariel:attention:snooze:{attention_item_id}",
+                "label": "Correct",
+                "custom_id": f"ariel:proactive:correct:{proactive_case_id}",
             }
         )
         buttons.append(
             {
                 "type": 2,
                 "style": 2,
-                "label": "Resolve",
-                "custom_id": f"ariel:attention:resolve:{attention_item_id}",
+                "label": "Stop pattern",
+                "custom_id": f"ariel:proactive:stop:{proactive_case_id}",
             }
         )
         buttons.append(
             {
                 "type": 2,
                 "style": 2,
-                "label": "Refresh",
-                "custom_id": f"ariel:attention:refresh:{attention_item_id}",
+                "label": "More",
+                "custom_id": f"ariel:proactive:more:{proactive_case_id}",
             }
         )
         return [{"type": 1, "components": buttons}]

@@ -318,7 +318,7 @@ def test_s5_pr02_context_bundle_follows_constitution_section_order_and_includes_
             "recent_active_session_turns",
             "memory_context",
             "open_commitments_and_jobs",
-            "relevant_artifacts_and_signals",
+            "relevant_artifacts_and_observations",
         ]
 
         memory_context = bundle["memory_context"]
@@ -334,10 +334,10 @@ def test_s5_pr02_context_bundle_follows_constitution_section_order_and_includes_
         assert isinstance(commitments_jobs, dict)
         assert isinstance(commitments_jobs["open_jobs"], list)
 
-        signals = bundle["relevant_artifacts_and_signals"]
-        assert isinstance(signals, dict)
-        assert isinstance(signals["artifacts"], list)
-        assert isinstance(signals["proactive_signals"], list)
+        observations = bundle["relevant_artifacts_and_observations"]
+        assert isinstance(observations, dict)
+        assert isinstance(observations["artifacts"], list)
+        assert isinstance(observations["proactive_observations"], list)
 
 
 def test_s5_pr02_timeline_supports_after_cursor_for_incremental_sync(postgres_url: str) -> None:

@@ -1714,7 +1714,7 @@ class SyncRunRecord(Base):
     cursor_after: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     item_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    signal_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    observation_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -1730,7 +1730,7 @@ class SyncRunRecord(Base):
         ),
         CheckConstraint("status IN ('running', 'succeeded', 'failed')", name="ck_sync_run_status"),
         CheckConstraint("item_count >= 0", name="ck_sync_run_item_count"),
-        CheckConstraint("signal_count >= 0", name="ck_sync_run_signal_count"),
+        CheckConstraint("observation_count >= 0", name="ck_sync_run_observation_count"),
     )
 
 
@@ -1805,8 +1805,8 @@ class WorkspaceItemEventRecord(Base):
     )
 
 
-class AttentionSignalRecord(Base):
-    __tablename__ = "attention_signals"
+class ProactiveObservationRecord(Base):
+    __tablename__ = "proactive_observations"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     workspace_item_id: Mapped[str | None] = mapped_column(
@@ -1818,15 +1818,17 @@ class AttentionSignalRecord(Base):
     source_type: Mapped[str] = mapped_column(String(32), nullable=False)
     source_id: Mapped[str] = mapped_column(String(160), nullable=False)
     dedupe_key: Mapped[str] = mapped_column(String(220), nullable=False, unique=True)
-    status: Mapped[str] = mapped_column(String(32), nullable=False)
-    priority: Mapped[str] = mapped_column(String(32), nullable=False)
-    urgency: Mapped[str] = mapped_column(String(32), nullable=False)
-    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
-    title: Mapped[str] = mapped_column(Text, nullable=False)
-    body: Mapped[str] = mapped_column(Text, nullable=False)
-    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    observation_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    subject: Mapped[str] = mapped_column(Text, nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     evidence: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     taint: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    trust_boundary: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )
@@ -1838,45 +1840,46 @@ class AttentionSignalRecord(Base):
         CheckConstraint(
             (
                 "source_type IN ('workspace_item', 'job', 'approval_request', "
-                "'memory_assertion', 'google_connector', 'capture')"
+                "'memory_assertion', 'google_connector', 'capture', 'discord_message', "
+                "'provider_event', 'connector_event', 'ci', 'location', 'local_activity')"
             ),
-            name="ck_attention_signal_source_type",
+            name="ck_proactive_observation_source_type",
         ),
         CheckConstraint(
-            "status IN ('new', 'reviewed', 'dismissed', 'superseded')",
-            name="ck_attention_signal_status",
+            "trust_boundary IN ('trusted_internal', 'reviewed_memory', 'user', 'provider', 'tainted')",
+            name="ck_proactive_observation_trust_boundary",
         ),
         CheckConstraint(
-            "priority IN ('critical', 'high', 'normal', 'low')",
-            name="ck_attention_signal_priority",
+            "status IN ('new', 'linked', 'ignored')",
+            name="ck_proactive_observation_status",
         ),
-        CheckConstraint(
-            "urgency IN ('critical', 'high', 'normal', 'low')",
-            name="ck_attention_signal_urgency",
-        ),
-        CheckConstraint(
-            "confidence >= 0.0 AND confidence <= 1.0",
-            name="ck_attention_signal_confidence",
-        ),
-        Index("ix_attention_signals_status_priority", "status", "priority", "updated_at"),
-        Index("ix_attention_signals_source", "source_type", "source_id"),
+        Index("ix_proactive_observations_status_updated", "status", "updated_at"),
+        Index("ix_proactive_observations_source", "source_type", "source_id"),
     )
 
 
-class AttentionGroupRecord(Base):
-    __tablename__ = "attention_groups"
+class ProactiveCaseRecord(Base):
+    __tablename__ = "proactive_cases"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    group_key: Mapped[str] = mapped_column(String(160), nullable=False, unique=True)
-    group_type: Mapped[str] = mapped_column(String(32), nullable=False)
-    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    case_key: Mapped[str] = mapped_column(String(220), nullable=False, unique=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
     title: Mapped[str] = mapped_column(Text, nullable=False)
     summary: Mapped[str] = mapped_column(Text, nullable=False)
-    group_metadata: Mapped[dict[str, Any]] = mapped_column(
-        "metadata",
-        JSONB,
+    latest_observation_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("proactive_observations.id", ondelete="RESTRICT"),
         nullable=False,
-        default=dict,
+        index=True,
+    )
+    last_decision_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("proactive_decisions.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    next_recheck_after: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
@@ -1886,234 +1889,25 @@ class AttentionGroupRecord(Base):
     )
 
     __table_args__ = (
-        CheckConstraint(
-            "group_type IN ('approval', 'job', 'connector', 'memory', 'capture', 'workspace')",
-            name="ck_attention_group_type",
-        ),
-        CheckConstraint(
-            "status IN ('active', 'suppressed', 'resolved')",
-            name="ck_attention_group_status",
-        ),
-        Index("ix_attention_groups_status_updated", "status", "updated_at"),
-    )
-
-
-class AttentionGroupMemberRecord(Base):
-    __tablename__ = "attention_group_members"
-
-    id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    group_id: Mapped[str] = mapped_column(
-        String(32),
-        ForeignKey("attention_groups.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    attention_signal_id: Mapped[str] = mapped_column(
-        String(32),
-        ForeignKey("attention_signals.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    grouping_reason: Mapped[str] = mapped_column(Text, nullable=False)
-    ranking_version: Mapped[str] = mapped_column(String(64), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, index=True
-    )
-
-    __table_args__ = (
-        UniqueConstraint(
-            "group_id",
-            "attention_signal_id",
-            name="uq_attention_group_member_signal",
-        ),
-    )
-
-
-class AttentionRankFeatureRecord(Base):
-    __tablename__ = "attention_rank_features"
-
-    id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    attention_signal_id: Mapped[str] = mapped_column(
-        String(32),
-        ForeignKey("attention_signals.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    feature_set_version: Mapped[str] = mapped_column(String(64), nullable=False)
-    features: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    score_components: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, index=True
-    )
-
-    __table_args__ = (
-        UniqueConstraint(
-            "attention_signal_id",
-            "feature_set_version",
-            name="uq_attention_rank_feature_signal_version",
-        ),
-    )
-
-
-class AttentionRankSnapshotRecord(Base):
-    __tablename__ = "attention_rank_snapshots"
-
-    id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    group_id: Mapped[str] = mapped_column(
-        String(32),
-        ForeignKey("attention_groups.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    snapshot_key: Mapped[str] = mapped_column(String(160), nullable=False, unique=True)
-    ranker_version: Mapped[str] = mapped_column(String(64), nullable=False)
-    source_signal_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
-    rank_score: Mapped[float] = mapped_column(Float, nullable=False)
-    rank_inputs: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    rank_reason: Mapped[str] = mapped_column(Text, nullable=False)
-    delivery_decision: Mapped[str] = mapped_column(String(32), nullable=False)
-    delivery_reason: Mapped[str] = mapped_column(Text, nullable=False)
-    suppression_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
-    next_follow_up_after: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True, index=True
-    )
-    priority: Mapped[str] = mapped_column(String(32), nullable=False)
-    urgency: Mapped[str] = mapped_column(String(32), nullable=False)
-    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
-    title: Mapped[str] = mapped_column(Text, nullable=False)
-    body: Mapped[str] = mapped_column(Text, nullable=False)
-    evidence: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    taint: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, index=True
-    )
-
-    __table_args__ = (
-        CheckConstraint(
-            "rank_score >= 0.0 AND rank_score <= 1.0",
-            name="ck_attention_rank_snapshot_score",
-        ),
-        CheckConstraint(
-            "delivery_decision IN ('interrupt_now', 'queue', 'digest', 'suppress')",
-            name="ck_attention_rank_snapshot_delivery_decision",
-        ),
-        CheckConstraint(
-            "priority IN ('critical', 'high', 'normal', 'low')",
-            name="ck_attention_rank_snapshot_priority",
-        ),
-        CheckConstraint(
-            "urgency IN ('critical', 'high', 'normal', 'low')",
-            name="ck_attention_rank_snapshot_urgency",
-        ),
-        CheckConstraint(
-            "confidence >= 0.0 AND confidence <= 1.0",
-            name="ck_attention_rank_snapshot_confidence",
-        ),
-        Index("ix_attention_rank_snapshots_group_created", "group_id", "created_at"),
-        Index("ix_attention_rank_snapshots_delivery", "delivery_decision", "created_at"),
-    )
-
-
-class AttentionItemRecord(Base):
-    __tablename__ = "attention_items"
-
-    id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    group_id: Mapped[str] = mapped_column(
-        String(32),
-        ForeignKey("attention_groups.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
-    rank_snapshot_id: Mapped[str] = mapped_column(
-        String(32),
-        ForeignKey("attention_rank_snapshots.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
-    source_type: Mapped[str] = mapped_column(String(32), nullable=False)
-    source_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
-    source_signal_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
-    dedupe_key: Mapped[str] = mapped_column(String(160), nullable=False, unique=True)
-    status: Mapped[str] = mapped_column(String(32), nullable=False)
-    priority: Mapped[str] = mapped_column(String(32), nullable=False)
-    urgency: Mapped[str] = mapped_column(String(32), nullable=False)
-    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
-    title: Mapped[str] = mapped_column(Text, nullable=False)
-    body: Mapped[str] = mapped_column(Text, nullable=False)
-    reason: Mapped[str] = mapped_column(Text, nullable=False)
-    evidence: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    taint: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    rank_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
-    rank_inputs: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    rank_reason: Mapped[str] = mapped_column(Text, nullable=False)
-    delivery_decision: Mapped[str] = mapped_column(String(32), nullable=False)
-    delivery_reason: Mapped[str] = mapped_column(Text, nullable=False)
-    suppression_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
-    expires_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True, index=True
-    )
-    next_follow_up_after: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True, index=True
-    )
-    last_notified_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, index=True
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, index=True
-    )
-
-    events: Mapped[list["AttentionItemEventRecord"]] = relationship(back_populates="item")
-
-    __table_args__ = (
-        CheckConstraint(
-            "source_type IN ('attention_group')",
-            name="ck_attention_item_source_type",
-        ),
         CheckConstraint(
             (
-                "status IN ('open', 'notified', 'acknowledged', 'snoozed', 'resolved', "
-                "'expired', 'cancelled', 'superseded')"
+                "status IN ('open', 'waiting', 'spoken', 'acted', 'asked', 'ignored', "
+                "'acknowledged', 'resolved', 'failed')"
             ),
-            name="ck_attention_item_status",
+            name="ck_proactive_case_status",
         ),
-        CheckConstraint(
-            "priority IN ('critical', 'high', 'normal', 'low')",
-            name="ck_attention_item_priority",
-        ),
-        CheckConstraint(
-            "urgency IN ('critical', 'high', 'normal', 'low')",
-            name="ck_attention_item_urgency",
-        ),
-        CheckConstraint(
-            "confidence >= 0.0 AND confidence <= 1.0",
-            name="ck_attention_item_confidence",
-        ),
-        CheckConstraint(
-            "rank_score >= 0.0 AND rank_score <= 1.0",
-            name="ck_attention_item_rank_score",
-        ),
-        CheckConstraint(
-            "delivery_decision IN ('interrupt_now', 'queue', 'digest', 'suppress')",
-            name="ck_attention_item_delivery_decision",
-        ),
-        Index("ix_attention_items_status_priority", "status", "priority", "updated_at"),
-        Index("ix_attention_items_status_rank", "status", "rank_score", "updated_at"),
-        Index("ix_attention_items_follow_up_due", "status", "next_follow_up_after", "id"),
-        Index("ix_attention_items_delivery", "delivery_decision", "status", "updated_at"),
-        Index("ix_attention_items_source", "source_type", "source_id"),
+        Index("ix_proactive_cases_status_updated", "status", "updated_at"),
+        Index("ix_proactive_cases_recheck", "status", "next_recheck_after", "id"),
     )
 
 
-class AttentionItemEventRecord(Base):
-    __tablename__ = "attention_item_events"
+class ProactiveCaseEventRecord(Base):
+    __tablename__ = "proactive_case_events"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    attention_item_id: Mapped[str] = mapped_column(
+    case_id: Mapped[str] = mapped_column(
         String(32),
-        ForeignKey("attention_items.id", ondelete="RESTRICT"),
+        ForeignKey("proactive_cases.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
@@ -2123,17 +1917,310 @@ class AttentionItemEventRecord(Base):
         DateTime(timezone=True), nullable=False, index=True
     )
 
-    item: Mapped[AttentionItemRecord] = relationship(back_populates="events")
+    __table_args__ = (
+        CheckConstraint(
+            (
+                "event_type IN ('opened', 'updated', 'context_built', 'decided', "
+                "'validated', 'turn_created', 'action_planned', 'action_executed', "
+                "'waiting', 'acknowledged', 'resolved', 'feedback_recorded', 'failed')"
+            ),
+            name="ck_proactive_case_event_type",
+        ),
+    )
+
+
+class ProactiveContextSnapshotRecord(Base):
+    __tablename__ = "proactive_context_snapshots"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    case_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("proactive_cases.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    snapshot_key: Mapped[str] = mapped_column(String(220), nullable=False, unique=True)
+    context: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    model_input: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    omitted_context: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    taint: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        Index("ix_proactive_context_snapshots_case_created", "case_id", "created_at"),
+    )
+
+
+class ProactiveDecisionRecord(Base):
+    __tablename__ = "proactive_decisions"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    case_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("proactive_cases.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    context_snapshot_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("proactive_context_snapshots.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    provider_response_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    decision_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    urgency: Mapped[str] = mapped_column(String(32), nullable=False)
+    user_visible_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    rationale: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence_refs: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    tool_refs: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    actions: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    follow_up: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    raw_model_output: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
 
     __table_args__ = (
         CheckConstraint(
             (
-                "event_type IN ('detected', 'updated', 'notified', 'acknowledged', "
-                "'snoozed', 'resolved', 'cancelled', 'expired', 'follow_up_queued', "
-                "'refreshed')"
+                "decision_type IN ('ignore', 'remember', 'wait', 'observe_more', "
+                "'speak_now', 'ask_user', 'act_now', 'speak_and_act')"
             ),
-            name="ck_attention_item_event_type",
+            name="ck_proactive_decision_type",
         ),
+        CheckConstraint(
+            "status IN ('proposed', 'invalid', 'validated', 'executed', 'ignored')",
+            name="ck_proactive_decision_status",
+        ),
+        CheckConstraint(
+            "urgency IN ('critical', 'high', 'normal', 'low')",
+            name="ck_proactive_decision_urgency",
+        ),
+        CheckConstraint(
+            "confidence >= 0.0 AND confidence <= 1.0",
+            name="ck_proactive_decision_confidence",
+        ),
+        Index("ix_proactive_decisions_case_created", "case_id", "created_at"),
+    )
+
+
+class ProactivePolicyValidationRecord(Base):
+    __tablename__ = "proactive_policy_validations"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    case_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("proactive_cases.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    decision_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("proactive_decisions.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    result: Mapped[str] = mapped_column(String(32), nullable=False)
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    action_plan_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    constraints: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    denial_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            (
+                "result IN ('authorized', 'authorized_with_constraints', 'denied', "
+                "'needs_user_authority', 'stale_context', 'invalid_decision', "
+                "'duplicate', 'dead_letter')"
+            ),
+            name="ck_proactive_policy_validation_result",
+        ),
+        Index("ix_proactive_policy_validations_decision", "decision_id", "created_at"),
+    )
+
+
+class ProactiveTurnRecord(Base):
+    __tablename__ = "proactive_turns"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    case_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("proactive_cases.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    decision_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("proactive_decisions.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    dedupe_key: Mapped[str] = mapped_column(String(220), nullable=False, unique=True)
+    origin: Mapped[str] = mapped_column(String(32), nullable=False, default="proactive")
+    channel: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    delivery_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    acked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            ("status IN ('pending', 'delivered', 'acknowledged', 'failed', 'cancelled')"),
+            name="ck_proactive_turn_status",
+        ),
+        CheckConstraint("origin IN ('proactive')", name="ck_proactive_turn_origin"),
+        CheckConstraint("channel IN ('discord')", name="ck_proactive_turn_channel"),
+        Index("ix_proactive_turns_status_updated", "status", "updated_at"),
+    )
+
+
+class ProactiveActionPlanRecord(Base):
+    __tablename__ = "proactive_action_plans"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    case_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("proactive_cases.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    decision_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("proactive_decisions.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    plan_key: Mapped[str] = mapped_column(String(220), nullable=False, unique=True)
+    action_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    target: Mapped[str] = mapped_column(String(160), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    payload_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    risk_tier: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    policy_validation_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("proactive_policy_validations.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            (
+                "status IN ('proposed', 'authorized', 'denied', 'executing', "
+                "'succeeded', 'failed', 'cancelled')"
+            ),
+            name="ck_proactive_action_plan_status",
+        ),
+        CheckConstraint(
+            "risk_tier IN ('low', 'medium', 'high', 'blocked')",
+            name="ck_proactive_action_plan_risk_tier",
+        ),
+        Index("ix_proactive_action_plans_case_status", "case_id", "status", "updated_at"),
+    )
+
+
+class ProactiveActionExecutionRecord(Base):
+    __tablename__ = "proactive_action_executions"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    action_plan_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("proactive_action_plans.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(220), nullable=False, unique=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    external_receipt: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'running', 'succeeded', 'failed')",
+            name="ck_proactive_action_execution_status",
+        ),
+    )
+
+
+class AutonomyScopeRecord(Base):
+    __tablename__ = "autonomy_scopes"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    scope_key: Mapped[str] = mapped_column(String(220), nullable=False, unique=True)
+    actor: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_context: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    action_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    target_system: Mapped[str] = mapped_column(String(128), nullable=False)
+    allowed_target_systems: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    allowed_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    allowed_payload_shape: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict
+    )
+    max_impact: Mapped[str] = mapped_column(String(32), nullable=False)
+    revocation_rule: Mapped[str] = mapped_column(Text, nullable=False)
+    notification_rule: Mapped[str] = mapped_column(String(32), nullable=False)
+    audit_visibility: Mapped[str] = mapped_column(String(32), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('active', 'paused', 'revoked')",
+            name="ck_autonomy_scope_status",
+        ),
+        CheckConstraint(
+            "max_impact IN ('low', 'medium', 'high')",
+            name="ck_autonomy_scope_max_impact",
+        ),
+        CheckConstraint(
+            "notification_rule IN ('silent_audit', 'notify_after', 'notify_before')",
+            name="ck_autonomy_scope_notification_rule",
+        ),
+        CheckConstraint(
+            "audit_visibility IN ('private', 'operator_visible')",
+            name="ck_autonomy_scope_audit_visibility",
+        ),
+        CheckConstraint("version >= 1", name="ck_autonomy_scope_version"),
+        Index("ix_autonomy_scopes_status_action", "status", "action_type", "target_system"),
     )
 
 
@@ -2141,73 +2228,43 @@ class ProactiveFeedbackRecord(Base):
     __tablename__ = "proactive_feedback"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    attention_item_id: Mapped[str] = mapped_column(
+    case_id: Mapped[str] = mapped_column(
         String(32),
-        ForeignKey("attention_items.id", ondelete="RESTRICT"),
+        ForeignKey("proactive_cases.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
     feedback_type: Mapped[str] = mapped_column(String(32), nullable=False)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )
 
     __table_args__ = (
         CheckConstraint(
-            "feedback_type IN ('important', 'noise', 'wrong', 'useful')",
+            (
+                "feedback_type IN ('ack', 'correct', 'stop_pattern', 'more_aggressive', "
+                "'useful', 'wrong', 'automatic_next_time')"
+            ),
             name="ck_proactive_feedback_type",
         ),
     )
 
 
-class ProactiveFeedbackRuleRecord(Base):
-    __tablename__ = "proactive_feedback_rules"
+class ProactiveLearningRecord(Base):
+    __tablename__ = "proactive_learning_records"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    rule_key: Mapped[str] = mapped_column(String(160), nullable=False, unique=True)
-    rule_type: Mapped[str] = mapped_column(String(32), nullable=False)
-    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
-    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
-    conditions: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    effect: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, index=True
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, index=True
-    )
-
-    __table_args__ = (
-        CheckConstraint(
-            "rule_type IN ('ranking', 'grouping', 'delivery', 'suppression')",
-            name="ck_proactive_feedback_rule_type",
-        ),
-        CheckConstraint(
-            "status IN ('active', 'paused', 'archived')",
-            name="ck_proactive_feedback_rule_status",
-        ),
-        CheckConstraint("priority >= 0", name="ck_proactive_feedback_rule_priority"),
-        Index("ix_proactive_feedback_rules_status_priority", "status", "priority", "updated_at"),
-    )
-
-
-class ActionProposalRecord(Base):
-    __tablename__ = "action_proposals"
-
-    id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    attention_item_id: Mapped[str] = mapped_column(
+    feedback_id: Mapped[str | None] = mapped_column(
         String(32),
-        ForeignKey("attention_items.id", ondelete="RESTRICT"),
-        nullable=False,
+        ForeignKey("proactive_feedback.id", ondelete="RESTRICT"),
+        nullable=True,
         index=True,
     )
-    capability_id: Mapped[str] = mapped_column(String(128), nullable=False)
-    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    payload_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    record_type: Mapped[str] = mapped_column(String(32), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
-    policy_state: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    evidence: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    content: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )
@@ -2217,8 +2274,12 @@ class ActionProposalRecord(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('proposed', 'approved', 'rejected', 'superseded')",
-            name="ck_action_proposal_status",
+            "record_type IN ('instruction', 'example', 'calibration', 'preference', 'autonomy_request')",
+            name="ck_proactive_learning_record_type",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'superseded', 'rejected')",
+            name="ck_proactive_learning_record_status",
         ),
     )
 
@@ -2254,11 +2315,9 @@ class BackgroundTaskRecord(Base):
                 "'expire_approvals', 'reap_stale_tasks', "
                 "'provider_subscription_renewal_due', 'provider_event_received', "
                 "'provider_sync_due', 'memory_extract_turn', "
-                "'workspace_signal_derivation_due', "
-                "'attention_feature_extraction_due', 'attention_grouping_due', "
-                "'attention_ranking_due', 'attention_review_due', 'attention_delivery_due', "
-                "'attention_item_follow_up_due', 'proactive_feedback_review_due', "
-                "'action_proposal_review_due', 'execute_action_attempt')"
+                "'workspace_observation_derivation_due', 'proactive_deliberation_due', "
+                "'proactive_follow_up_due', 'proactive_feedback_learning_due', "
+                "'proactive_action_execution_due', 'execute_action_attempt')"
             ),
             name="ck_background_task_type",
         ),
@@ -2430,7 +2489,7 @@ class NotificationRecord(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "source_type IN ('agency_event', 'attention_item', 'approval', 'connector_event')",
+            "source_type IN ('agency_event', 'proactive_turn', 'approval', 'connector_event')",
             name="ck_notification_source_type",
         ),
         CheckConstraint("channel IN ('discord')", name="ck_notification_channel"),
@@ -2670,7 +2729,7 @@ def serialize_sync_run(run: SyncRunRecord) -> dict[str, Any]:
         "cursor_after": redact_text(run.cursor_after) if run.cursor_after else None,
         "status": run.status,
         "item_count": run.item_count,
-        "signal_count": run.signal_count,
+        "observation_count": run.observation_count,
         "error": redact_text(run.error) if run.error is not None else None,
         "started_at": to_rfc3339(run.started_at) if run.started_at is not None else None,
         "completed_at": to_rfc3339(run.completed_at) if run.completed_at is not None else None,
@@ -2708,169 +2767,214 @@ def serialize_workspace_item_event(event: WorkspaceItemEventRecord) -> dict[str,
     }
 
 
-def serialize_attention_signal(signal: AttentionSignalRecord) -> dict[str, Any]:
+def serialize_proactive_observation(observation: ProactiveObservationRecord) -> dict[str, Any]:
     return {
-        "id": signal.id,
-        "workspace_item_id": signal.workspace_item_id,
-        "source_type": signal.source_type,
-        "source_id": signal.source_id,
-        "dedupe_key": signal.dedupe_key,
-        "status": signal.status,
-        "priority": signal.priority,
-        "urgency": signal.urgency,
-        "confidence": signal.confidence,
-        "title": redact_text(signal.title),
-        "body": redact_text(signal.body),
-        "reason": redact_text(signal.reason),
-        "evidence": redact_json_value(signal.evidence),
-        "taint": redact_json_value(signal.taint),
-        "created_at": to_rfc3339(signal.created_at),
-        "updated_at": to_rfc3339(signal.updated_at),
+        "id": observation.id,
+        "workspace_item_id": observation.workspace_item_id,
+        "source_type": observation.source_type,
+        "source_id": observation.source_id,
+        "dedupe_key": observation.dedupe_key,
+        "observation_type": observation.observation_type,
+        "subject": redact_text(observation.subject),
+        "summary": redact_text(observation.summary),
+        "payload": redact_json_value(observation.payload),
+        "evidence": redact_json_value(observation.evidence),
+        "taint": redact_json_value(observation.taint),
+        "trust_boundary": observation.trust_boundary,
+        "status": observation.status,
+        "observed_at": to_rfc3339(observation.observed_at),
+        "created_at": to_rfc3339(observation.created_at),
+        "updated_at": to_rfc3339(observation.updated_at),
     }
 
 
-def serialize_attention_group(group: AttentionGroupRecord) -> dict[str, Any]:
+def serialize_proactive_case(case: ProactiveCaseRecord) -> dict[str, Any]:
     return {
-        "id": group.id,
-        "group_key": group.group_key,
-        "group_type": group.group_type,
-        "status": group.status,
-        "title": redact_text(group.title),
-        "summary": redact_text(group.summary),
-        "metadata": redact_json_value(group.group_metadata),
-        "created_at": to_rfc3339(group.created_at),
-        "updated_at": to_rfc3339(group.updated_at),
+        "id": case.id,
+        "case_key": case.case_key,
+        "status": case.status,
+        "title": redact_text(case.title),
+        "summary": redact_text(case.summary),
+        "latest_observation_id": case.latest_observation_id,
+        "last_decision_id": case.last_decision_id,
+        "next_recheck_after": (
+            to_rfc3339(case.next_recheck_after) if case.next_recheck_after is not None else None
+        ),
+        "created_at": to_rfc3339(case.created_at),
+        "updated_at": to_rfc3339(case.updated_at),
     }
 
 
-def serialize_attention_rank_feature(feature: AttentionRankFeatureRecord) -> dict[str, Any]:
+def serialize_proactive_case_event(event: ProactiveCaseEventRecord) -> dict[str, Any]:
     return {
-        "id": feature.id,
-        "attention_signal_id": feature.attention_signal_id,
-        "feature_set_version": feature.feature_set_version,
-        "features": redact_json_value(feature.features),
-        "score_components": redact_json_value(feature.score_components),
-        "created_at": to_rfc3339(feature.created_at),
+        "id": event.id,
+        "case_id": event.case_id,
+        "event_type": event.event_type,
+        "payload": redact_json_value(event.payload),
+        "created_at": to_rfc3339(event.created_at),
     }
 
 
-def serialize_attention_rank_snapshot(snapshot: AttentionRankSnapshotRecord) -> dict[str, Any]:
+def serialize_proactive_context_snapshot(
+    snapshot: ProactiveContextSnapshotRecord,
+) -> dict[str, Any]:
     return {
         "id": snapshot.id,
-        "group_id": snapshot.group_id,
+        "case_id": snapshot.case_id,
         "snapshot_key": snapshot.snapshot_key,
-        "ranker_version": snapshot.ranker_version,
-        "source_signal_ids": snapshot.source_signal_ids,
-        "rank_score": snapshot.rank_score,
-        "rank_inputs": redact_json_value(snapshot.rank_inputs),
-        "rank_reason": redact_text(snapshot.rank_reason),
-        "delivery_decision": snapshot.delivery_decision,
-        "delivery_reason": redact_text(snapshot.delivery_reason),
-        "suppression_reason": (
-            redact_text(snapshot.suppression_reason)
-            if snapshot.suppression_reason is not None
-            else None
-        ),
-        "next_follow_up_after": (
-            to_rfc3339(snapshot.next_follow_up_after)
-            if snapshot.next_follow_up_after is not None
-            else None
-        ),
-        "priority": snapshot.priority,
-        "urgency": snapshot.urgency,
-        "confidence": snapshot.confidence,
-        "title": redact_text(snapshot.title),
-        "body": redact_text(snapshot.body),
-        "evidence": redact_json_value(snapshot.evidence),
+        "context": redact_json_value(snapshot.context),
+        "model_input": redact_json_value(snapshot.model_input),
+        "omitted_context": redact_json_value(snapshot.omitted_context),
         "taint": redact_json_value(snapshot.taint),
         "created_at": to_rfc3339(snapshot.created_at),
     }
 
 
-def serialize_action_proposal(proposal: ActionProposalRecord) -> dict[str, Any]:
+def serialize_proactive_decision(decision: ProactiveDecisionRecord) -> dict[str, Any]:
     return {
-        "id": proposal.id,
-        "attention_item_id": proposal.attention_item_id,
-        "capability_id": proposal.capability_id,
-        "payload": redact_json_value(proposal.payload),
-        "payload_hash": proposal.payload_hash,
-        "status": proposal.status,
-        "policy_state": redact_json_value(proposal.policy_state),
-        "evidence": redact_json_value(proposal.evidence),
-        "created_at": to_rfc3339(proposal.created_at),
-        "updated_at": to_rfc3339(proposal.updated_at),
+        "id": decision.id,
+        "case_id": decision.case_id,
+        "context_snapshot_id": decision.context_snapshot_id,
+        "provider": decision.provider,
+        "model": decision.model,
+        "provider_response_id": decision.provider_response_id,
+        "decision_type": decision.decision_type,
+        "status": decision.status,
+        "confidence": decision.confidence,
+        "urgency": decision.urgency,
+        "user_visible_message": (
+            redact_text(decision.user_visible_message)
+            if decision.user_visible_message is not None
+            else None
+        ),
+        "rationale": redact_text(decision.rationale),
+        "evidence_refs": decision.evidence_refs,
+        "tool_refs": decision.tool_refs,
+        "actions": redact_json_value(decision.actions),
+        "follow_up": redact_json_value(decision.follow_up),
+        "raw_model_output": redact_json_value(decision.raw_model_output),
+        "created_at": to_rfc3339(decision.created_at),
+    }
+
+
+def serialize_proactive_policy_validation(
+    validation: ProactivePolicyValidationRecord,
+) -> dict[str, Any]:
+    return {
+        "id": validation.id,
+        "case_id": validation.case_id,
+        "decision_id": validation.decision_id,
+        "result": validation.result,
+        "policy_version": validation.policy_version,
+        "action_plan_hash": validation.action_plan_hash,
+        "constraints": redact_json_value(validation.constraints),
+        "denial_reason": (
+            redact_text(validation.denial_reason) if validation.denial_reason is not None else None
+        ),
+        "created_at": to_rfc3339(validation.created_at),
+    }
+
+
+def serialize_proactive_turn(turn: ProactiveTurnRecord) -> dict[str, Any]:
+    return {
+        "id": turn.id,
+        "case_id": turn.case_id,
+        "decision_id": turn.decision_id,
+        "dedupe_key": turn.dedupe_key,
+        "origin": turn.origin,
+        "channel": turn.channel,
+        "status": turn.status,
+        "message": redact_text(turn.message),
+        "delivery_payload": redact_json_value(turn.delivery_payload),
+        "delivered_at": to_rfc3339(turn.delivered_at) if turn.delivered_at is not None else None,
+        "acked_at": to_rfc3339(turn.acked_at) if turn.acked_at is not None else None,
+        "created_at": to_rfc3339(turn.created_at),
+        "updated_at": to_rfc3339(turn.updated_at),
+    }
+
+
+def serialize_proactive_action_plan(plan: ProactiveActionPlanRecord) -> dict[str, Any]:
+    return {
+        "id": plan.id,
+        "case_id": plan.case_id,
+        "decision_id": plan.decision_id,
+        "plan_key": plan.plan_key,
+        "action_type": plan.action_type,
+        "target": plan.target,
+        "payload": redact_json_value(plan.payload),
+        "payload_hash": plan.payload_hash,
+        "risk_tier": plan.risk_tier,
+        "status": plan.status,
+        "policy_validation_id": plan.policy_validation_id,
+        "created_at": to_rfc3339(plan.created_at),
+        "updated_at": to_rfc3339(plan.updated_at),
+    }
+
+
+def serialize_proactive_action_execution(
+    execution: ProactiveActionExecutionRecord,
+) -> dict[str, Any]:
+    return {
+        "id": execution.id,
+        "action_plan_id": execution.action_plan_id,
+        "idempotency_key": execution.idempotency_key,
+        "status": execution.status,
+        "external_receipt": redact_json_value(execution.external_receipt),
+        "error": redact_text(execution.error) if execution.error is not None else None,
+        "started_at": to_rfc3339(execution.started_at)
+        if execution.started_at is not None
+        else None,
+        "completed_at": (
+            to_rfc3339(execution.completed_at) if execution.completed_at is not None else None
+        ),
+        "created_at": to_rfc3339(execution.created_at),
+        "updated_at": to_rfc3339(execution.updated_at),
+    }
+
+
+def serialize_autonomy_scope(scope: AutonomyScopeRecord) -> dict[str, Any]:
+    return {
+        "id": scope.id,
+        "scope_key": scope.scope_key,
+        "actor": scope.actor,
+        "source_context": redact_json_value(scope.source_context),
+        "action_type": scope.action_type,
+        "target_system": scope.target_system,
+        "allowed_target_systems": list(scope.allowed_target_systems),
+        "allowed_payload": redact_json_value(scope.allowed_payload),
+        "allowed_payload_shape": redact_json_value(scope.allowed_payload_shape),
+        "max_impact": scope.max_impact,
+        "revocation_rule": redact_text(scope.revocation_rule),
+        "notification_rule": scope.notification_rule,
+        "audit_visibility": scope.audit_visibility,
+        "version": scope.version,
+        "status": scope.status,
+        "revoked_at": to_rfc3339(scope.revoked_at) if scope.revoked_at is not None else None,
+        "created_at": to_rfc3339(scope.created_at),
+        "updated_at": to_rfc3339(scope.updated_at),
     }
 
 
 def serialize_proactive_feedback(feedback: ProactiveFeedbackRecord) -> dict[str, Any]:
     return {
         "id": feedback.id,
-        "attention_item_id": feedback.attention_item_id,
+        "case_id": feedback.case_id,
         "feedback_type": feedback.feedback_type,
         "note": redact_text(feedback.note) if feedback.note is not None else None,
+        "payload": redact_json_value(feedback.payload),
         "created_at": to_rfc3339(feedback.created_at),
     }
 
 
-def serialize_proactive_feedback_rule(rule: ProactiveFeedbackRuleRecord) -> dict[str, Any]:
+def serialize_proactive_learning_record(record: ProactiveLearningRecord) -> dict[str, Any]:
     return {
-        "id": rule.id,
-        "rule_key": rule.rule_key,
-        "rule_type": rule.rule_type,
-        "status": rule.status,
-        "priority": rule.priority,
-        "conditions": redact_json_value(rule.conditions),
-        "effect": redact_json_value(rule.effect),
-        "created_at": to_rfc3339(rule.created_at),
-        "updated_at": to_rfc3339(rule.updated_at),
-    }
-
-
-def serialize_attention_item(item: AttentionItemRecord) -> dict[str, Any]:
-    return {
-        "id": item.id,
-        "group_id": item.group_id,
-        "rank_snapshot_id": item.rank_snapshot_id,
-        "source_type": item.source_type,
-        "source_id": item.source_id,
-        "source_signal_ids": item.source_signal_ids,
-        "dedupe_key": item.dedupe_key,
-        "status": item.status,
-        "priority": item.priority,
-        "urgency": item.urgency,
-        "confidence": item.confidence,
-        "title": redact_text(item.title),
-        "body": redact_text(item.body),
-        "reason": redact_text(item.reason),
-        "evidence": redact_json_value(item.evidence),
-        "taint": redact_json_value(item.taint),
-        "rank_score": item.rank_score,
-        "rank_inputs": redact_json_value(item.rank_inputs),
-        "rank_reason": redact_text(item.rank_reason),
-        "delivery_decision": item.delivery_decision,
-        "delivery_reason": redact_text(item.delivery_reason),
-        "suppression_reason": (
-            redact_text(item.suppression_reason) if item.suppression_reason is not None else None
-        ),
-        "expires_at": to_rfc3339(item.expires_at) if item.expires_at is not None else None,
-        "next_follow_up_after": (
-            to_rfc3339(item.next_follow_up_after) if item.next_follow_up_after is not None else None
-        ),
-        "last_notified_at": (
-            to_rfc3339(item.last_notified_at) if item.last_notified_at is not None else None
-        ),
-        "created_at": to_rfc3339(item.created_at),
-        "updated_at": to_rfc3339(item.updated_at),
-    }
-
-
-def serialize_attention_item_event(event: AttentionItemEventRecord) -> dict[str, Any]:
-    return {
-        "id": event.id,
-        "attention_item_id": event.attention_item_id,
-        "event_type": event.event_type,
-        "payload": redact_json_value(event.payload),
-        "created_at": to_rfc3339(event.created_at),
+        "id": record.id,
+        "feedback_id": record.feedback_id,
+        "record_type": record.record_type,
+        "status": record.status,
+        "content": redact_json_value(record.content),
+        "created_at": to_rfc3339(record.created_at),
+        "updated_at": to_rfc3339(record.updated_at),
     }
 
 

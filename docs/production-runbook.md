@@ -119,6 +119,9 @@ Required worker settings:
 ```sh
 ARIEL_WORKER_POLL_SECONDS=1.0
 ARIEL_WORKER_HEARTBEAT_TIMEOUT_SECONDS=300
+ARIEL_PROACTIVE_AMBIENT_INTERVAL_SECONDS=60
+ARIEL_PROACTIVE_WORKER_MAX_ATTEMPTS=5
+ARIEL_PROACTIVE_DELIBERATION_TOOL_ROUNDS=2
 ```
 
 Required provider callback settings when Google provider ingress is enabled:
@@ -127,10 +130,15 @@ Required provider callback settings when Google provider ingress is enabled:
 ARIEL_GOOGLE_PROVIDER_EVENT_TOKEN=<shared-google-callback-token>
 ```
 
-The same `ariel-worker` service owns provider event sync, workspace signal derivation,
-attention feature extraction, grouping, ranking, review, delivery, feedback review,
-attention-item follow-ups, approval expiry, Agency event ingestion, and Discord
-notification delivery. There is no separate scheduler process.
+The same `ariel-worker` service owns provider event sync, ambient observation
+derivation, model deliberation, policy validation, proactive turn delivery,
+autonomous action execution, feedback learning, follow-ups, approval expiry,
+Agency event ingestion, and Discord notification delivery. There is no separate
+scheduler process. Ambient observation derivation is worker-owned and runs on
+`ARIEL_PROACTIVE_AMBIENT_INTERVAL_SECONDS`; the manual derivation endpoint is an
+operator replay/control path, not the normal sensing loop. Proactive deliberation
+can call read-only tools for at most `ARIEL_PROACTIVE_DELIBERATION_TOOL_ROUNDS`
+rounds before it must return a structured decision or fail closed.
 
 Set provider keys only for enabled capabilities:
 
@@ -217,19 +225,31 @@ curl -s http://127.0.0.1:8000/v1/connectors/google/sync-cursors
 curl -s http://127.0.0.1:8000/v1/provider-events
 curl -s http://127.0.0.1:8000/v1/sync-runs
 curl -s http://127.0.0.1:8000/v1/workspace-items
-curl -s http://127.0.0.1:8000/v1/attention-signals
-curl -s http://127.0.0.1:8000/v1/attention-rank-features
-curl -s http://127.0.0.1:8000/v1/attention-groups
-curl -s http://127.0.0.1:8000/v1/attention-rank-snapshots
-curl -s http://127.0.0.1:8000/v1/attention-items
-curl -s http://127.0.0.1:8000/v1/proactive-feedback-rules
+curl -s http://127.0.0.1:8000/v1/proactive/observations
+curl -s http://127.0.0.1:8000/v1/proactive/cases
+curl -s http://127.0.0.1:8000/v1/proactive/turns
+curl -s http://127.0.0.1:8000/v1/proactive/autonomy-scopes
+curl -s http://127.0.0.1:8000/v1/proactive/learning-records
 ```
 
-Force sync and signal derivation only through explicit mutation endpoints:
+Inspect one proactive case end to end:
+
+```sh
+case_id=<case-id>
+curl -s "http://127.0.0.1:8000/v1/proactive/cases/${case_id}"
+curl -s "http://127.0.0.1:8000/v1/proactive/cases/${case_id}/events"
+curl -s "http://127.0.0.1:8000/v1/proactive/cases/${case_id}/context-snapshots"
+curl -s "http://127.0.0.1:8000/v1/proactive/cases/${case_id}/decisions"
+curl -s "http://127.0.0.1:8000/v1/proactive/cases/${case_id}/validations"
+curl -s "http://127.0.0.1:8000/v1/proactive/cases/${case_id}/actions"
+```
+
+Force sync and observation derivation through explicit mutation endpoints when replaying
+or diagnosing a specific source:
 
 ```sh
 curl -X POST 'http://127.0.0.1:8000/v1/connectors/google/sync?resource_type=calendar&resource_id=primary'
-curl -X POST http://127.0.0.1:8000/v1/attention-signals/derive
+curl -X POST http://127.0.0.1:8000/v1/proactive/observations/derive
 ```
 
 System health:
@@ -325,6 +345,14 @@ OpenAI:
 - Confirm `ARIEL_OPENAI_API_KEY` is valid.
 - Confirm Responses calls use `store: false`.
 - Do not persist raw reasoning items during incident capture.
+
+Proactive worker:
+
+- Confirm `ariel-worker` is running before treating ambient sensing as healthy.
+- `failed` proactive tasks with attempts remaining are recovered to `pending` by the
+  worker and retried under their existing `max_attempts` budget.
+- Use `dead_letter` only when the retry budget is exhausted or an operator intentionally
+  stops a task.
 
 ## Acceptance Criteria
 

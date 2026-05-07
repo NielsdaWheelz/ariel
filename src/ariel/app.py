@@ -69,17 +69,10 @@ from ariel.memory import (
 )
 from ariel.persistence import (
     ActionAttemptRecord,
-    ActionProposalRecord,
     ApprovalRequestRecord,
+    AutonomyScopeRecord,
     AgencyEventRecord,
     ArtifactRecord,
-    AttentionGroupRecord,
-    AttentionItemEventRecord,
-    AttentionItemRecord,
-    AttentionRankFeatureRecord,
-    AttentionRankSnapshotRecord,
-    AttentionSignalRecord,
-    BackgroundTaskRecord,
     CaptureRecord,
     ConnectorSubscriptionRecord,
     EventRecord,
@@ -87,7 +80,16 @@ from ariel.persistence import (
     JobRecord,
     NotificationRecord,
     ProactiveFeedbackRecord,
-    ProactiveFeedbackRuleRecord,
+    ProactiveActionExecutionRecord,
+    ProactiveActionPlanRecord,
+    ProactiveCaseEventRecord,
+    ProactiveCaseRecord,
+    ProactiveContextSnapshotRecord,
+    ProactiveDecisionRecord,
+    ProactiveLearningRecord,
+    ProactiveObservationRecord,
+    ProactivePolicyValidationRecord,
+    ProactiveTurnRecord,
     ProviderEventRecord,
     SessionRecord,
     SessionRotationRecord,
@@ -97,23 +99,26 @@ from ariel.persistence import (
     TurnRecord,
     WorkspaceItemEventRecord,
     WorkspaceItemRecord,
-    serialize_action_proposal,
     serialize_agency_event,
     serialize_artifact,
-    serialize_attention_group,
-    serialize_attention_item,
-    serialize_attention_item_event,
-    serialize_attention_rank_feature,
-    serialize_attention_rank_snapshot,
-    serialize_attention_signal,
+    serialize_autonomy_scope,
     serialize_capture,
     serialize_connector_subscription,
     serialize_action_attempt,
     serialize_job,
     serialize_job_event,
     serialize_notification,
+    serialize_proactive_action_execution,
+    serialize_proactive_action_plan,
+    serialize_proactive_case,
+    serialize_proactive_case_event,
+    serialize_proactive_context_snapshot,
+    serialize_proactive_decision,
     serialize_proactive_feedback,
-    serialize_proactive_feedback_rule,
+    serialize_proactive_learning_record,
+    serialize_proactive_observation,
+    serialize_proactive_policy_validation,
+    serialize_proactive_turn,
     serialize_provider_event,
     serialize_session,
     serialize_sync_cursor,
@@ -123,18 +128,11 @@ from ariel.persistence import (
     serialize_workspace_item_event,
     to_rfc3339,
 )
-from ariel.redaction import redact_text, safe_failure_reason
+from ariel.redaction import redact_json_value, redact_text, safe_failure_reason
 from ariel.response_contracts import (
     ResponseContractViolation,
-    build_surface_action_proposal_list_response,
-    build_surface_attention_feedback_response,
-    build_surface_attention_group_list_response,
-    build_surface_attention_item_event_list_response,
-    build_surface_attention_item_list_response,
-    build_surface_attention_item_response,
-    build_surface_attention_rank_feature_list_response,
-    build_surface_attention_rank_snapshot_list_response,
-    build_surface_attention_signal_list_response,
+    build_surface_autonomy_scope_list_response,
+    build_surface_autonomy_scope_response,
     build_surface_artifact_response,
     build_surface_approval_response,
     build_surface_capture_failure_response,
@@ -144,7 +142,17 @@ from ariel.response_contracts import (
     build_surface_memory_search_response,
     build_surface_message_response,
     build_surface_provider_event_list_response,
-    build_surface_proactive_feedback_rule_list_response,
+    build_surface_proactive_action_list_response,
+    build_surface_proactive_case_event_list_response,
+    build_surface_proactive_case_list_response,
+    build_surface_proactive_case_response,
+    build_surface_proactive_context_snapshot_list_response,
+    build_surface_proactive_decision_list_response,
+    build_surface_proactive_feedback_response,
+    build_surface_proactive_learning_record_list_response,
+    build_surface_proactive_observation_list_response,
+    build_surface_proactive_policy_validation_list_response,
+    build_surface_proactive_turn_list_response,
     build_surface_rotation_list_response,
     build_surface_rotation_response,
     build_surface_sync_cursor_list_response,
@@ -165,6 +173,66 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}_{ulid.new().str.lower()}"
 
 
+def _proactive_case_not_found(case_id: str) -> ApiError:
+    return ApiError(
+        status_code=404,
+        code="E_PROACTIVE_CASE_NOT_FOUND",
+        message="proactive case not found",
+        details={"case_id": case_id},
+        retryable=False,
+    )
+
+
+def _require_proactive_case(db: Session, case_id: str) -> ProactiveCaseRecord:
+    proactive_case = db.get(ProactiveCaseRecord, case_id)
+    if proactive_case is None:
+        raise _proactive_case_not_found(case_id)
+    return proactive_case
+
+
+def _proactive_case_controls(case_id: str, *, undo_supported: bool) -> list[dict[str, str]]:
+    controls = [
+        {"id": "ack", "method": "POST", "path": f"/v1/proactive/cases/{case_id}/ack"},
+        {
+            "id": "correct",
+            "method": "POST",
+            "path": f"/v1/proactive/cases/{case_id}/correct",
+        },
+        {
+            "id": "stop_pattern",
+            "method": "POST",
+            "path": f"/v1/proactive/cases/{case_id}/stop-pattern",
+        },
+        {
+            "id": "more_aggressive",
+            "method": "POST",
+            "path": f"/v1/proactive/cases/{case_id}/more-aggressive",
+        },
+        {
+            "id": "inspect_why",
+            "method": "GET",
+            "path": f"/v1/proactive/cases/{case_id}/inspect-why",
+        },
+    ]
+    if undo_supported:
+        controls.append(
+            {"id": "undo", "method": "POST", "path": f"/v1/proactive/cases/{case_id}/undo"}
+        )
+    return controls
+
+
+def _proactive_undo_metadata(
+    executions: Sequence[ProactiveActionExecutionRecord],
+) -> tuple[ProactiveActionExecutionRecord, dict[str, Any]] | None:
+    for execution in executions:
+        if execution.status != "succeeded" or not isinstance(execution.external_receipt, dict):
+            continue
+        undo = execution.external_receipt.get("undo")
+        if isinstance(undo, dict) and undo.get("supported") is not False:
+            return execution, undo
+    return None
+
+
 _ACTIVE_SESSION_LOCK_ID = 24_310_001
 _ALLOWED_ROTATION_REASONS = {
     "user_initiated",
@@ -178,7 +246,7 @@ _CONTEXT_SECTION_ORDER = (
     "recent_active_session_turns",
     "memory_context",
     "open_commitments_and_jobs",
-    "relevant_artifacts_and_signals",
+    "relevant_artifacts_and_observations",
 )
 
 _CONTEXT_AUDIT_SCHEMA_VERSION = "1.0"
@@ -441,24 +509,20 @@ class AgencyEventRequest(BaseModel):
         return self
 
 
-class AttentionSnoozeRequest(BaseModel):
+class ProactiveFeedbackRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    snooze_until: datetime
-
-    @field_validator("snooze_until")
-    @classmethod
-    def _snooze_until_must_have_timezone(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("snooze_until must include a timezone")
-        return value
-
-
-class AttentionFeedbackRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    feedback_type: Literal["important", "noise", "wrong", "useful"]
+    feedback_type: Literal[
+        "ack",
+        "correct",
+        "stop_pattern",
+        "more_aggressive",
+        "useful",
+        "wrong",
+        "automatic_next_time",
+    ]
     note: str | None = Field(default=None, max_length=2000)
+    payload: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("note")
     @classmethod
@@ -467,6 +531,49 @@ class AttentionFeedbackRequest(BaseModel):
             return None
         normalized = value.strip()
         return normalized or None
+
+
+class AutonomyScopeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    actor: str = Field(default="user.local", max_length=128)
+    source_context: dict[str, Any] = Field(default_factory=dict)
+    action_type: str = Field(max_length=128)
+    target_system: str = Field(max_length=128)
+    allowed_target_systems: list[str] = Field(default_factory=list, max_length=20)
+    allowed_payload: dict[str, Any] = Field(default_factory=dict)
+    allowed_payload_shape: dict[str, Any] = Field(default_factory=dict)
+    max_impact: Literal["low", "medium", "high"] = "low"
+    revocation_rule: str = Field(default="user can revoke this scope at any time", max_length=500)
+    notification_rule: Literal["silent_audit", "notify_after", "notify_before"] = "notify_after"
+    audit_visibility: Literal["private", "operator_visible"] = "operator_visible"
+
+    @field_validator("actor", "action_type", "target_system")
+    @classmethod
+    def _required_scope_text_must_not_be_blank(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("value must not be blank")
+        return normalized
+
+    @field_validator("revocation_rule")
+    @classmethod
+    def _revocation_rule_must_not_be_blank(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("revocation_rule must not be blank")
+        return normalized
+
+    @field_validator("allowed_target_systems")
+    @classmethod
+    def _allowed_target_systems_must_not_be_blank(cls, value: list[str]) -> list[str]:
+        normalized = []
+        for item in value:
+            stripped = item.strip()
+            if not stripped:
+                raise ValueError("allowed_target_systems cannot include blank values")
+            normalized.append(stripped)
+        return normalized
 
 
 class WeatherDefaultLocationRequest(BaseModel):
@@ -715,9 +822,9 @@ def _build_responses_input_items(
                     }
                 )
 
-    relevant_artifacts_and_signals = context_bundle.get("relevant_artifacts_and_signals")
-    if isinstance(relevant_artifacts_and_signals, dict):
-        artifacts_raw = relevant_artifacts_and_signals.get("artifacts")
+    relevant_artifacts_and_observations = context_bundle.get("relevant_artifacts_and_observations")
+    if isinstance(relevant_artifacts_and_observations, dict):
+        artifacts_raw = relevant_artifacts_and_observations.get("artifacts")
         if isinstance(artifacts_raw, list) and artifacts_raw:
             artifact_lines: list[str] = []
             for artifact in artifacts_raw:
@@ -902,9 +1009,9 @@ def _estimate_context_tokens(*, context_bundle: dict[str, Any], user_message: st
                     if isinstance(raw_value, str):
                         token_total += _estimate_text_tokens(raw_value)
 
-    relevant_artifacts_and_signals = context_bundle.get("relevant_artifacts_and_signals")
-    if isinstance(relevant_artifacts_and_signals, dict):
-        artifacts_raw = relevant_artifacts_and_signals.get("artifacts")
+    relevant_artifacts_and_observations = context_bundle.get("relevant_artifacts_and_observations")
+    if isinstance(relevant_artifacts_and_observations, dict):
+        artifacts_raw = relevant_artifacts_and_observations.get("artifacts")
         if isinstance(artifacts_raw, list):
             for artifact in artifacts_raw:
                 if not isinstance(artifact, dict):
@@ -1667,7 +1774,7 @@ def _open_jobs_context(*, db: Session) -> list[dict[str, Any]]:
     return [serialize_job(job) for job in jobs]
 
 
-def _relevant_artifacts_and_signals_context(
+def _relevant_artifacts_and_observations_context(
     *,
     db: Session,
     prior_turns: Sequence[TurnRecord],
@@ -1676,7 +1783,7 @@ def _relevant_artifacts_and_signals_context(
     if not turn_ids:
         return {
             "artifacts": [],
-            "proactive_signals": [],
+            "proactive_observations": [],
         }
     artifacts = db.scalars(
         select(ArtifactRecord)
@@ -1686,7 +1793,7 @@ def _relevant_artifacts_and_signals_context(
     ).all()
     return {
         "artifacts": [serialize_artifact(artifact) for artifact in artifacts],
-        "proactive_signals": [],
+        "proactive_observations": [],
     }
 
 
@@ -1837,7 +1944,7 @@ def _build_turn_context_bundle(
     discord_context: dict[str, Any] | None,
     memory_context: dict[str, Any],
     open_commitments_and_jobs: dict[str, Any],
-    relevant_artifacts_and_signals: dict[str, Any],
+    relevant_artifacts_and_observations: dict[str, Any],
 ) -> dict[str, Any]:
     recent_turns = prior_turns[-max_recent_turns:]
     recent_active_session_turns = [
@@ -1887,7 +1994,7 @@ def _build_turn_context_bundle(
         "recent_active_session_turns": recent_active_session_turns,
         "memory_context": dict(memory_context),
         "open_commitments_and_jobs": dict(open_commitments_and_jobs),
-        "relevant_artifacts_and_signals": dict(relevant_artifacts_and_signals),
+        "relevant_artifacts_and_observations": dict(relevant_artifacts_and_observations),
         "recent_window": {
             "max_recent_turns": max_recent_turns,
             "included_turn_count": len(recent_active_session_turns),
@@ -2164,12 +2271,10 @@ def create_app(
                 "provider_events": "/v1/provider-events",
                 "sync_runs": "/v1/sync-runs",
                 "workspace_items": "/v1/workspace-items",
-                "attention_signals": "/v1/attention-signals",
-                "attention_rank_features": "/v1/attention-rank-features",
-                "attention_groups": "/v1/attention-groups",
-                "attention_rank_snapshots": "/v1/attention-rank-snapshots",
-                "attention_items": "/v1/attention-items",
-                "proactive_feedback_rules": "/v1/proactive-feedback-rules",
+                "proactive_observations": "/v1/proactive/observations",
+                "proactive_cases": "/v1/proactive/cases",
+                "proactive_turns": "/v1/proactive/turns",
+                "autonomy_scopes": "/v1/proactive/autonomy-scopes",
                 "jobs": "/v1/jobs",
                 "capture_records": "/v1/captures/record",
                 "notifications": "/v1/notifications",
@@ -3015,7 +3120,7 @@ def create_app(
             discord_context=discord_context,
             memory_context=pre_rotation_memory_context,
             open_commitments_and_jobs=pre_rotation_open_commitments_and_jobs,
-            relevant_artifacts_and_signals=_relevant_artifacts_and_signals_context(
+            relevant_artifacts_and_observations=_relevant_artifacts_and_observations_context(
                 db=db,
                 prior_turns=prior_turns,
             ),
@@ -3072,7 +3177,7 @@ def create_app(
             discord_context=discord_context,
             memory_context=memory_context,
             open_commitments_and_jobs=open_commitments_and_jobs,
-            relevant_artifacts_and_signals=_relevant_artifacts_and_signals_context(
+            relevant_artifacts_and_observations=_relevant_artifacts_and_observations_context(
                 db=db,
                 prior_turns=prior_turns,
             ),
@@ -4690,185 +4795,64 @@ def create_app(
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
 
-    @app.get("/v1/attention-signals")
-    def get_attention_signals(
-        status: Literal["new", "reviewed", "dismissed", "superseded"] | None = None,
-        source_type: Literal[
-            "workspace_item",
-            "job",
-            "approval_request",
-            "memory_assertion",
-            "google_connector",
-            "capture",
-        ]
-        | None = None,
+    @app.get("/v1/proactive/observations")
+    def get_proactive_observations(
+        status: Literal["new", "linked", "ignored"] | None = None,
+        source_type: str | None = None,
         limit: int = 50,
     ) -> dict[str, Any]:
         _ensure_schema_ready()
         bounded_limit = max(1, min(limit, 200))
         with session_factory() as db:
             with db.begin():
-                query = select(AttentionSignalRecord)
+                query = select(ProactiveObservationRecord)
                 if status is not None:
-                    query = query.where(AttentionSignalRecord.status == status)
+                    query = query.where(ProactiveObservationRecord.status == status)
                 if source_type is not None:
-                    query = query.where(AttentionSignalRecord.source_type == source_type)
-                signals = db.scalars(
+                    query = query.where(ProactiveObservationRecord.source_type == source_type)
+                observations = db.scalars(
                     query.order_by(
-                        AttentionSignalRecord.updated_at.desc(),
-                        AttentionSignalRecord.id.desc(),
+                        ProactiveObservationRecord.updated_at.desc(),
+                        ProactiveObservationRecord.id.desc(),
                     ).limit(bounded_limit)
                 ).all()
                 try:
-                    return build_surface_attention_signal_list_response(
-                        attention_signals=[serialize_attention_signal(signal) for signal in signals]
+                    return build_surface_proactive_observation_list_response(
+                        observations=[
+                            serialize_proactive_observation(observation)
+                            for observation in observations
+                        ]
                     )
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
 
-    @app.post("/v1/attention-signals/derive")
-    def derive_attention_signals() -> dict[str, Any]:
+    @app.post("/v1/proactive/observations/derive")
+    def derive_proactive_observations() -> dict[str, Any]:
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
                 now = _utcnow()
                 task = enqueue_background_task(
                     db,
-                    task_type="workspace_signal_derivation_due",
+                    task_type="workspace_observation_derivation_due",
                     payload={},
                     now=now,
                     max_attempts=3,
                 )
                 return {"ok": True, "task_id": task.id}
 
-    @app.get("/v1/attention-rank-features")
-    def get_attention_rank_features(limit: int = 50) -> dict[str, Any]:
-        _ensure_schema_ready()
-        bounded_limit = max(1, min(limit, 200))
-        with session_factory() as db:
-            with db.begin():
-                features = db.scalars(
-                    select(AttentionRankFeatureRecord)
-                    .order_by(
-                        AttentionRankFeatureRecord.created_at.desc(),
-                        AttentionRankFeatureRecord.id.desc(),
-                    )
-                    .limit(bounded_limit)
-                ).all()
-                try:
-                    return build_surface_attention_rank_feature_list_response(
-                        attention_rank_features=[
-                            serialize_attention_rank_feature(feature) for feature in features
-                        ]
-                    )
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.get("/v1/attention-groups")
-    def get_attention_groups(limit: int = 50) -> dict[str, Any]:
-        _ensure_schema_ready()
-        bounded_limit = max(1, min(limit, 200))
-        with session_factory() as db:
-            with db.begin():
-                groups = db.scalars(
-                    select(AttentionGroupRecord)
-                    .order_by(
-                        AttentionGroupRecord.updated_at.desc(), AttentionGroupRecord.id.desc()
-                    )
-                    .limit(bounded_limit)
-                ).all()
-                try:
-                    return build_surface_attention_group_list_response(
-                        attention_groups=[serialize_attention_group(group) for group in groups]
-                    )
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.get("/v1/attention-rank-snapshots")
-    def get_attention_rank_snapshots(limit: int = 50) -> dict[str, Any]:
-        _ensure_schema_ready()
-        bounded_limit = max(1, min(limit, 200))
-        with session_factory() as db:
-            with db.begin():
-                snapshots = db.scalars(
-                    select(AttentionRankSnapshotRecord)
-                    .order_by(
-                        AttentionRankSnapshotRecord.created_at.desc(),
-                        AttentionRankSnapshotRecord.id.desc(),
-                    )
-                    .limit(bounded_limit)
-                ).all()
-                try:
-                    return build_surface_attention_rank_snapshot_list_response(
-                        attention_rank_snapshots=[
-                            serialize_attention_rank_snapshot(snapshot) for snapshot in snapshots
-                        ]
-                    )
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.get("/v1/proactive-feedback-rules")
-    def get_proactive_feedback_rules(limit: int = 50) -> dict[str, Any]:
-        _ensure_schema_ready()
-        bounded_limit = max(1, min(limit, 200))
-        with session_factory() as db:
-            with db.begin():
-                rules = db.scalars(
-                    select(ProactiveFeedbackRuleRecord)
-                    .order_by(
-                        ProactiveFeedbackRuleRecord.priority.asc(),
-                        ProactiveFeedbackRuleRecord.updated_at.desc(),
-                        ProactiveFeedbackRuleRecord.id.desc(),
-                    )
-                    .limit(bounded_limit)
-                ).all()
-                try:
-                    return build_surface_proactive_feedback_rule_list_response(
-                        proactive_feedback_rules=[
-                            serialize_proactive_feedback_rule(rule) for rule in rules
-                        ]
-                    )
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.get("/v1/action-proposals")
-    def get_action_proposals(
-        status: Literal["proposed", "approved", "rejected", "superseded"] | None = None,
-        limit: int = 50,
-    ) -> dict[str, Any]:
-        _ensure_schema_ready()
-        bounded_limit = max(1, min(limit, 200))
-        with session_factory() as db:
-            with db.begin():
-                query = select(ActionProposalRecord)
-                if status is not None:
-                    query = query.where(ActionProposalRecord.status == status)
-                proposals = db.scalars(
-                    query.order_by(
-                        ActionProposalRecord.updated_at.desc(),
-                        ActionProposalRecord.id.desc(),
-                    ).limit(bounded_limit)
-                ).all()
-                try:
-                    return build_surface_action_proposal_list_response(
-                        action_proposals=[
-                            serialize_action_proposal(proposal) for proposal in proposals
-                        ]
-                    )
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.get("/v1/attention-items")
-    def get_attention_items(
+    @app.get("/v1/proactive/cases")
+    def get_proactive_cases(
         status: Literal[
             "open",
-            "notified",
+            "waiting",
+            "spoken",
+            "acted",
+            "asked",
+            "ignored",
             "acknowledged",
-            "snoozed",
             "resolved",
-            "expired",
-            "cancelled",
-            "superseded",
+            "failed",
         ]
         | None = None,
         limit: int = 50,
@@ -4877,483 +4861,593 @@ def create_app(
         bounded_limit = max(1, min(limit, 200))
         with session_factory() as db:
             with db.begin():
-                query = select(AttentionItemRecord)
+                query = select(ProactiveCaseRecord)
                 if status is not None:
-                    query = query.where(AttentionItemRecord.status == status)
-                attention_items = db.scalars(
+                    query = query.where(ProactiveCaseRecord.status == status)
+                cases = db.scalars(
                     query.order_by(
-                        AttentionItemRecord.rank_score.desc(),
-                        AttentionItemRecord.updated_at.desc(),
-                        AttentionItemRecord.id.asc(),
+                        ProactiveCaseRecord.updated_at.desc(),
+                        ProactiveCaseRecord.id.desc(),
                     ).limit(bounded_limit)
                 ).all()
                 try:
-                    return build_surface_attention_item_list_response(
-                        attention_items=[
-                            serialize_attention_item(attention_item)
-                            for attention_item in attention_items
-                        ]
+                    return build_surface_proactive_case_list_response(
+                        cases=[serialize_proactive_case(case) for case in cases]
                     )
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
 
-    @app.get("/v1/attention-items/{attention_item_id}")
-    def get_attention_item(attention_item_id: str) -> dict[str, Any]:
+    @app.get("/v1/proactive/cases/{case_id}")
+    def get_proactive_case(case_id: str) -> dict[str, Any]:
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
-                attention_item = db.scalar(
-                    select(AttentionItemRecord)
-                    .where(AttentionItemRecord.id == attention_item_id)
-                    .limit(1)
-                )
-                if attention_item is None:
-                    raise ApiError(
-                        status_code=404,
-                        code="E_ATTENTION_ITEM_NOT_FOUND",
-                        message="attention item not found",
-                        details={"attention_item_id": attention_item_id},
-                        retryable=False,
-                    )
+                proactive_case = _require_proactive_case(db, case_id)
                 try:
-                    return build_surface_attention_item_response(
-                        attention_item=serialize_attention_item(attention_item)
+                    return build_surface_proactive_case_response(
+                        case=serialize_proactive_case(proactive_case)
                     )
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
 
-    @app.get("/v1/attention-items/{attention_item_id}/events")
-    def get_attention_item_events(attention_item_id: str, limit: int = 50) -> dict[str, Any]:
+    @app.get("/v1/proactive/cases/{case_id}/events")
+    def get_proactive_case_events(case_id: str, limit: int = 50) -> dict[str, Any]:
         _ensure_schema_ready()
         bounded_limit = max(1, min(limit, 200))
         with session_factory() as db:
             with db.begin():
-                attention_item = db.scalar(
-                    select(AttentionItemRecord)
-                    .where(AttentionItemRecord.id == attention_item_id)
-                    .limit(1)
-                )
-                if attention_item is None:
-                    raise ApiError(
-                        status_code=404,
-                        code="E_ATTENTION_ITEM_NOT_FOUND",
-                        message="attention item not found",
-                        details={"attention_item_id": attention_item_id},
-                        retryable=False,
-                    )
+                _require_proactive_case(db, case_id)
                 events = db.scalars(
-                    select(AttentionItemEventRecord)
-                    .where(AttentionItemEventRecord.attention_item_id == attention_item_id)
+                    select(ProactiveCaseEventRecord)
+                    .where(ProactiveCaseEventRecord.case_id == case_id)
                     .order_by(
-                        AttentionItemEventRecord.created_at.asc(),
-                        AttentionItemEventRecord.id.asc(),
+                        ProactiveCaseEventRecord.created_at.asc(),
+                        ProactiveCaseEventRecord.id.asc(),
                     )
                     .limit(bounded_limit)
                 ).all()
                 try:
-                    return build_surface_attention_item_event_list_response(
-                        attention_item_id=attention_item_id,
-                        events=[serialize_attention_item_event(event) for event in events],
+                    return build_surface_proactive_case_event_list_response(
+                        case_id=case_id,
+                        events=[serialize_proactive_case_event(event) for event in events],
                     )
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
 
-    @app.post("/v1/attention-items/{attention_item_id}/ack")
-    def ack_attention_item(attention_item_id: str) -> dict[str, Any]:
+    @app.get("/v1/proactive/cases/{case_id}/context-snapshots")
+    def get_proactive_context_snapshots(case_id: str, limit: int = 50) -> dict[str, Any]:
+        _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 200))
+        with session_factory() as db:
+            with db.begin():
+                _require_proactive_case(db, case_id)
+                snapshots = db.scalars(
+                    select(ProactiveContextSnapshotRecord)
+                    .where(ProactiveContextSnapshotRecord.case_id == case_id)
+                    .order_by(
+                        ProactiveContextSnapshotRecord.created_at.desc(),
+                        ProactiveContextSnapshotRecord.id.desc(),
+                    )
+                    .limit(bounded_limit)
+                ).all()
+                try:
+                    return build_surface_proactive_context_snapshot_list_response(
+                        case_id=case_id,
+                        context_snapshots=[
+                            serialize_proactive_context_snapshot(snapshot) for snapshot in snapshots
+                        ],
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/proactive/cases/{case_id}/decisions")
+    def get_proactive_decisions(case_id: str, limit: int = 50) -> dict[str, Any]:
+        _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 200))
+        with session_factory() as db:
+            with db.begin():
+                _require_proactive_case(db, case_id)
+                decisions = db.scalars(
+                    select(ProactiveDecisionRecord)
+                    .where(ProactiveDecisionRecord.case_id == case_id)
+                    .order_by(
+                        ProactiveDecisionRecord.created_at.desc(),
+                        ProactiveDecisionRecord.id.desc(),
+                    )
+                    .limit(bounded_limit)
+                ).all()
+                try:
+                    return build_surface_proactive_decision_list_response(
+                        case_id=case_id,
+                        decisions=[
+                            serialize_proactive_decision(decision) for decision in decisions
+                        ],
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/proactive/cases/{case_id}/validations")
+    def get_proactive_validations(case_id: str, limit: int = 50) -> dict[str, Any]:
+        _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 200))
+        with session_factory() as db:
+            with db.begin():
+                _require_proactive_case(db, case_id)
+                validations = db.scalars(
+                    select(ProactivePolicyValidationRecord)
+                    .where(ProactivePolicyValidationRecord.case_id == case_id)
+                    .order_by(
+                        ProactivePolicyValidationRecord.created_at.desc(),
+                        ProactivePolicyValidationRecord.id.desc(),
+                    )
+                    .limit(bounded_limit)
+                ).all()
+                try:
+                    return build_surface_proactive_policy_validation_list_response(
+                        case_id=case_id,
+                        validations=[
+                            serialize_proactive_policy_validation(validation)
+                            for validation in validations
+                        ],
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/proactive/cases/{case_id}/actions")
+    def get_proactive_case_actions(case_id: str) -> dict[str, Any]:
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
-                attention_item = db.scalar(
-                    select(AttentionItemRecord)
-                    .where(AttentionItemRecord.id == attention_item_id)
-                    .with_for_update()
-                    .limit(1)
-                )
-                if attention_item is None:
-                    raise ApiError(
-                        status_code=404,
-                        code="E_ATTENTION_ITEM_NOT_FOUND",
-                        message="attention item not found",
-                        details={"attention_item_id": attention_item_id},
-                        retryable=False,
-                    )
-                if attention_item.status not in {"open", "notified", "snoozed", "acknowledged"}:
-                    raise ApiError(
-                        status_code=409,
-                        code="E_ATTENTION_ITEM_NOT_ACTIONABLE",
-                        message="attention item is not actionable",
-                        details={
-                            "attention_item_id": attention_item_id,
-                            "status": attention_item.status,
-                        },
-                        retryable=False,
-                    )
-                now = _utcnow()
-                if attention_item.status != "acknowledged":
-                    attention_item.status = "acknowledged"
-                    attention_item.next_follow_up_after = None
-                    attention_item.updated_at = now
-                    db.add(
-                        AttentionItemEventRecord(
-                            id=_new_id("aie"),
-                            attention_item_id=attention_item.id,
-                            event_type="acknowledged",
-                            payload={},
-                            created_at=now,
+                _require_proactive_case(db, case_id)
+                plans = db.scalars(
+                    select(ProactiveActionPlanRecord)
+                    .where(ProactiveActionPlanRecord.case_id == case_id)
+                    .order_by(ProactiveActionPlanRecord.created_at.desc())
+                ).all()
+                executions = db.scalars(
+                    select(ProactiveActionExecutionRecord)
+                    .where(
+                        ProactiveActionExecutionRecord.action_plan_id.in_(
+                            [plan.id for plan in plans] or ["none"]
                         )
                     )
-                notifications = db.scalars(
-                    select(NotificationRecord)
-                    .where(
-                        NotificationRecord.source_type == "attention_item",
-                        NotificationRecord.source_id == attention_item.id,
-                        NotificationRecord.status != "acknowledged",
-                    )
-                    .with_for_update()
+                    .order_by(ProactiveActionExecutionRecord.created_at.desc())
                 ).all()
-                for notification in notifications:
-                    notification.status = "acknowledged"
-                    notification.acked_at = now
-                    notification.updated_at = now
                 try:
-                    return build_surface_attention_item_response(
-                        attention_item=serialize_attention_item(attention_item)
+                    return build_surface_proactive_action_list_response(
+                        case_id=case_id,
+                        action_plans=[serialize_proactive_action_plan(plan) for plan in plans],
+                        action_executions=[
+                            serialize_proactive_action_execution(execution)
+                            for execution in executions
+                        ],
                     )
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
 
-    @app.post("/v1/attention-items/{attention_item_id}/snooze")
-    def snooze_attention_item(
-        attention_item_id: str,
-        request: AttentionSnoozeRequest,
-    ) -> dict[str, Any]:
+    @app.get("/v1/proactive/cases/{case_id}/inspect-why")
+    def inspect_proactive_case_why(case_id: str) -> dict[str, Any]:
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
-                attention_item = db.scalar(
-                    select(AttentionItemRecord)
-                    .where(AttentionItemRecord.id == attention_item_id)
-                    .with_for_update()
-                    .limit(1)
+                proactive_case = _require_proactive_case(db, case_id)
+                observation = db.get(
+                    ProactiveObservationRecord,
+                    proactive_case.latest_observation_id,
                 )
-                if attention_item is None:
-                    raise ApiError(
-                        status_code=404,
-                        code="E_ATTENTION_ITEM_NOT_FOUND",
-                        message="attention item not found",
-                        details={"attention_item_id": attention_item_id},
-                        retryable=False,
+                decision = (
+                    db.get(ProactiveDecisionRecord, proactive_case.last_decision_id)
+                    if proactive_case.last_decision_id is not None
+                    else None
+                )
+                if decision is None:
+                    decision = db.scalar(
+                        select(ProactiveDecisionRecord)
+                        .where(ProactiveDecisionRecord.case_id == case_id)
+                        .order_by(ProactiveDecisionRecord.created_at.desc())
+                        .limit(1)
                     )
-                if attention_item.status not in {"open", "notified", "snoozed"}:
+                snapshot = (
+                    db.get(ProactiveContextSnapshotRecord, decision.context_snapshot_id)
+                    if decision is not None
+                    else None
+                )
+                validation = (
+                    db.scalar(
+                        select(ProactivePolicyValidationRecord)
+                        .where(ProactivePolicyValidationRecord.decision_id == decision.id)
+                        .order_by(ProactivePolicyValidationRecord.created_at.desc())
+                        .limit(1)
+                    )
+                    if decision is not None
+                    else None
+                )
+                plans = db.scalars(
+                    select(ProactiveActionPlanRecord)
+                    .where(ProactiveActionPlanRecord.case_id == case_id)
+                    .order_by(ProactiveActionPlanRecord.created_at.desc())
+                ).all()
+                executions = db.scalars(
+                    select(ProactiveActionExecutionRecord)
+                    .where(
+                        ProactiveActionExecutionRecord.action_plan_id.in_(
+                            [plan.id for plan in plans] or ["none"]
+                        )
+                    )
+                    .order_by(ProactiveActionExecutionRecord.created_at.desc())
+                ).all()
+                return {
+                    "ok": True,
+                    "case": serialize_proactive_case(proactive_case),
+                    "why": {
+                        "trigger": (
+                            serialize_proactive_observation(observation)
+                            if observation is not None
+                            else None
+                        ),
+                        "decision": (
+                            serialize_proactive_decision(decision) if decision is not None else None
+                        ),
+                        "context_snapshot": (
+                            serialize_proactive_context_snapshot(snapshot)
+                            if snapshot is not None
+                            else None
+                        ),
+                        "validation": (
+                            serialize_proactive_policy_validation(validation)
+                            if validation is not None
+                            else None
+                        ),
+                        "action_plans": [serialize_proactive_action_plan(plan) for plan in plans],
+                        "action_executions": [
+                            serialize_proactive_action_execution(execution)
+                            for execution in executions
+                        ],
+                    },
+                    "controls": _proactive_case_controls(
+                        case_id,
+                        undo_supported=_proactive_undo_metadata(executions) is not None,
+                    ),
+                }
+
+    @app.post("/v1/proactive/cases/{case_id}/undo")
+    def undo_proactive_case_action(case_id: str) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                proactive_case = _require_proactive_case(db, case_id)
+                plans = db.scalars(
+                    select(ProactiveActionPlanRecord)
+                    .where(ProactiveActionPlanRecord.case_id == case_id)
+                    .order_by(ProactiveActionPlanRecord.created_at.desc())
+                ).all()
+                executions = db.scalars(
+                    select(ProactiveActionExecutionRecord)
+                    .where(
+                        ProactiveActionExecutionRecord.action_plan_id.in_(
+                            [plan.id for plan in plans] or ["none"]
+                        )
+                    )
+                    .order_by(ProactiveActionExecutionRecord.completed_at.desc().nullslast())
+                ).all()
+                undo = _proactive_undo_metadata(executions)
+                if undo is None:
                     raise ApiError(
                         status_code=409,
-                        code="E_ATTENTION_ITEM_NOT_ACTIONABLE",
-                        message="attention item is not actionable",
-                        details={
-                            "attention_item_id": attention_item_id,
-                            "status": attention_item.status,
-                        },
+                        code="E_PROACTIVE_UNDO_NOT_SUPPORTED",
+                        message="proactive case has no supported undo action",
+                        details={"case_id": case_id},
                         retryable=False,
                     )
+                execution, metadata = undo
                 now = _utcnow()
-                snooze_until = request.snooze_until.astimezone(UTC)
-                if snooze_until <= now:
-                    raise ApiError(
-                        status_code=422,
-                        code="E_ATTENTION_SNOOZE_IN_PAST",
-                        message="snooze_until must be in the future",
-                        details={"attention_item_id": attention_item_id},
-                        retryable=False,
-                    )
-                attention_item.status = "snoozed"
-                attention_item.next_follow_up_after = snooze_until
-                attention_item.updated_at = now
                 db.add(
-                    AttentionItemEventRecord(
-                        id=_new_id("aie"),
-                        attention_item_id=attention_item.id,
-                        event_type="snoozed",
-                        payload={"snooze_until": to_rfc3339(snooze_until)},
-                        created_at=now,
-                    )
-                )
-                db.add(
-                    BackgroundTaskRecord(
-                        id=_new_id("tsk"),
-                        task_type="attention_item_follow_up_due",
+                    ProactiveCaseEventRecord(
+                        id=_new_id("pce"),
+                        case_id=case_id,
+                        event_type="feedback_recorded",
                         payload={
-                            "attention_item_id": attention_item.id,
-                            "scheduled_for": to_rfc3339(snooze_until),
+                            "feedback_type": "undo_requested",
+                            "action_execution_id": execution.id,
                         },
-                        status="pending",
-                        attempts=0,
-                        max_attempts=3,
-                        error=None,
-                        claimed_by=None,
-                        run_after=snooze_until,
-                        last_heartbeat=None,
-                        created_at=now,
-                        updated_at=now,
-                    )
-                )
-                db.add(
-                    AttentionItemEventRecord(
-                        id=_new_id("aie"),
-                        attention_item_id=attention_item.id,
-                        event_type="follow_up_queued",
-                        payload={"scheduled_for": to_rfc3339(snooze_until)},
                         created_at=now,
                     )
                 )
-                notifications = db.scalars(
-                    select(NotificationRecord)
-                    .where(
-                        NotificationRecord.source_type == "attention_item",
-                        NotificationRecord.source_id == attention_item.id,
-                        NotificationRecord.status != "acknowledged",
-                    )
-                    .with_for_update()
+                return {
+                    "ok": True,
+                    "case": serialize_proactive_case(proactive_case),
+                    "undo": {
+                        "status": "requested",
+                        "action_execution_id": execution.id,
+                        "metadata": redact_json_value(metadata),
+                    },
+                }
+
+    @app.get("/v1/proactive/turns")
+    def get_proactive_turns(limit: int = 50) -> dict[str, Any]:
+        _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 200))
+        with session_factory() as db:
+            with db.begin():
+                turns = db.scalars(
+                    select(ProactiveTurnRecord)
+                    .order_by(ProactiveTurnRecord.created_at.desc(), ProactiveTurnRecord.id.desc())
+                    .limit(bounded_limit)
                 ).all()
-                for notification in notifications:
-                    notification.status = "acknowledged"
-                    notification.acked_at = now
-                    notification.updated_at = now
                 try:
-                    return build_surface_attention_item_response(
-                        attention_item=serialize_attention_item(attention_item)
+                    return build_surface_proactive_turn_list_response(
+                        turns=[serialize_proactive_turn(turn) for turn in turns]
                     )
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
 
-    @app.post("/v1/attention-items/{attention_item_id}/resolve")
-    def resolve_attention_item(attention_item_id: str) -> dict[str, Any]:
+    @app.post("/v1/proactive/cases/{case_id}/deliberate")
+    def deliberate_proactive_case(case_id: str) -> dict[str, Any]:
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
-                attention_item = db.scalar(
-                    select(AttentionItemRecord)
-                    .where(AttentionItemRecord.id == attention_item_id)
-                    .with_for_update()
-                    .limit(1)
-                )
-                if attention_item is None:
+                if db.get(ProactiveCaseRecord, case_id) is None:
                     raise ApiError(
                         status_code=404,
-                        code="E_ATTENTION_ITEM_NOT_FOUND",
-                        message="attention item not found",
-                        details={"attention_item_id": attention_item_id},
+                        code="E_PROACTIVE_CASE_NOT_FOUND",
+                        message="proactive case not found",
+                        details={"case_id": case_id},
                         retryable=False,
                     )
-                if attention_item.status not in {"open", "notified", "snoozed", "acknowledged"}:
-                    raise ApiError(
-                        status_code=409,
-                        code="E_ATTENTION_ITEM_NOT_ACTIONABLE",
-                        message="attention item is not actionable",
-                        details={
-                            "attention_item_id": attention_item_id,
-                            "status": attention_item.status,
-                        },
-                        retryable=False,
-                    )
-                now = _utcnow()
-                attention_item.status = "resolved"
-                attention_item.next_follow_up_after = None
-                attention_item.updated_at = now
-                db.add(
-                    AttentionItemEventRecord(
-                        id=_new_id("aie"),
-                        attention_item_id=attention_item.id,
-                        event_type="resolved",
-                        payload={},
-                        created_at=now,
-                    )
-                )
-                notifications = db.scalars(
-                    select(NotificationRecord)
-                    .where(
-                        NotificationRecord.source_type == "attention_item",
-                        NotificationRecord.source_id == attention_item.id,
-                        NotificationRecord.status != "acknowledged",
-                    )
-                    .with_for_update()
-                ).all()
-                for notification in notifications:
-                    notification.status = "acknowledged"
-                    notification.acked_at = now
-                    notification.updated_at = now
-                try:
-                    return build_surface_attention_item_response(
-                        attention_item=serialize_attention_item(attention_item)
-                    )
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.post("/v1/attention-items/{attention_item_id}/cancel")
-    def cancel_attention_item(attention_item_id: str) -> dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                attention_item = db.scalar(
-                    select(AttentionItemRecord)
-                    .where(AttentionItemRecord.id == attention_item_id)
-                    .with_for_update()
-                    .limit(1)
-                )
-                if attention_item is None:
-                    raise ApiError(
-                        status_code=404,
-                        code="E_ATTENTION_ITEM_NOT_FOUND",
-                        message="attention item not found",
-                        details={"attention_item_id": attention_item_id},
-                        retryable=False,
-                    )
-                if attention_item.status in {"resolved", "expired", "cancelled", "superseded"}:
-                    raise ApiError(
-                        status_code=409,
-                        code="E_ATTENTION_ITEM_NOT_ACTIONABLE",
-                        message="attention item is not actionable",
-                        details={
-                            "attention_item_id": attention_item_id,
-                            "status": attention_item.status,
-                        },
-                        retryable=False,
-                    )
-                now = _utcnow()
-                attention_item.status = "cancelled"
-                attention_item.next_follow_up_after = None
-                attention_item.updated_at = now
-                db.add(
-                    AttentionItemEventRecord(
-                        id=_new_id("aie"),
-                        attention_item_id=attention_item.id,
-                        event_type="cancelled",
-                        payload={},
-                        created_at=now,
-                    )
-                )
-                notifications = db.scalars(
-                    select(NotificationRecord)
-                    .where(
-                        NotificationRecord.source_type == "attention_item",
-                        NotificationRecord.source_id == attention_item.id,
-                        NotificationRecord.status != "acknowledged",
-                    )
-                    .with_for_update()
-                ).all()
-                for notification in notifications:
-                    notification.status = "acknowledged"
-                    notification.acked_at = now
-                    notification.updated_at = now
-                try:
-                    return build_surface_attention_item_response(
-                        attention_item=serialize_attention_item(attention_item)
-                    )
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.post("/v1/attention-items/{attention_item_id}/refresh")
-    def refresh_attention_item(attention_item_id: str) -> dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                attention_item = db.scalar(
-                    select(AttentionItemRecord)
-                    .where(AttentionItemRecord.id == attention_item_id)
-                    .with_for_update()
-                    .limit(1)
-                )
-                if attention_item is None:
-                    raise ApiError(
-                        status_code=404,
-                        code="E_ATTENTION_ITEM_NOT_FOUND",
-                        message="attention item not found",
-                        details={"attention_item_id": attention_item_id},
-                        retryable=False,
-                    )
-                if attention_item.status in {"resolved", "expired", "cancelled", "superseded"}:
-                    raise ApiError(
-                        status_code=409,
-                        code="E_ATTENTION_ITEM_NOT_ACTIONABLE",
-                        message="attention item is not actionable",
-                        details={
-                            "attention_item_id": attention_item_id,
-                            "status": attention_item.status,
-                        },
-                        retryable=False,
-                    )
-                now = _utcnow()
-                attention_item.updated_at = now
-                db.add(
-                    AttentionItemEventRecord(
-                        id=_new_id("aie"),
-                        attention_item_id=attention_item.id,
-                        event_type="refreshed",
-                        payload={},
-                        created_at=now,
-                    )
-                )
-                enqueue_background_task(
+                task = enqueue_background_task(
                     db,
-                    task_type="attention_ranking_due",
-                    payload={"attention_group_id": attention_item.group_id},
-                    now=now,
+                    task_type="proactive_deliberation_due",
+                    payload={"case_id": case_id},
+                    now=_utcnow(),
                 )
-                try:
-                    return build_surface_attention_item_response(
-                        attention_item=serialize_attention_item(attention_item)
-                    )
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
+                return {"ok": True, "task_id": task.id}
 
-    @app.post("/v1/attention-items/{attention_item_id}/feedback")
-    def record_attention_feedback(
-        attention_item_id: str,
-        request: AttentionFeedbackRequest,
+    @app.post("/v1/proactive/cases/{case_id}/ack")
+    def ack_proactive_case(case_id: str) -> dict[str, Any]:
+        request = ProactiveFeedbackRequest(feedback_type="ack")
+        return record_proactive_feedback(case_id=case_id, request=request)
+
+    @app.post("/v1/proactive/cases/{case_id}/correct")
+    def correct_proactive_case(
+        case_id: str,
+        request: ProactiveFeedbackRequest,
+    ) -> dict[str, Any]:
+        corrected = ProactiveFeedbackRequest(
+            feedback_type="correct",
+            note=request.note,
+            payload=request.payload,
+        )
+        return record_proactive_feedback(case_id=case_id, request=corrected)
+
+    @app.post("/v1/proactive/cases/{case_id}/stop-pattern")
+    def stop_proactive_pattern(case_id: str) -> dict[str, Any]:
+        request = ProactiveFeedbackRequest(feedback_type="stop_pattern")
+        return record_proactive_feedback(case_id=case_id, request=request)
+
+    @app.post("/v1/proactive/cases/{case_id}/more-aggressive")
+    def make_proactive_pattern_more_aggressive(case_id: str) -> dict[str, Any]:
+        request = ProactiveFeedbackRequest(feedback_type="more_aggressive")
+        return record_proactive_feedback(case_id=case_id, request=request)
+
+    @app.post("/v1/proactive/cases/{case_id}/feedback")
+    def record_proactive_feedback(
+        case_id: str,
+        request: ProactiveFeedbackRequest,
     ) -> dict[str, Any]:
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
-                attention_item = db.scalar(
-                    select(AttentionItemRecord)
-                    .where(AttentionItemRecord.id == attention_item_id)
+                proactive_case = db.scalar(
+                    select(ProactiveCaseRecord)
+                    .where(ProactiveCaseRecord.id == case_id)
+                    .with_for_update()
                     .limit(1)
                 )
-                if attention_item is None:
+                if proactive_case is None:
                     raise ApiError(
                         status_code=404,
-                        code="E_ATTENTION_ITEM_NOT_FOUND",
-                        message="attention item not found",
-                        details={"attention_item_id": attention_item_id},
+                        code="E_PROACTIVE_CASE_NOT_FOUND",
+                        message="proactive case not found",
+                        details={"case_id": case_id},
                         retryable=False,
                     )
                 now = _utcnow()
+                if request.feedback_type == "ack":
+                    proactive_case.status = "acknowledged"
+                    proactive_case.next_recheck_after = None
+                    proactive_case.updated_at = now
+                    turns = db.scalars(
+                        select(ProactiveTurnRecord)
+                        .where(ProactiveTurnRecord.case_id == case_id)
+                        .with_for_update()
+                    ).all()
+                    for turn in turns:
+                        turn.status = "acknowledged"
+                        turn.acked_at = now
+                        turn.updated_at = now
+                    notifications = db.scalars(
+                        select(NotificationRecord)
+                        .where(
+                            NotificationRecord.source_type == "proactive_turn",
+                            NotificationRecord.source_id.in_(
+                                [turn.id for turn in turns] or ["none"]
+                            ),
+                            NotificationRecord.status != "acknowledged",
+                        )
+                        .with_for_update()
+                    ).all()
+                    for notification in notifications:
+                        notification.status = "acknowledged"
+                        notification.acked_at = now
+                        notification.updated_at = now
                 feedback = ProactiveFeedbackRecord(
                     id=_new_id("pfb"),
-                    attention_item_id=attention_item.id,
+                    case_id=proactive_case.id,
                     feedback_type=request.feedback_type,
                     note=request.note,
+                    payload=request.payload,
                     created_at=now,
                 )
                 db.add(feedback)
                 db.add(
-                    AttentionItemEventRecord(
-                        id=_new_id("aie"),
-                        attention_item_id=attention_item.id,
-                        event_type="updated",
+                    ProactiveCaseEventRecord(
+                        id=_new_id("pce"),
+                        case_id=proactive_case.id,
+                        event_type="feedback_recorded",
                         payload={"feedback_type": request.feedback_type},
                         created_at=now,
                     )
                 )
                 enqueue_background_task(
                     db,
-                    task_type="proactive_feedback_review_due",
+                    task_type="proactive_feedback_learning_due",
                     payload={"feedback_id": feedback.id},
                     now=now,
                 )
                 try:
-                    return build_surface_attention_feedback_response(
-                        attention_item=serialize_attention_item(attention_item),
+                    return build_surface_proactive_feedback_response(
+                        case=serialize_proactive_case(proactive_case),
                         feedback=serialize_proactive_feedback(feedback),
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/proactive/autonomy-scopes")
+    def get_autonomy_scopes(limit: int = 50) -> dict[str, Any]:
+        _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 200))
+        with session_factory() as db:
+            with db.begin():
+                scopes = db.scalars(
+                    select(AutonomyScopeRecord)
+                    .order_by(AutonomyScopeRecord.updated_at.desc(), AutonomyScopeRecord.id.desc())
+                    .limit(bounded_limit)
+                ).all()
+                try:
+                    return build_surface_autonomy_scope_list_response(
+                        autonomy_scopes=[serialize_autonomy_scope(scope) for scope in scopes]
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.post("/v1/proactive/autonomy-scopes")
+    def grant_autonomy_scope(request: AutonomyScopeRequest) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                now = _utcnow()
+                allowed_target_systems = request.allowed_target_systems or [request.target_system]
+                scope_payload = {
+                    "targets": allowed_target_systems,
+                    "payload": request.allowed_payload,
+                    "shape": request.allowed_payload_shape,
+                    "source": request.source_context,
+                }
+                scope_hash = hashlib.sha256(
+                    json.dumps(scope_payload, sort_keys=True).encode()
+                ).hexdigest()
+                scope_key = f"{request.actor}:{request.action_type}:{scope_hash}"
+                scope = db.scalar(
+                    select(AutonomyScopeRecord)
+                    .where(AutonomyScopeRecord.scope_key == scope_key)
+                    .with_for_update()
+                    .limit(1)
+                )
+                if scope is None:
+                    scope = AutonomyScopeRecord(
+                        id=_new_id("asc"),
+                        scope_key=scope_key,
+                        actor=request.actor,
+                        source_context=request.source_context,
+                        action_type=request.action_type,
+                        target_system=request.target_system,
+                        allowed_target_systems=allowed_target_systems,
+                        allowed_payload=request.allowed_payload,
+                        allowed_payload_shape=request.allowed_payload_shape,
+                        max_impact=request.max_impact,
+                        revocation_rule=request.revocation_rule,
+                        notification_rule=request.notification_rule,
+                        audit_visibility=request.audit_visibility,
+                        version=1,
+                        status="active",
+                        revoked_at=None,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    db.add(scope)
+                    db.flush()
+                else:
+                    scope.actor = request.actor
+                    scope.source_context = request.source_context
+                    scope.action_type = request.action_type
+                    scope.target_system = request.target_system
+                    scope.allowed_payload = request.allowed_payload
+                    scope.allowed_target_systems = allowed_target_systems
+                    scope.allowed_payload_shape = request.allowed_payload_shape
+                    scope.max_impact = request.max_impact
+                    scope.revocation_rule = request.revocation_rule
+                    scope.notification_rule = request.notification_rule
+                    scope.audit_visibility = request.audit_visibility
+                    scope.version += 1
+                    scope.status = "active"
+                    scope.revoked_at = None
+                    scope.updated_at = now
+                try:
+                    return build_surface_autonomy_scope_response(
+                        autonomy_scope=serialize_autonomy_scope(scope)
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.delete("/v1/proactive/autonomy-scopes/{scope_id}")
+    def revoke_autonomy_scope(scope_id: str) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                scope = db.scalar(
+                    select(AutonomyScopeRecord)
+                    .where(AutonomyScopeRecord.id == scope_id)
+                    .with_for_update()
+                    .limit(1)
+                )
+                if scope is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_AUTONOMY_SCOPE_NOT_FOUND",
+                        message="autonomy scope not found",
+                        details={"scope_id": scope_id},
+                        retryable=False,
+                    )
+                now = _utcnow()
+                scope.status = "revoked"
+                scope.revoked_at = now
+                scope.updated_at = now
+                try:
+                    return build_surface_autonomy_scope_response(
+                        autonomy_scope=serialize_autonomy_scope(scope)
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/proactive/learning-records")
+    def get_proactive_learning_records(limit: int = 50) -> dict[str, Any]:
+        _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 200))
+        with session_factory() as db:
+            with db.begin():
+                records = db.scalars(
+                    select(ProactiveLearningRecord)
+                    .order_by(
+                        ProactiveLearningRecord.updated_at.desc(),
+                        ProactiveLearningRecord.id.desc(),
+                    )
+                    .limit(bounded_limit)
+                ).all()
+                try:
+                    return build_surface_proactive_learning_record_list_response(
+                        learning_records=[
+                            serialize_proactive_learning_record(record) for record in records
+                        ]
                     )
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
@@ -5454,26 +5548,32 @@ def create_app(
                 notification.acked_at = now
                 notification.updated_at = now
                 payload = notification.payload if isinstance(notification.payload, dict) else {}
-                attention_item_id = payload.get("attention_item_id")
-                if isinstance(attention_item_id, str):
-                    attention_item = db.scalar(
-                        select(AttentionItemRecord)
-                        .where(AttentionItemRecord.id == attention_item_id)
+                proactive_turn_id = payload.get("proactive_turn_id")
+                if isinstance(proactive_turn_id, str):
+                    proactive_turn = db.scalar(
+                        select(ProactiveTurnRecord)
+                        .where(ProactiveTurnRecord.id == proactive_turn_id)
                         .with_for_update()
                         .limit(1)
                     )
-                    if attention_item is not None and attention_item.status in {
-                        "open",
-                        "notified",
-                        "snoozed",
-                    }:
-                        attention_item.status = "acknowledged"
-                        attention_item.next_follow_up_after = None
-                        attention_item.updated_at = now
+                    if proactive_turn is not None and proactive_turn.status != "acknowledged":
+                        proactive_turn.status = "acknowledged"
+                        proactive_turn.acked_at = now
+                        proactive_turn.updated_at = now
+                        proactive_case = db.scalar(
+                            select(ProactiveCaseRecord)
+                            .where(ProactiveCaseRecord.id == proactive_turn.case_id)
+                            .with_for_update()
+                            .limit(1)
+                        )
+                        if proactive_case is not None:
+                            proactive_case.status = "acknowledged"
+                            proactive_case.next_recheck_after = None
+                            proactive_case.updated_at = now
                         db.add(
-                            AttentionItemEventRecord(
-                                id=_new_id("aie"),
-                                attention_item_id=attention_item.id,
+                            ProactiveCaseEventRecord(
+                                id=_new_id("pce"),
+                                case_id=proactive_turn.case_id,
                                 event_type="acknowledged",
                                 payload={"notification_id": notification.id},
                                 created_at=now,

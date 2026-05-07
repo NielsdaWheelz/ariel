@@ -41,8 +41,9 @@ This directory is the canonical home for repository documentation.
 
 ### Product operations
 
-- [proactive-attention-ranking-cutover.md](proactive-attention-ranking-cutover.md):
-  hard cutover to production attention ranking, grouping, delivery decisions, and follow-up
+- [proactive-ai-deliberation-cutover.md](proactive-ai-deliberation-cutover.md):
+  hard cutover to event-triggered AI deliberation, ambient sensing, and
+  autonomous action
 - [production-runbook.md](production-runbook.md): production deployment, operations,
   ambient Discord chat, deterministic slash operations, health checks, recovery,
   and acceptance criteria

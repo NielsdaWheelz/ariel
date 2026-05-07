@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 import logging
 from typing import Any
 
@@ -25,10 +24,12 @@ class ArielDiscordError(Exception):
 _APPROVAL_CUSTOM_ID_PREFIX = "ariel:approval:"
 _JOB_REFRESH_CUSTOM_ID_PREFIX = "ariel:job:refresh:"
 _NOTIFICATION_ACK_CUSTOM_ID_PREFIX = "ariel:notification:ack:"
-_ATTENTION_ACK_CUSTOM_ID_PREFIX = "ariel:attention:ack:"
-_ATTENTION_SNOOZE_CUSTOM_ID_PREFIX = "ariel:attention:snooze:"
-_ATTENTION_RESOLVE_CUSTOM_ID_PREFIX = "ariel:attention:resolve:"
-_ATTENTION_REFRESH_CUSTOM_ID_PREFIX = "ariel:attention:refresh:"
+_PROACTIVE_ACK_CUSTOM_ID_PREFIX = "ariel:proactive:ack:"
+_PROACTIVE_CORRECT_CUSTOM_ID_PREFIX = "ariel:proactive:correct:"
+_PROACTIVE_STOP_CUSTOM_ID_PREFIX = "ariel:proactive:stop:"
+_PROACTIVE_MORE_CUSTOM_ID_PREFIX = "ariel:proactive:more:"
+_PROACTIVE_INSPECT_CUSTOM_ID_PREFIX = "ariel:proactive:inspect:"
+_PROACTIVE_UNDO_CUSTOM_ID_PREFIX = "ariel:proactive:undo:"
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,69 +230,97 @@ def ack_notification(
     return _format_notification_ack_for_discord(notification), _notification_job_id(notification)
 
 
-def ack_attention_item(
+def ack_proactive_case(
     *,
     ariel_base_url: str,
-    attention_item_id: str,
+    case_id: str,
 ) -> str:
     with httpx.Client(timeout=60.0) as client:
         response = client.post(
-            f"{ariel_base_url}/v1/attention-items/{attention_item_id}/ack",
+            f"{ariel_base_url}/v1/proactive/cases/{case_id}/ack",
             json={},
         )
         payload = _json_response_payload(response)
         if response.status_code >= 400 or payload.get("ok") is not True:
             raise ArielDiscordError(_safe_ariel_error_message(payload))
-    return _format_attention_item_action_for_discord(payload, action="acknowledged")
+    return _format_proactive_case_action_for_discord(payload, action="acknowledged")
 
 
-def snooze_attention_item(
+def correct_proactive_case(
     *,
     ariel_base_url: str,
-    attention_item_id: str,
+    case_id: str,
 ) -> str:
-    snooze_until = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
     with httpx.Client(timeout=60.0) as client:
         response = client.post(
-            f"{ariel_base_url}/v1/attention-items/{attention_item_id}/snooze",
-            json={"snooze_until": snooze_until},
+            f"{ariel_base_url}/v1/proactive/cases/{case_id}/correct",
+            json={"feedback_type": "correct"},
         )
         payload = _json_response_payload(response)
         if response.status_code >= 400 or payload.get("ok") is not True:
             raise ArielDiscordError(_safe_ariel_error_message(payload))
-    return _format_attention_item_action_for_discord(payload, action="snoozed")
+    return _format_proactive_case_action_for_discord(payload, action="marked incorrect")
 
 
-def resolve_attention_item(
+def stop_proactive_pattern(
     *,
     ariel_base_url: str,
-    attention_item_id: str,
+    case_id: str,
 ) -> str:
     with httpx.Client(timeout=60.0) as client:
         response = client.post(
-            f"{ariel_base_url}/v1/attention-items/{attention_item_id}/resolve",
+            f"{ariel_base_url}/v1/proactive/cases/{case_id}/stop-pattern",
             json={},
         )
         payload = _json_response_payload(response)
         if response.status_code >= 400 or payload.get("ok") is not True:
             raise ArielDiscordError(_safe_ariel_error_message(payload))
-    return _format_attention_item_action_for_discord(payload, action="resolved")
+    return _format_proactive_case_action_for_discord(payload, action="muted pattern")
 
 
-def refresh_attention_item(
+def more_aggressive_proactive_pattern(
     *,
     ariel_base_url: str,
-    attention_item_id: str,
+    case_id: str,
 ) -> str:
     with httpx.Client(timeout=60.0) as client:
         response = client.post(
-            f"{ariel_base_url}/v1/attention-items/{attention_item_id}/refresh",
+            f"{ariel_base_url}/v1/proactive/cases/{case_id}/more-aggressive",
             json={},
         )
         payload = _json_response_payload(response)
         if response.status_code >= 400 or payload.get("ok") is not True:
             raise ArielDiscordError(_safe_ariel_error_message(payload))
-    return _format_attention_item_action_for_discord(payload, action="refreshed")
+    return _format_proactive_case_action_for_discord(payload, action="made more aggressive")
+
+
+def inspect_proactive_case(
+    *,
+    ariel_base_url: str,
+    case_id: str,
+) -> str:
+    with httpx.Client(timeout=60.0) as client:
+        response = client.get(f"{ariel_base_url}/v1/proactive/cases/{case_id}/inspect-why")
+        payload = _json_response_payload(response)
+        if response.status_code >= 400 or payload.get("ok") is not True:
+            raise ArielDiscordError(_safe_ariel_error_message(payload))
+    return _format_proactive_case_inspection_for_discord(payload)
+
+
+def undo_proactive_case(
+    *,
+    ariel_base_url: str,
+    case_id: str,
+) -> str:
+    with httpx.Client(timeout=60.0) as client:
+        response = client.post(
+            f"{ariel_base_url}/v1/proactive/cases/{case_id}/undo",
+            json={},
+        )
+        payload = _json_response_payload(response)
+        if response.status_code >= 400 or payload.get("ok") is not True:
+            raise ArielDiscordError(_safe_ariel_error_message(payload))
+    return _format_proactive_case_action_for_discord(payload, action="undo requested")
 
 
 class ArielDiscordBot(commands.Bot):
@@ -586,41 +615,64 @@ class ArielDiscordBot(commands.Bot):
                     allowed_user_id=self.ariel_user_id,
                 )
                 return
-        elif custom_id.startswith(_ATTENTION_ACK_CUSTOM_ID_PREFIX):
-            attention_item_id = custom_id.removeprefix(_ATTENTION_ACK_CUSTOM_ID_PREFIX)
-            if attention_item_id:
-                await _edit_with_attention_ack(
+        elif custom_id.startswith(_PROACTIVE_ACK_CUSTOM_ID_PREFIX):
+            case_id = custom_id.removeprefix(_PROACTIVE_ACK_CUSTOM_ID_PREFIX)
+            if case_id:
+                await _edit_with_proactive_case_action(
                     interaction=interaction,
                     ariel_base_url=self.ariel_base_url,
-                    attention_item_id=attention_item_id,
+                    case_id=case_id,
+                    action=ack_proactive_case,
                 )
                 return
-        elif custom_id.startswith(_ATTENTION_SNOOZE_CUSTOM_ID_PREFIX):
-            attention_item_id = custom_id.removeprefix(_ATTENTION_SNOOZE_CUSTOM_ID_PREFIX)
-            if attention_item_id:
-                await _edit_with_attention_snooze(
+        elif custom_id.startswith(_PROACTIVE_CORRECT_CUSTOM_ID_PREFIX):
+            case_id = custom_id.removeprefix(_PROACTIVE_CORRECT_CUSTOM_ID_PREFIX)
+            if case_id:
+                await _edit_with_proactive_case_action(
                     interaction=interaction,
                     ariel_base_url=self.ariel_base_url,
-                    attention_item_id=attention_item_id,
+                    case_id=case_id,
+                    action=correct_proactive_case,
                 )
                 return
-        elif custom_id.startswith(_ATTENTION_RESOLVE_CUSTOM_ID_PREFIX):
-            attention_item_id = custom_id.removeprefix(_ATTENTION_RESOLVE_CUSTOM_ID_PREFIX)
-            if attention_item_id:
-                await _edit_with_attention_resolve(
+        elif custom_id.startswith(_PROACTIVE_STOP_CUSTOM_ID_PREFIX):
+            case_id = custom_id.removeprefix(_PROACTIVE_STOP_CUSTOM_ID_PREFIX)
+            if case_id:
+                await _edit_with_proactive_case_action(
                     interaction=interaction,
                     ariel_base_url=self.ariel_base_url,
-                    attention_item_id=attention_item_id,
+                    case_id=case_id,
+                    action=stop_proactive_pattern,
                 )
                 return
-        elif custom_id.startswith(_ATTENTION_REFRESH_CUSTOM_ID_PREFIX):
-            attention_item_id = custom_id.removeprefix(_ATTENTION_REFRESH_CUSTOM_ID_PREFIX)
-            if attention_item_id:
-                await _edit_with_attention_refresh(
+        elif custom_id.startswith(_PROACTIVE_MORE_CUSTOM_ID_PREFIX):
+            case_id = custom_id.removeprefix(_PROACTIVE_MORE_CUSTOM_ID_PREFIX)
+            if case_id:
+                await _edit_with_proactive_case_action(
                     interaction=interaction,
                     ariel_base_url=self.ariel_base_url,
-                    attention_item_id=attention_item_id,
-                    allowed_user_id=self.ariel_user_id,
+                    case_id=case_id,
+                    action=more_aggressive_proactive_pattern,
+                )
+                return
+        elif custom_id.startswith(_PROACTIVE_INSPECT_CUSTOM_ID_PREFIX):
+            case_id = custom_id.removeprefix(_PROACTIVE_INSPECT_CUSTOM_ID_PREFIX)
+            if case_id:
+                await _edit_with_proactive_case_action(
+                    interaction=interaction,
+                    ariel_base_url=self.ariel_base_url,
+                    case_id=case_id,
+                    action=inspect_proactive_case,
+                )
+                return
+        elif custom_id.startswith(_PROACTIVE_UNDO_CUSTOM_ID_PREFIX):
+            case_id = custom_id.removeprefix(_PROACTIVE_UNDO_CUSTOM_ID_PREFIX)
+            if case_id:
+                await _edit_with_proactive_case_action(
+                    interaction=interaction,
+                    ariel_base_url=self.ariel_base_url,
+                    case_id=case_id,
+                    action=undo_proactive_case,
                 )
                 return
         await interaction.response.send_message(
@@ -834,19 +886,52 @@ def _format_notification_ack_for_discord(notification: dict[str, Any]) -> str:
     return f"Notification acknowledged: {title} ({notification_id})"
 
 
-def _format_attention_item_action_for_discord(payload: dict[str, Any], *, action: str) -> str:
-    attention_item = payload.get("attention_item")
-    if not isinstance(attention_item, dict):
-        raise ArielDiscordError("Ariel returned an invalid attention item response.")
-    attention_item_id = attention_item.get("id")
-    if not isinstance(attention_item_id, str) or not attention_item_id:
-        raise ArielDiscordError("Ariel returned an invalid attention item response.")
-    title = attention_item.get("title")
+def _format_proactive_case_action_for_discord(payload: dict[str, Any], *, action: str) -> str:
+    proactive_case = payload.get("case")
+    if not isinstance(proactive_case, dict):
+        raise ArielDiscordError("Ariel returned an invalid proactive case response.")
+    case_id = proactive_case.get("id")
+    if not isinstance(case_id, str) or not case_id:
+        raise ArielDiscordError("Ariel returned an invalid proactive case response.")
+    title = proactive_case.get("title")
     if not isinstance(title, str) or not title.strip():
-        title = attention_item.get("reason")
+        title = proactive_case.get("summary")
     if isinstance(title, str) and title.strip():
-        return f"Attention item {action}: {title.strip()} ({attention_item_id})"
-    return f"Attention item {action}: {attention_item_id}"
+        return f"Proactive case {action}: {title.strip()} ({case_id})"
+    return f"Proactive case {action}: {case_id}"
+
+
+def _format_proactive_case_inspection_for_discord(payload: dict[str, Any]) -> str:
+    proactive_case = payload.get("case")
+    why = payload.get("why")
+    if not isinstance(proactive_case, dict) or not isinstance(why, dict):
+        raise ArielDiscordError("Ariel returned an invalid proactive inspection response.")
+    case_id = proactive_case.get("id")
+    if not isinstance(case_id, str) or not case_id:
+        raise ArielDiscordError("Ariel returned an invalid proactive inspection response.")
+    title = proactive_case.get("title")
+    lines = [
+        (
+            f"Proactive case inspected: {title.strip()} ({case_id})"
+            if isinstance(title, str) and title.strip()
+            else f"Proactive case inspected: {case_id}"
+        )
+    ]
+    decision = why.get("decision")
+    if isinstance(decision, dict):
+        rationale = decision.get("rationale")
+        if isinstance(rationale, str) and rationale.strip():
+            lines.append(f"Why: {rationale.strip()}")
+        decision_type = decision.get("decision_type")
+        urgency = decision.get("urgency")
+        if isinstance(decision_type, str) and isinstance(urgency, str):
+            lines.append(f"Decision: {decision_type} urgency={urgency}")
+    trigger = why.get("trigger")
+    if isinstance(trigger, dict):
+        summary = trigger.get("summary")
+        if isinstance(summary, str) and summary.strip():
+            lines.append(f"Trigger: {summary.strip()}")
+    return "\n".join(lines)
 
 
 def _format_status_for_discord(
@@ -945,20 +1030,28 @@ def _notification_ack_custom_id(notification_id: str) -> str:
     return f"{_NOTIFICATION_ACK_CUSTOM_ID_PREFIX}{notification_id}"
 
 
-def _attention_ack_custom_id(attention_item_id: str) -> str:
-    return f"{_ATTENTION_ACK_CUSTOM_ID_PREFIX}{attention_item_id}"
+def _proactive_ack_custom_id(case_id: str) -> str:
+    return f"{_PROACTIVE_ACK_CUSTOM_ID_PREFIX}{case_id}"
 
 
-def _attention_snooze_custom_id(attention_item_id: str) -> str:
-    return f"{_ATTENTION_SNOOZE_CUSTOM_ID_PREFIX}{attention_item_id}"
+def _proactive_correct_custom_id(case_id: str) -> str:
+    return f"{_PROACTIVE_CORRECT_CUSTOM_ID_PREFIX}{case_id}"
 
 
-def _attention_resolve_custom_id(attention_item_id: str) -> str:
-    return f"{_ATTENTION_RESOLVE_CUSTOM_ID_PREFIX}{attention_item_id}"
+def _proactive_stop_custom_id(case_id: str) -> str:
+    return f"{_PROACTIVE_STOP_CUSTOM_ID_PREFIX}{case_id}"
 
 
-def _attention_refresh_custom_id(attention_item_id: str) -> str:
-    return f"{_ATTENTION_REFRESH_CUSTOM_ID_PREFIX}{attention_item_id}"
+def _proactive_more_custom_id(case_id: str) -> str:
+    return f"{_PROACTIVE_MORE_CUSTOM_ID_PREFIX}{case_id}"
+
+
+def _proactive_inspect_custom_id(case_id: str) -> str:
+    return f"{_PROACTIVE_INSPECT_CUSTOM_ID_PREFIX}{case_id}"
+
+
+def _proactive_undo_custom_id(case_id: str) -> str:
+    return f"{_PROACTIVE_UNDO_CUSTOM_ID_PREFIX}{case_id}"
 
 
 def _is_ariel_custom_id(custom_id: str) -> bool:
@@ -967,10 +1060,12 @@ def _is_ariel_custom_id(custom_id: str) -> bool:
             _APPROVAL_CUSTOM_ID_PREFIX,
             _JOB_REFRESH_CUSTOM_ID_PREFIX,
             _NOTIFICATION_ACK_CUSTOM_ID_PREFIX,
-            _ATTENTION_ACK_CUSTOM_ID_PREFIX,
-            _ATTENTION_SNOOZE_CUSTOM_ID_PREFIX,
-            _ATTENTION_RESOLVE_CUSTOM_ID_PREFIX,
-            _ATTENTION_REFRESH_CUSTOM_ID_PREFIX,
+            _PROACTIVE_ACK_CUSTOM_ID_PREFIX,
+            _PROACTIVE_CORRECT_CUSTOM_ID_PREFIX,
+            _PROACTIVE_STOP_CUSTOM_ID_PREFIX,
+            _PROACTIVE_MORE_CUSTOM_ID_PREFIX,
+            _PROACTIVE_INSPECT_CUSTOM_ID_PREFIX,
+            _PROACTIVE_UNDO_CUSTOM_ID_PREFIX,
         )
     )
 
@@ -1130,17 +1225,18 @@ async def _edit_with_notification_ack(
     )
 
 
-async def _edit_with_attention_ack(
+async def _edit_with_proactive_case_action(
     *,
     interaction: discord.Interaction,
     ariel_base_url: str,
-    attention_item_id: str,
+    case_id: str,
+    action: Any,
 ) -> None:
     try:
         content = await asyncio.to_thread(
-            ack_attention_item,
+            action,
             ariel_base_url=ariel_base_url,
-            attention_item_id=attention_item_id,
+            case_id=case_id,
         )
     except ArielDiscordError as exc:
         content = f"Ariel request failed: {exc}"
@@ -1149,80 +1245,6 @@ async def _edit_with_attention_ack(
     await interaction.response.edit_message(
         content=format_discord_message(content),
         view=None,
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
-
-
-async def _edit_with_attention_snooze(
-    *,
-    interaction: discord.Interaction,
-    ariel_base_url: str,
-    attention_item_id: str,
-) -> None:
-    try:
-        content = await asyncio.to_thread(
-            snooze_attention_item,
-            ariel_base_url=ariel_base_url,
-            attention_item_id=attention_item_id,
-        )
-    except ArielDiscordError as exc:
-        content = f"Ariel request failed: {exc}"
-    except httpx.HTTPError:
-        content = "Ariel request failed: could not reach the local Ariel API."
-    await interaction.response.edit_message(
-        content=format_discord_message(content),
-        view=None,
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
-
-
-async def _edit_with_attention_resolve(
-    *,
-    interaction: discord.Interaction,
-    ariel_base_url: str,
-    attention_item_id: str,
-) -> None:
-    try:
-        content = await asyncio.to_thread(
-            resolve_attention_item,
-            ariel_base_url=ariel_base_url,
-            attention_item_id=attention_item_id,
-        )
-    except ArielDiscordError as exc:
-        content = f"Ariel request failed: {exc}"
-    except httpx.HTTPError:
-        content = "Ariel request failed: could not reach the local Ariel API."
-    await interaction.response.edit_message(
-        content=format_discord_message(content),
-        view=None,
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
-
-
-async def _edit_with_attention_refresh(
-    *,
-    interaction: discord.Interaction,
-    ariel_base_url: str,
-    attention_item_id: str,
-    allowed_user_id: int | None,
-) -> None:
-    try:
-        content = await asyncio.to_thread(
-            refresh_attention_item,
-            ariel_base_url=ariel_base_url,
-            attention_item_id=attention_item_id,
-        )
-    except ArielDiscordError as exc:
-        content = f"Ariel request failed: {exc}"
-    except httpx.HTTPError:
-        content = "Ariel request failed: could not reach the local Ariel API."
-    await interaction.response.edit_message(
-        content=format_discord_message(content),
-        view=ArielActionView(
-            ariel_base_url=ariel_base_url,
-            attention_item_id=attention_item_id,
-            allowed_user_id=allowed_user_id,
-        ),
         allowed_mentions=discord.AllowedMentions.none(),
     )
 
@@ -1235,7 +1257,8 @@ class ArielActionView(discord.ui.View):
         approval_refs: list[str] | None = None,
         job_id: str | None = None,
         notification_id: str | None = None,
-        attention_item_id: str | None = None,
+        proactive_case_id: str | None = None,
+        proactive_can_undo: bool = False,
         allowed_user_id: int | None = None,
     ) -> None:
         super().__init__(timeout=None)
@@ -1272,34 +1295,49 @@ class ArielActionView(discord.ui.View):
             )
             self.add_item(ack_button)
 
-        if attention_item_id is not None:
-            attention_ack_button: discord.ui.Button[ArielActionView] = discord.ui.Button(
+        if proactive_case_id is not None:
+            proactive_ack_button: discord.ui.Button[ArielActionView] = discord.ui.Button(
                 label="Acknowledge",
                 style=discord.ButtonStyle.primary,
-                custom_id=_attention_ack_custom_id(attention_item_id),
+                custom_id=_proactive_ack_custom_id(proactive_case_id),
             )
-            self.add_item(attention_ack_button)
+            self.add_item(proactive_ack_button)
 
-            snooze_button: discord.ui.Button[ArielActionView] = discord.ui.Button(
-                label="Snooze 24h",
+            correct_button: discord.ui.Button[ArielActionView] = discord.ui.Button(
+                label="Incorrect",
                 style=discord.ButtonStyle.secondary,
-                custom_id=_attention_snooze_custom_id(attention_item_id),
+                custom_id=_proactive_correct_custom_id(proactive_case_id),
             )
-            self.add_item(snooze_button)
+            self.add_item(correct_button)
 
-            resolve_button: discord.ui.Button[ArielActionView] = discord.ui.Button(
-                label="Resolve",
-                style=discord.ButtonStyle.success,
-                custom_id=_attention_resolve_custom_id(attention_item_id),
+            stop_button: discord.ui.Button[ArielActionView] = discord.ui.Button(
+                label="Stop pattern",
+                style=discord.ButtonStyle.danger,
+                custom_id=_proactive_stop_custom_id(proactive_case_id),
             )
-            self.add_item(resolve_button)
+            self.add_item(stop_button)
 
-            attention_refresh_button: discord.ui.Button[ArielActionView] = discord.ui.Button(
-                label="Refresh",
+            more_button: discord.ui.Button[ArielActionView] = discord.ui.Button(
+                label="More",
                 style=discord.ButtonStyle.secondary,
-                custom_id=_attention_refresh_custom_id(attention_item_id),
+                custom_id=_proactive_more_custom_id(proactive_case_id),
             )
-            self.add_item(attention_refresh_button)
+            self.add_item(more_button)
+
+            inspect_button: discord.ui.Button[ArielActionView] = discord.ui.Button(
+                label="Why?",
+                style=discord.ButtonStyle.secondary,
+                custom_id=_proactive_inspect_custom_id(proactive_case_id),
+            )
+            self.add_item(inspect_button)
+
+            if proactive_can_undo:
+                undo_button: discord.ui.Button[ArielActionView] = discord.ui.Button(
+                    label="Undo",
+                    style=discord.ButtonStyle.danger,
+                    custom_id=_proactive_undo_custom_id(proactive_case_id),
+                )
+                self.add_item(undo_button)
 
 
 def main() -> None:

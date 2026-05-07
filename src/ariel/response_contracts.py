@@ -736,7 +736,7 @@ class SurfaceSyncRunContract(BaseModel):
     cursor_after: str | None
     status: Literal["running", "succeeded", "failed"]
     item_count: int
-    signal_count: int
+    observation_count: int
     error: str | None
     started_at: str | None
     completed_at: str | None
@@ -773,7 +773,7 @@ class SurfaceWorkspaceItemEventContract(BaseModel):
     created_at: str
 
 
-class SurfaceAttentionSignalContract(BaseModel):
+class SurfaceProactiveObservationContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
@@ -785,143 +785,196 @@ class SurfaceAttentionSignalContract(BaseModel):
         "memory_assertion",
         "google_connector",
         "capture",
+        "discord_message",
+        "provider_event",
+        "connector_event",
+        "ci",
+        "location",
+        "local_activity",
     ]
     source_id: str
     dedupe_key: str
-    status: Literal["new", "reviewed", "dismissed", "superseded"]
-    priority: Literal["critical", "high", "normal", "low"]
-    urgency: Literal["critical", "high", "normal", "low"]
-    confidence: float
-    title: str
-    body: str
-    reason: str
-    evidence: dict[str, Any]
-    taint: dict[str, Any]
-    created_at: str
-    updated_at: str
-
-
-class SurfaceAttentionGroupContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    id: str
-    group_key: str
-    group_type: Literal["approval", "job", "connector", "memory", "capture", "workspace"]
-    status: Literal["active", "suppressed", "resolved"]
-    title: str
+    observation_type: str
+    subject: str
     summary: str
-    metadata: dict[str, Any]
+    payload: dict[str, Any]
+    evidence: dict[str, Any]
+    taint: dict[str, Any]
+    trust_boundary: Literal["trusted_internal", "reviewed_memory", "user", "provider", "tainted"]
+    status: Literal["new", "linked", "ignored"]
+    observed_at: str
     created_at: str
     updated_at: str
 
 
-class SurfaceAttentionGroupMemberContract(BaseModel):
+class SurfaceProactiveCaseContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
-    group_id: str
-    attention_signal_id: str
-    grouping_reason: str
-    ranking_version: str
-    created_at: str
-
-
-class SurfaceAttentionRankFeatureContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    id: str
-    attention_signal_id: str
-    feature_set_version: str
-    features: dict[str, Any]
-    score_components: dict[str, Any]
-    created_at: str
-
-
-class SurfaceAttentionRankSnapshotContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    id: str
-    group_id: str
-    snapshot_key: str
-    ranker_version: str
-    source_signal_ids: list[str]
-    rank_score: float
-    rank_inputs: dict[str, Any]
-    rank_reason: str
-    delivery_decision: Literal["interrupt_now", "queue", "digest", "suppress"]
-    delivery_reason: str
-    suppression_reason: str | None
-    next_follow_up_after: str | None
-    priority: Literal["critical", "high", "normal", "low"]
-    urgency: Literal["critical", "high", "normal", "low"]
-    confidence: float
-    title: str
-    body: str
-    evidence: dict[str, Any]
-    taint: dict[str, Any]
-    created_at: str
-
-
-class SurfaceAttentionItemContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    id: str
-    group_id: str
-    rank_snapshot_id: str
-    source_type: Literal["attention_group"]
-    source_id: str
-    source_signal_ids: list[str]
-    dedupe_key: str
+    case_key: str
     status: Literal[
         "open",
-        "notified",
+        "waiting",
+        "spoken",
+        "acted",
+        "asked",
+        "ignored",
         "acknowledged",
-        "snoozed",
         "resolved",
-        "expired",
-        "cancelled",
-        "superseded",
+        "failed",
     ]
-    priority: Literal["critical", "high", "normal", "low"]
-    urgency: Literal["critical", "high", "normal", "low"]
-    confidence: float
     title: str
-    body: str
-    reason: str
-    evidence: dict[str, Any]
-    taint: dict[str, Any]
-    rank_score: float
-    rank_inputs: dict[str, Any]
-    rank_reason: str
-    delivery_decision: Literal["interrupt_now", "queue", "digest", "suppress"]
-    delivery_reason: str
-    suppression_reason: str | None
-    expires_at: str | None
-    next_follow_up_after: str | None
-    last_notified_at: str | None
+    summary: str
+    latest_observation_id: str
+    last_decision_id: str | None
+    next_recheck_after: str | None
     created_at: str
     updated_at: str
 
 
-class SurfaceAttentionItemEventContract(BaseModel):
+class SurfaceProactiveCaseEventContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
-    attention_item_id: str
+    case_id: str
     event_type: Literal[
-        "detected",
+        "opened",
         "updated",
-        "notified",
+        "context_built",
+        "decided",
+        "validated",
+        "turn_created",
+        "action_planned",
+        "action_executed",
+        "waiting",
         "acknowledged",
-        "snoozed",
         "resolved",
-        "cancelled",
-        "expired",
-        "follow_up_queued",
-        "refreshed",
+        "feedback_recorded",
+        "failed",
     ]
     payload: dict[str, Any]
     created_at: str
+
+
+class SurfaceProactiveContextSnapshotContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    case_id: str
+    snapshot_key: str
+    context: dict[str, Any]
+    model_input: list[dict[str, Any]]
+    omitted_context: dict[str, Any]
+    taint: dict[str, Any]
+    created_at: str
+
+
+class SurfaceProactiveDecisionContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    case_id: str
+    context_snapshot_id: str
+    provider: str
+    model: str
+    provider_response_id: str | None
+    decision_type: Literal[
+        "ignore",
+        "remember",
+        "wait",
+        "observe_more",
+        "speak_now",
+        "ask_user",
+        "act_now",
+        "speak_and_act",
+    ]
+    status: Literal["proposed", "invalid", "validated", "executed", "ignored"]
+    confidence: float
+    urgency: Literal["critical", "high", "normal", "low"]
+    user_visible_message: str | None
+    rationale: str
+    evidence_refs: list[str]
+    tool_refs: list[str]
+    actions: list[dict[str, Any]]
+    follow_up: dict[str, Any] | None
+    raw_model_output: dict[str, Any]
+    created_at: str
+
+
+class SurfaceProactivePolicyValidationContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    case_id: str
+    decision_id: str
+    result: Literal[
+        "authorized",
+        "authorized_with_constraints",
+        "denied",
+        "needs_user_authority",
+        "stale_context",
+        "invalid_decision",
+        "duplicate",
+        "dead_letter",
+    ]
+    policy_version: str
+    action_plan_hash: str | None
+    constraints: dict[str, Any]
+    denial_reason: str | None
+    created_at: str
+
+
+class SurfaceProactiveTurnContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    case_id: str
+    decision_id: str
+    dedupe_key: str
+    origin: Literal["proactive"]
+    channel: Literal["discord"]
+    status: Literal["pending", "delivered", "acknowledged", "failed", "cancelled"]
+    message: str
+    delivery_payload: dict[str, Any]
+    delivered_at: str | None
+    acked_at: str | None
+    created_at: str
+    updated_at: str
+
+
+class SurfaceProactiveActionPlanContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    case_id: str
+    decision_id: str
+    plan_key: str
+    action_type: str
+    target: str
+    payload: dict[str, Any]
+    payload_hash: str
+    risk_tier: Literal["low", "medium", "high", "blocked"]
+    status: Literal[
+        "proposed", "authorized", "denied", "executing", "succeeded", "failed", "cancelled"
+    ]
+    policy_validation_id: str | None
+    created_at: str
+    updated_at: str
+
+
+class SurfaceProactiveActionExecutionContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    action_plan_id: str
+    idempotency_key: str
+    status: Literal["pending", "running", "succeeded", "failed"]
+    external_receipt: dict[str, Any] | None
+    error: str | None
+    started_at: str | None
+    completed_at: str | None
+    created_at: str
+    updated_at: str
 
 
 class SurfaceConnectorSubscriptionListResponseContract(BaseModel):
@@ -967,115 +1020,156 @@ class SurfaceWorkspaceItemEventListResponseContract(BaseModel):
     events: list[SurfaceWorkspaceItemEventContract]
 
 
-class SurfaceAttentionSignalListResponseContract(BaseModel):
+class SurfaceProactiveObservationListResponseContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     ok: bool
-    attention_signals: list[SurfaceAttentionSignalContract]
+    observations: list[SurfaceProactiveObservationContract]
 
 
-class SurfaceAttentionGroupListResponseContract(BaseModel):
+class SurfaceProactiveCaseListResponseContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     ok: bool
-    attention_groups: list[SurfaceAttentionGroupContract]
+    cases: list[SurfaceProactiveCaseContract]
 
 
-class SurfaceAttentionRankFeatureListResponseContract(BaseModel):
+class SurfaceProactiveCaseResponseContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     ok: bool
-    attention_rank_features: list[SurfaceAttentionRankFeatureContract]
+    case: SurfaceProactiveCaseContract
 
 
-class SurfaceAttentionRankSnapshotListResponseContract(BaseModel):
+class SurfaceProactiveCaseEventListResponseContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     ok: bool
-    attention_rank_snapshots: list[SurfaceAttentionRankSnapshotContract]
+    case_id: str
+    events: list[SurfaceProactiveCaseEventContract]
 
 
-class SurfaceProactiveFeedbackRuleContract(BaseModel):
+class SurfaceProactiveContextSnapshotListResponseContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    case_id: str
+    context_snapshots: list[SurfaceProactiveContextSnapshotContract]
+
+
+class SurfaceProactiveDecisionListResponseContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    case_id: str
+    decisions: list[SurfaceProactiveDecisionContract]
+
+
+class SurfaceProactivePolicyValidationListResponseContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    case_id: str
+    validations: list[SurfaceProactivePolicyValidationContract]
+
+
+class SurfaceProactiveTurnListResponseContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    turns: list[SurfaceProactiveTurnContract]
+
+
+class SurfaceProactiveActionListResponseContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    case_id: str | None
+    action_plans: list[SurfaceProactiveActionPlanContract]
+    action_executions: list[SurfaceProactiveActionExecutionContract]
+
+
+class SurfaceAutonomyScopeContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
-    rule_key: str
-    rule_type: Literal["ranking", "grouping", "delivery", "suppression"]
-    status: Literal["active", "paused", "archived"]
-    priority: int
-    conditions: dict[str, Any]
-    effect: dict[str, Any]
+    scope_key: str
+    actor: str
+    source_context: dict[str, Any]
+    action_type: str
+    target_system: str
+    allowed_target_systems: list[str]
+    allowed_payload: dict[str, Any]
+    allowed_payload_shape: dict[str, Any]
+    max_impact: Literal["low", "medium", "high"]
+    revocation_rule: str
+    notification_rule: Literal["silent_audit", "notify_after", "notify_before"]
+    audit_visibility: Literal["private", "operator_visible"]
+    version: int
+    status: Literal["active", "paused", "revoked"]
+    revoked_at: str | None
     created_at: str
     updated_at: str
 
 
-class SurfaceProactiveFeedbackRuleListResponseContract(BaseModel):
+class SurfaceAutonomyScopeListResponseContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     ok: bool
-    proactive_feedback_rules: list[SurfaceProactiveFeedbackRuleContract]
+    autonomy_scopes: list[SurfaceAutonomyScopeContract]
 
 
-class SurfaceActionProposalContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    id: str
-    attention_item_id: str
-    capability_id: str
-    payload: dict[str, Any]
-    payload_hash: str
-    status: Literal["proposed", "approved", "rejected", "superseded"]
-    policy_state: dict[str, Any]
-    evidence: dict[str, Any]
-    created_at: str
-    updated_at: str
-
-
-class SurfaceActionProposalListResponseContract(BaseModel):
+class SurfaceAutonomyScopeResponseContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     ok: bool
-    action_proposals: list[SurfaceActionProposalContract]
+    autonomy_scope: SurfaceAutonomyScopeContract
 
 
 class SurfaceProactiveFeedbackContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
-    attention_item_id: str
-    feedback_type: Literal["important", "noise", "wrong", "useful"]
+    case_id: str
+    feedback_type: Literal[
+        "ack",
+        "correct",
+        "stop_pattern",
+        "more_aggressive",
+        "useful",
+        "wrong",
+        "automatic_next_time",
+    ]
     note: str | None
+    payload: dict[str, Any]
     created_at: str
 
 
-class SurfaceAttentionFeedbackResponseContract(BaseModel):
+class SurfaceProactiveFeedbackResponseContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     ok: bool
-    attention_item: SurfaceAttentionItemContract
+    case: SurfaceProactiveCaseContract
     feedback: SurfaceProactiveFeedbackContract
 
 
-class SurfaceAttentionItemResponseContract(BaseModel):
+class SurfaceProactiveLearningRecordContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    feedback_id: str | None
+    record_type: Literal["instruction", "example", "calibration", "preference", "autonomy_request"]
+    status: Literal["active", "superseded", "rejected"]
+    content: dict[str, Any]
+    created_at: str
+    updated_at: str
+
+
+class SurfaceProactiveLearningRecordListResponseContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     ok: bool
-    attention_item: SurfaceAttentionItemContract
-
-
-class SurfaceAttentionItemListResponseContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    ok: bool
-    attention_items: list[SurfaceAttentionItemContract]
-
-
-class SurfaceAttentionItemEventListResponseContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    ok: bool
-    attention_item_id: str
-    events: list[SurfaceAttentionItemEventContract]
+    learning_records: list[SurfaceProactiveLearningRecordContract]
 
 
 class SurfaceCaptureSuccessResponseContract(BaseModel):
@@ -1121,7 +1215,7 @@ def _default_surface_context_metadata() -> dict[str, Any]:
             "recent_active_session_turns",
             "memory_context",
             "open_commitments_and_jobs",
-            "relevant_artifacts_and_signals",
+            "relevant_artifacts_and_observations",
         ],
         "policy_instruction_count": 0,
         "recent_window": {
@@ -1597,135 +1691,170 @@ def build_surface_workspace_item_event_list_response(
     )
 
 
-def build_surface_attention_signal_list_response(*, attention_signals: Any) -> dict[str, Any]:
+def build_surface_proactive_observation_list_response(*, observations: Any) -> dict[str, Any]:
     return _validate_contract(
-        "surface_attention_signal_list_response",
-        SurfaceAttentionSignalListResponseContract,
+        "surface_proactive_observation_list_response",
+        SurfaceProactiveObservationListResponseContract,
         {
             "ok": True,
-            "attention_signals": attention_signals if isinstance(attention_signals, list) else [],
+            "observations": observations if isinstance(observations, list) else [],
         },
     )
 
 
-def build_surface_attention_group_list_response(*, attention_groups: Any) -> dict[str, Any]:
+def build_surface_proactive_case_list_response(*, cases: Any) -> dict[str, Any]:
     return _validate_contract(
-        "surface_attention_group_list_response",
-        SurfaceAttentionGroupListResponseContract,
+        "surface_proactive_case_list_response",
+        SurfaceProactiveCaseListResponseContract,
         {
             "ok": True,
-            "attention_groups": attention_groups if isinstance(attention_groups, list) else [],
+            "cases": cases if isinstance(cases, list) else [],
         },
     )
 
 
-def build_surface_attention_rank_feature_list_response(
+def build_surface_proactive_case_response(*, case: Any) -> dict[str, Any]:
+    return _validate_contract(
+        "surface_proactive_case_response",
+        SurfaceProactiveCaseResponseContract,
+        {"ok": True, "case": case if isinstance(case, dict) else {}},
+    )
+
+
+def build_surface_proactive_case_event_list_response(
     *,
-    attention_rank_features: Any,
+    case_id: Any,
+    events: Any,
 ) -> dict[str, Any]:
     return _validate_contract(
-        "surface_attention_rank_feature_list_response",
-        SurfaceAttentionRankFeatureListResponseContract,
-        {
-            "ok": True,
-            "attention_rank_features": (
-                attention_rank_features if isinstance(attention_rank_features, list) else []
-            ),
-        },
+        "surface_proactive_case_event_list_response",
+        SurfaceProactiveCaseEventListResponseContract,
+        {"ok": True, "case_id": case_id, "events": events if isinstance(events, list) else []},
     )
 
 
-def build_surface_attention_rank_snapshot_list_response(
+def build_surface_proactive_context_snapshot_list_response(
     *,
-    attention_rank_snapshots: Any,
+    case_id: Any,
+    context_snapshots: Any,
 ) -> dict[str, Any]:
     return _validate_contract(
-        "surface_attention_rank_snapshot_list_response",
-        SurfaceAttentionRankSnapshotListResponseContract,
+        "surface_proactive_context_snapshot_list_response",
+        SurfaceProactiveContextSnapshotListResponseContract,
         {
             "ok": True,
-            "attention_rank_snapshots": (
-                attention_rank_snapshots if isinstance(attention_rank_snapshots, list) else []
-            ),
+            "case_id": case_id,
+            "context_snapshots": (context_snapshots if isinstance(context_snapshots, list) else []),
         },
     )
 
 
-def build_surface_proactive_feedback_rule_list_response(
+def build_surface_proactive_decision_list_response(
     *,
-    proactive_feedback_rules: Any,
+    case_id: Any,
+    decisions: Any,
 ) -> dict[str, Any]:
     return _validate_contract(
-        "surface_proactive_feedback_rule_list_response",
-        SurfaceProactiveFeedbackRuleListResponseContract,
+        "surface_proactive_decision_list_response",
+        SurfaceProactiveDecisionListResponseContract,
         {
             "ok": True,
-            "proactive_feedback_rules": (
-                proactive_feedback_rules if isinstance(proactive_feedback_rules, list) else []
-            ),
+            "case_id": case_id,
+            "decisions": decisions if isinstance(decisions, list) else [],
         },
     )
 
 
-def build_surface_action_proposal_list_response(*, action_proposals: Any) -> dict[str, Any]:
-    return _validate_contract(
-        "surface_action_proposal_list_response",
-        SurfaceActionProposalListResponseContract,
-        {
-            "ok": True,
-            "action_proposals": action_proposals if isinstance(action_proposals, list) else [],
-        },
-    )
-
-
-def build_surface_attention_feedback_response(
+def build_surface_proactive_policy_validation_list_response(
     *,
-    attention_item: Any,
+    case_id: Any,
+    validations: Any,
+) -> dict[str, Any]:
+    return _validate_contract(
+        "surface_proactive_policy_validation_list_response",
+        SurfaceProactivePolicyValidationListResponseContract,
+        {
+            "ok": True,
+            "case_id": case_id,
+            "validations": validations if isinstance(validations, list) else [],
+        },
+    )
+
+
+def build_surface_proactive_turn_list_response(*, turns: Any) -> dict[str, Any]:
+    return _validate_contract(
+        "surface_proactive_turn_list_response",
+        SurfaceProactiveTurnListResponseContract,
+        {"ok": True, "turns": turns if isinstance(turns, list) else []},
+    )
+
+
+def build_surface_proactive_action_list_response(
+    *,
+    case_id: Any,
+    action_plans: Any,
+    action_executions: Any,
+) -> dict[str, Any]:
+    return _validate_contract(
+        "surface_proactive_action_list_response",
+        SurfaceProactiveActionListResponseContract,
+        {
+            "ok": True,
+            "case_id": case_id,
+            "action_plans": action_plans if isinstance(action_plans, list) else [],
+            "action_executions": (action_executions if isinstance(action_executions, list) else []),
+        },
+    )
+
+
+def build_surface_autonomy_scope_list_response(*, autonomy_scopes: Any) -> dict[str, Any]:
+    return _validate_contract(
+        "surface_autonomy_scope_list_response",
+        SurfaceAutonomyScopeListResponseContract,
+        {
+            "ok": True,
+            "autonomy_scopes": autonomy_scopes if isinstance(autonomy_scopes, list) else [],
+        },
+    )
+
+
+def build_surface_autonomy_scope_response(*, autonomy_scope: Any) -> dict[str, Any]:
+    return _validate_contract(
+        "surface_autonomy_scope_response",
+        SurfaceAutonomyScopeResponseContract,
+        {
+            "ok": True,
+            "autonomy_scope": autonomy_scope if isinstance(autonomy_scope, dict) else {},
+        },
+    )
+
+
+def build_surface_proactive_feedback_response(
+    *,
+    case: Any,
     feedback: Any,
 ) -> dict[str, Any]:
     return _validate_contract(
-        "surface_attention_feedback_response",
-        SurfaceAttentionFeedbackResponseContract,
+        "surface_proactive_feedback_response",
+        SurfaceProactiveFeedbackResponseContract,
         {
             "ok": True,
-            "attention_item": attention_item if isinstance(attention_item, dict) else {},
+            "case": case if isinstance(case, dict) else {},
             "feedback": feedback if isinstance(feedback, dict) else {},
         },
     )
 
 
-def build_surface_attention_item_response(*, attention_item: Any) -> dict[str, Any]:
-    attention_item_payload = attention_item if isinstance(attention_item, dict) else {}
-    return _validate_contract(
-        "surface_attention_item_response",
-        SurfaceAttentionItemResponseContract,
-        {"ok": True, "attention_item": attention_item_payload},
-    )
-
-
-def build_surface_attention_item_list_response(*, attention_items: Any) -> dict[str, Any]:
-    return _validate_contract(
-        "surface_attention_item_list_response",
-        SurfaceAttentionItemListResponseContract,
-        {
-            "ok": True,
-            "attention_items": attention_items if isinstance(attention_items, list) else [],
-        },
-    )
-
-
-def build_surface_attention_item_event_list_response(
+def build_surface_proactive_learning_record_list_response(
     *,
-    attention_item_id: Any,
-    events: Any,
+    learning_records: Any,
 ) -> dict[str, Any]:
     return _validate_contract(
-        "surface_attention_item_event_list_response",
-        SurfaceAttentionItemEventListResponseContract,
+        "surface_proactive_learning_record_list_response",
+        SurfaceProactiveLearningRecordListResponseContract,
         {
             "ok": True,
-            "attention_item_id": attention_item_id,
-            "events": events if isinstance(events, list) else [],
+            "learning_records": learning_records if isinstance(learning_records, list) else [],
         },
     )
 

@@ -67,13 +67,29 @@ sends no visible assistant text.
 `/ariel` and `/ask` are gone. `/status`, `/jobs`, `/memory`, and `/capture` are
 deterministic operational commands only and do not route free-form prompts to the model.
 
-## proactive attention
+## proactive AI deliberation
 
-The durable worker owns provider event sync, workspace signal derivation, ranking,
-grouping, attention review, delivery, feedback review, and follow-ups. Provider deltas
-and internal state create durable attention signals; signals become rank features,
-groups, rank snapshots, and then ranked attention items. Discord notifications carry
-acknowledge, snooze, resolve, and refresh buttons.
+The durable worker owns provider event sync, ambient observation derivation, model
+deliberation, policy validation, proactive turn delivery, autonomous action execution,
+feedback learning, and follow-ups. It queues ambient observation derivation itself on
+`ARIEL_PROACTIVE_AMBIENT_INTERVAL_SECONDS`; operators can still use
+`POST /v1/proactive/observations/derive` as an explicit replay/control path. Provider
+deltas and internal state create durable proactive observations; observations open or
+update proactive cases; cases assemble context and ask the model whether to ignore,
+remember, wait, speak, ask, act, or speak and act.
+
+Discord renders proactive turns and correction controls. It does not decide whether
+Ariel should speak or act. Autonomous actions require an active autonomy scope and
+record policy validation plus execution receipts.
+
+Worker task names:
+
+- `workspace_observation_derivation_due`
+- `proactive_deliberation_due`
+- `proactive_follow_up_due`
+- `proactive_feedback_learning_due`
+- `proactive_action_execution_due`
+- `deliver_discord_notification`
 
 Core inspection and mutation routes:
 
@@ -84,15 +100,22 @@ Core inspection and mutation routes:
 - `GET /v1/provider-events`
 - `GET /v1/sync-runs`
 - `GET /v1/workspace-items`
-- `GET /v1/attention-signals`
-- `GET /v1/attention-rank-features`
-- `GET /v1/attention-groups`
-- `GET /v1/attention-rank-snapshots`
-- `POST /v1/attention-signals/derive`
-- `GET /v1/attention-items`
-- `GET /v1/attention-items/{attention_item_id}/events`
-- `POST /v1/attention-items/{attention_item_id}/ack|snooze|resolve|cancel|refresh|feedback`
-- `GET /v1/proactive-feedback-rules`
+- `GET /v1/proactive/observations`
+- `POST /v1/proactive/observations/derive`
+- `GET /v1/proactive/cases`
+- `GET /v1/proactive/cases/{case_id}`
+- `GET /v1/proactive/cases/{case_id}/events`
+- `GET /v1/proactive/cases/{case_id}/context-snapshots`
+- `GET /v1/proactive/cases/{case_id}/decisions`
+- `GET /v1/proactive/cases/{case_id}/validations`
+- `GET /v1/proactive/cases/{case_id}/actions`
+- `POST /v1/proactive/cases/{case_id}/deliberate`
+- `POST /v1/proactive/cases/{case_id}/ack|correct|stop-pattern|more-aggressive|feedback`
+- `GET /v1/proactive/turns`
+- `GET /v1/proactive/autonomy-scopes`
+- `POST /v1/proactive/autonomy-scopes`
+- `DELETE /v1/proactive/autonomy-scopes/{scope_id}`
+- `GET /v1/proactive/learning-records`
 
 ## verification gates
 
@@ -273,7 +296,7 @@ slice-5 adds canonical durable memory, explicit + threshold rotation, and harden
   - `recent_active_session_turns`
   - `memory_context`
   - `open_commitments_and_jobs`
-  - `relevant_artifacts_and_signals`
+  - `relevant_artifacts_and_observations`
 
 ## slice-6 pr-01 drive vertical (search/read/share)
 
@@ -557,6 +580,12 @@ run the durable worker in another shell when Agency events or notifications are 
 ```bash
 make run-worker
 ```
+
+proactive worker settings:
+
+- `ARIEL_PROACTIVE_AMBIENT_INTERVAL_SECONDS` (default `60`) controls how often the worker queues ambient observation derivation.
+- `ARIEL_PROACTIVE_WORKER_MAX_ATTEMPTS` (default `5`) is the retry budget for worker-owned ambient and provider-renewal follow-up tasks.
+- `ARIEL_PROACTIVE_DELIBERATION_TOOL_ROUNDS` (default `2`) bounds read-only tool rounds during proactive deliberation.
 
 connection-string values (`user/password/database/port`) can be any values you want, as long as:
 
