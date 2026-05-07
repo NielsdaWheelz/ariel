@@ -16,14 +16,15 @@ from ariel.capability_registry import (
     response_tool_definitions,
 )
 from ariel.config import AppSettings
-from ariel.executor import execute_capability
-from ariel.memory import build_memory_context
+from ariel.executor import execute_capability, preflight_capability_execution
+from ariel.memory import AIJudgmentFailure, MEMORY_CURATION_PROMPT_VERSION, build_memory_context
 from ariel.persistence import (
     ApprovalRequestRecord,
     AutonomyScopeRecord,
     BackgroundTaskRecord,
     CaptureRecord,
     GoogleConnectorRecord,
+    AIJudgmentRecord,
     JobRecord,
     MemoryAssertionRecord,
     MemoryEntityRecord,
@@ -39,12 +40,16 @@ from ariel.persistence import (
     ProactiveObservationRecord,
     ProactivePolicyValidationRecord,
     ProactiveTurnRecord,
+    WorkspaceItemEventRecord,
+    WorkspaceItemRecord,
     to_rfc3339,
 )
 from ariel.redaction import safe_failure_reason
 
 
 PROACTIVE_POLICY_VERSION = "proactive-ai-deliberation-v1"
+PROACTIVE_AMBIENT_INTERPRETATION_PROMPT_VERSION = "proactive-ambient-interpretation-v1"
+PROACTIVE_FEEDBACK_LEARNING_PROMPT_VERSION = "proactive-feedback-learning-v1"
 _FOLLOW_UP_INTERVALS = {
     "PT5M": timedelta(minutes=5),
     "PT10M": timedelta(minutes=10),
@@ -52,6 +57,15 @@ _FOLLOW_UP_INTERVALS = {
     "PT1H": timedelta(hours=1),
 }
 _IMPACT_ORDER = {"low": 0, "medium": 1, "high": 2}
+_FEEDBACK_LEARNING_RECORD_TYPES = {
+    "instruction",
+    "example",
+    "calibration",
+    "preference",
+    "source_preference",
+    "prompt_instruction",
+    "autonomy_request",
+}
 
 
 def _payload_text(payload: dict[str, Any], key: str) -> str | None:
@@ -235,187 +249,518 @@ def upsert_proactive_observation(
     return case.id
 
 
-def process_workspace_observation_derivation_due(
+def _ambient_interpretation_candidates(
+    db: Session,
+    *,
+    now: datetime,
+    workspace_item_event_id: str | None,
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+
+    jobs = db.scalars(
+        select(JobRecord).order_by(JobRecord.updated_at.desc(), JobRecord.id.asc()).limit(24)
+    ).all()
+    for job in jobs:
+        candidates.append(
+            {
+                "candidate_id": f"job:{job.id}:{job.status}:{to_rfc3339(job.updated_at)}",
+                "source_type": "job",
+                "source_id": job.id,
+                "workspace_item_id": None,
+                "observed_at": to_rfc3339(job.updated_at),
+                "trust_boundary": "trusted_internal",
+                "taint": {"provenance_status": "trusted_internal"},
+                "raw_event": {
+                    "id": job.id,
+                    "source": job.source,
+                    "external_job_id": job.external_job_id,
+                    "status": job.status,
+                    "title": job.title,
+                    "summary": job.summary,
+                    "updated_at": to_rfc3339(job.updated_at),
+                },
+            }
+        )
+
+    approvals = db.scalars(
+        select(ApprovalRequestRecord)
+        .where(ApprovalRequestRecord.status == "pending")
+        .order_by(ApprovalRequestRecord.expires_at.asc(), ApprovalRequestRecord.id.asc())
+        .limit(24)
+    ).all()
+    for approval in approvals:
+        candidates.append(
+            {
+                "candidate_id": f"approval:{approval.id}:{to_rfc3339(approval.expires_at)}",
+                "source_type": "approval_request",
+                "source_id": approval.id,
+                "workspace_item_id": None,
+                "observed_at": to_rfc3339(now),
+                "trust_boundary": "trusted_internal",
+                "taint": {"provenance_status": "trusted_internal"},
+                "raw_event": {
+                    "id": approval.id,
+                    "action_attempt_id": approval.action_attempt_id,
+                    "status": approval.status,
+                    "expires_at": to_rfc3339(approval.expires_at),
+                },
+            }
+        )
+
+    assertions = db.scalars(
+        select(MemoryAssertionRecord)
+        .where(MemoryAssertionRecord.lifecycle_state == "active")
+        .order_by(MemoryAssertionRecord.updated_at.desc(), MemoryAssertionRecord.id.asc())
+        .limit(24)
+    ).all()
+    for assertion in assertions:
+        candidates.append(
+            {
+                "candidate_id": f"memory:{assertion.id}:{to_rfc3339(assertion.updated_at)}",
+                "source_type": "memory_assertion",
+                "source_id": assertion.id,
+                "workspace_item_id": None,
+                "observed_at": to_rfc3339(assertion.updated_at),
+                "trust_boundary": "reviewed_memory",
+                "taint": {"provenance_status": "reviewed_memory"},
+                "raw_event": {
+                    "id": assertion.id,
+                    "assertion_type": assertion.assertion_type,
+                    "subject_key": assertion.subject_key,
+                    "predicate": assertion.predicate,
+                    "object_value": assertion.object_value,
+                    "confidence": assertion.confidence,
+                    "updated_at": to_rfc3339(assertion.updated_at),
+                },
+            }
+        )
+
+    connectors = db.scalars(
+        select(GoogleConnectorRecord)
+        .order_by(GoogleConnectorRecord.updated_at.desc(), GoogleConnectorRecord.id.asc())
+        .limit(24)
+    ).all()
+    for connector in connectors:
+        candidates.append(
+            {
+                "candidate_id": (
+                    f"google-connector:{connector.id}:{connector.status}:"
+                    f"{to_rfc3339(connector.updated_at)}"
+                ),
+                "source_type": "google_connector",
+                "source_id": connector.id,
+                "workspace_item_id": None,
+                "observed_at": to_rfc3339(connector.updated_at),
+                "trust_boundary": "trusted_internal",
+                "taint": {"provenance_status": "trusted_internal"},
+                "raw_event": {
+                    "id": connector.id,
+                    "status": connector.status,
+                    "last_error_code": connector.last_error_code,
+                    "updated_at": to_rfc3339(connector.updated_at),
+                },
+            }
+        )
+
+    captures = db.scalars(
+        select(CaptureRecord)
+        .order_by(CaptureRecord.created_at.desc(), CaptureRecord.id.asc())
+        .limit(24)
+    ).all()
+    for capture in captures:
+        candidates.append(
+            {
+                "candidate_id": f"capture:{capture.id}:{capture.terminal_state}",
+                "source_type": "capture",
+                "source_id": capture.id,
+                "workspace_item_id": None,
+                "observed_at": to_rfc3339(capture.created_at),
+                "trust_boundary": "trusted_internal",
+                "taint": {"provenance_status": "trusted_internal"},
+                "raw_event": {
+                    "id": capture.id,
+                    "capture_kind": capture.capture_kind,
+                    "terminal_state": capture.terminal_state,
+                    "turn_id": capture.turn_id,
+                    "normalized_turn_input": capture.normalized_turn_input,
+                    "created_at": to_rfc3339(capture.created_at),
+                },
+            }
+        )
+
+    workspace_event_query = select(WorkspaceItemEventRecord)
+    if workspace_item_event_id is not None:
+        workspace_event_query = workspace_event_query.where(
+            WorkspaceItemEventRecord.id == workspace_item_event_id
+        )
+    workspace_events = db.scalars(
+        workspace_event_query.order_by(
+            WorkspaceItemEventRecord.created_at.desc(),
+            WorkspaceItemEventRecord.id.asc(),
+        ).limit(48)
+    ).all()
+    for event in workspace_events:
+        item = db.get(WorkspaceItemRecord, event.workspace_item_id)
+        if item is None:
+            continue
+        candidates.append(
+            {
+                "candidate_id": f"workspace-event:{event.dedupe_key}",
+                "source_type": "workspace_item",
+                "source_id": item.id,
+                "workspace_item_id": item.id,
+                "observed_at": to_rfc3339(event.created_at),
+                "trust_boundary": "provider",
+                "taint": {"provenance_status": "tainted", "source": item.provider},
+                "raw_event": {
+                    "event_id": event.id,
+                    "event_type": event.event_type,
+                    "provider_event_id": event.provider_event_id,
+                    "payload": event.payload,
+                    "workspace_item": {
+                        "id": item.id,
+                        "provider": item.provider,
+                        "item_type": item.item_type,
+                        "external_id": item.external_id,
+                        "title": item.title,
+                        "summary": item.summary,
+                        "source_uri": item.source_uri,
+                        "status": item.status,
+                        "metadata": item.item_metadata,
+                    },
+                },
+            }
+        )
+
+    return candidates
+
+
+def process_ambient_interpretation_due(
     *,
     session_factory: sessionmaker[Session],
     task_payload: dict[str, Any],
+    settings: AppSettings,
+    model_adapter: Any | None,
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
 ) -> None:
-    del task_payload
+    workspace_item_event_id = _payload_text(task_payload, "workspace_item_event_id")
     with session_factory() as db:
         with db.begin():
             now = now_fn()
+            candidates = _ambient_interpretation_candidates(
+                db,
+                now=now,
+                workspace_item_event_id=workspace_item_event_id,
+            )
 
-            jobs = db.scalars(
-                select(JobRecord)
-                .where(
-                    JobRecord.status.in_(
-                        (
-                            "queued",
-                            "running",
-                            "waiting_approval",
-                            "succeeded",
-                            "failed",
-                            "cancelled",
-                            "timed_out",
-                        )
+    source_id = workspace_item_event_id or str(task_payload.get("origin") or "ambient")
+    candidate_refs = [
+        {
+            "candidate_id": candidate["candidate_id"],
+            "source_type": candidate["source_type"],
+            "source_id": candidate["source_id"],
+        }
+        for candidate in candidates
+    ]
+    if not candidates:
+        now = now_fn()
+        with session_factory() as db:
+            with db.begin():
+                db.add(
+                    AIJudgmentRecord(
+                        id=new_id_fn("ajg"),
+                        judgment_type="ambient_interpretation",
+                        source_type="ambient_batch",
+                        source_id=source_id,
+                        status="succeeded",
+                        model=None,
+                        prompt_version=PROACTIVE_AMBIENT_INTERPRETATION_PROMPT_VERSION,
+                        provider_response_id=None,
+                        input_summary="ambient source interpretation",
+                        input_refs={
+                            "workspace_item_event_id": workspace_item_event_id,
+                            "candidate_count": 0,
+                            "candidate_refs": [],
+                            "task_payload": task_payload,
+                        },
+                        selected=[],
+                        omitted=[],
+                        output={"observations": [], "omitted": []},
+                        rationale="no ambient interpretation candidates",
+                        uncertainty=None,
+                        confidence=None,
+                        parse_status="not_required_no_candidates",
+                        validation_status="not_validated",
+                        failure_code=None,
+                        failure_reason=None,
+                        created_at=now,
+                        updated_at=now,
                     )
                 )
-                .order_by(JobRecord.updated_at.desc(), JobRecord.id.asc())
-                .limit(24)
-            ).all()
-            for job in jobs:
-                title = job.title or job.external_job_id
-                upsert_proactive_observation(
-                    db,
-                    dedupe_key=f"job:{job.id}:{job.status}:{to_rfc3339(job.updated_at)}",
-                    case_key=f"job:{job.id}",
-                    source_type="job",
-                    source_id=job.id,
-                    observation_type="job_state",
-                    subject=f"Job needs deliberation: {title}",
-                    summary=job.summary or f"{job.external_job_id} is {job.status}.",
-                    payload={"status": job.status},
-                    evidence={
-                        "job_id": job.id,
-                        "source": job.source,
-                        "external_job_id": job.external_job_id,
-                        "status": job.status,
-                    },
-                    taint={"provenance_status": "trusted_internal"},
-                    trust_boundary="trusted_internal",
-                    observed_at=job.updated_at,
-                    workspace_item_id=None,
-                    now=now,
-                    new_id_fn=new_id_fn,
+        return
+
+    model_input = [
+        {
+            "role": "system",
+            "content": (
+                "You are Ariel's ambient event interpreter. Decide whether durable source "
+                "records and provider events are worth proactive observations and what they mean. "
+                "Return only strict JSON with keys: observations, omitted, rationale. "
+                "Each observation must include candidate_id, observation_key, case_key, "
+                "observation_type, subject, summary, payload, evidence, rationale. "
+                "Return an empty observations array when nothing is worth observing."
+            ),
+        },
+        {
+            "role": "system",
+            "content": json.dumps(
+                {"candidates": candidates}, sort_keys=True, separators=(",", ":")
+            ),
+        },
+    ]
+
+    def record_failed_judgment(
+        *,
+        response: dict[str, Any] | None,
+        parse_status: str,
+        validation_status: str,
+        failure_code: str,
+        failure_reason: str,
+    ) -> None:
+        now = now_fn()
+        response_payload = response or {}
+        with session_factory() as db:
+            with db.begin():
+                db.add(
+                    AIJudgmentRecord(
+                        id=new_id_fn("ajg"),
+                        judgment_type="ambient_interpretation",
+                        source_type="ambient_batch",
+                        source_id=source_id,
+                        status="failed",
+                        model=_provider_value(response_payload, "model", settings.model_name),
+                        prompt_version=PROACTIVE_AMBIENT_INTERPRETATION_PROMPT_VERSION,
+                        provider_response_id=_provider_response_id(response_payload),
+                        input_summary="ambient source interpretation",
+                        input_refs={
+                            "workspace_item_event_id": workspace_item_event_id,
+                            "candidate_count": len(candidates),
+                            "candidate_refs": candidate_refs,
+                        },
+                        selected=[],
+                        omitted=[],
+                        output={
+                            "response_output": response_payload.get("output")
+                            if isinstance(response_payload, dict)
+                            else None
+                        },
+                        rationale=None,
+                        uncertainty=None,
+                        confidence=None,
+                        parse_status=parse_status,
+                        validation_status=validation_status,
+                        failure_code=failure_code,
+                        failure_reason=failure_reason,
+                        created_at=now,
+                        updated_at=now,
+                    )
                 )
 
-            approvals = db.scalars(
-                select(ApprovalRequestRecord)
-                .where(
-                    ApprovalRequestRecord.status == "pending",
-                    ApprovalRequestRecord.expires_at > now,
-                )
-                .order_by(ApprovalRequestRecord.expires_at.asc(), ApprovalRequestRecord.id.asc())
-                .limit(24)
-            ).all()
-            for approval in approvals:
-                upsert_proactive_observation(
-                    db,
-                    dedupe_key=f"approval:{approval.id}:{to_rfc3339(approval.expires_at)}",
-                    case_key=f"approval:{approval.id}",
-                    source_type="approval_request",
-                    source_id=approval.id,
-                    observation_type="approval_pending",
-                    subject="Approval is waiting",
-                    summary=f"Approval {approval.id} is pending.",
-                    payload={"expires_at": to_rfc3339(approval.expires_at)},
-                    evidence={
-                        "approval_request_id": approval.id,
-                        "action_attempt_id": approval.action_attempt_id,
-                        "expires_at": to_rfc3339(approval.expires_at),
-                    },
-                    taint={"provenance_status": "trusted_internal"},
-                    trust_boundary="trusted_internal",
-                    observed_at=now,
-                    workspace_item_id=None,
-                    now=now,
-                    new_id_fn=new_id_fn,
-                )
+    try:
+        response = _call_direct_json_model(
+            model_input=model_input,
+            settings=settings,
+            model_adapter=model_adapter,
+            origin="ambient_interpretation",
+        )
+    except Exception as exc:
+        reason = safe_failure_reason(str(exc), fallback=f"unexpected {exc.__class__.__name__}")
+        record_failed_judgment(
+            response=None,
+            parse_status="missing_output",
+            validation_status="not_validated",
+            failure_code="E_AI_JUDGMENT_REQUIRED",
+            failure_reason=reason,
+        )
+        raise RuntimeError(reason) from exc
 
-            commitments = db.scalars(
-                select(MemoryAssertionRecord)
-                .where(
-                    MemoryAssertionRecord.assertion_type == "commitment",
-                    MemoryAssertionRecord.lifecycle_state == "active",
-                )
-                .order_by(MemoryAssertionRecord.updated_at.desc(), MemoryAssertionRecord.id.asc())
-                .limit(24)
-            ).all()
-            for assertion in commitments:
-                value = assertion.object_value if isinstance(assertion.object_value, dict) else {}
-                text = value.get("text") if isinstance(value.get("text"), str) else ""
-                upsert_proactive_observation(
-                    db,
-                    dedupe_key=f"memory-commitment:{assertion.id}:{to_rfc3339(assertion.updated_at)}",
-                    case_key=f"memory-commitment:{assertion.id}",
-                    source_type="memory_assertion",
-                    source_id=assertion.id,
-                    observation_type="memory_commitment",
-                    subject="Remembered commitment needs deliberation",
-                    summary=text or assertion.predicate,
-                    payload={"assertion_type": assertion.assertion_type},
-                    evidence={
-                        "assertion_id": assertion.id,
-                        "subject_key": assertion.subject_key,
-                        "predicate": assertion.predicate,
-                        "confidence": assertion.confidence,
-                    },
-                    taint={"provenance_status": "reviewed_memory"},
-                    trust_boundary="reviewed_memory",
-                    observed_at=assertion.updated_at,
-                    workspace_item_id=None,
-                    now=now,
-                    new_id_fn=new_id_fn,
-                )
+    try:
+        raw_result = _parse_model_json(response)
+    except json.JSONDecodeError as exc:
+        reason = safe_failure_reason(str(exc), fallback="ambient interpreter returned invalid JSON")
+        record_failed_judgment(
+            response=response,
+            parse_status="invalid_json",
+            validation_status="not_validated",
+            failure_code="E_AI_JUDGMENT_INVALID_JSON",
+            failure_reason=reason,
+        )
+        raise RuntimeError(reason) from exc
+    except RuntimeError as exc:
+        reason = safe_failure_reason(str(exc), fallback="ambient interpreter output missing")
+        record_failed_judgment(
+            response=response,
+            parse_status="missing_output",
+            validation_status="not_validated",
+            failure_code="E_AI_JUDGMENT_SCHEMA",
+            failure_reason=reason,
+        )
+        raise
 
-            connectors = db.scalars(
-                select(GoogleConnectorRecord)
-                .where(GoogleConnectorRecord.status != "connected")
-                .order_by(GoogleConnectorRecord.updated_at.desc(), GoogleConnectorRecord.id.asc())
-                .limit(24)
-            ).all()
-            for connector in connectors:
-                upsert_proactive_observation(
-                    db,
-                    dedupe_key=f"google-connector:{connector.id}:{connector.status}:{to_rfc3339(connector.updated_at)}",
-                    case_key=f"google-connector:{connector.id}",
-                    source_type="google_connector",
-                    source_id=connector.id,
-                    observation_type="connector_health",
-                    subject="Google connector needs deliberation",
-                    summary=f"Google connector is {connector.status}.",
-                    payload={"status": connector.status},
-                    evidence={
-                        "connector_id": connector.id,
-                        "status": connector.status,
-                        "last_error_code": connector.last_error_code,
-                    },
-                    taint={"provenance_status": "trusted_internal"},
-                    trust_boundary="trusted_internal",
-                    observed_at=connector.updated_at,
-                    workspace_item_id=None,
-                    now=now,
-                    new_id_fn=new_id_fn,
-                )
+    observations = raw_result.get("observations")
+    if not isinstance(observations, list):
+        reason = "ambient interpreter response missing observations"
+        record_failed_judgment(
+            response=response,
+            parse_status="schema_invalid",
+            validation_status="invalid",
+            failure_code="E_AI_JUDGMENT_SCHEMA",
+            failure_reason=reason,
+        )
+        raise RuntimeError(reason)
+    candidate_by_id = {candidate["candidate_id"]: candidate for candidate in candidates}
+    validated_observations: list[dict[str, Any]] = []
+    for raw_observation in observations:
+        if not isinstance(raw_observation, dict):
+            reason = "ambient interpreter observation must be an object"
+            record_failed_judgment(
+                response=response,
+                parse_status="schema_invalid",
+                validation_status="invalid",
+                failure_code="E_AI_JUDGMENT_SCHEMA",
+                failure_reason=reason,
+            )
+            raise RuntimeError(reason)
+        candidate_id = _payload_text(raw_observation, "candidate_id")
+        observation_key = _payload_text(raw_observation, "observation_key")
+        case_key = _payload_text(raw_observation, "case_key")
+        observation_type = _payload_text(raw_observation, "observation_type")
+        subject = _payload_text(raw_observation, "subject")
+        summary = _payload_text(raw_observation, "summary")
+        rationale = _payload_text(raw_observation, "rationale")
+        candidate = candidate_by_id.get(candidate_id or "")
+        if (
+            candidate is None
+            or observation_key is None
+            or case_key is None
+            or observation_type is None
+            or subject is None
+            or summary is None
+            or rationale is None
+        ):
+            reason = "ambient interpreter observation failed schema validation"
+            record_failed_judgment(
+                response=response,
+                parse_status="schema_invalid",
+                validation_status="invalid",
+                failure_code="E_AI_JUDGMENT_SCHEMA",
+                failure_reason=reason,
+            )
+            raise RuntimeError(reason)
+        payload = raw_observation.get("payload")
+        evidence = raw_observation.get("evidence")
+        validated_observations.append(
+            {
+                "candidate": candidate,
+                "candidate_id": candidate_id,
+                "observation_key": observation_key,
+                "case_key": case_key,
+                "observation_type": observation_type,
+                "subject": subject,
+                "summary": summary,
+                "payload": payload if isinstance(payload, dict) else {},
+                "evidence": evidence if isinstance(evidence, dict) else {},
+                "rationale": rationale,
+            }
+        )
 
-            captures = db.scalars(
-                select(CaptureRecord)
-                .where(CaptureRecord.terminal_state == "turn_created")
-                .order_by(CaptureRecord.created_at.desc(), CaptureRecord.id.asc())
-                .limit(24)
-            ).all()
-            for capture in captures:
+    with session_factory() as db:
+        with db.begin():
+            now = now_fn()
+            raw_omitted = raw_result.get("omitted")
+            omitted = (
+                [item for item in raw_omitted if isinstance(item, dict)]
+                if isinstance(raw_omitted, list)
+                else []
+            )
+            db.add(
+                AIJudgmentRecord(
+                    id=new_id_fn("ajg"),
+                    judgment_type="ambient_interpretation",
+                    source_type="ambient_batch",
+                    source_id=source_id,
+                    status="succeeded",
+                    model=_provider_value(response, "model", settings.model_name),
+                    prompt_version=PROACTIVE_AMBIENT_INTERPRETATION_PROMPT_VERSION,
+                    provider_response_id=_provider_response_id(response),
+                    input_summary="ambient source interpretation",
+                    input_refs={
+                        "workspace_item_event_id": workspace_item_event_id,
+                        "candidate_count": len(candidates),
+                        "candidate_refs": candidate_refs,
+                    },
+                    selected=[
+                        {
+                            "candidate_id": observation["candidate_id"],
+                            "observation_key": observation["observation_key"],
+                            "case_key": observation["case_key"],
+                            "rationale": observation["rationale"],
+                        }
+                        for observation in validated_observations
+                    ],
+                    omitted=omitted,
+                    output=raw_result,
+                    rationale=raw_result.get("rationale")
+                    if isinstance(raw_result.get("rationale"), str)
+                    else None,
+                    uncertainty=None,
+                    confidence=None,
+                    parse_status="parsed",
+                    validation_status="valid",
+                    failure_code=None,
+                    failure_reason=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            for observation in validated_observations:
+                candidate = observation["candidate"]
                 upsert_proactive_observation(
                     db,
-                    dedupe_key=f"capture:{capture.id}:{capture.terminal_state}",
-                    case_key=f"capture:{capture.id}",
-                    source_type="capture",
-                    source_id=capture.id,
-                    observation_type="capture_ready",
-                    subject="Captured item is ready for deliberation",
-                    summary=capture.normalized_turn_input or "Captured item is ready.",
-                    payload={"capture_kind": capture.capture_kind},
+                    dedupe_key=(
+                        f"ai-ambient:{observation['candidate_id']}:{observation['observation_key']}"
+                    ),
+                    case_key=str(observation["case_key"]),
+                    source_type=str(candidate["source_type"]),
+                    source_id=str(candidate["source_id"]),
+                    observation_type=str(observation["observation_type"]),
+                    subject=str(observation["subject"]),
+                    summary=str(observation["summary"]),
+                    payload=observation["payload"],
                     evidence={
-                        "capture_id": capture.id,
-                        "capture_kind": capture.capture_kind,
-                        "turn_id": capture.turn_id,
+                        **observation["evidence"],
+                        "candidate_id": observation["candidate_id"],
+                        "ambient_interpretation": {
+                            "provider": _provider_value(response, "provider", "unknown"),
+                            "model": _provider_value(response, "model", "unknown"),
+                            "provider_response_id": _provider_response_id(response),
+                            "prompt_version": PROACTIVE_AMBIENT_INTERPRETATION_PROMPT_VERSION,
+                            "parse_status": "parsed",
+                            "validation_status": "valid",
+                            "rationale": observation["rationale"],
+                            "omitted": omitted,
+                        },
+                        "raw_candidate": candidate,
                     },
-                    taint={"provenance_status": "trusted_internal"},
-                    trust_boundary="trusted_internal",
-                    observed_at=capture.created_at,
-                    workspace_item_id=None,
+                    taint=dict(candidate["taint"]),
+                    trust_boundary=str(candidate["trust_boundary"]),
+                    observed_at=datetime.fromisoformat(str(candidate["observed_at"])),
+                    workspace_item_id=(
+                        str(candidate["workspace_item_id"])
+                        if candidate.get("workspace_item_id") is not None
+                        else None
+                    ),
                     now=now,
                     new_id_fn=new_id_fn,
                 )
@@ -434,6 +779,8 @@ def process_proactive_deliberation_due(
     if case_id is None:
         raise RuntimeError("proactive_deliberation_due task missing case_id")
 
+    memory_failure: RuntimeError | None = None
+    memory_failure_retryable = False
     with session_factory() as db:
         with db.begin():
             case = db.scalar(
@@ -452,96 +799,232 @@ def process_proactive_deliberation_due(
                 raise RuntimeError("latest proactive observation not found")
 
             now = now_fn()
-            memory_context, memory_event = build_memory_context(
-                db,
-                user_message=f"{case.title}\n{case.summary}",
-                max_recalled_assertions=settings.max_recalled_assertions,
-                settings=settings,
-            )
-            learning_records = db.scalars(
-                select(ProactiveLearningRecord)
-                .where(ProactiveLearningRecord.status == "active")
-                .order_by(
-                    ProactiveLearningRecord.updated_at.desc(),
-                    ProactiveLearningRecord.id.asc(),
+            try:
+                memory_context, memory_event = build_memory_context(
+                    db,
+                    user_message=f"{case.title}\n{case.summary}",
+                    max_recalled_assertions=settings.max_recalled_assertions,
+                    settings=settings,
                 )
-                .limit(20)
-            ).all()
-            context = {
-                "case": {
-                    "id": case.id,
-                    "status": case.status,
-                    "title": case.title,
-                    "summary": case.summary,
-                },
-                "latest_observation": {
-                    "id": observation.id,
-                    "source_type": observation.source_type,
-                    "source_id": observation.source_id,
-                    "observation_type": observation.observation_type,
-                    "subject": observation.subject,
-                    "summary": observation.summary,
-                    "payload": observation.payload,
-                    "evidence": observation.evidence,
-                    "trust_boundary": observation.trust_boundary,
-                    "observed_at": to_rfc3339(observation.observed_at),
-                },
-                "memory_context": memory_context,
-                "memory_recall": memory_event,
-                "learning_records": [
+            except AIJudgmentFailure as exc:
+                safe_reason = safe_failure_reason(
+                    exc.safe_reason,
+                    fallback=f"unexpected {exc.__class__.__name__}",
+                )
+                candidate_memory_ids = [
+                    memory_id
+                    for memory_id in db.scalars(
+                        select(MemoryAssertionRecord.id)
+                        .where(MemoryAssertionRecord.lifecycle_state == "active")
+                        .order_by(MemoryAssertionRecord.updated_at.desc())
+                        .limit(max(50, int(settings.max_recalled_assertions) * 8))
+                    ).all()
+                    if isinstance(memory_id, str)
+                ]
+                db.add(
+                    AIJudgmentRecord(
+                        id=new_id_fn("ajg"),
+                        judgment_type="memory_curation",
+                        source_type="proactive_case",
+                        source_id=case.id,
+                        status="failed",
+                        model=settings.model_name,
+                        prompt_version=MEMORY_CURATION_PROMPT_VERSION,
+                        provider_response_id=exc.provider_response_id,
+                        input_summary="memory curation for proactive case",
+                        input_refs={
+                            "case_id": case.id,
+                            "latest_observation_id": observation.id,
+                            "candidate_memory_ids": candidate_memory_ids,
+                        },
+                        selected=[],
+                        omitted=[],
+                        output={},
+                        rationale=None,
+                        uncertainty=None,
+                        confidence=None,
+                        parse_status=exc.parse_status,
+                        validation_status=exc.validation_status,
+                        failure_code=exc.code,
+                        failure_reason=safe_reason,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                db.add(
+                    AIJudgmentRecord(
+                        id=new_id_fn("ajg"),
+                        judgment_type="proactive_deliberation",
+                        source_type="proactive_case",
+                        source_id=case.id,
+                        status="failed",
+                        model=settings.model_name,
+                        prompt_version=PROACTIVE_POLICY_VERSION,
+                        provider_response_id=None,
+                        input_summary="proactive case deliberation",
+                        input_refs={
+                            "case_id": case.id,
+                            "latest_observation_id": observation.id,
+                            "dependency": "memory_curation",
+                        },
+                        selected=[],
+                        omitted=[],
+                        output={},
+                        rationale=None,
+                        uncertainty=None,
+                        confidence=None,
+                        parse_status="missing_output",
+                        validation_status="not_validated",
+                        failure_code=exc.code,
+                        failure_reason=safe_reason,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                case.status = "failed"
+                case.updated_at = now
+                _add_case_event(
+                    db,
+                    case_id=case.id,
+                    event_type="failed",
+                    payload={
+                        "failure_type": "memory_curation",
+                        "failure_code": exc.code,
+                        "failure_reason": safe_reason,
+                        "parse_status": exc.parse_status,
+                        "validation_status": exc.validation_status,
+                        "retryable": exc.retryable,
+                    },
+                    now=now,
+                    new_id_fn=new_id_fn,
+                )
+                memory_failure = RuntimeError(safe_reason)
+                memory_failure_retryable = exc.retryable
+            else:
+                learning_records = db.scalars(
+                    select(ProactiveLearningRecord)
+                    .where(ProactiveLearningRecord.status == "active")
+                    .order_by(
+                        ProactiveLearningRecord.updated_at.desc(),
+                        ProactiveLearningRecord.id.asc(),
+                    )
+                    .limit(20)
+                ).all()
+                context = {
+                    "case": {
+                        "id": case.id,
+                        "status": case.status,
+                        "title": case.title,
+                        "summary": case.summary,
+                    },
+                    "latest_observation": {
+                        "id": observation.id,
+                        "source_type": observation.source_type,
+                        "source_id": observation.source_id,
+                        "observation_type": observation.observation_type,
+                        "subject": observation.subject,
+                        "summary": observation.summary,
+                        "payload": observation.payload,
+                        "evidence": observation.evidence,
+                        "trust_boundary": observation.trust_boundary,
+                        "observed_at": to_rfc3339(observation.observed_at),
+                    },
+                    "memory_context": memory_context,
+                    "memory_recall": memory_event,
+                    "learning_records": [
+                        {
+                            "id": record.id,
+                            "record_type": record.record_type,
+                            "content": record.content,
+                        }
+                        for record in learning_records
+                    ],
+                }
+                model_input = [
                     {
-                        "id": record.id,
-                        "record_type": record.record_type,
-                        "content": record.content,
-                    }
-                    for record in learning_records
-                ],
-            }
-            model_input = [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are Ariel's proactive deliberation engine. Decide whether to "
-                        "ignore, remember, wait, observe_more, speak_now, ask_user, act_now, "
-                        "or speak_and_act. Return only strict JSON with keys: decision, "
-                        "confidence, urgency, user_visible_message, rationale, evidence_refs, "
-                        "tool_refs, actions, follow_up."
-                    ),
-                },
-                {
-                    "role": "system",
-                    "content": json.dumps(context, sort_keys=True, separators=(",", ":")),
-                },
-            ]
-            snapshot = ProactiveContextSnapshotRecord(
-                id=new_id_fn("pcs"),
-                case_id=case.id,
-                snapshot_key=f"case:{case.id}:context:{now.timestamp()}",
-                context=context,
-                model_input=model_input,
-                omitted_context={},
-                taint={"latest_observation": observation.taint},
-                created_at=now,
-            )
-            db.add(snapshot)
-            db.flush()
-            snapshot_id = snapshot.id
-            _add_case_event(
-                db,
-                case_id=case.id,
-                event_type="context_built",
-                payload={"context_snapshot_id": snapshot.id},
-                now=now,
-                new_id_fn=new_id_fn,
-            )
+                        "role": "system",
+                        "content": (
+                            "You are Ariel's proactive deliberation engine. Decide whether to "
+                            "ignore, remember, wait, observe_more, speak_now, ask_user, act_now, "
+                            "or speak_and_act. Return only strict JSON with keys: decision, "
+                            "confidence, urgency, user_visible_message, rationale, evidence_refs, "
+                            "tool_refs, actions, follow_up."
+                        ),
+                    },
+                    {
+                        "role": "system",
+                        "content": json.dumps(context, sort_keys=True, separators=(",", ":")),
+                    },
+                ]
+                snapshot = ProactiveContextSnapshotRecord(
+                    id=new_id_fn("pcs"),
+                    case_id=case.id,
+                    snapshot_key=f"case:{case.id}:context:{now.timestamp()}",
+                    context=context,
+                    model_input=model_input,
+                    omitted_context={},
+                    taint={"latest_observation": observation.taint},
+                    created_at=now,
+                )
+                db.add(snapshot)
+                db.flush()
+                snapshot_id = snapshot.id
+                _add_case_event(
+                    db,
+                    case_id=case.id,
+                    event_type="context_built",
+                    payload={"context_snapshot_id": snapshot.id},
+                    now=now,
+                    new_id_fn=new_id_fn,
+                )
 
-    response = _call_deliberation_model(
-        model_input=model_input,
-        settings=settings,
-        model_adapter=model_adapter,
-    )
+    if memory_failure is not None:
+        if memory_failure_retryable:
+            raise memory_failure
+        return
+
     try:
-        raw_decision = _parse_model_decision(response)
+        response = _call_deliberation_model(
+            model_input=model_input,
+            settings=settings,
+            model_adapter=model_adapter,
+        )
+    except Exception as exc:
+        reason = safe_failure_reason(str(exc), fallback=f"unexpected {exc.__class__.__name__}")
+        with session_factory() as db:
+            with db.begin():
+                db.add(
+                    AIJudgmentRecord(
+                        id=new_id_fn("ajg"),
+                        judgment_type="proactive_deliberation",
+                        source_type="proactive_case",
+                        source_id=case_id,
+                        status="failed",
+                        model=settings.model_name,
+                        prompt_version=PROACTIVE_POLICY_VERSION,
+                        provider_response_id=None,
+                        input_summary="proactive case deliberation",
+                        input_refs={
+                            "case_id": case_id,
+                            "context_snapshot_id": snapshot_id,
+                        },
+                        selected=[],
+                        omitted=[],
+                        output={},
+                        rationale=None,
+                        uncertainty=None,
+                        confidence=None,
+                        parse_status="missing_output",
+                        validation_status="not_validated",
+                        failure_code="E_AI_JUDGMENT_REQUIRED",
+                        failure_reason=reason,
+                        created_at=now_fn(),
+                        updated_at=now_fn(),
+                    )
+                )
+        raise RuntimeError(reason) from exc
+    try:
+        raw_decision = _parse_model_json(response)
     except (json.JSONDecodeError, RuntimeError) as exc:
         with session_factory() as db:
             with db.begin():
@@ -562,12 +1045,16 @@ def process_proactive_deliberation_due(
                     ) from exc
                 _update_snapshot_tool_context(stored_snapshot, response)
                 reason = safe_proactive_error(exc)
+                parse_status = (
+                    "invalid_json" if isinstance(exc, json.JSONDecodeError) else "missing_output"
+                )
                 _record_invalid_decision(
                     db=db,
                     case=case,
                     snapshot=stored_snapshot,
                     response=response,
                     reason=reason,
+                    parse_status=parse_status,
                     raw_model_output={
                         "parse_error": reason,
                         "response_output": response.get("output"),
@@ -674,6 +1161,46 @@ def process_proactive_deliberation_due(
             db.add(decision)
             db.flush()
             case.last_decision_id = decision.id
+            db.add(
+                AIJudgmentRecord(
+                    id=new_id_fn("ajg"),
+                    judgment_type="proactive_deliberation",
+                    source_type="proactive_case",
+                    source_id=case.id,
+                    status="succeeded" if valid else "failed",
+                    model=_provider_value(response, "model", "unknown"),
+                    prompt_version=PROACTIVE_POLICY_VERSION,
+                    provider_response_id=_provider_response_id(response),
+                    input_summary="proactive case deliberation",
+                    input_refs={
+                        "case_id": case.id,
+                        "context_snapshot_id": stored_snapshot.id,
+                        "latest_observation_id": case.latest_observation_id,
+                    },
+                    selected=[
+                        {
+                            "decision_id": decision.id,
+                            "decision_type": decision.decision_type,
+                            "evidence_refs": evidence_refs,
+                            "tool_refs": tool_refs,
+                            "action_count": len(actions),
+                        }
+                    ]
+                    if valid
+                    else [],
+                    omitted=[],
+                    output=decision.raw_model_output,
+                    rationale=decision.rationale,
+                    uncertainty=None,
+                    confidence=decision.confidence,
+                    parse_status="parsed",
+                    validation_status="valid" if valid else "invalid",
+                    failure_code=None if valid else "E_AI_JUDGMENT_SCHEMA",
+                    failure_reason=None if valid else "model decision failed schema validation",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
             _add_case_event(
                 db,
                 case_id=case.id,
@@ -860,7 +1387,7 @@ def _proactive_tool_call_outputs(
     return output_items
 
 
-def _parse_model_decision(response: dict[str, Any]) -> dict[str, Any]:
+def _parse_model_json(response: dict[str, Any]) -> dict[str, Any]:
     output = response.get("output")
     if not isinstance(output, list):
         raise RuntimeError("model response missing output")
@@ -879,6 +1406,50 @@ def _parse_model_decision(response: dict[str, Any]) -> dict[str, Any]:
                 if isinstance(parsed, dict):
                     return parsed
     raise RuntimeError("model response missing JSON decision")
+
+
+def _call_direct_json_model(
+    *,
+    model_input: list[dict[str, Any]],
+    settings: AppSettings,
+    model_adapter: Any | None,
+    origin: str,
+) -> dict[str, Any]:
+    if model_adapter is not None:
+        return model_adapter.create_response(
+            input_items=model_input,
+            tools=[],
+            user_message="",
+            history=[],
+            context_bundle={"origin": origin, "model_input": model_input},
+        )
+    if settings.openai_api_key is None:
+        raise RuntimeError("model credentials are not configured")
+    response = httpx.post(
+        "https://api.openai.com/v1/responses",
+        headers={
+            "authorization": f"Bearer {settings.openai_api_key}",
+            "content-type": "application/json",
+        },
+        json={
+            "model": settings.model_name,
+            "input": model_input,
+            "store": False,
+            "reasoning": {"effort": settings.model_reasoning_effort},
+            "text": {"verbosity": settings.model_verbosity},
+        },
+        timeout=settings.model_timeout_seconds,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"model provider returned HTTP {response.status_code}")
+    payload = response.json()
+    return {
+        "output": payload.get("output"),
+        "provider": "openai",
+        "model": settings.model_name,
+        "usage": payload.get("usage") if isinstance(payload.get("usage"), dict) else None,
+        "provider_response_id": payload.get("id"),
+    }
 
 
 def _provider_value(response: dict[str, Any], key: str, fallback: str) -> str:
@@ -912,6 +1483,7 @@ def _record_invalid_decision(
     snapshot: ProactiveContextSnapshotRecord,
     response: dict[str, Any],
     reason: str,
+    parse_status: str,
     raw_model_output: dict[str, Any],
     now: datetime,
     new_id_fn: Callable[[str], str],
@@ -939,6 +1511,40 @@ def _record_invalid_decision(
     db.add(decision)
     db.flush()
     case.last_decision_id = decision.id
+    db.add(
+        AIJudgmentRecord(
+            id=new_id_fn("ajg"),
+            judgment_type="proactive_deliberation",
+            source_type="proactive_case",
+            source_id=case.id,
+            status="failed",
+            model=_provider_value(response, "model", "unknown"),
+            prompt_version=PROACTIVE_POLICY_VERSION,
+            provider_response_id=_provider_response_id(response),
+            input_summary="proactive case deliberation",
+            input_refs={
+                "case_id": case.id,
+                "context_snapshot_id": snapshot.id,
+                "latest_observation_id": case.latest_observation_id,
+            },
+            selected=[],
+            omitted=[],
+            output=raw_model_output,
+            rationale=reason,
+            uncertainty=None,
+            confidence=0.0,
+            parse_status=parse_status,
+            validation_status="not_validated",
+            failure_code=(
+                "E_AI_JUDGMENT_INVALID_JSON"
+                if parse_status == "invalid_json"
+                else "E_AI_JUDGMENT_REQUIRED"
+            ),
+            failure_reason=reason,
+            created_at=now,
+            updated_at=now,
+        )
+    )
     db.add(
         ProactivePolicyValidationRecord(
             id=new_id_fn("ppv"),
@@ -1093,6 +1699,126 @@ def _payload_allowed_by_scope(scope: AutonomyScopeRecord, payload: dict[str, Any
     return all(payload.get(key) == value for key, value in allowed_payload.items())
 
 
+def _payload_shape_value_allowed(value: Any, expected_type: Any) -> bool:
+    if not isinstance(expected_type, str):
+        return False
+    match expected_type.strip().lower():
+        case "str" | "string":
+            return isinstance(value, str)
+        case "list" | "array":
+            return isinstance(value, list)
+        case "dict" | "object":
+            return isinstance(value, dict)
+        case "bool" | "boolean":
+            return isinstance(value, bool)
+        case "int" | "integer":
+            return isinstance(value, int) and not isinstance(value, bool)
+        case "float" | "number":
+            return isinstance(value, (int, float)) and not isinstance(value, bool)
+        case "null":
+            return value is None
+        case _:
+            return False
+
+
+def _payload_allowed_by_shape(scope: AutonomyScopeRecord, payload: dict[str, Any]) -> bool:
+    shape = scope.allowed_payload_shape
+    if not isinstance(shape, dict):
+        return False
+    if not shape:
+        return False
+
+    raw_required = shape.get("required")
+    required: dict[str, Any] = {}
+    if isinstance(raw_required, dict):
+        required = {key: value for key, value in raw_required.items() if isinstance(key, str)}
+    elif isinstance(raw_required, list):
+        required = {key: None for key in raw_required if isinstance(key, str)}
+
+    raw_properties = shape.get("properties")
+    properties = raw_properties if isinstance(raw_properties, dict) else {}
+    if properties:
+        for key in required:
+            if key not in payload:
+                return False
+        for key, spec in properties.items():
+            if not isinstance(key, str) or key not in payload:
+                continue
+            expected_type = spec.get("type") if isinstance(spec, dict) else spec
+            if expected_type is not None and not _payload_shape_value_allowed(
+                payload[key], expected_type
+            ):
+                return False
+        if shape.get("additionalProperties") is False:
+            allowed_keys = {key for key in properties if isinstance(key, str)}
+            return set(payload).issubset(allowed_keys)
+        return True
+
+    direct_shape = {
+        key: value
+        for key, value in shape.items()
+        if key not in {"required", "allow_extra", "additionalProperties"}
+    }
+    if not required:
+        required = {key: value for key, value in direct_shape.items() if isinstance(key, str)}
+    for key, expected_type in required.items():
+        if key not in payload:
+            return False
+        if expected_type is not None and not _payload_shape_value_allowed(
+            payload[key], expected_type
+        ):
+            return False
+    if shape.get("allow_extra") is False or shape.get("additionalProperties") is False:
+        allowed_keys = set(required) | {key for key in direct_shape if isinstance(key, str)}
+        return set(payload).issubset(allowed_keys)
+    return True
+
+
+def _action_target_allowed_by_scope(scope: AutonomyScopeRecord, target: str) -> bool:
+    source_context = scope.source_context if isinstance(scope.source_context, dict) else {}
+    allowed_targets = source_context.get("allowed_targets")
+    if isinstance(allowed_targets, list):
+        return target in {
+            item.strip() for item in allowed_targets if isinstance(item, str) and item.strip()
+        }
+    allowed_target = source_context.get("target")
+    if isinstance(allowed_target, str) and allowed_target.strip():
+        return target == allowed_target.strip()
+    return False
+
+
+def _payload_recipients(payload: dict[str, Any]) -> list[str]:
+    recipients: list[str] = []
+    for key in ("recipient", "recipients", "to", "cc", "bcc", "attendees", "grantee_email"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            recipients.append(value.strip().lower())
+        elif isinstance(value, list):
+            recipients.extend(
+                item.strip().lower() for item in value if isinstance(item, str) and item.strip()
+            )
+    return recipients
+
+
+def _payload_recipients_allowed_by_scope(
+    scope: AutonomyScopeRecord,
+    payload: dict[str, Any],
+) -> bool:
+    source_context = scope.source_context if isinstance(scope.source_context, dict) else {}
+    recipients = _payload_recipients(payload)
+    if not recipients:
+        return True
+    allowed_recipients = source_context.get("allowed_recipients")
+    if not isinstance(allowed_recipients, list):
+        return False
+    allowed = {
+        item.strip().lower()
+        for item in allowed_recipients
+        if isinstance(item, str) and item.strip()
+    }
+    return bool(recipients) and all(recipient in allowed for recipient in recipients)
+
+
 def _notification_rule_valid(scope: AutonomyScopeRecord) -> bool:
     notification_rule = getattr(scope, "notification_rule", None)
     return notification_rule in {"silent_audit", "notify_after", "notify_before"}
@@ -1103,7 +1829,10 @@ def _find_autonomy_scope(
     *,
     action_type: str,
     target_system: str,
-) -> AutonomyScopeRecord | None:
+    target: str,
+    payload: dict[str, Any],
+    risk_tier: str,
+) -> tuple[AutonomyScopeRecord | None, str, str, list[str]]:
     scopes = db.scalars(
         select(AutonomyScopeRecord)
         .where(
@@ -1111,19 +1840,57 @@ def _find_autonomy_scope(
             AutonomyScopeRecord.actor == "proactive",
             AutonomyScopeRecord.action_type == action_type,
         )
+        .order_by(AutonomyScopeRecord.created_at.asc(), AutonomyScopeRecord.id.asc())
         .limit(20)
     ).all()
+    considered_scope_ids: list[str] = []
+    denial_result = "needs_user_authority"
+    denial_reason = f"no active autonomy scope for {action_type}"
     for scope in scopes:
-        if scope.target_system == target_system:
-            return scope
+        target_system_matches = scope.target_system == target_system
         allowed_target_systems = getattr(scope, "allowed_target_systems", None)
-        if isinstance(allowed_target_systems, list) and target_system in allowed_target_systems:
-            return scope
-    return None
+        if isinstance(allowed_target_systems, list) and target_system in {
+            item for item in allowed_target_systems if isinstance(item, str)
+        }:
+            target_system_matches = True
+        if not target_system_matches:
+            continue
+
+        considered_scope_ids.append(scope.id)
+        if not _risk_allowed_by_scope(scope, risk_tier):
+            denial_reason = f"risk tier exceeds autonomy scope for {action_type}"
+            continue
+        if not _notification_rule_valid(scope):
+            denial_result = "invalid_decision"
+            denial_reason = f"autonomy scope notification rule invalid for {action_type}"
+            continue
+        if not _action_target_allowed_by_scope(scope, target):
+            denial_reason = f"target is outside autonomy scope for {action_type}"
+            continue
+        if not _payload_recipients_allowed_by_scope(scope, payload):
+            denial_reason = f"recipient is outside autonomy scope for {action_type}"
+            continue
+        if not _payload_allowed_by_shape(scope, payload):
+            denial_reason = f"payload shape is outside autonomy scope for {action_type}"
+            continue
+        if not _payload_allowed_by_scope(scope, payload):
+            denial_reason = f"payload is outside autonomy scope for {action_type}"
+            continue
+        return scope, "authorized", "", considered_scope_ids
+    return None, denial_result, denial_reason, considered_scope_ids
 
 
 def _decision_has_discord_message_action(decision: ProactiveDecisionRecord) -> bool:
     return any(action.get("action_type") == "send_discord_message" for action in decision.actions)
+
+
+def _taint_blocks_autonomous_write(latest_taint: Any) -> bool:
+    return isinstance(latest_taint, dict) and (
+        latest_taint.get("provenance_status") in {"tainted", "ambiguous"}
+        or latest_taint.get("status") in {"tainted", "ambiguous"}
+        or latest_taint.get("reason") == "prompt_injection"
+        or latest_taint.get("prompt_injection") is True
+    )
 
 
 def _validate_and_apply_decision(
@@ -1138,9 +1905,10 @@ def _validate_and_apply_decision(
     latest_taint = (
         snapshot.taint.get("latest_observation") if isinstance(snapshot.taint, dict) else {}
     )
-    tainted = isinstance(latest_taint, dict) and latest_taint.get("provenance_status") == "tainted"
+    tainted = _taint_blocks_autonomous_write(latest_taint)
     validation_result = "authorized"
     denial_reason = None
+    considered_scope_ids: list[str] = []
     normalized_actions: list[dict[str, Any]] = []
     if decision.decision_type in {"act_now", "speak_and_act"}:
         for action in decision.actions:
@@ -1150,13 +1918,18 @@ def _validate_and_apply_decision(
             risk_tier = action.get("risk_tier")
             if (
                 not isinstance(action_type, str)
+                or not action_type.strip()
                 or not isinstance(target, str)
+                or not target.strip()
                 or not isinstance(payload, dict)
                 or risk_tier not in {"low", "medium", "high", "blocked"}
             ):
                 validation_result = "invalid_decision"
                 denial_reason = "action schema invalid"
                 break
+            action_type = action_type.strip()
+            target = target.strip()
+            capability = None
             if action_type == "send_discord_message":
                 normalized_input = _normalize_action_payload(action_type, payload)
                 if normalized_input is None:
@@ -1179,36 +1952,43 @@ def _validate_and_apply_decision(
                 denial_reason = f"blocked risk tier for {action_type}"
                 break
             target_system = _action_target_system(action_type, action)
-            scope = _find_autonomy_scope(
+            scope, scope_result, scope_denial_reason, scope_ids = _find_autonomy_scope(
                 db,
                 action_type=action_type,
                 target_system=target_system,
+                target=target.strip(),
+                payload=normalized_input,
+                risk_tier=risk_tier,
             )
+            considered_scope_ids.extend(scope_ids)
             if scope is None:
-                validation_result = "needs_user_authority"
-                denial_reason = f"no active autonomy scope for {action_type}"
+                validation_result = scope_result
+                denial_reason = scope_denial_reason
                 break
-            if not _risk_allowed_by_scope(scope, risk_tier):
-                validation_result = "needs_user_authority"
-                denial_reason = f"risk tier exceeds autonomy scope for {action_type}"
-                break
-            if not _notification_rule_valid(scope):
-                validation_result = "invalid_decision"
-                denial_reason = f"autonomy scope notification rule invalid for {action_type}"
-                break
-            if not _payload_allowed_by_scope(scope, normalized_input):
-                validation_result = "needs_user_authority"
-                denial_reason = f"payload is outside autonomy scope for {action_type}"
-                break
-            if tainted and risk_tier != "low":
+            if tainted:
                 validation_result = "denied"
-                denial_reason = "tainted context cannot execute non-low-risk action"
+                denial_reason = (
+                    "tainted context cannot execute non-low-risk action"
+                    if risk_tier != "low"
+                    else "tainted context cannot execute autonomous write"
+                )
                 break
+            if capability is not None:
+                preflight_error = preflight_capability_execution(
+                    capability=capability,
+                    normalized_input=normalized_input,
+                )
+                if preflight_error is not None:
+                    validation_result = "denied"
+                    denial_reason = preflight_error
+                    break
             normalized_actions.append(
                 {
                     **action,
+                    "target": target.strip(),
                     "payload": normalized_input,
                     "target_system": target_system,
+                    "autonomy_scope_id": scope.id,
                 }
             )
         if validation_result in {"authorized", "authorized_with_constraints"}:
@@ -1223,7 +2003,7 @@ def _validate_and_apply_decision(
         result=validation_result,
         policy_version=PROACTIVE_POLICY_VERSION,
         action_plan_hash=action_plan_hash,
-        constraints={},
+        constraints={"considered_scope_ids": considered_scope_ids} if considered_scope_ids else {},
         denial_reason=denial_reason,
         created_at=now,
     )
@@ -1631,10 +2411,21 @@ def process_proactive_action_execution_due(
                         plan.status = "failed"
                         plan.updated_at = now
                     else:
-                        capability_payload = normalized_input
-                        capability_action_type = plan.action_type
-                        plan.status = "executing"
-                        plan.updated_at = now
+                        preflight_error = preflight_capability_execution(
+                            capability=capability,
+                            normalized_input=normalized_input,
+                        )
+                        if preflight_error is not None:
+                            execution.status = "failed"
+                            execution.error = preflight_error
+                            execution.completed_at = now
+                            plan.status = "failed"
+                            plan.updated_at = now
+                        else:
+                            capability_payload = normalized_input
+                            capability_action_type = plan.action_type
+                            plan.status = "executing"
+                            plan.updated_at = now
 
     if capability_payload is not None and capability_action_type is not None:
         capability = get_capability(capability_action_type)
@@ -1834,10 +2625,103 @@ def process_proactive_follow_up_due(
             )
 
 
+def _feedback_learning_audit(
+    *,
+    feedback_id: str,
+    response: dict[str, Any],
+    parse_status: str,
+    validation_status: str,
+) -> dict[str, Any]:
+    return {
+        "source_feedback_id": feedback_id,
+        "model": _provider_value(response, "model", "unknown"),
+        "provider": _provider_value(response, "provider", "unknown"),
+        "provider_response_id": _provider_response_id(response),
+        "prompt_version": PROACTIVE_FEEDBACK_LEARNING_PROMPT_VERSION,
+        "parse_status": parse_status,
+        "validation_status": validation_status,
+    }
+
+
+def _record_feedback_learning_failure(
+    *,
+    session_factory: sessionmaker[Session],
+    feedback_id: str,
+    response: dict[str, Any] | None,
+    parse_status: str,
+    validation_status: str,
+    failure_code: str,
+    reason: str,
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> None:
+    with session_factory() as db:
+        with db.begin():
+            feedback = db.get(ProactiveFeedbackRecord, feedback_id)
+            if feedback is None:
+                return
+            now = now_fn()
+            response_payload = response or {}
+            db.add(
+                AIJudgmentRecord(
+                    id=new_id_fn("ajg"),
+                    judgment_type="feedback_learning",
+                    source_type="proactive_feedback",
+                    source_id=feedback.id,
+                    status="failed",
+                    model=_provider_value(response_payload, "model", "unknown"),
+                    prompt_version=PROACTIVE_FEEDBACK_LEARNING_PROMPT_VERSION,
+                    provider_response_id=_provider_response_id(response_payload),
+                    input_summary="proactive feedback learning",
+                    input_refs={
+                        "feedback_id": feedback.id,
+                        "case_id": feedback.case_id,
+                    },
+                    selected=[],
+                    omitted=[],
+                    output={
+                        "response_output": response_payload.get("output")
+                        if isinstance(response_payload, dict)
+                        else None
+                    },
+                    rationale=None,
+                    uncertainty=None,
+                    confidence=None,
+                    parse_status=parse_status,
+                    validation_status=validation_status,
+                    failure_code=failure_code,
+                    failure_reason=reason,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            _add_case_event(
+                db,
+                case_id=feedback.case_id,
+                event_type="failed",
+                payload={
+                    "failure_type": "feedback_learning_failed",
+                    "feedback_id": feedback.id,
+                    "failure_code": failure_code,
+                    "reason": reason,
+                    "audit": _feedback_learning_audit(
+                        feedback_id=feedback.id,
+                        response=response or {},
+                        parse_status=parse_status,
+                        validation_status=validation_status,
+                    ),
+                },
+                now=now,
+                new_id_fn=new_id_fn,
+            )
+
+
 def process_proactive_feedback_learning_due(
     *,
     session_factory: sessionmaker[Session],
     task_payload: dict[str, Any],
+    settings: AppSettings,
+    model_adapter: Any | None,
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
 ) -> None:
@@ -1854,48 +2738,363 @@ def process_proactive_feedback_learning_due(
             )
             if feedback is None:
                 raise RuntimeError("proactive feedback not found")
+            case = db.get(ProactiveCaseRecord, feedback.case_id)
+            if case is None:
+                raise RuntimeError("proactive feedback case not found")
+            observation = db.get(ProactiveObservationRecord, case.latest_observation_id)
+            decision = (
+                db.get(ProactiveDecisionRecord, case.last_decision_id)
+                if case.last_decision_id is not None
+                else None
+            )
+            snapshot = (
+                db.get(ProactiveContextSnapshotRecord, decision.context_snapshot_id)
+                if decision is not None
+                else None
+            )
+            turns = db.scalars(
+                select(ProactiveTurnRecord)
+                .where(ProactiveTurnRecord.case_id == case.id)
+                .order_by(ProactiveTurnRecord.created_at.desc(), ProactiveTurnRecord.id.asc())
+                .limit(5)
+            ).all()
+            action_plans = db.scalars(
+                select(ProactiveActionPlanRecord)
+                .where(ProactiveActionPlanRecord.case_id == case.id)
+                .order_by(
+                    ProactiveActionPlanRecord.created_at.desc(),
+                    ProactiveActionPlanRecord.id.asc(),
+                )
+                .limit(5)
+            ).all()
+            action_executions = db.scalars(
+                select(ProactiveActionExecutionRecord)
+                .where(
+                    ProactiveActionExecutionRecord.action_plan_id.in_(
+                        [plan.id for plan in action_plans] or [""]
+                    )
+                )
+                .order_by(
+                    ProactiveActionExecutionRecord.created_at.desc(),
+                    ProactiveActionExecutionRecord.id.asc(),
+                )
+                .limit(5)
+            ).all()
+            learning_records = db.scalars(
+                select(ProactiveLearningRecord)
+                .where(ProactiveLearningRecord.status == "active")
+                .order_by(
+                    ProactiveLearningRecord.updated_at.desc(),
+                    ProactiveLearningRecord.id.asc(),
+                )
+                .limit(20)
+            ).all()
+            context = {
+                "prompt_version": PROACTIVE_FEEDBACK_LEARNING_PROMPT_VERSION,
+                "feedback": {
+                    "id": feedback.id,
+                    "feedback_type": feedback.feedback_type,
+                    "note": feedback.note,
+                    "payload": feedback.payload,
+                    "created_at": to_rfc3339(feedback.created_at),
+                },
+                "case": {
+                    "id": case.id,
+                    "case_key": case.case_key,
+                    "status": case.status,
+                    "title": case.title,
+                    "summary": case.summary,
+                },
+                "latest_observation": None
+                if observation is None
+                else {
+                    "id": observation.id,
+                    "source_type": observation.source_type,
+                    "source_id": observation.source_id,
+                    "observation_type": observation.observation_type,
+                    "subject": observation.subject,
+                    "summary": observation.summary,
+                    "payload": observation.payload,
+                    "evidence": observation.evidence,
+                    "trust_boundary": observation.trust_boundary,
+                },
+                "decision": None
+                if decision is None
+                else {
+                    "id": decision.id,
+                    "decision_type": decision.decision_type,
+                    "status": decision.status,
+                    "confidence": decision.confidence,
+                    "urgency": decision.urgency,
+                    "user_visible_message": decision.user_visible_message,
+                    "rationale": decision.rationale,
+                    "evidence_refs": decision.evidence_refs,
+                    "tool_refs": decision.tool_refs,
+                    "actions": decision.actions,
+                    "follow_up": decision.follow_up,
+                    "raw_model_output": decision.raw_model_output,
+                },
+                "context_snapshot": None
+                if snapshot is None
+                else {
+                    "id": snapshot.id,
+                    "context": snapshot.context,
+                    "omitted_context": snapshot.omitted_context,
+                },
+                "turns": [
+                    {
+                        "id": turn.id,
+                        "status": turn.status,
+                        "channel": turn.channel,
+                        "message": turn.message,
+                        "delivery_payload": turn.delivery_payload,
+                        "delivered_at": (
+                            to_rfc3339(turn.delivered_at) if turn.delivered_at is not None else None
+                        ),
+                        "acked_at": to_rfc3339(turn.acked_at)
+                        if turn.acked_at is not None
+                        else None,
+                    }
+                    for turn in turns
+                ],
+                "action_plans": [
+                    {
+                        "id": plan.id,
+                        "status": plan.status,
+                        "action_type": plan.action_type,
+                        "target": plan.target,
+                        "payload": plan.payload,
+                        "risk_tier": plan.risk_tier,
+                    }
+                    for plan in action_plans
+                ],
+                "action_executions": [
+                    {
+                        "id": execution.id,
+                        "action_plan_id": execution.action_plan_id,
+                        "status": execution.status,
+                        "external_receipt": execution.external_receipt,
+                        "error": execution.error,
+                    }
+                    for execution in action_executions
+                ],
+                "related_learning_records": [
+                    {
+                        "id": record.id,
+                        "feedback_id": record.feedback_id,
+                        "record_type": record.record_type,
+                        "content": record.content,
+                    }
+                    for record in learning_records
+                    if record.feedback_id != feedback.id
+                ],
+            }
+            input_refs = {
+                "feedback_id": feedback.id,
+                "case_id": case.id,
+                "latest_observation_id": observation.id if observation is not None else None,
+                "decision_id": decision.id if decision is not None else None,
+                "context_snapshot_id": snapshot.id if snapshot is not None else None,
+                "turn_ids": [turn.id for turn in turns],
+                "action_plan_ids": [plan.id for plan in action_plans],
+                "action_execution_ids": [execution.id for execution in action_executions],
+                "related_learning_record_ids": [
+                    record.id for record in learning_records if record.feedback_id != feedback.id
+                ],
+            }
+
+    model_input = [
+        {
+            "role": "system",
+            "content": (
+                "You are Ariel's proactive feedback learner. Interpret the feedback and "
+                "context into durable learning records. Return only strict JSON with key "
+                "learning_records. Each item must include record_type and content. "
+                "Allowed record_type values are instruction, example, calibration, "
+                "preference, source_preference, prompt_instruction, autonomy_request. "
+                "You may return an empty array. Do not grant autonomy; autonomy_request "
+                "records are proposals only. Prompt version: "
+                f"{PROACTIVE_FEEDBACK_LEARNING_PROMPT_VERSION}."
+            ),
+        },
+        {
+            "role": "system",
+            "content": json.dumps(context, sort_keys=True, separators=(",", ":")),
+        },
+    ]
+    try:
+        response = _call_direct_json_model(
+            model_input=model_input,
+            settings=settings,
+            model_adapter=model_adapter,
+            origin="feedback_learning",
+        )
+    except Exception as exc:
+        reason = safe_failure_reason(str(exc), fallback=f"unexpected {exc.__class__.__name__}")
+        _record_feedback_learning_failure(
+            session_factory=session_factory,
+            feedback_id=feedback_id,
+            response={"model": settings.model_name},
+            parse_status="missing_output",
+            validation_status="not_validated",
+            failure_code="E_AI_JUDGMENT_REQUIRED",
+            reason=reason,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        raise RuntimeError(reason) from exc
+    try:
+        raw_result = _parse_model_json(response)
+    except json.JSONDecodeError as exc:
+        reason = f"feedback_learner_parse_failed:{safe_proactive_error(exc)}"
+        _record_feedback_learning_failure(
+            session_factory=session_factory,
+            feedback_id=feedback_id,
+            response=response,
+            parse_status="invalid_json",
+            validation_status="not_validated",
+            failure_code="E_AI_JUDGMENT_INVALID_JSON",
+            reason=reason,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        raise RuntimeError(reason) from exc
+    except RuntimeError as exc:
+        reason = f"feedback_learner_parse_failed:{safe_proactive_error(exc)}"
+        _record_feedback_learning_failure(
+            session_factory=session_factory,
+            feedback_id=feedback_id,
+            response=response,
+            parse_status="missing_output",
+            validation_status="not_validated",
+            failure_code="E_AI_JUDGMENT_REQUIRED",
+            reason=reason,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        raise RuntimeError(reason) from exc
+
+    raw_records = raw_result.get("learning_records")
+    if not isinstance(raw_records, list):
+        reason = "feedback_learner_validation_failed:missing_learning_records"
+        _record_feedback_learning_failure(
+            session_factory=session_factory,
+            feedback_id=feedback_id,
+            response=response,
+            parse_status="schema_invalid",
+            validation_status="invalid",
+            failure_code="E_AI_JUDGMENT_SCHEMA",
+            reason=reason,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        raise RuntimeError(reason)
+    records: list[tuple[str, dict[str, Any]]] = []
+    for raw_record in raw_records:
+        if not isinstance(raw_record, dict):
+            reason = "feedback_learner_validation_failed:record_not_object"
+            _record_feedback_learning_failure(
+                session_factory=session_factory,
+                feedback_id=feedback_id,
+                response=response,
+                parse_status="schema_invalid",
+                validation_status="invalid",
+                failure_code="E_AI_JUDGMENT_SCHEMA",
+                reason=reason,
+                now_fn=now_fn,
+                new_id_fn=new_id_fn,
+            )
+            raise RuntimeError(reason)
+        record_type = _payload_text(raw_record, "record_type")
+        content = raw_record.get("content")
+        if record_type not in _FEEDBACK_LEARNING_RECORD_TYPES or not isinstance(content, dict):
+            reason = "feedback_learner_validation_failed:record_schema_invalid"
+            _record_feedback_learning_failure(
+                session_factory=session_factory,
+                feedback_id=feedback_id,
+                response=response,
+                parse_status="schema_invalid",
+                validation_status="invalid",
+                failure_code="E_AI_JUDGMENT_SCHEMA",
+                reason=reason,
+                now_fn=now_fn,
+                new_id_fn=new_id_fn,
+            )
+            raise RuntimeError(reason)
+        records.append((record_type, content))
+
+    audit = _feedback_learning_audit(
+        feedback_id=feedback_id,
+        response=response,
+        parse_status="parsed",
+        validation_status="valid",
+    )
+
+    with session_factory() as db:
+        with db.begin():
+            feedback = db.scalar(
+                select(ProactiveFeedbackRecord)
+                .where(ProactiveFeedbackRecord.id == feedback_id)
+                .with_for_update()
+                .limit(1)
+            )
+            if feedback is None:
+                raise RuntimeError("proactive feedback not found after learning")
             now = now_fn()
-            match feedback.feedback_type:
-                case "stop_pattern":
-                    record_type = "preference"
-                    content = {
-                        "instruction": "Interrupt less for matching proactive cases.",
-                        "case_id": feedback.case_id,
-                        "note": feedback.note,
-                    }
-                case "more_aggressive" | "useful":
-                    record_type = "preference"
-                    content = {
-                        "instruction": "Be more willing to speak for matching proactive cases.",
-                        "case_id": feedback.case_id,
-                        "note": feedback.note,
-                    }
-                case "automatic_next_time":
-                    record_type = "autonomy_request"
-                    content = {
-                        "instruction": "Propose an autonomy scope for this pattern.",
-                        "case_id": feedback.case_id,
-                        "note": feedback.note,
-                    }
-                case "correct" | "wrong":
-                    record_type = "example"
-                    content = {
-                        "instruction": "Treat this proactive decision as a correction example.",
-                        "case_id": feedback.case_id,
-                        "note": feedback.note,
-                    }
-                case "ack":
-                    record_type = "calibration"
-                    content = {"instruction": "User acknowledged this proactive case."}
-                case _:
-                    raise RuntimeError(f"unsupported proactive feedback: {feedback.feedback_type}")
-            db.add(
-                ProactiveLearningRecord(
+            selected: list[dict[str, Any]] = []
+            for record_type, content in records:
+                record = ProactiveLearningRecord(
                     id=new_id_fn("plr"),
                     feedback_id=feedback.id,
                     record_type=record_type,
                     status="active",
                     content=content,
+                    model=audit["model"],
+                    prompt_version=PROACTIVE_FEEDBACK_LEARNING_PROMPT_VERSION,
+                    provider_response_id=audit["provider_response_id"],
+                    parse_status="parsed",
+                    validation_status="valid",
+                    created_at=now,
+                    updated_at=now,
+                )
+                db.add(record)
+                selected.append(
+                    {
+                        "learning_record_id": record.id,
+                        "record_type": record.record_type,
+                    }
+                )
+            confidence = raw_result.get("confidence")
+            db.add(
+                AIJudgmentRecord(
+                    id=new_id_fn("ajg"),
+                    judgment_type="feedback_learning",
+                    source_type="proactive_feedback",
+                    source_id=feedback.id,
+                    status="succeeded",
+                    model=audit["model"],
+                    prompt_version=PROACTIVE_FEEDBACK_LEARNING_PROMPT_VERSION,
+                    provider_response_id=audit["provider_response_id"],
+                    input_summary="proactive feedback learning",
+                    input_refs=input_refs,
+                    selected=selected,
+                    omitted=[
+                        item for item in raw_result.get("omitted", []) if isinstance(item, dict)
+                    ]
+                    if isinstance(raw_result.get("omitted"), list)
+                    else [],
+                    output=raw_result,
+                    rationale=raw_result.get("rationale")
+                    if isinstance(raw_result.get("rationale"), str)
+                    else None,
+                    uncertainty=raw_result.get("uncertainty")
+                    if isinstance(raw_result.get("uncertainty"), str)
+                    else None,
+                    confidence=float(confidence) if isinstance(confidence, (int, float)) else None,
+                    parse_status="parsed",
+                    validation_status="valid",
+                    failure_code=None,
+                    failure_reason=None,
                     created_at=now,
                     updated_at=now,
                 )

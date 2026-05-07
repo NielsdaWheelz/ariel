@@ -42,7 +42,6 @@ TURN_KEYS = {
 EVENT_KEYS = {"id", "turn_id", "sequence", "event_type", "payload", "created_at"}
 EVENT_PAYLOAD_KEYS_BY_TYPE: dict[str, set[str]] = {
     "evt.turn.started": {"message", "discord"},
-    "evt.turn.limit_reached": {"code", "message", "limit", "applied_limits"},
     "evt.assistant.emitted": {"message", "bounded_failure"},
     "evt.turn.failed": {"failure_reason", "error_code", "limit"},
     "evt.turn.completed": set(),
@@ -187,23 +186,7 @@ def _assert_surface_event_payload(event: dict[str, Any]) -> None:
     else:
         _assert_keys(payload, EVENT_PAYLOAD_KEYS_BY_TYPE[event_type])
 
-    if event_type == "evt.turn.limit_reached":
-        limit = payload["limit"]
-        assert isinstance(limit, dict)
-        _assert_keys(limit, {"budget", "unit", "limit", "measured"})
-        applied_limits = payload["applied_limits"]
-        assert isinstance(applied_limits, dict)
-        _assert_keys(
-            applied_limits,
-            {
-                "max_recent_turns",
-                "max_context_tokens",
-                "max_response_tokens",
-                "max_model_attempts",
-                "max_turn_wall_time_ms",
-            },
-        )
-    elif event_type == "evt.assistant.emitted":
+    if event_type == "evt.assistant.emitted":
         bounded_failure = payload["bounded_failure"]
         if bounded_failure is not None:
             assert isinstance(bounded_failure, dict)

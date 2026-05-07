@@ -51,6 +51,11 @@ from ariel.google_connector import (
     GoogleConnectorRuntime,
 )
 from ariel.memory import (
+    AIJudgmentFailure,
+    MEMORY_CONTEXT_SCHEMA_VERSION,
+    MEMORY_CONTINUITY_PROMPT_VERSION,
+    MEMORY_CURATION_PROMPT_VERSION,
+    MEMORY_PROJECTION_VERSION,
     approve_candidate,
     build_memory_context,
     context_text,
@@ -66,9 +71,11 @@ from ariel.memory import (
     retract_assertion,
     search_memory,
     set_assertion_priority,
+    validate_continuity_compaction_payload,
 )
 from ariel.persistence import (
     ActionAttemptRecord,
+    AIJudgmentRecord,
     ApprovalRequestRecord,
     AutonomyScopeRecord,
     AgencyEventRecord,
@@ -78,6 +85,7 @@ from ariel.persistence import (
     EventRecord,
     JobEventRecord,
     JobRecord,
+    MemoryAssertionRecord,
     NotificationRecord,
     ProactiveFeedbackRecord,
     ProactiveActionExecutionRecord,
@@ -90,6 +98,7 @@ from ariel.persistence import (
     ProactiveObservationRecord,
     ProactivePolicyValidationRecord,
     ProactiveTurnRecord,
+    ProjectStateSnapshotRecord,
     ProviderEventRecord,
     SessionRecord,
     SessionRotationRecord,
@@ -614,20 +623,6 @@ class ContextCompactionAdapter(Protocol):
     ) -> dict[str, Any] | None: ...
 
 
-@dataclass(slots=True)
-class NoopContextCompactionAdapter:
-    def compact(
-        self,
-        *,
-        context_bundle: dict[str, Any],
-        user_message: str,
-        estimated_context_tokens: int,
-        max_context_tokens: int,
-    ) -> dict[str, Any] | None:
-        del context_bundle, user_message, estimated_context_tokens, max_context_tokens
-        return None
-
-
 class ModelAdapterError(Exception):
     def __init__(
         self,
@@ -637,6 +632,13 @@ class ModelAdapterError(Exception):
         code: str,
         message: str,
         retryable: bool,
+        provider: str | None = None,
+        model: str | None = None,
+        usage: dict[str, Any] | None = None,
+        provider_response_id: str | None = None,
+        parse_status: str | None = None,
+        validation_status: str | None = None,
+        raw_output_shape: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(safe_reason)
         self.safe_reason = safe_reason
@@ -644,6 +646,13 @@ class ModelAdapterError(Exception):
         self.code = code
         self.message = message
         self.retryable = retryable
+        self.provider = provider
+        self.model = model
+        self.usage = usage
+        self.provider_response_id = provider_response_id
+        self.parse_status = parse_status
+        self.validation_status = validation_status
+        self.raw_output_shape = raw_output_shape
 
 
 @dataclass(slots=True)
@@ -750,6 +759,228 @@ class OpenAIResponsesAdapter:
             "usage": usage,
             "provider_response_id": provider_response_id,
         }
+
+
+@dataclass(slots=True)
+class OpenAIContextCompactionAdapter:
+    api_key: str | None
+    model: str
+    timeout_seconds: float
+
+    def compact(
+        self,
+        *,
+        context_bundle: dict[str, Any],
+        user_message: str,
+        estimated_context_tokens: int,
+        max_context_tokens: int,
+    ) -> dict[str, Any] | None:
+        if estimated_context_tokens <= max_context_tokens:
+            return None
+        if not self.api_key:
+            raise ModelAdapterError(
+                safe_reason="context compaction requires model credentials",
+                status_code=503,
+                code="E_MODEL_CREDENTIALS",
+                message="model credentials are not configured",
+                retryable=False,
+            )
+
+        try:
+            response = httpx.post(
+                "https://api.openai.com/v1/responses",
+                headers={
+                    "authorization": f"Bearer {self.api_key}",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": self.model,
+                    "input": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Compact Ariel turn context for the master assistant. Return JSON only "
+                                "with keys summary, recent_active_session_turns, preserved_turn_refs, "
+                                "omitted_turn_refs, user_commitments, assistant_commitments, decisions, "
+                                "open_loops, tool_action_outcomes, unresolved_uncertainty, "
+                                "important_omissions, and confidence. Preserve exact turn_id values. "
+                                "Every source turn must appear exactly once in preserved_turn_refs or "
+                                "omitted_turn_refs with a reason. Keep unresolved commitments, decisions, "
+                                "tool outcomes, uncertainty, and omissions needed for the current user "
+                                "request. Do not answer the user."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": json.dumps(
+                                {
+                                    "user_message": user_message,
+                                    "max_context_tokens": max_context_tokens,
+                                    "context_bundle": context_bundle,
+                                },
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                        },
+                    ],
+                    "store": False,
+                    "text": {"verbosity": "low"},
+                },
+                timeout=self.timeout_seconds,
+            )
+        except httpx.TimeoutException as exc:
+            raise ModelAdapterError(
+                safe_reason="context compaction model timed out",
+                status_code=502,
+                code="E_MODEL_FAILURE",
+                message="model provider request failed",
+                retryable=True,
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise ModelAdapterError(
+                safe_reason="context compaction model network request failed",
+                status_code=502,
+                code="E_MODEL_FAILURE",
+                message="model provider request failed",
+                retryable=True,
+            ) from exc
+        if response.status_code >= 400:
+            raise ModelAdapterError(
+                safe_reason=f"context compaction model returned HTTP {response.status_code}",
+                status_code=502,
+                code="E_MODEL_FAILURE",
+                message="model provider request failed",
+                retryable=True,
+            )
+        try:
+            response_payload = response.json()
+        except ValueError as exc:
+            raise ModelAdapterError(
+                safe_reason="context compaction provider returned invalid JSON",
+                status_code=502,
+                code="E_MODEL_FAILURE",
+                message="model provider request failed",
+                retryable=True,
+            ) from exc
+        provider_response_id = response_payload.get("id")
+        provider_response_id = (
+            provider_response_id if isinstance(provider_response_id, str) else None
+        )
+        compacted_text = _extract_responses_assistant_text(response_payload.get("output"))
+        try:
+            compacted_payload = json.loads(compacted_text)
+        except json.JSONDecodeError as exc:
+            raise ModelAdapterError(
+                safe_reason="context compaction model returned malformed JSON",
+                status_code=502,
+                code="E_AI_JUDGMENT_INVALID_JSON",
+                message="AI continuity compaction failed",
+                retryable=False,
+                provider_response_id=provider_response_id,
+                parse_status="invalid_json",
+                validation_status="invalid",
+            ) from exc
+        if not isinstance(compacted_payload, dict):
+            raise ModelAdapterError(
+                safe_reason="context compaction model returned non-object JSON",
+                status_code=502,
+                code="E_AI_JUDGMENT_SCHEMA",
+                message="AI continuity compaction failed",
+                retryable=False,
+                provider_response_id=provider_response_id,
+                parse_status="schema_invalid",
+                validation_status="invalid",
+            )
+        compacted_turns = compacted_payload.get("recent_active_session_turns")
+        summary = compacted_payload.get("summary")
+        if not isinstance(compacted_turns, list):
+            raise ModelAdapterError(
+                safe_reason="context compaction model omitted recent_active_session_turns",
+                status_code=502,
+                code="E_AI_JUDGMENT_SCHEMA",
+                message="AI continuity compaction failed",
+                retryable=False,
+                provider_response_id=provider_response_id,
+                parse_status="schema_invalid",
+                validation_status="invalid",
+            )
+        if not isinstance(summary, str) or not summary.strip():
+            raise ModelAdapterError(
+                safe_reason="context compaction model omitted summary",
+                status_code=502,
+                code="E_AI_JUDGMENT_SCHEMA",
+                message="AI continuity compaction failed",
+                retryable=False,
+                provider_response_id=provider_response_id,
+                parse_status="schema_invalid",
+                validation_status="invalid",
+            )
+        for turn in compacted_turns:
+            if not isinstance(turn, dict) or not isinstance(turn.get("turn_id"), str):
+                raise ModelAdapterError(
+                    safe_reason="context compaction model returned invalid turn entries",
+                    status_code=502,
+                    code="E_AI_JUDGMENT_SCHEMA",
+                    message="AI continuity compaction failed",
+                    retryable=False,
+                    provider_response_id=provider_response_id,
+                    parse_status="schema_invalid",
+                    validation_status="invalid",
+                )
+        source_turn_ids = [
+            turn["turn_id"]
+            for turn in context_bundle.get("recent_active_session_turns", [])
+            if isinstance(turn, dict) and isinstance(turn.get("turn_id"), str)
+        ]
+        try:
+            continuity = validate_continuity_compaction_payload(
+                compacted_payload,
+                source_turn_ids=source_turn_ids,
+                model=self.model,
+                provider_response_id=provider_response_id,
+            )
+        except AIJudgmentFailure as exc:
+            raise ModelAdapterError(
+                safe_reason=exc.safe_reason,
+                status_code=502,
+                code=exc.code,
+                message="AI continuity compaction failed",
+                retryable=exc.retryable,
+                provider_response_id=provider_response_id,
+                parse_status=exc.parse_status,
+                validation_status=exc.validation_status,
+            ) from exc
+        compacted_turn_ids = [
+            turn["turn_id"]
+            for turn in compacted_turns
+            if isinstance(turn, dict) and isinstance(turn.get("turn_id"), str)
+        ]
+        if set(compacted_turn_ids) != {ref["turn_id"] for ref in continuity["preserved_turn_refs"]}:
+            raise ModelAdapterError(
+                safe_reason="context compaction preserved turn refs do not match compacted turns",
+                status_code=502,
+                code="E_AI_JUDGMENT_VALIDATION",
+                message="AI continuity compaction failed",
+                retryable=False,
+                provider_response_id=provider_response_id,
+                parse_status="parsed",
+                validation_status="invalid",
+            )
+        compacted_bundle = dict(context_bundle)
+        compacted_bundle["recent_active_session_turns"] = compacted_turns
+        compacted_bundle["continuity_compaction"] = continuity
+        compacted_bundle["recent_window"] = {
+            "max_recent_turns": len(compacted_turns),
+            "included_turn_count": len(compacted_turns),
+            "omitted_turn_count": len(continuity["omitted_turn_refs"]),
+            "included_turn_ids": [
+                turn["turn_id"] for turn in compacted_turns if isinstance(turn, dict)
+            ],
+            "omitted_turns": continuity["omitted_turn_refs"],
+            "compacted_by": "ai_context_compaction",
+            "target_context_tokens": max_context_tokens,
+        }
+        return compacted_bundle
 
 
 def _build_responses_input_items(
@@ -921,6 +1152,138 @@ def _extract_responses_assistant_text(output_items: Any) -> str:
     return "".join(text_parts).strip()
 
 
+def _call_tool_result_interpreter(
+    *,
+    model_adapter: ModelAdapter,
+    interpreter_input: dict[str, Any],
+) -> dict[str, Any]:
+    response = model_adapter.create_response(
+        input_items=[
+            {
+                "role": "system",
+                "content": (
+                    "Interpret audited tool results for Ariel's master assistant. Return JSON only "
+                    "with findings, contradictions, uncertainty, selected_output_refs, "
+                    "omitted_output_refs, citation_refs, artifact_refs, recommended_next_evidence, "
+                    "and confidence. Do not write final user-facing prose. Do not authorize actions."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(interpreter_input, sort_keys=True, separators=(",", ":")),
+            },
+        ],
+        tools=[],
+        user_message="",
+        history=[],
+        context_bundle={
+            "origin": "tool_result_interpretation",
+            "tool_result_interpreter_input": interpreter_input,
+        },
+    )
+    provider_response_id = response.get("provider_response_id")
+    if not isinstance(provider_response_id, str):
+        provider_response_id = None
+    provider = response.get("provider")
+    if not isinstance(provider, str):
+        provider = None
+    model = response.get("model")
+    if not isinstance(model, str):
+        model = None
+    usage = response.get("usage")
+    if not isinstance(usage, dict):
+        usage = None
+    response_output = response.get("output")
+    text = _extract_responses_assistant_text(response_output)
+    raw_output_shape = {
+        "output_type": type(response_output).__name__,
+        "output_count": len(response_output) if isinstance(response_output, list) else None,
+        "text_present": bool(text),
+    }
+    try:
+        output = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ModelAdapterError(
+            safe_reason="tool-result interpreter returned malformed JSON",
+            status_code=502,
+            code="E_AI_JUDGMENT_INVALID_JSON",
+            message="AI tool-result interpretation failed",
+            retryable=False,
+            provider=provider,
+            model=model,
+            usage=usage,
+            provider_response_id=provider_response_id,
+            parse_status="invalid_json",
+            validation_status="not_validated",
+            raw_output_shape=raw_output_shape,
+        ) from exc
+    if not isinstance(output, dict):
+        raise ModelAdapterError(
+            safe_reason="tool-result interpreter returned non-object JSON",
+            status_code=502,
+            code="E_AI_JUDGMENT_SCHEMA",
+            message="AI tool-result interpretation failed",
+            retryable=False,
+            provider=provider,
+            model=model,
+            usage=usage,
+            provider_response_id=provider_response_id,
+            parse_status="schema_invalid",
+            validation_status="invalid",
+            raw_output_shape=raw_output_shape,
+        )
+    for key in (
+        "findings",
+        "contradictions",
+        "uncertainty",
+        "selected_output_refs",
+        "omitted_output_refs",
+        "citation_refs",
+        "artifact_refs",
+        "recommended_next_evidence",
+    ):
+        if not isinstance(output.get(key), list):
+            raise ModelAdapterError(
+                safe_reason=f"tool-result interpreter omitted {key}",
+                status_code=502,
+                code="E_AI_JUDGMENT_SCHEMA",
+                message="AI tool-result interpretation failed",
+                retryable=False,
+                provider=provider,
+                model=model,
+                usage=usage,
+                provider_response_id=provider_response_id,
+                parse_status="schema_invalid",
+                validation_status="invalid",
+                raw_output_shape=raw_output_shape,
+            )
+    confidence = output.get("confidence")
+    if not isinstance(confidence, int | float):
+        raise ModelAdapterError(
+            safe_reason="tool-result interpreter omitted confidence",
+            status_code=502,
+            code="E_AI_JUDGMENT_SCHEMA",
+            message="AI tool-result interpretation failed",
+            retryable=False,
+            provider=provider,
+            model=model,
+            usage=usage,
+            provider_response_id=provider_response_id,
+            parse_status="schema_invalid",
+            validation_status="invalid",
+            raw_output_shape=raw_output_shape,
+        )
+    output["confidence"] = max(0.0, min(float(confidence), 1.0))
+    return {
+        "output": output,
+        "provider": response.get("provider"),
+        "model": response.get("model"),
+        "usage": usage,
+        "provider_response_id": provider_response_id,
+        "response_output_shape": raw_output_shape,
+    }
+
+
 def _extract_responses_function_calls(output_items: Any) -> list[dict[str, Any]]:
     if not isinstance(output_items, list):
         return []
@@ -1034,11 +1397,6 @@ def _turn_limit_message(violation: TurnLimitViolation) -> str:
         return (
             "this turn stopped because the response budget was exhausted. "
             "please narrow the request so i can answer within the response budget."
-        )
-    if violation.budget == "model_attempts":
-        return (
-            "this turn stopped because the model attempt limit was exhausted. "
-            "please provide missing details or retry with a narrower request."
         )
     if violation.budget == "turn_wall_time_ms":
         return (
@@ -1803,6 +2161,7 @@ def _rotate_active_session(
     reason: str,
     idempotency_key: str | None,
     actor_id: str,
+    settings: AppSettings,
     trigger_snapshot: dict[str, Any] | None = None,
 ) -> tuple[SessionRecord, SessionRotationRecord, bool]:
     if reason not in _ALLOWED_ROTATION_REASONS:
@@ -1859,12 +2218,31 @@ def _rotate_active_session(
 
     now = _utcnow()
     prior_session_id = active_session.id
+    rotated_session_id = _new_id("ses")
+    rotation_id = _new_id("rot")
+    prior_turns = db.scalars(
+        select(TurnRecord)
+        .where(TurnRecord.session_id == prior_session_id)
+        .order_by(TurnRecord.created_at.asc(), TurnRecord.id.asc())
+    ).all()
+    record_rotation_context_block(
+        db=db,
+        rotation_id=rotation_id,
+        prior_session_id=prior_session_id,
+        new_session_id=rotated_session_id,
+        rotation_reason=reason,
+        prior_turns=prior_turns,
+        settings=settings,
+        now_fn=_utcnow,
+        new_id_fn=_new_id,
+    )
+
     active_session.is_active = False
     active_session.lifecycle_state = "closed"
     active_session.updated_at = now
 
     rotated_session = SessionRecord(
-        id=_new_id("ses"),
+        id=rotated_session_id,
         is_active=True,
         lifecycle_state="active",
         rotated_from_session_id=prior_session_id,
@@ -1876,7 +2254,7 @@ def _rotate_active_session(
     db.flush()
 
     rotation_record = SessionRotationRecord(
-        id=_new_id("rot"),
+        id=rotation_id,
         rotated_from_session_id=prior_session_id,
         rotated_to_session_id=rotated_session.id,
         reason=reason,
@@ -1888,20 +2266,6 @@ def _rotate_active_session(
     db.add(rotation_record)
     db.flush()
 
-    prior_turns = db.scalars(
-        select(TurnRecord)
-        .where(TurnRecord.session_id == prior_session_id)
-        .order_by(TurnRecord.created_at.asc(), TurnRecord.id.asc())
-    ).all()
-    record_rotation_context_block(
-        db=db,
-        prior_session_id=prior_session_id,
-        new_session_id=rotated_session.id,
-        rotation_reason=reason,
-        prior_turns=prior_turns,
-        now_fn=_utcnow,
-        new_id_fn=_new_id,
-    )
     return rotated_session, rotation_record, False
 
 
@@ -2159,7 +2523,11 @@ def create_app(
     settings = AppSettings()
     db_url = database_url or settings.database_url
     adapter = model_adapter or _build_default_model_adapter(settings)
-    compaction_adapter = context_compaction_adapter or NoopContextCompactionAdapter()
+    compaction_adapter = context_compaction_adapter or OpenAIContextCompactionAdapter(
+        api_key=settings.openai_api_key,
+        model=settings.model_name,
+        timeout_seconds=settings.model_timeout_seconds,
+    )
 
     engine = create_engine(db_url, future=True, pool_pre_ping=True)
     session_factory = sessionmaker(bind=engine, future=True, expire_on_commit=False)
@@ -2521,12 +2889,29 @@ def create_app(
         idempotency_key = _normalize_idempotency_key(request.headers.get("Idempotency-Key"))
         with session_factory() as db:
             with db.begin():
-                rotated_session, rotation_record, idempotent_replay = _rotate_active_session(
-                    db,
-                    reason="user_initiated",
-                    idempotency_key=idempotency_key,
-                    actor_id=str(app.state.approval_actor_id),
-                )
+                try:
+                    rotated_session, rotation_record, idempotent_replay = _rotate_active_session(
+                        db,
+                        reason="user_initiated",
+                        idempotency_key=idempotency_key,
+                        actor_id=str(app.state.approval_actor_id),
+                        settings=settings,
+                    )
+                except AIJudgmentFailure as exc:
+                    return _error_response(
+                        ApiError(
+                            status_code=502 if exc.retryable else 422,
+                            code=exc.code,
+                            message="AI session continuity failed",
+                            details={
+                                "judgment_type": "continuity_compaction",
+                                "prompt_version": MEMORY_CONTINUITY_PROMPT_VERSION,
+                                "parse_status": exc.parse_status,
+                                "validation_status": exc.validation_status,
+                            },
+                            retryable=exc.retryable,
+                        )
+                    )
                 try:
                     return build_surface_rotation_response(
                         session=serialize_session(rotated_session),
@@ -3105,12 +3490,33 @@ def create_app(
             .where(TurnRecord.session_id == active_session.id)
             .order_by(TurnRecord.created_at.asc(), TurnRecord.id.asc())
         ).all()
-        pre_rotation_memory_context, _ = build_memory_context(
-            db,
-            user_message=user_message,
-            max_recalled_assertions=int(app.state.max_recalled_assertions),
-            settings=settings,
-        )
+        pre_rotation_memory_context = {
+            "schema_version": MEMORY_CONTEXT_SCHEMA_VERSION,
+            "projection_version": MEMORY_PROJECTION_VERSION,
+            "pinned_core": [],
+            "project_state": [],
+            "commitments_and_decisions": [],
+            "semantic_assertions": [],
+            "episodic_evidence": [],
+            "procedural_memory": [],
+            "conflicts": [],
+            "recall_window": {
+                "max_selected_memories": int(app.state.max_recalled_assertions),
+                "selected_memory_count": 0,
+                "memory_candidate_count": 0,
+                "omitted_memory_count": 0,
+                "selected_memory_ids": [],
+                "selected_memories": [],
+                "omitted_memories": [],
+                "candidate_memory_ids": [],
+                "curation_parse_status": "not_required_pre_rotation_estimate",
+            },
+            "projection_health": {
+                "projection_version": MEMORY_PROJECTION_VERSION,
+                "selected_assertion_count": 0,
+                "selected_memory_count": 0,
+            },
+        }
         pre_rotation_open_commitments_and_jobs = {
             "open_jobs": _open_jobs_context(db=db),
         }
@@ -3139,13 +3545,101 @@ def create_app(
             now=_utcnow(),
         )
         if auto_rotation_reason is not None:
-            active_session, _, _ = _rotate_active_session(
-                db,
-                reason=auto_rotation_reason,
-                idempotency_key=None,
-                actor_id=str(app.state.approval_actor_id),
-                trigger_snapshot=trigger_snapshot,
-            )
+            try:
+                active_session, _, _ = _rotate_active_session(
+                    db,
+                    reason=auto_rotation_reason,
+                    idempotency_key=None,
+                    actor_id=str(app.state.approval_actor_id),
+                    settings=settings,
+                    trigger_snapshot=trigger_snapshot,
+                )
+            except AIJudgmentFailure as exc:
+                now_failed_rotation = _utcnow()
+                failed_turn = TurnRecord(
+                    id=_new_id("trn"),
+                    session_id=active_session.id,
+                    user_message=user_message,
+                    assistant_message=None,
+                    status="failed",
+                    created_at=now_failed_rotation,
+                    updated_at=now_failed_rotation,
+                )
+                db.add(failed_turn)
+                db.add(
+                    EventRecord(
+                        id=_new_id("evn"),
+                        session_id=active_session.id,
+                        turn_id=failed_turn.id,
+                        sequence=1,
+                        event_type="evt.turn.started",
+                        payload=jsonable_encoder(
+                            {"message": user_message, "discord": discord_context}
+                        ),
+                        created_at=now_failed_rotation,
+                    )
+                )
+                db.add(
+                    EventRecord(
+                        id=_new_id("evn"),
+                        session_id=active_session.id,
+                        turn_id=failed_turn.id,
+                        sequence=2,
+                        event_type="evt.ai_judgment.failed",
+                        payload=jsonable_encoder(
+                            {
+                                "judgment_type": "continuity_compaction",
+                                "failure_code": exc.code,
+                                "failure_reason": safe_failure_reason(
+                                    exc.safe_reason,
+                                    fallback=f"unexpected {exc.__class__.__name__}",
+                                ),
+                                "prompt_version": MEMORY_CONTINUITY_PROMPT_VERSION,
+                                "source_id": active_session.id,
+                                "parse_status": exc.parse_status,
+                                "validation_status": exc.validation_status,
+                                "retryable": exc.retryable,
+                            }
+                        ),
+                        created_at=now_failed_rotation,
+                    )
+                )
+                db.add(
+                    EventRecord(
+                        id=_new_id("evn"),
+                        session_id=active_session.id,
+                        turn_id=failed_turn.id,
+                        sequence=3,
+                        event_type="evt.turn.failed",
+                        payload=jsonable_encoder(
+                            {
+                                "failure_reason": "AI session continuity failed",
+                                "error_code": exc.code,
+                            }
+                        ),
+                        created_at=now_failed_rotation,
+                    )
+                )
+                active_session.updated_at = now_failed_rotation
+                db.flush()
+                failure = ApiError(
+                    status_code=502 if exc.retryable else 422,
+                    code=exc.code,
+                    message="AI session continuity failed",
+                    details={
+                        "session_id": active_session.id,
+                        "turn_id": failed_turn.id,
+                        "judgment_type": "continuity_compaction",
+                        "prompt_version": MEMORY_CONTINUITY_PROMPT_VERSION,
+                    },
+                    retryable=exc.retryable,
+                )
+                return TurnExecutionOutcome(
+                    turn_id=failed_turn.id,
+                    effective_session_id=active_session.id,
+                    status_code=failure.status_code,
+                    response_payload=_error_payload(failure),
+                )
             prior_turns = db.scalars(
                 select(TurnRecord)
                 .where(TurnRecord.session_id == active_session.id)
@@ -3162,28 +3656,6 @@ def create_app(
             baseline=runtime_provenance,
             ingress=ingress_runtime_provenance,
         )
-        memory_context, memory_recall_event_payload = build_memory_context(
-            db,
-            user_message=user_message,
-            max_recalled_assertions=int(app.state.max_recalled_assertions),
-            settings=settings,
-        )
-        open_commitments_and_jobs = {
-            "open_jobs": _open_jobs_context(db=db),
-        }
-        context_bundle = _build_turn_context_bundle(
-            prior_turns=prior_turns,
-            max_recent_turns=int(app.state.max_recent_turns),
-            discord_context=discord_context,
-            memory_context=memory_context,
-            open_commitments_and_jobs=open_commitments_and_jobs,
-            relevant_artifacts_and_observations=_relevant_artifacts_and_observations_context(
-                db=db,
-                prior_turns=prior_turns,
-            ),
-        )
-        context_metadata = _context_bundle_audit_metadata(context_bundle)
-
         now = _utcnow()
         turn = TurnRecord(
             id=_new_id("trn"),
@@ -3217,6 +3689,58 @@ def create_app(
             db.add(event)
             created_events.append(event)
 
+        def add_ai_judgment(
+            *,
+            judgment_type: str,
+            source_type: str,
+            source_id: str,
+            status: str,
+            model: str | None,
+            prompt_version: str,
+            provider_response_id: str | None = None,
+            input_summary: str,
+            input_refs: dict[str, Any],
+            selected: list[dict[str, Any]] | None = None,
+            omitted: list[dict[str, Any]] | None = None,
+            output: dict[str, Any] | None = None,
+            rationale: str | None = None,
+            uncertainty: str | None = None,
+            confidence: float | None = None,
+            parse_status: str,
+            validation_status: str,
+            failure_code: str | None = None,
+            failure_reason: str | None = None,
+        ) -> str:
+            now_judgment = _utcnow()
+            judgment_id = _new_id("ajg")
+            db.add(
+                AIJudgmentRecord(
+                    id=judgment_id,
+                    judgment_type=judgment_type,
+                    source_type=source_type,
+                    source_id=source_id,
+                    status=status,
+                    model=model,
+                    prompt_version=prompt_version,
+                    provider_response_id=provider_response_id,
+                    input_summary=input_summary,
+                    input_refs=jsonable_encoder(input_refs),
+                    selected=jsonable_encoder(selected or []),
+                    omitted=jsonable_encoder(omitted or []),
+                    output=jsonable_encoder(output or {}),
+                    rationale=rationale,
+                    uncertainty=uncertainty,
+                    confidence=confidence,
+                    parse_status=parse_status,
+                    validation_status=validation_status,
+                    failure_code=failure_code,
+                    failure_reason=failure_reason,
+                    created_at=now_judgment,
+                    updated_at=now_judgment,
+                )
+            )
+            return judgment_id
+
         if discord_context is not None and discord_attachment_sources:
             app.state.attachment_runtime.record_discord_sources(
                 db=db,
@@ -3228,11 +3752,236 @@ def create_app(
                 new_id_fn=_new_id,
             )
         add_event("evt.turn.started", {"message": user_message, "discord": discord_context})
+
+        try:
+            memory_context, memory_recall_event_payload = build_memory_context(
+                db,
+                user_message=user_message,
+                max_recalled_assertions=int(app.state.max_recalled_assertions),
+                settings=settings,
+                current_session_id=effective_session_id,
+            )
+        except AIJudgmentFailure as exc:
+            safe_reason = safe_failure_reason(
+                exc.safe_reason,
+                fallback=f"unexpected {exc.__class__.__name__}",
+            )
+            input_refs = {
+                "session_id": effective_session_id,
+                "turn_id": turn.id,
+                "candidate_memory_ids": [
+                    memory_id
+                    for memory_id in db.scalars(
+                        select(MemoryAssertionRecord.id)
+                        .where(MemoryAssertionRecord.lifecycle_state == "active")
+                        .order_by(MemoryAssertionRecord.updated_at.desc())
+                        .limit(max(50, int(app.state.max_recalled_assertions) * 8))
+                    ).all()
+                    if isinstance(memory_id, str)
+                ],
+            }
+            add_ai_judgment(
+                judgment_type="memory_curation",
+                source_type="turn",
+                source_id=turn.id,
+                status="failed",
+                model=settings.model_name,
+                prompt_version=MEMORY_CURATION_PROMPT_VERSION,
+                provider_response_id=exc.provider_response_id,
+                input_summary="memory curation for turn",
+                input_refs=input_refs,
+                parse_status=exc.parse_status,
+                validation_status=exc.validation_status,
+                failure_code=exc.code,
+                failure_reason=safe_reason,
+            )
+            add_event(
+                "evt.ai_judgment.failed",
+                {
+                    "judgment_type": "memory_curation",
+                    "failure_code": exc.code,
+                    "failure_reason": safe_reason,
+                    "prompt_version": MEMORY_CURATION_PROMPT_VERSION,
+                    "source_id": turn.id,
+                    "input_refs": input_refs,
+                    "parse_status": exc.parse_status,
+                    "validation_status": exc.validation_status,
+                    "retryable": exc.retryable,
+                },
+            )
+            turn.status = "failed"
+            turn.updated_at = _utcnow()
+            add_event(
+                "evt.turn.failed",
+                {
+                    "failure_reason": "AI memory curation failed",
+                    "error_code": exc.code,
+                },
+            )
+            active_session.updated_at = _utcnow()
+            db.flush()
+            failure = ApiError(
+                status_code=502 if exc.retryable else 422,
+                code=exc.code,
+                message="AI memory curation failed",
+                details={
+                    "session_id": effective_session_id,
+                    "turn_id": turn.id,
+                    "judgment_type": "memory_curation",
+                    "prompt_version": MEMORY_CURATION_PROMPT_VERSION,
+                },
+                retryable=exc.retryable,
+            )
+            return TurnExecutionOutcome(
+                turn_id=turn.id,
+                effective_session_id=effective_session_id,
+                status_code=failure.status_code,
+                response_payload=_error_payload(failure),
+            )
+        except Exception as exc:
+            safe_reason = safe_failure_reason(
+                str(exc),
+                fallback=f"unexpected {exc.__class__.__name__}",
+            )
+            input_refs = {
+                "session_id": effective_session_id,
+                "turn_id": turn.id,
+                "candidate_memory_ids": [
+                    memory_id
+                    for memory_id in db.scalars(
+                        select(MemoryAssertionRecord.id)
+                        .where(MemoryAssertionRecord.lifecycle_state == "active")
+                        .order_by(MemoryAssertionRecord.updated_at.desc())
+                        .limit(max(50, int(app.state.max_recalled_assertions) * 8))
+                    ).all()
+                    if isinstance(memory_id, str)
+                ],
+            }
+            add_ai_judgment(
+                judgment_type="memory_curation",
+                source_type="turn",
+                source_id=turn.id,
+                status="failed",
+                model=settings.model_name,
+                prompt_version=MEMORY_CURATION_PROMPT_VERSION,
+                input_summary="memory curation for turn",
+                input_refs=input_refs,
+                parse_status="parsed",
+                validation_status="invalid",
+                failure_code="E_AI_JUDGMENT_SCHEMA",
+                failure_reason=safe_reason,
+            )
+            add_event(
+                "evt.ai_judgment.failed",
+                {
+                    "judgment_type": "memory_curation",
+                    "failure_code": "E_AI_JUDGMENT_SCHEMA",
+                    "failure_reason": safe_reason,
+                    "prompt_version": MEMORY_CURATION_PROMPT_VERSION,
+                    "source_id": turn.id,
+                    "input_refs": input_refs,
+                    "parse_status": "parsed",
+                    "validation_status": "invalid",
+                    "retryable": True,
+                },
+            )
+            turn.status = "failed"
+            turn.updated_at = _utcnow()
+            add_event(
+                "evt.turn.failed",
+                {
+                    "failure_reason": "AI memory curation failed",
+                    "error_code": "E_AI_JUDGMENT_SCHEMA",
+                },
+            )
+            active_session.updated_at = _utcnow()
+            db.flush()
+            failure = ApiError(
+                status_code=502,
+                code="E_AI_JUDGMENT_SCHEMA",
+                message="AI memory curation failed",
+                details={
+                    "session_id": effective_session_id,
+                    "turn_id": turn.id,
+                    "judgment_type": "memory_curation",
+                    "prompt_version": MEMORY_CURATION_PROMPT_VERSION,
+                },
+                retryable=True,
+            )
+            return TurnExecutionOutcome(
+                turn_id=turn.id,
+                effective_session_id=effective_session_id,
+                status_code=failure.status_code,
+                response_payload=_error_payload(failure),
+            )
+
+        memory_curation_parse_status = memory_recall_event_payload.get("curation_parse_status")
+        if not isinstance(memory_curation_parse_status, str):
+            memory_curation_parse_status = "parsed"
+        memory_curation_provider_response_id = memory_recall_event_payload.get(
+            "curation_provider_response_id"
+        )
+        if not isinstance(memory_curation_provider_response_id, str):
+            memory_curation_provider_response_id = None
+        add_ai_judgment(
+            judgment_type="memory_curation",
+            source_type="turn",
+            source_id=turn.id,
+            status="succeeded",
+            model=memory_recall_event_payload.get("curation_model")
+            if isinstance(memory_recall_event_payload.get("curation_model"), str)
+            else settings.model_name,
+            prompt_version=MEMORY_CURATION_PROMPT_VERSION,
+            provider_response_id=memory_curation_provider_response_id,
+            input_summary="memory curation for turn",
+            input_refs={
+                "session_id": effective_session_id,
+                "turn_id": turn.id,
+                "candidate_memory_ids": memory_recall_event_payload.get("candidate_memory_ids", []),
+                "candidate_memories": memory_recall_event_payload.get("candidate_memories", []),
+            },
+            selected=memory_recall_event_payload.get("selected_memories")
+            if isinstance(memory_recall_event_payload.get("selected_memories"), list)
+            else [],
+            omitted=memory_recall_event_payload.get("omitted_memories")
+            if isinstance(memory_recall_event_payload.get("omitted_memories"), list)
+            else [],
+            output={"recall_window": memory_recall_event_payload},
+            rationale=memory_recall_event_payload.get("curation_rationale")
+            if isinstance(memory_recall_event_payload.get("curation_rationale"), str)
+            else None,
+            uncertainty=memory_recall_event_payload.get("curation_uncertainty")
+            if isinstance(memory_recall_event_payload.get("curation_uncertainty"), str)
+            else None,
+            confidence=(
+                float(memory_recall_event_payload["curation_confidence"])
+                if isinstance(memory_recall_event_payload.get("curation_confidence"), int | float)
+                else None
+            ),
+            parse_status=memory_curation_parse_status,
+            validation_status="valid",
+        )
+        open_commitments_and_jobs = {
+            "open_jobs": _open_jobs_context(db=db),
+        }
+        context_bundle = _build_turn_context_bundle(
+            prior_turns=prior_turns,
+            max_recent_turns=int(app.state.max_recent_turns),
+            discord_context=discord_context,
+            memory_context=memory_context,
+            open_commitments_and_jobs=open_commitments_and_jobs,
+            relevant_artifacts_and_observations=_relevant_artifacts_and_observations_context(
+                db=db,
+                prior_turns=prior_turns,
+            ),
+        )
+        context_metadata = _context_bundle_audit_metadata(context_bundle)
         if (
-            memory_recall_event_payload["included_memory_count"]
+            memory_recall_event_payload["selected_memory_count"]
+            or memory_recall_event_payload["memory_candidate_count"]
             or memory_recall_event_payload["conflict_ids"]
         ):
-            add_event("evt.memory.recalled", memory_recall_event_payload)
+            add_event("evt.memory.curated", memory_recall_event_payload)
         applied_limits = _applied_turn_limits(app)
 
         def elapsed_turn_ms(started_at: float) -> int:
@@ -3261,15 +4010,6 @@ def create_app(
             raw_limit = failure.details.get("limit")
             limit_details = raw_limit if isinstance(raw_limit, dict) else {}
             add_event(
-                "evt.turn.limit_reached",
-                {
-                    "code": failure.code,
-                    "message": failure.message,
-                    "limit": limit_details,
-                    "applied_limits": applied_limits,
-                },
-            )
-            add_event(
                 "evt.assistant.emitted",
                 {
                     "message": failure.message,
@@ -3297,30 +4037,446 @@ def create_app(
         assistant_response: dict[str, Any] | None = None
         responses_input_items: list[dict[str, Any]] = []
         responses_tools = response_tool_definitions()
+        last_tool_result_interpreter_judgment_id: str | None = None
+
+        def record_model_output_budget_failure(
+            *,
+            attempt: int,
+            provider_response_id: str | None,
+            failure_reason: str,
+        ) -> ApiError:
+            prompt_version = "model-output-v1"
+            add_ai_judgment(
+                judgment_type="model_output",
+                source_type="turn",
+                source_id=turn.id,
+                status="failed",
+                model=app.state.model_adapter.model,
+                prompt_version=prompt_version,
+                provider_response_id=provider_response_id,
+                input_summary="final model-authored assistant output for turn",
+                input_refs={
+                    "session_id": effective_session_id,
+                    "turn_id": turn.id,
+                    "attempt": attempt,
+                    "max_model_attempts": int(app.state.max_model_attempts),
+                    "last_tool_result_interpreter_judgment_id": (
+                        last_tool_result_interpreter_judgment_id
+                    ),
+                },
+                parse_status="missing_output",
+                validation_status="not_validated",
+                failure_code="E_AI_JUDGMENT_BUDGET",
+                failure_reason=failure_reason,
+            )
+            add_event(
+                "evt.ai_judgment.failed",
+                {
+                    "judgment_type": "model_output",
+                    "failure_code": "E_AI_JUDGMENT_BUDGET",
+                    "failure_reason": failure_reason,
+                    "prompt_version": prompt_version,
+                    "source_id": turn.id,
+                    "parse_status": "missing_output",
+                    "validation_status": "not_validated",
+                    "provider_response_id": provider_response_id,
+                    "attempt": attempt,
+                    "max_model_attempts": int(app.state.max_model_attempts),
+                    "last_tool_result_interpreter_judgment_id": (
+                        last_tool_result_interpreter_judgment_id
+                    ),
+                },
+            )
+            return ApiError(
+                status_code=429,
+                code="E_AI_JUDGMENT_BUDGET",
+                message="AI model output failed",
+                details={
+                    "session_id": effective_session_id,
+                    "turn_id": turn.id,
+                    "judgment_type": "model_output",
+                    "prompt_version": prompt_version,
+                    "attempt": attempt,
+                    "max_model_attempts": int(app.state.max_model_attempts),
+                    "provider_response_id": provider_response_id,
+                    "last_tool_result_interpreter_judgment_id": (
+                        last_tool_result_interpreter_judgment_id
+                    ),
+                },
+                retryable=True,
+            )
 
         context_tokens = _estimate_context_tokens(
             context_bundle=context_bundle,
             user_message=user_message,
         )
-        compacted_context_bundle = app.state.context_compaction_adapter.compact(
-            context_bundle=context_bundle,
-            user_message=user_message,
-            estimated_context_tokens=context_tokens,
-            max_context_tokens=int(app.state.max_context_tokens),
-        )
-        if isinstance(compacted_context_bundle, dict):
-            context_bundle = compacted_context_bundle
-            context_metadata = _context_bundle_audit_metadata(context_bundle)
-            context_tokens = _estimate_context_tokens(
+        try:
+            compacted_context_bundle = app.state.context_compaction_adapter.compact(
                 context_bundle=context_bundle,
                 user_message=user_message,
+                estimated_context_tokens=context_tokens,
+                max_context_tokens=int(app.state.max_context_tokens),
             )
-        if context_tokens > app.state.max_context_tokens:
-            bounded_failure = build_turn_limit_failure(
-                budget="context_tokens",
-                unit="tokens",
-                measured=context_tokens,
-                limit=app.state.max_context_tokens,
+        except ModelAdapterError as exc:
+            model_failure_reason = safe_failure_reason(
+                exc.safe_reason,
+                fallback=f"unexpected {exc.__class__.__name__}",
+            )
+            compaction_failure_code = (
+                exc.code if exc.code.startswith("E_AI_JUDGMENT_") else "E_AI_JUDGMENT_REQUIRED"
+            )
+            compaction_parse_status = (
+                exc.parse_status if isinstance(exc.parse_status, str) else "missing_output"
+            )
+            compaction_validation_status = (
+                exc.validation_status if isinstance(exc.validation_status, str) else "not_validated"
+            )
+            add_ai_judgment(
+                judgment_type="continuity_compaction",
+                source_type="turn",
+                source_id=turn.id,
+                status="failed",
+                model=getattr(app.state.context_compaction_adapter, "model", settings.model_name),
+                prompt_version=MEMORY_CONTINUITY_PROMPT_VERSION,
+                provider_response_id=exc.provider_response_id
+                if isinstance(exc.provider_response_id, str)
+                else None,
+                input_summary="context-pressure continuity compaction",
+                input_refs={
+                    "session_id": effective_session_id,
+                    "turn_id": turn.id,
+                    "estimated_context_tokens": context_tokens,
+                    "max_context_tokens": int(app.state.max_context_tokens),
+                    "source_turn_ids": [
+                        item["turn_id"]
+                        for item in context_bundle.get("recent_active_session_turns", [])
+                        if isinstance(item, dict) and isinstance(item.get("turn_id"), str)
+                    ],
+                },
+                parse_status=compaction_parse_status,
+                validation_status=compaction_validation_status,
+                failure_code=compaction_failure_code,
+                failure_reason=model_failure_reason,
+            )
+            add_event(
+                "evt.ai_judgment.failed",
+                {
+                    "judgment_type": "continuity_compaction",
+                    "code": compaction_failure_code,
+                    "failure_code": compaction_failure_code,
+                    "failure_reason": model_failure_reason,
+                    "prompt_version": MEMORY_CONTINUITY_PROMPT_VERSION,
+                    "source_id": turn.id,
+                    "parse_status": compaction_parse_status,
+                    "validation_status": compaction_validation_status,
+                    "retryable": exc.retryable,
+                },
+            )
+            model_failure = ApiError(
+                status_code=exc.status_code,
+                code=compaction_failure_code,
+                message="AI continuity compaction failed",
+                details={
+                    "session_id": effective_session_id,
+                    "turn_id": turn.id,
+                    "judgment_type": "continuity_compaction",
+                    "prompt_version": MEMORY_CONTINUITY_PROMPT_VERSION,
+                },
+                retryable=exc.retryable,
+            )
+            compacted_context_bundle = None
+        if isinstance(compacted_context_bundle, dict):
+            continuity = compacted_context_bundle.get("continuity_compaction")
+            if context_tokens > app.state.max_context_tokens and not isinstance(continuity, dict):
+                failure_reason = "context compaction did not return an AI continuity record"
+                add_ai_judgment(
+                    judgment_type="continuity_compaction",
+                    source_type="turn",
+                    source_id=turn.id,
+                    status="failed",
+                    model=getattr(
+                        app.state.context_compaction_adapter, "model", settings.model_name
+                    ),
+                    prompt_version=MEMORY_CONTINUITY_PROMPT_VERSION,
+                    input_summary="context-pressure continuity compaction",
+                    input_refs={
+                        "session_id": effective_session_id,
+                        "turn_id": turn.id,
+                        "estimated_context_tokens": context_tokens,
+                        "max_context_tokens": int(app.state.max_context_tokens),
+                    },
+                    parse_status="schema_invalid",
+                    validation_status="invalid",
+                    failure_code="E_AI_JUDGMENT_SCHEMA",
+                    failure_reason=failure_reason,
+                )
+                add_event(
+                    "evt.ai_judgment.failed",
+                    {
+                        "judgment_type": "continuity_compaction",
+                        "failure_code": "E_AI_JUDGMENT_SCHEMA",
+                        "failure_reason": failure_reason,
+                        "prompt_version": MEMORY_CONTINUITY_PROMPT_VERSION,
+                        "source_id": turn.id,
+                        "parse_status": "schema_invalid",
+                        "validation_status": "invalid",
+                    },
+                )
+                model_failure = ApiError(
+                    status_code=502,
+                    code="E_AI_JUDGMENT_SCHEMA",
+                    message="AI continuity compaction failed",
+                    details={
+                        "session_id": effective_session_id,
+                        "turn_id": turn.id,
+                        "judgment_type": "continuity_compaction",
+                        "prompt_version": MEMORY_CONTINUITY_PROMPT_VERSION,
+                    },
+                    retryable=False,
+                )
+                compacted_context_bundle = None
+                continuity = None
+            if isinstance(continuity, dict):
+                continuity_provider_response_id = continuity.get("provider_response_id")
+                if not isinstance(continuity_provider_response_id, str):
+                    continuity_provider_response_id = None
+                try:
+                    continuity = validate_continuity_compaction_payload(
+                        continuity,
+                        source_turn_ids=[
+                            item["turn_id"]
+                            for item in context_bundle.get("recent_active_session_turns", [])
+                            if isinstance(item, dict) and isinstance(item.get("turn_id"), str)
+                        ],
+                        model=getattr(
+                            app.state.context_compaction_adapter,
+                            "model",
+                            settings.model_name,
+                        ),
+                        provider_response_id=continuity_provider_response_id,
+                    )
+                except AIJudgmentFailure as exc:
+                    failure_reason = safe_failure_reason(
+                        exc.safe_reason,
+                        fallback=f"unexpected {exc.__class__.__name__}",
+                    )
+                    add_ai_judgment(
+                        judgment_type="continuity_compaction",
+                        source_type="turn",
+                        source_id=turn.id,
+                        status="failed",
+                        model=getattr(
+                            app.state.context_compaction_adapter,
+                            "model",
+                            settings.model_name,
+                        ),
+                        prompt_version=MEMORY_CONTINUITY_PROMPT_VERSION,
+                        provider_response_id=exc.provider_response_id,
+                        input_summary="context-pressure continuity compaction",
+                        input_refs={
+                            "session_id": effective_session_id,
+                            "turn_id": turn.id,
+                            "estimated_context_tokens": context_tokens,
+                            "max_context_tokens": int(app.state.max_context_tokens),
+                        },
+                        parse_status=exc.parse_status,
+                        validation_status=exc.validation_status,
+                        failure_code=exc.code,
+                        failure_reason=failure_reason,
+                    )
+                    add_event(
+                        "evt.ai_judgment.failed",
+                        {
+                            "judgment_type": "continuity_compaction",
+                            "failure_code": exc.code,
+                            "failure_reason": failure_reason,
+                            "prompt_version": MEMORY_CONTINUITY_PROMPT_VERSION,
+                            "source_id": turn.id,
+                            "parse_status": exc.parse_status,
+                            "validation_status": exc.validation_status,
+                        },
+                    )
+                    model_failure = ApiError(
+                        status_code=502,
+                        code=exc.code,
+                        message="AI continuity compaction failed",
+                        details={
+                            "session_id": effective_session_id,
+                            "turn_id": turn.id,
+                            "judgment_type": "continuity_compaction",
+                            "prompt_version": MEMORY_CONTINUITY_PROMPT_VERSION,
+                        },
+                        retryable=exc.retryable,
+                    )
+                    compacted_context_bundle = None
+                    continuity = None
+            if isinstance(continuity, dict):
+                source_turn_ids = continuity.get("source_turn_ids")
+                preserved_turn_refs = continuity.get("preserved_turn_refs")
+                omitted_turn_refs = continuity.get("omitted_turn_refs")
+                continuity_provider_response_id = continuity.get("provider_response_id")
+                if not isinstance(continuity_provider_response_id, str):
+                    continuity_provider_response_id = None
+                now_compaction = _utcnow()
+                db.add(
+                    ProjectStateSnapshotRecord(
+                        id=_new_id("pss"),
+                        project_key="session_continuity",
+                        summary=redact_text(str(continuity.get("summary") or ""))[:2000],
+                        state={
+                            "reason": "context_pressure",
+                            "session_id": effective_session_id,
+                            "turn_id": turn.id,
+                            "provider_response_id": continuity_provider_response_id,
+                            "source_turn_ids": source_turn_ids
+                            if isinstance(source_turn_ids, list)
+                            else [],
+                            "preserved_turn_refs": preserved_turn_refs
+                            if isinstance(preserved_turn_refs, list)
+                            else [],
+                            "omitted_turn_refs": omitted_turn_refs
+                            if isinstance(omitted_turn_refs, list)
+                            else [],
+                            "user_commitments": continuity.get("user_commitments")
+                            if isinstance(continuity.get("user_commitments"), list)
+                            else [],
+                            "assistant_commitments": continuity.get("assistant_commitments")
+                            if isinstance(continuity.get("assistant_commitments"), list)
+                            else [],
+                            "decisions": continuity.get("decisions")
+                            if isinstance(continuity.get("decisions"), list)
+                            else [],
+                            "open_loops": continuity.get("open_loops")
+                            if isinstance(continuity.get("open_loops"), list)
+                            else [],
+                            "unresolved_uncertainty": continuity.get("unresolved_uncertainty")
+                            if isinstance(continuity.get("unresolved_uncertainty"), list)
+                            else [],
+                            "important_omissions": continuity.get("important_omissions")
+                            if isinstance(continuity.get("important_omissions"), list)
+                            else [],
+                            "tool_action_outcomes": continuity.get("tool_action_outcomes")
+                            if isinstance(continuity.get("tool_action_outcomes"), list)
+                            else [],
+                            "confidence": continuity.get("confidence")
+                            if isinstance(continuity.get("confidence"), int | float)
+                            else None,
+                            "model": getattr(
+                                app.state.context_compaction_adapter,
+                                "model",
+                                settings.model_name,
+                            ),
+                            "prompt_version": MEMORY_CONTINUITY_PROMPT_VERSION,
+                            "parse_status": "parsed",
+                            "validation_status": "valid",
+                        },
+                        source_assertion_ids=[],
+                        source_episode_ids=[],
+                        source_evidence_ids=[],
+                        lifecycle_state="active",
+                        projection_version=MEMORY_PROJECTION_VERSION,
+                        created_at=now_compaction,
+                        updated_at=now_compaction,
+                    )
+                )
+                add_ai_judgment(
+                    judgment_type="continuity_compaction",
+                    source_type="turn",
+                    source_id=turn.id,
+                    status="succeeded",
+                    model=getattr(
+                        app.state.context_compaction_adapter, "model", settings.model_name
+                    ),
+                    prompt_version=MEMORY_CONTINUITY_PROMPT_VERSION,
+                    provider_response_id=continuity_provider_response_id,
+                    input_summary="context-pressure continuity compaction",
+                    input_refs={
+                        "session_id": effective_session_id,
+                        "turn_id": turn.id,
+                        "estimated_context_tokens": context_tokens,
+                        "max_context_tokens": int(app.state.max_context_tokens),
+                        "source_turn_ids": source_turn_ids
+                        if isinstance(source_turn_ids, list)
+                        else [],
+                    },
+                    selected=[
+                        item
+                        for item in compacted_context_bundle.get("recent_active_session_turns", [])
+                        if isinstance(item, dict)
+                    ],
+                    omitted=omitted_turn_refs if isinstance(omitted_turn_refs, list) else [],
+                    output={"continuity_compaction": continuity},
+                    rationale=continuity.get("summary")
+                    if isinstance(continuity.get("summary"), str)
+                    else None,
+                    parse_status="parsed",
+                    validation_status="valid",
+                )
+                add_event(
+                    "evt.ai_judgment.completed",
+                    {
+                        "judgment_type": "continuity_compaction",
+                        "source_turn_ids": source_turn_ids
+                        if isinstance(source_turn_ids, list)
+                        else [],
+                        "omitted_turn_count": len(omitted_turn_refs)
+                        if isinstance(omitted_turn_refs, list)
+                        else 0,
+                    },
+                )
+            if model_failure is None:
+                context_bundle = compacted_context_bundle
+                context_metadata = _context_bundle_audit_metadata(context_bundle)
+                context_tokens = _estimate_context_tokens(
+                    context_bundle=context_bundle,
+                    user_message=user_message,
+                )
+        if model_failure is not None:
+            pass
+        elif context_tokens > app.state.max_context_tokens:
+            failure_reason = "context pressure requires AI continuity compaction"
+            add_ai_judgment(
+                judgment_type="continuity_compaction",
+                source_type="turn",
+                source_id=turn.id,
+                status="failed",
+                model=getattr(app.state.context_compaction_adapter, "model", settings.model_name),
+                prompt_version=MEMORY_CONTINUITY_PROMPT_VERSION,
+                input_summary="context-pressure continuity compaction",
+                input_refs={
+                    "session_id": effective_session_id,
+                    "turn_id": turn.id,
+                    "estimated_context_tokens": context_tokens,
+                    "max_context_tokens": int(app.state.max_context_tokens),
+                },
+                parse_status="missing_output",
+                validation_status="not_validated",
+                failure_code="E_AI_JUDGMENT_REQUIRED",
+                failure_reason=failure_reason,
+            )
+            add_event(
+                "evt.ai_judgment.failed",
+                {
+                    "judgment_type": "continuity_compaction",
+                    "failure_code": "E_AI_JUDGMENT_REQUIRED",
+                    "failure_reason": failure_reason,
+                    "prompt_version": MEMORY_CONTINUITY_PROMPT_VERSION,
+                    "source_id": turn.id,
+                    "parse_status": "missing_output",
+                    "validation_status": "not_validated",
+                },
+            )
+            model_failure = ApiError(
+                status_code=502,
+                code="E_AI_JUDGMENT_REQUIRED",
+                message="AI continuity compaction failed",
+                details={
+                    "session_id": effective_session_id,
+                    "turn_id": turn.id,
+                    "judgment_type": "continuity_compaction",
+                    "prompt_version": MEMORY_CONTINUITY_PROMPT_VERSION,
+                },
+                retryable=True,
             )
         else:
             responses_input_items = _build_responses_input_items(
@@ -3418,6 +4574,146 @@ def create_app(
                                 "assistant_silent": True,
                             }
                             break
+                        tool_result_interpreter_output: dict[str, Any] | None = None
+                        if function_processing.tool_result_interpreter_input is not None:
+                            try:
+                                interpreted = _call_tool_result_interpreter(
+                                    model_adapter=app.state.model_adapter,
+                                    interpreter_input=function_processing.tool_result_interpreter_input,
+                                )
+                            except ModelAdapterError as exc:
+                                failure_reason = safe_failure_reason(
+                                    exc.safe_reason,
+                                    fallback=f"unexpected {exc.__class__.__name__}",
+                                )
+                                parse_status = exc.parse_status or (
+                                    "invalid_json"
+                                    if exc.code == "E_AI_JUDGMENT_INVALID_JSON"
+                                    else "schema_invalid"
+                                )
+                                validation_status = exc.validation_status or (
+                                    "not_validated"
+                                    if exc.code == "E_AI_JUDGMENT_INVALID_JSON"
+                                    else "invalid"
+                                )
+                                last_tool_result_interpreter_judgment_id = add_ai_judgment(
+                                    judgment_type="tool_result_interpretation",
+                                    source_type="turn",
+                                    source_id=turn.id,
+                                    status="failed",
+                                    model=exc.model or app.state.model_adapter.model,
+                                    prompt_version="tool-result-interpretation-v1",
+                                    provider_response_id=exc.provider_response_id
+                                    if isinstance(exc.provider_response_id, str)
+                                    else None,
+                                    input_summary="tool-result interpretation for turn",
+                                    input_refs=function_processing.tool_result_interpreter_input,
+                                    parse_status=parse_status,
+                                    validation_status=validation_status,
+                                    failure_code=exc.code,
+                                    failure_reason=failure_reason,
+                                    output={
+                                        "provider": exc.provider
+                                        or app.state.model_adapter.provider,
+                                        "usage": exc.usage or {},
+                                        "response_output_shape": exc.raw_output_shape or {},
+                                    },
+                                )
+                                add_event(
+                                    "evt.ai_judgment.failed",
+                                    {
+                                        "judgment_type": "tool_result_interpretation",
+                                        "failure_code": exc.code,
+                                        "failure_reason": failure_reason,
+                                        "prompt_version": "tool-result-interpretation-v1",
+                                        "source_id": turn.id,
+                                        "parse_status": parse_status,
+                                        "validation_status": validation_status,
+                                        "provider": exc.provider
+                                        or app.state.model_adapter.provider,
+                                        "model": exc.model or app.state.model_adapter.model,
+                                        "usage": exc.usage or {},
+                                        "provider_response_id": exc.provider_response_id
+                                        if isinstance(exc.provider_response_id, str)
+                                        else None,
+                                        "response_output_shape": exc.raw_output_shape or {},
+                                    },
+                                )
+                                raise
+                            interpreted_output = interpreted["output"]
+                            if isinstance(interpreted_output, dict):
+                                tool_result_interpreter_output = interpreted_output
+                                function_processing.tool_result_interpreter_output = (
+                                    tool_result_interpreter_output
+                                )
+                                last_tool_result_interpreter_judgment_id = add_ai_judgment(
+                                    judgment_type="tool_result_interpretation",
+                                    source_type="turn",
+                                    source_id=turn.id,
+                                    status="succeeded",
+                                    model=interpreted.get("model")
+                                    if isinstance(interpreted.get("model"), str)
+                                    else app.state.model_adapter.model,
+                                    prompt_version="tool-result-interpretation-v1",
+                                    provider_response_id=interpreted.get("provider_response_id")
+                                    if isinstance(interpreted.get("provider_response_id"), str)
+                                    else None,
+                                    input_summary="tool-result interpretation for turn",
+                                    input_refs=function_processing.tool_result_interpreter_input,
+                                    selected=[
+                                        {"output_ref": output_ref}
+                                        for output_ref in interpreted_output.get(
+                                            "selected_output_refs", []
+                                        )
+                                        if isinstance(output_ref, str)
+                                    ],
+                                    omitted=interpreted_output.get("omitted_output_refs")
+                                    if isinstance(
+                                        interpreted_output.get("omitted_output_refs"), list
+                                    )
+                                    else [],
+                                    output={
+                                        **tool_result_interpreter_output,
+                                        "provider": interpreted.get("provider"),
+                                        "usage": interpreted.get("usage") or {},
+                                        "response_output_shape": interpreted.get(
+                                            "response_output_shape"
+                                        )
+                                        or {},
+                                    },
+                                    uncertainty=json.dumps(
+                                        interpreted_output.get("uncertainty", []),
+                                        sort_keys=True,
+                                    ),
+                                    confidence=interpreted_output.get("confidence")
+                                    if isinstance(interpreted_output.get("confidence"), int | float)
+                                    else None,
+                                    parse_status="parsed",
+                                    validation_status="valid",
+                                )
+                                add_event(
+                                    "evt.ai_judgment.completed",
+                                    {
+                                        "judgment_type": "tool_result_interpretation",
+                                        "prompt_version": "tool-result-interpretation-v1",
+                                        "source_id": turn.id,
+                                        "parse_status": "parsed",
+                                        "validation_status": "valid",
+                                        "provider": interpreted.get("provider"),
+                                        "model": interpreted.get("model"),
+                                        "usage": interpreted.get("usage") or {},
+                                        "provider_response_id": interpreted.get(
+                                            "provider_response_id"
+                                        ),
+                                        "response_output_shape": interpreted.get(
+                                            "response_output_shape"
+                                        )
+                                        or {},
+                                        "reason_codes": function_processing.tool_result_interpreter_input[
+                                            "reason_codes"
+                                        ],
+                                    },
+                                )
                         for output_item in output_items:
                             if isinstance(output_item, dict):
                                 responses_input_items.append(jsonable_encoder(output_item))
@@ -3431,12 +4727,35 @@ def create_app(
                                 ),
                             }
                         )
+                        if tool_result_interpreter_output is not None:
+                            responses_input_items.append(
+                                {
+                                    "role": "system",
+                                    "content": (
+                                        "AI tool-result interpretation:\n"
+                                        + json.dumps(
+                                            jsonable_encoder(tool_result_interpreter_output),
+                                            sort_keys=True,
+                                            separators=(",", ":"),
+                                        )
+                                    ),
+                                }
+                            )
                         if attempt >= app.state.max_model_attempts:
-                            assistant_response = {
-                                **candidate_response,
-                                "assistant_text": function_processing.assistant_message,
-                                "assistant_silent": False,
-                            }
+                            candidate_provider_response_id = candidate_response.get(
+                                "provider_response_id"
+                            )
+                            model_failure = record_model_output_budget_failure(
+                                attempt=attempt,
+                                provider_response_id=candidate_provider_response_id
+                                if isinstance(candidate_provider_response_id, str)
+                                else None,
+                                failure_reason=(
+                                    "model exhausted its attempt budget before authoring "
+                                    "a final assistant response"
+                                ),
+                            )
+                            model_failure_reason = "AI model output exhausted its attempt budget"
                             break
                         continue
                     if not assistant_text:
@@ -3469,15 +4788,31 @@ def create_app(
                             exc.safe_reason,
                             fallback=fallback_reason,
                         )
+                        error_details = {
+                            "session_id": effective_session_id,
+                            "turn_id": turn.id,
+                            "attempt": attempt,
+                            "failure_code": exc.code,
+                        }
+                        if exc.parse_status is not None:
+                            error_details["parse_status"] = exc.parse_status
+                        if exc.validation_status is not None:
+                            error_details["validation_status"] = exc.validation_status
+                        if exc.provider is not None:
+                            error_details["provider"] = exc.provider
+                        if exc.model is not None:
+                            error_details["model"] = exc.model
+                        if exc.usage is not None:
+                            error_details["usage"] = exc.usage
+                        if exc.provider_response_id is not None:
+                            error_details["provider_response_id"] = exc.provider_response_id
+                        if exc.raw_output_shape is not None:
+                            error_details["response_output_shape"] = exc.raw_output_shape
                         model_failure_candidate = ApiError(
                             status_code=exc.status_code,
                             code=exc.code,
                             message=exc.message,
-                            details={
-                                "session_id": effective_session_id,
-                                "turn_id": turn.id,
-                                "attempt": attempt,
-                            },
+                            details=error_details,
                             retryable=exc.retryable,
                         )
                         should_retry = exc.retryable
@@ -3506,7 +4841,21 @@ def create_app(
                             "duration_ms": duration_ms,
                             "failure_reason": failure_reason,
                             "attempt": attempt,
-                        },
+                        }
+                        | (
+                            {
+                                "failure_code": exc.code,
+                                "parse_status": exc.parse_status,
+                                "validation_status": exc.validation_status,
+                                "provider": exc.provider or app.state.model_adapter.provider,
+                                "model": exc.model or app.state.model_adapter.model,
+                                "usage": exc.usage or {},
+                                "provider_response_id": exc.provider_response_id,
+                                "response_output_shape": exc.raw_output_shape or {},
+                            }
+                            if isinstance(exc, ModelAdapterError)
+                            else {}
+                        ),
                     )
 
                     elapsed_after_failure_ms = elapsed_turn_ms(turn_started_at)
@@ -3521,12 +4870,21 @@ def create_app(
                     if should_retry and attempt < app.state.max_model_attempts:
                         continue
                     if should_retry and attempt >= app.state.max_model_attempts:
-                        bounded_failure = build_turn_limit_failure(
-                            budget="model_attempts",
-                            unit="attempts",
-                            measured=attempt,
-                            limit=app.state.max_model_attempts,
+                        provider_response_id = (
+                            exc.provider_response_id
+                            if isinstance(exc, ModelAdapterError)
+                            and isinstance(exc.provider_response_id, str)
+                            else None
                         )
+                        model_failure = record_model_output_budget_failure(
+                            attempt=attempt,
+                            provider_response_id=provider_response_id,
+                            failure_reason=(
+                                "model exhausted its retry budget before authoring "
+                                "a final assistant response"
+                            ),
+                        )
+                        model_failure_reason = failure_reason
                         break
 
                     model_failure = model_failure_candidate
@@ -3721,6 +5079,108 @@ def create_app(
                         status_code=existing_idempotency.status_code,
                         content=existing_idempotency.response_payload,
                     )
+
+                if discord_context is not None:
+                    now_discord = _utcnow()
+                    discord_message_id = str(discord_context["message_id"])
+                    discord_item = db.scalar(
+                        select(WorkspaceItemRecord)
+                        .where(
+                            WorkspaceItemRecord.provider == "discord",
+                            WorkspaceItemRecord.item_type == "discord_message",
+                            WorkspaceItemRecord.external_id == discord_message_id,
+                        )
+                        .with_for_update()
+                        .limit(1)
+                    )
+                    channel_name = discord_context.get("channel_name")
+                    title = (
+                        f"Discord message in #{channel_name}"
+                        if isinstance(channel_name, str) and channel_name.strip()
+                        else f"Discord message in channel {discord_context['channel_id']}"
+                    )
+                    summary = redact_text(payload.message)[:2000]
+                    metadata = {
+                        "guild_id": discord_context.get("guild_id"),
+                        "guild_name": discord_context.get("guild_name"),
+                        "channel_id": discord_context["channel_id"],
+                        "channel_name": discord_context.get("channel_name"),
+                        "channel_type": discord_context.get("channel_type"),
+                        "thread_id": discord_context.get("thread_id"),
+                        "thread_name": discord_context.get("thread_name"),
+                        "parent_channel_id": discord_context.get("parent_channel_id"),
+                        "parent_channel_name": discord_context.get("parent_channel_name"),
+                        "author_id": discord_context["author_id"],
+                        "author_name": discord_context.get("author_name"),
+                        "reply_to_message_id": discord_context.get("reply_to_message_id"),
+                        "mentioned_bot": discord_context.get("mentioned_bot"),
+                        "attachments": discord_context.get("attachments", []),
+                    }
+                    if discord_item is None:
+                        discord_item = WorkspaceItemRecord(
+                            id=_new_id("wki"),
+                            provider="discord",
+                            item_type="discord_message",
+                            external_id=discord_message_id,
+                            title=title,
+                            summary=summary,
+                            source_uri=discord_context.get("message_url")
+                            if isinstance(discord_context.get("message_url"), str)
+                            else None,
+                            status="active",
+                            item_metadata=metadata,
+                            observed_at=now_discord,
+                            deleted_at=None,
+                            created_at=now_discord,
+                            updated_at=now_discord,
+                        )
+                        db.add(discord_item)
+                        db.flush()
+                    else:
+                        discord_item.title = title
+                        discord_item.summary = summary
+                        discord_item.source_uri = (
+                            discord_context.get("message_url")
+                            if isinstance(discord_context.get("message_url"), str)
+                            else None
+                        )
+                        discord_item.status = "active"
+                        discord_item.item_metadata = metadata
+                        discord_item.observed_at = now_discord
+                        discord_item.deleted_at = None
+                        discord_item.updated_at = now_discord
+                        db.flush()
+
+                    discord_event_dedupe_key = f"discord:message:{discord_message_id}:ingested"
+                    existing_discord_event = db.scalar(
+                        select(WorkspaceItemEventRecord)
+                        .where(WorkspaceItemEventRecord.dedupe_key == discord_event_dedupe_key)
+                        .limit(1)
+                    )
+                    if existing_discord_event is None:
+                        discord_event = WorkspaceItemEventRecord(
+                            id=_new_id("wie"),
+                            workspace_item_id=discord_item.id,
+                            dedupe_key=discord_event_dedupe_key,
+                            provider_event_id=None,
+                            event_type="created",
+                            payload={
+                                "provider": "discord",
+                                "item_type": "discord_message",
+                                "message_id": discord_message_id,
+                                "message": summary,
+                                "metadata": metadata,
+                            },
+                            created_at=now_discord,
+                        )
+                        db.add(discord_event)
+                        db.flush()
+                        enqueue_background_task(
+                            db,
+                            task_type="ambient_interpretation_due",
+                            payload={"workspace_item_event_id": discord_event.id},
+                            now=now_discord,
+                        )
 
                 def persist_idempotency_result(
                     *,
@@ -4725,12 +6185,13 @@ def create_app(
 
     @app.get("/v1/workspace-items")
     def get_workspace_items(
-        provider: Literal["google", "ariel"] | None = None,
+        provider: Literal["google", "ariel", "discord"] | None = None,
         item_type: Literal[
             "calendar_event",
             "email_message",
             "drive_file",
             "internal_state",
+            "discord_message",
         ]
         | None = None,
         status: Literal["active", "deleted"] | None = None,
@@ -4825,21 +6286,6 @@ def create_app(
                     )
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
-
-    @app.post("/v1/proactive/observations/derive")
-    def derive_proactive_observations() -> dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                now = _utcnow()
-                task = enqueue_background_task(
-                    db,
-                    task_type="workspace_observation_derivation_due",
-                    payload={},
-                    now=now,
-                    max_attempts=3,
-                )
-                return {"ok": True, "task_id": task.id}
 
     @app.get("/v1/proactive/cases")
     def get_proactive_cases(

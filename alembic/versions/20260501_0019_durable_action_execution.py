@@ -26,11 +26,7 @@ def upgrade() -> None:
             "'expire_approvals', 'reap_stale_tasks', "
             "'provider_subscription_renewal_due', 'provider_event_received', "
             "'provider_sync_due', 'memory_extract_turn', "
-            "'workspace_signal_derivation_due', "
-            "'attention_feature_extraction_due', 'attention_grouping_due', "
-            "'attention_ranking_due', 'attention_review_due', 'attention_delivery_due', "
-            "'attention_item_follow_up_due', 'proactive_feedback_review_due', "
-            "'action_proposal_review_due', 'execute_action_attempt')"
+            "'execute_action_attempt')"
         ),
     )
 
@@ -44,11 +40,6 @@ def downgrade() -> None:
             "task_type IN ('agency_event_received', 'deliver_discord_notification', "
             "'expire_approvals', 'reap_stale_tasks', "
             "'provider_subscription_renewal_due', 'provider_event_received', "
-            "'provider_sync_due', 'memory_extract_turn', "
-            "'workspace_signal_derivation_due', "
-            "'attention_feature_extraction_due', 'attention_grouping_due', "
-            "'attention_ranking_due', 'attention_review_due', 'attention_delivery_due', "
-            "'attention_item_follow_up_due', 'proactive_feedback_review_due', "
-            "'action_proposal_review_due')"
+            "'provider_sync_due', 'memory_extract_turn')"
         ),
     )

@@ -40,7 +40,18 @@ class DurableWorkflowAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        del tools, history, context_bundle
+        del tools, history
+        if context_bundle.get("origin") == "ambient_interpretation":
+            return responses_message(
+                assistant_text=json.dumps(
+                    _ambient_interpretation_fixture(input_items), sort_keys=True
+                ),
+                provider=self.provider,
+                model=self.model,
+                provider_response_id="resp_ambient_interpretation_123",
+                input_tokens=8,
+                output_tokens=5,
+            )
         return responses_message(
             assistant_text=f"assistant::{user_message}",
             provider=self.provider,
@@ -49,6 +60,91 @@ class DurableWorkflowAdapter:
             input_tokens=8,
             output_tokens=5,
         )
+
+
+def _first_ambient_candidate(input_items: list[dict[str, Any]]) -> dict[str, Any]:
+    for item in input_items:
+        content = item.get("content")
+        if item.get("role") == "system" and isinstance(content, str):
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError:
+                continue
+            candidates = parsed.get("candidates") if isinstance(parsed, dict) else None
+            if isinstance(candidates, list):
+                for candidate in candidates:
+                    if isinstance(candidate, dict):
+                        return candidate
+    raise AssertionError("ambient candidate not provided")
+
+
+def _ambient_interpretation_fixture(input_items: list[dict[str, Any]]) -> dict[str, Any]:
+    candidate = _first_ambient_candidate(input_items)
+    source_type = str(candidate["source_type"])
+    source_id = str(candidate["source_id"])
+    if source_type == "workspace_item":
+        observation = {
+            "candidate_id": candidate["candidate_id"],
+            "observation_key": "calendar-design-review",
+            "case_key": f"workspace-item:{source_id}",
+            "observation_type": "workspace_delta",
+            "subject": "Design review changed",
+            "summary": "The calendar design review changed.",
+            "payload": {"workspace_status": "active"},
+            "evidence": {"workspace_item_id": source_id},
+            "rationale": "The changed calendar event may affect planning.",
+        }
+    else:
+        observation = {
+            "candidate_id": candidate["candidate_id"],
+            "observation_key": "selected",
+            "case_key": f"{source_type}:{source_id}",
+            "observation_type": "job_state" if source_type == "job" else "ambient_event",
+            "subject": f"{source_type} needs deliberation",
+            "summary": "The ambient interpreter selected this candidate.",
+            "payload": {"source_type": source_type},
+            "evidence": {"job_id": source_id} if source_type == "job" else {"source_id": source_id},
+            "rationale": "The model selected this ambient candidate for proactive deliberation.",
+        }
+    return {
+        "observations": [observation],
+        "omitted": [],
+        "rationale": "One ambient candidate matters.",
+    }
+
+
+def _feedback_learning_fixture(context_bundle: dict[str, Any]) -> dict[str, Any]:
+    model_input = context_bundle.get("model_input")
+    feedback_context: dict[str, Any] = {}
+    if isinstance(model_input, list):
+        for item in model_input:
+            content = item.get("content") if isinstance(item, dict) else None
+            if not isinstance(content, str):
+                continue
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict) and isinstance(parsed.get("feedback"), dict):
+                feedback_context = parsed
+                break
+    raw_feedback = feedback_context.get("feedback") if isinstance(feedback_context, dict) else {}
+    feedback = raw_feedback if isinstance(raw_feedback, dict) else {}
+    raw_case = feedback_context.get("case") if isinstance(feedback_context, dict) else {}
+    case = raw_case if isinstance(raw_case, dict) else {}
+    return {
+        "learning_records": [
+            {
+                "record_type": "example",
+                "content": {
+                    "case_id": case.get("id"),
+                    "feedback_type": feedback.get("feedback_type"),
+                    "note": feedback.get("note"),
+                    "instruction": "Use this feedback as a proactive correction example.",
+                },
+            }
+        ]
+    }
 
 
 @dataclass
@@ -66,7 +162,29 @@ class ProactiveDecisionAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        del input_items, tools, history
+        del tools, history
+        if context_bundle.get("origin") == "ambient_interpretation":
+            return responses_message(
+                assistant_text=json.dumps(
+                    _ambient_interpretation_fixture(input_items), sort_keys=True
+                ),
+                provider=self.provider,
+                model=self.model,
+                provider_response_id="resp_ambient_interpretation_123",
+                input_tokens=32,
+                output_tokens=24,
+            )
+        if context_bundle.get("origin") == "feedback_learning":
+            return responses_message(
+                assistant_text=json.dumps(
+                    _feedback_learning_fixture(context_bundle), sort_keys=True
+                ),
+                provider=self.provider,
+                model=self.model,
+                provider_response_id="resp_feedback_learning_123",
+                input_tokens=32,
+                output_tokens=24,
+            )
         if context_bundle.get("origin") == "proactive":
             return responses_message(
                 assistant_text=json.dumps(self.decision, sort_keys=True),
@@ -170,7 +288,8 @@ def test_background_tasks_claim_retry_and_reap_are_durable_and_worker_safe(
     postgres_url: str,
 ) -> None:
     now = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
-    with _build_client(postgres_url, DurableWorkflowAdapter()) as client:
+    adapter = DurableWorkflowAdapter()
+    with _build_client(postgres_url, adapter) as client:
         with _session_factory(client)() as db:
             with db.begin():
                 first = enqueue_background_task(
@@ -230,7 +349,8 @@ def test_agency_event_ingress_is_signed_idempotent_and_rejects_conflicts(
         "payload": {"branch": "main"},
     }
 
-    with _build_client(postgres_url, DurableWorkflowAdapter()) as client:
+    adapter = DurableWorkflowAdapter()
+    with _build_client(postgres_url, adapter) as client:
         signed = _signed_agency_body(payload, secret=secret, timestamp=timestamp)
         first = client.post("/v1/agency/events", content=signed.body, headers=signed.headers)
         assert first.status_code == 202
@@ -271,7 +391,8 @@ def test_agency_event_worker_creates_job_event_and_proactive_case_once(
         "payload": {"artifact": "pr"},
     }
 
-    with _build_client(postgres_url, DurableWorkflowAdapter()) as client:
+    adapter = DurableWorkflowAdapter()
+    with _build_client(postgres_url, adapter) as client:
         signed = _signed_agency_body(payload, secret=secret, timestamp=timestamp)
         response = client.post("/v1/agency/events", content=signed.body, headers=signed.headers)
         assert response.status_code == 202
@@ -282,6 +403,7 @@ def test_agency_event_worker_creates_job_event_and_proactive_case_once(
                 session_factory=_session_factory(client),
                 settings=settings,
                 worker_id="worker-a",
+                model_adapter=adapter,
             )
             is True
         )
@@ -290,6 +412,7 @@ def test_agency_event_worker_creates_job_event_and_proactive_case_once(
                 session_factory=_session_factory(client),
                 settings=settings,
                 worker_id="worker-a",
+                model_adapter=adapter,
             )
             is True
         )
@@ -425,6 +548,12 @@ def test_google_calendar_sync_creates_workspace_state_and_proactive_case(
             settings=settings,
             worker_id="worker-sync",
         )
+        assert process_one_task(
+            session_factory=_session_factory(client),
+            settings=settings,
+            worker_id="worker-ambient",
+            model_adapter=DurableWorkflowAdapter(),
+        )
 
         sync_runs = client.get("/v1/sync-runs")
         assert sync_runs.status_code == 200
@@ -463,7 +592,7 @@ def test_google_calendar_sync_creates_workspace_state_and_proactive_case(
                 assert task_type == "proactive_deliberation_due"
 
 
-def test_proactive_derivation_deliberates_speaks_and_acknowledges_case_and_turn(
+def test_proactive_interpretation_deliberates_speaks_and_acknowledges_case_and_turn(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -486,10 +615,6 @@ def test_proactive_derivation_deliberates_speaks_and_acknowledges_case_and_turn(
 
     with _build_client(postgres_url, adapter) as client:
         _seed_job(client, job_id="job_proactive_ack", status="waiting_approval", now=now)
-
-        derive = client.post("/v1/proactive/observations/derive")
-        assert derive.status_code == 200
-
         settings = cast(Any, AppSettings)(_env_file=None)
         assert process_one_task(
             session_factory=_session_factory(client),
@@ -543,6 +668,32 @@ def test_proactive_derivation_deliberates_speaks_and_acknowledges_case_and_turn(
         assert decision["decision_type"] == "speak_now"
         assert decision["status"] == "executed"
         assert decision["user_visible_message"] == "Sir, you should review this approval now."
+
+        with _session_factory(client)() as db:
+            with db.begin():
+                judgment = (
+                    db.execute(
+                        text(
+                            "SELECT status, model, prompt_version, provider_response_id, "
+                            "parse_status, validation_status "
+                            "FROM ai_judgments "
+                            "WHERE judgment_type = 'proactive_deliberation' "
+                            "AND source_id = :case_id "
+                            "ORDER BY created_at DESC LIMIT 1"
+                        ),
+                        {"case_id": proactive_case["id"]},
+                    )
+                    .mappings()
+                    .one()
+                )
+                assert judgment == {
+                    "status": "succeeded",
+                    "model": "model.proactive-deliberation-v1",
+                    "prompt_version": "proactive-ai-deliberation-v1",
+                    "provider_response_id": "resp_proactive_deliberation_123",
+                    "parse_status": "parsed",
+                    "validation_status": "valid",
+                }
 
         validations = client.get(f"/v1/proactive/cases/{proactive_case['id']}/validations")
         assert validations.status_code == 200
@@ -613,8 +764,6 @@ def test_proactive_wait_decision_schedules_and_runs_durable_follow_up(
 
     with _build_client(postgres_url, adapter) as client:
         _seed_job(client, job_id="job_proactive_follow_up", status="running", now=now)
-        derive = client.post("/v1/proactive/observations/derive")
-        assert derive.status_code == 200
 
         settings = cast(Any, AppSettings)(_env_file=None)
         assert process_one_task(
@@ -701,8 +850,6 @@ def test_proactive_feedback_creates_durable_learning_record(
 
     with _build_client(postgres_url, adapter) as client:
         _seed_job(client, job_id="job_proactive_feedback", status="running", now=now)
-        derive = client.post("/v1/proactive/observations/derive")
-        assert derive.status_code == 200
 
         settings = cast(Any, AppSettings)(_env_file=None)
         assert process_one_task(
@@ -755,10 +902,25 @@ def test_proactive_feedback_creates_durable_learning_record(
             model_adapter=adapter,
         )
 
-        learning = client.get("/v1/proactive/learning-records")
-        assert learning.status_code == 200
-        record = learning.json()["learning_records"][0]
-        assert record["record_type"] == "example"
-        assert record["status"] == "active"
-        assert record["content"]["case_id"] == proactive_case["id"]
-        assert record["content"]["note"] == "not worth interrupting"
+        with _session_factory(client)() as db:
+            with db.begin():
+                record = (
+                    db.execute(
+                        text(
+                            "SELECT record_type, status, content, model, prompt_version, "
+                            "parse_status, validation_status "
+                            "FROM proactive_learning_records "
+                            "ORDER BY created_at DESC LIMIT 1"
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+                assert record["record_type"] == "example"
+                assert record["status"] == "active"
+                assert record["content"]["case_id"] == proactive_case["id"]
+                assert record["content"]["note"] == "not worth interrupting"
+                assert record["model"] == "model.proactive-deliberation-v1"
+                assert record["prompt_version"] == "proactive-feedback-learning-v1"
+                assert record["parse_status"] == "parsed"
+                assert record["validation_status"] == "valid"

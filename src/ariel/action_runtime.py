@@ -4,7 +4,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 import json
-import re
 from typing import Any, Literal
 
 from fastapi.encoders import jsonable_encoder
@@ -26,7 +25,6 @@ from ariel.capability_registry import (
 from ariel.executor import (
     ExecutionResult,
     append_turn_event,
-    build_assistant_action_appendix,
     execute_capability,
     next_turn_event_sequence,
     preflight_capability_execution,
@@ -36,7 +34,6 @@ from ariel.google_connector import (
     GOOGLE_READ_CAPABILITY_IDS,
     GoogleCapabilityExecutionResult,
     GoogleConnectorRuntime,
-    TypedAuthFailure,
 )
 from ariel.persistence import (
     ActionAttemptRecord,
@@ -81,6 +78,8 @@ class FunctionCallProcessingResult:
     assistant_sources: list[dict[str, Any]] = field(default_factory=list)
     silent_response: bool = False
     runtime_provenance: RuntimeProvenance | None = None
+    tool_result_interpreter_input: dict[str, Any] | None = None
+    tool_result_interpreter_output: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -292,8 +291,18 @@ def _taint_event_payload(
 
 _MAX_CITED_SOURCES = 4
 _MAX_SNIPPET_LENGTH = 320
-_NEWS_FRESHNESS_MAX_AGE = timedelta(hours=48)
-_MAX_CONFLICT_COMPONENT_TOKENS = 8
+_MAX_DIRECT_TOOL_OUTPUT_JSON_CHARS = 6_000
+_MAX_INTERPRETER_OUTPUT_JSON_CHARS = 16_000
+_MODALITY_HEAVY_VALUES = {"audio", "document", "image", "video"}
+_CONTRADICTION_SIGNAL_KEYS = {
+    "conflict",
+    "conflicts",
+    "conflicting_results",
+    "conflicting_sources",
+    "contradiction",
+    "contradictions",
+    "inconsistent_results",
+}
 _MAPS_RETRIEVAL_CAPABILITY_IDS = {"cap.maps.directions", "cap.maps.search_places"}
 _WEB_EXTRACT_RETRIEVAL_CAPABILITY_IDS = {"cap.web.extract"}
 _GROUNDED_RETRIEVAL_CAPABILITIES = {
@@ -304,14 +313,6 @@ _GROUNDED_RETRIEVAL_CAPABILITIES = {
     *_WEB_EXTRACT_RETRIEVAL_CAPABILITY_IDS,
     *ATTACHMENT_CAPABILITY_IDS,
     *GOOGLE_READ_CAPABILITY_IDS,
-}
-
-_TYPED_AUTH_FAILURE_CLASSES = {
-    "not_connected",
-    "consent_required",
-    "scope_missing",
-    "token_expired",
-    "access_revoked",
 }
 
 _TYPED_AUTH_RECOVERY: dict[str, str] = {
@@ -336,108 +337,6 @@ _TYPED_PROVIDER_RECOVERY: dict[str, str] = {
     "provider_unreachable": "Google could not be reached. Retry shortly.",
 }
 
-_TYPED_MAPS_RECOVERY: dict[str, str] = {
-    "provider_credentials_missing": (
-        "maps provider credentials are missing. ask your operator to configure encrypted server credentials."
-    ),
-    "provider_credentials_invalid": (
-        "maps provider credentials are invalid. ask your operator to rotate and re-encrypt credentials."
-    ),
-    "provider_timeout": "maps provider timed out. retry shortly.",
-    "provider_network_failure": "maps provider had a network failure. retry shortly.",
-    "provider_rate_limited": "maps provider rate limited this request. wait briefly, then retry.",
-    "provider_upstream_failure": "maps provider is degraded right now. retry shortly.",
-    "provider_permission_denied": (
-        "maps provider denied access. verify key restrictions and provider permissions."
-    ),
-    "provider_request_rejected": "maps provider rejected this request. verify inputs and retry.",
-    "provider_invalid_payload": "maps provider returned an invalid payload. retry shortly.",
-    "provider_unreachable": (
-        "maps provider endpoint is unreachable. ask your operator to verify endpoint configuration."
-    ),
-}
-
-
-_TYPED_WEB_EXTRACT_RECOVERY: dict[str, str] = {
-    "url_invalid": "provide a valid public url and retry (example: https://example.com/page).",
-    "url_scheme_unsupported": "use an http(s) url. non-http schemes are blocked.",
-    "url_destination_unsafe": (
-        "this destination is blocked by url safety policy. use a public internet host."
-    ),
-    "access_restricted": (
-        "the page is access-restricted. provide a publicly readable url or share exported text."
-    ),
-    "unsupported_format": (
-        "this page format is unsupported for text extraction. try a text-first page or exported text."
-    ),
-    "provider_timeout": "url extraction timed out. retry with a narrower page or section.",
-    "provider_network_failure": "url extraction had a network failure. retry shortly.",
-    "provider_rate_limited": "url extraction is rate limited. wait briefly, then retry.",
-    "provider_upstream_failure": "url extraction provider is degraded. retry shortly.",
-    "provider_request_rejected": "url extraction request was rejected. verify the url and retry.",
-    "provider_invalid_payload": "url extraction provider returned invalid data. retry shortly.",
-    "provider_unreachable": (
-        "url extraction provider endpoint is unreachable. ask your operator to verify endpoint config."
-    ),
-}
-
-_TYPED_ATTACHMENT_RECOVERY: dict[str, str] = {
-    "unsupported_type": "upload a text, PDF, image, or audio attachment.",
-    "too_large": "upload a smaller attachment or paste the relevant excerpt.",
-    "expired": "re-upload the attachment and ask again.",
-    "unavailable": "re-upload the attachment or verify Discord still exposes it.",
-    "unsafe": "the attachment was blocked by safety scanning.",
-    "scan_failed": "attachment scanning is unavailable; ask the operator to configure it.",
-    "extract_failed": "try a clearer export or paste the text directly.",
-    "provider_timeout": "retry shortly; extraction provider timed out.",
-    "provider_unavailable": "ask the operator to configure attachment extraction provider access.",
-    "resource_limit": "ask for a narrower read of the attachment.",
-}
-
-
-def _maps_recovery_hint_for_error(error: str) -> str | None:
-    typed = _TYPED_MAPS_RECOVERY.get(error)
-    if typed is not None:
-        return typed
-    if error.startswith("egress_destination_denied"):
-        return (
-            "maps egress policy blocked the configured destination before execution. "
-            "ask your operator to review the endpoint allowlist."
-        )
-    if error in {
-        "egress_preflight_missing_intent",
-        "egress_preflight_contract_invalid",
-        "egress_preflight_undeclared_intent",
-        "egress_destination_invalid",
-    }:
-        return (
-            "maps egress preflight contract is invalid. "
-            "ask your operator to review capability egress declarations."
-        )
-    return None
-
-
-def _web_extract_recovery_hint_for_error(error: str) -> str | None:
-    typed = _TYPED_WEB_EXTRACT_RECOVERY.get(error)
-    if typed is not None:
-        return typed
-    if error.startswith("egress_destination_denied"):
-        return (
-            "url extraction egress policy blocked the configured destination before execution. "
-            "ask your operator to review the endpoint allowlist."
-        )
-    if error in {
-        "egress_preflight_missing_intent",
-        "egress_preflight_contract_invalid",
-        "egress_preflight_undeclared_intent",
-        "egress_destination_invalid",
-    }:
-        return (
-            "url extraction egress preflight contract is invalid. "
-            "ask your operator to review capability egress declarations."
-        )
-    return None
-
 
 def _parse_rfc3339_timestamp(value: Any) -> datetime | None:
     if not isinstance(value, str):
@@ -459,6 +358,255 @@ def _truncate_snippet(value: str) -> str:
     if len(normalized) <= _MAX_SNIPPET_LENGTH:
         return normalized
     return normalized[:_MAX_SNIPPET_LENGTH].rstrip() + "..."
+
+
+def _json_payload_size(value: Any) -> int:
+    try:
+        return len(json.dumps(jsonable_encoder(value), sort_keys=True, separators=(",", ":")))
+    except (TypeError, ValueError):
+        return len(str(value))
+
+
+def _structured_signal_present(value: Any) -> bool:
+    if value is True:
+        return True
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, list | dict):
+        return bool(value)
+    return False
+
+
+def _has_contradiction_signal(value: Any) -> bool:
+    if isinstance(value, dict):
+        for key, nested_value in value.items():
+            if (
+                isinstance(key, str)
+                and key.strip().lower() in _CONTRADICTION_SIGNAL_KEYS
+                and _structured_signal_present(nested_value)
+            ):
+                return True
+            if _has_contradiction_signal(nested_value):
+                return True
+    if isinstance(value, list):
+        for nested_value in value:
+            if _has_contradiction_signal(nested_value):
+                return True
+    return False
+
+
+def _source_count(output_payload: Any) -> int:
+    if not isinstance(output_payload, dict):
+        return 0
+    raw_results = output_payload.get("results")
+    if not isinstance(raw_results, list):
+        return 0
+    return sum(1 for item in raw_results if isinstance(item, dict))
+
+
+def _has_modality_heavy_output(output_payload: Any) -> bool:
+    if not isinstance(output_payload, dict):
+        return False
+    modality = output_payload.get("modality")
+    if isinstance(modality, str) and modality.strip().lower() in _MODALITY_HEAVY_VALUES:
+        return True
+    blocks = output_payload.get("blocks")
+    if not isinstance(blocks, list):
+        return False
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        kind = block.get("kind")
+        if isinstance(kind, str) and kind.strip().lower() not in {"", "text"}:
+            return True
+    return False
+
+
+def _tool_result_interpretation_reason_codes(output_payload: Any) -> list[str]:
+    reason_codes: list[str] = []
+    if _json_payload_size(output_payload) > _MAX_DIRECT_TOOL_OUTPUT_JSON_CHARS:
+        reason_codes.append("large")
+    if _source_count(output_payload) > 1:
+        reason_codes.append("multi_source")
+    if _has_contradiction_signal(output_payload):
+        reason_codes.append("contradictory")
+    if _has_modality_heavy_output(output_payload):
+        reason_codes.append("modality_heavy")
+    return reason_codes
+
+
+def _bounded_interpreter_output(output_payload: Any) -> tuple[Any, bool]:
+    encoded = jsonable_encoder(output_payload)
+    try:
+        rendered = json.dumps(encoded, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        rendered = str(encoded)
+    if len(rendered) <= _MAX_INTERPRETER_OUTPUT_JSON_CHARS:
+        return encoded, False
+    return (
+        {
+            "bounded": True,
+            "original_json_chars": len(rendered),
+            "json_prefix": rendered[:_MAX_INTERPRETER_OUTPUT_JSON_CHARS],
+        },
+        True,
+    )
+
+
+def _append_reason_codes(
+    existing: dict[str, list[str]],
+    *,
+    action_attempt_id: str,
+    reason_codes: list[str],
+) -> None:
+    if not reason_codes:
+        return
+    current = existing.setdefault(action_attempt_id, [])
+    for reason_code in reason_codes:
+        if reason_code not in current:
+            current.append(reason_code)
+
+
+def _build_tool_result_interpreter_input(
+    *,
+    session_id: str,
+    turn_id: str,
+    action_attempts: list[ActionAttemptRecord],
+    reason_codes_by_attempt_id: dict[str, list[str]],
+    call_ids_by_attempt_id: dict[str, str],
+    taint_by_attempt_id: dict[str, dict[str, Any]],
+    retrieval_sources: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    audited_tool_outputs: list[dict[str, Any]] = []
+    output_refs: list[str] = []
+    capability_ids: list[str] = []
+    omitted_output_refs: list[dict[str, Any]] = []
+    typed_tool_failures: list[dict[str, Any]] = []
+
+    for action_attempt in action_attempts:
+        if action_attempt.status in {"failed", "rejected", "denied", "expired"}:
+            failure_reason = action_attempt.execution_error or action_attempt.policy_reason
+            typed_tool_failures.append(
+                {
+                    "action_attempt_id": action_attempt.id,
+                    "capability_id": action_attempt.capability_id,
+                    "status": action_attempt.status,
+                    "failure_code": failure_reason or action_attempt.status,
+                }
+            )
+
+        reason_codes = reason_codes_by_attempt_id.get(action_attempt.id)
+        if not reason_codes:
+            continue
+        output_refs.append(action_attempt.id)
+        if action_attempt.capability_id not in capability_ids:
+            capability_ids.append(action_attempt.capability_id)
+        bounded_output, truncated = _bounded_interpreter_output(action_attempt.execution_output)
+        if truncated:
+            omitted_output_refs.append(
+                {
+                    "output_ref": action_attempt.id,
+                    "reason": "interpreter_input_budget",
+                }
+            )
+        audited_tool_outputs.append(
+            {
+                "output_ref": action_attempt.id,
+                "action_attempt_id": action_attempt.id,
+                "call_id": call_ids_by_attempt_id.get(action_attempt.id),
+                "capability_id": action_attempt.capability_id,
+                "status": action_attempt.status,
+                "reason_codes": reason_codes,
+                "output": bounded_output,
+                "taint": taint_by_attempt_id.get(action_attempt.id),
+                "provenance": {
+                    "capability_version": action_attempt.capability_version,
+                    "capability_contract_hash": action_attempt.capability_contract_hash,
+                },
+            }
+        )
+
+    if not audited_tool_outputs:
+        return None
+
+    citation_refs = list(retrieval_sources)
+    artifact_refs = [
+        source["artifact_id"]
+        for source in retrieval_sources
+        if isinstance(source.get("artifact_id"), str)
+    ]
+    reason_codes = sorted(
+        {
+            reason_code
+            for attempt_reason_codes in reason_codes_by_attempt_id.values()
+            for reason_code in attempt_reason_codes
+        }
+    )
+    return {
+        "judgment_type": "tool_result_interpretation",
+        "source_type": "turn",
+        "source_id": turn_id,
+        "session_id": session_id,
+        "action_attempt_ids": output_refs,
+        "capability_ids": capability_ids,
+        "audited_tool_outputs": audited_tool_outputs,
+        "artifact_refs": artifact_refs,
+        "citation_refs": citation_refs,
+        "taint": [taint_by_attempt_id[item] for item in output_refs if item in taint_by_attempt_id],
+        "provenance": {
+            "turn_id": turn_id,
+            "action_attempt_ids": output_refs,
+        },
+        "typed_tool_failures": typed_tool_failures,
+        "omitted_output_refs": omitted_output_refs,
+        "reason_codes": reason_codes,
+        "budgets": {
+            "max_direct_tool_output_json_chars": _MAX_DIRECT_TOOL_OUTPUT_JSON_CHARS,
+            "max_interpreter_output_json_chars": _MAX_INTERPRETER_OUTPUT_JSON_CHARS,
+        },
+        "output_contract": {
+            "findings": [],
+            "contradictions": [],
+            "uncertainty": [],
+            "selected_output_refs": [],
+            "omitted_output_refs": [],
+            "citation_refs": [],
+            "artifact_refs": [],
+            "recommended_next_evidence": [],
+            "confidence": None,
+        },
+    }
+
+
+def _redact_function_outputs_requiring_interpretation(
+    *,
+    function_call_outputs: list[dict[str, Any]],
+    reason_codes_by_call_id: dict[str, dict[str, Any]],
+) -> None:
+    for function_call_output in function_call_outputs:
+        call_id = function_call_output.get("call_id")
+        if not isinstance(call_id, str):
+            continue
+        interpreter_route = reason_codes_by_call_id.get(call_id)
+        if interpreter_route is None:
+            continue
+        function_call_output["output"] = json.dumps(
+            jsonable_encoder(
+                {
+                    "status": "succeeded",
+                    "capability_id": interpreter_route["capability_id"],
+                    "action_attempt_id": interpreter_route["action_attempt_id"],
+                    "tool_result_interpreter": {
+                        "required": True,
+                        "reason_codes": interpreter_route["reason_codes"],
+                        "output_ref": interpreter_route["action_attempt_id"],
+                        "output": None,
+                    },
+                }
+            ),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
 
 def _extract_search_source_candidates(
@@ -514,10 +662,8 @@ def _persist_retrieval_artifacts(
     candidates: list[GroundedSourceCandidate],
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
-) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
+) -> list[dict[str, Any]]:
     assistant_sources: list[dict[str, Any]] = []
-    citation_snippets: list[str] = []
-    source_metadata: list[dict[str, Any]] = []
     for candidate in candidates:
         now = now_fn()
         artifact = ArtifactRecord(
@@ -547,517 +693,7 @@ def _persist_retrieval_artifacts(
                 ),
             }
         )
-        citation_snippets.append(candidate.snippet)
-        source_metadata.append(
-            {
-                "capability_id": capability_id,
-                "published_at": candidate.published_at,
-            }
-        )
-    return assistant_sources, citation_snippets, source_metadata
-
-
-def _normalize_retrieval_errors(retrieval_errors: list[str]) -> list[str]:
-    normalized_errors: list[str] = []
-    for error in retrieval_errors:
-        lowered = error.lower()
-        if "timeout" in lowered or "timed out" in lowered:
-            normalized_errors.append("timeout")
-            continue
-        if "rate limit" in lowered:
-            normalized_errors.append("rate_limited")
-            continue
-        normalized_errors.append(error)
-    return normalized_errors
-
-
-def _normalize_claim_component(value: str) -> str:
-    normalized = re.sub(r"[^a-z0-9\s]", " ", value.lower())
-    return " ".join(normalized.split())
-
-
-def _is_usable_claim_component(value: str) -> bool:
-    tokens = value.split()
-    return 0 < len(tokens) <= _MAX_CONFLICT_COMPONENT_TOKENS
-
-
-def _extract_claim_signature(snippet: str) -> tuple[str, str] | None:
-    if not isinstance(snippet, str):
-        return None
-    normalized_snippet = " ".join(snippet.split())
-    if not normalized_snippet:
-        return None
-
-    claim_of_match = re.search(
-        r"\b(?:the\s+)?(?P<attribute>[a-zA-Z][a-zA-Z0-9\s'-]{0,40}?)\s+of\s+"
-        r"(?P<entity>[a-zA-Z][a-zA-Z0-9\s'-]{0,40}?)\s+is\s+"
-        r"(?P<value>[a-zA-Z0-9][a-zA-Z0-9\s'-]{0,40})\b",
-        normalized_snippet,
-    )
-    if claim_of_match is not None:
-        attribute = _normalize_claim_component(claim_of_match.group("attribute"))
-        entity = _normalize_claim_component(claim_of_match.group("entity"))
-        value = _normalize_claim_component(claim_of_match.group("value"))
-        if (
-            _is_usable_claim_component(attribute)
-            and _is_usable_claim_component(entity)
-            and _is_usable_claim_component(value)
-        ):
-            return f"{attribute} of {entity}", value
-
-    claim_possessive_match = re.search(
-        r"\b(?P<entity>[a-zA-Z][a-zA-Z0-9\s'-]{0,40}?)'s\s+"
-        r"(?P<attribute>[a-zA-Z][a-zA-Z0-9\s'-]{0,40}?)\s+is\s+"
-        r"(?P<value>[a-zA-Z0-9][a-zA-Z0-9\s'-]{0,40})\b",
-        normalized_snippet,
-    )
-    if claim_possessive_match is None:
-        return None
-
-    attribute = _normalize_claim_component(claim_possessive_match.group("attribute"))
-    entity = _normalize_claim_component(claim_possessive_match.group("entity"))
-    value = _normalize_claim_component(claim_possessive_match.group("value"))
-    if (
-        _is_usable_claim_component(attribute)
-        and _is_usable_claim_component(entity)
-        and _is_usable_claim_component(value)
-    ):
-        return f"{attribute} of {entity}", value
-    return None
-
-
-def _conflicting_claim_keys(citation_snippets: list[str]) -> list[str]:
-    observed_values_by_claim: dict[str, set[str]] = {}
-    for snippet in citation_snippets:
-        claim_signature = _extract_claim_signature(snippet)
-        if claim_signature is None:
-            continue
-        claim_key, claim_value = claim_signature
-        values = observed_values_by_claim.setdefault(claim_key, set())
-        values.add(claim_value)
-    conflicting_claims = [
-        claim_key for claim_key, values in observed_values_by_claim.items() if len(values) > 1
-    ]
-    conflicting_claims.sort()
-    return conflicting_claims
-
-
-def _synthesize_grounded_retrieval_answer(
-    *,
-    collected_sources: list[dict[str, Any]],
-    citation_snippets: list[str],
-    retrieval_errors: list[str],
-) -> tuple[str, list[dict[str, Any]]]:
-    normalized_errors = _normalize_retrieval_errors(retrieval_errors)
-
-    if not collected_sources:
-        if normalized_errors:
-            primary_error = normalized_errors[0]
-            return (
-                "i'm uncertain because web retrieval failed "
-                f"({primary_error}). please retry with a narrower query or try again shortly.",
-                [],
-            )
-        return (
-            "i'm uncertain because i could not find enough external evidence to support this claim. "
-            "please provide a more specific query or share a source to verify.",
-            [],
-        )
-
-    bounded_snippets = citation_snippets[: len(collected_sources)]
-    conflicting_claims = _conflicting_claim_keys(bounded_snippets)
-    citation_lines: list[str] = []
-    for index, snippet in enumerate(bounded_snippets, start=1):
-        normalized_snippet = snippet.strip()
-        if not normalized_snippet:
-            continue
-        citation_lines.append(f"{normalized_snippet} [{index}]")
-
-    if conflicting_claims:
-        conflict_details = (
-            f" ({conflicting_claims[0]})" if len(conflicting_claims) == 1 else " (multiple claims)"
-        )
-        evidence_summary = (
-            " ".join(citation_lines) if citation_lines else "cited evidence is inconsistent."
-        )
-        message = (
-            "i'm uncertain because cited sources conflict on the same claim"
-            f"{conflict_details}. {evidence_summary} "
-            "please retry with a narrower query, add a timeframe, or share a trusted source."
-        )
-        if normalized_errors:
-            message = (
-                f"{message} some retrieval attempts also failed "
-                f"({'; '.join(normalized_errors[:2])})."
-            )
-        return message, collected_sources
-
-    if not citation_lines:
-        citation_lines.append("i found grounded external evidence for this request. [1]")
-
-    message = " ".join(citation_lines)
-    if normalized_errors:
-        message = (
-            f"{message} partial results: some retrieval attempts failed "
-            f"({'; '.join(normalized_errors[:2])}). please retry with a narrower query."
-        )
-    return message, collected_sources
-
-
-def _synthesize_news_retrieval_answer(
-    *,
-    collected_sources: list[dict[str, Any]],
-    citation_snippets: list[str],
-    retrieval_errors: list[str],
-    source_metadata: list[dict[str, Any]],
-    now_fn: Callable[[], datetime],
-) -> tuple[str, list[dict[str, Any]]]:
-    message, assistant_sources = _synthesize_grounded_retrieval_answer(
-        collected_sources=collected_sources,
-        citation_snippets=citation_snippets,
-        retrieval_errors=retrieval_errors,
-    )
-    if not assistant_sources:
-        return message, assistant_sources
-
-    stale_count = 0
-    missing_count = 0
-    ambiguous_count = 0
-    now = now_fn()
-    for item in source_metadata:
-        capability_id = item.get("capability_id")
-        if capability_id != "cap.search.news":
-            continue
-        published_at = item.get("published_at")
-        if published_at is None:
-            missing_count += 1
-            continue
-        if not isinstance(published_at, datetime):
-            ambiguous_count += 1
-            continue
-        age = now - published_at
-        if age < timedelta(0):
-            ambiguous_count += 1
-            continue
-        if age > _NEWS_FRESHNESS_MAX_AGE:
-            stale_count += 1
-
-    freshness_notes: list[str] = []
-    if stale_count:
-        freshness_notes.append(
-            f"{stale_count} cited item(s) are stale (> {int(_NEWS_FRESHNESS_MAX_AGE.total_seconds() // 3600)}h)"
-        )
-    if missing_count:
-        freshness_notes.append(f"{missing_count} cited item(s) have missing publication timing")
-    if ambiguous_count:
-        freshness_notes.append(f"{ambiguous_count} cited item(s) have ambiguous publication timing")
-    if freshness_notes:
-        message = f"{message} freshness note: {'; '.join(freshness_notes)}."
-    return message, assistant_sources
-
-
-def _synthesize_weather_retrieval_answer(
-    *,
-    collected_sources: list[dict[str, Any]],
-    citation_snippets: list[str],
-    retrieval_errors: list[str],
-    weather_outputs: list[dict[str, Any]],
-) -> tuple[str, list[dict[str, Any]]]:
-    normalized_errors = _normalize_retrieval_errors(retrieval_errors)
-    if not collected_sources:
-        if any("weather_location_required" in error for error in normalized_errors):
-            return (
-                "i need your weather location before i can answer. "
-                "tell me a city or region (for example: weather in seattle today).",
-                [],
-            )
-        if normalized_errors:
-            primary_error = normalized_errors[0]
-            return (
-                "i'm uncertain because weather retrieval failed "
-                f"({primary_error}). please retry with a specific location or try again shortly.",
-                [],
-            )
-        return (
-            "i'm uncertain because i could not retrieve weather evidence. "
-            "please share a location and timeframe to retry.",
-            [],
-        )
-
-    first_output = weather_outputs[0] if weather_outputs else {}
-    location_raw = first_output.get("location")
-    timeframe_raw = first_output.get("timeframe")
-    forecast_timestamp_raw = first_output.get("forecast_timestamp")
-    location = (
-        location_raw.strip()
-        if isinstance(location_raw, str) and location_raw.strip()
-        else "your location"
-    )
-    timeframe = (
-        timeframe_raw.strip() if isinstance(timeframe_raw, str) and timeframe_raw.strip() else "now"
-    )
-    forecast_timestamp = (
-        forecast_timestamp_raw.strip()
-        if isinstance(forecast_timestamp_raw, str) and forecast_timestamp_raw.strip()
-        else "timestamp unavailable"
-    )
-    grounded_message, _ = _synthesize_grounded_retrieval_answer(
-        collected_sources=collected_sources,
-        citation_snippets=citation_snippets,
-        retrieval_errors=retrieval_errors,
-    )
-    message = f"weather for {location} ({timeframe}) at {forecast_timestamp}. {grounded_message}"
-    return message, collected_sources
-
-
-def _synthesize_maps_retrieval_answer(
-    *,
-    collected_sources: list[dict[str, Any]],
-    citation_snippets: list[str],
-    retrieval_errors: list[str],
-    maps_outputs: list[dict[str, Any]],
-) -> tuple[str, list[dict[str, Any]]]:
-    raw_errors = list(retrieval_errors)
-    normalized_errors = _normalize_retrieval_errors(raw_errors)
-    if not collected_sources:
-        if any("maps_origin_required" in error for error in raw_errors):
-            return (
-                "i need an explicit origin before i can get directions. "
-                "i cannot infer your location from device or ip signals.",
-                [],
-            )
-        if any("maps_destination_required" in error for error in raw_errors):
-            return (
-                "i need an explicit destination before i can get directions. "
-                "i cannot infer your location from device or ip signals.",
-                [],
-            )
-        if any("maps_location_context_required" in error for error in raw_errors):
-            return (
-                "i need explicit location context for nearby-place search. "
-                "i cannot infer location from device or ip signals.",
-                [],
-            )
-        for candidate in raw_errors:
-            typed_recovery = _maps_recovery_hint_for_error(candidate)
-            if typed_recovery is not None:
-                failure_surface = (
-                    "maps runtime failure"
-                    if candidate.startswith("egress_")
-                    else "maps provider failure"
-                )
-                return f"{failure_surface} ({candidate}). {typed_recovery}", []
-        if normalized_errors:
-            primary_error = normalized_errors[0]
-            return (
-                "i'm uncertain because maps retrieval failed "
-                f"({primary_error}). retry with explicit route/place context.",
-                [],
-            )
-        return (
-            "i'm uncertain because i could not retrieve maps evidence. "
-            "share explicit route fields or nearby-place location context to retry.",
-            [],
-        )
-
-    grounded_message, _ = _synthesize_grounded_retrieval_answer(
-        collected_sources=collected_sources,
-        citation_snippets=citation_snippets,
-        retrieval_errors=retrieval_errors,
-    )
-    first_output = maps_outputs[0] if maps_outputs else {}
-    uncertainty_raw = first_output.get("uncertainty")
-    if isinstance(uncertainty_raw, str) and uncertainty_raw == "insufficient_evidence":
-        grounded_message = (
-            f"{grounded_message} uncertainty: map evidence is limited; "
-            "please refine the query or provide more specific location context."
-        )
-    return grounded_message, collected_sources
-
-
-def _synthesize_web_extract_retrieval_answer(
-    *,
-    collected_sources: list[dict[str, Any]],
-    citation_snippets: list[str],
-    retrieval_errors: list[str],
-    web_extract_outputs: list[dict[str, Any]],
-) -> tuple[str, list[dict[str, Any]]]:
-    raw_errors = list(retrieval_errors)
-    normalized_errors = _normalize_retrieval_errors(raw_errors)
-    if not collected_sources:
-        for candidate in raw_errors:
-            typed_recovery = _web_extract_recovery_hint_for_error(candidate)
-            if typed_recovery is not None:
-                return f"url extraction failure ({candidate}). {typed_recovery}", []
-        if normalized_errors:
-            return (
-                "i'm uncertain because url extraction failed "
-                f"({normalized_errors[0]}). provide a public http(s) url and retry.",
-                [],
-            )
-        return (
-            "i'm uncertain because i could not extract enough url evidence. "
-            "provide a public url and retry with narrower scope.",
-            [],
-        )
-
-    grounded_message, _ = _synthesize_grounded_retrieval_answer(
-        collected_sources=collected_sources,
-        citation_snippets=citation_snippets,
-        retrieval_errors=retrieval_errors,
-    )
-    first_output = web_extract_outputs[0] if web_extract_outputs else {}
-    extract_outcome_raw = first_output.get("extract_outcome")
-    extract_outcome = extract_outcome_raw if isinstance(extract_outcome_raw, dict) else {}
-    outcome_status = extract_outcome.get("status")
-    if isinstance(outcome_status, str) and outcome_status == "partial":
-        recovery_raw = extract_outcome.get("recovery")
-        recovery = (
-            recovery_raw.strip()
-            if isinstance(recovery_raw, str) and recovery_raw.strip()
-            else "narrow scope to a specific section and retry."
-        )
-        grounded_message = (
-            f"{grounded_message} partial coverage: extraction was truncated. {recovery}"
-        )
-    return grounded_message, collected_sources
-
-
-def _synthesize_attachment_read_answer(
-    *,
-    collected_sources: list[dict[str, Any]],
-    citation_snippets: list[str],
-    retrieval_errors: list[str],
-    attachment_outputs: list[dict[str, Any]],
-) -> tuple[str, list[dict[str, Any]]]:
-    for output in attachment_outputs:
-        read_outcome_raw = output.get("read_outcome")
-        read_outcome = read_outcome_raw if isinstance(read_outcome_raw, dict) else {}
-        status_raw = read_outcome.get("status")
-        if not isinstance(status_raw, str) or status_raw == "ok":
-            continue
-        recovery = _TYPED_ATTACHMENT_RECOVERY.get(
-            status_raw,
-            "retry with a different attachment.",
-        )
-        return f"attachment read failed ({status_raw}). {recovery}", []
-
-    if not collected_sources:
-        if retrieval_errors:
-            return (
-                "i'm uncertain because attachment reading failed "
-                f"({retrieval_errors[0]}). re-upload the attachment or retry.",
-                [],
-            )
-        return (
-            "i'm uncertain because i could not read enough attachment content. "
-            "re-upload the attachment or paste the relevant text.",
-            [],
-        )
-
-    bounded_snippets = citation_snippets[: len(collected_sources)]
-    rendered_snippets: list[str] = []
-    for index, snippet in enumerate(bounded_snippets, start=1):
-        normalized = snippet.strip()
-        if not normalized:
-            continue
-        rendered_snippets.append(f"{normalized} [{index}]")
-    if not rendered_snippets:
-        rendered_snippets.append("attachment content was read. [1]")
-    return f"attachment content: {' '.join(rendered_snippets)}", collected_sources
-
-
-def _synthesize_google_read_answer(
-    *,
-    collected_sources: list[dict[str, Any]],
-    citation_snippets: list[str],
-    retrieval_errors: list[str],
-    retrieval_capability_ids: set[str],
-    google_outputs: list[dict[str, Any]],
-    google_auth_failures: list[TypedAuthFailure],
-) -> tuple[str, list[dict[str, Any]]]:
-    if google_auth_failures:
-        first_failure = google_auth_failures[0]
-        return (
-            f"google connector auth failure ({first_failure.failure_class}). "
-            f"{first_failure.recovery}",
-            [],
-        )
-
-    for candidate in retrieval_errors:
-        if candidate in _TYPED_AUTH_FAILURE_CLASSES:
-            recovery = _TYPED_AUTH_RECOVERY.get(candidate, "Reconnect Google and retry.")
-            return (
-                f"google connector auth failure ({candidate}). {recovery}",
-                [],
-            )
-        typed_provider_recovery = _TYPED_PROVIDER_RECOVERY.get(candidate)
-        if typed_provider_recovery is not None:
-            return (
-                f"google workspace provider failure ({candidate}). {typed_provider_recovery}",
-                [],
-            )
-
-    if not collected_sources:
-        if retrieval_errors:
-            return (
-                "i could not retrieve google workspace data. "
-                f"failure: {retrieval_errors[0]}. reconnect google and retry.",
-                [],
-            )
-        return (
-            "i could not retrieve google workspace data. reconnect google and retry.",
-            [],
-        )
-
-    if retrieval_capability_ids == {"cap.calendar.list"}:
-        prefix = "schedule context:"
-    elif retrieval_capability_ids == {"cap.calendar.propose_slots"}:
-        prefix = "slot options:"
-    elif retrieval_capability_ids.issubset({"cap.email.search", "cap.email.read"}):
-        prefix = "email results:"
-    elif retrieval_capability_ids.issubset({"cap.drive.search", "cap.drive.read"}):
-        prefix = "drive results:"
-    else:
-        prefix = "google workspace results:"
-
-    bounded_snippets = citation_snippets[: len(collected_sources)]
-    rendered_snippets: list[str] = []
-    for index, snippet in enumerate(bounded_snippets, start=1):
-        normalized = snippet.strip()
-        if not normalized:
-            continue
-        rendered_snippets.append(f"{normalized} [{index}]")
-    if not rendered_snippets:
-        rendered_snippets.append("results available. [1]")
-
-    message = f"{prefix} {' '.join(rendered_snippets)}"
-
-    for output in google_outputs:
-        attendee_intersection_used = output.get("attendee_intersection_used")
-        if attendee_intersection_used is not False:
-            continue
-        recovery_hint_raw = output.get("attendee_recovery_hint")
-        recovery_hint = (
-            recovery_hint_raw.strip()
-            if isinstance(recovery_hint_raw, str) and recovery_hint_raw.strip()
-            else (
-                "Reconnect Google and grant attendee free/busy scope to include "
-                "attendee intersection."
-            )
-        )
-        message = (
-            f"{message} attendee availability was unavailable, so planning used "
-            f"user-calendar-only mode. {recovery_hint}"
-        )
-        break
-
-    non_typed_errors = [
-        item for item in retrieval_errors if item not in _TYPED_AUTH_FAILURE_CLASSES
-    ]
-    if non_typed_errors:
-        message = f"{message} partial results: {non_typed_errors[0]}. retry with narrower input."
-    return message, collected_sources
+    return assistant_sources
 
 
 def _response_function_call_output(*, call_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1094,17 +730,12 @@ def process_response_function_calls(
     retrieval_requested = False
     retrieval_errors: list[str] = []
     retrieval_sources: list[dict[str, Any]] = []
-    retrieval_snippets: list[str] = []
-    retrieval_source_metadata: list[dict[str, Any]] = []
     retrieval_capability_ids: set[str] = set()
-    weather_outputs: list[dict[str, Any]] = []
-    maps_outputs: list[dict[str, Any]] = []
-    web_extract_outputs: list[dict[str, Any]] = []
-    google_outputs: list[dict[str, Any]] = []
-    google_auth_failures: list[TypedAuthFailure] = []
-    attachment_outputs: list[dict[str, Any]] = []
     result_runtime_provenance: RuntimeProvenance | None = None
     silent_response = False
+    call_ids_by_attempt_id: dict[str, str] = {}
+    taint_by_attempt_id: dict[str, dict[str, Any]] = {}
+    interpreter_reason_codes_by_attempt_id: dict[str, list[str]] = {}
 
     function_calls = function_calls_raw if isinstance(function_calls_raw, list) else []
     for function_call_index, function_call_raw in enumerate(function_calls, start=1):
@@ -1120,8 +751,6 @@ def process_response_function_calls(
         is_attachment_capability_call = capability_id in ATTACHMENT_CAPABILITY_IDS
         is_retrieval_call = capability_id in _GROUNDED_RETRIEVAL_CAPABILITIES
         is_weather_forecast_call = capability_id == "cap.weather.forecast"
-        is_maps_retrieval_call = capability_id in _MAPS_RETRIEVAL_CAPABILITY_IDS
-        is_web_extract_retrieval_call = capability_id in _WEB_EXTRACT_RETRIEVAL_CAPABILITY_IDS
         if is_retrieval_call:
             retrieval_requested = True
             retrieval_capability_ids.add(capability_id)
@@ -1203,6 +832,9 @@ def process_response_function_calls(
         db.add(action_attempt)
         db.flush()
         created_action_attempts.append(action_attempt)
+        if call_id:
+            call_ids_by_attempt_id[action_attempt.id] = call_id
+        taint_by_attempt_id[action_attempt.id] = taint_payload
         add_event(
             "evt.action.proposed",
             {
@@ -1543,15 +1175,12 @@ def process_response_function_calls(
                 and google_execution_result.output is not None
             ):
                 execution_result = google_execution_result
-                google_outputs.append(google_execution_result.output)
             else:
                 error_reason = (
                     google_execution_result.auth_failure.failure_class
                     if google_execution_result.auth_failure is not None
                     else (google_execution_result.error or "execution_output_missing")
                 )
-                if google_execution_result.auth_failure is not None:
-                    google_auth_failures.append(google_execution_result.auth_failure)
                 if call_id:
                     function_call_outputs.append(
                         _response_function_call_output(
@@ -1627,6 +1256,11 @@ def process_response_function_calls(
             action_attempt.execution_error = None
             action_attempt.status = "succeeded"
             action_attempt.updated_at = now_fn()
+            _append_reason_codes(
+                interpreter_reason_codes_by_attempt_id,
+                action_attempt_id=action_attempt.id,
+                reason_codes=_tool_result_interpretation_reason_codes(execution_result.output),
+            )
             if is_discord_capability_call:
                 silent_response = True
             else:
@@ -1649,7 +1283,6 @@ def process_response_function_calls(
                 )
             if is_retrieval_call:
                 if is_attachment_capability_call:
-                    attachment_outputs.append(execution_result.output)
                     read_outcome_raw = execution_result.output.get("read_outcome")
                     read_outcome = read_outcome_raw if isinstance(read_outcome_raw, dict) else {}
                     read_status = read_outcome.get("status")
@@ -1672,11 +1305,7 @@ def process_response_function_calls(
                         now_fn=now_fn,
                     )
                     if candidates:
-                        (
-                            persisted_sources,
-                            persisted_snippets,
-                            persisted_metadata,
-                        ) = _persist_retrieval_artifacts(
+                        persisted_sources = _persist_retrieval_artifacts(
                             db=db,
                             session_id=session_id,
                             turn_id=turn.id,
@@ -1687,16 +1316,8 @@ def process_response_function_calls(
                             new_id_fn=new_id_fn,
                         )
                         retrieval_sources.extend(persisted_sources)
-                        retrieval_snippets.extend(persisted_snippets)
-                        retrieval_source_metadata.extend(persisted_metadata)
                     else:
                         retrieval_errors.append("insufficient_evidence")
-                if is_weather_forecast_call:
-                    weather_outputs.append(execution_result.output)
-                if is_maps_retrieval_call:
-                    maps_outputs.append(execution_result.output)
-                if is_web_extract_retrieval_call:
-                    web_extract_outputs.append(execution_result.output)
             add_event(
                 "evt.action.execution.succeeded",
                 {
@@ -1734,74 +1355,106 @@ def process_response_function_calls(
             },
         )
 
-    assistant_sources: list[dict[str, Any]]
+    if len(retrieval_sources) > 1:
+        for action_attempt in created_action_attempts:
+            if (
+                action_attempt.status == "succeeded"
+                and action_attempt.capability_id in _GROUNDED_RETRIEVAL_CAPABILITIES
+            ):
+                _append_reason_codes(
+                    interpreter_reason_codes_by_attempt_id,
+                    action_attempt_id=action_attempt.id,
+                    reason_codes=["multi_source"],
+                )
+
+    tool_result_interpreter_input = _build_tool_result_interpreter_input(
+        session_id=session_id,
+        turn_id=turn.id,
+        action_attempts=created_action_attempts,
+        reason_codes_by_attempt_id=interpreter_reason_codes_by_attempt_id,
+        call_ids_by_attempt_id=call_ids_by_attempt_id,
+        taint_by_attempt_id=taint_by_attempt_id,
+        retrieval_sources=retrieval_sources,
+    )
+    tool_result_interpreter_output: dict[str, Any] | None = None
+    if tool_result_interpreter_input is not None:
+        reason_codes_by_call_id: dict[str, dict[str, Any]] = {}
+        for action_attempt in created_action_attempts:
+            output_call_id = call_ids_by_attempt_id.get(action_attempt.id)
+            reason_codes = interpreter_reason_codes_by_attempt_id.get(action_attempt.id)
+            if output_call_id is None or not reason_codes:
+                continue
+            reason_codes_by_call_id[output_call_id] = {
+                "action_attempt_id": action_attempt.id,
+                "capability_id": action_attempt.capability_id,
+                "reason_codes": reason_codes,
+            }
+        _redact_function_outputs_requiring_interpretation(
+            function_call_outputs=function_call_outputs,
+            reason_codes_by_call_id=reason_codes_by_call_id,
+        )
+
     if silent_response:
         final_assistant_message = ""
         assistant_sources = []
-    elif retrieval_requested:
-        if retrieval_capability_ids and retrieval_capability_ids.issubset(
-            GOOGLE_READ_CAPABILITY_IDS
-        ):
-            final_assistant_message, assistant_sources = _synthesize_google_read_answer(
-                collected_sources=retrieval_sources,
-                citation_snippets=retrieval_snippets,
-                retrieval_errors=retrieval_errors,
-                retrieval_capability_ids=retrieval_capability_ids,
-                google_outputs=google_outputs,
-                google_auth_failures=google_auth_failures,
-            )
-        elif retrieval_capability_ids == {"cap.search.news"}:
-            final_assistant_message, assistant_sources = _synthesize_news_retrieval_answer(
-                collected_sources=retrieval_sources,
-                citation_snippets=retrieval_snippets,
-                retrieval_errors=retrieval_errors,
-                source_metadata=retrieval_source_metadata,
-                now_fn=now_fn,
-            )
-        elif retrieval_capability_ids.issubset(_MAPS_RETRIEVAL_CAPABILITY_IDS):
-            final_assistant_message, assistant_sources = _synthesize_maps_retrieval_answer(
-                collected_sources=retrieval_sources,
-                citation_snippets=retrieval_snippets,
-                retrieval_errors=retrieval_errors,
-                maps_outputs=maps_outputs,
-            )
-        elif retrieval_capability_ids.issubset(_WEB_EXTRACT_RETRIEVAL_CAPABILITY_IDS):
-            final_assistant_message, assistant_sources = _synthesize_web_extract_retrieval_answer(
-                collected_sources=retrieval_sources,
-                citation_snippets=retrieval_snippets,
-                retrieval_errors=retrieval_errors,
-                web_extract_outputs=web_extract_outputs,
-            )
-        elif retrieval_capability_ids.issubset(ATTACHMENT_CAPABILITY_IDS):
-            final_assistant_message, assistant_sources = _synthesize_attachment_read_answer(
-                collected_sources=retrieval_sources,
-                citation_snippets=retrieval_snippets,
-                retrieval_errors=retrieval_errors,
-                attachment_outputs=attachment_outputs,
-            )
-        elif retrieval_capability_ids == {"cap.weather.forecast"}:
-            final_assistant_message, assistant_sources = _synthesize_weather_retrieval_answer(
-                collected_sources=retrieval_sources,
-                citation_snippets=retrieval_snippets,
-                retrieval_errors=retrieval_errors,
-                weather_outputs=weather_outputs,
-            )
-        else:
-            final_assistant_message, assistant_sources = _synthesize_grounded_retrieval_answer(
-                collected_sources=retrieval_sources,
-                citation_snippets=retrieval_snippets,
-                retrieval_errors=retrieval_errors,
-            )
     else:
-        appendix = build_assistant_action_appendix(
-            inline_results=inline_results,
-            pending_approvals=pending_approvals,
-            blocked_reasons=blocked_reasons,
+        action_attempt_summaries: list[dict[str, Any]] = []
+        for action_attempt in created_action_attempts:
+            summary: dict[str, Any] = {
+                "action_attempt_id": action_attempt.id,
+                "capability_id": action_attempt.capability_id,
+                "status": action_attempt.status,
+                "policy_decision": action_attempt.policy_decision,
+                "approval_required": action_attempt.approval_required,
+                "has_execution_output": action_attempt.execution_output is not None,
+            }
+            if action_attempt.policy_reason is not None:
+                summary["policy_reason"] = action_attempt.policy_reason
+            if action_attempt.execution_error is not None:
+                summary["execution_error"] = action_attempt.execution_error
+            action_attempt_summaries.append(summary)
+
+        tool_summary: dict[str, Any] = {
+            "kind": "audited_tool_results",
+            "requires_model_final_answer": tool_result_interpreter_input is None,
+            "action_attempts": action_attempt_summaries,
+            "inline_result_count": len(inline_results),
+            "pending_approvals": pending_approvals,
+            "blocked_reasons": blocked_reasons,
+            "retrieval": {
+                "requested": retrieval_requested,
+                "capability_ids": sorted(retrieval_capability_ids),
+                "source_count": len(retrieval_sources),
+                "sources": retrieval_sources,
+                "errors": retrieval_errors,
+            },
+        }
+        if tool_result_interpreter_input is not None:
+            tool_summary["tool_result_interpreter"] = {
+                "required": True,
+                "reason_codes": tool_result_interpreter_input["reason_codes"],
+                "input_refs": {
+                    "action_attempt_ids": tool_result_interpreter_input["action_attempt_ids"],
+                    "capability_ids": tool_result_interpreter_input["capability_ids"],
+                    "audited_tool_output_refs": [
+                        item["output_ref"]
+                        for item in tool_result_interpreter_input["audited_tool_outputs"]
+                    ],
+                    "artifact_refs": tool_result_interpreter_input["artifact_refs"],
+                    "citation_refs": tool_result_interpreter_input["citation_refs"],
+                    "typed_tool_failure_count": len(
+                        tool_result_interpreter_input["typed_tool_failures"]
+                    ),
+                    "omitted_output_refs": tool_result_interpreter_input["omitted_output_refs"],
+                },
+                "output": tool_result_interpreter_output,
+            }
+        final_assistant_message = json.dumps(
+            jsonable_encoder(tool_summary),
+            sort_keys=True,
+            separators=(",", ":"),
         )
-        final_assistant_message = (
-            f"{assistant_message}\n{appendix}" if appendix else assistant_message
-        )
-        assistant_sources = []
+        assistant_sources = retrieval_sources if retrieval_requested else []
     return FunctionCallProcessingResult(
         assistant_message=final_assistant_message,
         function_call_outputs=function_call_outputs,
@@ -1809,6 +1462,8 @@ def process_response_function_calls(
         assistant_sources=assistant_sources,
         silent_response=silent_response,
         runtime_provenance=result_runtime_provenance,
+        tool_result_interpreter_input=tool_result_interpreter_input,
+        tool_result_interpreter_output=tool_result_interpreter_output,
     )
 
 

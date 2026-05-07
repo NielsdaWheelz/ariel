@@ -7,9 +7,18 @@ ranking into event-triggered AI deliberation, ambient always-on sensing, and
 autonomous action.
 
 The cutover covers provider-triggered deliberation, ambient observation ingestion,
-context assembly, model decision contracts, proactive turns, autonomous action
-plans, policy validation, durable execution, feedback learning, inspection APIs,
-operator recovery, and acceptance tests.
+candidate context assembly, model decision contracts, proactive turns,
+autonomous action plans, policy validation, durable execution, AI feedback
+learning, inspection APIs, operator recovery, and acceptance tests.
+
+This cutover follows [ai-first.md](ai-first.md): AI owns proactive judgment and
+deterministic code owns rails.
+
+[ai-first-completion-cutover.md](ai-first-completion-cutover.md) owns the broad
+completion plan for autonomy-scope enforcement, taint handling, feedback-learning
+audit records, ambient source coverage, and shared preflight/egress rails.
+[ai-first-verification-gap-cutover.md](ai-first-verification-gap-cutover.md)
+owns the final verified gap list after implementation review.
 
 It does not cover scheduled prompt products, daily briefing products, generic
 automation-builder UI, provider-hosted memory, model fine-tuning, mobile push, or
@@ -90,8 +99,8 @@ model's proactive judgment with a deterministic ranking substitute.
   or denied, and what side effect happened.
 - Proactive turns are first-class assistant-originated turns, not synthetic user
   turns.
-- Feedback teaches future deliberation through durable model instructions,
-  examples, scope changes, and preference records.
+- AI feedback learning teaches future deliberation through durable model
+  instructions, examples, scope-change proposals, and preference records.
 - Taint and provenance survive through observation, context assembly, model
   deliberation, proactive turn, action plan, execution, and feedback.
 - The system remains correct across retries, duplicate events, restarts,
@@ -134,7 +143,7 @@ model's proactive judgment with a deterministic ranking substitute.
 - Provider events, internal state transitions, ambient observations, captures,
   memory changes, job changes, connector health changes, and external search
   results can open or update a proactive case.
-- Each case triggers context assembly and model deliberation.
+- Each case triggers candidate context assembly and model deliberation.
 - The model can call read-only tools during deliberation when the context bundle
   is insufficient.
 - The model chooses one explicit decision:
@@ -156,21 +165,19 @@ model's proactive judgment with a deterministic ranking substitute.
 - Ambient sensing means Ariel continuously observes enabled sources, not that it
   reads arbitrary systems without consent or configuration.
 - Enabled sources produce durable observations:
-  - Discord messages and interactions
-  - Google Calendar changes
-  - Gmail thread changes
-  - Drive file changes
+  - workspace item events from Discord ambient messages and Google sync
+  - Google connector health
   - captures
-  - job and approval state
-  - memory commitments and preferences
-  - connector health
-  - configured local or browser activity
-  - configured location or travel context
-  - configured repository, CI, or incident streams
+  - jobs
+  - approval requests
+  - reviewed memory assertions
+- Location/travel, local or browser activity, repository, CI, and incident
+  streams are absent until each has real configuration, persistence, ingress,
+  trust and taint labeling, dedupe, interpretation, and tests.
 - Observations are normalized at ingress and carry source, timestamp, trust
   boundary, taint, actor, subject, and dedupe key.
 - Ambient observers never notify or act directly.
-- The durable worker queues ambient observation derivation on
+- The durable worker queues ambient interpretation on
   `ARIEL_PROACTIVE_AMBIENT_INTERVAL_SECONDS`; transport and inspection APIs do not own
   normal ambient sensing.
 - Ambient observation compression is allowed only as a derived projection. The
@@ -217,9 +224,11 @@ model's proactive judgment with a deterministic ranking substitute.
 The primary pipeline is:
 
 1. Ingress writes raw provider event records or ambient source records.
-2. Normalizers create canonical `proactive_observations`.
+2. AI ambient interpretation decides whether source records become canonical
+   `proactive_observations`; deterministic rails validate and persist the
+   model output.
 3. Case routing opens or updates a durable `proactive_case`.
-4. Context assembly creates a `proactive_context_snapshot`.
+4. Candidate context assembly creates a `proactive_context_snapshot`.
 5. Model deliberation creates an append-only `proactive_decision`.
 6. Policy validation evaluates the structured decision and exact action plans.
 7. Execution delivers proactive turns or runs authorized autonomous actions.
@@ -243,9 +252,9 @@ action executions are the source of truth for the proactive system.
   situation Ariel is deciding about.
 - `proactive_case_events`: append-only lifecycle events for case creation,
   update, deliberation, validation, delivery, action, feedback, and recovery.
-- `proactive_context_snapshots`: immutable context bundles shown to the model,
-  including memory references, recent history references, tool outputs, search
-  outputs, sensor state, omitted-context diagnostics, and taint summary.
+- `proactive_context_snapshots`: immutable candidate context bundles shown to the
+  model, including memory references, recent history references, tool outputs,
+  search outputs, sensor state, omitted-context diagnostics, and taint summary.
 - `proactive_decisions`: append-only structured model decisions with model id,
   prompt version, decision type, confidence, urgency, rationale, evidence refs,
   proposed message, proposed actions, and follow-up condition.
@@ -429,9 +438,10 @@ version, result, constraints, and denial reason.
 
 ### Learning
 
-- Feedback creates durable learning records through a worker step.
+- Feedback creates durable learning records through an AI feedback learner worker
+  step.
 - Learning records can alter future context, prompt instructions, examples,
-  autonomy scopes, and calibration.
+  autonomy-scope proposals, and calibration.
 - Learning records cannot override hard policy blocks.
 - Negative feedback must be visible in future deliberation context.
 - Positive feedback can make Ariel more aggressive for matching patterns without
@@ -443,7 +453,7 @@ version, result, constraints, and denial reason.
   behavior.
 - Every worker task has an exact payload. Broad queue scans are not fallback
   behavior.
-- Worker-owned ambient derivation and provider-renewal follow-up tasks use
+- Worker-owned ambient interpretation and provider-renewal follow-up tasks use
   `ARIEL_PROACTIVE_WORKER_MAX_ATTEMPTS` as their retry budget.
 - Read-only deliberation tool use is bounded by
   `ARIEL_PROACTIVE_DELIBERATION_TOOL_ROUNDS`.
@@ -492,8 +502,8 @@ version, result, constraints, and denial reason.
   context assembly fails closed.
 - Speaking first is a first-class assistant-originated turn.
 - Autonomous action is a first-class execution path for approved scopes.
-- User feedback changes future model deliberation through durable learning
-  records.
+- User feedback changes future model deliberation through AI-authored durable
+  learning records.
 - Policy validation remains the only authorization boundary for side effects.
 - Discord and future channels render proactive turns but do not own decisions.
 - Inspection APIs can explain every proactive turn and autonomous action.
@@ -522,8 +532,8 @@ version, result, constraints, and denial reason.
   not silently fall back to deterministic notification behavior.
 - A configured ambient Discord observation can create a case from a commitment the
   user made in conversation.
-- A configured CI failure stream can create a case, deliberate with repo context,
-  and open an allowed internal follow-up action when scoped.
+- Repository, CI, incident, location, and local/browser activity streams are
+  absent from acceptance until implemented end to end.
 - A failed autonomous external call is replayable and does not double-send on
   retry.
 - Feedback "stop interrupting me about this" creates a durable learning record
@@ -570,7 +580,8 @@ version, result, constraints, and denial reason.
 - Autonomy scopes, not one-off confirmations, define what Ariel can do freely.
 - The runtime validates exact model-authored action payloads.
 - Invalid model output fails closed without deterministic fallback.
-- Feedback changes future model deliberation through durable learning records.
+- Feedback changes future model deliberation through AI-authored durable learning
+  records.
 - Hard cutover deletes old code paths instead of hiding them behind flags.
 
 ## File Plan
@@ -579,8 +590,8 @@ version, result, constraints, and denial reason.
 - `docs/index.md`: link this spec and remove the old attention-ranking spec.
 - `docs/production-runbook.md`: add proactive case, decision, action, and
   recovery playbooks.
-- `.env.example`: add model, tool, sensor, autonomy, and proactive worker
-  settings.
+- `.env.example`: list AppSettings model, connector, autonomy, and proactive
+  worker settings with defaults.
 - `alembic/versions/*_proactive_ai_deliberation_cutover.py`: drop old attention
   records and add proactive observation, case, context, decision, validation,
   turn, action, autonomy, feedback, and learning records.
@@ -588,9 +599,9 @@ version, result, constraints, and denial reason.
   proactive records and serializers.
 - `src/ariel/response_contracts.py`: replace attention response contracts with
   proactive case, decision, turn, action, feedback, and autonomy contracts.
-- `src/ariel/proactivity.py`: own context assembly, model deliberation calls,
-  decision parsing, policy validation, case routing, ambient observation
-  derivation, feedback learning orchestration, and proactive controls.
+- `src/ariel/proactivity.py`: own candidate context assembly, model deliberation
+  calls, decision parsing, policy validation, case routing, ambient observation
+  interpretation, AI feedback learning orchestration, and proactive controls.
 - `src/ariel/sync_runtime.py`: convert provider deltas into proactive
   observations and case updates.
 - `src/ariel/app.py`: replace attention endpoints with proactive inspection,
@@ -602,12 +613,11 @@ version, result, constraints, and denial reason.
   with exact payload hashes and side-effect receipts.
 - `src/ariel/proactivity.py`: validate decisions, taint, autonomy scopes,
   payload hashes, idempotency, and hard safety blocks.
-- `src/ariel/memory.py`: provide proactive context sections and feedback-derived
-  learning records.
+- `src/ariel/memory.py`: provide bounded memory candidate services for proactive
+  deliberation.
 - `src/ariel/discord_bot.py`: deliver proactive turns and controls without owning
   proactive decisions.
-- `src/ariel/config.py`: add settings for sensors, deliberation models, tool
-  budgets, autonomy defaults, and worker retry budgets.
+- `src/ariel/config.py`: remains the source of truth for AppSettings env names.
 - `tests/integration/`: replace attention tests with event-triggered
   deliberation, ambient sensing, autonomous action, denial, retry, feedback, and
   inspection acceptance tests.
@@ -620,14 +630,15 @@ version, result, constraints, and denial reason.
 1. Delete old attention contracts, tasks, and docs references.
 2. Add proactive schema and response contracts.
 3. Add observation ingestion and case routing.
-4. Add context snapshot assembly.
+4. Add candidate context snapshot assembly.
 5. Add model deliberation adapter and strict decision parsing.
 6. Add policy validation for decisions and action plans.
 7. Add proactive turn creation and Discord delivery.
 8. Add autonomy scopes and action execution.
-9. Add ambient sensors for existing sources first: Discord, Google sync, captures,
-   jobs, approvals, memory commitments, and connector health.
-10. Add feedback learning records and future-context injection.
+9. Add ambient interpretation for existing source records first: workspace item
+   events, Google connector health, captures, jobs, approvals, and memory
+   assertions.
+10. Add AI feedback learning records and future-context injection.
 11. Replace tests with the new acceptance suite.
 12. Update runbook, README, `.env.example`, and operator recovery docs.
 

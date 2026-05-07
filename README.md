@@ -69,14 +69,19 @@ deterministic operational commands only and do not route free-form prompts to th
 
 ## proactive AI deliberation
 
-The durable worker owns provider event sync, ambient observation derivation, model
-deliberation, policy validation, proactive turn delivery, autonomous action execution,
-feedback learning, and follow-ups. It queues ambient observation derivation itself on
-`ARIEL_PROACTIVE_AMBIENT_INTERVAL_SECONDS`; operators can still use
-`POST /v1/proactive/observations/derive` as an explicit replay/control path. Provider
-deltas and internal state create durable proactive observations; observations open or
-update proactive cases; cases assemble context and ask the model whether to ignore,
-remember, wait, speak, ask, act, or speak and act.
+The durable worker owns provider event sync, ambient interpretation, model deliberation,
+policy validation, proactive turn delivery, autonomous action execution, feedback
+learning, and follow-ups. It queues `ambient_interpretation_due` on
+`ARIEL_PROACTIVE_AMBIENT_INTERVAL_SECONDS`. Provider deltas, Discord ambient workspace
+events, and internal state create durable source records; AI ambient interpretation
+selects which records become proactive observations. Observations open or update cases;
+cases assemble context and ask the model whether to ignore, remember, wait, speak, ask,
+act, or speak and act.
+
+Configured ambient source families are workspace item events, Google connector health,
+captures, jobs, approval requests, and reviewed memory assertions. Location/travel,
+local or browser activity, repository, CI, and incident streams are absent until each is
+implemented end to end.
 
 Discord renders proactive turns and correction controls. It does not decide whether
 Ariel should speak or act. Autonomous actions require an active autonomy scope and
@@ -84,7 +89,7 @@ record policy validation plus execution receipts.
 
 Worker task names:
 
-- `workspace_observation_derivation_due`
+- `ambient_interpretation_due`
 - `proactive_deliberation_due`
 - `proactive_follow_up_due`
 - `proactive_feedback_learning_due`
@@ -101,7 +106,6 @@ Core inspection and mutation routes:
 - `GET /v1/sync-runs`
 - `GET /v1/workspace-items`
 - `GET /v1/proactive/observations`
-- `POST /v1/proactive/observations/derive`
 - `GET /v1/proactive/cases`
 - `GET /v1/proactive/cases/{case_id}`
 - `GET /v1/proactive/cases/{case_id}/events`
@@ -583,7 +587,7 @@ make run-worker
 
 proactive worker settings:
 
-- `ARIEL_PROACTIVE_AMBIENT_INTERVAL_SECONDS` (default `60`) controls how often the worker queues ambient observation derivation.
+- `ARIEL_PROACTIVE_AMBIENT_INTERVAL_SECONDS` (default `60`) controls how often the worker queues ambient interpretation.
 - `ARIEL_PROACTIVE_WORKER_MAX_ATTEMPTS` (default `5`) is the retry budget for worker-owned ambient and provider-renewal follow-up tasks.
 - `ARIEL_PROACTIVE_DELIBERATION_TOOL_ROUNDS` (default `2`) bounds read-only tool rounds during proactive deliberation.
 

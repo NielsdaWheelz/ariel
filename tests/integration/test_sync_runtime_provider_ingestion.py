@@ -13,6 +13,7 @@ from testcontainers.postgres import PostgresContainer
 from ariel.config import AppSettings
 from ariel.db import reset_schema_for_tests
 from ariel.persistence import (
+    BackgroundTaskRecord,
     ProactiveCaseRecord,
     ProactiveObservationRecord,
     SyncCursorRecord,
@@ -222,8 +223,13 @@ def test_gmail_sync_follows_history_pages_and_dedupes_replayed_events(
     with db_sessions() as db:
         with db.begin():
             runs = db.scalars(select(SyncRunRecord).order_by(SyncRunRecord.id.asc())).all()
+            events = db.scalars(
+                select(WorkspaceItemEventRecord).order_by(WorkspaceItemEventRecord.id.asc())
+            ).all()
+            ambient_tasks = db.scalars(
+                select(BackgroundTaskRecord).order_by(BackgroundTaskRecord.id.asc())
+            ).all()
             workspace_item_count = db.scalar(select(func.count()).select_from(WorkspaceItemRecord))
-            event_count = db.scalar(select(func.count()).select_from(WorkspaceItemEventRecord))
             observation_count = db.scalar(
                 select(func.count()).select_from(ProactiveObservationRecord)
             )
@@ -236,9 +242,14 @@ def test_gmail_sync_follows_history_pages_and_dedupes_replayed_events(
     ]
     assert providers[1].history_calls == providers[0].history_calls
     assert [run.item_count for run in runs] == [3, 0]
-    assert [run.observation_count for run in runs] == [3, 0]
+    assert [run.observation_count for run in runs] == [0, 0]
     assert [run.cursor_after for run in runs] == ["hist-3", "hist-3"]
     assert workspace_item_count == 2
-    assert event_count == 3
-    assert observation_count == 3
-    assert case_count == 2
+    assert len(events) == 3
+    assert [task.task_type for task in ambient_tasks] == ["ambient_interpretation_due"] * 3
+    assert [task.payload for task in ambient_tasks] == [
+        {"workspace_item_event_id": event.id} for event in events
+    ]
+    assert [task.status for task in ambient_tasks] == ["pending"] * 3
+    assert observation_count == 0
+    assert case_count == 0

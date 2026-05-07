@@ -19,43 +19,83 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.execute(
-        "DELETE FROM background_tasks WHERE task_type IN ("
-        "'proactive_check_due', 'workspace_signal_derivation_due', "
-        "'attention_feature_extraction_due', 'attention_grouping_due', "
-        "'attention_ranking_due', 'attention_review_due', 'attention_delivery_due', "
-        "'attention_item_follow_up_due', 'proactive_feedback_review_due', "
-        "'action_proposal_review_due')"
-    )
-    op.execute(
-        "DELETE FROM notification_deliveries WHERE notification_id IN ("
-        "SELECT id FROM notifications WHERE source_type = 'attention_item')"
-    )
-    op.execute("DELETE FROM notifications WHERE source_type = 'attention_item'")
-
-    op.drop_table("action_proposals")
-    op.drop_table("proactive_feedback_rules")
-    op.drop_table("proactive_feedback")
-    op.drop_table("attention_item_events")
-    op.drop_table("attention_items")
-    op.drop_table("attention_rank_snapshots")
-    op.drop_table("attention_rank_features")
-    op.drop_table("attention_group_members")
-    op.drop_table("attention_groups")
-    op.drop_table("attention_signals")
-    op.drop_constraint("ck_sync_run_signal_count", "sync_runs", type_="check")
-    op.alter_column(
-        "sync_runs",
-        "signal_count",
-        new_column_name="observation_count",
-        existing_type=sa.Integer(),
-        nullable=False,
-    )
+    op.drop_constraint("ck_workspace_item_provider", "workspace_items", type_="check")
     op.create_check_constraint(
-        "ck_sync_run_observation_count",
-        "sync_runs",
-        "observation_count >= 0",
+        "ck_workspace_item_provider",
+        "workspace_items",
+        "provider IN ('google', 'ariel', 'discord')",
     )
+    op.drop_constraint("ck_workspace_item_type", "workspace_items", type_="check")
+    op.create_check_constraint(
+        "ck_workspace_item_type",
+        "workspace_items",
+        (
+            "item_type IN ('calendar_event', 'email_message', 'drive_file', "
+            "'internal_state', 'discord_message')"
+        ),
+    )
+
+    op.create_table(
+        "ai_judgments",
+        sa.Column("id", sa.String(length=32), nullable=False),
+        sa.Column("judgment_type", sa.String(length=64), nullable=False),
+        sa.Column("source_type", sa.String(length=64), nullable=False),
+        sa.Column("source_id", sa.String(length=128), nullable=False),
+        sa.Column("status", sa.String(length=32), nullable=False),
+        sa.Column("model", sa.String(length=128), nullable=True),
+        sa.Column("prompt_version", sa.String(length=64), nullable=False),
+        sa.Column("provider_response_id", sa.String(length=128), nullable=True),
+        sa.Column("input_summary", sa.Text(), nullable=False),
+        sa.Column("input_refs", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+        sa.Column("selected", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+        sa.Column("omitted", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+        sa.Column("output", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+        sa.Column("rationale", sa.Text(), nullable=True),
+        sa.Column("uncertainty", sa.Text(), nullable=True),
+        sa.Column("confidence", sa.Float(), nullable=True),
+        sa.Column("parse_status", sa.String(length=32), nullable=False),
+        sa.Column("validation_status", sa.String(length=32), nullable=False),
+        sa.Column("failure_code", sa.String(length=64), nullable=True),
+        sa.Column("failure_reason", sa.Text(), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+        sa.CheckConstraint(
+            (
+                "judgment_type IN ('memory_curation', 'tool_result_interpretation', "
+                "'continuity_compaction', 'feedback_learning', "
+                "'ambient_interpretation', 'proactive_deliberation', 'model_output')"
+            ),
+            name="ck_ai_judgment_type",
+        ),
+        sa.CheckConstraint("status IN ('succeeded', 'failed')", name="ck_ai_judgment_status"),
+        sa.CheckConstraint(
+            (
+                "parse_status IN ('not_required_no_candidates', 'parsed', 'invalid_json', "
+                "'missing_output', 'schema_invalid')"
+            ),
+            name="ck_ai_judgment_parse_status",
+        ),
+        sa.CheckConstraint(
+            "validation_status IN ('valid', 'invalid', 'not_validated')",
+            name="ck_ai_judgment_validation_status",
+        ),
+        sa.CheckConstraint(
+            (
+                "failure_code IS NULL OR failure_code IN ("
+                "'E_AI_JUDGMENT_REQUIRED', 'E_AI_JUDGMENT_CREDENTIALS', "
+                "'E_AI_JUDGMENT_TIMEOUT', 'E_AI_JUDGMENT_INVALID_JSON', "
+                "'E_AI_JUDGMENT_SCHEMA', 'E_AI_JUDGMENT_VALIDATION', "
+                "'E_AI_JUDGMENT_BUDGET')"
+            ),
+            name="ck_ai_judgment_failure_code",
+        ),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index("ix_ai_judgments_created_at", "ai_judgments", ["created_at"])
+    op.create_index("ix_ai_judgments_judgment_type", "ai_judgments", ["judgment_type"])
+    op.create_index("ix_ai_judgments_source_id", "ai_judgments", ["source_id"])
+    op.create_index("ix_ai_judgments_source_type", "ai_judgments", ["source_type"])
+    op.create_index("ix_ai_judgments_updated_at", "ai_judgments", ["updated_at"])
 
     op.create_table(
         "proactive_observations",
@@ -78,8 +118,7 @@ def upgrade() -> None:
         sa.CheckConstraint(
             (
                 "source_type IN ('workspace_item', 'job', 'approval_request', "
-                "'memory_assertion', 'google_connector', 'capture', 'discord_message', "
-                "'provider_event', 'connector_event', 'ci', 'location', 'local_activity')"
+                "'memory_assertion', 'google_connector', 'capture')"
             ),
             name="ck_proactive_observation_source_type",
         ),
@@ -541,18 +580,32 @@ def upgrade() -> None:
         sa.Column("record_type", sa.String(length=32), nullable=False),
         sa.Column("status", sa.String(length=32), nullable=False),
         sa.Column("content", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+        sa.Column("model", sa.String(length=128), nullable=True),
+        sa.Column("prompt_version", sa.String(length=64), nullable=False),
+        sa.Column("provider_response_id", sa.String(length=128), nullable=True),
+        sa.Column("parse_status", sa.String(length=32), nullable=False),
+        sa.Column("validation_status", sa.String(length=32), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.CheckConstraint(
             (
                 "record_type IN ('instruction', 'example', 'calibration', "
-                "'preference', 'autonomy_request')"
+                "'preference', 'source_preference', 'prompt_instruction', "
+                "'autonomy_request')"
             ),
             name="ck_proactive_learning_record_type",
         ),
         sa.CheckConstraint(
             "status IN ('active', 'superseded', 'rejected')",
             name="ck_proactive_learning_record_status",
+        ),
+        sa.CheckConstraint(
+            "parse_status IN ('parsed', 'invalid_json', 'missing_output', 'schema_invalid')",
+            name="ck_proactive_learning_parse_status",
+        ),
+        sa.CheckConstraint(
+            "validation_status IN ('valid', 'invalid')",
+            name="ck_proactive_learning_validation_status",
         ),
         sa.ForeignKeyConstraint(["feedback_id"], ["proactive_feedback.id"], ondelete="RESTRICT"),
         sa.PrimaryKeyConstraint("id"),
@@ -582,7 +635,7 @@ def upgrade() -> None:
             "'expire_approvals', 'reap_stale_tasks', "
             "'provider_subscription_renewal_due', 'provider_event_received', "
             "'provider_sync_due', 'memory_extract_turn', "
-            "'workspace_observation_derivation_due', 'proactive_deliberation_due', "
+            "'ambient_interpretation_due', 'proactive_deliberation_due', "
             "'proactive_follow_up_due', 'proactive_feedback_learning_due', "
             "'proactive_action_execution_due', 'execute_action_attempt')"
         ),
@@ -597,8 +650,16 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.execute(
+        "DELETE FROM workspace_item_events WHERE workspace_item_id IN ("
+        "SELECT id FROM workspace_items WHERE provider = 'discord' "
+        "OR item_type = 'discord_message')"
+    )
+    op.execute(
+        "DELETE FROM workspace_items WHERE provider = 'discord' OR item_type = 'discord_message'"
+    )
+    op.execute(
         "DELETE FROM background_tasks WHERE task_type IN ("
-        "'workspace_observation_derivation_due', 'proactive_deliberation_due', "
+        "'ambient_interpretation_due', 'proactive_deliberation_due', "
         "'proactive_follow_up_due', 'proactive_feedback_learning_due', "
         "'proactive_action_execution_due')"
     )
@@ -612,7 +673,7 @@ def downgrade() -> None:
     op.create_check_constraint(
         "ck_notification_source_type",
         "notifications",
-        "source_type IN ('agency_event', 'attention_item', 'approval', 'connector_event')",
+        "source_type IN ('agency_event')",
     )
     op.drop_constraint("ck_background_task_type", "background_tasks", type_="check")
     op.create_check_constraint(
@@ -622,13 +683,20 @@ def downgrade() -> None:
             "task_type IN ('agency_event_received', 'deliver_discord_notification', "
             "'expire_approvals', 'reap_stale_tasks', "
             "'provider_subscription_renewal_due', 'provider_event_received', "
-            "'provider_sync_due', 'memory_extract_turn', "
-            "'workspace_signal_derivation_due', "
-            "'attention_feature_extraction_due', 'attention_grouping_due', "
-            "'attention_ranking_due', 'attention_review_due', 'attention_delivery_due', "
-            "'attention_item_follow_up_due', 'proactive_feedback_review_due', "
-            "'action_proposal_review_due', 'execute_action_attempt')"
+            "'provider_sync_due', 'memory_extract_turn', 'execute_action_attempt')"
         ),
+    )
+    op.drop_constraint("ck_workspace_item_type", "workspace_items", type_="check")
+    op.create_check_constraint(
+        "ck_workspace_item_type",
+        "workspace_items",
+        "item_type IN ('calendar_event', 'email_message', 'drive_file', 'internal_state')",
+    )
+    op.drop_constraint("ck_workspace_item_provider", "workspace_items", type_="check")
+    op.create_check_constraint(
+        "ck_workspace_item_provider",
+        "workspace_items",
+        "provider IN ('google', 'ariel')",
     )
 
     op.drop_table("proactive_learning_records")
@@ -644,248 +712,4 @@ def downgrade() -> None:
     op.drop_table("proactive_case_events")
     op.drop_table("proactive_cases")
     op.drop_table("proactive_observations")
-
-    op.drop_constraint("ck_sync_run_observation_count", "sync_runs", type_="check")
-    op.alter_column(
-        "sync_runs",
-        "observation_count",
-        new_column_name="signal_count",
-        existing_type=sa.Integer(),
-        nullable=False,
-    )
-    op.create_check_constraint("ck_sync_run_signal_count", "sync_runs", "signal_count >= 0")
-
-    op.create_table(
-        "attention_signals",
-        sa.Column("id", sa.String(length=32), nullable=False),
-        sa.Column("workspace_item_id", sa.String(length=32), nullable=True),
-        sa.Column("source_type", sa.String(length=32), nullable=False),
-        sa.Column("source_id", sa.String(length=160), nullable=False),
-        sa.Column("dedupe_key", sa.String(length=220), nullable=False),
-        sa.Column("status", sa.String(length=32), nullable=False),
-        sa.Column("priority", sa.String(length=32), nullable=False),
-        sa.Column("urgency", sa.String(length=32), nullable=False),
-        sa.Column("confidence", sa.Float(), nullable=False),
-        sa.Column("title", sa.Text(), nullable=False),
-        sa.Column("body", sa.Text(), nullable=False),
-        sa.Column("reason", sa.Text(), nullable=False),
-        sa.Column("evidence", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("taint", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
-        sa.CheckConstraint(
-            (
-                "source_type IN ('workspace_item', 'job', 'approval_request', "
-                "'memory_assertion', 'google_connector', 'capture')"
-            ),
-            name="ck_attention_signal_source_type",
-        ),
-        sa.CheckConstraint(
-            "status IN ('new', 'reviewed', 'dismissed', 'superseded')",
-            name="ck_attention_signal_status",
-        ),
-        sa.CheckConstraint(
-            "priority IN ('critical', 'high', 'normal', 'low')",
-            name="ck_attention_signal_priority",
-        ),
-        sa.CheckConstraint(
-            "urgency IN ('critical', 'high', 'normal', 'low')",
-            name="ck_attention_signal_urgency",
-        ),
-        sa.CheckConstraint(
-            "confidence >= 0.0 AND confidence <= 1.0",
-            name="ck_attention_signal_confidence",
-        ),
-        sa.ForeignKeyConstraint(["workspace_item_id"], ["workspace_items.id"], ondelete="RESTRICT"),
-        sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("dedupe_key"),
-    )
-    op.create_table(
-        "attention_groups",
-        sa.Column("id", sa.String(length=32), nullable=False),
-        sa.Column("group_key", sa.String(length=160), nullable=False),
-        sa.Column("group_type", sa.String(length=32), nullable=False),
-        sa.Column("status", sa.String(length=32), nullable=False),
-        sa.Column("title", sa.Text(), nullable=False),
-        sa.Column("summary", sa.Text(), nullable=False),
-        sa.Column("metadata", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
-        sa.CheckConstraint(
-            "group_type IN ('approval', 'job', 'connector', 'memory', 'capture', 'workspace')",
-            name="ck_attention_group_type",
-        ),
-        sa.CheckConstraint(
-            "status IN ('active', 'suppressed', 'resolved')",
-            name="ck_attention_group_status",
-        ),
-        sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("group_key"),
-    )
-    op.create_table(
-        "attention_group_members",
-        sa.Column("id", sa.String(length=32), nullable=False),
-        sa.Column("group_id", sa.String(length=32), nullable=False),
-        sa.Column("attention_signal_id", sa.String(length=32), nullable=False),
-        sa.Column("grouping_reason", sa.Text(), nullable=False),
-        sa.Column("ranking_version", sa.String(length=64), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.ForeignKeyConstraint(["group_id"], ["attention_groups.id"], ondelete="RESTRICT"),
-        sa.ForeignKeyConstraint(
-            ["attention_signal_id"], ["attention_signals.id"], ondelete="RESTRICT"
-        ),
-        sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint(
-            "group_id",
-            "attention_signal_id",
-            name="uq_attention_group_member_signal",
-        ),
-    )
-    op.create_table(
-        "attention_rank_features",
-        sa.Column("id", sa.String(length=32), nullable=False),
-        sa.Column("attention_signal_id", sa.String(length=32), nullable=False),
-        sa.Column("feature_set_version", sa.String(length=64), nullable=False),
-        sa.Column("features", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("score_components", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.ForeignKeyConstraint(
-            ["attention_signal_id"], ["attention_signals.id"], ondelete="RESTRICT"
-        ),
-        sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint(
-            "attention_signal_id",
-            "feature_set_version",
-            name="uq_attention_rank_feature_signal_version",
-        ),
-    )
-    op.create_table(
-        "attention_rank_snapshots",
-        sa.Column("id", sa.String(length=32), nullable=False),
-        sa.Column("group_id", sa.String(length=32), nullable=False),
-        sa.Column("snapshot_key", sa.String(length=160), nullable=False),
-        sa.Column("ranker_version", sa.String(length=64), nullable=False),
-        sa.Column("source_signal_ids", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("rank_score", sa.Float(), nullable=False),
-        sa.Column("rank_inputs", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("rank_reason", sa.Text(), nullable=False),
-        sa.Column("delivery_decision", sa.String(length=32), nullable=False),
-        sa.Column("delivery_reason", sa.Text(), nullable=False),
-        sa.Column("suppression_reason", sa.Text(), nullable=True),
-        sa.Column("next_follow_up_after", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("priority", sa.String(length=32), nullable=False),
-        sa.Column("urgency", sa.String(length=32), nullable=False),
-        sa.Column("confidence", sa.Float(), nullable=False),
-        sa.Column("title", sa.Text(), nullable=False),
-        sa.Column("body", sa.Text(), nullable=False),
-        sa.Column("evidence", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("taint", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.CheckConstraint(
-            "rank_score >= 0.0 AND rank_score <= 1.0",
-            name="ck_attention_rank_snapshot_score",
-        ),
-        sa.CheckConstraint(
-            "delivery_decision IN ('interrupt_now', 'queue', 'digest', 'suppress')",
-            name="ck_attention_rank_snapshot_delivery_decision",
-        ),
-        sa.ForeignKeyConstraint(["group_id"], ["attention_groups.id"], ondelete="RESTRICT"),
-        sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("snapshot_key"),
-    )
-    op.create_table(
-        "attention_items",
-        sa.Column("id", sa.String(length=32), nullable=False),
-        sa.Column("group_id", sa.String(length=32), nullable=False),
-        sa.Column("rank_snapshot_id", sa.String(length=32), nullable=False),
-        sa.Column("source_type", sa.String(length=32), nullable=False),
-        sa.Column("source_id", sa.String(length=128), nullable=False),
-        sa.Column("source_signal_ids", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("dedupe_key", sa.String(length=160), nullable=False),
-        sa.Column("status", sa.String(length=32), nullable=False),
-        sa.Column("priority", sa.String(length=32), nullable=False),
-        sa.Column("urgency", sa.String(length=32), nullable=False),
-        sa.Column("confidence", sa.Float(), nullable=False),
-        sa.Column("title", sa.Text(), nullable=False),
-        sa.Column("body", sa.Text(), nullable=False),
-        sa.Column("reason", sa.Text(), nullable=False),
-        sa.Column("evidence", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("taint", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("rank_score", sa.Float(), nullable=False),
-        sa.Column("rank_inputs", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("rank_reason", sa.Text(), nullable=False),
-        sa.Column("delivery_decision", sa.String(length=32), nullable=False),
-        sa.Column("delivery_reason", sa.Text(), nullable=False),
-        sa.Column("suppression_reason", sa.Text(), nullable=True),
-        sa.Column("expires_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("next_follow_up_after", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("last_notified_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
-        sa.CheckConstraint(
-            "source_type IN ('attention_group')",
-            name="ck_attention_item_source_type",
-        ),
-        sa.CheckConstraint(
-            (
-                "status IN ('open', 'notified', 'acknowledged', 'snoozed', 'resolved', "
-                "'expired', 'cancelled', 'superseded')"
-            ),
-            name="ck_attention_item_status",
-        ),
-        sa.ForeignKeyConstraint(["group_id"], ["attention_groups.id"], ondelete="RESTRICT"),
-        sa.ForeignKeyConstraint(
-            ["rank_snapshot_id"], ["attention_rank_snapshots.id"], ondelete="RESTRICT"
-        ),
-        sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("dedupe_key"),
-    )
-    op.create_table(
-        "attention_item_events",
-        sa.Column("id", sa.String(length=32), nullable=False),
-        sa.Column("attention_item_id", sa.String(length=32), nullable=False),
-        sa.Column("event_type", sa.String(length=64), nullable=False),
-        sa.Column("payload", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.ForeignKeyConstraint(["attention_item_id"], ["attention_items.id"], ondelete="RESTRICT"),
-        sa.PrimaryKeyConstraint("id"),
-    )
-    op.create_table(
-        "proactive_feedback",
-        sa.Column("id", sa.String(length=32), nullable=False),
-        sa.Column("attention_item_id", sa.String(length=32), nullable=False),
-        sa.Column("feedback_type", sa.String(length=32), nullable=False),
-        sa.Column("note", sa.Text(), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.ForeignKeyConstraint(["attention_item_id"], ["attention_items.id"], ondelete="RESTRICT"),
-        sa.PrimaryKeyConstraint("id"),
-    )
-    op.create_table(
-        "proactive_feedback_rules",
-        sa.Column("id", sa.String(length=32), nullable=False),
-        sa.Column("rule_key", sa.String(length=160), nullable=False),
-        sa.Column("rule_type", sa.String(length=32), nullable=False),
-        sa.Column("status", sa.String(length=32), nullable=False),
-        sa.Column("priority", sa.Integer(), nullable=False),
-        sa.Column("conditions", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("effect", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
-        sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("rule_key"),
-    )
-    op.create_table(
-        "action_proposals",
-        sa.Column("id", sa.String(length=32), nullable=False),
-        sa.Column("attention_item_id", sa.String(length=32), nullable=False),
-        sa.Column("capability_id", sa.String(length=128), nullable=False),
-        sa.Column("payload", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("payload_hash", sa.String(length=128), nullable=False),
-        sa.Column("status", sa.String(length=32), nullable=False),
-        sa.Column("policy_state", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("evidence", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
-        sa.ForeignKeyConstraint(["attention_item_id"], ["attention_items.id"], ondelete="RESTRICT"),
-        sa.PrimaryKeyConstraint("id"),
-    )
+    op.drop_table("ai_judgments")

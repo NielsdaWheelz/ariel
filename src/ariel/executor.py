@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-import json
 from typing import Any, Literal
 from urllib.parse import urlparse
 
@@ -231,28 +230,6 @@ def _dispatch_egress_requests(*, egress_requests: list[dict[str, Any]]) -> str |
         if dispatch_error is not None:
             return f"egress_dispatch_failed:{dispatch_error}"
     return None
-
-
-def build_assistant_action_appendix(
-    *,
-    inline_results: list[dict[str, Any]],
-    pending_approvals: list[dict[str, Any]],
-    blocked_reasons: list[str],
-) -> str:
-    lines: list[str] = []
-    for result in inline_results:
-        capability_id = result["capability_id"]
-        output = json.dumps(result["output"], sort_keys=True)
-        lines.append(f"action result ({capability_id}): {output}")
-    for pending in pending_approvals:
-        lines.append(
-            "approval required "
-            f"({pending['capability_id']}): approval_ref={pending['approval_ref']} "
-            f"expires_at={pending['expires_at']}"
-        )
-    if blocked_reasons:
-        lines.append("blocked function calls: " + "; ".join(blocked_reasons))
-    return "\n".join(lines)
 
 
 def append_turn_event(

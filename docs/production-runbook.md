@@ -8,13 +8,18 @@ ingress.
 Production uses:
 
 - OpenAI Responses API only.
-- Discord Gateway for ambient chat, deterministic slash operations, buttons,
-  approvals, jobs, and status.
+- Discord Gateway for ambient chat, operational slash commands, buttons,
+  approvals, jobs, and status. Slash commands are rails and control surfaces,
+  not AI judgment surfaces.
 - Ariel API bound to loopback.
 - Agency daemon over a local Unix socket.
 - PostgreSQL 16 as canonical storage.
 - Caddy-managed TLS for the optional public callback path only.
 - systemd for process supervision.
+
+Production follows [ai-first.md](ai-first.md): model and subagent calls own
+judgment; deterministic services own validation, authorization, idempotency,
+taint, replay, recovery, and audit.
 
 No voice, legacy model provider, Chat Completions, public Ariel API, fallback provider, or
 Tailscale requirement is part of this deployment.
@@ -98,9 +103,11 @@ ARIEL_DISCORD_NOTIFICATION_TIMEOUT_SECONDS=10.0
 
 `ARIEL_DISCORD_GUILD_ID` is the one home guild. Owner DMs are also accepted. Ambient
 messages are the Discord AI surface; `/ariel` and `/ask` are gone. `/status`, `/jobs`,
-`/memory`, and `/capture` are deterministic operational commands only. Do not use
-`ARIEL_DISCORD_CHANNEL_ID` as a one-channel-only chat gate; it is the default notification
-and thread parent when a message-specific Discord target is unavailable.
+`/memory`, and `/capture` are deterministic operational commands only. They expose
+rails, state, and operator controls; they do not decide user intent, memory relevance,
+tool strategy, or response content. Do not use `ARIEL_DISCORD_CHANNEL_ID` as a
+one-channel-only chat gate; it is the default notification and thread parent when a
+message-specific Discord target is unavailable.
 
 Required Agency settings:
 
@@ -130,15 +137,22 @@ Required provider callback settings when Google provider ingress is enabled:
 ARIEL_GOOGLE_PROVIDER_EVENT_TOKEN=<shared-google-callback-token>
 ```
 
-The same `ariel-worker` service owns provider event sync, ambient observation
-derivation, model deliberation, policy validation, proactive turn delivery,
-autonomous action execution, feedback learning, follow-ups, approval expiry,
+The same `ariel-worker` service owns provider event sync, ambient interpretation,
+model and subagent deliberation, policy validation, proactive turn delivery,
+autonomous action execution, AI feedback learning, follow-ups, approval expiry,
 Agency event ingestion, and Discord notification delivery. There is no separate
-scheduler process. Ambient observation derivation is worker-owned and runs on
-`ARIEL_PROACTIVE_AMBIENT_INTERVAL_SECONDS`; the manual derivation endpoint is an
-operator replay/control path, not the normal sensing loop. Proactive deliberation
-can call read-only tools for at most `ARIEL_PROACTIVE_DELIBERATION_TOOL_ROUNDS`
-rounds before it must return a structured decision or fail closed.
+scheduler process. The worker orchestrates AI judgment while deterministic code
+enforces validation, replay, idempotency, policy, audit, and recovery. Ambient
+interpretation is worker-owned and runs on
+`ARIEL_PROACTIVE_AMBIENT_INTERVAL_SECONDS` or source-event tasks. No public replay
+route owns normal sensing. Proactive deliberation can call read-only tools for at most
+`ARIEL_PROACTIVE_DELIBERATION_TOOL_ROUNDS` rounds before it must return a
+structured decision or fail closed.
+
+Configured ambient source families are workspace item events, Google connector
+health, captures, jobs, approval requests, and reviewed memory assertions.
+Location/travel, local or browser activity, repository, CI, and incident streams
+are absent in this deployment.
 
 Set provider keys only for enabled capabilities:
 
@@ -244,12 +258,11 @@ curl -s "http://127.0.0.1:8000/v1/proactive/cases/${case_id}/validations"
 curl -s "http://127.0.0.1:8000/v1/proactive/cases/${case_id}/actions"
 ```
 
-Force sync and observation derivation through explicit mutation endpoints when replaying
-or diagnosing a specific source:
+Force sync when replaying or diagnosing a specific source. Provider ingestion
+queues ambient interpretation for each durable source event.
 
 ```sh
 curl -X POST 'http://127.0.0.1:8000/v1/connectors/google/sync?resource_type=calendar&resource_id=primary'
-curl -X POST http://127.0.0.1:8000/v1/proactive/observations/derive
 ```
 
 System health:
@@ -360,7 +373,7 @@ Proactive worker:
 - Discord is the production ingress for ambient chat, approvals, jobs, and status
   through one configured home guild plus owner DMs.
 - No `/ariel` or `/ask` AI slash commands are registered; `/status`, `/jobs`, `/memory`,
-  and `/capture` are deterministic operational commands only.
+  and `/capture` are deterministic operational rails only.
 - Responses API is the only production model path.
 - No legacy provider, Chat Completions, compatibility flag, or fallback provider is
   configured.

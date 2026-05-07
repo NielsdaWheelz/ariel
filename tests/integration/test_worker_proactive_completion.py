@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session, sessionmaker
 from testcontainers.postgres import PostgresContainer
 
@@ -32,7 +32,7 @@ def session_factory(postgres_url: str) -> Generator[sessionmaker[Session], None,
         engine.dispose()
 
 
-def test_worker_owns_periodic_ambient_observation_derivation(
+def test_worker_owns_periodic_ambient_interpretation(
     session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -51,7 +51,7 @@ def test_worker_owns_periodic_ambient_observation_derivation(
             tasks = db.scalars(select(BackgroundTaskRecord)).all()
             assert len(tasks) == 1
             task = tasks[0]
-            assert task.task_type == "workspace_observation_derivation_due"
+            assert task.task_type == "ambient_interpretation_due"
             assert task.payload == {"origin": "worker_ambient"}
             assert task.status == "completed"
             assert task.attempts == 1
@@ -99,6 +99,49 @@ def test_failed_proactive_tasks_recover_until_retry_budget_is_exhausted(
             assert task.attempts == 2
             assert task.error == "proactive case not found"
             assert task.run_after > now
+
+
+def test_legacy_task_type_dead_letters_without_retry(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 5, 1, 12, 45, tzinfo=UTC)
+    monkeypatch.setattr("ariel.worker._utcnow", lambda: now)
+    with session_factory() as db:
+        with db.begin():
+            db.execute(text("ALTER TABLE background_tasks DROP CONSTRAINT ck_background_task_type"))
+            db.add(
+                BackgroundTaskRecord(
+                    id="tsk_legacy_attention",
+                    task_type="attention_ranking_due",
+                    payload={},
+                    status="pending",
+                    attempts=0,
+                    max_attempts=5,
+                    error=None,
+                    claimed_by=None,
+                    run_after=now - timedelta(minutes=1),
+                    last_heartbeat=None,
+                    created_at=now - timedelta(minutes=2),
+                    updated_at=now - timedelta(minutes=1),
+                )
+            )
+
+    assert process_one_task(
+        session_factory=session_factory,
+        settings=cast(Any, AppSettings)(_env_file=None),
+        worker_id="w1",
+    )
+
+    with session_factory() as db:
+        with db.begin():
+            task = db.get(BackgroundTaskRecord, "tsk_legacy_attention")
+            assert task is not None
+            assert task.status == "dead_letter"
+            assert task.attempts == 1
+            assert task.max_attempts == 5
+            assert task.error == "unsupported task type: attention_ranking_due"
+            assert task.run_after == now
 
 
 def test_subscription_renewal_task_enqueues_provider_sync_work(

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Generator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
+import json
 from typing import Any, cast
 
 from fastapi.testclient import TestClient
@@ -13,6 +14,7 @@ from testcontainers.postgres import PostgresContainer
 from ariel.app import ModelAdapter, create_app
 from ariel.config import AppSettings
 from ariel.persistence import (
+    AutonomyScopeRecord,
     ProactiveActionExecutionRecord,
     ProactiveActionPlanRecord,
     ProactiveCaseEventRecord,
@@ -23,8 +25,18 @@ from ariel.persistence import (
     ProactivePolicyValidationRecord,
     ProactiveTurnRecord,
 )
+from ariel.proactivity import process_proactive_deliberation_due
 from ariel.worker import process_one_task
 from tests.integration.responses_helpers import responses_message
+
+
+_ID_COUNTER = 0
+
+
+def _new_test_id(prefix: str) -> str:
+    global _ID_COUNTER
+    _ID_COUNTER += 1
+    return f"{prefix}_api_{_ID_COUNTER}"
 
 
 @dataclass
@@ -41,12 +53,176 @@ class StaticAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        del input_items, tools, user_message, history, context_bundle
+        del input_items, tools, user_message, history
+        if context_bundle.get("origin") == "feedback_learning":
+            assistant_text = json.dumps(
+                {
+                    "learning_records": [
+                        {
+                            "record_type": "autonomy_request",
+                            "content": {
+                                "instruction": "Propose an autonomy scope for this pattern.",
+                                "case_id": "case_api",
+                                "note": "Handle this next time.",
+                            },
+                        }
+                    ]
+                },
+                sort_keys=True,
+            )
+        else:
+            assistant_text = "ok"
         return responses_message(
-            assistant_text="ok",
+            assistant_text=assistant_text,
             provider=self.provider,
             model=self.model,
             provider_response_id="resp_proactive_api_123",
+            input_tokens=1,
+            output_tokens=1,
+        )
+
+
+def _feedback_learning_context(context_bundle: dict[str, Any]) -> dict[str, Any]:
+    model_input = context_bundle.get("model_input")
+    if not isinstance(model_input, list):
+        return {}
+    for item in model_input:
+        content = item.get("content") if isinstance(item, dict) else None
+        if not isinstance(content, str):
+            continue
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict) and isinstance(parsed.get("feedback"), dict):
+            return parsed
+    return {}
+
+
+@dataclass
+class FeedbackTypeEchoAdapter:
+    provider: str = "provider.proactive-feedback"
+    model: str = "model.proactive-feedback-v1"
+    seen_feedback_types: list[str] = field(default_factory=list)
+
+    def create_response(
+        self,
+        *,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
+        history: list[dict[str, Any]],
+        context_bundle: dict[str, Any],
+    ) -> dict[str, Any]:
+        del input_items, tools, user_message, history
+        context = _feedback_learning_context(context_bundle)
+        raw_feedback = context.get("feedback") if isinstance(context, dict) else {}
+        feedback = raw_feedback if isinstance(raw_feedback, dict) else {}
+        raw_proactive_case = context.get("case") if isinstance(context, dict) else {}
+        proactive_case = raw_proactive_case if isinstance(raw_proactive_case, dict) else {}
+        feedback_type = str(feedback.get("feedback_type") or "")
+        self.seen_feedback_types.append(feedback_type)
+        return responses_message(
+            assistant_text=json.dumps(
+                {
+                    "learning_records": [
+                        {
+                            "record_type": "example",
+                            "content": {
+                                "case_id": proactive_case.get("id"),
+                                "feedback_type": feedback_type,
+                                "note": feedback.get("note"),
+                            },
+                        }
+                    ]
+                },
+                sort_keys=True,
+            ),
+            provider=self.provider,
+            model=self.model,
+            provider_response_id=f"resp_feedback_{feedback_type or 'unknown'}",
+            input_tokens=1,
+            output_tokens=1,
+        )
+
+
+@dataclass
+class InvalidFeedbackLearnerAdapter:
+    provider: str = "provider.proactive-feedback-invalid"
+    model: str = "model.proactive-feedback-invalid-v1"
+
+    def create_response(
+        self,
+        *,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
+        history: list[dict[str, Any]],
+        context_bundle: dict[str, Any],
+    ) -> dict[str, Any]:
+        del input_items, tools, user_message, history, context_bundle
+        return responses_message(
+            assistant_text="{not json",
+            provider=self.provider,
+            model=self.model,
+            provider_response_id="resp_feedback_invalid",
+            input_tokens=1,
+            output_tokens=1,
+        )
+
+
+@dataclass
+class SchemaInvalidFeedbackLearnerAdapter:
+    provider: str = "provider.proactive-feedback-schema-invalid"
+    model: str = "model.proactive-feedback-schema-invalid-v1"
+
+    def create_response(
+        self,
+        *,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
+        history: list[dict[str, Any]],
+        context_bundle: dict[str, Any],
+    ) -> dict[str, Any]:
+        del input_items, tools, user_message, history, context_bundle
+        return responses_message(
+            assistant_text=json.dumps(
+                {"learning_records": [{"record_type": "example"}]},
+                sort_keys=True,
+            ),
+            provider=self.provider,
+            model=self.model,
+            provider_response_id="resp_feedback_schema_invalid",
+            input_tokens=1,
+            output_tokens=1,
+        )
+
+
+@dataclass
+class DecisionAdapter:
+    decision: dict[str, Any]
+    provider: str = "provider.proactive-action"
+    model: str = "model.proactive-action-v1"
+
+    def create_response(
+        self,
+        *,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
+        history: list[dict[str, Any]],
+        context_bundle: dict[str, Any],
+    ) -> dict[str, Any]:
+        del input_items, tools, user_message, history
+        assistant_text = json.dumps(self.decision, sort_keys=True)
+        if context_bundle.get("origin") != "proactive":
+            assistant_text = "ok"
+        return responses_message(
+            assistant_text=assistant_text,
+            provider=self.provider,
+            model=self.model,
+            provider_response_id="resp_proactive_action",
             input_tokens=1,
             output_tokens=1,
         )
@@ -76,6 +252,7 @@ def _seed_case(
     *,
     case_id: str = "case_api",
     undo_supported: bool = True,
+    taint: dict[str, Any] | None = None,
 ) -> None:
     now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
     with _session_factory(client)() as db:
@@ -91,7 +268,7 @@ def _seed_case(
                 summary="The job reached a state worth surfacing.",
                 payload={"status": "waiting"},
                 evidence={"job_id": f"job_{case_id}"},
-                taint={"status": "clean"},
+                taint=taint or {"status": "clean"},
                 trust_boundary="trusted_internal",
                 status="linked",
                 observed_at=now,
@@ -218,6 +395,70 @@ def _seed_case(
                 db.add(execution)
 
 
+def _seed_scope(
+    client: TestClient,
+    *,
+    scope_id: str,
+    action_type: str,
+    target_system: str,
+    source_context: dict[str, Any] | None = None,
+    allowed_payload_shape: dict[str, Any] | None = None,
+    max_impact: str = "low",
+) -> None:
+    now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
+    with _session_factory(client)() as db:
+        with db.begin():
+            db.add(
+                AutonomyScopeRecord(
+                    id=scope_id,
+                    scope_key=f"scope:{scope_id}",
+                    actor="proactive",
+                    source_context=source_context or {},
+                    action_type=action_type,
+                    target_system=target_system,
+                    allowed_target_systems=[target_system],
+                    allowed_payload={},
+                    allowed_payload_shape=allowed_payload_shape or {},
+                    max_impact=max_impact,
+                    revocation_rule="manual",
+                    notification_rule="notify_after",
+                    audit_visibility="operator_visible",
+                    version=1,
+                    status="active",
+                    revoked_at=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
+
+def _run_decision(client: TestClient, *, case_id: str, adapter: DecisionAdapter) -> None:
+    process_proactive_deliberation_due(
+        session_factory=_session_factory(client),
+        task_payload={"case_id": case_id},
+        settings=cast(Any, AppSettings)(_env_file=None),
+        model_adapter=adapter,
+        now_fn=lambda: datetime(2026, 5, 7, 12, 1, tzinfo=UTC),
+        new_id_fn=_new_test_id,
+    )
+
+
+def _decision_payload(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "decision": "act_now",
+        "confidence": 0.9,
+        "urgency": "normal",
+        "user_visible_message": None,
+        "rationale": "The proactive API test supplied this action.",
+        "evidence_refs": ["latest_observation"],
+        "tool_refs": [],
+        "actions": [],
+        "follow_up": None,
+    }
+    payload.update(overrides)
+    return payload
+
+
 def test_missing_proactive_case_subresources_return_404(postgres_url: str) -> None:
     with _build_client(postgres_url, StaticAdapter()) as client:
         get_paths = [
@@ -331,6 +572,7 @@ def test_automatic_next_time_feedback_creates_autonomy_request_learning_record(
         )
         assert feedback.status_code == 200
         assert feedback.json()["feedback"]["feedback_type"] == "automatic_next_time"
+        feedback_id = feedback.json()["feedback"]["id"]
 
         assert process_one_task(
             session_factory=_session_factory(client),
@@ -339,19 +581,748 @@ def test_automatic_next_time_feedback_creates_autonomy_request_learning_record(
             model_adapter=StaticAdapter(),
         )
 
-        learning = client.get("/v1/proactive/learning-records")
-        assert learning.status_code == 200
-        record = learning.json()["learning_records"][0]
-        assert record["record_type"] == "autonomy_request"
-        assert record["content"] == {
-            "instruction": "Propose an autonomy scope for this pattern.",
-            "case_id": "case_api",
-            "note": "Handle this next time.",
-        }
-
         with _session_factory(client)() as db:
             with db.begin():
+                record = (
+                    db.execute(
+                        text(
+                            "SELECT feedback_id, record_type, content, model, prompt_version, "
+                            "provider_response_id, parse_status, validation_status "
+                            "FROM proactive_learning_records LIMIT 1"
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+                assert record["record_type"] == "autonomy_request"
+                assert record["content"]["instruction"] == (
+                    "Propose an autonomy scope for this pattern."
+                )
+                assert record["content"]["case_id"] == "case_api"
+                assert record["content"]["note"] == "Handle this next time."
+                assert record["feedback_id"] == feedback_id
+                assert record["model"] == "model.proactive-api-v1"
+                assert record["provider_response_id"] == "resp_proactive_api_123"
+                assert record["prompt_version"] == "proactive-feedback-learning-v1"
+                assert record["parse_status"] == "parsed"
+                assert record["validation_status"] == "valid"
                 task_status = db.execute(
                     text("SELECT status FROM background_tasks ORDER BY created_at DESC LIMIT 1")
                 ).scalar_one()
                 assert task_status == "completed"
+
+
+def test_all_feedback_types_are_processed_by_ai_feedback_learner(postgres_url: str) -> None:
+    adapter = FeedbackTypeEchoAdapter()
+    feedback_types = [
+        "stop_pattern",
+        "more_aggressive",
+        "useful",
+        "wrong",
+        "correct",
+        "ack",
+        "automatic_next_time",
+    ]
+    with _build_client(postgres_url, adapter) as client:
+        for index, feedback_type in enumerate(feedback_types):
+            case_id = f"case_f{index}"
+            _seed_case(client, case_id=case_id, undo_supported=False)
+            feedback = client.post(
+                f"/v1/proactive/cases/{case_id}/feedback",
+                json={"feedback_type": feedback_type, "note": f"note {feedback_type}"},
+            )
+            assert feedback.status_code == 200
+            assert process_one_task(
+                session_factory=_session_factory(client),
+                settings=cast(Any, AppSettings)(_env_file=None),
+                worker_id="worker-proactive-feedback",
+                model_adapter=adapter,
+            )
+
+        with _session_factory(client)() as db:
+            with db.begin():
+                records = [
+                    dict(row)
+                    for row in db.execute(
+                        text(
+                            "SELECT feedback_id, content, model, prompt_version, "
+                            "parse_status, validation_status "
+                            "FROM proactive_learning_records"
+                        )
+                    ).mappings()
+                ]
+                assert adapter.seen_feedback_types == feedback_types
+                assert {record["content"]["feedback_type"] for record in records} == set(
+                    feedback_types
+                )
+                for record in records:
+                    assert record["model"] == "model.proactive-feedback-v1"
+                    assert record["prompt_version"] == "proactive-feedback-learning-v1"
+                    assert record["parse_status"] == "parsed"
+                    assert record["validation_status"] == "valid"
+                    assert record["feedback_id"] is not None
+                judgments = [
+                    dict(row)
+                    for row in db.execute(
+                        text(
+                            "SELECT source_id, status, model, prompt_version, "
+                            "provider_response_id, parse_status, validation_status "
+                            "FROM ai_judgments "
+                            "WHERE judgment_type = 'feedback_learning' "
+                            "ORDER BY created_at ASC"
+                        )
+                    ).mappings()
+                ]
+                assert len(judgments) == len(feedback_types)
+                assert {judgment["source_id"] for judgment in judgments} == {
+                    record["feedback_id"] for record in records
+                }
+                for judgment in judgments:
+                    assert judgment["status"] == "succeeded"
+                    assert judgment["model"] == "model.proactive-feedback-v1"
+                    assert judgment["prompt_version"] == "proactive-feedback-learning-v1"
+                    assert str(judgment["provider_response_id"]).startswith("resp_feedback_")
+                    assert judgment["parse_status"] == "parsed"
+                    assert judgment["validation_status"] == "valid"
+
+
+def test_invalid_feedback_learner_output_fails_closed(postgres_url: str) -> None:
+    adapter = InvalidFeedbackLearnerAdapter()
+    with _build_client(postgres_url, adapter) as client:
+        _seed_case(client, undo_supported=False)
+        feedback = client.post(
+            "/v1/proactive/cases/case_api/feedback",
+            json={"feedback_type": "useful", "note": "good interruption"},
+        )
+        assert feedback.status_code == 200
+
+        assert process_one_task(
+            session_factory=_session_factory(client),
+            settings=cast(Any, AppSettings)(_env_file=None),
+            worker_id="worker-proactive-feedback-invalid",
+            model_adapter=adapter,
+        )
+
+        learning = client.get("/v1/proactive/learning-records")
+        assert learning.status_code == 200
+        assert learning.json()["learning_records"] == []
+
+        with _session_factory(client)() as db:
+            with db.begin():
+                task = (
+                    db.execute(
+                        text(
+                            "SELECT status, error FROM background_tasks "
+                            "WHERE task_type = 'proactive_feedback_learning_due' "
+                            "ORDER BY updated_at DESC LIMIT 1"
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+                assert task["status"] == "pending"
+                assert str(task["error"]).startswith("feedback_learner_parse_failed:")
+                failure_type = db.execute(
+                    text(
+                        "SELECT payload ->> 'failure_type' FROM proactive_case_events "
+                        "WHERE case_id = 'case_api' AND event_type = 'failed' "
+                        "ORDER BY created_at DESC LIMIT 1"
+                    )
+                ).scalar_one()
+                assert failure_type == "feedback_learning_failed"
+                judgment = (
+                    db.execute(
+                        text(
+                            "SELECT status, model, provider_response_id, parse_status, "
+                            "validation_status, failure_code "
+                            "FROM ai_judgments "
+                            "WHERE judgment_type = 'feedback_learning' "
+                            "ORDER BY created_at DESC LIMIT 1"
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+                assert judgment == {
+                    "status": "failed",
+                    "model": "model.proactive-feedback-invalid-v1",
+                    "provider_response_id": "resp_feedback_invalid",
+                    "parse_status": "invalid_json",
+                    "validation_status": "not_validated",
+                    "failure_code": "E_AI_JUDGMENT_INVALID_JSON",
+                }
+
+
+def test_schema_invalid_feedback_learner_output_fails_closed(postgres_url: str) -> None:
+    adapter = SchemaInvalidFeedbackLearnerAdapter()
+    with _build_client(postgres_url, adapter) as client:
+        _seed_case(client, undo_supported=False)
+        feedback = client.post(
+            "/v1/proactive/cases/case_api/feedback",
+            json={"feedback_type": "useful", "note": "good interruption"},
+        )
+        assert feedback.status_code == 200
+        feedback_id = feedback.json()["feedback"]["id"]
+
+        assert process_one_task(
+            session_factory=_session_factory(client),
+            settings=cast(Any, AppSettings)(_env_file=None),
+            worker_id="worker-proactive-feedback-schema-invalid",
+            model_adapter=adapter,
+        )
+
+        learning = client.get("/v1/proactive/learning-records")
+        assert learning.status_code == 200
+        assert learning.json()["learning_records"] == []
+
+        with _session_factory(client)() as db:
+            with db.begin():
+                task = (
+                    db.execute(
+                        text(
+                            "SELECT status, error FROM background_tasks "
+                            "WHERE task_type = 'proactive_feedback_learning_due' "
+                            "ORDER BY updated_at DESC LIMIT 1"
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+                assert task["status"] == "pending"
+                assert task["error"] == ("feedback_learner_validation_failed:record_schema_invalid")
+                assert (
+                    db.execute(text("SELECT COUNT(*) FROM proactive_learning_records")).scalar_one()
+                    == 0
+                )
+                judgment = (
+                    db.execute(
+                        text(
+                            "SELECT source_id, status, model, provider_response_id, "
+                            "parse_status, validation_status, failure_code, failure_reason "
+                            "FROM ai_judgments "
+                            "WHERE judgment_type = 'feedback_learning' "
+                            "ORDER BY created_at DESC LIMIT 1"
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+                assert judgment == {
+                    "source_id": feedback_id,
+                    "status": "failed",
+                    "model": "model.proactive-feedback-schema-invalid-v1",
+                    "provider_response_id": "resp_feedback_schema_invalid",
+                    "parse_status": "schema_invalid",
+                    "validation_status": "invalid",
+                    "failure_code": "E_AI_JUDGMENT_SCHEMA",
+                    "failure_reason": "feedback_learner_validation_failed:record_schema_invalid",
+                }
+
+
+def test_autonomy_scope_enforces_target_recipient_and_payload_shape(
+    postgres_url: str,
+) -> None:
+    email_shape = {
+        "required": {
+            "to": "list",
+            "cc": "list",
+            "bcc": "list",
+            "subject": "string",
+            "body": "string",
+        },
+        "allow_extra": False,
+    }
+    good_action: dict[str, Any] = {
+        "action_type": "cap.email.draft",
+        "target": "team-email",
+        "target_system": "gmail",
+        "payload": {
+            "to": ["ops@example.com"],
+            "cc": [],
+            "bcc": [],
+            "subject": "Status",
+            "body": "Please review the blocked job.",
+        },
+        "risk_tier": "low",
+    }
+    with _build_client(postgres_url, DecisionAdapter(_decision_payload())) as client:
+        _seed_scope(
+            client,
+            scope_id="scope_email",
+            action_type="cap.email.draft",
+            target_system="gmail",
+            source_context={
+                "allowed_targets": ["team-email"],
+                "allowed_recipients": ["ops@example.com"],
+            },
+            allowed_payload_shape=email_shape,
+        )
+
+        _seed_case(client, case_id="case_allowed", undo_supported=False)
+        _run_decision(
+            client,
+            case_id="case_allowed",
+            adapter=DecisionAdapter(_decision_payload(actions=[good_action])),
+        )
+        with _session_factory(client)() as db:
+            with db.begin():
+                allowed = (
+                    db.execute(
+                        text(
+                            "SELECT result, denial_reason FROM proactive_policy_validations "
+                            "WHERE case_id = 'case_allowed' ORDER BY created_at DESC LIMIT 1"
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+                plan_count = db.execute(
+                    text(
+                        "SELECT COUNT(*) FROM proactive_action_plans "
+                        "WHERE case_id = 'case_allowed' AND action_type = 'cap.email.draft'"
+                    )
+                ).scalar_one()
+                assert allowed["result"] == "authorized"
+                assert allowed["denial_reason"] is None
+                assert plan_count == 1
+                judgment = (
+                    db.execute(
+                        text(
+                            "SELECT status, prompt_version, parse_status, validation_status "
+                            "FROM ai_judgments WHERE source_id = 'case_allowed' "
+                            "AND judgment_type = 'proactive_deliberation'"
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+                assert judgment == {
+                    "status": "succeeded",
+                    "prompt_version": "proactive-ai-deliberation-v1",
+                    "parse_status": "parsed",
+                    "validation_status": "valid",
+                }
+
+        _seed_case(client, case_id="case_bad_target", undo_supported=False)
+        bad_target = {**good_action, "target": "other-email"}
+        _run_decision(
+            client,
+            case_id="case_bad_target",
+            adapter=DecisionAdapter(_decision_payload(actions=[bad_target])),
+        )
+
+        _seed_case(client, case_id="case_bad_recipient", undo_supported=False)
+        bad_recipient = {
+            **good_action,
+            "payload": {**good_action["payload"], "to": ["outside@example.com"]},
+        }
+        _run_decision(
+            client,
+            case_id="case_bad_recipient",
+            adapter=DecisionAdapter(_decision_payload(actions=[bad_recipient])),
+        )
+
+        _seed_scope(
+            client,
+            scope_id="scope_shape",
+            action_type="cap.framework.write_draft",
+            target_system="cap.framework.write_draft",
+            source_context={"allowed_targets": ["framework"]},
+            allowed_payload_shape={"required": {"title": "string"}, "allow_extra": False},
+        )
+        _seed_case(client, case_id="case_bad_shape", undo_supported=False)
+        bad_shape = {
+            "action_type": "cap.framework.write_draft",
+            "target": "framework",
+            "payload": {"note": "Draft the note."},
+            "risk_tier": "low",
+        }
+        _run_decision(
+            client,
+            case_id="case_bad_shape",
+            adapter=DecisionAdapter(_decision_payload(actions=[bad_shape])),
+        )
+
+        with _session_factory(client)() as db:
+            with db.begin():
+                denials = {
+                    row["case_id"]: row["denial_reason"]
+                    for row in db.execute(
+                        text(
+                            "SELECT case_id, denial_reason FROM proactive_policy_validations "
+                            "WHERE case_id IN ("
+                            "'case_bad_target', 'case_bad_recipient', 'case_bad_shape'"
+                            ") ORDER BY case_id"
+                        )
+                    ).mappings()
+                }
+                assert denials == {
+                    "case_bad_recipient": "recipient is outside autonomy scope for cap.email.draft",
+                    "case_bad_shape": (
+                        "payload shape is outside autonomy scope for cap.framework.write_draft"
+                    ),
+                    "case_bad_target": "target is outside autonomy scope for cap.email.draft",
+                }
+
+
+def test_autonomy_scope_selection_checks_later_full_scope(
+    postgres_url: str,
+) -> None:
+    email_shape = {
+        "required": {
+            "to": "list",
+            "cc": "list",
+            "bcc": "list",
+            "subject": "string",
+            "body": "string",
+        },
+        "allow_extra": False,
+    }
+    action = {
+        "action_type": "cap.email.draft",
+        "target": "team-email",
+        "target_system": "gmail",
+        "payload": {
+            "to": ["ops@example.com"],
+            "cc": [],
+            "bcc": [],
+            "subject": "Status",
+            "body": "Please review the blocked job.",
+        },
+        "risk_tier": "low",
+    }
+
+    with _build_client(postgres_url, DecisionAdapter(_decision_payload())) as client:
+        _seed_scope(
+            client,
+            scope_id="scope_multi_a_bad_recipient",
+            action_type="cap.email.draft",
+            target_system="gmail",
+            source_context={
+                "allowed_targets": ["team-email"],
+                "allowed_recipients": ["finance@example.com"],
+            },
+            allowed_payload_shape=email_shape,
+        )
+        _seed_scope(
+            client,
+            scope_id="scope_multi_b_authorized",
+            action_type="cap.email.draft",
+            target_system="gmail",
+            source_context={
+                "allowed_targets": ["team-email"],
+                "allowed_recipients": ["ops@example.com"],
+            },
+            allowed_payload_shape=email_shape,
+        )
+        _seed_case(client, case_id="case_multi_scope", undo_supported=False)
+        _run_decision(
+            client,
+            case_id="case_multi_scope",
+            adapter=DecisionAdapter(_decision_payload(actions=[action])),
+        )
+
+        with _session_factory(client)() as db:
+            with db.begin():
+                validation = (
+                    db.execute(
+                        text(
+                            "SELECT result, denial_reason, constraints "
+                            "FROM proactive_policy_validations "
+                            "WHERE case_id = 'case_multi_scope' "
+                            "ORDER BY created_at DESC LIMIT 1"
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+                plan_count = db.execute(
+                    text(
+                        "SELECT COUNT(*) FROM proactive_action_plans "
+                        "WHERE case_id = 'case_multi_scope'"
+                    )
+                ).scalar_one()
+
+    assert validation["result"] == "authorized"
+    assert validation["denial_reason"] is None
+    assert validation["constraints"]["considered_scope_ids"] == [
+        "scope_multi_a_bad_recipient",
+        "scope_multi_b_authorized",
+    ]
+    assert plan_count == 1
+
+
+def test_autonomy_scope_selection_does_not_union_partial_scopes(
+    postgres_url: str,
+) -> None:
+    email_shape = {
+        "required": {
+            "to": "list",
+            "cc": "list",
+            "bcc": "list",
+            "subject": "string",
+            "body": "string",
+        },
+        "allow_extra": False,
+    }
+    action = {
+        "action_type": "cap.email.draft",
+        "target": "team-email",
+        "target_system": "gmail",
+        "payload": {
+            "to": ["ops@example.com"],
+            "cc": [],
+            "bcc": [],
+            "subject": "Status",
+            "body": "Please review the blocked job.",
+        },
+        "risk_tier": "low",
+    }
+
+    with _build_client(postgres_url, DecisionAdapter(_decision_payload())) as client:
+        _seed_scope(
+            client,
+            scope_id="scope_partial_target",
+            action_type="cap.email.draft",
+            target_system="gmail",
+            source_context={
+                "allowed_targets": ["team-email"],
+                "allowed_recipients": ["finance@example.com"],
+            },
+            allowed_payload_shape=email_shape,
+        )
+        _seed_scope(
+            client,
+            scope_id="scope_partial_recipient",
+            action_type="cap.email.draft",
+            target_system="gmail",
+            source_context={
+                "allowed_targets": ["finance-email"],
+                "allowed_recipients": ["ops@example.com"],
+            },
+            allowed_payload_shape=email_shape,
+        )
+        _seed_case(client, case_id="case_partial_scopes", undo_supported=False)
+        _run_decision(
+            client,
+            case_id="case_partial_scopes",
+            adapter=DecisionAdapter(_decision_payload(actions=[action])),
+        )
+
+        with _session_factory(client)() as db:
+            with db.begin():
+                validation = (
+                    db.execute(
+                        text(
+                            "SELECT result, denial_reason, constraints "
+                            "FROM proactive_policy_validations "
+                            "WHERE case_id = 'case_partial_scopes' "
+                            "ORDER BY created_at DESC LIMIT 1"
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+                plan_count = db.execute(
+                    text(
+                        "SELECT COUNT(*) FROM proactive_action_plans "
+                        "WHERE case_id = 'case_partial_scopes'"
+                    )
+                ).scalar_one()
+
+    assert validation["result"] == "needs_user_authority"
+    assert validation["denial_reason"] in {
+        "recipient is outside autonomy scope for cap.email.draft",
+        "target is outside autonomy scope for cap.email.draft",
+    }
+    assert validation["constraints"]["considered_scope_ids"] == [
+        "scope_partial_recipient",
+        "scope_partial_target",
+    ]
+    assert plan_count == 0
+
+
+def test_autonomy_scope_missing_target_or_recipient_scope_denies_writes(
+    postgres_url: str,
+) -> None:
+    email_shape = {
+        "required": {
+            "to": "list",
+            "cc": "list",
+            "bcc": "list",
+            "subject": "string",
+            "body": "string",
+        },
+        "allow_extra": False,
+    }
+    email_action = {
+        "action_type": "cap.email.draft",
+        "target": "team-email",
+        "target_system": "gmail",
+        "payload": {
+            "to": ["ops@example.com"],
+            "cc": [],
+            "bcc": [],
+            "subject": "Status",
+            "body": "Please review the blocked job.",
+        },
+        "risk_tier": "low",
+    }
+    framework_action = {
+        "action_type": "cap.framework.write_draft",
+        "target": "framework",
+        "payload": {"note": "Draft the note."},
+        "risk_tier": "low",
+    }
+    with _build_client(postgres_url, DecisionAdapter(_decision_payload())) as client:
+        _seed_scope(
+            client,
+            scope_id="scope_no_target",
+            action_type="cap.framework.write_draft",
+            target_system="cap.framework.write_draft",
+            source_context={},
+            allowed_payload_shape={"required": {"note": "string"}, "allow_extra": False},
+        )
+        _seed_case(client, case_id="case_no_target", undo_supported=False)
+        _run_decision(
+            client,
+            case_id="case_no_target",
+            adapter=DecisionAdapter(_decision_payload(actions=[framework_action])),
+        )
+
+        _seed_scope(
+            client,
+            scope_id="scope_no_recipient",
+            action_type="cap.email.draft",
+            target_system="gmail",
+            source_context={"allowed_targets": ["team-email"]},
+            allowed_payload_shape=email_shape,
+        )
+        _seed_case(client, case_id="case_no_recipient", undo_supported=False)
+        _run_decision(
+            client,
+            case_id="case_no_recipient",
+            adapter=DecisionAdapter(_decision_payload(actions=[email_action])),
+        )
+
+        with _session_factory(client)() as db:
+            with db.begin():
+                denials = {
+                    row["case_id"]: row["denial_reason"]
+                    for row in db.execute(
+                        text(
+                            "SELECT case_id, denial_reason FROM proactive_policy_validations "
+                            "WHERE case_id IN ('case_no_target', 'case_no_recipient')"
+                        )
+                    ).mappings()
+                }
+
+    assert denials == {
+        "case_no_recipient": "recipient is outside autonomy scope for cap.email.draft",
+        "case_no_target": "target is outside autonomy scope for cap.framework.write_draft",
+    }
+
+
+def test_tainted_context_cannot_execute_low_risk_autonomous_write(
+    postgres_url: str,
+) -> None:
+    action = {
+        "action_type": "cap.framework.write_draft",
+        "target": "framework",
+        "payload": {"note": "Draft from tainted content."},
+        "risk_tier": "low",
+    }
+    with _build_client(postgres_url, DecisionAdapter(_decision_payload())) as client:
+        _seed_scope(
+            client,
+            scope_id="scope_tainted",
+            action_type="cap.framework.write_draft",
+            target_system="cap.framework.write_draft",
+            source_context={"allowed_targets": ["framework"]},
+            allowed_payload_shape={"required": {"note": "string"}, "allow_extra": False},
+        )
+        _seed_case(
+            client,
+            case_id="case_tainted",
+            undo_supported=False,
+            taint={"provenance_status": "tainted", "reason": "prompt_injection"},
+        )
+        _run_decision(
+            client,
+            case_id="case_tainted",
+            adapter=DecisionAdapter(_decision_payload(actions=[action])),
+        )
+
+        with _session_factory(client)() as db:
+            with db.begin():
+                validation = (
+                    db.execute(
+                        text(
+                            "SELECT result, denial_reason FROM proactive_policy_validations "
+                            "WHERE case_id = 'case_tainted' ORDER BY created_at DESC LIMIT 1"
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+                plan_count = db.execute(
+                    text(
+                        "SELECT COUNT(*) FROM proactive_action_plans WHERE case_id = 'case_tainted'"
+                    )
+                ).scalar_one()
+                assert validation["result"] == "denied"
+                assert validation["denial_reason"] == (
+                    "tainted context cannot execute autonomous write"
+                )
+                assert plan_count == 0
+
+
+def test_proactive_write_uses_capability_preflight_before_action_plan(
+    postgres_url: str,
+) -> None:
+    action = {
+        "action_type": "cap.framework.external_notify",
+        "target": "framework-notify",
+        "target_system": "framework",
+        "payload": {"destination": "evil.example", "message": "Notify outside scope."},
+        "risk_tier": "low",
+    }
+    with _build_client(postgres_url, DecisionAdapter(_decision_payload())) as client:
+        _seed_scope(
+            client,
+            scope_id="scope_external",
+            action_type="cap.framework.external_notify",
+            target_system="framework",
+            source_context={"allowed_targets": ["framework-notify"]},
+            allowed_payload_shape={
+                "required": {"destination": "string", "message": "string"},
+                "allow_extra": False,
+            },
+        )
+        _seed_case(client, case_id="case_egress", undo_supported=False)
+        _run_decision(
+            client,
+            case_id="case_egress",
+            adapter=DecisionAdapter(_decision_payload(actions=[action])),
+        )
+
+        with _session_factory(client)() as db:
+            with db.begin():
+                validation = (
+                    db.execute(
+                        text(
+                            "SELECT result, denial_reason FROM proactive_policy_validations "
+                            "WHERE case_id = 'case_egress' ORDER BY created_at DESC LIMIT 1"
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+                plan_count = db.execute(
+                    text(
+                        "SELECT COUNT(*) FROM proactive_action_plans WHERE case_id = 'case_egress'"
+                    )
+                ).scalar_one()
+                assert validation["result"] == "denied"
+                assert validation["denial_reason"] == "egress_destination_denied:evil.example"
+                assert plan_count == 0

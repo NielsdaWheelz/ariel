@@ -14,7 +14,9 @@ from testcontainers.postgres import PostgresContainer
 from ariel.app import create_app
 from ariel.config import AppSettings
 from ariel.executor import ExecutionResult
+from ariel.memory import AIJudgmentFailure
 from ariel.persistence import (
+    AIJudgmentRecord,
     AutonomyScopeRecord,
     MemoryAssertionRecord,
     ProactiveActionExecutionRecord,
@@ -208,9 +210,17 @@ def _seed_scope(
                 updated_at=now,
             )
             for field_name, value in {
-                "source_context": {},
+                "source_context": {
+                    "allowed_targets": ["owner-discord"]
+                    if action_type == "send_discord_message"
+                    else ["framework"]
+                },
                 "allowed_target_systems": [target_system],
-                "allowed_payload_shape": {},
+                "allowed_payload_shape": (
+                    {"required": {"message": "string"}, "allow_extra": False}
+                    if action_type == "send_discord_message"
+                    else {"required": {"note": "string"}, "allow_extra": False}
+                ),
                 "revocation_rule": "manual",
                 "audit_visibility": "private",
                 "version": 1,
@@ -281,10 +291,58 @@ def test_json_parse_failure_persists_invalid_decision_record(postgres_url: str) 
                 assert decision is not None
                 assert decision.status == "invalid"
                 assert decision.raw_model_output["parse_error"]
-                assert validation is not None
-                assert validation.result == "invalid_decision"
                 assert case is not None
                 assert case.status == "failed"
+                assert validation is not None
+                assert validation.result == "invalid_decision"
+
+
+def test_proactive_memory_curation_failure_is_case_audited_before_deliberation(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
+    adapter = ProactiveAdapter(json.dumps(_decision_payload(decision="ignore")))
+
+    def fail_memory_context(*args: Any, **kwargs: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+        del args, kwargs
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_SCHEMA",
+            safe_reason="fixture memory curation failed",
+            retryable=True,
+            parse_status="schema_invalid",
+            validation_status="invalid",
+            provider_response_id="resp_memory_failure",
+        )
+
+    monkeypatch.setattr("ariel.proactivity.build_memory_context", fail_memory_context)
+
+    with _build_client(postgres_url, adapter) as client:
+        case_id = _seed_case(client, now=now)
+        with pytest.raises(RuntimeError, match="fixture memory curation failed"):
+            _run_deliberation(client, case_id=case_id, adapter=adapter, now=now)
+
+        with _session_factory(client)() as db:
+            case = db.get(ProactiveCaseRecord, case_id)
+            assert case is not None
+            assert case.status == "failed"
+            judgments = db.scalars(
+                select(AIJudgmentRecord).order_by(AIJudgmentRecord.created_at.asc())
+            ).all()
+            assert [judgment.judgment_type for judgment in judgments] == [
+                "memory_curation",
+                "proactive_deliberation",
+            ]
+            assert all(judgment.source_id == case_id for judgment in judgments)
+            assert judgments[0].provider_response_id == "resp_memory_failure"
+            assert judgments[0].failure_code == "E_AI_JUDGMENT_SCHEMA"
+            assert judgments[0].parse_status == "schema_invalid"
+            assert judgments[0].validation_status == "invalid"
+            assert judgments[1].input_refs["dependency"] == "memory_curation"
+            assert db.scalar(select(func.count()).select_from(ProactiveContextSnapshotRecord)) == 0
+            assert db.scalar(select(func.count()).select_from(ProactiveDecisionRecord)) == 0
+            assert db.scalar(select(func.count()).select_from(ProactiveTurnRecord)) == 0
+            assert db.scalar(select(func.count()).select_from(ProactiveActionPlanRecord)) == 0
 
 
 def test_deliberation_can_call_read_only_tool_and_store_tool_output(

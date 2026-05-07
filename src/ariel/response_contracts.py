@@ -24,7 +24,7 @@ class SurfaceSessionContract(BaseModel):
 
 SurfaceEventType = Literal[
     "evt.turn.started",
-    "evt.memory.recalled",
+    "evt.memory.curated",
     "evt.memory.evidence_recorded",
     "evt.memory.candidate_proposed",
     "evt.memory.review_required",
@@ -39,7 +39,8 @@ SurfaceEventType = Literal[
     "evt.memory.projection_rebuilt",
     "evt.memory.recall_omitted_item",
     "evt.memory.extraction_queued",
-    "evt.turn.limit_reached",
+    "evt.ai_judgment.failed",
+    "evt.ai_judgment.completed",
     "evt.assistant.emitted",
     "evt.turn.failed",
     "evt.turn.completed",
@@ -166,26 +167,36 @@ class SurfaceMemoryRecallExclusionContract(BaseModel):
     reason: str
 
 
-class SurfaceEventMemoryRecalledPayloadContract(BaseModel):
+class SurfaceMemoryRecallSelectionContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    kind: str
+    rationale: str
+
+
+class SurfaceEventMemoryCuratedPayloadContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_version: str
     projection_version: str
-    max_recalled_items: int
-    included_memory_count: int
+    max_selected_memories: int
+    selected_memory_count: int
+    memory_candidate_count: int
     omitted_memory_count: int
-    included_memory_ids: list[str]
+    selected_memory_ids: list[str]
+    selected_memories: list[SurfaceMemoryRecallSelectionContract]
     omitted_memories: list[SurfaceMemoryRecallExclusionContract]
+    candidate_memory_ids: list[str]
+    candidate_memories: list[dict[str, Any]]
+    curation_rationale: str
+    curation_uncertainty: str
+    curation_confidence: float
+    curation_model: str | None
+    curation_prompt_version: str
+    curation_parse_status: str
+    curation_provider_response_id: str | None = None
     conflict_ids: list[str]
-
-
-class SurfaceEventTurnLimitReachedPayloadContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    code: str
-    message: str
-    limit: SurfaceTurnLimitDetailContract
-    applied_limits: SurfaceAppliedTurnLimitsContract
 
 
 class SurfaceEventAssistantEmittedPayloadContract(BaseModel):
@@ -235,6 +246,12 @@ class SurfaceEventModelFailedPayloadContract(BaseModel):
     duration_ms: int
     failure_reason: str
     attempt: int
+    failure_code: str | None = None
+    parse_status: str | None = None
+    validation_status: Literal["valid", "invalid", "not_validated"] | None = None
+    usage: SurfaceModelUsageContract | None = None
+    provider_response_id: str | None = None
+    response_output_shape: dict[str, Any] | None = None
 
 
 class SurfaceEventActionProposedPayloadContract(BaseModel):
@@ -314,6 +331,43 @@ class SurfaceEventActionExecutionFailedPayloadContract(BaseModel):
 
 class SurfaceEventMemoryPayloadContract(BaseModel):
     model_config = ConfigDict(extra="allow")
+
+
+class SurfaceEventAIJudgmentPayloadContract(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    judgment_type: Literal[
+        "memory_curation",
+        "tool_result_interpretation",
+        "continuity_compaction",
+        "feedback_learning",
+        "ambient_interpretation",
+        "proactive_deliberation",
+        "model_output",
+    ]
+    parse_status: (
+        Literal[
+            "not_required_no_candidates",
+            "parsed",
+            "invalid_json",
+            "missing_output",
+            "schema_invalid",
+        ]
+        | None
+    ) = None
+    validation_status: Literal["valid", "invalid", "not_validated"] | None = None
+    failure_code: (
+        Literal[
+            "E_AI_JUDGMENT_REQUIRED",
+            "E_AI_JUDGMENT_CREDENTIALS",
+            "E_AI_JUDGMENT_TIMEOUT",
+            "E_AI_JUDGMENT_INVALID_JSON",
+            "E_AI_JUDGMENT_SCHEMA",
+            "E_AI_JUDGMENT_VALIDATION",
+            "E_AI_JUDGMENT_BUDGET",
+        ]
+        | None
+    ) = None
 
 
 class SurfaceEventEnvelopeContract(BaseModel):
@@ -582,8 +636,6 @@ class SurfaceMemoryAssertionContract(BaseModel):
     superseded_by_id: str | None
     evidence_refs: list[SurfaceMemoryEvidenceRefContract]
     projection_version: str
-    rank_reason: str | None = None
-    rank_score: float | None = None
 
 
 class SurfaceMemoryConflictContract(BaseModel):
@@ -747,8 +799,14 @@ class SurfaceWorkspaceItemContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
-    provider: Literal["google", "ariel"]
-    item_type: Literal["calendar_event", "email_message", "drive_file", "internal_state"]
+    provider: Literal["google", "ariel", "discord"]
+    item_type: Literal[
+        "calendar_event",
+        "email_message",
+        "drive_file",
+        "internal_state",
+        "discord_message",
+    ]
     external_id: str
     title: str
     summary: str
@@ -785,12 +843,6 @@ class SurfaceProactiveObservationContract(BaseModel):
         "memory_assertion",
         "google_connector",
         "capture",
-        "discord_message",
-        "provider_event",
-        "connector_event",
-        "ci",
-        "location",
-        "local_activity",
     ]
     source_id: str
     dedupe_key: str
@@ -1158,9 +1210,22 @@ class SurfaceProactiveLearningRecordContract(BaseModel):
 
     id: str
     feedback_id: str | None
-    record_type: Literal["instruction", "example", "calibration", "preference", "autonomy_request"]
+    record_type: Literal[
+        "instruction",
+        "example",
+        "calibration",
+        "preference",
+        "source_preference",
+        "prompt_instruction",
+        "autonomy_request",
+    ]
     status: Literal["active", "superseded", "rejected"]
     content: dict[str, Any]
+    model: str | None
+    prompt_version: str
+    provider_response_id: str | None
+    parse_status: Literal["parsed", "invalid_json", "missing_output", "schema_invalid"]
+    validation_status: Literal["valid", "invalid"]
     created_at: str
     updated_at: str
 
@@ -1247,16 +1312,16 @@ def _project_surface_event_payload(
             SurfaceEventTurnStartedPayloadContract,
             payload,
         )
-    if event_type == "evt.memory.recalled":
+    if event_type == "evt.memory.curated":
         return _validate_contract(
-            "surface_event_payload.evt.memory.recalled",
-            SurfaceEventMemoryRecalledPayloadContract,
+            "surface_event_payload.evt.memory.curated",
+            SurfaceEventMemoryCuratedPayloadContract,
             payload,
         )
-    if event_type == "evt.turn.limit_reached":
+    if event_type.startswith("evt.ai_judgment."):
         return _validate_contract(
-            "surface_event_payload.evt.turn.limit_reached",
-            SurfaceEventTurnLimitReachedPayloadContract,
+            f"surface_event_payload.{event_type}",
+            SurfaceEventAIJudgmentPayloadContract,
             payload,
         )
     if event_type == "evt.assistant.emitted":
@@ -1301,6 +1366,7 @@ def _project_surface_event_payload(
         )
     if event_type == "evt.model.failed":
         normalized_payload = dict(payload)
+        normalized_payload["usage"] = _coerce_surface_model_usage(payload.get("usage"))
         if not isinstance(normalized_payload.get("attempt"), int):
             normalized_payload["attempt"] = 1
         return _validate_contract(

@@ -22,7 +22,6 @@ from ariel.persistence import (
     WorkspaceItemRecord,
     to_rfc3339,
 )
-from ariel.proactivity import upsert_proactive_observation
 
 
 def process_provider_event_received(
@@ -295,7 +294,6 @@ def process_provider_sync_due(
                             new_id_fn=new_id_fn,
                         ):
                             item_count += 1
-                            observation_count += 1
             elif resource_type == "gmail":
                 for output in outputs:
                     cursor_after = _payload_text(output, "historyId") or cursor_after
@@ -332,7 +330,6 @@ def process_provider_sync_due(
                             new_id_fn=new_id_fn,
                         ):
                             item_count += 1
-                            observation_count += 1
 
             cursor.cursor_value = cursor_after
             cursor.cursor_version += 1 if cursor_after != cursor_before else 0
@@ -366,7 +363,7 @@ def _sync_calendar_item(
     status = "deleted" if item.get("status") == "cancelled" else "active"
     title = _payload_text(item, "summary") or "Calendar event"
     updated = _payload_text(item, "updated") or to_rfc3339(now)
-    return _upsert_workspace_item_event_and_observation(
+    return _upsert_workspace_item_event(
         db,
         provider="google",
         item_type="calendar_event",
@@ -379,9 +376,6 @@ def _sync_calendar_item(
         event_type="deleted" if status == "deleted" else "updated",
         event_dedupe_key=f"google:calendar:{resource_id}:{external_id}:{status}:{updated}",
         provider_event_id=provider_event_id,
-        observation_subject=f"Calendar changed: {title}",
-        observation_summary=title,
-        observation_reason="Google Calendar delta changed this event.",
         now=now,
         new_id_fn=new_id_fn,
     )
@@ -431,7 +425,7 @@ def _sync_gmail_history(
             message_id = _payload_text(message, "id")
             if message_id is None:
                 continue
-            changed = _upsert_workspace_item_event_and_observation(
+            changed = _upsert_workspace_item_event(
                 db,
                 provider="google",
                 item_type="email_message",
@@ -444,14 +438,10 @@ def _sync_gmail_history(
                 event_type="deleted" if status == "deleted" else "updated",
                 event_dedupe_key=f"google:gmail:{resource_id}:{message_id}:{history_id}:{key}",
                 provider_event_id=provider_event_id,
-                observation_subject=f"Gmail changed: message {message_id}",
-                observation_summary=f"Gmail reported {key} for message {message_id}.",
-                observation_reason="Gmail history changed this message.",
                 now=now,
                 new_id_fn=new_id_fn,
             )
             item_count += 1 if changed else 0
-            observation_count += 1 if changed else 0
     return item_count, observation_count
 
 
@@ -477,7 +467,7 @@ def _sync_drive_change(
     title = _payload_text(file_payload, "name") or f"Drive file {file_id}"
     changed_at = _payload_text(change, "time") or _payload_text(file_payload, "modifiedTime")
     changed_at = changed_at or to_rfc3339(now)
-    return _upsert_workspace_item_event_and_observation(
+    return _upsert_workspace_item_event(
         db,
         provider="google",
         item_type="drive_file",
@@ -490,15 +480,12 @@ def _sync_drive_change(
         event_type="deleted" if status == "deleted" else "updated",
         event_dedupe_key=f"google:drive:{resource_id}:{file_id}:{status}:{changed_at}",
         provider_event_id=provider_event_id,
-        observation_subject=f"Drive changed: {title}",
-        observation_summary=title,
-        observation_reason="Google Drive delta changed this file.",
         now=now,
         new_id_fn=new_id_fn,
     )
 
 
-def _upsert_workspace_item_event_and_observation(
+def _upsert_workspace_item_event(
     db: Session,
     *,
     provider: str,
@@ -512,9 +499,6 @@ def _upsert_workspace_item_event_and_observation(
     event_type: str,
     event_dedupe_key: str,
     provider_event_id: str | None,
-    observation_subject: str,
-    observation_summary: str,
-    observation_reason: str,
     now: datetime,
     new_id_fn: Callable[[str], str],
 ) -> bool:
@@ -577,27 +561,21 @@ def _upsert_workspace_item_event_and_observation(
     )
     db.add(event)
     db.flush()
-    upsert_proactive_observation(
-        db,
-        dedupe_key=f"workspace-event:{event.dedupe_key}",
-        case_key=f"workspace-item:{item.id}",
-        source_type="workspace_item",
-        source_id=item.id,
-        observation_type="workspace_delta",
-        subject=observation_subject,
-        summary=observation_summary,
-        payload={"reason": observation_reason, "workspace_status": status},
-        workspace_item_id=item.id,
-        evidence={
-            "workspace_item_id": item.id,
-            "workspace_item_event_id": event.id,
-            "provider_event_id": provider_event_id,
-        },
-        taint={"provenance_status": "tainted", "source": "google_workspace"},
-        trust_boundary="provider",
-        observed_at=now,
-        now=now,
-        new_id_fn=new_id_fn,
+    db.add(
+        BackgroundTaskRecord(
+            id=new_id_fn("tsk"),
+            task_type="ambient_interpretation_due",
+            payload={"workspace_item_event_id": event.id},
+            status="pending",
+            attempts=0,
+            max_attempts=3,
+            error=None,
+            claimed_by=None,
+            run_after=now,
+            last_heartbeat=None,
+            created_at=now,
+            updated_at=now,
+        )
     )
     return True
 

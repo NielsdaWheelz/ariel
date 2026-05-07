@@ -34,19 +34,23 @@ from .proactivity import (
     process_proactive_deliberation_due,
     process_proactive_feedback_learning_due,
     process_proactive_follow_up_due,
-    process_workspace_observation_derivation_due,
+    process_ambient_interpretation_due,
 )
 from .redaction import safe_failure_reason
 from .sync_runtime import process_provider_event_received, process_provider_sync_due
 
 
 PROACTIVE_RECOVERABLE_TASK_TYPES = (
-    "workspace_observation_derivation_due",
+    "ambient_interpretation_due",
     "proactive_deliberation_due",
     "proactive_follow_up_due",
     "proactive_feedback_learning_due",
     "proactive_action_execution_due",
 )
+
+
+class UnsupportedTaskType(RuntimeError):
+    pass
 
 
 def _utcnow() -> datetime:
@@ -166,7 +170,7 @@ def enqueue_due_worker_owned_ambient_task(
         return None
     latest = db.scalar(
         select(BackgroundTaskRecord)
-        .where(BackgroundTaskRecord.task_type == "workspace_observation_derivation_due")
+        .where(BackgroundTaskRecord.task_type == "ambient_interpretation_due")
         .order_by(
             BackgroundTaskRecord.run_after.desc(),
             BackgroundTaskRecord.created_at.desc(),
@@ -182,7 +186,7 @@ def enqueue_due_worker_owned_ambient_task(
         return None
     return enqueue_background_task(
         db,
-        task_type="workspace_observation_derivation_due",
+        task_type="ambient_interpretation_due",
         payload={"origin": "worker_ambient"},
         now=now,
         max_attempts=settings.proactive_worker_max_attempts,
@@ -322,10 +326,12 @@ def process_one_task(
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                 )
-            case "workspace_observation_derivation_due":
-                process_workspace_observation_derivation_due(
+            case "ambient_interpretation_due":
+                process_ambient_interpretation_due(
                     session_factory=session_factory,
                     task_payload=task_payload,
+                    settings=resolved_settings,
+                    model_adapter=model_adapter,
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                 )
@@ -349,6 +355,8 @@ def process_one_task(
                 process_proactive_feedback_learning_due(
                     session_factory=session_factory,
                     task_payload=task_payload,
+                    settings=resolved_settings,
+                    model_adapter=model_adapter,
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                 )
@@ -361,7 +369,15 @@ def process_one_task(
                     new_id_fn=_new_id,
                 )
             case _:
-                raise RuntimeError(f"unsupported task type: {task_type}")
+                raise UnsupportedTaskType(f"unsupported task type: {task_type}")
+    except UnsupportedTaskType as exc:
+        _mark_task_failed(
+            session_factory=session_factory,
+            task_id=task_id,
+            error=safe_failure_reason(str(exc), fallback="unsupported task type"),
+            retry=False,
+        )
+        return True
     except Exception as exc:
         _mark_task_failed(
             session_factory=session_factory,
@@ -415,6 +431,7 @@ def _mark_task_failed(
     session_factory: sessionmaker[Session],
     task_id: str,
     error: str,
+    retry: bool = True,
 ) -> None:
     with session_factory() as db:
         with db.begin():
@@ -422,11 +439,17 @@ def _mark_task_failed(
             if task is None:
                 return
             now = _utcnow()
-            task.status = "dead_letter" if task.attempts >= task.max_attempts else "pending"
+            task.status = (
+                "pending" if retry and task.attempts < task.max_attempts else "dead_letter"
+            )
             task.error = error
             task.claimed_by = None
             task.last_heartbeat = None
-            task.run_after = now + timedelta(seconds=min(300, 2 ** max(task.attempts - 1, 0)))
+            task.run_after = (
+                now + timedelta(seconds=min(300, 2 ** max(task.attempts - 1, 0)))
+                if task.status == "pending"
+                else now
+            )
             task.updated_at = now
 
 
@@ -582,7 +605,7 @@ def _process_agency_event_received(
             }:
                 enqueue_background_task(
                     db,
-                    task_type="workspace_observation_derivation_due",
+                    task_type="ambient_interpretation_due",
                     payload={"origin": "agency_event", "agency_event_id": agency_event.id},
                     now=now,
                     max_attempts=3,

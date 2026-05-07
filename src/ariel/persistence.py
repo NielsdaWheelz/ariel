@@ -312,6 +312,70 @@ class EventRecord(Base):
     )
 
 
+class AIJudgmentRecord(Base):
+    __tablename__ = "ai_judgments"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    judgment_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    source_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    source_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    prompt_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider_response_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    input_summary: Mapped[str] = mapped_column(Text, nullable=False)
+    input_refs: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    selected: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    omitted: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    output: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    rationale: Mapped[str | None] = mapped_column(Text, nullable=True)
+    uncertainty: Mapped[str | None] = mapped_column(Text, nullable=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    parse_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    validation_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    failure_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            (
+                "judgment_type IN ('memory_curation', 'tool_result_interpretation', "
+                "'continuity_compaction', 'feedback_learning', "
+                "'ambient_interpretation', 'proactive_deliberation', 'model_output')"
+            ),
+            name="ck_ai_judgment_type",
+        ),
+        CheckConstraint("status IN ('succeeded', 'failed')", name="ck_ai_judgment_status"),
+        CheckConstraint(
+            (
+                "parse_status IN ('not_required_no_candidates', 'parsed', 'invalid_json', "
+                "'missing_output', 'schema_invalid')"
+            ),
+            name="ck_ai_judgment_parse_status",
+        ),
+        CheckConstraint(
+            "validation_status IN ('valid', 'invalid', 'not_validated')",
+            name="ck_ai_judgment_validation_status",
+        ),
+        CheckConstraint(
+            (
+                "failure_code IS NULL OR failure_code IN ("
+                "'E_AI_JUDGMENT_REQUIRED', 'E_AI_JUDGMENT_CREDENTIALS', "
+                "'E_AI_JUDGMENT_TIMEOUT', 'E_AI_JUDGMENT_INVALID_JSON', "
+                "'E_AI_JUDGMENT_SCHEMA', 'E_AI_JUDGMENT_VALIDATION', "
+                "'E_AI_JUDGMENT_BUDGET')"
+            ),
+            name="ck_ai_judgment_failure_code",
+        ),
+    )
+
+
 class ActionAttemptRecord(Base):
     __tablename__ = "action_attempts"
 
@@ -1764,9 +1828,15 @@ class WorkspaceItemRecord(Base):
 
     __table_args__ = (
         UniqueConstraint("provider", "item_type", "external_id", name="uq_workspace_item_external"),
-        CheckConstraint("provider IN ('google', 'ariel')", name="ck_workspace_item_provider"),
         CheckConstraint(
-            "item_type IN ('calendar_event', 'email_message', 'drive_file', 'internal_state')",
+            "provider IN ('google', 'ariel', 'discord')",
+            name="ck_workspace_item_provider",
+        ),
+        CheckConstraint(
+            (
+                "item_type IN ('calendar_event', 'email_message', 'drive_file', "
+                "'internal_state', 'discord_message')"
+            ),
             name="ck_workspace_item_type",
         ),
         CheckConstraint("status IN ('active', 'deleted')", name="ck_workspace_item_status"),
@@ -1840,8 +1910,7 @@ class ProactiveObservationRecord(Base):
         CheckConstraint(
             (
                 "source_type IN ('workspace_item', 'job', 'approval_request', "
-                "'memory_assertion', 'google_connector', 'capture', 'discord_message', "
-                "'provider_event', 'connector_event', 'ci', 'location', 'local_activity')"
+                "'memory_assertion', 'google_connector', 'capture')"
             ),
             name="ck_proactive_observation_source_type",
         ),
@@ -2265,6 +2334,11 @@ class ProactiveLearningRecord(Base):
     record_type: Mapped[str] = mapped_column(String(32), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     content: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    prompt_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider_response_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    parse_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    validation_status: Mapped[str] = mapped_column(String(32), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )
@@ -2274,12 +2348,23 @@ class ProactiveLearningRecord(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "record_type IN ('instruction', 'example', 'calibration', 'preference', 'autonomy_request')",
+            (
+                "record_type IN ('instruction', 'example', 'calibration', 'preference', "
+                "'source_preference', 'prompt_instruction', 'autonomy_request')"
+            ),
             name="ck_proactive_learning_record_type",
         ),
         CheckConstraint(
             "status IN ('active', 'superseded', 'rejected')",
             name="ck_proactive_learning_record_status",
+        ),
+        CheckConstraint(
+            "parse_status IN ('parsed', 'invalid_json', 'missing_output', 'schema_invalid')",
+            name="ck_proactive_learning_parse_status",
+        ),
+        CheckConstraint(
+            "validation_status IN ('valid', 'invalid')",
+            name="ck_proactive_learning_validation_status",
         ),
     )
 
@@ -2315,7 +2400,7 @@ class BackgroundTaskRecord(Base):
                 "'expire_approvals', 'reap_stale_tasks', "
                 "'provider_subscription_renewal_due', 'provider_event_received', "
                 "'provider_sync_due', 'memory_extract_turn', "
-                "'workspace_observation_derivation_due', 'proactive_deliberation_due', "
+                "'ambient_interpretation_due', 'proactive_deliberation_due', "
                 "'proactive_follow_up_due', 'proactive_feedback_learning_due', "
                 "'proactive_action_execution_due', 'execute_action_attempt')"
             ),
@@ -2973,6 +3058,11 @@ def serialize_proactive_learning_record(record: ProactiveLearningRecord) -> dict
         "record_type": record.record_type,
         "status": record.status,
         "content": redact_json_value(record.content),
+        "model": record.model,
+        "prompt_version": record.prompt_version,
+        "provider_response_id": record.provider_response_id,
+        "parse_status": record.parse_status,
+        "validation_status": record.validation_status,
         "created_at": to_rfc3339(record.created_at),
         "updated_at": to_rfc3339(record.updated_at),
     }

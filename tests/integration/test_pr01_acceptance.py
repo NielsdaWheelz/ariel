@@ -5,10 +5,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import text
 from testcontainers.postgres import PostgresContainer
 
 from ariel.app import ModelAdapter, ModelAdapterError, create_app
@@ -131,7 +132,18 @@ class AttachmentReadAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        del tools, user_message, history, context_bundle
+        del tools, user_message, history
+        if context_bundle.get("origin") == "tool_result_interpretation":
+            return responses_with_function_calls(
+                input_items=input_items,
+                assistant_text="",
+                proposals=[],
+                provider=self.provider,
+                model=self.model,
+                provider_response_id="resp_attachment_interpreter_123",
+                input_tokens=7,
+                output_tokens=5,
+            )
         self.input_items.append(input_items)
         return responses_with_function_calls(
             input_items=input_items,
@@ -352,6 +364,57 @@ def test_discord_no_response_tool_completes_turn_without_visible_reply(
             and "https://cdn.discordapp.com/attachments/note.txt" not in item["content"]
             for item in adapter.input_items[0]
         )
+        with cast(Any, client.app).state.session_factory() as db:
+            with db.begin():
+                workspace_item = (
+                    db.execute(
+                        text(
+                            "SELECT id, provider, item_type, external_id, title, summary, "
+                            "source_uri, metadata FROM workspace_items "
+                            "WHERE provider = 'discord' AND item_type = 'discord_message' "
+                            "AND external_id = '101112'"
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+                workspace_event = (
+                    db.execute(
+                        text(
+                            "SELECT id, workspace_item_id, dedupe_key, event_type, payload "
+                            "FROM workspace_item_events "
+                            "WHERE workspace_item_id = :workspace_item_id"
+                        ),
+                        {"workspace_item_id": workspace_item["id"]},
+                    )
+                    .mappings()
+                    .one()
+                )
+                task = (
+                    db.execute(
+                        text(
+                            "SELECT task_type, payload FROM background_tasks "
+                            "WHERE task_type = 'ambient_interpretation_due' "
+                            "AND payload ->> 'workspace_item_event_id' = :event_id"
+                        ),
+                        {"event_id": workspace_event["id"]},
+                    )
+                    .mappings()
+                    .one()
+                )
+        assert workspace_item["provider"] == "discord"
+        assert workspace_item["item_type"] == "discord_message"
+        assert workspace_item["title"] == "Discord message in #ops"
+        assert workspace_item["summary"] == "noted"
+        assert workspace_item["source_uri"] == "https://discord.com/channels/123/456/101112"
+        assert workspace_item["metadata"]["channel_id"] == 456
+        assert workspace_item["metadata"]["author_id"] == 131415
+        assert workspace_event["dedupe_key"] == "discord:message:101112:ingested"
+        assert workspace_event["event_type"] == "created"
+        assert workspace_event["payload"]["message_id"] == "101112"
+        assert workspace_event["payload"]["message"] == "noted"
+        assert task["task_type"] == "ambient_interpretation_due"
+        assert task["payload"]["workspace_item_event_id"] == workspace_event["id"]
 
 
 def test_discord_attachment_content_is_referenced_without_raw_cdn_url(
@@ -488,6 +551,290 @@ def test_discord_attachment_read_tool_reads_text_attachment(
     durable_payload = json.dumps(body, sort_keys=True)
     assert "https://cdn.discordapp.com/attachments/report.txt" not in durable_payload
     assert "download_url" not in durable_payload
+
+
+def test_large_attachment_read_writes_tool_result_interpretation_judgment(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    large_text = "quarterly revenue increased " * 320
+
+    class FakeStreamResponse:
+        status_code = 200
+        headers = {"content-length": str(len(large_text.encode()))}
+
+        def __enter__(self) -> "FakeStreamResponse":
+            return self
+
+        def __exit__(self, *_: Any) -> None:
+            return None
+
+        def iter_bytes(self) -> list[bytes]:
+            return [large_text.encode()]
+
+    class FakeHttpClient:
+        def __init__(self, *_: Any, **__: Any) -> None:
+            return None
+
+        def __enter__(self) -> "FakeHttpClient":
+            return self
+
+        def __exit__(self, *_: Any) -> None:
+            return None
+
+        def stream(self, method: str, url: str) -> FakeStreamResponse:
+            assert method == "GET"
+            assert url == "https://cdn.discordapp.com/attachments/large-report.txt"
+            return FakeStreamResponse()
+
+    monkeypatch.setenv("ARIEL_ATTACHMENT_SCANNER_MODE", "disabled")
+    monkeypatch.setenv("ARIEL_ATTACHMENT_BLOB_STORE_PATH", str(tmp_path / "attachments"))
+    monkeypatch.setattr("ariel.attachment_content.httpx.Client", FakeHttpClient)
+
+    adapter = AttachmentReadAdapter()
+    with _build_client(postgres_url, adapter) as client:
+        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
+        response = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={
+                "message": "please summarize this long report",
+                "discord": {
+                    "guild_id": 123,
+                    "channel_id": 456,
+                    "message_id": 789,
+                    "author_id": 101112,
+                    "mentioned_bot": False,
+                    "attachments": [
+                        {
+                            "source": "discord",
+                            "source_attachment_id": 131415,
+                            "filename": "large-report.txt",
+                            "content_type": "text/plain",
+                            "size_bytes": len(large_text.encode()),
+                            "attachment_ref": "discord:131415",
+                            "download_url": (
+                                "https://cdn.discordapp.com/attachments/large-report.txt"
+                            ),
+                        }
+                    ],
+                },
+            },
+        )
+        assert response.status_code == 200
+        turn_id = response.json()["turn"]["id"]
+        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        assert timeline.status_code == 200
+        event = next(
+            event
+            for event in timeline.json()["turns"][0]["events"]
+            if event["event_type"] == "evt.ai_judgment.completed"
+            and event["payload"].get("judgment_type") == "tool_result_interpretation"
+        )
+        assert event["payload"]["response_output_shape"] == {
+            "output_type": "list",
+            "output_count": 1,
+            "text_present": True,
+        }
+
+        with cast(Any, client.app).state.session_factory() as db:
+            with db.begin():
+                judgment = (
+                    db.execute(
+                        text(
+                            "SELECT status, model, prompt_version, provider_response_id, "
+                            "parse_status, validation_status, selected, output "
+                            "FROM ai_judgments "
+                            "WHERE judgment_type = 'tool_result_interpretation' "
+                            "AND source_id = :turn_id "
+                            "ORDER BY created_at DESC LIMIT 1"
+                        ),
+                        {"turn_id": turn_id},
+                    )
+                    .mappings()
+                    .one()
+                )
+
+    assert judgment["status"] == "succeeded"
+    assert judgment["model"] == "model.attachment-read-v1"
+    assert judgment["prompt_version"] == "tool-result-interpretation-v1"
+    assert judgment["provider_response_id"] == "resp_attachment_interpreter_123"
+    assert judgment["parse_status"] == "parsed"
+    assert judgment["validation_status"] == "valid"
+    selected_refs = [
+        item["output_ref"]
+        for item in judgment["selected"]
+        if isinstance(item, dict) and isinstance(item.get("output_ref"), str)
+    ]
+    assert selected_refs
+    assert judgment["output"]["selected_output_refs"] == selected_refs
+    assert judgment["output"]["provider"] == "provider.attachment-read"
+    assert judgment["output"]["usage"] == {
+        "input_tokens": 7,
+        "output_tokens": 5,
+        "total_tokens": 12,
+    }
+
+
+def test_invalid_tool_result_interpreter_output_preserves_failure_provenance(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    large_text = "quarterly revenue increased " * 320
+
+    class InvalidInterpreterAdapter(AttachmentReadAdapter):
+        def create_response(
+            self,
+            *,
+            input_items: list[dict[str, Any]],
+            tools: list[dict[str, Any]],
+            user_message: str,
+            history: list[dict[str, Any]],
+            context_bundle: dict[str, Any],
+        ) -> dict[str, Any]:
+            if context_bundle.get("origin") == "tool_result_interpretation":
+                del input_items, tools, user_message, history
+                return responses_message(
+                    assistant_text="{not json",
+                    provider=self.provider,
+                    model=self.model,
+                    provider_response_id="resp_attachment_interpreter_invalid",
+                    input_tokens=17,
+                    output_tokens=11,
+                )
+            return super().create_response(
+                input_items=input_items,
+                tools=tools,
+                user_message=user_message,
+                history=history,
+                context_bundle=context_bundle,
+            )
+
+    class FakeStreamResponse:
+        status_code = 200
+        headers = {"content-length": str(len(large_text.encode()))}
+
+        def __enter__(self) -> "FakeStreamResponse":
+            return self
+
+        def __exit__(self, *_: Any) -> None:
+            return None
+
+        def iter_bytes(self) -> list[bytes]:
+            return [large_text.encode()]
+
+    class FakeHttpClient:
+        def __init__(self, *_: Any, **__: Any) -> None:
+            return None
+
+        def __enter__(self) -> "FakeHttpClient":
+            return self
+
+        def __exit__(self, *_: Any) -> None:
+            return None
+
+        def stream(self, method: str, url: str) -> FakeStreamResponse:
+            assert method == "GET"
+            assert url == "https://cdn.discordapp.com/attachments/large-report.txt"
+            return FakeStreamResponse()
+
+    monkeypatch.setenv("ARIEL_ATTACHMENT_SCANNER_MODE", "disabled")
+    monkeypatch.setenv("ARIEL_ATTACHMENT_BLOB_STORE_PATH", str(tmp_path / "attachments"))
+    monkeypatch.setattr("ariel.attachment_content.httpx.Client", FakeHttpClient)
+
+    with _build_client(postgres_url, InvalidInterpreterAdapter()) as client:
+        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
+        response = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={
+                "message": "please summarize this long report",
+                "discord": {
+                    "guild_id": 123,
+                    "channel_id": 456,
+                    "message_id": 789,
+                    "author_id": 101112,
+                    "mentioned_bot": False,
+                    "attachments": [
+                        {
+                            "source": "discord",
+                            "source_attachment_id": 131415,
+                            "filename": "large-report.txt",
+                            "content_type": "text/plain",
+                            "size_bytes": len(large_text.encode()),
+                            "attachment_ref": "discord:131415",
+                            "download_url": (
+                                "https://cdn.discordapp.com/attachments/large-report.txt"
+                            ),
+                        }
+                    ],
+                },
+            },
+        )
+        assert response.status_code == 502
+        body = response.json()
+        assert body["error"]["code"] == "E_AI_JUDGMENT_INVALID_JSON"
+        assert body["error"]["details"]["parse_status"] == "invalid_json"
+        assert body["error"]["details"]["validation_status"] == "not_validated"
+        assert body["error"]["details"]["provider"] == "provider.attachment-read"
+        assert body["error"]["details"]["model"] == "model.attachment-read-v1"
+        assert body["error"]["details"]["usage"] == {
+            "input_tokens": 17,
+            "output_tokens": 11,
+            "total_tokens": 28,
+        }
+        assert body["error"]["details"]["provider_response_id"] == (
+            "resp_attachment_interpreter_invalid"
+        )
+
+        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        assert timeline.status_code == 200
+        turn = timeline.json()["turns"][0]
+        event_types = [event["event_type"] for event in turn["events"]]
+        assert "evt.assistant.emitted" not in event_types
+        failure_event = next(
+            event
+            for event in turn["events"]
+            if event["payload"].get("judgment_type") == "tool_result_interpretation"
+        )
+        assert failure_event["payload"]["failure_code"] == "E_AI_JUDGMENT_INVALID_JSON"
+        assert failure_event["payload"]["parse_status"] == "invalid_json"
+        assert failure_event["payload"]["validation_status"] == "not_validated"
+        assert failure_event["payload"]["provider_response_id"] == (
+            "resp_attachment_interpreter_invalid"
+        )
+        turn_id = turn["id"]
+
+        with cast(Any, client.app).state.session_factory() as db:
+            with db.begin():
+                judgment = (
+                    db.execute(
+                        text(
+                            "SELECT status, model, provider_response_id, parse_status, "
+                            "validation_status, failure_code, output "
+                            "FROM ai_judgments "
+                            "WHERE judgment_type = 'tool_result_interpretation' "
+                            "AND source_id = :turn_id "
+                            "ORDER BY created_at DESC LIMIT 1"
+                        ),
+                        {"turn_id": turn_id},
+                    )
+                    .mappings()
+                    .one()
+                )
+
+    assert judgment["status"] == "failed"
+    assert judgment["model"] == "model.attachment-read-v1"
+    assert judgment["provider_response_id"] == "resp_attachment_interpreter_invalid"
+    assert judgment["parse_status"] == "invalid_json"
+    assert judgment["validation_status"] == "not_validated"
+    assert judgment["failure_code"] == "E_AI_JUDGMENT_INVALID_JSON"
+    assert judgment["output"]["provider"] == "provider.attachment-read"
+    assert judgment["output"]["usage"] == {
+        "input_tokens": 17,
+        "output_tokens": 11,
+        "total_tokens": 28,
+    }
 
 
 def test_discord_turn_context_includes_bounded_same_channel_history(
@@ -1211,20 +1558,13 @@ def test_pr02_context_budget_exhaustion_returns_bounded_failure_with_audit_detai
             f"/v1/sessions/{session_id}/message",
             json={"message": "hello from bounded context"},
         )
-        assert send.status_code == 429
+        assert send.status_code == 503
         body = send.json()
         assert body["ok"] is False
-        assert body["error"]["code"] == "E_TURN_LIMIT_REACHED"
-        assert "context budget" in body["error"]["message"].lower()
-
-        limit_details = body["error"]["details"]["limit"]
-        assert limit_details["budget"] == "context_tokens"
-        assert limit_details["unit"] == "tokens"
-        assert limit_details["limit"] == 1
-        assert limit_details["measured"] > 1
+        assert body["error"]["code"].startswith("E_AI_JUDGMENT_")
+        assert "continuity" in body["error"]["message"].lower()
+        assert body["error"]["details"]["judgment_type"] == "continuity_compaction"
         assert body["error"]["details"]["session_id"] == session_id
-        assert body["error"]["details"]["applied_limits"]["max_recent_turns"] == 12
-        assert body["error"]["details"]["applied_limits"]["max_context_tokens"] == 1
 
         timeline = client.get(f"/v1/sessions/{session_id}/events")
         assert timeline.status_code == 200
@@ -1235,21 +1575,11 @@ def test_pr02_context_budget_exhaustion_returns_bounded_failure_with_audit_detai
         turn = turns[0]
         assert turn["status"] == "failed"
         event_types = [event["event_type"] for event in turn["events"]]
-        assert event_types == [
-            "evt.turn.started",
-            "evt.turn.limit_reached",
-            "evt.assistant.emitted",
-            "evt.turn.failed",
-        ]
-        limit_event = next(
-            event for event in turn["events"] if event["event_type"] == "evt.turn.limit_reached"
-        )
-        assert limit_event["payload"]["code"] == "E_TURN_LIMIT_REACHED"
-        assert limit_event["payload"]["limit"]["budget"] == "context_tokens"
-        assistant_emitted = next(
-            event for event in turn["events"] if event["event_type"] == "evt.assistant.emitted"
-        )
-        assert "context budget" in assistant_emitted["payload"]["message"].lower()
+        assert "evt.turn.started" in event_types
+        assert "evt.ai_judgment.failed" in event_types
+        assert "evt.turn.failed" in event_types
+        assert "evt.turn.limit_reached" not in event_types
+        assert "evt.assistant.emitted" not in event_types
 
 
 def test_pr02_response_budget_exhaustion_is_emitted_before_terminal_failed(
@@ -1291,7 +1621,6 @@ def test_pr02_response_budget_exhaustion_is_emitted_before_terminal_failed(
             "evt.turn.started",
             "evt.model.started",
             "evt.model.completed",
-            "evt.turn.limit_reached",
             "evt.assistant.emitted",
             "evt.turn.failed",
         ]
@@ -1333,13 +1662,12 @@ def test_pr02_response_budget_uses_reported_output_tokens_when_present(
             "evt.turn.started",
             "evt.model.started",
             "evt.model.completed",
-            "evt.turn.limit_reached",
             "evt.assistant.emitted",
             "evt.turn.failed",
         ]
 
 
-def test_pr02_model_attempt_budget_exhaustion_uses_limit_error_not_model_error(
+def test_pr02_model_attempt_budget_exhaustion_uses_ai_judgment_budget_error(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1356,15 +1684,10 @@ def test_pr02_model_attempt_budget_exhaustion_uses_limit_error_not_model_error(
         assert send.status_code == 429
         body = send.json()
         assert body["ok"] is False
-        assert body["error"]["code"] == "E_TURN_LIMIT_REACHED"
-        assert "attempt limit" in body["error"]["message"].lower()
-
-        limit_details = body["error"]["details"]["limit"]
-        assert limit_details["budget"] == "model_attempts"
-        assert limit_details["unit"] == "attempts"
-        assert limit_details["limit"] == 2
-        assert limit_details["measured"] == 2
-        assert body["error"]["details"]["applied_limits"]["max_model_attempts"] == 2
+        assert body["error"]["code"] == "E_AI_JUDGMENT_BUDGET"
+        assert body["error"]["details"]["judgment_type"] == "model_output"
+        assert body["error"]["details"]["attempt"] == 2
+        assert body["error"]["details"]["max_model_attempts"] == 2
 
         timeline = client.get(f"/v1/sessions/{session_id}/events")
         assert timeline.status_code == 200
@@ -1374,11 +1697,12 @@ def test_pr02_model_attempt_budget_exhaustion_uses_limit_error_not_model_error(
         assert len([event for event in events if event["event_type"] == "evt.model.started"]) == 2
         assert len([event for event in events if event["event_type"] == "evt.model.failed"]) == 2
         event_types = [event["event_type"] for event in events]
-        assert event_types[-3:] == [
-            "evt.turn.limit_reached",
-            "evt.assistant.emitted",
-            "evt.turn.failed",
-        ]
+        assert event_types[-2:] == ["evt.ai_judgment.failed", "evt.turn.failed"]
+        assert "evt.assistant.emitted" not in event_types
+        model_output_failure = next(
+            event for event in events if event["payload"].get("judgment_type") == "model_output"
+        )
+        assert model_output_failure["payload"]["failure_code"] == "E_AI_JUDGMENT_BUDGET"
         assert not any(
             saved_turn["status"] == "in_progress" for saved_turn in timeline.json()["turns"]
         )
@@ -1425,7 +1749,6 @@ def test_pr02_wall_time_budget_takes_precedence_if_multiple_limits_exhaust(
             "evt.turn.started",
             "evt.model.started",
             "evt.model.failed",
-            "evt.turn.limit_reached",
             "evt.assistant.emitted",
             "evt.turn.failed",
         ]
@@ -1471,11 +1794,7 @@ def test_pr02_wall_time_budget_exhaustion_is_bounded_and_auditable(
         assert timeline.status_code == 200
         turn = timeline.json()["turns"][0]
         event_types = [event["event_type"] for event in turn["events"]]
-        assert event_types[-3:] == [
-            "evt.turn.limit_reached",
-            "evt.assistant.emitted",
-            "evt.turn.failed",
-        ]
+        assert event_types[-2:] == ["evt.assistant.emitted", "evt.turn.failed"]
         assert turn["status"] == "failed"
         assert not any(
             saved_turn["status"] == "in_progress" for saved_turn in timeline.json()["turns"]

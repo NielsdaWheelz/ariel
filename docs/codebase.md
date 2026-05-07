@@ -53,6 +53,12 @@ This document covers the tech stack, repository-wide code organization, imports,
 - `db.py` owns engine/session lifecycle.
 - `config.py` owns settings and validation.
 - `app.py` owns the FastAPI app and request handlers.
+- AI-first ownership follows [ai-first.md](ai-first.md): model and subagent calls
+  own judgment; deterministic modules expose rails and bounded services.
+- Do not hide product judgment inside modules named planner, ranker, classifier,
+  synthesizer, router, helper, or utility. Those modules may gather candidates,
+  enforce rails, and record audit state; they must not become replacement AI
+  brains.
 
 ## Makefile
 

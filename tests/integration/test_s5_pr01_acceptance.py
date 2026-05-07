@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from itertools import count
@@ -17,6 +17,7 @@ from ariel.config import AppSettings
 import ariel.memory as memory
 from ariel.memory import MEMORY_PROJECTION_VERSION, process_memory_projection_job
 from ariel.persistence import (
+    AIJudgmentRecord,
     BackgroundTaskRecord,
     MemoryAssertionRecord,
     MemoryEmbeddingProjectionRecord,
@@ -49,8 +50,47 @@ def _fake_memory_embedding(text: str, *, settings: AppSettings) -> list[float]:
     return [component / norm for component in vector]
 
 
+def _fake_memory_curation(
+    *,
+    user_message: str,
+    history: Sequence[dict[str, Any]],
+    candidates: Sequence[dict[str, Any]],
+    max_selected: int,
+    settings: AppSettings,
+) -> dict[str, Any]:
+    del user_message, history, settings
+    selected: list[dict[str, str]] = []
+    omitted: list[dict[str, str]] = []
+    for candidate in candidates:
+        memory_id = candidate["id"]
+        value = str(candidate.get("value", ""))
+        kind = str(candidate.get("kind") or "semantic_assertion")
+        if "delivery risk" not in value and len(selected) < max_selected:
+            selected.append(
+                {
+                    "id": memory_id,
+                    "kind": kind,
+                    "rationale": "curator selected for this turn",
+                }
+            )
+        else:
+            omitted.append({"id": memory_id, "kind": kind, "reason": "curator omitted"})
+    return {
+        "selected_memories": selected,
+        "omitted_memories": omitted,
+        "rationale": "fixture curator decision",
+        "uncertainty": "",
+        "confidence": 0.9,
+        "model": "fixture-memory-curator",
+        "prompt_version": memory.MEMORY_CURATION_PROMPT_VERSION,
+        "provider_response_id": "resp_fixture_memory_curator",
+        "parse_status": "parsed",
+    }
+
+
 def _use_fake_embeddings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(memory, "embed_memory_text", _fake_memory_embedding)
+    monkeypatch.setattr(memory, "_curate_memory_context_with_model", _fake_memory_curation)
 
 
 def _process_projection(client: TestClient) -> None:
@@ -119,13 +159,19 @@ def postgres_url() -> Generator[str, None, None]:
         yield postgres.get_connection_url().replace("psycopg2", "psycopg")
 
 
-def _build_client(postgres_url: str, adapter: ModelAdapter, *, reset_database: bool) -> TestClient:
+def _build_client(
+    postgres_url: str,
+    adapter: ModelAdapter,
+    *,
+    reset_database: bool,
+    raise_server_exceptions: bool = True,
+) -> TestClient:
     app = create_app(
         database_url=postgres_url,
         model_adapter=adapter,
         reset_database=reset_database,
     )
-    return TestClient(app)
+    return TestClient(app, raise_server_exceptions=raise_server_exceptions)
 
 
 def _session_id(client: TestClient) -> str:
@@ -392,7 +438,7 @@ def test_s5_pr01_projections_are_vector_and_keyword_not_legacy_terms(
             assert keyword.weighted_terms
 
 
-def test_s5_pr01_recall_is_bounded_deterministic_and_reports_omissions(
+def test_s5_pr01_recall_uses_ai_curation_and_reports_omissions(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -424,6 +470,7 @@ def test_s5_pr01_recall_is_bounded_deterministic_and_reports_omissions(
             json={"message": "what is the latest apollo project status?"},
         )
         assert first.status_code == 200
+        first_turn_id = first.json()["turn"]["id"]
         first_ids = [
             item["id"]
             for item in adapter.context_bundles[-1]["memory_context"]["semantic_assertions"]
@@ -434,6 +481,7 @@ def test_s5_pr01_recall_is_bounded_deterministic_and_reports_omissions(
             json={"message": "again, what is the latest apollo project status?"},
         )
         assert second.status_code == 200
+        second_turn_id = second.json()["turn"]["id"]
         second_ids = [
             item["id"]
             for item in adapter.context_bundles[-1]["memory_context"]["semantic_assertions"]
@@ -441,21 +489,159 @@ def test_s5_pr01_recall_is_bounded_deterministic_and_reports_omissions(
 
         assert first_ids == second_ids
         assert len(first_ids) == 2
-        first_reasons = [
-            item["rank_reason"]
-            for item in adapter.context_bundles[-2]["memory_context"]["semantic_assertions"]
-        ]
-        assert any("semantic_vector" in reason for reason in first_reasons)
-        assert any("keyword" in reason for reason in first_reasons)
+        first_assertions = adapter.context_bundles[-2]["memory_context"]["semantic_assertions"]
+        assert {item["predicate"] for item in first_assertions} == {
+            "project.archive",
+            "project.state",
+        }
+        assert all("rank_reason" not in item for item in first_assertions)
+        assert all("rank_score" not in item for item in first_assertions)
 
         recalled_event_payload = next(
             event["payload"]
             for event in _latest_turn(client, session_id)["events"]
-            if event["event_type"] == "evt.memory.recalled"
+            if event["event_type"] == "evt.memory.curated"
         )
-        assert recalled_event_payload["max_recalled_items"] == 2
-        assert recalled_event_payload["included_memory_count"] == 2
+        assert recalled_event_payload["max_selected_memories"] == 2
+        assert recalled_event_payload["selected_memory_count"] == 2
+        assert recalled_event_payload["curation_model"] == "fixture-memory-curator"
+        assert recalled_event_payload["selected_memories"] == [
+            {
+                "id": first_ids[0],
+                "kind": "semantic_assertion",
+                "rationale": "curator selected for this turn",
+            },
+            {
+                "id": first_ids[1],
+                "kind": "semantic_assertion",
+                "rationale": "curator selected for this turn",
+            },
+        ]
         assert recalled_event_payload["omitted_memory_count"] >= 1
         assert any(
-            item["reason"] == "top_k_bounded" for item in recalled_event_payload["omitted_memories"]
+            item["reason"] == "curator omitted"
+            for item in recalled_event_payload["omitted_memories"]
         )
+        first_candidate = next(
+            item
+            for item in recalled_event_payload["candidate_memories"]
+            if item["kind"] == "semantic_assertion"
+        )
+        assert first_candidate["lifecycle_state"] == "active"
+        assert first_candidate["trust_boundary"]
+        assert first_candidate["taint"]["provenance_status"]
+        assert first_candidate["projection_version"] == MEMORY_PROJECTION_VERSION
+        assert first_candidate["retrieval_rank"] >= 1
+        assert first_candidate["retrieval_features"]["updated_at_order"] >= 1
+        assert "conflict_status" in first_candidate
+
+        with cast(Any, client.app).state.session_factory() as db:
+            judgments = db.scalars(
+                select(AIJudgmentRecord)
+                .where(
+                    AIJudgmentRecord.judgment_type == "memory_curation",
+                    AIJudgmentRecord.source_id.in_([first_turn_id, second_turn_id]),
+                )
+                .order_by(AIJudgmentRecord.created_at.asc())
+            ).all()
+            assert [judgment.source_id for judgment in judgments] == [
+                first_turn_id,
+                second_turn_id,
+            ]
+            assert all(judgment.status == "succeeded" for judgment in judgments)
+            assert all(
+                judgment.provider_response_id == "resp_fixture_memory_curator"
+                for judgment in judgments
+            )
+            assert all(judgment.parse_status == "parsed" for judgment in judgments)
+            assert all(judgment.validation_status == "valid" for judgment in judgments)
+            assert all(judgment.selected for judgment in judgments)
+            assert all(judgment.output["recall_window"]["curation_model"] for judgment in judgments)
+            assert all(judgment.input_refs["candidate_memories"] for judgment in judgments)
+
+
+def test_s5_pr01_invalid_memory_curation_fails_as_typed_audited_turn_failure(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def invalid_memory_curation(
+        *,
+        user_message: str,
+        history: Sequence[dict[str, Any]],
+        candidates: Sequence[dict[str, Any]],
+        max_selected: int,
+        settings: AppSettings,
+    ) -> dict[str, Any]:
+        del user_message, history, candidates, max_selected, settings
+        raise RuntimeError("memory curation JSON missing required fields")
+
+    monkeypatch.setattr(memory, "embed_memory_text", _fake_memory_embedding)
+    monkeypatch.setattr(memory, "_curate_memory_context_with_model", invalid_memory_curation)
+    adapter = MemoryProbeAdapter()
+    with _build_client(
+        postgres_url,
+        adapter,
+        reset_database=True,
+        raise_server_exceptions=False,
+    ) as client:
+        session_id = _session_id(client)
+        candidate = _candidate(
+            client,
+            subject_key="project:curation-cutover",
+            predicate="project.state",
+            assertion_type="project_state",
+            value="curation cutover candidate should require AI selection",
+            evidence_text="The curation cutover candidate should require AI selection.",
+        )
+        assert client.post(f"/v1/memory/candidates/{candidate['id']}/approve").status_code == 200
+        _process_projection(client)
+
+        response = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "recall the curation cutover project state"},
+        )
+
+        assert response.headers["content-type"].startswith("application/json")
+        assert response.status_code == 502
+        error = response.json()["error"]
+        assert error["code"] == "E_AI_JUDGMENT_SCHEMA"
+        assert error["retryable"] is True
+        assert error["details"]["judgment_type"] == "memory_curation"
+        assert error["details"]["prompt_version"] == memory.MEMORY_CURATION_PROMPT_VERSION
+        assert isinstance(error["details"]["turn_id"], str)
+
+        latest_turn = _latest_turn(client, session_id)
+        assert latest_turn["id"] == error["details"]["turn_id"]
+        assert "evt.turn.started" in _event_types(latest_turn)
+        assert "evt.assistant.emitted" not in _event_types(latest_turn)
+        assert adapter.context_bundles == []
+
+        audit_events = [
+            event
+            for event in latest_turn["events"]
+            if event["payload"].get("judgment_type") == "memory_curation"
+        ]
+        assert audit_events
+        failure_payload = audit_events[-1]["payload"]
+        assert failure_payload["failure_code"] == "E_AI_JUDGMENT_SCHEMA"
+        assert failure_payload["prompt_version"] == memory.MEMORY_CURATION_PROMPT_VERSION
+        assert failure_payload["source_id"] == latest_turn["id"]
+        assert failure_payload["parse_status"] == "parsed"
+        assert failure_payload["validation_status"] == "invalid"
+        assert candidate["id"] in repr(failure_payload["input_refs"])
+
+        with cast(Any, client.app).state.session_factory() as db:
+            judgment = db.scalar(
+                select(AIJudgmentRecord)
+                .where(
+                    AIJudgmentRecord.judgment_type == "memory_curation",
+                    AIJudgmentRecord.source_id == latest_turn["id"],
+                )
+                .limit(1)
+            )
+            assert judgment is not None
+            assert judgment.status == "failed"
+            assert judgment.failure_code == "E_AI_JUDGMENT_SCHEMA"
+            assert judgment.parse_status == "parsed"
+            assert judgment.validation_status == "invalid"
+            assert candidate["id"] in repr(judgment.input_refs)

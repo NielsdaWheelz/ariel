@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from .config import AppSettings
 from .persistence import (
+    AIJudgmentRecord,
     MemoryAssertionEvidenceRecord,
     MemoryAssertionRecord,
     MemoryConflictMemberRecord,
@@ -38,7 +39,30 @@ from .redaction import redact_text
 
 MEMORY_CONTEXT_SCHEMA_VERSION = "memory.sota.v1"
 MEMORY_PROJECTION_VERSION = "embedding-v1"
+MEMORY_CURATION_PROMPT_VERSION = "memory-curation-v1"
+MEMORY_CONTINUITY_PROMPT_VERSION = "memory-continuity-v1"
 USER_SUBJECT_KEY = "user:default"
+
+
+class AIJudgmentFailure(RuntimeError):
+    def __init__(
+        self,
+        *,
+        code: str,
+        safe_reason: str,
+        retryable: bool,
+        parse_status: str,
+        validation_status: str,
+        provider_response_id: str | None = None,
+    ) -> None:
+        super().__init__(safe_reason)
+        self.code = code
+        self.safe_reason = safe_reason
+        self.retryable = retryable
+        self.parse_status = parse_status
+        self.validation_status = validation_status
+        self.provider_response_id = provider_response_id
+
 
 _STOPWORDS = {
     "a",
@@ -1474,29 +1498,245 @@ def create_relationship(
 def record_rotation_context_block(
     db: Session,
     *,
+    rotation_id: str,
     prior_session_id: str,
     new_session_id: str,
     rotation_reason: str,
     prior_turns: Sequence[TurnRecord],
+    settings: AppSettings,
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
 ) -> None:
     now = now_fn()
-    snippets = []
-    for turn in prior_turns[-3:]:
-        assistant = _clean_text(turn.assistant_message or "", max_chars=260)
-        user = _clean_text(turn.user_message, max_chars=260)
-        snippets.append(f"user={user}; assistant={assistant}" if assistant else user)
-    summary = _clean_text(" | ".join(snippets), max_chars=1200) or "session rotated"
+    source_turns = [
+        {
+            "turn_id": turn.id,
+            "user_message": _clean_text(turn.user_message, max_chars=900),
+            "assistant_message": _clean_text(turn.assistant_message or "", max_chars=900),
+            "status": turn.status,
+            "created_at": to_rfc3339(turn.created_at),
+        }
+        for turn in prior_turns
+    ]
+    source_turn_ids = [turn["turn_id"] for turn in source_turns]
+    input_refs = {
+        "rotation_id": rotation_id,
+        "rotation_reason": rotation_reason,
+        "prior_session_id": prior_session_id,
+        "new_session_id": new_session_id,
+        "source_turn_ids": source_turn_ids,
+    }
+    ai_judgment_id = new_id_fn("ajg")
+    if source_turns:
+        try:
+            payload = _curate_rotation_context_with_model(
+                rotation_reason=rotation_reason,
+                prior_session_id=prior_session_id,
+                new_session_id=new_session_id,
+                source_turns=source_turns,
+                settings=settings,
+            )
+        except AIJudgmentFailure as exc:
+            db.add(
+                AIJudgmentRecord(
+                    id=ai_judgment_id,
+                    judgment_type="continuity_compaction",
+                    source_type="session_rotation",
+                    source_id=rotation_id,
+                    status="failed",
+                    model=settings.model_name,
+                    prompt_version=MEMORY_CONTINUITY_PROMPT_VERSION,
+                    provider_response_id=exc.provider_response_id,
+                    input_summary="session-rotation continuity compaction",
+                    input_refs=input_refs,
+                    selected=[],
+                    omitted=[],
+                    output={},
+                    rationale=None,
+                    uncertainty=None,
+                    confidence=None,
+                    parse_status=exc.parse_status,
+                    validation_status=exc.validation_status,
+                    failure_code=exc.code,
+                    failure_reason=exc.safe_reason,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            db.flush()
+            raise
+        except Exception as exc:
+            failure = AIJudgmentFailure(
+                code="E_AI_JUDGMENT_SCHEMA",
+                safe_reason=f"continuity curation failed: {exc.__class__.__name__}",
+                retryable=True,
+                parse_status="missing_output",
+                validation_status="not_validated",
+            )
+            db.add(
+                AIJudgmentRecord(
+                    id=ai_judgment_id,
+                    judgment_type="continuity_compaction",
+                    source_type="session_rotation",
+                    source_id=rotation_id,
+                    status="failed",
+                    model=settings.model_name,
+                    prompt_version=MEMORY_CONTINUITY_PROMPT_VERSION,
+                    provider_response_id=None,
+                    input_summary="session-rotation continuity compaction",
+                    input_refs=input_refs,
+                    selected=[],
+                    omitted=[],
+                    output={},
+                    rationale=None,
+                    uncertainty=None,
+                    confidence=None,
+                    parse_status=failure.parse_status,
+                    validation_status=failure.validation_status,
+                    failure_code=failure.code,
+                    failure_reason=failure.safe_reason,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            db.flush()
+            raise failure from exc
+        summary = _clean_text(str(payload["summary"]), max_chars=2000)
+        decisions = payload.get("decisions")
+        open_loops = payload.get("open_loops")
+        unresolved_uncertainty = payload.get("unresolved_uncertainty")
+        important_omissions = payload.get("important_omissions")
+        preserved_turn_refs = payload.get("preserved_turn_refs")
+        omitted_turn_refs = payload.get("omitted_turn_refs")
+        user_commitments = payload.get("user_commitments")
+        assistant_commitments = payload.get("assistant_commitments")
+        tool_action_outcomes = payload.get("tool_action_outcomes")
+        confidence = payload.get("confidence")
+        model = payload.get("model")
+        parse_status = payload.get("parse_status")
+        validation_status = payload.get("validation_status")
+        provider_response_id = payload.get("provider_response_id")
+    else:
+        summary = "No source turns required continuity curation."
+        decisions = []
+        open_loops = []
+        unresolved_uncertainty = []
+        important_omissions = []
+        preserved_turn_refs = []
+        omitted_turn_refs = []
+        user_commitments = []
+        assistant_commitments = []
+        tool_action_outcomes = []
+        confidence = 1.0
+        model = None
+        parse_status = "not_required_no_candidates"
+        validation_status = "not_validated"
+        provider_response_id = None
+    db.add(
+        AIJudgmentRecord(
+            id=ai_judgment_id,
+            judgment_type="continuity_compaction",
+            source_type="session_rotation",
+            source_id=rotation_id,
+            status="succeeded",
+            model=model
+            if isinstance(model, str)
+            else settings.model_name
+            if source_turns
+            else None,
+            prompt_version=MEMORY_CONTINUITY_PROMPT_VERSION,
+            provider_response_id=provider_response_id
+            if isinstance(provider_response_id, str)
+            else None,
+            input_summary="session-rotation continuity compaction",
+            input_refs=input_refs,
+            selected=preserved_turn_refs if isinstance(preserved_turn_refs, list) else [],
+            omitted=omitted_turn_refs if isinstance(omitted_turn_refs, list) else [],
+            output={
+                "continuity_compaction": {
+                    "summary": summary,
+                    "source_turn_ids": source_turn_ids,
+                    "preserved_turn_refs": preserved_turn_refs
+                    if isinstance(preserved_turn_refs, list)
+                    else [],
+                    "omitted_turn_refs": omitted_turn_refs
+                    if isinstance(omitted_turn_refs, list)
+                    else [],
+                    "provider_response_id": provider_response_id
+                    if isinstance(provider_response_id, str)
+                    else None,
+                    "decisions": decisions if isinstance(decisions, list) else [],
+                    "open_loops": open_loops if isinstance(open_loops, list) else [],
+                    "unresolved_uncertainty": unresolved_uncertainty
+                    if isinstance(unresolved_uncertainty, list)
+                    else [],
+                    "important_omissions": important_omissions
+                    if isinstance(important_omissions, list)
+                    else [],
+                }
+            },
+            rationale=summary if source_turns else None,
+            uncertainty=None,
+            confidence=max(0.0, min(float(confidence), 1.0))
+            if isinstance(confidence, int | float)
+            else None,
+            parse_status=parse_status if isinstance(parse_status, str) else "parsed",
+            validation_status="valid" if source_turns else "not_validated",
+            failure_code=None,
+            failure_reason=None,
+            created_at=now,
+            updated_at=now,
+        )
+    )
     db.add(
         ProjectStateSnapshotRecord(
             id=new_id_fn("pss"),
             project_key="session_continuity",
             summary=summary,
             state={
+                "ai_judgment_id": ai_judgment_id,
+                "rotation_id": rotation_id,
                 "rotation_reason": rotation_reason,
                 "prior_session_id": prior_session_id,
                 "new_session_id": new_session_id,
+                "provider_response_id": provider_response_id
+                if isinstance(provider_response_id, str)
+                else None,
+                "source_turn_ids": source_turn_ids,
+                "preserved_turn_refs": preserved_turn_refs
+                if isinstance(preserved_turn_refs, list)
+                else [],
+                "omitted_turn_refs": omitted_turn_refs
+                if isinstance(omitted_turn_refs, list)
+                else [],
+                "user_commitments": user_commitments if isinstance(user_commitments, list) else [],
+                "assistant_commitments": assistant_commitments
+                if isinstance(assistant_commitments, list)
+                else [],
+                "decisions": decisions if isinstance(decisions, list) else [],
+                "open_loops": open_loops if isinstance(open_loops, list) else [],
+                "unresolved_uncertainty": unresolved_uncertainty
+                if isinstance(unresolved_uncertainty, list)
+                else [],
+                "tool_action_outcomes": tool_action_outcomes
+                if isinstance(tool_action_outcomes, list)
+                else [],
+                "important_omissions": important_omissions
+                if isinstance(important_omissions, list)
+                else [],
+                "confidence": max(0.0, min(float(confidence), 1.0))
+                if isinstance(confidence, int | float)
+                else None,
+                "model": model
+                if isinstance(model, str)
+                else settings.model_name
+                if source_turns
+                else None,
+                "prompt_version": MEMORY_CONTINUITY_PROMPT_VERSION,
+                "parse_status": parse_status if isinstance(parse_status, str) else "parsed",
+                "validation_status": validation_status
+                if isinstance(validation_status, str)
+                else "valid",
             },
             source_assertion_ids=[],
             source_episode_ids=[],
@@ -1506,6 +1746,123 @@ def record_rotation_context_block(
             created_at=now,
             updated_at=now,
         )
+    )
+
+
+def _curate_rotation_context_with_model(
+    *,
+    rotation_reason: str,
+    prior_session_id: str,
+    new_session_id: str,
+    source_turns: Sequence[dict[str, Any]],
+    settings: AppSettings,
+) -> dict[str, Any]:
+    if settings.openai_api_key is None:
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_CREDENTIALS",
+            safe_reason="AI continuity curation requires ARIEL_OPENAI_API_KEY",
+            retryable=False,
+            parse_status="missing_output",
+            validation_status="not_validated",
+        )
+    try:
+        response = httpx.post(
+            "https://api.openai.com/v1/responses",
+            headers={
+                "authorization": f"Bearer {settings.openai_api_key}",
+                "content-type": "application/json",
+            },
+            json={
+                "model": settings.model_name,
+                "input": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are Ariel's continuity curator. Summarize the closed session for "
+                            "future turns. Return JSON only with summary, preserved_turn_refs, "
+                            "omitted_turn_refs, user_commitments, assistant_commitments, decisions, "
+                            "open_loops, tool_action_outcomes, unresolved_uncertainty, "
+                            "important_omissions, and confidence. Every source turn must appear "
+                            "exactly once in preserved_turn_refs or omitted_turn_refs with a reason. "
+                            "Do not answer the user."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "prompt_version": MEMORY_CONTINUITY_PROMPT_VERSION,
+                                "rotation_reason": rotation_reason,
+                                "prior_session_id": prior_session_id,
+                                "new_session_id": new_session_id,
+                                "source_turns": list(source_turns),
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    },
+                ],
+                "store": False,
+                "text": {"verbosity": "low"},
+            },
+            timeout=settings.model_timeout_seconds,
+        )
+    except httpx.TimeoutException as exc:
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_TIMEOUT",
+            safe_reason="continuity curation model timed out",
+            retryable=True,
+            parse_status="missing_output",
+            validation_status="not_validated",
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_REQUIRED",
+            safe_reason="continuity curation model network request failed",
+            retryable=True,
+            parse_status="missing_output",
+            validation_status="not_validated",
+        ) from exc
+    if response.status_code >= 400:
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_REQUIRED",
+            safe_reason=f"continuity curation model returned HTTP {response.status_code}",
+            retryable=True,
+            parse_status="missing_output",
+            validation_status="not_validated",
+        )
+    try:
+        response_payload = response.json()
+    except ValueError as exc:
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_REQUIRED",
+            safe_reason="continuity curation provider returned invalid JSON",
+            retryable=True,
+            parse_status="missing_output",
+            validation_status="not_validated",
+        ) from exc
+    provider_response_id = response_payload.get("id")
+    provider_response_id = provider_response_id if isinstance(provider_response_id, str) else None
+    try:
+        payload = json.loads(_extract_output_text(response_payload.get("output")))
+    except json.JSONDecodeError as exc:
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_INVALID_JSON",
+            safe_reason="continuity curation model returned malformed JSON",
+            retryable=False,
+            parse_status="invalid_json",
+            validation_status="invalid",
+            provider_response_id=provider_response_id,
+        ) from exc
+    return validate_continuity_compaction_payload(
+        payload,
+        source_turn_ids=[
+            turn["turn_id"]
+            for turn in source_turns
+            if isinstance(turn, dict) and isinstance(turn.get("turn_id"), str)
+        ],
+        model=settings.model_name,
+        provider_response_id=provider_response_id,
     )
 
 
@@ -1549,10 +1906,8 @@ def serialize_assertion(
     assertion: MemoryAssertionRecord,
     *,
     evidence_refs: Sequence[dict[str, Any]] = (),
-    rank_reason: str | None = None,
-    rank_score: float | None = None,
 ) -> dict[str, Any]:
-    payload = {
+    return {
         "id": assertion.id,
         "subject_key": assertion.subject_key,
         "predicate": assertion.predicate,
@@ -1571,10 +1926,136 @@ def serialize_assertion(
         "evidence_refs": list(evidence_refs),
         "projection_version": MEMORY_PROJECTION_VERSION,
     }
-    if rank_reason is not None:
-        payload["rank_reason"] = rank_reason
-    if rank_score is not None:
-        payload["rank_score"] = round(rank_score, 4)
+
+
+def validate_continuity_compaction_payload(
+    raw_payload: Any,
+    *,
+    source_turn_ids: Sequence[str],
+    model: str | None,
+    provider_response_id: str | None,
+) -> dict[str, Any]:
+    if not isinstance(raw_payload, dict):
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_SCHEMA",
+            safe_reason="continuity compaction model returned a non-object JSON value",
+            retryable=False,
+            parse_status="schema_invalid",
+            validation_status="invalid",
+            provider_response_id=provider_response_id,
+        )
+
+    required_lists = (
+        "preserved_turn_refs",
+        "omitted_turn_refs",
+        "user_commitments",
+        "assistant_commitments",
+        "decisions",
+        "open_loops",
+        "tool_action_outcomes",
+        "unresolved_uncertainty",
+        "important_omissions",
+    )
+    summary = raw_payload.get("summary")
+    confidence = raw_payload.get("confidence")
+    if (
+        not isinstance(summary, str)
+        or not summary.strip()
+        or not isinstance(confidence, int | float)
+        or any(not isinstance(raw_payload.get(key), list) for key in required_lists)
+    ):
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_SCHEMA",
+            safe_reason="continuity compaction JSON missing required fields",
+            retryable=False,
+            parse_status="schema_invalid",
+            validation_status="invalid",
+            provider_response_id=provider_response_id,
+        )
+    if float(confidence) < 0.0 or float(confidence) > 1.0:
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_VALIDATION",
+            safe_reason="continuity compaction confidence must be between 0 and 1",
+            retryable=False,
+            parse_status="parsed",
+            validation_status="invalid",
+            provider_response_id=provider_response_id,
+        )
+
+    known_turn_ids = set(source_turn_ids)
+    seen_turn_ids: set[str] = set()
+    preserved_turn_refs: list[dict[str, str]] = []
+    omitted_turn_refs: list[dict[str, str]] = []
+    for key, target in (
+        ("preserved_turn_refs", preserved_turn_refs),
+        ("omitted_turn_refs", omitted_turn_refs),
+    ):
+        for ref in raw_payload[key]:
+            if (
+                not isinstance(ref, dict)
+                or not isinstance(ref.get("turn_id"), str)
+                or not isinstance(ref.get("reason"), str)
+                or not ref["reason"].strip()
+            ):
+                raise AIJudgmentFailure(
+                    code="E_AI_JUDGMENT_SCHEMA",
+                    safe_reason=f"continuity compaction {key} entries need turn_id and reason",
+                    retryable=False,
+                    parse_status="schema_invalid",
+                    validation_status="invalid",
+                    provider_response_id=provider_response_id,
+                )
+            turn_id = ref["turn_id"]
+            if turn_id not in known_turn_ids:
+                raise AIJudgmentFailure(
+                    code="E_AI_JUDGMENT_VALIDATION",
+                    safe_reason="continuity compaction referenced an unknown source turn",
+                    retryable=False,
+                    parse_status="parsed",
+                    validation_status="invalid",
+                    provider_response_id=provider_response_id,
+                )
+            if turn_id in seen_turn_ids:
+                raise AIJudgmentFailure(
+                    code="E_AI_JUDGMENT_VALIDATION",
+                    safe_reason="continuity compaction duplicated a source turn reference",
+                    retryable=False,
+                    parse_status="parsed",
+                    validation_status="invalid",
+                    provider_response_id=provider_response_id,
+                )
+            seen_turn_ids.add(turn_id)
+            target.append({"turn_id": turn_id, "reason": _clean_text(ref["reason"], max_chars=500)})
+
+    if seen_turn_ids != known_turn_ids:
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_VALIDATION",
+            safe_reason="continuity compaction must account for every source turn",
+            retryable=False,
+            parse_status="parsed",
+            validation_status="invalid",
+            provider_response_id=provider_response_id,
+        )
+
+    payload = {
+        "summary": _clean_text(summary, max_chars=2000),
+        "source_turn_ids": list(source_turn_ids),
+        "preserved_turn_refs": preserved_turn_refs,
+        "omitted_turn_refs": omitted_turn_refs,
+        "user_commitments": list(raw_payload["user_commitments"]),
+        "assistant_commitments": list(raw_payload["assistant_commitments"]),
+        "decisions": list(raw_payload["decisions"]),
+        "open_loops": list(raw_payload["open_loops"]),
+        "tool_action_outcomes": list(raw_payload["tool_action_outcomes"]),
+        "unresolved_uncertainty": list(raw_payload["unresolved_uncertainty"]),
+        "important_omissions": list(raw_payload["important_omissions"]),
+        "confidence": float(confidence),
+        "model": model,
+        "prompt_version": MEMORY_CONTINUITY_PROMPT_VERSION,
+        "provider_response_id": provider_response_id,
+        "parse_status": "parsed",
+        "validation_status": "valid",
+    }
     return payload
 
 
@@ -1699,6 +2180,290 @@ def list_memory(db: Session) -> dict[str, Any]:
     }
 
 
+def _validated_memory_curation(
+    raw_payload: Any,
+    *,
+    candidate_ids: set[str],
+    candidate_kinds: dict[str, str],
+    max_selected: int,
+    model: str,
+) -> dict[str, Any]:
+    if not isinstance(raw_payload, dict):
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_SCHEMA",
+            safe_reason="memory curation model returned a non-object JSON value",
+            retryable=False,
+            parse_status="schema_invalid",
+            validation_status="invalid",
+        )
+
+    selected_raw = raw_payload.get("selected_memories")
+    omitted_raw = raw_payload.get("omitted_memories")
+    rationale = raw_payload.get("rationale")
+    uncertainty = raw_payload.get("uncertainty")
+    confidence = raw_payload.get("confidence")
+    if not (
+        isinstance(selected_raw, list)
+        and isinstance(omitted_raw, list)
+        and isinstance(rationale, str)
+        and isinstance(uncertainty, str)
+        and isinstance(confidence, int | float)
+    ):
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_SCHEMA",
+            safe_reason="memory curation JSON missing required fields",
+            retryable=False,
+            parse_status="schema_invalid",
+            validation_status="invalid",
+        )
+
+    selected: list[dict[str, str]] = []
+    selected_ids: list[str] = []
+    for item in selected_raw:
+        if not isinstance(item, dict):
+            raise AIJudgmentFailure(
+                code="E_AI_JUDGMENT_SCHEMA",
+                safe_reason="memory curation selected_memories entries must be objects",
+                retryable=False,
+                parse_status="schema_invalid",
+                validation_status="invalid",
+            )
+        memory_id = item.get("id")
+        item_rationale = item.get("rationale")
+        if not isinstance(memory_id, str) or not isinstance(item_rationale, str):
+            raise AIJudgmentFailure(
+                code="E_AI_JUDGMENT_SCHEMA",
+                safe_reason="memory curation selected memory missing id or rationale",
+                retryable=False,
+                parse_status="schema_invalid",
+                validation_status="invalid",
+            )
+        if memory_id not in candidate_ids:
+            raise AIJudgmentFailure(
+                code="E_AI_JUDGMENT_VALIDATION",
+                safe_reason="memory curation selected an unknown memory id",
+                retryable=False,
+                parse_status="parsed",
+                validation_status="invalid",
+            )
+        if memory_id in selected_ids:
+            raise AIJudgmentFailure(
+                code="E_AI_JUDGMENT_VALIDATION",
+                safe_reason="memory curation selected duplicate memory ids",
+                retryable=False,
+                parse_status="parsed",
+                validation_status="invalid",
+            )
+        selected_ids.append(memory_id)
+        selected.append(
+            {
+                "id": memory_id,
+                "kind": candidate_kinds[memory_id],
+                "rationale": _clean_text(item_rationale, max_chars=300),
+            }
+        )
+
+    if len(selected) > max_selected:
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_VALIDATION",
+            safe_reason="memory curation selected too many memories",
+            retryable=False,
+            parse_status="parsed",
+            validation_status="invalid",
+        )
+
+    omitted: list[dict[str, str]] = []
+    omitted_ids: list[str] = []
+    for item in omitted_raw:
+        if not isinstance(item, dict):
+            raise AIJudgmentFailure(
+                code="E_AI_JUDGMENT_SCHEMA",
+                safe_reason="memory curation omitted_memories entries must be objects",
+                retryable=False,
+                parse_status="schema_invalid",
+                validation_status="invalid",
+            )
+        memory_id = item.get("id")
+        reason = item.get("reason")
+        if not isinstance(memory_id, str) or not isinstance(reason, str):
+            raise AIJudgmentFailure(
+                code="E_AI_JUDGMENT_SCHEMA",
+                safe_reason="memory curation omitted memory missing id or reason",
+                retryable=False,
+                parse_status="schema_invalid",
+                validation_status="invalid",
+            )
+        if memory_id not in candidate_ids:
+            raise AIJudgmentFailure(
+                code="E_AI_JUDGMENT_VALIDATION",
+                safe_reason="memory curation omitted an unknown memory id",
+                retryable=False,
+                parse_status="parsed",
+                validation_status="invalid",
+            )
+        if memory_id in omitted_ids:
+            raise AIJudgmentFailure(
+                code="E_AI_JUDGMENT_VALIDATION",
+                safe_reason="memory curation omitted duplicate memory ids",
+                retryable=False,
+                parse_status="parsed",
+                validation_status="invalid",
+            )
+        omitted_ids.append(memory_id)
+        omitted.append(
+            {"id": memory_id, "kind": candidate_kinds[memory_id], "reason": _clean_text(reason)}
+        )
+
+    if set(selected_ids) | set(omitted_ids) != candidate_ids:
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_VALIDATION",
+            safe_reason="memory curation must account for every memory candidate",
+            retryable=False,
+            parse_status="parsed",
+            validation_status="invalid",
+        )
+    if set(selected_ids).intersection(omitted_ids):
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_VALIDATION",
+            safe_reason="memory curation cannot select and omit the same memory",
+            retryable=False,
+            parse_status="parsed",
+            validation_status="invalid",
+        )
+
+    return {
+        "selected_memories": selected,
+        "omitted_memories": omitted,
+        "rationale": _clean_text(rationale, max_chars=700),
+        "uncertainty": _clean_text(uncertainty, max_chars=500),
+        "confidence": max(0.0, min(float(confidence), 1.0)),
+        "model": model,
+        "prompt_version": MEMORY_CURATION_PROMPT_VERSION,
+        "parse_status": "parsed",
+    }
+
+
+def _curate_memory_context_with_model(
+    *,
+    user_message: str,
+    history: Sequence[dict[str, Any]],
+    candidates: Sequence[dict[str, Any]],
+    max_selected: int,
+    settings: AppSettings,
+) -> dict[str, Any]:
+    if settings.openai_api_key is None:
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_CREDENTIALS",
+            safe_reason="AI memory curation requires ARIEL_OPENAI_API_KEY",
+            retryable=False,
+            parse_status="missing_output",
+            validation_status="not_validated",
+        )
+
+    prompt = (
+        "You are Ariel's memory curator. Select only memories that matter for the "
+        "current turn. Use the user request, recent history, memory values, evidence, "
+        "validity, conflicts, and provenance. Do not select memories just because they "
+        "appear first. Return JSON only with selected_memories, omitted_memories, "
+        "rationale, uncertainty, and confidence. selected_memories must contain objects "
+        "with id and rationale. omitted_memories must contain every unselected candidate "
+        "with id and reason. Select at most the provided max_selected."
+    )
+    try:
+        response = httpx.post(
+            "https://api.openai.com/v1/responses",
+            headers={
+                "authorization": f"Bearer {settings.openai_api_key}",
+                "content-type": "application/json",
+            },
+            json={
+                "model": settings.model_name,
+                "input": [
+                    {"role": "system", "content": prompt},
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "prompt_version": MEMORY_CURATION_PROMPT_VERSION,
+                                "max_selected": max_selected,
+                                "user_request": user_message,
+                                "recent_history": list(history),
+                                "memory_candidates": list(candidates),
+                            }
+                        ),
+                    },
+                ],
+                "store": False,
+                "text": {"verbosity": "low"},
+            },
+            timeout=settings.model_timeout_seconds,
+        )
+    except httpx.TimeoutException as exc:
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_TIMEOUT",
+            safe_reason="memory curation model timed out",
+            retryable=True,
+            parse_status="missing_output",
+            validation_status="not_validated",
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_REQUIRED",
+            safe_reason="memory curation model network request failed",
+            retryable=True,
+            parse_status="missing_output",
+            validation_status="not_validated",
+        ) from exc
+    if response.status_code >= 400:
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_REQUIRED",
+            safe_reason=f"memory curation model returned HTTP {response.status_code}",
+            retryable=True,
+            parse_status="missing_output",
+            validation_status="not_validated",
+        )
+    try:
+        response_payload = response.json()
+    except ValueError as exc:
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_REQUIRED",
+            safe_reason="memory curation provider returned invalid JSON",
+            retryable=True,
+            parse_status="missing_output",
+            validation_status="not_validated",
+        ) from exc
+    provider_response_id = response_payload.get("id")
+    provider_response_id = provider_response_id if isinstance(provider_response_id, str) else None
+    text = _extract_output_text(response_payload.get("output"))
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_INVALID_JSON",
+            safe_reason="memory curation model returned malformed JSON",
+            retryable=False,
+            parse_status="invalid_json",
+            validation_status="invalid",
+            provider_response_id=provider_response_id,
+        ) from exc
+    try:
+        curation = _validated_memory_curation(
+            payload,
+            candidate_ids={str(candidate["id"]) for candidate in candidates},
+            candidate_kinds={
+                str(candidate["id"]): str(candidate.get("kind") or "memory")
+                for candidate in candidates
+            },
+            max_selected=max_selected,
+            model=settings.model_name,
+        )
+    except AIJudgmentFailure as exc:
+        exc.provider_response_id = provider_response_id
+        raise
+    curation["provider_response_id"] = provider_response_id
+    return curation
+
+
 def search_memory(
     db: Session,
     *,
@@ -1721,7 +2486,10 @@ def build_memory_context(
     user_message: str,
     max_recalled_assertions: int,
     settings: AppSettings | None = None,
+    current_session_id: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    resolved_settings = settings or AppSettings()
+    candidate_limit = max(50, max_recalled_assertions * 8)
     query_terms = set(_terms(user_message))
     entity_rows = db.scalars(select(MemoryEntityRecord)).all()
     matching_entity_ids = {
@@ -1747,9 +2515,8 @@ def build_memory_context(
         ).all()
     }
 
-    active_assertions: Sequence[MemoryAssertionRecord] = ()
-    ranked: list[tuple[float, str, MemoryAssertionRecord, str]] = []
-    resolved_settings = settings or AppSettings()
+    candidate_ids: set[str] = set()
+    vector_distance_by_assertion_id: dict[str, float] = {}
     embedding_count = (
         db.scalar(
             select(func.count())
@@ -1784,143 +2551,114 @@ def build_memory_context(
                 == resolved_settings.memory_embedding_dimensions,
             )
             .order_by(vector_distance.asc(), MemoryEmbeddingProjectionRecord.assertion_id.asc())
-            .limit(max(50, max_recalled_assertions * 8))
+            .limit(candidate_limit)
         ).all()
-        semantic_scores = {
-            assertion_id: max(0.0, 1.0 - float(distance))
-            for assertion_id, distance in vector_rows
-            if distance is not None
-        }
-        keywords = {
-            row.canonical_id: row
-            for row in db.scalars(
-                select(MemoryKeywordProjectionRecord).where(
-                    MemoryKeywordProjectionRecord.canonical_table == "memory_assertions",
-                    MemoryKeywordProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
-                )
-            ).all()
-        }
-        keyword_candidate_ids = {
-            assertion_id
-            for assertion_id, keyword in keywords.items()
-            if query_terms.intersection(set(keyword.weighted_terms))
-        }
-        entity_candidate_ids = {
-            row.canonical_id
-            for row in db.scalars(
-                select(MemoryEntityProjectionRecord).where(
-                    MemoryEntityProjectionRecord.canonical_table == "memory_assertions",
-                    MemoryEntityProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
-                    MemoryEntityProjectionRecord.entity_id.in_(
-                        matching_entity_ids | graph_neighbors or {""}
-                    ),
-                )
-            ).all()
-        }
-        missing_score_ids = (keyword_candidate_ids | entity_candidate_ids) - set(semantic_scores)
-        if missing_score_ids:
-            distance_rows = db.execute(
-                select(
-                    MemoryEmbeddingProjectionRecord.assertion_id,
-                    vector_distance.label("distance"),
-                ).where(
-                    MemoryEmbeddingProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
-                    MemoryEmbeddingProjectionRecord.embedding_provider
-                    == resolved_settings.memory_embedding_provider,
-                    MemoryEmbeddingProjectionRecord.embedding_model
-                    == resolved_settings.memory_embedding_model,
-                    MemoryEmbeddingProjectionRecord.embedding_dimensions
-                    == resolved_settings.memory_embedding_dimensions,
-                    MemoryEmbeddingProjectionRecord.assertion_id.in_(missing_score_ids),
-                )
-            ).all()
-            for assertion_id, distance in distance_rows:
-                if distance is not None:
-                    semantic_scores[assertion_id] = max(0.0, 1.0 - float(distance))
+        for assertion_id, distance in vector_rows:
+            if distance is not None:
+                candidate_ids.add(assertion_id)
+                vector_distance_by_assertion_id[assertion_id] = float(distance)
 
-        candidate_ids = set(semantic_scores)
-        if candidate_ids:
-            active_assertions = db.scalars(
-                select(MemoryAssertionRecord)
-                .where(
-                    MemoryAssertionRecord.lifecycle_state == "active",
-                    MemoryAssertionRecord.id.in_(candidate_ids),
-                )
-                .order_by(MemoryAssertionRecord.updated_at.desc(), MemoryAssertionRecord.id.asc())
-            ).all()
-            salience = {
-                row.assertion_id: row
-                for row in db.scalars(
-                    select(MemorySalienceRecord).where(
-                        MemorySalienceRecord.assertion_id.in_(candidate_ids)
-                    )
-                ).all()
-            }
-            for assertion in active_assertions:
-                reasons: list[str] = []
-                score = assertion.confidence
-                semantic_score = semantic_scores.get(assertion.id, 0.0)
-                if semantic_score > 0.0:
-                    score += semantic_score * 6.0
-                    reasons.append("semantic_vector")
+    keywords = {
+        row.canonical_id: row
+        for row in db.scalars(
+            select(MemoryKeywordProjectionRecord).where(
+                MemoryKeywordProjectionRecord.canonical_table == "memory_assertions",
+                MemoryKeywordProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
+            )
+        ).all()
+    }
+    keyword_terms_by_assertion_id: dict[str, list[str]] = {}
+    for assertion_id, keyword in keywords.items():
+        matched_terms = sorted(query_terms.intersection(set(keyword.weighted_terms)))
+        if matched_terms:
+            candidate_ids.add(assertion_id)
+            keyword_terms_by_assertion_id[assertion_id] = matched_terms
+    entity_scope = matching_entity_ids | graph_neighbors
+    entity_ids_by_assertion_id: dict[str, list[str]] = {}
+    if entity_scope:
+        for row in db.scalars(
+            select(MemoryEntityProjectionRecord).where(
+                MemoryEntityProjectionRecord.canonical_table == "memory_assertions",
+                MemoryEntityProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
+                MemoryEntityProjectionRecord.entity_id.in_(entity_scope),
+            )
+        ).all():
+            candidate_ids.add(row.canonical_id)
+            entity_ids_by_assertion_id.setdefault(row.canonical_id, []).append(row.entity_id)
 
-                keyword = keywords.get(assertion.id)
-                if keyword is not None:
-                    keyword_score = sum(
-                        float(keyword.weighted_terms.get(term, 0.0)) for term in query_terms
-                    )
-                    if keyword_score > 0.0:
-                        score += keyword_score * 1.5
-                        reasons.append("keyword")
-
-                if assertion.subject_entity_id in matching_entity_ids:
-                    score += 3.0
-                    reasons.append("entity")
-                if assertion.subject_entity_id in graph_neighbors:
-                    score += 2.0
-                    reasons.append("graph")
-                if assertion.assertion_type in {"commitment", "decision"}:
-                    score += 2.0
-                    reasons.append("commitment_or_decision")
-                if (
-                    assertion.assertion_type == "project_state"
-                    and "project" in user_message.lower()
-                ):
-                    score += 2.0
-                    reasons.append("project_state")
-                salience_row = salience.get(assertion.id)
-                if salience_row is not None:
-                    score += salience_row.score
-                    if salience_row.user_priority == "pinned":
-                        reasons.append("pinned")
-                    if salience_row.user_priority == "deprioritized":
-                        score -= 100.0
-                        reasons.append("deprioritized")
-                if score <= 1.0 and not reasons:
-                    continue
-                ranked.append((score, assertion.id, assertion, "+".join(reasons) or "salience"))
-
-    ranked.sort(key=lambda row: (-row[0], row[1]))
-    selected = ranked[:max_recalled_assertions]
-    omitted = ranked[max_recalled_assertions:]
-    selected_ids = [assertion.id for _, _, assertion, _ in selected]
-    assertion_ids = [assertion.id for assertion in active_assertions]
-    evidence_refs = _evidence_refs_by_assertion(db, selected_ids + assertion_ids)
-    semantic_assertions = [
-        serialize_assertion(
+    candidate_assertions = (
+        db.scalars(
+            select(MemoryAssertionRecord)
+            .where(
+                MemoryAssertionRecord.lifecycle_state == "active",
+                MemoryAssertionRecord.id.in_(candidate_ids or {""}),
+            )
+            .order_by(MemoryAssertionRecord.updated_at.desc(), MemoryAssertionRecord.id.asc())
+            .limit(candidate_limit)
+        ).all()
+        if candidate_ids
+        else []
+    )
+    candidate_ids = {assertion.id for assertion in candidate_assertions}
+    evidence_refs = _evidence_refs_by_assertion(
+        db, [assertion.id for assertion in candidate_assertions]
+    )
+    open_conflict_ids_by_assertion_id: dict[str, list[str]] = {}
+    if candidate_assertions:
+        for conflict_id, assertion_id in db.execute(
+            select(
+                MemoryConflictMemberRecord.conflict_set_id, MemoryConflictMemberRecord.assertion_id
+            )
+            .join(
+                MemoryConflictSetRecord,
+                MemoryConflictSetRecord.id == MemoryConflictMemberRecord.conflict_set_id,
+            )
+            .where(
+                MemoryConflictSetRecord.lifecycle_state == "open",
+                MemoryConflictMemberRecord.assertion_id.in_(
+                    [assertion.id for assertion in candidate_assertions]
+                ),
+            )
+        ).all():
+            open_conflict_ids_by_assertion_id.setdefault(assertion_id, []).append(conflict_id)
+    candidate_payloads: list[dict[str, Any]] = []
+    for assertion in candidate_assertions:
+        refs = evidence_refs.get(assertion.id, [])
+        candidate_payload = serialize_assertion(
             assertion,
-            evidence_refs=evidence_refs.get(assertion.id, []),
-            rank_reason=reason,
-            rank_score=score,
+            evidence_refs=refs,
         )
-        for score, _, assertion, reason in selected
-    ]
-    conflicts = db.scalars(
-        select(MemoryConflictSetRecord)
-        .where(MemoryConflictSetRecord.lifecycle_state == "open")
-        .order_by(MemoryConflictSetRecord.updated_at.desc(), MemoryConflictSetRecord.id.asc())
-    ).all()
-    project_snapshots = db.scalars(
+        candidate_payload["kind"] = "semantic_assertion"
+        candidate_payload["lifecycle_state"] = assertion.lifecycle_state
+        candidate_payload["trust_boundary"] = (
+            refs[0]["trust_boundary"]
+            if refs and isinstance(refs[0].get("trust_boundary"), str)
+            else "reviewed_memory"
+        )
+        candidate_payload["taint"] = {
+            "provenance_status": candidate_payload["trust_boundary"],
+            "evidence_ids": [
+                ref["evidence_id"] for ref in refs if isinstance(ref.get("evidence_id"), str)
+            ],
+        }
+        candidate_payload["retrieval_features"] = {
+            "vector_distance": vector_distance_by_assertion_id.get(assertion.id),
+            "keyword_terms": keyword_terms_by_assertion_id.get(assertion.id, []),
+            "entity_ids": sorted(entity_ids_by_assertion_id.get(assertion.id, [])),
+            "updated_at_order": len(candidate_payloads) + 1,
+        }
+        candidate_payload["retrieval_rank"] = len(candidate_payloads) + 1
+        candidate_payload["conflict_status"] = (
+            {
+                "state": "open",
+                "conflict_ids": sorted(open_conflict_ids_by_assertion_id[assertion.id]),
+            }
+            if assertion.id in open_conflict_ids_by_assertion_id
+            else {"state": "none", "conflict_ids": []}
+        )
+        candidate_payloads.append(candidate_payload)
+
+    candidate_project_snapshots = db.scalars(
         select(ProjectStateSnapshotRecord)
         .where(ProjectStateSnapshotRecord.lifecycle_state == "active")
         .order_by(
@@ -1929,7 +2667,65 @@ def build_memory_context(
         )
         .limit(8)
     ).all()
-    procedures = db.scalars(
+    for snapshot in candidate_project_snapshots:
+        candidate_payloads.append(
+            {
+                "id": snapshot.id,
+                "kind": "project_state",
+                "project_key": snapshot.project_key,
+                "summary": redact_text(snapshot.summary),
+                "state": snapshot.state,
+                "lifecycle_state": snapshot.lifecycle_state,
+                "source_assertion_ids": snapshot.source_assertion_ids,
+                "source_evidence_ids": snapshot.source_evidence_ids,
+                "trust_boundary": "reviewed_memory",
+                "taint": {"provenance_status": "reviewed_memory"},
+                "retrieval_features": {
+                    "source": "active_project_state",
+                    "updated_at_order": len(candidate_payloads) + 1,
+                },
+                "retrieval_rank": len(candidate_payloads) + 1,
+                "projection_version": MEMORY_PROJECTION_VERSION,
+                "updated_at": to_rfc3339(snapshot.updated_at),
+            }
+        )
+
+    episode_query = select(MemoryEpisodeRecord).where(
+        MemoryEpisodeRecord.lifecycle_state == "active"
+    )
+    if current_session_id is not None:
+        episode_query = episode_query.where(
+            MemoryEpisodeRecord.scope_key != f"session:{current_session_id}"
+        )
+    candidate_episodes = db.scalars(
+        episode_query.order_by(
+            MemoryEpisodeRecord.occurred_at.desc(), MemoryEpisodeRecord.id.asc()
+        ).limit(6)
+    ).all()
+    for episode in candidate_episodes:
+        candidate_payloads.append(
+            {
+                "id": episode.id,
+                "kind": "episode",
+                "episode_type": episode.episode_type,
+                "scope_key": episode.scope_key,
+                "summary": redact_text(episode.summary),
+                "outcome": redact_text(episode.outcome) if episode.outcome else None,
+                "primary_evidence_id": episode.primary_evidence_id,
+                "lifecycle_state": episode.lifecycle_state,
+                "trust_boundary": "reviewed_memory",
+                "taint": {"provenance_status": "reviewed_memory"},
+                "retrieval_features": {
+                    "source": "active_episode",
+                    "occurred_at_order": len(candidate_payloads) + 1,
+                },
+                "retrieval_rank": len(candidate_payloads) + 1,
+                "projection_version": MEMORY_PROJECTION_VERSION,
+                "occurred_at": to_rfc3339(episode.occurred_at),
+            }
+        )
+
+    candidate_procedures = db.scalars(
         select(MemoryProcedureRecord)
         .where(
             MemoryProcedureRecord.lifecycle_state == "active",
@@ -1938,44 +2734,148 @@ def build_memory_context(
         .order_by(MemoryProcedureRecord.updated_at.desc(), MemoryProcedureRecord.id.asc())
         .limit(8)
     ).all()
-    reasoning_traces = db.scalars(
-        select(MemoryEpisodeRecord)
-        .where(MemoryEpisodeRecord.lifecycle_state == "active")
-        .order_by(MemoryEpisodeRecord.occurred_at.desc(), MemoryEpisodeRecord.id.asc())
-        .limit(6)
+    for procedure in candidate_procedures:
+        candidate_payloads.append(
+            {
+                "id": procedure.id,
+                "kind": "procedure",
+                "procedure_key": procedure.procedure_key,
+                "scope_key": procedure.scope_key,
+                "instruction": redact_text(procedure.instruction),
+                "source_assertion_id": procedure.source_assertion_id,
+                "lifecycle_state": procedure.lifecycle_state,
+                "review_state": procedure.review_state,
+                "trust_boundary": "reviewed_memory",
+                "taint": {"provenance_status": "reviewed_memory"},
+                "retrieval_features": {
+                    "source": "approved_procedure",
+                    "updated_at_order": len(candidate_payloads) + 1,
+                },
+                "retrieval_rank": len(candidate_payloads) + 1,
+                "projection_version": MEMORY_PROJECTION_VERSION,
+                "updated_at": to_rfc3339(procedure.updated_at),
+            }
+        )
+
+    recent_turns = list(
+        reversed(
+            db.scalars(
+                select(TurnRecord)
+                .order_by(TurnRecord.created_at.desc(), TurnRecord.id.desc())
+                .limit(8)
+            ).all()
+        )
+    )
+    history = [
+        {
+            "turn_id": turn.id,
+            "user_message": _clean_text(turn.user_message, max_chars=500),
+            "assistant_message": _clean_text(turn.assistant_message or "", max_chars=500),
+            "status": turn.status,
+        }
+        for turn in recent_turns
+    ]
+
+    if candidate_payloads:
+        curation = _curate_memory_context_with_model(
+            user_message=user_message,
+            history=history,
+            candidates=candidate_payloads,
+            max_selected=max_recalled_assertions,
+            settings=resolved_settings,
+        )
+    else:
+        curation = {
+            "selected_memories": [],
+            "omitted_memories": [],
+            "rationale": "No memory candidates were available for AI curation.",
+            "uncertainty": "",
+            "confidence": 1.0,
+            "model": None,
+            "prompt_version": MEMORY_CURATION_PROMPT_VERSION,
+            "parse_status": "not_required_no_candidates",
+        }
+
+    selected_ids = [item["id"] for item in curation["selected_memories"]]
+    selected_by_kind: dict[str, list[str]] = {}
+    for item in curation["selected_memories"]:
+        selected_by_kind.setdefault(item["kind"], []).append(item["id"])
+    assertions_by_id = {assertion.id: assertion for assertion in candidate_assertions}
+    selected_assertions = [
+        assertions_by_id[memory_id]
+        for memory_id in selected_by_kind.get("semantic_assertion", [])
+        if memory_id in assertions_by_id
+    ]
+    semantic_assertions = [
+        serialize_assertion(
+            assertion,
+            evidence_refs=evidence_refs.get(assertion.id, []),
+        )
+        for assertion in selected_assertions
+    ]
+    conflicts = db.scalars(
+        select(MemoryConflictSetRecord)
+        .where(MemoryConflictSetRecord.lifecycle_state == "open")
+        .order_by(MemoryConflictSetRecord.updated_at.desc(), MemoryConflictSetRecord.id.asc())
     ).all()
+    snapshots_by_id = {snapshot.id: snapshot for snapshot in candidate_project_snapshots}
+    project_snapshots = [
+        snapshots_by_id[memory_id]
+        for memory_id in selected_by_kind.get("project_state", [])
+        if memory_id in snapshots_by_id
+    ]
+    episodes_by_id = {episode.id: episode for episode in candidate_episodes}
+    selected_episodes = [
+        episodes_by_id[memory_id]
+        for memory_id in selected_by_kind.get("episode", [])
+        if memory_id in episodes_by_id
+    ]
+    procedures_by_id = {procedure.id: procedure for procedure in candidate_procedures}
+    procedures = [
+        procedures_by_id[memory_id]
+        for memory_id in selected_by_kind.get("procedure", [])
+        if memory_id in procedures_by_id
+    ]
     recall_window: dict[str, Any] = {
-        "max_recalled_items": max_recalled_assertions,
-        "included_memory_count": len(semantic_assertions),
-        "omitted_memory_count": len(omitted),
-        "included_memory_ids": [item["id"] for item in semantic_assertions],
-        "omitted_memories": [
-            {"id": assertion.id, "kind": "semantic_assertion", "reason": "top_k_bounded"}
-            for _, _, assertion, _ in omitted
-        ],
+        "max_selected_memories": max_recalled_assertions,
+        "selected_memory_count": len(curation["selected_memories"]),
+        "memory_candidate_count": len(candidate_payloads),
+        "omitted_memory_count": len(curation["omitted_memories"]),
+        "selected_memory_ids": selected_ids,
+        "selected_memories": list(curation["selected_memories"]),
+        "omitted_memories": list(curation["omitted_memories"]),
+        "candidate_memory_ids": [item["id"] for item in candidate_payloads],
+        "candidate_memories": candidate_payloads,
+        "curation_rationale": curation["rationale"],
+        "curation_uncertainty": curation["uncertainty"],
+        "curation_confidence": curation["confidence"],
+        "curation_model": curation["model"],
+        "curation_prompt_version": curation["prompt_version"],
+        "curation_parse_status": curation["parse_status"],
+        "curation_provider_response_id": curation.get("provider_response_id"),
     }
     context = {
         "schema_version": MEMORY_CONTEXT_SCHEMA_VERSION,
         "projection_version": MEMORY_PROJECTION_VERSION,
         "pinned_core": [
-            item
-            for item in semantic_assertions
-            if item["type"] in {"profile", "preference"}
-            and "pinned" in str(item.get("rank_reason"))
+            item for item in semantic_assertions if item["type"] in {"profile", "preference"}
         ],
         "project_state": [
             {
                 "id": snapshot.id,
                 "project_key": snapshot.project_key,
                 "summary": redact_text(snapshot.summary),
+                "state": snapshot.state,
                 "source_assertion_ids": snapshot.source_assertion_ids,
                 "source_evidence_ids": snapshot.source_evidence_ids,
+                "created_at": to_rfc3339(snapshot.created_at),
+                "updated_at": to_rfc3339(snapshot.updated_at),
             }
             for snapshot in project_snapshots
         ],
         "commitments_and_decisions": [
             serialize_assertion(assertion, evidence_refs=evidence_refs.get(assertion.id, []))
-            for assertion in active_assertions
+            for assertion in selected_assertions
             if assertion.assertion_type in {"commitment", "decision"}
         ][:12],
         "semantic_assertions": semantic_assertions,
@@ -1989,7 +2889,7 @@ def build_memory_context(
                 "primary_evidence_id": episode.primary_evidence_id,
                 "occurred_at": to_rfc3339(episode.occurred_at),
             }
-            for episode in reasoning_traces
+            for episode in selected_episodes
         ],
         "procedural_memory": [
             {
@@ -2005,7 +2905,8 @@ def build_memory_context(
         "recall_window": recall_window,
         "projection_health": {
             "projection_version": MEMORY_PROJECTION_VERSION,
-            "selected_assertion_count": len(selected),
+            "selected_assertion_count": len(selected_assertions),
+            "selected_memory_count": len(curation["selected_memories"]),
         },
     }
     event_payload = {

@@ -10,6 +10,11 @@ the product surface is transport-neutral: the assistant reads an attachment, not
 This doc supersedes the current metadata-only attachment behavior for any user
 intent that clearly requires attachment content.
 
+Attachment handling follows [../ai-first.md](../ai-first.md): the model decides
+whether attachment content is needed and how to use it; deterministic services
+own acquisition, authorization, scanning, extraction limits, taint, provenance,
+and typed failures.
+
 ## Cutover Policy
 
 - Ship as a hard cutover.
@@ -52,7 +57,8 @@ intent that clearly requires attachment content.
 - The model sees an opaque attachment reference, filename, declared content
   type, size, and source message context. It does not see the raw Discord CDN
   URL.
-- The model uses one primary tool, `cap.attachment.read`, to inspect content.
+- The model chooses whether to use one primary tool, `cap.attachment.read`, to
+  inspect content.
 - The read capability performs authorization, acquisition, validation, malware
   scanning, extraction, artifact persistence, and provenance creation.
 - Extracted text, OCR, image observations, and transcripts are returned as
@@ -169,8 +175,10 @@ attachment's identity.
 - The model can see enough metadata to decide whether content reading is
   relevant.
 - The model cannot see or choose an arbitrary download URL.
-- Clear content-read intents are expected to produce a `cap.attachment.read`
-  call before a grounded answer.
+- Clear content-read intents are expected to make the model choose a
+  `cap.attachment.read` call before a grounded answer. Deterministic code
+  validates the call and enforces authorization, scanning, extraction limits,
+  taint, and provenance.
 
 The old text-only context that lists `url=...` is removed.
 
@@ -239,6 +247,9 @@ evidence:
 - Feed bounded extracted blocks back to the model as tool output.
 - Require final answers to cite the artifact/source blocks they used.
 - Keep taint on any later action proposal influenced by attachment content.
+- Do not synthesize final attachment answers deterministically from extracted
+  blocks. The model authors the answer from audited tool output or the turn
+  fails closed.
 
 ### Layer 7: Policy
 

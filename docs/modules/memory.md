@@ -4,13 +4,24 @@
 
 This document defines Ariel's hard cutover from command-pattern and keyword-ish
 memory into a production memory architecture with typed canonical state, temporal
-graph retrieval, evidence-backed recall, deterministic context assembly, and
+graph retrieval, evidence-backed recall, AI-curated context assembly, and
 operator-visible lifecycle controls.
 
 The cutover covers durable user memory, project state, episodic evidence, action
 and reasoning traces, procedural memory, candidate extraction, review, conflict
 resolution, temporal validity, salience, retrieval projections, and context
 assembly.
+
+Memory follows [../ai-first.md](../ai-first.md): AI owns extraction judgment,
+relevance judgment, omission judgment, and continuity interpretation;
+deterministic code owns canonical state, lifecycle rails, candidate retrieval,
+policy, provenance, and audit.
+
+[../ai-first-completion-cutover.md](../ai-first-completion-cutover.md) owns the
+current completion plan for typed memory curation failures, durable curation
+audit records, continuity durability, and file-ownership simplification. That
+completion plan supersedes any older aspirational split that would add modules
+without a clear readability payoff.
 
 It does not cover model provider hosted memory, prompt caching, generic document
 RAG, model fine-tuning, or transcript storage except when transcript content is
@@ -28,12 +39,13 @@ preserved as explicit memory evidence.
 - Do not fall back to command parsing, lexical keyword recall, transcript replay,
   provider-hosted memory, or long-context full-history replay when memory
   retrieval fails.
-- Keyword/BM25 match may be one signal inside the new hybrid retrieval planner.
+- Keyword/BM25 match may be one signal inside the new candidate retrieval service.
   It must not be a standalone fallback path.
 - If memory context required by policy cannot be assembled, fail closed with a
   typed error and an auditable event.
-- Context sections can be omitted only because deterministic scope, lifecycle, or
-  budget rules exclude them.
+- Deterministic code may omit context only because access, lifecycle, or budget
+  rails exclude it. AI memory curation may omit context for relevance only with
+  an auditable reason.
 - Existing narrow memory rows are not a compatibility contract.
 - Any preservation of production memories must be a one-time import into the new
   canonical schema before cutover. Runtime code must not contain import adapters.
@@ -89,7 +101,8 @@ preserved as explicit memory evidence.
 
 ### Recall Behavior
 
-- The context builder assembles memory in deterministic sections:
+- The AI memory curator assembles memory context from bounded, validated
+  candidates:
   - pinned core memory
   - current project state
   - active commitments and unresolved decisions
@@ -98,18 +111,22 @@ preserved as explicit memory evidence.
   - relevant action and reasoning traces
   - reviewed procedural memory
   - unresolved conflicts that affect the turn
-- Retrieval uses structured filters, semantic similarity, BM25/full-text match,
-  entity match, graph distance, temporal validity, salience, confidence,
-  verification age, source quality, task relevance, and reranking.
-- Every recalled item includes id, lifecycle state, source evidence ids,
-  evidence snippet or evidence reference, rank reason, rank score, validity
-  interval, source trust, and projection version.
-- Token budget enforcement is deterministic and emits omitted-item diagnostics.
+- Candidate retrieval uses structured filters, semantic similarity,
+  BM25/full-text match, entity match, graph distance, temporal validity, salience,
+  confidence, verification age, source quality, task relevance, and ordering
+  features.
+- Every candidate and selected memory includes id, lifecycle state, source
+  evidence ids, evidence snippet or evidence reference, candidate-order features,
+  AI selection or omission reason, validity interval, source trust, and
+  projection version.
+- Token budget enforcement is deterministic. Relevance selection and omission
+  judgment are AI-owned and emit omitted-item diagnostics.
 - Recall never includes superseded, rejected, retracted, or deleted assertions in
   normal context.
 - Recall never includes conflicted facts as if they were active facts. It returns
   conflict warnings and candidate evidence for uncertainty handling.
-- The model sees a structured memory bundle. It does not see raw database rows.
+- The master model sees the AI-curated memory bundle. It does not see raw
+  database rows unless an explicit inspection tool is called.
 
 ## Structure
 
@@ -205,9 +222,9 @@ The following are rebuildable projections, not canonical memory:
    Candidate review state, promotion decisions, rejection reasons, conflict
    sets, resolution winners, review actor ids, and audit history.
 
-6. Salience model
+6. Salience feature model
 
-   Stored, inspectable rank inputs:
+   Stored, inspectable candidate-order features:
 
    - user priority
    - project relevance
@@ -226,24 +243,28 @@ The following are rebuildable projections, not canonical memory:
    Rebuildable indexes and summaries. Projection failure must be observable and
    must not silently corrupt active memory.
 
-8. Retrieval planner
+8. Candidate retrieval service
 
-   The only runtime owner of memory recall decisions. It combines scope filters,
+   Gathers eligible candidates and provenance. It combines scope filters,
    semantic search, BM25, graph traversal, temporal filtering, salience, and
-   reranking into one deterministic recall bundle.
+   candidate ordering into one bounded candidate pool. It does not decide final
+   relevance.
 
-9. Context compiler
+9. AI memory curator
 
-   Converts planner output into bounded context sections with ids, snippets,
-   provenance, uncertainty markers, and omission diagnostics.
+   Decides which candidates matter for the current turn, how conflicts affect
+   uncertainty, and which items to omit. It returns bounded context sections with
+   ids, snippets, provenance, uncertainty markers, and omission diagnostics.
 
 ### Request Flow
 
 1. The request is admitted and the current session/thread state is loaded.
-2. The retrieval planner builds memory context from canonical memory and healthy
-   projections.
-3. The context compiler emits a bounded, structured context bundle.
-4. The model receives only the compiled context bundle and current user message.
+2. The candidate retrieval service gathers eligible memory evidence from
+   canonical memory and healthy projections.
+3. The AI memory curator emits a bounded, structured context bundle with
+   selection and omission reasons.
+4. The master model receives only the curated context bundle and current user
+   message.
 5. The assistant response, tool calls, action outcomes, and surfaced sources are
    persisted.
 6. Background memory tasks are enqueued for extraction, consolidation, graph
@@ -265,9 +286,9 @@ The following are rebuildable projections, not canonical memory:
 - Background task failure never invokes legacy recall or legacy extraction.
 - Dead-lettered tasks are inspectable and retryable.
 
-### Retrieval Planner
+### Candidate Retrieval And AI Curation
 
-The planner receives:
+The candidate retrieval service receives:
 
 - user id
 - organization or workspace id when present
@@ -280,23 +301,37 @@ The planner receives:
 - maximum context budget
 - current time
 
-The planner returns:
+The candidate retrieval service returns:
 
-- pinned context blocks
-- project state blocks
-- ranked semantic assertions
-- ranked episodic evidence snippets
-- ranked reasoning traces
+- eligible pinned context blocks
+- eligible project state blocks
+- ordered semantic assertion candidates
+- ordered episodic evidence candidates
+- ordered reasoning trace candidates
 - reviewed procedural rules
 - conflict warnings
 - omitted-item diagnostics
 - projection health diagnostics
 
-### Ranking
+The AI memory curator receives the candidate pool and returns the memory bundle
+shown to the master assistant.
 
-Ranking is deterministic for identical inputs and database state.
+The AI memory curator returns:
 
-Ranking inputs:
+- selected memory sections
+- selection reasons
+- omitted relevant candidates with omission reasons
+- uncertainty and conflict notes
+- provenance references
+- model and prompt version
+
+### Candidate Ordering
+
+Candidate ordering is deterministic for identical inputs and database state.
+Candidate ordering bounds the service output. It does not decide semantic
+importance for the turn.
+
+Candidate ordering inputs:
 
 - structured scope filters
 - semantic vector similarity
@@ -313,21 +348,24 @@ Ranking inputs:
 - user priority
 - project/task linkage
 - open commitment linkage
-- reranker score
+- reranker feature score
 
 Ties are resolved by stable ids after semantic score, salience, priority, and
-timestamp.
+timestamp. AI selection can choose lower-ordered candidates when the current turn
+makes them relevant.
 
 ## Final State
 
 - `src/ariel/app.py` contains route wiring and request handling only.
-- `src/ariel/memory.py` contains domain lifecycle operations, not extraction,
-  projection, or retrieval planner logic.
+- `src/ariel/memory.py` contains domain lifecycle operations, candidate
+  retrieval, and AI curation while that keeps the current control flow easiest
+  to read.
 - `src/ariel/memory_extraction.py` owns evidence normalization and candidate
   extraction.
 - `src/ariel/memory_projection.py` owns projection job execution and rebuilds.
-- `src/ariel/memory_retrieval.py` owns retrieval planning, ranking, and context
-  assembly.
+- `src/ariel/memory_retrieval.py` and `src/ariel/memory_curation.py` are created
+  only if the split clearly makes the current implementation easier to skim.
+  They are not required as empty architecture placeholders.
 - `src/ariel/persistence.py` owns ORM models for canonical memory and
   projections.
 - Memory APIs expose new contracts only.
@@ -343,7 +381,8 @@ timestamp.
 - PostgreSQL is canonical memory state.
 - Provider-hosted memory is never canonical.
 - Embeddings are projections, not memory.
-- Graph state is first-class, not inferred at prompt time.
+- Graph edges, validity windows, and provenance are canonical rails.
+  Relationship interpretation remains AI-owned.
 - Temporal validity is first-class.
 - Evidence snippets are first-class recall items.
 - Review is first-class.
@@ -354,7 +393,8 @@ timestamp.
 - Procedural memory can affect assistant behavior only when active and reviewed.
 - Untrusted content cannot create active trusted memory without review.
 - Hidden instructions from retrieved memory must not bypass policy.
-- Memory context must be bounded and deterministic.
+- Memory candidate retrieval must be bounded and auditable. Memory relevance and
+  context selection are AI-owned.
 - Memory failures must be typed, surfaced, and auditable.
 - Managed products such as Zep, Mem0, Letta, LangGraph, or Neo4j Agent Memory are
   reference models, not required runtime dependencies.
@@ -373,7 +413,7 @@ timestamp.
 - Keep memory safe under concurrency, retries, process restarts, and background
   worker failure.
 - Use hybrid retrieval instead of vector-only or keyword-only recall.
-- Evaluate memory behavior, not just row persistence.
+- Evaluate rail invariants and AI memory behavior, not just row persistence.
 
 ## Non-Goals
 
@@ -574,7 +614,8 @@ enough metadata to reconstruct behavior.
   - Remove old memory item/revision models.
 - `src/ariel/memory.py`
   - Domain services for assertion lifecycle, review decisions, conflict
-    operations, project state operations, and deletion/redaction workflows.
+    operations, project state operations, candidate retrieval, AI curation, and
+    deletion/redaction workflows.
 - `src/ariel/memory_models.py`
   - Pydantic models and owned types for memory values, evidence, recall, and
     projection payloads.
@@ -585,8 +626,11 @@ enough metadata to reconstruct behavior.
   - Projection rebuild jobs for embeddings, BM25/full-text rows, entity indexes,
     graph caches, compact context blocks, and project state blocks.
 - `src/ariel/memory_retrieval.py`
-  - Retrieval planner, ranking, hybrid search, temporal filtering, graph
-    traversal, reranking, and context bundle construction.
+  - Optional extraction point for candidate retrieval only when it removes real
+    complexity from `memory.py`.
+- `src/ariel/memory_curation.py`
+  - Optional extraction point for AI curation only when it removes real
+    complexity from `memory.py`.
 - `src/ariel/memory_eval.py`
   - Local long-memory evaluation runner and fixtures.
 - `src/ariel/response_contracts.py`
@@ -661,13 +705,16 @@ enough metadata to reconstruct behavior.
 
 ### Retrieval
 
-- Recall is deterministic for identical inputs and database state.
-- Recall uses hybrid retrieval with structured filters, vector similarity,
-  BM25/full-text, entity matching, graph traversal, temporal validity, salience,
-  and reranking.
-- Recall returns provenance, evidence snippets, rank reasons, rank scores,
-  validity windows, and projection versions.
-- Recall emits deterministic omitted-item diagnostics under budget pressure.
+- Candidate retrieval is deterministic for identical inputs and database state.
+- Candidate retrieval uses hybrid retrieval with structured filters, vector
+  similarity, BM25/full-text, entity matching, graph traversal, temporal
+  validity, salience, and candidate-order features.
+- AI memory curation decides which candidates matter for the current turn.
+- Recall returns provenance, evidence snippets, candidate-order features,
+  AI selection reasons, AI omission reasons, validity windows, and projection
+  versions.
+- Recall emits deterministic rail omissions and AI relevance omissions under
+  budget pressure.
 - Unresolved conflicts appear as uncertainty in context when relevant.
 - Temporal questions use validity intervals and event times rather than latest row
   order alone.
@@ -715,14 +762,17 @@ enough metadata to reconstruct behavior.
   wrong memory and semantic/entity retrieval fixes it.
 - The eval includes at least one case where the correct answer is to abstain.
 - The eval includes at least one deletion/correction case.
-- The eval records accuracy, retrieval precision, omitted relevant memories,
-  context tokens, projection latency, and extraction latency.
+- The eval records answer accuracy, candidate recall, curation precision,
+  omitted relevant memories, context tokens, projection latency, extraction
+  latency, and curation latency.
 
 ### Operations
 
 - Projection jobs are observable.
 - Dead-lettered projection jobs are inspectable and retryable.
 - Memory recall emits diagnostics for omitted candidates and projection failures.
+- Memory curation emits selection and omission reasons for the bundle shown to
+  the master assistant.
 - Memory import/export is observable.
 - Redaction and deletion produce auditable records.
 - No failed background job can silently corrupt active memory.
@@ -743,15 +793,16 @@ enough metadata to reconstruct behavior.
 - Graph memory is first-class in Ariel's schema. A future external graph database
   can be a projection backend only if Postgres remains canonical.
 - Embeddings, BM25 rows, graph caches, and summaries are projections.
-- Hybrid retrieval is required.
+- Hybrid candidate retrieval is required.
 - Temporal validity is required.
 - Evidence snippets are required.
 - Review, conflict, salience, deletion, and redaction are required.
 - Background consolidation is required for production quality.
 - The hot path reads memory and enqueues memory work; it does not run full
   consolidation.
-- Explicit user commands remain useful UX, but model extraction and review own
-  canonical memory creation.
+- Explicit user commands remain useful UX, but AI extraction proposes memory
+  candidates and deterministic lifecycle rails plus explicit user/operator
+  review promote or reject them.
 - Provider-side memory is not canonical.
 - The cutover does not preserve old runtime APIs or schema.
 - The implementation starts with Ariel-owned infrastructure, not a required
@@ -790,7 +841,7 @@ production-shippable until the old system is removed.
    retry/dead-letter behavior.
 8. Add projection rebuilders for embeddings, BM25/full-text, entity indexes,
    graph caches, context blocks, and project state blocks.
-9. Add retrieval planner and context bundle contract.
+9. Add candidate retrieval and AI curation contracts.
 10. Rewrite memory APIs and events around the new contracts.
 11. Replace model-loop memory recall with the new context bundle.
 12. Add acceptance, integration, and long-memory eval coverage.
