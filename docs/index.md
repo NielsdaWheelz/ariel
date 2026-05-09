@@ -53,6 +53,9 @@ This directory is the canonical home for repository documentation.
 
 ### Product operations
 
+- [email-decluttering-sota-cutover.md](email-decluttering-sota-cutover.md):
+  hard cutover plan for frontier email decluttering, mailbox mutations,
+  thread watches, auditability, and undo
 - [proactive-ai-deliberation-cutover.md](proactive-ai-deliberation-cutover.md):
   hard cutover to event-triggered AI deliberation, ambient sensing, and
   autonomous action

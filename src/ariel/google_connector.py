@@ -16,7 +16,7 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import httpx
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from ariel.persistence import (
     GoogleConnectorEventRecord,
@@ -36,6 +36,7 @@ GOOGLE_CALENDAR_WRITE_SCOPE = "https://www.googleapis.com/auth/calendar.events"
 GOOGLE_GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 GOOGLE_GMAIL_COMPOSE_SCOPE = "https://www.googleapis.com/auth/gmail.compose"
 GOOGLE_GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
+GOOGLE_GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
 GOOGLE_DRIVE_METADATA_READ_SCOPE = "https://www.googleapis.com/auth/drive.metadata.readonly"
 GOOGLE_DRIVE_READ_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
 GOOGLE_DRIVE_SHARE_SCOPE = "https://www.googleapis.com/auth/drive"
@@ -45,6 +46,7 @@ GOOGLE_READ_CAPABILITY_SCOPES: dict[str, set[str]] = {
     "cap.calendar.propose_slots": {GOOGLE_CALENDAR_READ_SCOPE},
     "cap.email.search": {GOOGLE_GMAIL_READ_SCOPE},
     "cap.email.read": {GOOGLE_GMAIL_READ_SCOPE},
+    "cap.email.thread_watch.create": {GOOGLE_GMAIL_READ_SCOPE},
     "cap.drive.search": {GOOGLE_DRIVE_METADATA_READ_SCOPE},
     "cap.drive.read": {GOOGLE_DRIVE_READ_SCOPE},
 }
@@ -53,6 +55,10 @@ GOOGLE_WRITE_CAPABILITY_SCOPES: dict[str, set[str]] = {
     "cap.calendar.create_event": {GOOGLE_CALENDAR_WRITE_SCOPE},
     "cap.email.draft": {GOOGLE_GMAIL_COMPOSE_SCOPE},
     "cap.email.send": {GOOGLE_GMAIL_SEND_SCOPE},
+    "cap.email.archive": {GOOGLE_GMAIL_MODIFY_SCOPE},
+    "cap.email.trash": {GOOGLE_GMAIL_MODIFY_SCOPE},
+    "cap.email.labels.modify": {GOOGLE_GMAIL_MODIFY_SCOPE},
+    "cap.email.undo": {GOOGLE_GMAIL_MODIFY_SCOPE},
     "cap.drive.share": {GOOGLE_DRIVE_SHARE_SCOPE},
 }
 GOOGLE_WRITE_CAPABILITY_IDS = frozenset(GOOGLE_WRITE_CAPABILITY_SCOPES.keys())
@@ -91,6 +97,7 @@ _AUTH_FAILURE_RECOVERY: dict[TypedAuthFailureClass, str] = {
 
 _GOOGLE_TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
 _MAX_GOOGLE_RESULTS = 5
+_GMAIL_BATCH_MODIFY_LIMIT = 1000
 _MAX_DRIVE_READ_BYTES = 131072
 _MAX_DRIVE_READ_CHARS = 2000
 _DRIVE_NATIVE_DOC_MIME_TYPE = "application/vnd.google-apps.document"
@@ -104,6 +111,35 @@ _DRIVE_TEXT_LIKE_MIME_TYPES = {
     "application/rtf",
     "application/xml",
 }
+_GMAIL_SYSTEM_LABEL_IDS = frozenset(
+    {
+        "CATEGORY_FORUMS",
+        "CATEGORY_PERSONAL",
+        "CATEGORY_PROMOTIONS",
+        "CATEGORY_SOCIAL",
+        "CATEGORY_UPDATES",
+        "CHAT",
+        "DRAFT",
+        "IMPORTANT",
+        "INBOX",
+        "SENT",
+        "SPAM",
+        "STARRED",
+        "TRASH",
+        "UNREAD",
+    }
+)
+_GMAIL_MESSAGE_MODIFIABLE_SYSTEM_LABEL_IDS = frozenset(
+    {
+        "IMPORTANT",
+        "INBOX",
+        "STARRED",
+        "UNREAD",
+    }
+)
+_GMAIL_UNDO_MODIFY_BLOCKED_LABEL_IDS = (
+    _GMAIL_SYSTEM_LABEL_IDS - _GMAIL_MESSAGE_MODIFIABLE_SYSTEM_LABEL_IDS
+)
 
 
 def _utcnow() -> datetime:
@@ -218,6 +254,41 @@ class GoogleWorkspaceProvider(Protocol):
         max_results: int | None = None,
         history_types: list[str] | None = None,
         label_id: str | None = None,
+    ) -> dict[str, Any]: ...
+
+    def email_get_message_label_state(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]: ...
+
+    def email_archive(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]: ...
+
+    def email_trash(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]: ...
+
+    def email_modify_labels(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]: ...
+
+    def email_undo(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
     ) -> dict[str, Any]: ...
 
     def calendar_create_event(
@@ -488,6 +559,7 @@ class DefaultGoogleWorkspaceProvider:
         access_token: str,
         params: dict[str, Any] | None = None,
         json_payload: dict[str, Any] | None = None,
+        allow_empty_response: bool = False,
     ) -> dict[str, Any]:
         attempts = max(1, self.max_attempts)
         for attempt in range(1, attempts + 1):
@@ -524,6 +596,8 @@ class DefaultGoogleWorkspaceProvider:
                 raise RuntimeError("resource_not_found")
             if status_code >= 400:
                 raise RuntimeError(f"google_request_failed:{status_code}")
+            if allow_empty_response and (status_code in {204, 205} or not response.content):
+                return {}
             try:
                 payload = response.json()
             except ValueError as exc:
@@ -950,6 +1024,707 @@ class DefaultGoogleWorkspaceProvider:
             access_token=access_token,
             params=params,
         )
+
+    def _gmail_read_message_state(
+        self,
+        *,
+        access_token: str,
+        message_id: str,
+    ) -> dict[str, Any]:
+        payload = self._request_json(
+            method="GET",
+            url=f"{self.gmail_api_base_url}/users/me/messages/{quote(message_id, safe='')}",
+            access_token=access_token,
+            params={"format": "minimal"},
+        )
+        return _gmail_message_state(payload=payload, requested_message_id=message_id)
+
+    def _gmail_read_message_states(
+        self,
+        *,
+        access_token: str,
+        message_ids: list[str],
+    ) -> list[dict[str, Any]]:
+        states: list[dict[str, Any]] = []
+        for message_id in message_ids:
+            states.append(
+                self._gmail_read_message_state(
+                    access_token=access_token,
+                    message_id=message_id,
+                )
+            )
+        return states
+
+    def _gmail_read_message_states_for_audit(
+        self,
+        *,
+        access_token: str,
+        message_ids: list[str],
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        try:
+            return (
+                self._gmail_read_message_states(
+                    access_token=access_token,
+                    message_ids=message_ids,
+                ),
+                None,
+            )
+        except Exception as exc:
+            reason = safe_failure_reason(str(exc), fallback=f"unexpected {exc.__class__.__name__}")
+            return [], reason
+
+    def _gmail_modify_message_labels(
+        self,
+        *,
+        access_token: str,
+        message_id: str,
+        add_label_ids: list[str],
+        remove_label_ids: list[str],
+    ) -> dict[str, Any]:
+        return self._request_json(
+            method="POST",
+            url=f"{self.gmail_api_base_url}/users/me/messages/{quote(message_id, safe='')}/modify",
+            access_token=access_token,
+            json_payload={
+                "addLabelIds": add_label_ids,
+                "removeLabelIds": remove_label_ids,
+            },
+        )
+
+    def _gmail_batch_modify_message_labels(
+        self,
+        *,
+        access_token: str,
+        message_ids: list[str],
+        add_label_ids: list[str],
+        remove_label_ids: list[str],
+    ) -> int:
+        if not message_ids:
+            return 0
+        if len(message_ids) > _GMAIL_BATCH_MODIFY_LIMIT:
+            raise RuntimeError("schema_invalid")
+        self._request_json(
+            method="POST",
+            url=f"{self.gmail_api_base_url}/users/me/messages/batchModify",
+            access_token=access_token,
+            json_payload={
+                "ids": message_ids,
+                "addLabelIds": add_label_ids,
+                "removeLabelIds": remove_label_ids,
+            },
+            allow_empty_response=True,
+        )
+        return 1
+
+    def _gmail_trash_message(
+        self,
+        *,
+        access_token: str,
+        message_id: str,
+    ) -> dict[str, Any]:
+        return self._request_json(
+            method="POST",
+            url=f"{self.gmail_api_base_url}/users/me/messages/{quote(message_id, safe='')}/trash",
+            access_token=access_token,
+        )
+
+    def _gmail_untrash_message(
+        self,
+        *,
+        access_token: str,
+        message_id: str,
+    ) -> dict[str, Any]:
+        return self._request_json(
+            method="POST",
+            url=f"{self.gmail_api_base_url}/users/me/messages/{quote(message_id, safe='')}/untrash",
+            access_token=access_token,
+        )
+
+    def _gmail_list_labels(self, *, access_token: str) -> list[dict[str, Any]]:
+        payload = self._request_json(
+            method="GET",
+            url=f"{self.gmail_api_base_url}/users/me/labels",
+            access_token=access_token,
+        )
+        raw_labels = payload.get("labels")
+        return (
+            [label for label in raw_labels if isinstance(label, dict)]
+            if isinstance(raw_labels, list)
+            else []
+        )
+
+    def _gmail_resolve_label_names(
+        self,
+        *,
+        access_token: str,
+        label_names: list[str],
+    ) -> list[dict[str, str]]:
+        if not label_names:
+            return []
+        provider_labels = self._gmail_list_labels(access_token=access_token)
+        labels_by_name: dict[str, str] = {}
+        for label in provider_labels:
+            name_raw = label.get("name")
+            id_raw = label.get("id")
+            if not isinstance(name_raw, str) or not isinstance(id_raw, str):
+                continue
+            name = name_raw.strip()
+            label_id = id_raw.strip()
+            if name and label_id:
+                labels_by_name[name] = label_id
+
+        resolved: list[dict[str, str]] = []
+        for label_name in label_names:
+            if label_name in _GMAIL_SYSTEM_LABEL_IDS:
+                resolved.append({"name": label_name, "id": label_name})
+                continue
+            resolved_label_id = labels_by_name.get(label_name)
+            if resolved_label_id is None:
+                raise RuntimeError("label_not_found")
+            resolved.append({"name": label_name, "id": resolved_label_id})
+        return resolved
+
+    def email_get_message_label_state(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]:
+        message_ids = _gmail_message_ids_from_input(normalized_input)
+        states = self._gmail_read_message_states(
+            access_token=access_token,
+            message_ids=message_ids,
+        )
+        return {
+            "message_ids": message_ids,
+            "state": states,
+            "labels": _gmail_label_map(states),
+            "retrieved_at": to_rfc3339(_utcnow()),
+        }
+
+    def email_archive(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]:
+        message_ids = _gmail_message_ids_from_input(normalized_input)
+        before_state = _gmail_supplied_before_state_from_input(
+            normalized_input,
+            message_ids=message_ids,
+        )
+        if before_state is None:
+            before_state = self._gmail_read_message_states(
+                access_token=access_token,
+                message_ids=message_ids,
+            )
+        message_ids_to_archive = [
+            state["message_id"] for state in before_state if "INBOX" in state["label_ids"]
+        ]
+        provider_calls: list[dict[str, Any]] = []
+        failed_provider_call: dict[str, Any] | None = None
+        error: str | None = None
+        try:
+            if len(message_ids_to_archive) == 1:
+                self._gmail_modify_message_labels(
+                    access_token=access_token,
+                    message_id=message_ids_to_archive[0],
+                    add_label_ids=[],
+                    remove_label_ids=["INBOX"],
+                )
+                provider_calls.append(
+                    {
+                        "api": "users.messages.modify",
+                        "message_count": 1,
+                        "removeLabelIds": ["INBOX"],
+                    }
+                )
+            elif len(message_ids_to_archive) > 1:
+                call_count = self._gmail_batch_modify_message_labels(
+                    access_token=access_token,
+                    message_ids=message_ids_to_archive,
+                    add_label_ids=[],
+                    remove_label_ids=["INBOX"],
+                )
+                provider_calls.append(
+                    {
+                        "api": "users.messages.batchModify",
+                        "message_count": len(message_ids_to_archive),
+                        "call_count": call_count,
+                        "removeLabelIds": ["INBOX"],
+                    }
+                )
+        except Exception as exc:
+            error = safe_failure_reason(str(exc), fallback=f"unexpected {exc.__class__.__name__}")
+            failed_provider_call = {
+                "api": "users.messages.batchModify"
+                if len(message_ids_to_archive) > 1
+                else "users.messages.modify",
+                "message_ids": message_ids_to_archive,
+                "removeLabelIds": ["INBOX"],
+                "error": error,
+            }
+
+        after_state, after_state_error = self._gmail_read_message_states_for_audit(
+            access_token=access_token,
+            message_ids=message_ids,
+        )
+        noop_message_ids = [
+            state["message_id"] for state in before_state if "INBOX" not in state["label_ids"]
+        ]
+        provider_result: dict[str, Any] = {
+            "operation": "archive",
+            "provider": "gmail",
+            "provider_calls": provider_calls,
+            "mutated_message_ids": message_ids_to_archive if error is None else [],
+            "attempted_message_ids": message_ids_to_archive,
+            "noop_message_ids": noop_message_ids,
+        }
+        if failed_provider_call is not None:
+            provider_result["failed_provider_call"] = failed_provider_call
+        if error is not None:
+            provider_result["error"] = error
+        if after_state_error is not None:
+            provider_result["after_state_error"] = after_state_error
+            if error is None:
+                provider_result["error"] = after_state_error
+                error = after_state_error
+        return _gmail_mutation_output(
+            status=(
+                "archived" if error is None else "partially_failed" if provider_calls else "failed"
+            ),
+            operation="archive",
+            message_ids=message_ids,
+            before_state=before_state,
+            after_state=after_state,
+            provider_result=provider_result,
+        )
+
+    def email_trash(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]:
+        message_ids = _gmail_message_ids_from_input(normalized_input)
+        before_state = _gmail_supplied_before_state_from_input(
+            normalized_input,
+            message_ids=message_ids,
+        )
+        if before_state is None:
+            before_state = self._gmail_read_message_states(
+                access_token=access_token,
+                message_ids=message_ids,
+            )
+        message_ids_to_trash = [
+            state["message_id"] for state in before_state if "TRASH" not in state["label_ids"]
+        ]
+        provider_calls: list[dict[str, Any]] = []
+        mutated_message_ids: list[str] = []
+        failed_provider_call: dict[str, Any] | None = None
+        error: str | None = None
+        for message_id in message_ids_to_trash:
+            try:
+                self._gmail_trash_message(access_token=access_token, message_id=message_id)
+            except Exception as exc:
+                error = safe_failure_reason(
+                    str(exc),
+                    fallback=f"unexpected {exc.__class__.__name__}",
+                )
+                failed_provider_call = {
+                    "api": "users.messages.trash",
+                    "message_id": message_id,
+                    "error": error,
+                }
+                break
+            provider_calls.append({"api": "users.messages.trash", "message_id": message_id})
+            mutated_message_ids.append(message_id)
+
+        after_state, after_state_error = self._gmail_read_message_states_for_audit(
+            access_token=access_token,
+            message_ids=message_ids,
+        )
+        noop_message_ids = [
+            state["message_id"] for state in before_state if "TRASH" in state["label_ids"]
+        ]
+        provider_result: dict[str, Any] = {
+            "operation": "trash",
+            "provider": "gmail",
+            "provider_calls": provider_calls,
+            "mutated_message_ids": mutated_message_ids,
+            "attempted_message_ids": message_ids_to_trash,
+            "noop_message_ids": noop_message_ids,
+        }
+        if failed_provider_call is not None:
+            provider_result["failed_provider_call"] = failed_provider_call
+        if error is not None:
+            provider_result["error"] = error
+        if after_state_error is not None:
+            provider_result["after_state_error"] = after_state_error
+            if error is None:
+                provider_result["error"] = after_state_error
+                error = after_state_error
+        status = "trashed"
+        if error is not None:
+            status = "partially_failed" if mutated_message_ids else "failed"
+        return _gmail_mutation_output(
+            status=status,
+            operation="trash",
+            message_ids=message_ids,
+            before_state=before_state,
+            after_state=after_state,
+            provider_result=provider_result,
+        )
+
+    def email_modify_labels(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]:
+        message_ids = _gmail_message_ids_from_input(normalized_input)
+        label_names_to_add = _gmail_label_names_from_input(
+            normalized_input,
+            field_name="add_labels",
+        )
+        label_names_to_remove = _gmail_label_names_from_input(
+            normalized_input,
+            field_name="remove_labels",
+        )
+        provider_label_ids = _gmail_provider_label_ids_from_input(normalized_input)
+        if provider_label_ids is None:
+            add_label_name_set = set(label_names_to_add)
+            combined_label_names = label_names_to_add + [
+                label_name
+                for label_name in label_names_to_remove
+                if label_name not in add_label_name_set
+            ]
+            combined_resolution = self._gmail_resolve_label_names(
+                access_token=access_token,
+                label_names=combined_label_names,
+            )
+            resolution_by_name = {entry["name"]: entry for entry in combined_resolution}
+            add_resolution = [resolution_by_name[label_name] for label_name in label_names_to_add]
+            remove_resolution = [
+                resolution_by_name[label_name] for label_name in label_names_to_remove
+            ]
+        else:
+            add_resolution = [
+                {"name": label_id, "id": label_id} for label_id in provider_label_ids["add"]
+            ]
+            remove_resolution = [
+                {"name": label_id, "id": label_id} for label_id in provider_label_ids["remove"]
+            ]
+        add_label_ids = [entry["id"] for entry in add_resolution]
+        remove_label_ids = [entry["id"] for entry in remove_resolution]
+        if not add_label_ids and not remove_label_ids:
+            raise RuntimeError("schema_invalid")
+        if set(add_label_ids) & set(remove_label_ids):
+            raise RuntimeError("schema_invalid")
+        blocked_system_label_ids = (set(add_label_ids) | set(remove_label_ids)) - (
+            _GMAIL_MESSAGE_MODIFIABLE_SYSTEM_LABEL_IDS - {"INBOX"}
+        )
+        if blocked_system_label_ids & _GMAIL_SYSTEM_LABEL_IDS:
+            raise RuntimeError("system_label_requires_dedicated_capability")
+
+        before_state = _gmail_supplied_before_state_from_input(
+            normalized_input,
+            message_ids=message_ids,
+        )
+        if before_state is None:
+            before_state = self._gmail_read_message_states(
+                access_token=access_token,
+                message_ids=message_ids,
+            )
+        message_ids_to_modify = [
+            state["message_id"]
+            for state in before_state
+            if _gmail_label_mutation_needed(
+                label_ids=state["label_ids"],
+                add_label_ids=add_label_ids,
+                remove_label_ids=remove_label_ids,
+            )
+        ]
+        provider_calls: list[dict[str, Any]] = []
+        failed_provider_call: dict[str, Any] | None = None
+        error: str | None = None
+        try:
+            if len(message_ids_to_modify) == 1:
+                self._gmail_modify_message_labels(
+                    access_token=access_token,
+                    message_id=message_ids_to_modify[0],
+                    add_label_ids=add_label_ids,
+                    remove_label_ids=remove_label_ids,
+                )
+                provider_calls.append(
+                    {
+                        "api": "users.messages.modify",
+                        "message_count": 1,
+                        "addLabelIds": add_label_ids,
+                        "removeLabelIds": remove_label_ids,
+                    }
+                )
+            elif len(message_ids_to_modify) > 1:
+                call_count = self._gmail_batch_modify_message_labels(
+                    access_token=access_token,
+                    message_ids=message_ids_to_modify,
+                    add_label_ids=add_label_ids,
+                    remove_label_ids=remove_label_ids,
+                )
+                provider_calls.append(
+                    {
+                        "api": "users.messages.batchModify",
+                        "message_count": len(message_ids_to_modify),
+                        "call_count": call_count,
+                        "addLabelIds": add_label_ids,
+                        "removeLabelIds": remove_label_ids,
+                    }
+                )
+        except Exception as exc:
+            error = safe_failure_reason(str(exc), fallback=f"unexpected {exc.__class__.__name__}")
+            failed_provider_call = {
+                "api": "users.messages.batchModify"
+                if len(message_ids_to_modify) > 1
+                else "users.messages.modify",
+                "message_ids": message_ids_to_modify,
+                "addLabelIds": add_label_ids,
+                "removeLabelIds": remove_label_ids,
+                "error": error,
+            }
+
+        after_state, after_state_error = self._gmail_read_message_states_for_audit(
+            access_token=access_token,
+            message_ids=message_ids,
+        )
+        noop_message_ids = [
+            state["message_id"]
+            for state in before_state
+            if state["message_id"] not in set(message_ids_to_modify)
+        ]
+        provider_result: dict[str, Any] = {
+            "operation": "labels.modify",
+            "provider": "gmail",
+            "provider_calls": provider_calls,
+            "mutated_message_ids": message_ids_to_modify if error is None else [],
+            "attempted_message_ids": message_ids_to_modify,
+            "noop_message_ids": noop_message_ids,
+            "provider_label_ids": {
+                "add": add_label_ids,
+                "remove": remove_label_ids,
+            },
+        }
+        if failed_provider_call is not None:
+            provider_result["failed_provider_call"] = failed_provider_call
+        if error is not None:
+            provider_result["error"] = error
+        if after_state_error is not None:
+            provider_result["after_state_error"] = after_state_error
+            if error is None:
+                provider_result["error"] = after_state_error
+                error = after_state_error
+        output = _gmail_mutation_output(
+            status=(
+                "labels_modified"
+                if error is None
+                else "partially_failed"
+                if provider_calls
+                else "failed"
+            ),
+            operation="labels.modify",
+            message_ids=message_ids,
+            before_state=before_state,
+            after_state=after_state,
+            provider_result=provider_result,
+        )
+        output["provider_label_ids"] = {
+            "add": add_label_ids,
+            "remove": remove_label_ids,
+        }
+        output["label_resolution"] = {
+            "add": add_resolution,
+            "remove": remove_resolution,
+        }
+        return output
+
+    def email_undo(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]:
+        message_ids = _gmail_message_ids_from_input(normalized_input)
+        target_state = _gmail_restore_state_from_input(
+            normalized_input,
+            message_ids=message_ids,
+        )
+        before_undo_state = self._gmail_read_message_states(
+            access_token=access_token,
+            message_ids=message_ids,
+        )
+        current_state_by_id = {state["message_id"]: state for state in before_undo_state}
+        provider_calls: list[dict[str, Any]] = []
+        restored_message_ids: list[str] = []
+        noop_message_ids: list[str] = []
+        skipped_immutable_label_ids: dict[str, list[str]] = {}
+        failed_provider_call: dict[str, Any] | None = None
+        error: str | None = None
+
+        for target in target_state:
+            message_id = target["message_id"]
+            target_label_ids = target["label_ids"]
+            current_state = current_state_by_id[message_id]
+            current_label_ids = current_state["label_ids"]
+            if current_label_ids == target_label_ids:
+                noop_message_ids.append(message_id)
+                continue
+
+            if "TRASH" in current_label_ids and "TRASH" not in target_label_ids:
+                try:
+                    self._gmail_untrash_message(access_token=access_token, message_id=message_id)
+                except Exception as exc:
+                    error = safe_failure_reason(
+                        str(exc),
+                        fallback=f"unexpected {exc.__class__.__name__}",
+                    )
+                    failed_provider_call = {
+                        "api": "users.messages.untrash",
+                        "message_id": message_id,
+                        "error": error,
+                    }
+                    break
+                provider_calls.append({"api": "users.messages.untrash", "message_id": message_id})
+                try:
+                    current_state = self._gmail_read_message_state(
+                        access_token=access_token,
+                        message_id=message_id,
+                    )
+                except Exception as exc:
+                    error = safe_failure_reason(
+                        str(exc),
+                        fallback=f"unexpected {exc.__class__.__name__}",
+                    )
+                    failed_provider_call = {
+                        "api": "users.messages.get",
+                        "message_id": message_id,
+                        "error": error,
+                    }
+                    break
+                current_label_ids = current_state["label_ids"]
+            elif "TRASH" not in current_label_ids and "TRASH" in target_label_ids:
+                try:
+                    self._gmail_trash_message(access_token=access_token, message_id=message_id)
+                except Exception as exc:
+                    error = safe_failure_reason(
+                        str(exc),
+                        fallback=f"unexpected {exc.__class__.__name__}",
+                    )
+                    failed_provider_call = {
+                        "api": "users.messages.trash",
+                        "message_id": message_id,
+                        "error": error,
+                    }
+                    break
+                provider_calls.append({"api": "users.messages.trash", "message_id": message_id})
+                try:
+                    current_state = self._gmail_read_message_state(
+                        access_token=access_token,
+                        message_id=message_id,
+                    )
+                except Exception as exc:
+                    error = safe_failure_reason(
+                        str(exc),
+                        fallback=f"unexpected {exc.__class__.__name__}",
+                    )
+                    failed_provider_call = {
+                        "api": "users.messages.get",
+                        "message_id": message_id,
+                        "error": error,
+                    }
+                    break
+                current_label_ids = current_state["label_ids"]
+
+            raw_add_label_ids = [
+                label_id for label_id in target_label_ids if label_id not in current_label_ids
+            ]
+            raw_remove_label_ids = [
+                label_id for label_id in current_label_ids if label_id not in target_label_ids
+            ]
+            add_label_ids, skipped_add_label_ids = _gmail_message_modify_label_ids_for_undo(
+                raw_add_label_ids
+            )
+            remove_label_ids, skipped_remove_label_ids = _gmail_message_modify_label_ids_for_undo(
+                raw_remove_label_ids
+            )
+            skipped_label_ids = sorted(set(skipped_add_label_ids + skipped_remove_label_ids))
+            if skipped_label_ids:
+                skipped_immutable_label_ids[message_id] = skipped_label_ids
+            if add_label_ids or remove_label_ids:
+                try:
+                    self._gmail_modify_message_labels(
+                        access_token=access_token,
+                        message_id=message_id,
+                        add_label_ids=add_label_ids,
+                        remove_label_ids=remove_label_ids,
+                    )
+                except Exception as exc:
+                    error = safe_failure_reason(
+                        str(exc),
+                        fallback=f"unexpected {exc.__class__.__name__}",
+                    )
+                    failed_provider_call = {
+                        "api": "users.messages.modify",
+                        "message_id": message_id,
+                        "addLabelIds": add_label_ids,
+                        "removeLabelIds": remove_label_ids,
+                        "error": error,
+                    }
+                    break
+                provider_calls.append(
+                    {
+                        "api": "users.messages.modify",
+                        "message_id": message_id,
+                        "addLabelIds": add_label_ids,
+                        "removeLabelIds": remove_label_ids,
+                    }
+                )
+            if not skipped_label_ids:
+                restored_message_ids.append(message_id)
+
+        after_state, after_state_error = self._gmail_read_message_states_for_audit(
+            access_token=access_token,
+            message_ids=message_ids,
+        )
+        provider_result: dict[str, Any] = {
+            "operation": "undo",
+            "provider": "gmail",
+            "provider_calls": provider_calls,
+            "restored_message_ids": restored_message_ids,
+            "noop_message_ids": noop_message_ids,
+        }
+        if skipped_immutable_label_ids:
+            provider_result["skipped_immutable_label_ids"] = skipped_immutable_label_ids
+            error = "immutable_label_restore_unsupported"
+        if failed_provider_call is not None:
+            provider_result["failed_provider_call"] = failed_provider_call
+        if error is not None:
+            provider_result["error"] = error
+        if after_state_error is not None:
+            provider_result["after_state_error"] = after_state_error
+            if error is None:
+                error = after_state_error
+        status = "undone"
+        if error is not None:
+            status = "partially_failed" if restored_message_ids or provider_calls else "failed"
+        output = _gmail_mutation_output(
+            status=status,
+            operation="undo",
+            message_ids=message_ids,
+            before_state=before_undo_state,
+            after_state=after_state,
+            provider_result=provider_result,
+        )
+        output["restored_state"] = target_state
+        return output
 
     def _compose_raw_email_message(self, *, normalized_input: dict[str, Any]) -> str:
         message = EmailMessage()
@@ -1426,6 +2201,206 @@ class DefaultGoogleWorkspaceProvider:
             "role": role,
             "permission_id": permission_id,
         }
+
+
+def _gmail_string_list(raw_value: Any, *, require_non_empty: bool) -> list[str]:
+    if not isinstance(raw_value, list):
+        raise RuntimeError("schema_invalid")
+    values: list[str] = []
+    seen: set[str] = set()
+    for item in raw_value:
+        if not isinstance(item, str):
+            raise RuntimeError("schema_invalid")
+        value = item.strip()
+        if not value:
+            raise RuntimeError("schema_invalid")
+        if value in seen:
+            continue
+        values.append(value)
+        seen.add(value)
+    if require_non_empty and not values:
+        raise RuntimeError("schema_invalid")
+    return values
+
+
+def _gmail_message_ids_from_input(normalized_input: dict[str, Any]) -> list[str]:
+    return _gmail_string_list(
+        normalized_input.get("message_ids"),
+        require_non_empty=True,
+    )
+
+
+def _gmail_label_names_from_input(
+    normalized_input: dict[str, Any],
+    *,
+    field_name: Literal["add_labels", "remove_labels"],
+) -> list[str]:
+    raw_value = normalized_input.get(field_name, [])
+    return _gmail_string_list(raw_value, require_non_empty=False)
+
+
+def _gmail_provider_label_ids_from_input(
+    normalized_input: dict[str, Any],
+) -> dict[Literal["add", "remove"], list[str]] | None:
+    raw_value = normalized_input.get("provider_label_ids")
+    if raw_value is None:
+        return None
+    if not isinstance(raw_value, dict):
+        raise RuntimeError("schema_invalid")
+    add_label_ids = _gmail_string_list(raw_value.get("add", []), require_non_empty=False)
+    remove_label_ids = _gmail_string_list(raw_value.get("remove", []), require_non_empty=False)
+    return {"add": add_label_ids, "remove": remove_label_ids}
+
+
+def _gmail_message_modify_label_ids_for_undo(label_ids: list[str]) -> tuple[list[str], list[str]]:
+    allowed_label_ids: list[str] = []
+    blocked_label_ids: list[str] = []
+    for label_id in label_ids:
+        if label_id in _GMAIL_UNDO_MODIFY_BLOCKED_LABEL_IDS or label_id == "TRASH":
+            blocked_label_ids.append(label_id)
+        else:
+            allowed_label_ids.append(label_id)
+    return allowed_label_ids, blocked_label_ids
+
+
+def _gmail_label_ids_from_payload(payload: dict[str, Any]) -> list[str]:
+    raw_label_ids = payload.get("labelIds", [])
+    if raw_label_ids is None:
+        return []
+    if not isinstance(raw_label_ids, list):
+        raise RuntimeError("google_invalid_payload")
+    label_ids: list[str] = []
+    seen: set[str] = set()
+    for raw_label_id in raw_label_ids:
+        if not isinstance(raw_label_id, str):
+            raise RuntimeError("google_invalid_payload")
+        label_id = raw_label_id.strip()
+        if not label_id:
+            raise RuntimeError("google_invalid_payload")
+        if label_id in seen:
+            continue
+        label_ids.append(label_id)
+        seen.add(label_id)
+    return sorted(label_ids)
+
+
+def _gmail_message_state(
+    *,
+    payload: dict[str, Any],
+    requested_message_id: str,
+) -> dict[str, Any]:
+    message_id_raw = payload.get("id")
+    message_id = (
+        message_id_raw.strip()
+        if isinstance(message_id_raw, str) and message_id_raw.strip()
+        else requested_message_id
+    )
+    thread_id_raw = payload.get("threadId")
+    thread_id = (
+        thread_id_raw.strip() if isinstance(thread_id_raw, str) and thread_id_raw.strip() else None
+    )
+    return {
+        "message_id": message_id,
+        "thread_id": thread_id,
+        "label_ids": _gmail_label_ids_from_payload(payload),
+    }
+
+
+def _gmail_label_map(states: list[dict[str, Any]]) -> dict[str, list[str]]:
+    label_map: dict[str, list[str]] = {}
+    for state in states:
+        message_id = str(state["message_id"])
+        label_ids_raw = state["label_ids"]
+        label_ids = [str(label_id) for label_id in label_ids_raw]
+        label_map[message_id] = label_ids
+    return label_map
+
+
+def _gmail_label_mutation_needed(
+    *,
+    label_ids: list[str],
+    add_label_ids: list[str],
+    remove_label_ids: list[str],
+) -> bool:
+    label_id_set = set(label_ids)
+    for label_id in add_label_ids:
+        if label_id not in label_id_set:
+            return True
+    for label_id in remove_label_ids:
+        if label_id in label_id_set:
+            return True
+    return False
+
+
+def _gmail_supplied_before_state_from_input(
+    normalized_input: dict[str, Any],
+    *,
+    message_ids: list[str],
+) -> list[dict[str, Any]] | None:
+    if "before_state" not in normalized_input:
+        return None
+    return _gmail_restore_state_from_input(normalized_input, message_ids=message_ids)
+
+
+def _gmail_restore_state_from_input(
+    normalized_input: dict[str, Any],
+    *,
+    message_ids: list[str],
+) -> list[dict[str, Any]]:
+    raw_state = normalized_input.get("before_state")
+    if not isinstance(raw_state, list):
+        raise RuntimeError("schema_invalid")
+
+    state_by_message_id: dict[str, dict[str, Any]] = {}
+    for entry in raw_state:
+        if not isinstance(entry, dict):
+            raise RuntimeError("schema_invalid")
+        message_id_raw = entry.get("message_id")
+        if not isinstance(message_id_raw, str) or not message_id_raw.strip():
+            raise RuntimeError("schema_invalid")
+        message_id = message_id_raw.strip()
+        if message_id in state_by_message_id:
+            raise RuntimeError("schema_invalid")
+        thread_id_raw = entry.get("thread_id")
+        thread_id = (
+            thread_id_raw.strip()
+            if isinstance(thread_id_raw, str) and thread_id_raw.strip()
+            else None
+        )
+        label_ids = _gmail_string_list(entry.get("label_ids", []), require_non_empty=False)
+        state_by_message_id[message_id] = {
+            "message_id": message_id,
+            "thread_id": thread_id,
+            "label_ids": sorted(label_ids),
+        }
+
+    if set(state_by_message_id) != set(message_ids):
+        raise RuntimeError("schema_invalid")
+    return [state_by_message_id[message_id] for message_id in message_ids]
+
+
+def _gmail_mutation_output(
+    *,
+    status: str,
+    operation: str,
+    message_ids: list[str],
+    before_state: list[dict[str, Any]],
+    after_state: list[dict[str, Any]],
+    provider_result: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "operation": operation,
+        "message_ids": message_ids,
+        "affected_message_ids": message_ids,
+        "before_state": before_state,
+        "after_state": after_state,
+        "before_labels": _gmail_label_map(before_state),
+        "after_labels": _gmail_label_map(after_state),
+        "provider_result": provider_result,
+        "undo_supported": True,
+        "executed_at": to_rfc3339(_utcnow()),
+    }
 
 
 def _parse_rfc3339(value: Any) -> datetime | None:
@@ -2829,6 +3804,249 @@ class GoogleConnectorRuntime:
             granted_scopes=granted_scopes,
         )
 
+    def refresh_access_token_for_capability(
+        self,
+        *,
+        session_factory: sessionmaker[Session],
+        capability_id: str,
+        now_fn: Callable[[], datetime],
+        new_id_fn: Callable[[str], str],
+    ) -> None:
+        required_scopes = GOOGLE_CAPABILITY_SCOPES.get(capability_id)
+        if required_scopes is None:
+            return
+        refresh_token: str | None = None
+        with session_factory() as db:
+            with db.begin():
+                connector = self._connector_for_update(db=db)
+                if connector is None or connector.status != "connected":
+                    return
+                if not required_scopes.issubset(
+                    set(_normalize_scope_list(connector.granted_scopes))
+                ):
+                    _set_connector_error(
+                        connector=connector,
+                        error_code="consent_required",
+                        now_fn=now_fn,
+                        preserve_existing_blocking=True,
+                    )
+                    return
+                if connector.access_token_enc is None:
+                    _set_connector_error(
+                        connector=connector,
+                        error_code="token_missing",
+                        now_fn=now_fn,
+                        preserve_existing_blocking=True,
+                    )
+                    return
+                if (
+                    connector.access_token_expires_at is None
+                    or connector.access_token_expires_at > now_fn()
+                ):
+                    return
+                if connector.refresh_token_enc is None:
+                    _set_connector_error(
+                        connector=connector,
+                        error_code="refresh_missing",
+                        now_fn=now_fn,
+                        preserve_existing_blocking=True,
+                    )
+                    return
+                refresh_token = _decrypt_secret(
+                    ciphertext=connector.refresh_token_enc,
+                    secret=self.encryption_secret,
+                    expected_key_version=connector.encryption_key_version,
+                    encryption_keys=self.encryption_keys,
+                )
+        if refresh_token is None:
+            return
+
+        try:
+            refreshed_payload = self.oauth_client.refresh_access_token(refresh_token=refresh_token)
+        except Exception as exc:
+            reason = safe_failure_reason(
+                str(exc), fallback=f"unexpected {exc.__class__.__name__}"
+            ).lower()
+            with session_factory() as db:
+                with db.begin():
+                    connector = self._connector_for_update(db=db)
+                    if connector is None:
+                        return
+                    if "invalid_grant" in reason or "revoked" in reason:
+                        connector.status = "revoked"
+                        error_code = "access_revoked"
+                    else:
+                        error_code = "token_expired"
+                    _set_connector_error(
+                        connector=connector,
+                        error_code=error_code,
+                        now_fn=now_fn,
+                        preserve_existing_blocking=True,
+                    )
+                    _append_connector_event(
+                        db=db,
+                        connector_id=connector.id,
+                        event_type="evt.connector.google.refresh.failed",
+                        payload_data={
+                            **_connector_event_payload(
+                                connector,
+                                scopes=_normalize_scope_list(connector.granted_scopes),
+                            ),
+                            "failure_reason": error_code,
+                        },
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
+            return
+
+        access_token_raw = refreshed_payload.get("access_token")
+        if not isinstance(access_token_raw, str) or not access_token_raw.strip():
+            with session_factory() as db:
+                with db.begin():
+                    connector = self._connector_for_update(db=db)
+                    if connector is not None:
+                        _set_connector_error(
+                            connector=connector,
+                            error_code="token_expired",
+                            now_fn=now_fn,
+                            preserve_existing_blocking=True,
+                        )
+            return
+        refreshed_refresh_token_raw = refreshed_payload.get("refresh_token")
+        refreshed_refresh_token = (
+            refreshed_refresh_token_raw.strip()
+            if isinstance(refreshed_refresh_token_raw, str) and refreshed_refresh_token_raw.strip()
+            else refresh_token
+        )
+        expires_in_raw = refreshed_payload.get("expires_in_seconds")
+        expires_in_seconds = expires_in_raw if isinstance(expires_in_raw, int) else 3600
+        if expires_in_seconds <= 0:
+            expires_in_seconds = 60
+
+        with session_factory() as db:
+            with db.begin():
+                connector = self._connector_for_update(db=db)
+                if connector is None or connector.status != "connected":
+                    return
+                if (
+                    connector.access_token_expires_at is not None
+                    and connector.access_token_expires_at > now_fn()
+                ):
+                    return
+                connector.access_token_enc = _encrypt_secret(
+                    plaintext=access_token_raw.strip(),
+                    secret=self.encryption_secret,
+                    key_version=self.encryption_key_version,
+                    encryption_keys=self.encryption_keys,
+                )
+                connector.refresh_token_enc = _encrypt_secret(
+                    plaintext=refreshed_refresh_token,
+                    secret=self.encryption_secret,
+                    key_version=self.encryption_key_version,
+                    encryption_keys=self.encryption_keys,
+                )
+                connector.encryption_key_version = self.encryption_key_version
+                connector.access_token_expires_at = now_fn() + timedelta(seconds=expires_in_seconds)
+                connector.token_obtained_at = now_fn()
+                _clear_connector_error(
+                    connector=connector,
+                    now_fn=now_fn,
+                    preserve_existing_blocking=True,
+                )
+                _append_connector_event(
+                    db=db,
+                    connector_id=connector.id,
+                    event_type="evt.connector.google.refresh.succeeded",
+                    payload_data={
+                        **_connector_event_payload(
+                            connector,
+                            scopes=_normalize_scope_list(connector.granted_scopes),
+                        ),
+                        "access_token_expires_at": to_rfc3339(connector.access_token_expires_at),
+                    },
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
+
+    def prepare_capability_access_without_refresh(
+        self,
+        *,
+        db: Session,
+        capability_id: str,
+        now_fn: Callable[[], datetime],
+    ) -> tuple[str | None, set[str], str | None, GoogleCapabilityExecutionResult | None]:
+        required_scopes = GOOGLE_CAPABILITY_SCOPES.get(capability_id)
+        if required_scopes is None:
+            return (
+                None,
+                set(),
+                None,
+                GoogleCapabilityExecutionResult(
+                    status="failed",
+                    output=None,
+                    auth_failure=None,
+                    error="unknown_capability",
+                ),
+            )
+        connector = self._connector_for_update(db=db)
+        if connector is None or connector.status == "not_connected":
+            return None, set(), None, self._typed_failure(failure_class="not_connected")
+        if connector.status == "revoked":
+            return None, set(), None, self._typed_failure(failure_class="access_revoked")
+        provider_account_id = connector.account_subject
+        if provider_account_id is None or not provider_account_id.strip():
+            return None, set(), None, self._typed_failure(failure_class="not_connected")
+        granted_scopes = set(_normalize_scope_list(connector.granted_scopes))
+        if not required_scopes.issubset(granted_scopes):
+            _set_connector_error(
+                connector=connector,
+                error_code="consent_required",
+                now_fn=now_fn,
+                preserve_existing_blocking=True,
+            )
+            return (
+                None,
+                granted_scopes,
+                provider_account_id,
+                self._typed_failure(failure_class="consent_required"),
+            )
+        if connector.access_token_enc is None:
+            _set_connector_error(
+                connector=connector,
+                error_code="token_missing",
+                now_fn=now_fn,
+                preserve_existing_blocking=True,
+            )
+            return (
+                None,
+                granted_scopes,
+                provider_account_id,
+                self._typed_failure(failure_class="token_expired"),
+            )
+        if (
+            connector.access_token_expires_at is not None
+            and connector.access_token_expires_at <= now_fn()
+        ):
+            _set_connector_error(
+                connector=connector,
+                error_code="token_expired",
+                now_fn=now_fn,
+                preserve_existing_blocking=True,
+            )
+            return (
+                None,
+                granted_scopes,
+                provider_account_id,
+                self._typed_failure(failure_class="token_expired"),
+            )
+        access_token = _decrypt_secret(
+            ciphertext=connector.access_token_enc,
+            secret=self.encryption_secret,
+            expected_key_version=connector.encryption_key_version,
+            encryption_keys=self.encryption_keys,
+        )
+        return access_token, granted_scopes, provider_account_id, None
+
     def prepare_capability_access(
         self,
         *,
@@ -2922,6 +4140,26 @@ class GoogleConnectorRuntime:
                 )
             elif capability_id == "cap.email.read":
                 output_payload = self.workspace_provider.email_read(
+                    access_token=access_token,
+                    normalized_input=normalized_input,
+                )
+            elif capability_id == "cap.email.archive":
+                output_payload = self.workspace_provider.email_archive(
+                    access_token=access_token,
+                    normalized_input=normalized_input,
+                )
+            elif capability_id == "cap.email.trash":
+                output_payload = self.workspace_provider.email_trash(
+                    access_token=access_token,
+                    normalized_input=normalized_input,
+                )
+            elif capability_id == "cap.email.labels.modify":
+                output_payload = self.workspace_provider.email_modify_labels(
+                    access_token=access_token,
+                    normalized_input=normalized_input,
+                )
+            elif capability_id == "cap.email.undo":
+                output_payload = self.workspace_provider.email_undo(
                     access_token=access_token,
                     normalized_input=normalized_input,
                 )
@@ -3049,6 +4287,43 @@ class GoogleConnectorRuntime:
         if access_token is None:
             raise RuntimeError("token_expired")
         return access_token
+
+    def access_token_for_background_sync_without_refresh(
+        self,
+        *,
+        db: Session,
+        now_fn: Callable[[], datetime],
+    ) -> str:
+        connector = self._connector_for_update(db=db)
+        if connector is None or connector.status == "not_connected":
+            raise RuntimeError("not_connected")
+        if connector.status == "revoked":
+            raise RuntimeError("access_revoked")
+        if connector.access_token_enc is None:
+            _set_connector_error(
+                connector=connector,
+                error_code="token_missing",
+                now_fn=now_fn,
+                preserve_existing_blocking=True,
+            )
+            raise RuntimeError("token_expired")
+        if (
+            connector.access_token_expires_at is not None
+            and connector.access_token_expires_at <= now_fn()
+        ):
+            _set_connector_error(
+                connector=connector,
+                error_code="token_expired",
+                now_fn=now_fn,
+                preserve_existing_blocking=True,
+            )
+            raise RuntimeError("token_expired")
+        return _decrypt_secret(
+            ciphertext=connector.access_token_enc,
+            secret=self.encryption_secret,
+            expected_key_version=connector.encryption_key_version,
+            encryption_keys=self.encryption_keys,
+        )
 
     def execute_read_capability(
         self,

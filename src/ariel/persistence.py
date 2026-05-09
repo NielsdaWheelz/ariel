@@ -484,6 +484,220 @@ class ApprovalRequestRecord(Base):
     )
 
 
+class EmailActionRecord(Base):
+    __tablename__ = "email_actions"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False, default="google")
+    provider_account_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    action_attempt_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("action_attempts.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    capability_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    input_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    approval_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("approval_requests.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    provider_message_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    provider_thread_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    before_state: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    intended_state: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    after_state: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    provider_result: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    undo_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    undo_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    execution_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failure_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("provider IN ('google')", name="ck_email_action_provider"),
+        CheckConstraint(
+            (
+                "capability_id IN ('cap.email.archive', 'cap.email.trash', "
+                "'cap.email.labels.modify', 'cap.email.undo')"
+            ),
+            name="ck_email_action_capability",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'executing', 'succeeded', 'failed', 'undone')",
+            name="ck_email_action_status",
+        ),
+        CheckConstraint("execution_attempts >= 0", name="ck_email_action_attempts_nonnegative"),
+        CheckConstraint(
+            "jsonb_typeof(provider_message_ids) = 'array'",
+            name="ck_email_action_provider_message_ids_array",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(provider_thread_ids) = 'array'",
+            name="ck_email_action_provider_thread_ids_array",
+        ),
+        CheckConstraint(
+            (
+                "(status = 'failed' AND failure_code IS NOT NULL) OR "
+                "(status != 'failed' AND failure_code IS NULL)"
+            ),
+            name="ck_email_action_failure_code_status",
+        ),
+        CheckConstraint(
+            (
+                "(undo_token_hash IS NULL AND undo_expires_at IS NULL) OR "
+                "(undo_token_hash IS NOT NULL AND undo_expires_at IS NOT NULL)"
+            ),
+            name="ck_email_action_undo_fields_paired",
+        ),
+        CheckConstraint(
+            (
+                "capability_id = 'cap.email.undo' OR status != 'succeeded' OR "
+                "(undo_token_hash IS NOT NULL AND undo_expires_at IS NOT NULL)"
+            ),
+            name="ck_email_action_succeeded_mutation_has_undo",
+        ),
+        Index(
+            "ix_email_actions_idempotency_key_unique",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=(idempotency_key.is_not(None)),
+        ),
+        Index(
+            "ix_email_actions_provider_account_status",
+            "provider",
+            "provider_account_id",
+            "status",
+            "id",
+        ),
+        Index(
+            "ix_email_actions_undo_token_hash",
+            "undo_token_hash",
+            unique=True,
+            postgresql_where=undo_token_hash.is_not(None),
+        ),
+        Index(
+            "ix_email_actions_provider_message_ids",
+            "provider_message_ids",
+            postgresql_using="gin",
+        ),
+        Index(
+            "ix_email_actions_provider_thread_ids",
+            "provider_thread_ids",
+            postgresql_using="gin",
+        ),
+    )
+
+
+class EmailThreadWatchRecord(Base):
+    __tablename__ = "email_thread_watches"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False, default="google")
+    provider_account_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    provider_thread_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    anchor_message_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    condition: Mapped[str] = mapped_column(String(32), nullable=False)
+    deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    note: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    cancel_idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_by_action_attempt_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("action_attempts.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    matched_message_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    matched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    canceled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("provider IN ('google')", name="ck_email_thread_watch_provider"),
+        CheckConstraint(
+            "condition IN ('no_reply_by_deadline', 'any_reply_arrives')",
+            name="ck_email_thread_watch_condition",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'due', 'completed', 'canceled', 'failed')",
+            name="ck_email_thread_watch_status",
+        ),
+        CheckConstraint(
+            (
+                "(matched_message_id IS NULL AND matched_at IS NULL) OR "
+                "(matched_message_id IS NOT NULL AND matched_at IS NOT NULL)"
+            ),
+            name="ck_email_thread_watch_matched_fields_paired",
+        ),
+        CheckConstraint(
+            (
+                "(status IN ('active', 'due', 'failed') "
+                "AND canceled_at IS NULL "
+                "AND completed_at IS NULL) OR "
+                "(status = 'canceled' "
+                "AND canceled_at IS NOT NULL "
+                "AND completed_at IS NULL) OR "
+                "(status = 'completed' "
+                "AND completed_at IS NOT NULL "
+                "AND canceled_at IS NULL "
+                "AND matched_message_id IS NOT NULL "
+                "AND matched_at IS NOT NULL)"
+            ),
+            name="ck_email_thread_watch_status_timestamps",
+        ),
+        Index(
+            "ix_email_thread_watches_idempotency_key_unique",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=(idempotency_key.is_not(None)),
+        ),
+        Index(
+            "ix_email_thread_watches_cancel_idempotency_key_unique",
+            "cancel_idempotency_key",
+            unique=True,
+            postgresql_where=(cancel_idempotency_key.is_not(None)),
+        ),
+        Index(
+            "ix_email_thread_watches_active_thread",
+            "provider",
+            "provider_account_id",
+            "provider_thread_id",
+            "condition",
+            "deadline",
+            unique=True,
+            postgresql_where=status == "active",
+        ),
+        Index(
+            "ix_email_thread_watches_due",
+            "status",
+            "deadline",
+            "id",
+        ),
+        Index(
+            "ix_email_thread_watches_provider_thread_status",
+            "provider",
+            "provider_account_id",
+            "provider_thread_id",
+            "status",
+        ),
+    )
+
+
 class ArtifactRecord(Base):
     __tablename__ = "artifacts"
 
@@ -2782,6 +2996,69 @@ def serialize_sync_cursor(cursor: SyncCursorRecord) -> dict[str, Any]:
         "last_error_at": to_rfc3339(cursor.last_error_at) if cursor.last_error_at else None,
         "created_at": to_rfc3339(cursor.created_at),
         "updated_at": to_rfc3339(cursor.updated_at),
+    }
+
+
+def serialize_email_action(action: EmailActionRecord) -> dict[str, Any]:
+    undo_available = (
+        action.status == "succeeded"
+        and action.undo_token_hash is not None
+        and action.undo_expires_at is not None
+        and action.undo_expires_at > datetime.now(tz=UTC)
+    )
+    return {
+        "id": action.id,
+        "provider": action.provider,
+        "provider_account_id": redact_text(action.provider_account_id),
+        "action_attempt_id": action.action_attempt_id,
+        "capability_id": action.capability_id,
+        "input_hash": action.input_hash,
+        "idempotency_key": redact_text(action.idempotency_key)
+        if action.idempotency_key is not None
+        else None,
+        "status": action.status,
+        "approval_id": action.approval_id,
+        "provider_message_ids": redact_json_value(action.provider_message_ids),
+        "provider_thread_ids": redact_json_value(action.provider_thread_ids),
+        "before_state": redact_json_value(action.before_state),
+        "intended_state": redact_json_value(action.intended_state),
+        "after_state": redact_json_value(action.after_state),
+        "provider_result": redact_json_value(action.provider_result),
+        "undo_available": undo_available,
+        "undo_expires_at": to_rfc3339(action.undo_expires_at) if action.undo_expires_at else None,
+        "execution_attempts": action.execution_attempts,
+        "failure_code": action.failure_code,
+        "created_at": to_rfc3339(action.created_at),
+        "updated_at": to_rfc3339(action.updated_at),
+    }
+
+
+def serialize_email_thread_watch(watch: EmailThreadWatchRecord) -> dict[str, Any]:
+    return {
+        "id": watch.id,
+        "provider": watch.provider,
+        "provider_account_id": redact_text(watch.provider_account_id),
+        "provider_thread_id": redact_text(watch.provider_thread_id),
+        "anchor_message_id": redact_text(watch.anchor_message_id),
+        "condition": watch.condition,
+        "deadline": to_rfc3339(watch.deadline),
+        "note": redact_text(watch.note),
+        "idempotency_key": redact_text(watch.idempotency_key)
+        if watch.idempotency_key is not None
+        else None,
+        "cancel_idempotency_key": redact_text(watch.cancel_idempotency_key)
+        if watch.cancel_idempotency_key is not None
+        else None,
+        "status": watch.status,
+        "created_by_action_attempt_id": watch.created_by_action_attempt_id,
+        "matched_message_id": redact_text(watch.matched_message_id)
+        if watch.matched_message_id is not None
+        else None,
+        "matched_at": to_rfc3339(watch.matched_at) if watch.matched_at else None,
+        "canceled_at": to_rfc3339(watch.canceled_at) if watch.canceled_at else None,
+        "completed_at": to_rfc3339(watch.completed_at) if watch.completed_at else None,
+        "created_at": to_rfc3339(watch.created_at),
+        "updated_at": to_rfc3339(watch.updated_at),
     }
 
 

@@ -28,6 +28,7 @@ _GOOGLE_CALENDAR_READ_SCOPE = "https://www.googleapis.com/auth/calendar.readonly
 _GOOGLE_CALENDAR_FREEBUSY_SCOPE = "https://www.googleapis.com/auth/calendar.freebusy"
 _GOOGLE_CALENDAR_WRITE_SCOPE = "https://www.googleapis.com/auth/calendar.events"
 _GOOGLE_GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+_GOOGLE_GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
 _GOOGLE_GMAIL_COMPOSE_SCOPE = "https://www.googleapis.com/auth/gmail.compose"
 _GOOGLE_GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 _GOOGLE_DRIVE_METADATA_READ_SCOPE = "https://www.googleapis.com/auth/drive.metadata.readonly"
@@ -38,6 +39,7 @@ _GOOGLE_ALLOWED_EGRESS_DESTINATIONS = (
     "gmail.googleapis.com",
     "oauth2.googleapis.com",
 )
+_GOOGLE_GMAIL_ALLOWED_EGRESS_DESTINATIONS = ("gmail.googleapis.com",)
 AGENCY_CAPABILITY_IDS = {
     "cap.agency.run",
     "cap.agency.status",
@@ -467,7 +469,7 @@ def _validate_calendar_create_event_input(
 def _validate_email_composition_input(
     raw_input: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
-    if not set(raw_input.keys()).issubset({"to", "cc", "bcc", "subject", "body"}):
+    if set(raw_input.keys()) != {"to", "cc", "bcc", "subject", "body"}:
         return None, "schema_invalid"
 
     to_recipients = _normalize_email_recipients(raw_input.get("to"))
@@ -508,6 +510,165 @@ def _validate_email_send_input(
     raw_input: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
     return _validate_email_composition_input(raw_input)
+
+
+def _normalize_email_message_ids(raw_value: Any) -> list[str] | None:
+    if not isinstance(raw_value, list) or not raw_value or len(raw_value) > 1000:
+        return None
+    message_ids: list[str] = []
+    seen: set[str] = set()
+    for raw_message_id in raw_value:
+        message_id = _normalize_optional_text(raw_message_id, max_length=256)
+        if message_id is None:
+            return None
+        if message_id in seen:
+            continue
+        seen.add(message_id)
+        message_ids.append(message_id)
+    if not message_ids:
+        return None
+    return message_ids
+
+
+def _normalize_email_label_names(raw_value: Any) -> list[str] | None:
+    if not isinstance(raw_value, list) or len(raw_value) > 100:
+        return None
+    label_names: list[str] = []
+    seen: set[str] = set()
+    for raw_label_name in raw_value:
+        label_name = _normalize_optional_text(raw_label_name, max_length=225)
+        if label_name is None:
+            return None
+        if label_name in seen:
+            continue
+        seen.add(label_name)
+        label_names.append(label_name)
+    return label_names
+
+
+def _validate_email_message_batch_mutation_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {"message_ids", "idempotency_key"}:
+        return None, "schema_invalid"
+    message_ids = _normalize_email_message_ids(raw_input.get("message_ids"))
+    idempotency_key = _normalize_optional_text(raw_input.get("idempotency_key"), max_length=128)
+    if message_ids is None or idempotency_key is None:
+        return None, "schema_invalid"
+    return {"message_ids": message_ids, "idempotency_key": idempotency_key}, None
+
+
+def _validate_email_labels_modify_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {
+        "message_ids",
+        "add_labels",
+        "remove_labels",
+        "idempotency_key",
+    }:
+        return None, "schema_invalid"
+    message_ids = _normalize_email_message_ids(raw_input.get("message_ids"))
+    add_labels = _normalize_email_label_names(raw_input.get("add_labels"))
+    remove_labels = _normalize_email_label_names(raw_input.get("remove_labels"))
+    idempotency_key = _normalize_optional_text(raw_input.get("idempotency_key"), max_length=128)
+    if (
+        message_ids is None
+        or add_labels is None
+        or remove_labels is None
+        or idempotency_key is None
+    ):
+        return None, "schema_invalid"
+    if not add_labels and not remove_labels:
+        return None, "schema_invalid"
+    if set(add_labels).intersection(remove_labels):
+        return None, "schema_invalid"
+    return {
+        "message_ids": message_ids,
+        "add_labels": add_labels,
+        "remove_labels": remove_labels,
+        "idempotency_key": idempotency_key,
+    }, None
+
+
+def _validate_email_undo_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {"undo_token", "idempotency_key"}:
+        return None, "schema_invalid"
+    undo_token = _normalize_optional_text(raw_input.get("undo_token"), max_length=512)
+    idempotency_key = _normalize_optional_text(raw_input.get("idempotency_key"), max_length=128)
+    if undo_token is None or idempotency_key is None:
+        return None, "schema_invalid"
+    return {"undo_token": undo_token, "idempotency_key": idempotency_key}, None
+
+
+_EMAIL_THREAD_WATCH_CONDITIONS = (
+    "no_reply_by_deadline",
+    "any_reply_arrives",
+)
+
+
+def _validate_email_thread_watch_create_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {
+        "provider_thread_id",
+        "anchor_message_id",
+        "condition",
+        "deadline",
+        "note",
+        "idempotency_key",
+    }:
+        return None, "schema_invalid"
+    provider_thread_id = _normalize_optional_text(
+        raw_input.get("provider_thread_id"), max_length=256
+    )
+    anchor_message_id = _normalize_optional_text(raw_input.get("anchor_message_id"), max_length=256)
+    condition_raw = raw_input.get("condition")
+    if not isinstance(condition_raw, str):
+        return None, "schema_invalid"
+    condition = condition_raw.strip().lower()
+    deadline = _normalize_rfc3339_like(raw_input.get("deadline"))
+    note = _normalize_optional_text(raw_input.get("note"), max_length=2000)
+    idempotency_key = _normalize_optional_text(raw_input.get("idempotency_key"), max_length=128)
+    if (
+        provider_thread_id is None
+        or anchor_message_id is None
+        or condition not in _EMAIL_THREAD_WATCH_CONDITIONS
+        or deadline is None
+        or note is None
+        or idempotency_key is None
+    ):
+        return None, "schema_invalid"
+    return {
+        "provider_thread_id": provider_thread_id,
+        "anchor_message_id": anchor_message_id,
+        "condition": condition,
+        "deadline": deadline,
+        "note": note,
+        "idempotency_key": idempotency_key,
+    }, None
+
+
+def _validate_email_thread_watch_cancel_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {"watch_id", "idempotency_key"}:
+        return None, "schema_invalid"
+    watch_id = _normalize_optional_text(raw_input.get("watch_id"), max_length=128)
+    idempotency_key = _normalize_optional_text(raw_input.get("idempotency_key"), max_length=128)
+    if watch_id is None or idempotency_key is None:
+        return None, "schema_invalid"
+    return {"watch_id": watch_id, "idempotency_key": idempotency_key}, None
+
+
+def _validate_email_thread_watch_list_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if raw_input:
+        return None, "schema_invalid"
+    return {}, None
 
 
 _WEATHER_ALLOWED_TIMEFRAMES = {"now", "today", "tomorrow", "next_24h"}
@@ -1925,6 +2086,26 @@ def _execute_google_email_send(_: dict[str, Any]) -> dict[str, Any]:
     raise RuntimeError("google_runtime_not_bound")
 
 
+def _execute_google_email_archive(_: dict[str, Any]) -> dict[str, Any]:
+    raise RuntimeError("google_runtime_not_bound")
+
+
+def _execute_google_email_trash(_: dict[str, Any]) -> dict[str, Any]:
+    raise RuntimeError("google_runtime_not_bound")
+
+
+def _execute_google_email_labels_modify(_: dict[str, Any]) -> dict[str, Any]:
+    raise RuntimeError("google_runtime_not_bound")
+
+
+def _execute_google_email_undo(_: dict[str, Any]) -> dict[str, Any]:
+    raise RuntimeError("google_runtime_not_bound")
+
+
+def _execute_email_thread_watch_runtime(_: dict[str, Any]) -> dict[str, Any]:
+    raise RuntimeError("email_thread_watch_runtime_not_bound")
+
+
 def _execute_google_drive_search(_: dict[str, Any]) -> dict[str, Any]:
     raise RuntimeError("google_runtime_not_bound")
 
@@ -2050,6 +2231,86 @@ def _declare_google_email_send_egress_intent(input_payload: dict[str, Any]) -> l
                 "subject": input_payload["subject"],
             },
         }
+    ]
+
+
+def _declare_google_email_archive_egress_intent(
+    input_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "destination": "https://gmail.googleapis.com/gmail/v1/users/me/messages/batchModify",
+            "payload": {
+                "message_ids": input_payload["message_ids"],
+                "remove_label_names": ["INBOX"],
+            },
+        }
+    ]
+
+
+def _declare_google_email_trash_egress_intent(
+    input_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "destination": (
+                f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}/trash"
+            ),
+            "payload": {"message_id": message_id},
+        }
+        for message_id in input_payload["message_ids"]
+    ]
+
+
+def _declare_google_email_labels_modify_egress_intent(
+    input_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "destination": "https://gmail.googleapis.com/gmail/v1/users/me/messages/batchModify",
+            "payload": {
+                "message_ids": input_payload["message_ids"],
+                "add_labels": input_payload["add_labels"],
+                "remove_labels": input_payload["remove_labels"],
+            },
+        }
+    ]
+
+
+def _declare_google_email_undo_egress_intent(
+    input_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    del input_payload
+    return [
+        {
+            "destination": "https://gmail.googleapis.com/gmail/v1/users/me/messages/batchModify",
+            "payload": {"operation": "undo"},
+        }
+    ]
+
+
+def _declare_google_email_thread_watch_create_egress_intent(
+    input_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    provider_thread_id = input_payload["provider_thread_id"]
+    anchor_message_id = input_payload["anchor_message_id"]
+    return [
+        {
+            "destination": (
+                f"https://gmail.googleapis.com/gmail/v1/users/me/threads/{provider_thread_id}"
+            ),
+            "payload": {
+                "provider_thread_id": provider_thread_id,
+                "condition": input_payload["condition"],
+                "deadline": input_payload["deadline"],
+            },
+        },
+        {
+            "destination": (
+                f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{anchor_message_id}"
+            ),
+            "payload": {"anchor_message_id": anchor_message_id},
+        },
     ]
 
 
@@ -2550,7 +2811,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
             "idempotency": "deterministic_read",
             "required_scopes": [_GOOGLE_GMAIL_READ_SCOPE],
         },
-        allowed_egress_destinations=_GOOGLE_ALLOWED_EGRESS_DESTINATIONS,
+        allowed_egress_destinations=_GOOGLE_GMAIL_ALLOWED_EGRESS_DESTINATIONS,
         validate_input=_validate_email_search_input,
         execute=_execute_google_email_search,
         declare_egress_intent=_declare_google_email_search_egress_intent,
@@ -2566,7 +2827,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
             "idempotency": "deterministic_read",
             "required_scopes": [_GOOGLE_GMAIL_READ_SCOPE],
         },
-        allowed_egress_destinations=_GOOGLE_ALLOWED_EGRESS_DESTINATIONS,
+        allowed_egress_destinations=_GOOGLE_GMAIL_ALLOWED_EGRESS_DESTINATIONS,
         validate_input=_validate_email_read_input,
         execute=_execute_google_email_read,
         declare_egress_intent=_declare_google_email_read_egress_intent,
@@ -2658,7 +2919,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         capability_id="cap.email.draft",
         version="1.0",
         impact_level="write_reversible",
-        policy_decision="allow_inline",
+        policy_decision="requires_approval",
         contract_metadata={
             "input_schema": "email_compose_v1",
             "output_schema": "email_draft_result_v1",
@@ -2666,7 +2927,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
             "required_scopes": [_GOOGLE_GMAIL_COMPOSE_SCOPE],
             "delivery_state": "draft_only",
         },
-        allowed_egress_destinations=_GOOGLE_ALLOWED_EGRESS_DESTINATIONS,
+        allowed_egress_destinations=_GOOGLE_GMAIL_ALLOWED_EGRESS_DESTINATIONS,
         validate_input=_validate_email_draft_input,
         execute=_execute_google_email_draft,
         declare_egress_intent=_declare_google_email_draft_egress_intent,
@@ -2682,10 +2943,135 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
             "idempotency": "action_attempt_id",
             "required_scopes": [_GOOGLE_GMAIL_SEND_SCOPE],
         },
-        allowed_egress_destinations=_GOOGLE_ALLOWED_EGRESS_DESTINATIONS,
+        allowed_egress_destinations=_GOOGLE_GMAIL_ALLOWED_EGRESS_DESTINATIONS,
         validate_input=_validate_email_send_input,
         execute=_execute_google_email_send,
         declare_egress_intent=_declare_google_email_send_egress_intent,
+    ),
+    "cap.email.archive": CapabilityDefinition(
+        capability_id="cap.email.archive",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="requires_approval",
+        contract_metadata={
+            "input_schema": "email_message_batch_mutation_v1",
+            "output_schema": "email_mailbox_mutation_result_v1",
+            "idempotency": "client_key",
+            "required_scopes": [_GOOGLE_GMAIL_MODIFY_SCOPE],
+            "mutation": "remove_inbox_label",
+            "undo": "required",
+        },
+        allowed_egress_destinations=_GOOGLE_GMAIL_ALLOWED_EGRESS_DESTINATIONS,
+        validate_input=_validate_email_message_batch_mutation_input,
+        execute=_execute_google_email_archive,
+        declare_egress_intent=_declare_google_email_archive_egress_intent,
+    ),
+    "cap.email.trash": CapabilityDefinition(
+        capability_id="cap.email.trash",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="requires_approval",
+        contract_metadata={
+            "input_schema": "email_message_batch_mutation_v1",
+            "output_schema": "email_mailbox_mutation_result_v1",
+            "idempotency": "client_key",
+            "required_scopes": [_GOOGLE_GMAIL_MODIFY_SCOPE],
+            "mutation": "move_to_trash",
+            "permanent_delete": False,
+            "undo": "required",
+        },
+        allowed_egress_destinations=_GOOGLE_GMAIL_ALLOWED_EGRESS_DESTINATIONS,
+        validate_input=_validate_email_message_batch_mutation_input,
+        execute=_execute_google_email_trash,
+        declare_egress_intent=_declare_google_email_trash_egress_intent,
+    ),
+    "cap.email.labels.modify": CapabilityDefinition(
+        capability_id="cap.email.labels.modify",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="requires_approval",
+        contract_metadata={
+            "input_schema": "email_labels_modify_v1",
+            "output_schema": "email_label_mutation_result_v1",
+            "idempotency": "client_key",
+            "required_scopes": [_GOOGLE_GMAIL_MODIFY_SCOPE],
+            "label_resolution": "execution_time_with_action_record_reuse",
+            "undo": "required",
+        },
+        allowed_egress_destinations=_GOOGLE_GMAIL_ALLOWED_EGRESS_DESTINATIONS,
+        validate_input=_validate_email_labels_modify_input,
+        execute=_execute_google_email_labels_modify,
+        declare_egress_intent=_declare_google_email_labels_modify_egress_intent,
+    ),
+    "cap.email.undo": CapabilityDefinition(
+        capability_id="cap.email.undo",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="requires_approval",
+        contract_metadata={
+            "input_schema": "email_undo_v1",
+            "output_schema": "email_undo_result_v1",
+            "idempotency": "client_key",
+            "required_scopes": [_GOOGLE_GMAIL_MODIFY_SCOPE],
+            "undo_source": "email_action_record",
+            "supported_capabilities": [
+                "cap.email.archive",
+                "cap.email.trash",
+                "cap.email.labels.modify",
+            ],
+        },
+        allowed_egress_destinations=_GOOGLE_GMAIL_ALLOWED_EGRESS_DESTINATIONS,
+        validate_input=_validate_email_undo_input,
+        execute=_execute_google_email_undo,
+        declare_egress_intent=_declare_google_email_undo_egress_intent,
+    ),
+    "cap.email.thread_watch.create": CapabilityDefinition(
+        capability_id="cap.email.thread_watch.create",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="requires_approval",
+        contract_metadata={
+            "input_schema": "email_thread_watch_create_v1",
+            "output_schema": "email_thread_watch_create_result_v1",
+            "idempotency": "client_key",
+            "required_scopes": [_GOOGLE_GMAIL_READ_SCOPE],
+            "execution_mode": "local_durable_workflow",
+            "deadline": "required",
+        },
+        allowed_egress_destinations=_GOOGLE_GMAIL_ALLOWED_EGRESS_DESTINATIONS,
+        validate_input=_validate_email_thread_watch_create_input,
+        execute=_execute_email_thread_watch_runtime,
+        declare_egress_intent=_declare_google_email_thread_watch_create_egress_intent,
+    ),
+    "cap.email.thread_watch.cancel": CapabilityDefinition(
+        capability_id="cap.email.thread_watch.cancel",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "email_thread_watch_cancel_v1",
+            "output_schema": "email_thread_watch_cancel_result_v1",
+            "idempotency": "client_key",
+            "execution_mode": "local_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_email_thread_watch_cancel_input,
+        execute=_execute_email_thread_watch_runtime,
+    ),
+    "cap.email.thread_watch.list": CapabilityDefinition(
+        capability_id="cap.email.thread_watch.list",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "email_thread_watch_list_v1",
+            "output_schema": "email_thread_watch_list_result_v1",
+            "idempotency": "deterministic_read",
+            "execution_mode": "local_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_email_thread_watch_list_input,
+        execute=_execute_email_thread_watch_runtime,
     ),
     "cap.drive.share": CapabilityDefinition(
         capability_id="cap.drive.share",
@@ -2968,6 +3354,23 @@ _STRING_LIST = {
     "items": {"type": "string"},
     "maxItems": 20,
 }
+_EMAIL_RECIPIENT_LIST = {
+    "type": "array",
+    "items": {"type": "string", "minLength": 1, "maxLength": 320},
+    "maxItems": 20,
+}
+_EMAIL_MESSAGE_ID_LIST = {
+    "type": "array",
+    "items": {"type": "string", "minLength": 1, "maxLength": 256},
+    "minItems": 1,
+    "maxItems": 1000,
+}
+_EMAIL_LABEL_LIST = {
+    "type": "array",
+    "items": {"type": "string", "minLength": 1, "maxLength": 225},
+    "maxItems": 100,
+}
+_IDEMPOTENCY_KEY_SCHEMA = {"type": "string", "minLength": 1, "maxLength": 128}
 
 _RESPONSE_TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     "calendar_window_v1": _object_schema(
@@ -2984,8 +3387,12 @@ _RESPONSE_TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "attendees": _STRING_LIST,
         }
     ),
-    "email_search_v1": _object_schema({"query": {"type": "string", "maxLength": 1000}}),
-    "email_read_v1": _object_schema({"message_id": {"type": "string", "maxLength": 256}}),
+    "email_search_v1": _object_schema(
+        {"query": {"type": "string", "minLength": 1, "maxLength": 1000}}
+    ),
+    "email_read_v1": _object_schema(
+        {"message_id": {"type": "string", "minLength": 1, "maxLength": 256}}
+    ),
     "drive_search_query_v1": _object_schema({"query": {"type": "string", "maxLength": 1000}}),
     "drive_read_v1": _object_schema({"file_id": {"type": "string", "maxLength": 256}}),
     "maps_directions_query_v1": _object_schema(
@@ -3017,13 +3424,50 @@ _RESPONSE_TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     ),
     "email_compose_v1": _object_schema(
         {
-            "to": _STRING_LIST,
-            "cc": _STRING_LIST,
-            "bcc": _STRING_LIST,
-            "subject": {"type": "string", "maxLength": 998},
-            "body": {"type": "string", "maxLength": 20000},
+            "to": _EMAIL_RECIPIENT_LIST,
+            "cc": _EMAIL_RECIPIENT_LIST,
+            "bcc": _EMAIL_RECIPIENT_LIST,
+            "subject": {"type": "string", "minLength": 1, "maxLength": 998},
+            "body": {"type": "string", "minLength": 1, "maxLength": 20000},
         }
     ),
+    "email_message_batch_mutation_v1": _object_schema(
+        {
+            "message_ids": _EMAIL_MESSAGE_ID_LIST,
+            "idempotency_key": _IDEMPOTENCY_KEY_SCHEMA,
+        }
+    ),
+    "email_labels_modify_v1": _object_schema(
+        {
+            "message_ids": _EMAIL_MESSAGE_ID_LIST,
+            "add_labels": _EMAIL_LABEL_LIST,
+            "remove_labels": _EMAIL_LABEL_LIST,
+            "idempotency_key": _IDEMPOTENCY_KEY_SCHEMA,
+        }
+    ),
+    "email_undo_v1": _object_schema(
+        {
+            "undo_token": {"type": "string", "minLength": 1, "maxLength": 512},
+            "idempotency_key": _IDEMPOTENCY_KEY_SCHEMA,
+        }
+    ),
+    "email_thread_watch_create_v1": _object_schema(
+        {
+            "provider_thread_id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "anchor_message_id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "condition": {"type": "string", "enum": list(_EMAIL_THREAD_WATCH_CONDITIONS)},
+            "deadline": {"type": "string"},
+            "note": {"type": "string", "minLength": 1, "maxLength": 2000},
+            "idempotency_key": _IDEMPOTENCY_KEY_SCHEMA,
+        }
+    ),
+    "email_thread_watch_cancel_v1": _object_schema(
+        {
+            "watch_id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "idempotency_key": _IDEMPOTENCY_KEY_SCHEMA,
+        }
+    ),
+    "email_thread_watch_list_v1": _object_schema({}),
     "drive_share_v1": _object_schema(
         {
             "file_id": {"type": "string", "maxLength": 256},
@@ -3110,6 +3554,13 @@ _RESPONSE_TOOL_DESCRIPTIONS: dict[str, str] = {
     "cap.calendar.create_event": "Create a calendar event after approval.",
     "cap.email.draft": "Create an email draft.",
     "cap.email.send": "Send an email after approval.",
+    "cap.email.archive": "Archive email messages by provider message id after approval.",
+    "cap.email.trash": "Move email messages to Trash after approval.",
+    "cap.email.labels.modify": "Add or remove email labels after approval.",
+    "cap.email.undo": "Undo one prior mutable email action by undo token.",
+    "cap.email.thread_watch.create": "Create a deadline-bound email thread watch.",
+    "cap.email.thread_watch.cancel": "Cancel an email thread watch by watch id.",
+    "cap.email.thread_watch.list": "List active email thread watches.",
     "cap.drive.share": "Share a Drive file after approval.",
     "cap.web.extract": "Extract bounded text and provenance from a public URL.",
     "cap.attachment.read": (

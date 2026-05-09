@@ -1,20 +1,24 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
+import hashlib
 from typing import Any, cast
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from ariel.config import AppSettings
 from ariel.google_connector import (
     DefaultGoogleOAuthClient,
     DefaultGoogleWorkspaceProvider,
+    GOOGLE_CONNECTOR_ID,
     GoogleConnectorRuntime,
 )
 from ariel.persistence import (
     BackgroundTaskRecord,
+    EmailThreadWatchRecord,
+    GoogleConnectorRecord,
     ProviderEventRecord,
     SyncCursorRecord,
     SyncRunRecord,
@@ -22,6 +26,46 @@ from ariel.persistence import (
     WorkspaceItemRecord,
     to_rfc3339,
 )
+
+
+def _provider_sync_lock_id(*parts: str) -> int:
+    digest = hashlib.sha256("\x1f".join(parts).encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") & 0x7FFF_FFFF_FFFF_FFFF
+
+
+def _acquire_provider_sync_lock(
+    session_factory: sessionmaker[Session],
+    *,
+    provider: str,
+    resource_type: str,
+    resource_id: str,
+) -> tuple[Session | None, int | None]:
+    lock_db = session_factory()
+    bind = lock_db.get_bind()
+    if bind is None or bind.dialect.name != "postgresql":
+        lock_db.close()
+        return None, None
+    lock_id = _provider_sync_lock_id("provider_sync", provider, resource_type, resource_id)
+    lock_db.execute(text("SELECT pg_advisory_lock(:lock_id)"), {"lock_id": lock_id})
+    lock_db.commit()
+    return lock_db, lock_id
+
+
+def _release_provider_sync_lock(lock_db: Session | None, lock_id: int | None) -> None:
+    if lock_db is None or lock_id is None:
+        return
+    lock_db.execute(text("SELECT pg_advisory_unlock(:lock_id)"), {"lock_id": lock_id})
+    lock_db.commit()
+    lock_db.close()
+
+
+def _provider_account_id_for_sync(db: Session) -> str:
+    account_subject = db.scalar(
+        select(GoogleConnectorRecord.account_subject)
+        .where(GoogleConnectorRecord.id == GOOGLE_CONNECTOR_ID)
+        .limit(1)
+    )
+    return account_subject or GOOGLE_CONNECTOR_ID
 
 
 def process_provider_event_received(
@@ -90,73 +134,111 @@ def process_provider_sync_due(
 
     now = now_fn()
     sync_run_id = new_id_fn("syn")
-    with session_factory() as db:
-        with db.begin():
-            event: ProviderEventRecord | None = None
-            if provider_event_id is not None:
-                event = db.scalar(
-                    select(ProviderEventRecord)
-                    .where(ProviderEventRecord.id == provider_event_id)
+    lock_db, lock_id = _acquire_provider_sync_lock(
+        session_factory,
+        provider="google",
+        resource_type=resource_type,
+        resource_id=resource_id,
+    )
+    try:
+        with session_factory() as db:
+            with db.begin():
+                event: ProviderEventRecord | None = None
+                if provider_event_id is not None:
+                    event = db.scalar(
+                        select(ProviderEventRecord)
+                        .where(ProviderEventRecord.id == provider_event_id)
+                        .with_for_update()
+                        .limit(1)
+                    )
+                    if event is None:
+                        raise RuntimeError("provider event not found")
+                    if event.status == "processed":
+                        _release_provider_sync_lock(lock_db, lock_id)
+                        return
+                    resource_type = event.resource_type
+                    resource_id = event.resource_id
+
+                cursor = db.scalar(
+                    select(SyncCursorRecord)
+                    .where(
+                        SyncCursorRecord.provider == "google",
+                        SyncCursorRecord.resource_type == resource_type,
+                        SyncCursorRecord.resource_id == resource_id,
+                    )
                     .with_for_update()
                     .limit(1)
                 )
-                if event is None:
-                    raise RuntimeError("provider event not found")
-                if event.status == "processed":
+                if cursor is None:
+                    cursor = SyncCursorRecord(
+                        id=new_id_fn("cur"),
+                        provider="google",
+                        resource_type=resource_type,
+                        resource_id=resource_id,
+                        cursor_value=None,
+                        cursor_version=0,
+                        status="ready",
+                        last_successful_sync_at=None,
+                        last_error_code=None,
+                        last_error_at=None,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    db.add(cursor)
+                    db.flush()
+
+                if resource_type == "gmail" and cursor.status == "invalid":
+                    db.add(
+                        SyncRunRecord(
+                            id=sync_run_id,
+                            provider="google",
+                            resource_type=resource_type,
+                            resource_id=resource_id,
+                            provider_event_id=event.id if event is not None else None,
+                            cursor_before=cursor.cursor_value,
+                            cursor_after=None,
+                            status="failed",
+                            item_count=0,
+                            observation_count=0,
+                            error="gmail_sync_cursor_invalid",
+                            started_at=now,
+                            completed_at=now,
+                            created_at=now,
+                        )
+                    )
+                    cursor.last_error_code = "gmail_sync_cursor_invalid"
+                    cursor.last_error_at = now
+                    cursor.updated_at = now
+                    if event is not None:
+                        event.status = "failed"
+                        event.error = "gmail_sync_cursor_invalid"
+                    _release_provider_sync_lock(lock_db, lock_id)
                     return
-                resource_type = event.resource_type
-                resource_id = event.resource_id
 
-            cursor = db.scalar(
-                select(SyncCursorRecord)
-                .where(
-                    SyncCursorRecord.provider == "google",
-                    SyncCursorRecord.resource_type == resource_type,
-                    SyncCursorRecord.resource_id == resource_id,
+                cursor.status = "syncing"
+                cursor.updated_at = now
+                db.add(
+                    SyncRunRecord(
+                        id=sync_run_id,
+                        provider="google",
+                        resource_type=resource_type,
+                        resource_id=resource_id,
+                        provider_event_id=event.id if event is not None else None,
+                        cursor_before=cursor.cursor_value,
+                        cursor_after=None,
+                        status="running",
+                        item_count=0,
+                        observation_count=0,
+                        error=None,
+                        started_at=now,
+                        completed_at=None,
+                        created_at=now,
+                    )
                 )
-                .with_for_update()
-                .limit(1)
-            )
-            if cursor is None:
-                cursor = SyncCursorRecord(
-                    id=new_id_fn("cur"),
-                    provider="google",
-                    resource_type=resource_type,
-                    resource_id=resource_id,
-                    cursor_value=None,
-                    cursor_version=0,
-                    status="ready",
-                    last_successful_sync_at=None,
-                    last_error_code=None,
-                    last_error_at=None,
-                    created_at=now,
-                    updated_at=now,
-                )
-                db.add(cursor)
-                db.flush()
-
-            cursor.status = "syncing"
-            cursor.updated_at = now
-            db.add(
-                SyncRunRecord(
-                    id=sync_run_id,
-                    provider="google",
-                    resource_type=resource_type,
-                    resource_id=resource_id,
-                    provider_event_id=event.id if event is not None else None,
-                    cursor_before=cursor.cursor_value,
-                    cursor_after=None,
-                    status="running",
-                    item_count=0,
-                    observation_count=0,
-                    error=None,
-                    started_at=now,
-                    completed_at=None,
-                    created_at=now,
-                )
-            )
-            cursor_before = cursor.cursor_value
-
+                cursor_before = cursor.cursor_value
+    except Exception:
+        _release_provider_sync_lock(lock_db, lock_id)
+        raise
     runtime = GoogleConnectorRuntime(
         oauth_client=DefaultGoogleOAuthClient(
             client_id=settings.google_oauth_client_id,
@@ -173,13 +255,34 @@ def process_provider_sync_due(
 
     outputs: list[dict[str, Any]] = []
     try:
+        sync_capability_id = {
+            "calendar": "cap.calendar.list",
+            "gmail": "cap.email.search",
+            "drive": "cap.drive.search",
+        }[resource_type]
+        refresh_access_token = getattr(runtime, "refresh_access_token_for_capability", None)
+        if callable(refresh_access_token):
+            refresh_access_token(
+                session_factory=session_factory,
+                capability_id=sync_capability_id,
+                now_fn=now_fn,
+                new_id_fn=new_id_fn,
+            )
         with session_factory() as db:
             with db.begin():
-                access_token = runtime.access_token_for_background_sync(
-                    db=db,
-                    now_fn=now_fn,
-                    new_id_fn=new_id_fn,
+                access_token_without_refresh = getattr(
+                    runtime,
+                    "access_token_for_background_sync_without_refresh",
+                    None,
                 )
+                if callable(access_token_without_refresh):
+                    access_token = access_token_without_refresh(db=db, now_fn=now_fn)
+                else:
+                    access_token = runtime.access_token_for_background_sync(
+                        db=db,
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
         if resource_type == "calendar":
             page_token: str | None = None
             while True:
@@ -242,110 +345,129 @@ def process_provider_sync_due(
             error=str(exc),
             now=now_fn(),
         )
+        _release_provider_sync_lock(lock_db, lock_id)
         raise
 
-    with session_factory() as db:
-        with db.begin():
-            event = (
-                db.scalar(
-                    select(ProviderEventRecord)
-                    .where(ProviderEventRecord.id == provider_event_id)
+    try:
+        with session_factory() as db:
+            with db.begin():
+                event = (
+                    db.scalar(
+                        select(ProviderEventRecord)
+                        .where(ProviderEventRecord.id == provider_event_id)
+                        .with_for_update()
+                        .limit(1)
+                    )
+                    if provider_event_id is not None
+                    else None
+                )
+                cursor = db.scalar(
+                    select(SyncCursorRecord)
+                    .where(
+                        SyncCursorRecord.provider == "google",
+                        SyncCursorRecord.resource_type == resource_type,
+                        SyncCursorRecord.resource_id == resource_id,
+                    )
                     .with_for_update()
                     .limit(1)
                 )
-                if provider_event_id is not None
-                else None
-            )
-            cursor = db.scalar(
-                select(SyncCursorRecord)
-                .where(
-                    SyncCursorRecord.provider == "google",
-                    SyncCursorRecord.resource_type == resource_type,
-                    SyncCursorRecord.resource_id == resource_id,
+                run = db.scalar(
+                    select(SyncRunRecord)
+                    .where(SyncRunRecord.id == sync_run_id)
+                    .with_for_update()
+                    .limit(1)
                 )
-                .with_for_update()
-                .limit(1)
-            )
-            run = db.scalar(
-                select(SyncRunRecord)
-                .where(SyncRunRecord.id == sync_run_id)
-                .with_for_update()
-                .limit(1)
-            )
-            if cursor is None or run is None:
-                raise RuntimeError("sync state missing")
+                if cursor is None or run is None:
+                    raise RuntimeError("sync state missing")
+                if cursor.cursor_value != cursor_before:
+                    run.status = "failed"
+                    run.error = "sync_cursor_changed"
+                    run.completed_at = now_fn()
+                    cursor.status = "ready"
+                    cursor.updated_at = now_fn()
+                    if event is not None:
+                        event.status = "failed"
+                        event.error = "sync_cursor_changed"
+                    _release_provider_sync_lock(lock_db, lock_id)
+                    return
 
-            now = now_fn()
-            item_count = 0
-            observation_count = 0
-            cursor_after = cursor_before
-            if resource_type == "calendar":
-                for output in outputs:
-                    cursor_after = _payload_text(output, "nextSyncToken") or cursor_after
-                    raw_items = output.get("items")
-                    items = raw_items if isinstance(raw_items, list) else []
-                    for item in items:
-                        if isinstance(item, dict) and _sync_calendar_item(
-                            db,
-                            cast(dict[str, Any], item),
-                            resource_id=resource_id,
-                            provider_event_id=provider_event_id,
-                            now=now,
-                            new_id_fn=new_id_fn,
-                        ):
-                            item_count += 1
-            elif resource_type == "gmail":
-                for output in outputs:
-                    cursor_after = _payload_text(output, "historyId") or cursor_after
-                    raw_histories = output.get("history")
-                    histories = raw_histories if isinstance(raw_histories, list) else []
-                    for history in histories:
-                        if isinstance(history, dict):
-                            added, observations = _sync_gmail_history(
+                now = now_fn()
+                item_count = 0
+                observation_count = 0
+                cursor_after = cursor_before
+                provider_account_id = _provider_account_id_for_sync(db)
+                if resource_type == "calendar":
+                    for output in outputs:
+                        cursor_after = _payload_text(output, "nextSyncToken") or cursor_after
+                        raw_items = output.get("items")
+                        items = raw_items if isinstance(raw_items, list) else []
+                        for item in items:
+                            if isinstance(item, dict) and _sync_calendar_item(
                                 db,
-                                cast(dict[str, Any], history),
+                                cast(dict[str, Any], item),
                                 resource_id=resource_id,
                                 provider_event_id=provider_event_id,
                                 now=now,
                                 new_id_fn=new_id_fn,
-                            )
-                            item_count += added
-                            observation_count += observations
-            else:
-                for output in outputs:
-                    cursor_after = (
-                        _payload_text(output, "newStartPageToken")
-                        or _payload_text(output, "startPageToken")
-                        or cursor_after
-                    )
-                    raw_changes = output.get("changes")
-                    changes = raw_changes if isinstance(raw_changes, list) else []
-                    for change in changes:
-                        if isinstance(change, dict) and _sync_drive_change(
-                            db,
-                            cast(dict[str, Any], change),
-                            resource_id=resource_id,
-                            provider_event_id=provider_event_id,
-                            now=now,
-                            new_id_fn=new_id_fn,
-                        ):
-                            item_count += 1
+                            ):
+                                item_count += 1
+                elif resource_type == "gmail":
+                    for output in outputs:
+                        cursor_after = _payload_text(output, "historyId") or cursor_after
+                        raw_histories = output.get("history")
+                        histories = raw_histories if isinstance(raw_histories, list) else []
+                        for history in histories:
+                            if isinstance(history, dict):
+                                added, observations = _sync_gmail_history(
+                                    db,
+                                    cast(dict[str, Any], history),
+                                    resource_id=resource_id,
+                                    provider_account_id=provider_account_id,
+                                    provider_event_id=provider_event_id,
+                                    now=now,
+                                    new_id_fn=new_id_fn,
+                                )
+                                item_count += added
+                                observation_count += observations
+                else:
+                    for output in outputs:
+                        cursor_after = (
+                            _payload_text(output, "newStartPageToken")
+                            or _payload_text(output, "startPageToken")
+                            or cursor_after
+                        )
+                        raw_changes = output.get("changes")
+                        changes = raw_changes if isinstance(raw_changes, list) else []
+                        for change in changes:
+                            if isinstance(change, dict) and _sync_drive_change(
+                                db,
+                                cast(dict[str, Any], change),
+                                resource_id=resource_id,
+                                provider_event_id=provider_event_id,
+                                now=now,
+                                new_id_fn=new_id_fn,
+                            ):
+                                item_count += 1
 
-            cursor.cursor_value = cursor_after
-            cursor.cursor_version += 1 if cursor_after != cursor_before else 0
-            cursor.status = "ready"
-            cursor.last_successful_sync_at = now
-            cursor.last_error_code = None
-            cursor.last_error_at = None
-            cursor.updated_at = now
-            run.cursor_after = cursor_after
-            run.status = "succeeded"
-            run.item_count = item_count
-            run.observation_count = observation_count
-            run.completed_at = now
-            if event is not None:
-                event.status = "processed"
-                event.processed_at = now
+                cursor.cursor_value = cursor_after
+                cursor.cursor_version += 1 if cursor_after != cursor_before else 0
+                cursor.status = "ready"
+                cursor.last_successful_sync_at = now
+                cursor.last_error_code = None
+                cursor.last_error_at = None
+                cursor.updated_at = now
+                run.cursor_after = cursor_after
+                run.status = "succeeded"
+                run.item_count = item_count
+                run.observation_count = observation_count
+                run.completed_at = now
+                if event is not None:
+                    event.status = "processed"
+                    event.processed_at = now
+    except Exception:
+        _release_provider_sync_lock(lock_db, lock_id)
+        raise
+    _release_provider_sync_lock(lock_db, lock_id)
 
 
 def _sync_calendar_item(
@@ -403,6 +525,7 @@ def _sync_gmail_history(
     history: dict[str, Any],
     *,
     resource_id: str,
+    provider_account_id: str,
     provider_event_id: str | None,
     now: datetime,
     new_id_fn: Callable[[str], str],
@@ -425,6 +548,75 @@ def _sync_gmail_history(
             message_id = _payload_text(message, "id")
             if message_id is None:
                 continue
+            thread_id = _payload_text(message, "threadId")
+            message_received_at = _gmail_message_received_at(message, fallback=now)
+            label_ids_raw = message.get("labelIds")
+            label_ids = (
+                [label_id for label_id in label_ids_raw if isinstance(label_id, str)]
+                if isinstance(label_ids_raw, list)
+                else []
+            )
+            thread_watch_signals: list[dict[str, Any]] = []
+            if key == "messagesAdded" and thread_id is not None:
+                watches = db.scalars(
+                    select(EmailThreadWatchRecord)
+                    .where(
+                        EmailThreadWatchRecord.provider == "google",
+                        EmailThreadWatchRecord.provider_account_id == provider_account_id,
+                        EmailThreadWatchRecord.provider_thread_id == thread_id,
+                        EmailThreadWatchRecord.status == "active",
+                    )
+                    .with_for_update()
+                ).all()
+                for watch in watches:
+                    if message_id == watch.anchor_message_id:
+                        continue
+                    if (
+                        watch.condition == "no_reply_by_deadline"
+                        and message_received_at > watch.deadline
+                    ):
+                        watch.status = "due"
+                        signal_type = "email_thread_watch_due"
+                    elif (
+                        watch.condition == "any_reply_arrives"
+                        and message_received_at > watch.deadline
+                    ):
+                        watch.status = "failed"
+                        watch.updated_at = now
+                        continue
+                    else:
+                        watch.status = "completed"
+                        watch.matched_message_id = message_id
+                        watch.matched_at = message_received_at
+                        watch.completed_at = now
+                        signal_type = "email_thread_watch_completed"
+                    watch.updated_at = now
+                    signal_changed = emit_email_thread_watch_signal(
+                        db,
+                        watch=watch,
+                        signal_type=signal_type,
+                        now=now,
+                        new_id_fn=new_id_fn,
+                        trigger_message_id=message_id,
+                    )
+                    item_count += 1 if signal_changed else 0
+                    thread_watch_signals.append(
+                        {
+                            "signal": signal_type,
+                            "watch_id": watch.id,
+                            "watch_status": watch.status,
+                            "condition": watch.condition,
+                            "deadline": to_rfc3339(watch.deadline),
+                            "message_received_at": to_rfc3339(message_received_at),
+                            "matched_message_id": watch.matched_message_id,
+                            "matched_at": (
+                                to_rfc3339(watch.matched_at)
+                                if watch.matched_at is not None
+                                else None
+                            ),
+                            "signal_emitted": signal_changed,
+                        }
+                    )
             changed = _upsert_workspace_item_event(
                 db,
                 provider="google",
@@ -434,7 +626,14 @@ def _sync_gmail_history(
                 summary=f"Gmail history {key} for message {message_id}.",
                 source_uri=f"https://mail.google.com/mail/u/0/#inbox/{message_id}",
                 status=status,
-                metadata={"resource_id": resource_id, "history_id": history_id, "change": key},
+                metadata={
+                    "resource_id": resource_id,
+                    "history_id": history_id,
+                    "change": key,
+                    "thread_id": thread_id,
+                    "label_ids": label_ids,
+                    "email_thread_watch_signals": thread_watch_signals,
+                },
                 event_type="deleted" if status == "deleted" else "updated",
                 event_dedupe_key=f"google:gmail:{resource_id}:{message_id}:{history_id}:{key}",
                 provider_event_id=provider_event_id,
@@ -443,6 +642,82 @@ def _sync_gmail_history(
             )
             item_count += 1 if changed else 0
     return item_count, observation_count
+
+
+def _gmail_message_received_at(message: dict[str, Any], *, fallback: datetime) -> datetime:
+    internal_date_raw = message.get("internalDate")
+    if isinstance(internal_date_raw, str) and internal_date_raw.strip():
+        try:
+            millis = int(internal_date_raw.strip())
+        except ValueError:
+            return fallback
+        if millis >= 0:
+            return datetime.fromtimestamp(millis / 1000, tz=UTC)
+    return fallback
+
+
+def emit_email_thread_watch_signal(
+    db: Session,
+    *,
+    watch: EmailThreadWatchRecord,
+    signal_type: str,
+    now: datetime,
+    new_id_fn: Callable[[str], str],
+    trigger_message_id: str | None = None,
+) -> bool:
+    matched_message_id = (
+        watch.matched_message_id if signal_type == "email_thread_watch_completed" else None
+    )
+    metadata = {
+        "signal": signal_type,
+        "watch_id": watch.id,
+        "provider": watch.provider,
+        "provider_account_id": watch.provider_account_id,
+        "provider_thread_id": watch.provider_thread_id,
+        "anchor_message_id": watch.anchor_message_id,
+        "condition": watch.condition,
+        "deadline": to_rfc3339(watch.deadline),
+        "note": watch.note,
+        "watch_status": watch.status,
+        "matched_message_id": matched_message_id,
+        "matched_at": to_rfc3339(watch.matched_at) if watch.matched_at is not None else None,
+        "completed_at": (
+            to_rfc3339(watch.completed_at) if watch.completed_at is not None else None
+        ),
+        "trigger_message_id": trigger_message_id,
+        "signaled_at": to_rfc3339(now),
+    }
+    signal_key = (
+        to_rfc3339(watch.deadline)
+        if signal_type == "email_thread_watch_due"
+        else str(matched_message_id or to_rfc3339(watch.completed_at or now))
+    )
+    title = (
+        "Email thread watch due"
+        if signal_type == "email_thread_watch_due"
+        else "Email thread watch completed"
+    )
+    summary = (
+        f"Thread {watch.provider_thread_id} reached its reply deadline."
+        if signal_type == "email_thread_watch_due"
+        else f"Thread {watch.provider_thread_id} received a watched reply."
+    )
+    return _upsert_workspace_item_event(
+        db,
+        provider="ariel",
+        item_type="internal_state",
+        external_id=f"email-thread-watch:{watch.id}",
+        title=title,
+        summary=summary,
+        source_uri=None,
+        status="active",
+        metadata=metadata,
+        event_type="updated",
+        event_dedupe_key=f"ariel:email-thread-watch:{watch.id}:{signal_type}:{signal_key}",
+        provider_event_id=None,
+        now=now,
+        new_id_fn=new_id_fn,
+    )
 
 
 def _sync_drive_change(
@@ -597,6 +872,7 @@ def _mark_sync_failed(
                 run.status = "failed"
                 run.error = error
                 run.completed_at = now
+            cursor_before = run.cursor_before if run is not None else None
             cursor = db.scalar(
                 select(SyncCursorRecord)
                 .where(
@@ -608,10 +884,16 @@ def _mark_sync_failed(
                 .limit(1)
             )
             if cursor is not None:
-                cursor.status = "error"
-                cursor.last_error_code = error[:64]
-                cursor.last_error_at = now
-                cursor.updated_at = now
+                if run is None or cursor.cursor_value == cursor_before:
+                    cursor.status = (
+                        "invalid"
+                        if resource_type == "gmail"
+                        and error in {"resource_not_found", "gmail_sync_cursor_missing"}
+                        else "error"
+                    )
+                    cursor.last_error_code = error[:64]
+                    cursor.last_error_at = now
+                    cursor.updated_at = now
             if provider_event_id is not None:
                 event = db.get(ProviderEventRecord, provider_event_id)
                 if event is not None:

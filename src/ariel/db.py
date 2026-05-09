@@ -72,6 +72,8 @@ REQUIRED_TABLES: Final[tuple[str, ...]] = (
     "job_events",
     "notifications",
     "notification_deliveries",
+    "email_actions",
+    "email_thread_watches",
 )
 
 

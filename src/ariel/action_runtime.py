@@ -3,7 +3,9 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+import hashlib
 import json
+import secrets
 from typing import Any, Literal
 
 from fastapi.encoders import jsonable_encoder
@@ -31,6 +33,7 @@ from ariel.executor import (
 )
 from ariel.google_connector import (
     GOOGLE_CAPABILITY_IDS,
+    GOOGLE_CONNECTOR_ID,
     GOOGLE_READ_CAPABILITY_IDS,
     GoogleCapabilityExecutionResult,
     GoogleConnectorRuntime,
@@ -40,6 +43,9 @@ from ariel.persistence import (
     ApprovalRequestRecord,
     ArtifactRecord,
     BackgroundTaskRecord,
+    EmailActionRecord,
+    EmailThreadWatchRecord,
+    GoogleConnectorRecord,
     TurnRecord,
     to_rfc3339,
 )
@@ -47,6 +53,29 @@ from ariel.policy_engine import evaluate_proposal
 from ariel.weather_state import resolve_weather_location
 
 _SIDE_EFFECT_EXECUTION_LOCK_ID = 24_310_002
+_EMAIL_MUTATION_CAPABILITY_IDS = {
+    "cap.email.archive",
+    "cap.email.trash",
+    "cap.email.labels.modify",
+    "cap.email.undo",
+}
+_EMAIL_THREAD_WATCH_CAPABILITY_IDS = {
+    "cap.email.thread_watch.create",
+    "cap.email.thread_watch.cancel",
+}
+_EMAIL_TRANSIENT_PROVIDER_ERRORS = {
+    "google_upstream_429",
+    "google_upstream_500",
+    "google_upstream_502",
+    "google_upstream_503",
+    "google_upstream_504",
+    "provider_timeout",
+    "provider_network_failure",
+    "provider_rate_limited",
+    "provider_upstream_failure",
+    "provider_unreachable",
+    "token_expired",
+}
 
 ModelDeclaredTaintStatus = Literal["missing", "true", "false", "malformed"]
 ProposalProvenanceStatus = Literal["clean", "tainted", "ambiguous"]
@@ -160,6 +189,108 @@ def _enqueue_action_execution_task(
     db.add(task)
     db.flush()
     return task
+
+
+def _email_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _email_idempotency_key(
+    *,
+    capability_id: str,
+    provider_account_id: str,
+    client_key: str,
+) -> str:
+    raw = f"{capability_id}\x1fgoogle\x1f{provider_account_id}\x1f{client_key}"
+    return "email:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _email_provider_error_is_retryable(error: str) -> bool:
+    return error in _EMAIL_TRANSIENT_PROVIDER_ERRORS or error.startswith("google_upstream_5")
+
+
+def _current_google_provider_account_id(db: Session) -> str | None:
+    connector = db.scalar(
+        select(GoogleConnectorRecord)
+        .where(GoogleConnectorRecord.id == GOOGLE_CONNECTOR_ID)
+        .limit(1)
+    )
+    if connector is None or connector.status != "connected":
+        return None
+    account_subject = connector.account_subject
+    if account_subject is None or not account_subject.strip():
+        return None
+    return account_subject
+
+
+def _email_advisory_lock_id(*parts: str) -> int:
+    digest = hashlib.sha256("\x1f".join(parts).encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") & 0x7FFF_FFFF_FFFF_FFFF
+
+
+def _acquire_email_advisory_lock(db: Session, *parts: str) -> None:
+    bind = db.get_bind()
+    if bind is None or bind.dialect.name != "postgresql":
+        return
+    db.execute(
+        text("SELECT pg_advisory_xact_lock(:lock_id)"),
+        {"lock_id": _email_advisory_lock_id(*parts)},
+    )
+
+
+def _email_action_result_payload(
+    *,
+    action: EmailActionRecord,
+    undo_token: str | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    undo_available = (
+        action.status == "succeeded"
+        and action.undo_token_hash is not None
+        and action.undo_expires_at is not None
+        and (now is None or action.undo_expires_at > now)
+    )
+    payload: dict[str, Any] = {
+        "status": action.status,
+        "email_action_id": action.id,
+        "capability_id": action.capability_id,
+        "provider": action.provider,
+        "provider_account_id": action.provider_account_id,
+        "message_ids": action.provider_message_ids,
+        "thread_ids": action.provider_thread_ids,
+        "before_state": action.before_state,
+        "intended_state": action.intended_state,
+        "after_state": action.after_state,
+        "provider_result": action.provider_result,
+        "undo_available": undo_available,
+        "undo_expires_at": to_rfc3339(action.undo_expires_at)
+        if action.undo_expires_at is not None
+        else None,
+    }
+    if undo_token is not None:
+        payload["undo_token"] = undo_token
+    return payload
+
+
+def _email_provider_state_lists(output: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    before_state_raw = output.get("before_state")
+    after_state_raw = output.get("after_state")
+    if not isinstance(before_state_raw, list):
+        raise RuntimeError("email_before_state_missing")
+    if not isinstance(after_state_raw, list):
+        raise RuntimeError("email_after_state_missing")
+    return {"messages": before_state_raw}, {"messages": after_state_raw}
+
+
+def _email_thread_ids_from_state(state: dict[str, Any]) -> list[str]:
+    thread_ids: list[str] = []
+    for entry in state.get("messages", []):
+        if not isinstance(entry, dict):
+            continue
+        thread_id = entry.get("thread_id")
+        if isinstance(thread_id, str) and thread_id and thread_id not in thread_ids:
+            thread_ids.append(thread_id)
+    return thread_ids
 
 
 def _append_action_execution_event(
@@ -1120,6 +1251,79 @@ def process_response_function_calls(
                 retrieval_errors.append(preflight_error)
             continue
 
+        if capability_id == "cap.email.thread_watch.list":
+            provider_account_id = _current_google_provider_account_id(db)
+            if provider_account_id is None:
+                action_attempt.execution_output = None
+                action_attempt.execution_error = "google_account_identity_missing"
+                action_attempt.status = "failed"
+                action_attempt.updated_at = now_fn()
+                blocked_reasons.append(f"{capability_id}: google_account_identity_missing")
+                if call_id:
+                    function_call_outputs.append(
+                        _response_function_call_output(
+                            call_id=call_id,
+                            payload={
+                                "status": "failed",
+                                "capability_id": capability_id,
+                                "error": "google_account_identity_missing",
+                            },
+                        )
+                    )
+                add_event(
+                    "evt.action.execution.failed",
+                    {
+                        "action_attempt_id": action_attempt.id,
+                        "error": "google_account_identity_missing",
+                    },
+                )
+                continue
+            watches = db.scalars(
+                select(EmailThreadWatchRecord)
+                .where(
+                    EmailThreadWatchRecord.provider == "google",
+                    EmailThreadWatchRecord.provider_account_id == provider_account_id,
+                    EmailThreadWatchRecord.status == "active",
+                )
+                .order_by(EmailThreadWatchRecord.deadline.asc(), EmailThreadWatchRecord.id.asc())
+                .limit(100)
+            ).all()
+            output = {
+                "status": "listed",
+                "watches": [
+                    {
+                        "watch_id": watch.id,
+                        "provider_thread_id": watch.provider_thread_id,
+                        "anchor_message_id": watch.anchor_message_id,
+                        "condition": watch.condition,
+                        "deadline": to_rfc3339(watch.deadline),
+                        "note": watch.note,
+                        "status": watch.status,
+                    }
+                    for watch in watches
+                ],
+            }
+            action_attempt.execution_output = output
+            action_attempt.execution_error = None
+            action_attempt.status = "succeeded"
+            action_attempt.updated_at = now_fn()
+            inline_results.append({"capability_id": capability_id, "output": output})
+            if call_id:
+                function_call_outputs.append(
+                    _response_function_call_output(
+                        call_id=call_id,
+                        payload={"status": "succeeded", "capability_id": capability_id, **output},
+                    )
+                )
+            add_event(
+                "evt.action.execution.succeeded",
+                {
+                    "action_attempt_id": action_attempt.id,
+                    "output": output,
+                },
+            )
+            continue
+
         if evaluation.capability.impact_level != "read":
             task = _enqueue_action_execution_task(
                 db=db,
@@ -1839,10 +2043,34 @@ def process_action_execution_task(
     new_id_fn: Callable[[str], str],
 ) -> bool:
     provider_call: tuple[str, dict[str, Any], str, set[str]] | None = None
+    email_provider_call: tuple[str, str, dict[str, Any], str, set[str]] | None = None
+    email_undo_prior_action_id: str | None = None
+    email_lock_parts: tuple[str, ...] | None = None
     agency_call: tuple[str, dict[str, Any], dict[str, Any]] | None = None
     agency_result: tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]] | None = None
     local_call: tuple[CapabilityDefinition, dict[str, Any]] | None = None
+    thread_watch_result: dict[str, Any] | None = None
     execution_result: ExecutionResult | GoogleCapabilityExecutionResult | None = None
+    retryable_provider_error: str | None = None
+
+    if google_runtime is not None:
+        with session_factory() as db:
+            with db.begin():
+                action_attempt = db.get(ActionAttemptRecord, action_attempt_id)
+                google_capability_id = (
+                    action_attempt.capability_id
+                    if action_attempt is not None
+                    and action_attempt.status == "executing"
+                    and action_attempt.capability_id in GOOGLE_CAPABILITY_IDS
+                    else None
+                )
+        if google_capability_id is not None:
+            google_runtime.refresh_access_token_for_capability(
+                session_factory=session_factory,
+                capability_id=google_capability_id,
+                now_fn=now_fn,
+                new_id_fn=new_id_fn,
+            )
 
     with session_factory() as db:
         with db.begin():
@@ -1866,7 +2094,9 @@ def process_action_execution_task(
                 )
                 return True
             if (
-                isinstance(action_attempt.execution_output, dict)
+                action_attempt.capability_id not in _EMAIL_MUTATION_CAPABILITY_IDS
+                and action_attempt.capability_id not in _EMAIL_THREAD_WATCH_CAPABILITY_IDS
+                and isinstance(action_attempt.execution_output, dict)
                 and action_attempt.execution_output.get("dispatch_state") == "provider_call_started"
             ):
                 _fail_action_execution(
@@ -1925,7 +2155,213 @@ def process_action_execution_task(
                 )
                 return True
 
-            if action_attempt.capability_id in GOOGLE_CAPABILITY_IDS:
+            if action_attempt.capability_id in _EMAIL_THREAD_WATCH_CAPABILITY_IDS:
+                now = now_fn()
+                if action_attempt.capability_id == "cap.email.thread_watch.create":
+                    if google_runtime is None:
+                        _fail_action_execution(
+                            db=db,
+                            action_attempt=action_attempt,
+                            error="google_runtime_not_bound",
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        return True
+                    _, _, prepared_provider_account_id, access_failure = (
+                        google_runtime.prepare_capability_access_without_refresh(
+                            db=db,
+                            capability_id=action_attempt.capability_id,
+                            now_fn=now_fn,
+                        )
+                    )
+                    if access_failure is not None:
+                        _fail_action_execution(
+                            db=db,
+                            action_attempt=action_attempt,
+                            error=(
+                                access_failure.auth_failure.failure_class
+                                if access_failure.auth_failure is not None
+                                else (access_failure.error or "google_access_failed")
+                            ),
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        return True
+                    provider_account_id = prepared_provider_account_id
+                    if provider_account_id is None:
+                        _fail_action_execution(
+                            db=db,
+                            action_attempt=action_attempt,
+                            error="google_account_identity_missing",
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        return True
+                    _acquire_email_advisory_lock(
+                        db,
+                        "email_thread_watch",
+                        "google",
+                        provider_account_id,
+                        str(normalized_input["provider_thread_id"]),
+                    )
+                    idempotency_key = _email_idempotency_key(
+                        capability_id=action_attempt.capability_id,
+                        provider_account_id=provider_account_id,
+                        client_key=str(normalized_input["idempotency_key"]),
+                    )
+                    watch = db.scalar(
+                        select(EmailThreadWatchRecord)
+                        .where(EmailThreadWatchRecord.idempotency_key == idempotency_key)
+                        .with_for_update()
+                        .limit(1)
+                    )
+                    if watch is None:
+                        watch = EmailThreadWatchRecord(
+                            id=new_id_fn("etw"),
+                            provider="google",
+                            provider_account_id=provider_account_id,
+                            provider_thread_id=str(normalized_input["provider_thread_id"]),
+                            anchor_message_id=str(normalized_input["anchor_message_id"]),
+                            condition=str(normalized_input["condition"]),
+                            deadline=datetime.fromisoformat(
+                                str(normalized_input["deadline"]).replace("Z", "+00:00")
+                            ),
+                            note=str(normalized_input["note"]),
+                            status="active",
+                            idempotency_key=idempotency_key,
+                            cancel_idempotency_key=None,
+                            created_by_action_attempt_id=action_attempt.id,
+                            matched_message_id=None,
+                            matched_at=None,
+                            canceled_at=None,
+                            completed_at=None,
+                            created_at=now,
+                            updated_at=now,
+                        )
+                        db.add(watch)
+                        db.flush()
+                    elif (
+                        watch.provider_thread_id != str(normalized_input["provider_thread_id"])
+                        or watch.anchor_message_id != str(normalized_input["anchor_message_id"])
+                        or watch.condition != str(normalized_input["condition"])
+                        or to_rfc3339(watch.deadline) != str(normalized_input["deadline"])
+                        or watch.note != str(normalized_input["note"])
+                    ):
+                        _fail_action_execution(
+                            db=db,
+                            action_attempt=action_attempt,
+                            error="idempotency_key_input_mismatch",
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        return True
+                    thread_watch_result = {
+                        "status": watch.status,
+                        "watch_id": watch.id,
+                        "provider_thread_id": watch.provider_thread_id,
+                        "anchor_message_id": watch.anchor_message_id,
+                        "condition": watch.condition,
+                        "deadline": to_rfc3339(watch.deadline),
+                        "note": watch.note,
+                    }
+                else:
+                    provider_account_id = _current_google_provider_account_id(db)
+                    if provider_account_id is None:
+                        _fail_action_execution(
+                            db=db,
+                            action_attempt=action_attempt,
+                            error="google_account_identity_missing",
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        return True
+                    watch = db.scalar(
+                        select(EmailThreadWatchRecord)
+                        .where(
+                            EmailThreadWatchRecord.id == normalized_input["watch_id"],
+                            EmailThreadWatchRecord.provider == "google",
+                            EmailThreadWatchRecord.provider_account_id == provider_account_id,
+                        )
+                        .with_for_update()
+                        .limit(1)
+                    )
+                    if watch is None:
+                        _fail_action_execution(
+                            db=db,
+                            action_attempt=action_attempt,
+                            error="thread_watch_not_found",
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        return True
+                    _acquire_email_advisory_lock(
+                        db,
+                        "email_thread_watch",
+                        watch.provider,
+                        watch.provider_account_id,
+                        watch.provider_thread_id,
+                    )
+                    cancel_idempotency_key = _email_idempotency_key(
+                        capability_id=action_attempt.capability_id,
+                        provider_account_id=watch.provider_account_id,
+                        client_key=str(normalized_input["idempotency_key"]),
+                    )
+                    existing_cancel = db.scalar(
+                        select(EmailThreadWatchRecord)
+                        .where(
+                            EmailThreadWatchRecord.cancel_idempotency_key == cancel_idempotency_key
+                        )
+                        .with_for_update()
+                        .limit(1)
+                    )
+                    if existing_cancel is not None and existing_cancel.id != watch.id:
+                        _fail_action_execution(
+                            db=db,
+                            action_attempt=action_attempt,
+                            error="idempotency_key_input_mismatch",
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        return True
+                    if watch.status == "canceled":
+                        if watch.cancel_idempotency_key != cancel_idempotency_key:
+                            _fail_action_execution(
+                                db=db,
+                                action_attempt=action_attempt,
+                                error="idempotency_key_input_mismatch",
+                                now_fn=now_fn,
+                                new_id_fn=new_id_fn,
+                            )
+                            return True
+                    elif watch.status == "active":
+                        watch.status = "canceled"
+                        watch.canceled_at = now
+                        watch.cancel_idempotency_key = cancel_idempotency_key
+                        watch.updated_at = now
+                    thread_watch_result = {
+                        "status": watch.status,
+                        "watch_id": watch.id,
+                        "provider_thread_id": watch.provider_thread_id,
+                        "condition": watch.condition,
+                    }
+                action_attempt.status = "succeeded"
+                action_attempt.execution_output = thread_watch_result
+                action_attempt.execution_error = None
+                action_attempt.updated_at = now
+                _append_action_execution_event(
+                    db=db,
+                    action_attempt=action_attempt,
+                    event_type="evt.action.execution.succeeded",
+                    payload_data={
+                        "action_attempt_id": action_attempt.id,
+                        "output": thread_watch_result,
+                    },
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
+                return True
+
+            if action_attempt.capability_id in _EMAIL_MUTATION_CAPABILITY_IDS:
                 if google_runtime is None:
                     _fail_action_execution(
                         db=db,
@@ -1935,12 +2371,230 @@ def process_action_execution_task(
                         new_id_fn=new_id_fn,
                     )
                     return True
-                access_token, granted_scopes, access_failure = (
-                    google_runtime.prepare_capability_access(
+                access_token, granted_scopes, provider_account_id, access_failure = (
+                    google_runtime.prepare_capability_access_without_refresh(
                         db=db,
                         capability_id=action_attempt.capability_id,
                         now_fn=now_fn,
+                    )
+                )
+                if access_failure is not None:
+                    _fail_action_execution(
+                        db=db,
+                        action_attempt=action_attempt,
+                        error=(
+                            access_failure.auth_failure.failure_class
+                            if access_failure.auth_failure is not None
+                            else (access_failure.error or "google_access_failed")
+                        ),
+                        now_fn=now_fn,
                         new_id_fn=new_id_fn,
+                    )
+                    return True
+                if access_token is None:
+                    _fail_action_execution(
+                        db=db,
+                        action_attempt=action_attempt,
+                        error="token_expired",
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
+                    return True
+                if provider_account_id is None:
+                    _fail_action_execution(
+                        db=db,
+                        action_attempt=action_attempt,
+                        error="google_account_identity_missing",
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
+                    return True
+                idempotency_key = _email_idempotency_key(
+                    capability_id=action_attempt.capability_id,
+                    provider_account_id=provider_account_id,
+                    client_key=str(normalized_input["idempotency_key"]),
+                )
+                email_action = db.scalar(
+                    select(EmailActionRecord)
+                    .where(EmailActionRecord.idempotency_key == idempotency_key)
+                    .with_for_update()
+                    .limit(1)
+                )
+                if email_action is not None:
+                    if email_action.input_hash != action_attempt.payload_hash:
+                        _fail_action_execution(
+                            db=db,
+                            action_attempt=action_attempt,
+                            error="idempotency_key_input_mismatch",
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        return True
+                    if email_action.status in {"succeeded", "undone"}:
+                        replay_output = _email_action_result_payload(
+                            action=email_action,
+                            now=now_fn(),
+                        )
+                        action_attempt.status = "succeeded"
+                        action_attempt.execution_output = replay_output
+                        action_attempt.execution_error = None
+                        action_attempt.updated_at = now_fn()
+                        _append_action_execution_event(
+                            db=db,
+                            action_attempt=action_attempt,
+                            event_type="evt.action.execution.succeeded",
+                            payload_data={
+                                "action_attempt_id": action_attempt.id,
+                                "output": replay_output,
+                            },
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        return True
+                    elif email_action.status == "failed":
+                        error = email_action.failure_code or "email_action_failed"
+                        if not _email_provider_error_is_retryable(error):
+                            _fail_action_execution(
+                                db=db,
+                                action_attempt=action_attempt,
+                                error=error,
+                                now_fn=now_fn,
+                                new_id_fn=new_id_fn,
+                            )
+                            return True
+                    stored_input = (
+                        email_action.intended_state
+                        if isinstance(email_action.intended_state, dict)
+                        else {}
+                    )
+                    provider_input = dict(stored_input)
+                    provider_message_ids = list(email_action.provider_message_ids)
+                    if "message_ids" not in provider_input:
+                        provider_input["message_ids"] = provider_message_ids
+                    before_messages = (
+                        email_action.before_state.get("messages")
+                        if isinstance(email_action.before_state, dict)
+                        else None
+                    )
+                    if isinstance(before_messages, list) and "before_state" not in provider_input:
+                        provider_input["before_state"] = before_messages
+                    prior_action_id = provider_input.get("prior_email_action_id")
+                    if isinstance(prior_action_id, str):
+                        email_undo_prior_action_id = prior_action_id
+                else:
+                    provider_input = dict(normalized_input)
+                    provider_message_ids = list(normalized_input.get("message_ids", []))
+                    if action_attempt.capability_id == "cap.email.undo":
+                        undo_token_hash = _email_hash(str(normalized_input["undo_token"]))
+                        prior_action = db.scalar(
+                            select(EmailActionRecord)
+                            .where(EmailActionRecord.undo_token_hash == undo_token_hash)
+                            .with_for_update()
+                            .limit(1)
+                        )
+                        if (
+                            prior_action is None
+                            or prior_action.status != "succeeded"
+                            or prior_action.undo_expires_at is None
+                            or prior_action.undo_expires_at <= now_fn()
+                            or prior_action.provider != "google"
+                            or prior_action.provider_account_id != provider_account_id
+                            or not prior_action.before_state.get("messages")
+                            or not isinstance(prior_action.before_state.get("messages"), list)
+                        ):
+                            _fail_action_execution(
+                                db=db,
+                                action_attempt=action_attempt,
+                                error="undo_unavailable",
+                                now_fn=now_fn,
+                                new_id_fn=new_id_fn,
+                            )
+                            return True
+                        email_undo_prior_action_id = prior_action.id
+                        provider_message_ids = list(prior_action.provider_message_ids)
+                        provider_input = {
+                            "message_ids": provider_message_ids,
+                            "before_state": prior_action.before_state["messages"],
+                            "prior_email_action_id": prior_action.id,
+                        }
+                    email_action = EmailActionRecord(
+                        id=new_id_fn("ema"),
+                        provider="google",
+                        provider_account_id=provider_account_id,
+                        action_attempt_id=action_attempt.id,
+                        capability_id=action_attempt.capability_id,
+                        input_hash=action_attempt.payload_hash,
+                        idempotency_key=idempotency_key,
+                        status="pending",
+                        approval_id=(
+                            action_attempt.approval_request.id
+                            if action_attempt.approval_request is not None
+                            else None
+                        ),
+                        provider_message_ids=provider_message_ids,
+                        provider_thread_ids=[],
+                        before_state={},
+                        intended_state=provider_input,
+                        after_state={},
+                        provider_result={},
+                        undo_token_hash=None,
+                        undo_expires_at=None,
+                        execution_attempts=0,
+                        failure_code=None,
+                        created_at=now_fn(),
+                        updated_at=now_fn(),
+                    )
+                    db.add(email_action)
+                    db.flush()
+                if not provider_message_ids:
+                    _fail_action_execution(
+                        db=db,
+                        action_attempt=action_attempt,
+                        error="email_message_ids_missing",
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
+                    return True
+                email_lock_parts = (
+                    "email_action",
+                    "google",
+                    provider_account_id,
+                    ",".join(sorted(provider_message_ids)),
+                )
+                _acquire_email_advisory_lock(db, *email_lock_parts)
+                email_action.status = "executing"
+                email_action.execution_attempts += 1
+                email_action.failure_code = None
+                email_action.provider_message_ids = provider_message_ids
+                email_action.intended_state = provider_input
+                email_action.updated_at = now_fn()
+                action_attempt.execution_output = {
+                    "dispatch_state": "provider_call_started",
+                    "email_action_id": email_action.id,
+                }
+                action_attempt.updated_at = now_fn()
+                email_provider_call = (
+                    email_action.id,
+                    action_attempt.capability_id,
+                    provider_input,
+                    access_token,
+                    granted_scopes,
+                )
+            elif action_attempt.capability_id in GOOGLE_CAPABILITY_IDS:
+                if google_runtime is None:
+                    _fail_action_execution(
+                        db=db,
+                        action_attempt=action_attempt,
+                        error="google_runtime_not_bound",
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
+                    return True
+                access_token, granted_scopes, _, access_failure = (
+                    google_runtime.prepare_capability_access_without_refresh(
+                        db=db,
+                        capability_id=action_attempt.capability_id,
+                        now_fn=now_fn,
                     )
                 )
                 if access_failure is not None:
@@ -2025,7 +2679,92 @@ def process_action_execution_task(
             else:
                 local_call = (capability, normalized_input)
 
-    if provider_call is not None:
+    if email_provider_call is not None:
+        email_action_id, capability_id, normalized_input, access_token, granted_scopes = (
+            email_provider_call
+        )
+        assert google_runtime is not None
+        lock_db: Session | None = None
+        lock_id: int | None = None
+        if email_lock_parts is not None:
+            lock_db = session_factory()
+            bind = lock_db.get_bind()
+            if bind is not None and bind.dialect.name == "postgresql":
+                lock_id = _email_advisory_lock_id(*email_lock_parts)
+                lock_db.execute(text("SELECT pg_advisory_lock(:lock_id)"), {"lock_id": lock_id})
+                lock_db.commit()
+            else:
+                lock_db.close()
+                lock_db = None
+        try:
+            if capability_id != "cap.email.undo" and "before_state" not in normalized_input:
+                message_ids = normalized_input["message_ids"]
+                before_state_output = (
+                    google_runtime.workspace_provider.email_get_message_label_state(
+                        access_token=access_token,
+                        normalized_input={"message_ids": message_ids},
+                    )
+                )
+                before_messages_raw = before_state_output.get("state")
+                if not isinstance(before_messages_raw, list):
+                    raise RuntimeError("email_before_state_missing")
+                before_message_ids: list[str] = []
+                for before_message in before_messages_raw:
+                    if not isinstance(before_message, dict):
+                        raise RuntimeError("email_before_state_missing")
+                    before_message_id = before_message.get("message_id")
+                    if not isinstance(before_message_id, str) or not before_message_id:
+                        raise RuntimeError("email_before_state_missing")
+                    before_message_ids.append(before_message_id)
+                if sorted(before_message_ids) != sorted(message_ids):
+                    raise RuntimeError("email_before_state_missing")
+                before_messages = before_messages_raw
+                normalized_input = {**normalized_input, "before_state": before_messages}
+                with session_factory() as db:
+                    with db.begin():
+                        email_action = db.scalar(
+                            select(EmailActionRecord)
+                            .where(EmailActionRecord.id == email_action_id)
+                            .with_for_update()
+                            .limit(1)
+                        )
+                        if email_action is not None:
+                            email_action.before_state = {"messages": before_messages}
+                            email_action.provider_thread_ids = _email_thread_ids_from_state(
+                                email_action.before_state
+                            )
+                            stored_input = (
+                                email_action.intended_state
+                                if isinstance(email_action.intended_state, dict)
+                                else {}
+                            )
+                            email_action.intended_state = {
+                                **stored_input,
+                                "before_state": before_messages,
+                            }
+                            email_action.updated_at = now_fn()
+            email_provider_call = (
+                email_action_id,
+                capability_id,
+                normalized_input,
+                access_token,
+                granted_scopes,
+            )
+            execution_result = google_runtime.execute_provider_capability(
+                capability_id=capability_id,
+                normalized_input=normalized_input,
+                access_token=access_token,
+                granted_scopes=granted_scopes,
+            )
+        finally:
+            if lock_db is not None and lock_id is not None:
+                lock_db.execute(
+                    text("SELECT pg_advisory_unlock(:lock_id)"),
+                    {"lock_id": lock_id},
+                )
+                lock_db.commit()
+                lock_db.close()
+    elif provider_call is not None:
         capability_id, normalized_input, access_token, granted_scopes = provider_call
         assert google_runtime is not None
         execution_result = google_runtime.execute_provider_capability(
@@ -2114,18 +2853,169 @@ def process_action_execution_task(
                         ),
                         error=None,
                     )
-            if execution_result.status == "succeeded" and execution_result.output is not None:
+            if email_provider_call is not None:
+                email_action_id, capability_id, provider_input, _, _ = email_provider_call
+                email_action = db.scalar(
+                    select(EmailActionRecord)
+                    .where(EmailActionRecord.id == email_action_id)
+                    .with_for_update()
+                    .limit(1)
+                )
+                if email_action is None:
+                    raise RuntimeError("email action not found")
+                if execution_result.status == "succeeded" and execution_result.output is not None:
+                    try:
+                        before_state, after_state = _email_provider_state_lists(
+                            execution_result.output
+                        )
+                    except RuntimeError as exc:
+                        if str(exc) != "email_before_state_missing":
+                            raise
+                        captured_before_messages = provider_input.get("before_state")
+                        if not isinstance(captured_before_messages, list):
+                            raise
+                        before_state = {"messages": captured_before_messages}
+                        after_state_raw = execution_result.output.get("after_state")
+                        after_state = {
+                            "messages": after_state_raw if isinstance(after_state_raw, list) else []
+                        }
+                        provider_result_raw = execution_result.output.get("provider_result")
+                        if isinstance(provider_result_raw, dict):
+                            provider_result_raw["before_state_error"] = str(exc)
+                        else:
+                            execution_result.output["provider_result"] = {
+                                "before_state_error": str(exc)
+                            }
+                    email_action.before_state = before_state
+                    email_action.after_state = after_state
+                    provider_result_raw = execution_result.output.get("provider_result")
+                    provider_result: dict[str, Any] = (
+                        provider_result_raw
+                        if isinstance(provider_result_raw, dict)
+                        else execution_result.output
+                    )
+                    email_action.provider_result = provider_result
+                    message_ids_raw = provider_input.get("message_ids")
+                    email_action.provider_message_ids = (
+                        list(message_ids_raw) if isinstance(message_ids_raw, list) else []
+                    )
+                    email_action.provider_thread_ids = _email_thread_ids_from_state(before_state)
+                    for thread_id in _email_thread_ids_from_state(after_state):
+                        if thread_id not in email_action.provider_thread_ids:
+                            email_action.provider_thread_ids.append(thread_id)
+                    stored_intent = dict(provider_input)
+                    provider_label_ids = execution_result.output.get("provider_label_ids")
+                    if provider_label_ids is None:
+                        provider_label_ids = provider_result.get("provider_label_ids")
+                    if isinstance(provider_label_ids, dict):
+                        stored_intent["provider_label_ids"] = provider_label_ids
+                    label_resolution = execution_result.output.get("label_resolution")
+                    if isinstance(label_resolution, dict):
+                        stored_intent["label_resolution"] = label_resolution
+                    email_action.intended_state = stored_intent
+                    email_action.updated_at = now_fn()
+                    provider_status = execution_result.output.get("status")
+                    provider_error: str | None = None
+                    provider_error_raw = provider_result.get("error")
+                    if isinstance(provider_error_raw, str) and provider_error_raw:
+                        provider_error = provider_error_raw
+                    after_state_error_raw = provider_result.get("after_state_error")
+                    if (
+                        provider_error is None
+                        and isinstance(after_state_error_raw, str)
+                        and after_state_error_raw
+                    ):
+                        provider_error = after_state_error_raw
+                    if provider_error is None and provider_status in {
+                        "failed",
+                        "partially_failed",
+                    }:
+                        provider_error = str(provider_status)
+                    if provider_error is not None:
+                        if _email_provider_error_is_retryable(provider_error):
+                            email_action.status = "executing"
+                            email_action.failure_code = None
+                            retryable_provider_error = provider_error
+                        else:
+                            email_action.status = "failed"
+                            email_action.failure_code = provider_error
+                        execution_result = ExecutionResult(
+                            status="failed",
+                            output=None,
+                            error=provider_error,
+                        )
+                    else:
+                        email_action.status = "succeeded"
+                        email_action.failure_code = None
+                        undo_token: str | None = None
+                        if capability_id != "cap.email.undo":
+                            undo_token = secrets.token_urlsafe(32)
+                            email_action.undo_token_hash = _email_hash(undo_token)
+                            email_action.undo_expires_at = now_fn() + timedelta(days=30)
+                        elif email_undo_prior_action_id is not None:
+                            prior_action = db.scalar(
+                                select(EmailActionRecord)
+                                .where(EmailActionRecord.id == email_undo_prior_action_id)
+                                .with_for_update()
+                                .limit(1)
+                            )
+                            if prior_action is not None and prior_action.status == "succeeded":
+                                prior_action.status = "undone"
+                                prior_action.updated_at = now_fn()
+                        execution_result = ExecutionResult(
+                            status="succeeded",
+                            output=_email_action_result_payload(
+                                action=email_action,
+                                undo_token=undo_token,
+                                now=now_fn(),
+                            ),
+                            error=None,
+                        )
+                else:
+                    error = execution_result.error or "execution_output_missing"
+                    if (
+                        isinstance(execution_result, GoogleCapabilityExecutionResult)
+                        and execution_result.auth_failure is not None
+                    ):
+                        error = execution_result.auth_failure.failure_class
+                    if _email_provider_error_is_retryable(error):
+                        email_action.status = "executing"
+                        email_action.failure_code = None
+                        retryable_provider_error = error
+                    else:
+                        email_action.status = "failed"
+                        email_action.failure_code = error
+                    email_action.provider_result = {"error": error}
+                    email_action.updated_at = now_fn()
+            if retryable_provider_error is not None:
+                action_attempt.execution_error = retryable_provider_error
+                action_attempt.updated_at = now_fn()
+                _append_action_execution_event(
+                    db=db,
+                    action_attempt=action_attempt,
+                    event_type="evt.action.execution.retrying",
+                    payload_data={
+                        "action_attempt_id": action_attempt.id,
+                        "error": retryable_provider_error,
+                    },
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
+            elif execution_result.status == "succeeded" and execution_result.output is not None:
                 action_attempt.status = "succeeded"
                 action_attempt.execution_output = execution_result.output
                 action_attempt.execution_error = None
                 action_attempt.updated_at = now_fn()
+                event_output = dict(execution_result.output)
+                if "undo_token" in event_output:
+                    event_output["undo_token"] = "[redacted]"
                 _append_action_execution_event(
                     db=db,
                     action_attempt=action_attempt,
                     event_type="evt.action.execution.succeeded",
                     payload_data={
                         "action_attempt_id": action_attempt.id,
-                        "output": execution_result.output,
+                        "output": event_output,
                     },
                     now_fn=now_fn,
                     new_id_fn=new_id_fn,
@@ -2150,4 +3040,6 @@ def process_action_execution_task(
                     now_fn=now_fn,
                     new_id_fn=new_id_fn,
                 )
+    if retryable_provider_error is not None:
+        raise RuntimeError(retryable_provider_error)
     return True

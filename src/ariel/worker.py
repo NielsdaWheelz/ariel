@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -21,11 +22,13 @@ from .persistence import (
     AgencyEventRecord,
     BackgroundTaskRecord,
     ConnectorSubscriptionRecord,
+    EmailThreadWatchRecord,
     JobEventRecord,
     JobRecord,
     NotificationDeliveryRecord,
     NotificationRecord,
     SessionRecord,
+    SyncCursorRecord,
 )
 from .memory import process_memory_extract_turn, process_memory_projection_job
 from .proactivity import (
@@ -37,7 +40,11 @@ from .proactivity import (
     process_ambient_interpretation_due,
 )
 from .redaction import safe_failure_reason
-from .sync_runtime import process_provider_event_received, process_provider_sync_due
+from .sync_runtime import (
+    emit_email_thread_watch_signal,
+    process_provider_event_received,
+    process_provider_sync_due,
+)
 
 
 PROACTIVE_RECOVERABLE_TASK_TYPES = (
@@ -59,6 +66,65 @@ def _utcnow() -> datetime:
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}_{ulid.new().str.lower()}"
+
+
+def process_due_email_thread_watches(
+    *,
+    session_factory: sessionmaker[Session],
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> int:
+    now = now_fn()
+    with session_factory() as db:
+        with db.begin():
+            pending_provider_sync_task_id = db.scalar(
+                select(BackgroundTaskRecord.id)
+                .where(
+                    BackgroundTaskRecord.status.in_(("pending", "running")),
+                    BackgroundTaskRecord.run_after <= now,
+                    BackgroundTaskRecord.task_type.in_(
+                        ("provider_event_received", "provider_sync_due")
+                    ),
+                )
+                .order_by(BackgroundTaskRecord.run_after.asc(), BackgroundTaskRecord.id.asc())
+                .limit(1)
+            )
+            syncing_gmail_cursor_id = db.scalar(
+                select(SyncCursorRecord.id)
+                .where(
+                    SyncCursorRecord.provider == "google",
+                    SyncCursorRecord.resource_type == "gmail",
+                    SyncCursorRecord.status == "syncing",
+                )
+                .limit(1)
+            )
+            if pending_provider_sync_task_id is not None or syncing_gmail_cursor_id is not None:
+                return 0
+
+            watches = db.scalars(
+                select(EmailThreadWatchRecord)
+                .where(
+                    EmailThreadWatchRecord.status == "active",
+                    EmailThreadWatchRecord.deadline <= now,
+                )
+                .with_for_update()
+                .order_by(EmailThreadWatchRecord.deadline.asc(), EmailThreadWatchRecord.id.asc())
+                .limit(100)
+            ).all()
+            for watch in watches:
+                if watch.condition == "no_reply_by_deadline":
+                    watch.status = "due"
+                    emit_email_thread_watch_signal(
+                        db,
+                        watch=watch,
+                        signal_type="email_thread_watch_due",
+                        now=now,
+                        new_id_fn=new_id_fn,
+                    )
+                else:
+                    watch.status = "failed"
+                watch.updated_at = now
+            return len(watches)
 
 
 def enqueue_background_task(
@@ -241,6 +307,17 @@ def process_one_task(
                 now=now,
                 heartbeat_timeout_seconds=resolved_settings.worker_heartbeat_timeout_seconds,
             )
+
+    if process_due_email_thread_watches(
+        session_factory=session_factory,
+        now_fn=_utcnow,
+        new_id_fn=_new_id,
+    ):
+        return True
+
+    with session_factory() as db:
+        with db.begin():
+            now = _utcnow()
             enqueue_due_worker_owned_ambient_task(db, settings=resolved_settings, now=now)
 
     if process_memory_projection_job(
@@ -416,7 +493,12 @@ def run_worker(
 
 def main() -> None:
     settings = AppSettings()
-    engine = create_engine(settings.database_url, future=True, pool_pre_ping=True)
+    engine = create_engine(
+        settings.database_url,
+        future=True,
+        pool_pre_ping=True,
+        isolation_level="SERIALIZABLE",
+    )
     try:
         run_worker(
             session_factory=sessionmaker(bind=engine, future=True, expire_on_commit=False),

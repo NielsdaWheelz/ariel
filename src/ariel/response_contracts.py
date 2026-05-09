@@ -795,6 +795,60 @@ class SurfaceSyncRunContract(BaseModel):
     created_at: str
 
 
+class SurfaceEmailActionContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    provider: Literal["google"]
+    provider_account_id: str
+    action_attempt_id: str
+    capability_id: Literal[
+        "cap.email.archive",
+        "cap.email.trash",
+        "cap.email.labels.modify",
+        "cap.email.undo",
+    ]
+    input_hash: str
+    idempotency_key: str
+    status: Literal["pending", "executing", "succeeded", "failed", "undone"]
+    approval_id: str | None
+    provider_message_ids: list[str]
+    provider_thread_ids: list[str]
+    before_state: dict[str, Any]
+    intended_state: dict[str, Any]
+    after_state: dict[str, Any]
+    provider_result: dict[str, Any]
+    undo_available: bool
+    undo_expires_at: str | None
+    execution_attempts: int
+    failure_code: str | None
+    created_at: str
+    updated_at: str
+
+
+class SurfaceEmailThreadWatchContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    provider: Literal["google"]
+    provider_account_id: str
+    provider_thread_id: str
+    anchor_message_id: str
+    condition: Literal["no_reply_by_deadline", "any_reply_arrives"]
+    deadline: str
+    note: str
+    idempotency_key: str
+    cancel_idempotency_key: str | None
+    status: Literal["active", "due", "completed", "canceled", "failed"]
+    created_by_action_attempt_id: str
+    matched_message_id: str | None
+    matched_at: str | None
+    canceled_at: str | None
+    completed_at: str | None
+    created_at: str
+    updated_at: str
+
+
 class SurfaceWorkspaceItemContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1055,6 +1109,34 @@ class SurfaceSyncRunListResponseContract(BaseModel):
 
     ok: bool
     sync_runs: list[SurfaceSyncRunContract]
+
+
+class SurfaceEmailActionListResponseContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    email_actions: list[SurfaceEmailActionContract]
+
+
+class SurfaceEmailActionResponseContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    email_action: SurfaceEmailActionContract
+
+
+class SurfaceEmailThreadWatchListResponseContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    email_thread_watches: list[SurfaceEmailThreadWatchContract]
+
+
+class SurfaceEmailThreadWatchResponseContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    email_thread_watch: SurfaceEmailThreadWatchContract
 
 
 class SurfaceWorkspaceItemListResponseContract(BaseModel):
@@ -1727,6 +1809,44 @@ def build_surface_sync_run_list_response(*, sync_runs: Any) -> dict[str, Any]:
             "ok": True,
             "sync_runs": sync_runs if isinstance(sync_runs, list) else [],
         },
+    )
+
+
+def build_surface_email_action_list_response(*, email_actions: Any) -> dict[str, Any]:
+    return _validate_contract(
+        "surface_email_action_list_response",
+        SurfaceEmailActionListResponseContract,
+        {"ok": True, "email_actions": email_actions},
+    )
+
+
+def build_surface_email_action_response(*, email_action: Any) -> dict[str, Any]:
+    return _validate_contract(
+        "surface_email_action_response",
+        SurfaceEmailActionResponseContract,
+        {"ok": True, "email_action": email_action},
+    )
+
+
+def build_surface_email_thread_watch_list_response(
+    *,
+    email_thread_watches: Any,
+) -> dict[str, Any]:
+    return _validate_contract(
+        "surface_email_thread_watch_list_response",
+        SurfaceEmailThreadWatchListResponseContract,
+        {"ok": True, "email_thread_watches": email_thread_watches},
+    )
+
+
+def build_surface_email_thread_watch_response(
+    *,
+    email_thread_watch: Any,
+) -> dict[str, Any]:
+    return _validate_contract(
+        "surface_email_thread_watch_response",
+        SurfaceEmailThreadWatchResponseContract,
+        {"ok": True, "email_thread_watch": email_thread_watch},
     )
 
 

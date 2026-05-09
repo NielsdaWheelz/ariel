@@ -364,3 +364,318 @@ def test_default_workspace_provider_distinguishes_scope_vs_acl_forbidden(
             access_token="tok_live",
             normalized_input={"file_id": "drv_acl_scope"},
         )
+
+
+class _FakeGmailMailbox:
+    def __init__(
+        self,
+        *,
+        labels_by_message_id: dict[str, list[str]],
+        fail_trash_message_id: str | None = None,
+    ) -> None:
+        self.labels_by_message_id = {
+            message_id: list(label_ids) for message_id, label_ids in labels_by_message_id.items()
+        }
+        self.fail_trash_message_id = fail_trash_message_id
+        self.calls: list[dict[str, Any]] = []
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+        json: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        del headers, timeout
+        self.calls.append(
+            {
+                "method": method,
+                "url": url,
+                "params": params or {},
+                "json": json or {},
+            }
+        )
+        request = httpx.Request(method, url)
+        if method == "GET" and url.endswith("/labels"):
+            return httpx.Response(
+                200,
+                json={
+                    "labels": [
+                        {"id": "Label_Client", "name": "Client"},
+                        {"id": "Label_Old", "name": "Old"},
+                    ]
+                },
+                request=request,
+            )
+        if method == "GET" and "/messages/" in url:
+            message_id = url.rsplit("/messages/", 1)[1]
+            return self._message_response(message_id=message_id, request=request)
+        if method == "POST" and url.endswith("/batchModify"):
+            payload = json or {}
+            for message_id in payload.get("ids", []):
+                self._apply_labels(
+                    message_id=str(message_id),
+                    add_label_ids=payload.get("addLabelIds", []),
+                    remove_label_ids=payload.get("removeLabelIds", []),
+                )
+            return httpx.Response(204, request=request)
+        if method == "POST" and url.endswith("/modify"):
+            message_id = url.rsplit("/messages/", 1)[1].split("/", 1)[0]
+            payload = json or {}
+            self._apply_labels(
+                message_id=message_id,
+                add_label_ids=payload.get("addLabelIds", []),
+                remove_label_ids=payload.get("removeLabelIds", []),
+            )
+            return self._message_response(message_id=message_id, request=request)
+        if method == "POST" and url.endswith("/trash"):
+            message_id = url.rsplit("/messages/", 1)[1].split("/", 1)[0]
+            if message_id == self.fail_trash_message_id:
+                return httpx.Response(
+                    500,
+                    json={"error": {"message": "trash failed"}},
+                    request=request,
+                )
+            self._apply_labels(
+                message_id=message_id,
+                add_label_ids=["TRASH"],
+                remove_label_ids=["INBOX"],
+            )
+            return self._message_response(message_id=message_id, request=request)
+        if method == "POST" and url.endswith("/untrash"):
+            message_id = url.rsplit("/messages/", 1)[1].split("/", 1)[0]
+            self._apply_labels(
+                message_id=message_id,
+                add_label_ids=[],
+                remove_label_ids=["TRASH"],
+            )
+            return self._message_response(message_id=message_id, request=request)
+        return httpx.Response(404, json={"error": {"message": "not found"}}, request=request)
+
+    def _message_response(self, *, message_id: str, request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": message_id,
+                "threadId": f"thr_{message_id}",
+                "labelIds": self.labels_by_message_id.get(message_id, []),
+            },
+            request=request,
+        )
+
+    def _apply_labels(
+        self,
+        *,
+        message_id: str,
+        add_label_ids: list[str],
+        remove_label_ids: list[str],
+    ) -> None:
+        label_ids = set(self.labels_by_message_id.get(message_id, []))
+        label_ids.update(add_label_ids)
+        label_ids.difference_update(remove_label_ids)
+        self.labels_by_message_id[message_id] = sorted(label_ids)
+
+
+def test_default_workspace_provider_email_archive_preserves_before_and_after_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mailbox = _FakeGmailMailbox(
+        labels_by_message_id={
+            "msg_inbox": ["INBOX", "Label_Client"],
+            "msg_done": ["Label_Client"],
+        }
+    )
+    monkeypatch.setattr(httpx, "request", mailbox.request)
+    provider = DefaultGoogleWorkspaceProvider(timeout_seconds=5.0, max_attempts=1)
+
+    output = provider.email_archive(
+        access_token="tok_live",
+        normalized_input={"message_ids": ["msg_inbox", "msg_done"]},
+    )
+
+    assert output["status"] == "archived"
+    assert output["before_labels"]["msg_inbox"] == ["INBOX", "Label_Client"]
+    assert output["after_labels"]["msg_inbox"] == ["Label_Client"]
+    assert output["provider_result"]["mutated_message_ids"] == ["msg_inbox"]
+    assert output["provider_result"]["noop_message_ids"] == ["msg_done"]
+
+
+def test_default_workspace_provider_email_archive_uses_supplied_before_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mailbox = _FakeGmailMailbox(labels_by_message_id={"msg_1": ["INBOX"]})
+    monkeypatch.setattr(httpx, "request", mailbox.request)
+    provider = DefaultGoogleWorkspaceProvider(timeout_seconds=5.0, max_attempts=1)
+
+    output = provider.email_archive(
+        access_token="tok_live",
+        normalized_input={
+            "message_ids": ["msg_1"],
+            "before_state": [
+                {
+                    "message_id": "msg_1",
+                    "thread_id": "thr_original",
+                    "label_ids": ["INBOX", "Label_Client"],
+                }
+            ],
+        },
+    )
+
+    message_get_calls = [
+        call for call in mailbox.calls if call["method"] == "GET" and "/messages/" in call["url"]
+    ]
+    assert len(message_get_calls) == 1
+    assert output["before_labels"]["msg_1"] == ["INBOX", "Label_Client"]
+    assert output["after_labels"]["msg_1"] == []
+
+
+def test_default_workspace_provider_email_trash_uses_trash_not_permanent_delete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mailbox = _FakeGmailMailbox(labels_by_message_id={"msg_1": ["INBOX"]})
+    monkeypatch.setattr(httpx, "request", mailbox.request)
+    provider = DefaultGoogleWorkspaceProvider(timeout_seconds=5.0, max_attempts=1)
+
+    output = provider.email_trash(
+        access_token="tok_live",
+        normalized_input={"message_ids": ["msg_1"]},
+    )
+
+    assert output["status"] == "trashed"
+    assert output["after_labels"]["msg_1"] == ["TRASH"]
+    assert any(call["url"].endswith("/trash") for call in mailbox.calls)
+    assert all(call["method"] != "DELETE" for call in mailbox.calls)
+    assert all("/delete" not in call["url"] for call in mailbox.calls)
+
+
+def test_default_workspace_provider_email_trash_partial_failure_keeps_audit_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mailbox = _FakeGmailMailbox(
+        labels_by_message_id={
+            "msg_ok": ["INBOX"],
+            "msg_fail": ["INBOX"],
+        },
+        fail_trash_message_id="msg_fail",
+    )
+    monkeypatch.setattr(httpx, "request", mailbox.request)
+    provider = DefaultGoogleWorkspaceProvider(timeout_seconds=5.0, max_attempts=1)
+
+    output = provider.email_trash(
+        access_token="tok_live",
+        normalized_input={"message_ids": ["msg_ok", "msg_fail"]},
+    )
+
+    assert output["status"] == "partially_failed"
+    assert output["before_labels"]["msg_ok"] == ["INBOX"]
+    assert output["before_labels"]["msg_fail"] == ["INBOX"]
+    assert output["after_labels"]["msg_ok"] == ["TRASH"]
+    assert output["after_labels"]["msg_fail"] == ["INBOX"]
+    assert output["provider_result"]["mutated_message_ids"] == ["msg_ok"]
+    assert output["provider_result"]["failed_provider_call"]["message_id"] == "msg_fail"
+    assert output["provider_result"]["error"] == "google_upstream_500"
+
+
+def test_default_workspace_provider_email_labels_modify_reuses_provider_label_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mailbox = _FakeGmailMailbox(labels_by_message_id={"msg_1": ["INBOX", "Label_Old"]})
+    monkeypatch.setattr(httpx, "request", mailbox.request)
+    provider = DefaultGoogleWorkspaceProvider(timeout_seconds=5.0, max_attempts=1)
+
+    output = provider.email_modify_labels(
+        access_token="tok_live",
+        normalized_input={
+            "message_ids": ["msg_1"],
+            "add_labels": ["Client"],
+            "remove_labels": ["Old"],
+            "provider_label_ids": {
+                "add": ["Label_Client"],
+                "remove": ["Label_Old"],
+            },
+        },
+    )
+
+    assert output["status"] == "labels_modified"
+    assert output["after_labels"]["msg_1"] == ["INBOX", "Label_Client"]
+    assert output["provider_label_ids"] == {
+        "add": ["Label_Client"],
+        "remove": ["Label_Old"],
+    }
+    assert not any(call["url"].endswith("/labels") for call in mailbox.calls)
+
+
+def test_default_workspace_provider_email_labels_modify_rejects_immutable_system_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mailbox = _FakeGmailMailbox(labels_by_message_id={"msg_1": ["INBOX"]})
+    monkeypatch.setattr(httpx, "request", mailbox.request)
+    provider = DefaultGoogleWorkspaceProvider(timeout_seconds=5.0, max_attempts=1)
+
+    with pytest.raises(RuntimeError, match="system_label_requires_dedicated_capability"):
+        provider.email_modify_labels(
+            access_token="tok_live",
+            normalized_input={
+                "message_ids": ["msg_1"],
+                "add_labels": ["SENT"],
+                "remove_labels": [],
+            },
+        )
+
+    assert not any(call["url"].endswith("/modify") for call in mailbox.calls)
+
+
+def test_default_workspace_provider_email_labels_modify_allows_modifiable_system_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mailbox = _FakeGmailMailbox(labels_by_message_id={"msg_1": ["INBOX"]})
+    monkeypatch.setattr(httpx, "request", mailbox.request)
+    provider = DefaultGoogleWorkspaceProvider(timeout_seconds=5.0, max_attempts=1)
+
+    output = provider.email_modify_labels(
+        access_token="tok_live",
+        normalized_input={
+            "message_ids": ["msg_1"],
+            "add_labels": ["STARRED"],
+            "remove_labels": [],
+        },
+    )
+
+    assert output["status"] == "labels_modified"
+    assert output["after_labels"]["msg_1"] == ["INBOX", "STARRED"]
+
+
+def test_default_workspace_provider_email_undo_skips_immutable_system_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mailbox = _FakeGmailMailbox(labels_by_message_id={"msg_1": ["INBOX", "Label_Old"]})
+    monkeypatch.setattr(httpx, "request", mailbox.request)
+    provider = DefaultGoogleWorkspaceProvider(timeout_seconds=5.0, max_attempts=1)
+
+    output = provider.email_undo(
+        access_token="tok_live",
+        normalized_input={
+            "message_ids": ["msg_1"],
+            "before_state": [
+                {
+                    "message_id": "msg_1",
+                    "thread_id": "thr_msg_1",
+                    "label_ids": ["DRAFT", "INBOX", "Label_Client", "SENT"],
+                }
+            ],
+        },
+    )
+
+    modify_calls = [call for call in mailbox.calls if call["url"].endswith("/modify")]
+    assert output["status"] == "partially_failed"
+    assert len(modify_calls) == 1
+    assert modify_calls[0]["json"] == {
+        "addLabelIds": ["Label_Client"],
+        "removeLabelIds": ["Label_Old"],
+    }
+    assert output["provider_result"]["skipped_immutable_label_ids"] == {"msg_1": ["DRAFT", "SENT"]}
+    assert output["provider_result"]["restored_message_ids"] == []
+    assert output["provider_result"]["error"] == "immutable_label_restore_unsupported"

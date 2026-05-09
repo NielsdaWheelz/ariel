@@ -82,6 +82,8 @@ from ariel.persistence import (
     ArtifactRecord,
     CaptureRecord,
     ConnectorSubscriptionRecord,
+    EmailActionRecord,
+    EmailThreadWatchRecord,
     EventRecord,
     JobEventRecord,
     JobRecord,
@@ -114,6 +116,8 @@ from ariel.persistence import (
     serialize_capture,
     serialize_connector_subscription,
     serialize_action_attempt,
+    serialize_email_action,
+    serialize_email_thread_watch,
     serialize_job,
     serialize_job_event,
     serialize_notification,
@@ -147,6 +151,10 @@ from ariel.response_contracts import (
     build_surface_capture_failure_response,
     build_surface_capture_success_response,
     build_surface_connector_subscription_list_response,
+    build_surface_email_action_list_response,
+    build_surface_email_action_response,
+    build_surface_email_thread_watch_list_response,
+    build_surface_email_thread_watch_response,
     build_surface_memory_response,
     build_surface_memory_search_response,
     build_surface_message_response,
@@ -2529,7 +2537,12 @@ def create_app(
         timeout_seconds=settings.model_timeout_seconds,
     )
 
-    engine = create_engine(db_url, future=True, pool_pre_ping=True)
+    engine = create_engine(
+        db_url,
+        future=True,
+        pool_pre_ping=True,
+        isolation_level="SERIALIZABLE",
+    )
     session_factory = sessionmaker(bind=engine, future=True, expire_on_commit=False)
 
     @asynccontextmanager
@@ -2638,6 +2651,8 @@ def create_app(
                 "agency_events": "/v1/agency/events",
                 "provider_events": "/v1/provider-events",
                 "sync_runs": "/v1/sync-runs",
+                "email_actions": "/v1/email/actions",
+                "email_thread_watches": "/v1/email/thread-watches",
                 "workspace_items": "/v1/workspace-items",
                 "proactive_observations": "/v1/proactive/observations",
                 "proactive_cases": "/v1/proactive/cases",
@@ -6179,6 +6194,129 @@ def create_app(
                 try:
                     return build_surface_sync_run_list_response(
                         sync_runs=[serialize_sync_run(sync_run) for sync_run in sync_runs]
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/email/actions")
+    def get_email_actions(
+        provider_account_id: str,
+        provider: Literal["google"] = "google",
+        status: Literal["pending", "executing", "succeeded", "failed", "undone"] | None = None,
+        action_attempt_id: str | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 200))
+        with session_factory() as db:
+            with db.begin():
+                query = select(EmailActionRecord)
+                query = query.where(
+                    EmailActionRecord.provider == provider,
+                    EmailActionRecord.provider_account_id == provider_account_id,
+                )
+                if status is not None:
+                    query = query.where(EmailActionRecord.status == status)
+                if action_attempt_id is not None:
+                    query = query.where(EmailActionRecord.action_attempt_id == action_attempt_id)
+                actions = db.scalars(
+                    query.order_by(
+                        EmailActionRecord.created_at.desc(),
+                        EmailActionRecord.id.desc(),
+                    ).limit(bounded_limit)
+                ).all()
+                try:
+                    return build_surface_email_action_list_response(
+                        email_actions=[serialize_email_action(action) for action in actions]
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/email/actions/{email_action_id}")
+    def get_email_action(email_action_id: str, provider_account_id: str) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                action = db.scalar(
+                    select(EmailActionRecord)
+                    .where(
+                        EmailActionRecord.id == email_action_id,
+                        EmailActionRecord.provider_account_id == provider_account_id,
+                    )
+                    .limit(1)
+                )
+                if action is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_EMAIL_ACTION_NOT_FOUND",
+                        message="email action not found",
+                        details={"email_action_id": email_action_id},
+                        retryable=False,
+                    )
+                try:
+                    return build_surface_email_action_response(
+                        email_action=serialize_email_action(action)
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/email/thread-watches")
+    def get_email_thread_watches(
+        provider_account_id: str,
+        provider: Literal["google"] = "google",
+        status: Literal["active", "due", "completed", "canceled", "failed"] | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 200))
+        with session_factory() as db:
+            with db.begin():
+                query = select(EmailThreadWatchRecord)
+                query = query.where(
+                    EmailThreadWatchRecord.provider == provider,
+                    EmailThreadWatchRecord.provider_account_id == provider_account_id,
+                )
+                if status is not None:
+                    query = query.where(EmailThreadWatchRecord.status == status)
+                watches = db.scalars(
+                    query.order_by(
+                        EmailThreadWatchRecord.created_at.desc(),
+                        EmailThreadWatchRecord.id.desc(),
+                    ).limit(bounded_limit)
+                ).all()
+                try:
+                    return build_surface_email_thread_watch_list_response(
+                        email_thread_watches=[
+                            serialize_email_thread_watch(watch) for watch in watches
+                        ]
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/email/thread-watches/{watch_id}")
+    def get_email_thread_watch(watch_id: str, provider_account_id: str) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                watch = db.scalar(
+                    select(EmailThreadWatchRecord)
+                    .where(
+                        EmailThreadWatchRecord.id == watch_id,
+                        EmailThreadWatchRecord.provider_account_id == provider_account_id,
+                    )
+                    .limit(1)
+                )
+                if watch is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_EMAIL_THREAD_WATCH_NOT_FOUND",
+                        message="email thread watch not found",
+                        details={"watch_id": watch_id},
+                        retryable=False,
+                    )
+                try:
+                    return build_surface_email_thread_watch_response(
+                        email_thread_watch=serialize_email_thread_watch(watch)
                     )
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
