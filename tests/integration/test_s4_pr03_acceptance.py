@@ -3,17 +3,13 @@ from __future__ import annotations
 import copy
 from collections.abc import Generator
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from typing import Any, cast
 
 from fastapi.testclient import TestClient
 import pytest
 from testcontainers.postgres import PostgresContainer
-import ulid
 
-from ariel.action_runtime import process_action_execution_task
 from ariel.app import ModelAdapter, create_app
-from ariel.google_connector import GoogleConnectorRuntime
 from tests.integration.responses_helpers import responses_with_function_calls
 
 
@@ -42,7 +38,23 @@ class ActionProposalAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         del tools, history, context_bundle
-        proposals = self.proposals_by_message.get(user_message, [])
+        proposals = copy.deepcopy(self.proposals_by_message.get(user_message, []))
+        current_turn_ref = None
+        for item in input_items:
+            content = item.get("content")
+            if not isinstance(content, str):
+                continue
+            for line in content.splitlines():
+                if line.startswith("- current user instruction: "):
+                    current_turn_ref = line.removeprefix("- current user instruction: ").strip()
+        for proposal in proposals:
+            input_payload = proposal.get("input")
+            if (
+                current_turn_ref is not None
+                and isinstance(input_payload, dict)
+                and input_payload.get("user_instruction_ref") == "turn:current"
+            ):
+                input_payload["user_instruction_ref"] = current_turn_ref
         assistant_text = self.assistant_text_by_message.get(
             user_message,
             f"assistant::{user_message}",
@@ -50,7 +62,7 @@ class ActionProposalAdapter:
         return responses_with_function_calls(
             input_items=input_items,
             assistant_text=assistant_text,
-            proposals=copy.deepcopy(proposals),
+            proposals=proposals,
             provider=self.provider,
             model=self.model,
             provider_response_id="resp_s4_pr03_123",
@@ -149,12 +161,31 @@ class FakeGoogleWorkspaceProvider:
     ) -> dict[str, Any]:
         del access_token
         return {
-            "results": [
+            "schema_version": "google.calendar.events.v1",
+            "events": [
                 {
-                    "title": "team sync",
-                    "source": "calendar://primary",
-                    "snippet": "today 10:00-10:30 team sync",
-                    "published_at": None,
+                    "provider_account_id": "google",
+                    "calendar_id": "primary",
+                    "event_id": "evt-team-sync",
+                    "status": "confirmed",
+                    "summary": "team sync",
+                    "description_blocks": [],
+                    "attendees": [],
+                    "start": {
+                        "value": "2026-03-04T10:00:00Z",
+                        "timezone": "UTC",
+                        "all_day": False,
+                    },
+                    "end": {
+                        "value": "2026-03-04T10:30:00Z",
+                        "timezone": "UTC",
+                        "all_day": False,
+                    },
+                    "all_day": False,
+                    "recurrence": [],
+                    "updated": "2026-03-03T09:00:00Z",
+                    "provider_url": "https://calendar.google.com/event?eid=evt-team-sync",
+                    "raw_payload_digest": "c" * 64,
                 }
             ],
             "retrieved_at": "2026-03-03T12:00:00Z",
@@ -173,34 +204,72 @@ class FakeGoogleWorkspaceProvider:
         attendees = normalized_input.get("attendees", [])
         if attendee_intersection_enabled:
             return {
-                "results": [
+                "schema_version": "google.calendar.slot_options.v1",
+                "slots": [
                     {
-                        "title": "slot option 1",
-                        "source": "calendar://availability",
-                        "snippet": "wed 10:30-11:00 works for all attendees",
-                        "published_at": None,
+                        "slot_id": "slot_1",
+                        "start": {
+                            "value": "2026-03-04T10:30:00Z",
+                            "timezone": "UTC",
+                            "all_day": False,
+                        },
+                        "end": {
+                            "value": "2026-03-04T11:00:00Z",
+                            "timezone": "UTC",
+                            "all_day": False,
+                        },
+                        "availability_scope": "all_attendees",
+                        "partial": False,
                     }
                 ],
                 "retrieved_at": "2026-03-03T12:00:00Z",
+                "window_start": normalized_input["window_start"],
+                "window_end": normalized_input["window_end"],
+                "duration_minutes": normalized_input["duration_minutes"],
                 "attendees_considered": attendees,
-                "attendee_intersection_used": True,
-                "attendee_recovery_hint": None,
+                "availability_scope": "all_attendees",
+                "partial": False,
+                "partial_reason": None,
+                "timezone": "UTC",
+                "source_evidence_refs": [],
+                "constraints_used": {},
+                "freebusy_diagnostics": [],
+                "no_slots_reason": None,
             }
         return {
-            "results": [
+            "schema_version": "google.calendar.slot_options.v1",
+            "slots": [
                 {
-                    "title": "slot option 1",
-                    "source": "calendar://availability",
-                    "snippet": "wed 09:30-10:00 available on your calendar only",
-                    "published_at": None,
+                    "slot_id": "slot_1",
+                    "start": {
+                        "value": "2026-03-04T09:30:00Z",
+                        "timezone": "UTC",
+                        "all_day": False,
+                    },
+                    "end": {
+                        "value": "2026-03-04T10:00:00Z",
+                        "timezone": "UTC",
+                        "all_day": False,
+                    },
+                    "availability_scope": "primary_calendar_only",
+                    "partial": True,
                 }
             ],
             "retrieved_at": "2026-03-03T12:00:00Z",
+            "window_start": normalized_input["window_start"],
+            "window_end": normalized_input["window_end"],
+            "duration_minutes": normalized_input["duration_minutes"],
             "attendees_considered": attendees,
-            "attendee_intersection_used": False,
-            "attendee_recovery_hint": (
-                "Reconnect Google and grant attendee free/busy scope to include attendee intersection."
-            ),
+            "availability_scope": "primary_calendar_only",
+            "partial": True,
+            "partial_reason": "attendee_freebusy_scope_missing",
+            "timezone": "UTC",
+            "source_evidence_refs": [],
+            "constraints_used": {},
+            "freebusy_diagnostics": [
+                {"calendar_id": "attendees", "reason_code": "freebusy_scope_missing"}
+            ],
+            "no_slots_reason": None,
         }
 
     def email_search(
@@ -211,7 +280,8 @@ class FakeGoogleWorkspaceProvider:
     ) -> dict[str, Any]:
         del access_token, normalized_input
         return {
-            "results": [],
+            "schema_version": "google.gmail.message_refs.v1",
+            "messages": [],
             "retrieved_at": "2026-03-03T12:00:00Z",
         }
 
@@ -223,7 +293,22 @@ class FakeGoogleWorkspaceProvider:
     ) -> dict[str, Any]:
         del access_token, normalized_input
         return {
-            "results": [],
+            "schema_version": "google.gmail.message_evidence.v1",
+            "message": {"message_id": "msg-1"},
+            "evidence": {
+                "source_kind": "gmail_message",
+                "message_id": "msg-1",
+                "body_digest": "f" * 64,
+                "blocks": [
+                    {
+                        "block_id": "gmail:msg-1:body:0",
+                        "kind": "body",
+                        "text": "message evidence",
+                        "digest": "a" * 64,
+                    }
+                ],
+            },
+            "read_outcome": {"status": "ok", "reason_code": None, "recovery": None},
             "retrieved_at": "2026-03-03T12:00:00Z",
         }
 
@@ -265,12 +350,19 @@ class FakeGoogleWorkspaceProvider:
         if "cap.calendar.create_event" in self.fail_scope_missing_for:
             raise RuntimeError("insufficient_permissions")
         return {
+            "schema_version": "google.calendar.create_result.v1",
             "status": "created",
             "event_id": "evt_1",
+            "calendar_id": "primary",
             "title": "event",
             "start_time": "2026-03-04T10:00:00Z",
             "end_time": "2026-03-04T10:30:00Z",
             "provider_event_ref": "calendar://evt_1",
+            "etag": "etag_evt_1",
+            "updated": "2026-03-03T12:00:00Z",
+            "ical_uid": "evt_1@google.com",
+            "provider_status": "confirmed",
+            "executed_at": "2026-03-03T12:00:01Z",
         }
 
 
@@ -316,32 +408,13 @@ def _surface_attempt(turn_payload: dict[str, Any], *, proposal_index: int = 1) -
     return item
 
 
-def _new_id(prefix: str) -> str:
-    return f"{prefix}_{ulid.new().str.lower()}"
-
-
-def _run_queued_action(client: TestClient, action_attempt_id: str) -> None:
-    app_state = cast(Any, client.app).state
-    process_action_execution_task(
-        session_factory=app_state.session_factory,
-        action_attempt_id=action_attempt_id,
-        google_runtime=GoogleConnectorRuntime(
-            oauth_client=app_state.google_oauth_client,
-            workspace_provider=app_state.google_workspace_provider,
-            redirect_uri=str(app_state.google_oauth_redirect_uri),
-            oauth_state_ttl_seconds=int(app_state.google_oauth_state_ttl_seconds),
-            encryption_secret=str(app_state.connector_encryption_secret),
-            encryption_key_version=str(app_state.connector_encryption_key_version),
-            encryption_keys=(
-                str(app_state.connector_encryption_keys)
-                if app_state.connector_encryption_keys is not None
-                else None
-            ),
-        ),
-        agency_runtime=None,
-        now_fn=lambda: datetime.now(tz=UTC),
-        new_id_fn=_new_id,
-    )
+def _approval_ref(turn_payload: dict[str, Any], *, proposal_index: int = 1) -> str:
+    attempt = _surface_attempt(turn_payload, proposal_index=proposal_index)
+    approval = attempt.get("approval")
+    assert isinstance(approval, dict)
+    ref = approval.get("reference")
+    assert isinstance(ref, str)
+    return ref
 
 
 def _connect_google(client: TestClient, *, code: str) -> dict[str, Any]:
@@ -382,6 +455,8 @@ def test_s4_pr03_blocking_auth_failures_remap_readiness_to_reconnect_required(
                         "to": ["ops@example.com"],
                         "subject": "status",
                         "body": "hello",
+                        "idempotency_key": "draft-follow-up-1",
+                        "user_instruction_ref": "turn:current",
                     },
                 }
             ]
@@ -438,9 +513,18 @@ def test_s4_pr03_blocking_auth_failures_remap_readiness_to_reconnect_required(
             f"/v1/sessions/{session_id}/message", json={"message": "draft follow-up"}
         )
         assert sent.status_code == 200
-        attempt = _surface_attempt(sent.json()["turn"])
-        assert attempt["execution"]["status"] == "in_progress"
-        _run_queued_action(client, attempt["action_attempt_id"])
+        turn = sent.json()["turn"]
+        attempt = _surface_attempt(turn)
+        assert attempt["approval"]["status"] == "pending"
+        approved = client.post(
+            "/v1/approvals",
+            json={
+                "approval_ref": _approval_ref(turn),
+                "decision": "approve",
+                "actor_id": "user.local",
+            },
+        )
+        assert approved.status_code == 200
 
         timeline = client.get(f"/v1/sessions/{session_id}/events")
         assert timeline.status_code == 200
@@ -511,6 +595,8 @@ def test_s4_pr03_reconnect_required_persists_until_successful_reconnect(
                         "to": ["ops@example.com"],
                         "subject": "status",
                         "body": "hello",
+                        "idempotency_key": "draft-follow-up-1",
+                        "user_instruction_ref": "turn:current",
                     },
                 }
             ],
@@ -560,9 +646,18 @@ def test_s4_pr03_reconnect_required_persists_until_successful_reconnect(
             f"/v1/sessions/{session_id}/message", json={"message": "draft follow-up"}
         )
         assert first.status_code == 200
-        first_attempt = _surface_attempt(first.json()["turn"])
-        assert first_attempt["execution"]["status"] == "in_progress"
-        _run_queued_action(client, first_attempt["action_attempt_id"])
+        first_turn = first.json()["turn"]
+        first_attempt = _surface_attempt(first_turn)
+        assert first_attempt["approval"]["status"] == "pending"
+        first_approved = client.post(
+            "/v1/approvals",
+            json={
+                "approval_ref": _approval_ref(first_turn),
+                "decision": "approve",
+                "actor_id": "user.local",
+            },
+        )
+        assert first_approved.status_code == 200
 
         timeline = client.get(f"/v1/sessions/{session_id}/events")
         assert timeline.status_code == 200
@@ -617,6 +712,8 @@ def test_s4_pr03_blocking_readiness_state_is_not_downgraded_by_later_transient_f
                         "to": ["ops@example.com"],
                         "subject": "status",
                         "body": "hello",
+                        "idempotency_key": "draft-follow-up-1",
+                        "user_instruction_ref": "turn:current",
                     },
                 }
             ],
@@ -658,9 +755,18 @@ def test_s4_pr03_blocking_readiness_state_is_not_downgraded_by_later_transient_f
             json={"message": "draft follow-up"},
         )
         assert blocking_failure.status_code == 200
-        blocking_attempt = _surface_attempt(blocking_failure.json()["turn"])
-        assert blocking_attempt["execution"]["status"] == "in_progress"
-        _run_queued_action(client, blocking_attempt["action_attempt_id"])
+        blocking_turn = blocking_failure.json()["turn"]
+        blocking_attempt = _surface_attempt(blocking_turn)
+        assert blocking_attempt["approval"]["status"] == "pending"
+        blocking_approved = client.post(
+            "/v1/approvals",
+            json={
+                "approval_ref": _approval_ref(blocking_turn),
+                "decision": "approve",
+                "actor_id": "user.local",
+            },
+        )
+        assert blocking_approved.status_code == 200
 
         timeline = client.get(f"/v1/sessions/{session_id}/events")
         assert timeline.status_code == 200
@@ -696,10 +802,26 @@ def test_s4_pr03_attendee_reconnect_intent_requests_freebusy_and_closes_fallback
                         "window_end": "2026-03-05T00:00:00Z",
                         "duration_minutes": 30,
                         "attendees": ["a@example.com", "b@example.com"],
+                        "timezone": "UTC",
+                        "source_evidence_ids": [],
+                        "quoted_content_caveat": False,
+                        "participants": ["a@example.com", "b@example.com"],
+                        "proposed_windows": [],
+                        "timezone_evidence": {
+                            "source": None,
+                            "rationale": None,
+                            "confidence": None,
+                        },
+                        "constraints": {"hard": [], "soft": [], "attendee_notes": []},
                     },
                 }
             ]
-        }
+        },
+        assistant_text_by_message={
+            "plan team sync": (
+                "Your calendar only is available right now; reconnect calendar free/busy access."
+            )
+        },
     )
     oauth_client = FakeGoogleOAuthClient(
         tokens_by_code={
@@ -740,7 +862,7 @@ def test_s4_pr03_attendee_reconnect_intent_requests_freebusy_and_closes_fallback
         before_payload = before_reconnect.json()
         before_attempt = _surface_attempt(before_payload["turn"])
         assert before_attempt["execution"]["status"] == "succeeded"
-        assert before_attempt["execution"]["output"]["attendee_intersection_used"] is False
+        assert before_attempt["execution"]["output"]["partial"] is True
         before_message = before_payload["assistant"]["message"].lower()
         assert "user-calendar-only" in before_message or "your calendar only" in before_message
         assert "reconnect" in before_message
@@ -775,6 +897,9 @@ def test_s4_pr03_attendee_reconnect_intent_requests_freebusy_and_closes_fallback
             params={"state": reconnect_state, "code": "reconnect-freebusy"},
         )
         assert callback.status_code == 200
+        adapter.assistant_text_by_message["plan team sync"] = (
+            "The selected time works for all attendees."
+        )
 
         after_reconnect = client.post(
             f"/v1/sessions/{session_id}/message",
@@ -784,7 +909,7 @@ def test_s4_pr03_attendee_reconnect_intent_requests_freebusy_and_closes_fallback
         after_payload = after_reconnect.json()
         after_attempt = _surface_attempt(after_payload["turn"])
         assert after_attempt["execution"]["status"] == "succeeded"
-        assert after_attempt["execution"]["output"]["attendee_intersection_used"] is True
+        assert after_attempt["execution"]["output"]["partial"] is False
         after_message = after_payload["assistant"]["message"].lower()
         assert "works for all attendees" in after_message
         assert "user-calendar-only" not in after_message

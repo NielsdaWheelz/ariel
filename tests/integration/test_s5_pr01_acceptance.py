@@ -531,7 +531,7 @@ def test_s5_pr01_recall_uses_ai_curation_and_reports_omissions(
         assert first_candidate["trust_boundary"]
         assert first_candidate["taint"]["provenance_status"]
         assert first_candidate["projection_version"] == MEMORY_PROJECTION_VERSION
-        assert first_candidate["retrieval_rank"] >= 1
+        assert first_candidate["transport_order"] >= 1
         assert first_candidate["retrieval_features"]["updated_at_order"] >= 1
         assert "conflict_status" in first_candidate
 

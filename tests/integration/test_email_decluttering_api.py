@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Generator
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from fastapi.testclient import TestClient
@@ -63,7 +63,7 @@ def test_email_state_inspection_endpoints_return_serialized_records(
     client: TestClient,
 ) -> None:
     now = datetime(2026, 5, 8, 12, 0, tzinfo=UTC)
-    session_factory = client.app.state.session_factory
+    session_factory = cast(Any, client.app).state.session_factory
 
     with session_factory() as db:
         with db.begin():

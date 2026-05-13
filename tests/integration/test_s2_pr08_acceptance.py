@@ -12,7 +12,7 @@ from testcontainers.postgres import PostgresContainer
 import ariel.action_runtime as action_runtime_module
 import ariel.policy_engine as policy_engine_module
 from ariel.app import ModelAdapter, create_app
-from tests.integration.responses_helpers import responses_with_function_calls
+from tests.integration.responses_helpers import responses_message, responses_with_function_calls
 from ariel.capability_registry import (
     CapabilityDefinition,
     get_capability as registry_get_capability,
@@ -24,6 +24,7 @@ class ActionProposalAdapter:
     provider: str = "provider.s2-pr08"
     model: str = "model.s2-pr08-v1"
     proposals_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    final_messages_by_message: dict[str, str] = field(default_factory=dict)
 
     def create_response(
         self,
@@ -35,10 +36,26 @@ class ActionProposalAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         del tools, history, context_bundle
+        assistant_text = self.final_messages_by_message.get(
+            user_message,
+            f"assistant::{user_message}",
+        )
+        if any(
+            isinstance(item, dict) and item.get("type") == "function_call_output"
+            for item in input_items
+        ):
+            return responses_message(
+                assistant_text=assistant_text,
+                provider=self.provider,
+                model=self.model,
+                provider_response_id="resp_s2_pr08_123",
+                input_tokens=21,
+                output_tokens=15,
+            )
         proposals = self.proposals_by_message.get(user_message, [])
         return responses_with_function_calls(
             input_items=input_items,
-            assistant_text=f"assistant::{user_message}",
+            assistant_text=assistant_text,
             proposals=copy.deepcopy(proposals),
             provider=self.provider,
             model=self.model,
@@ -193,7 +210,8 @@ def test_s2_pr08_non_allowlisted_preflight_denies_before_capability_execution(
                     },
                 }
             ]
-        }
+        },
+        final_messages_by_message={"deny outbound": "blocked: egress_destination_denied"},
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
@@ -299,7 +317,8 @@ def test_s2_pr08_missing_malformed_or_undeclared_intent_fails_closed_before_disp
                     },
                 }
             ]
-        }
+        },
+        final_messages_by_message={"intent failure": f"blocked: {expected_error}"},
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)

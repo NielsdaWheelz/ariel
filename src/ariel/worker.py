@@ -10,7 +10,11 @@ import ulid
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from .action_runtime import process_action_execution_task, reconcile_expired_approvals_for_session
+from .action_runtime import (
+    process_action_execution_task,
+    process_provider_write_reconcile_due,
+    reconcile_expired_approvals_for_session,
+)
 from .agency_daemon import AgencyDaemonClient, AgencyRuntime
 from .config import AppSettings
 from .google_connector import (
@@ -29,6 +33,8 @@ from .persistence import (
     NotificationRecord,
     SessionRecord,
     SyncCursorRecord,
+    WorkFollowUpLoopRecord,
+    to_rfc3339,
 )
 from .memory import process_memory_extract_turn, process_memory_projection_job
 from .proactivity import (
@@ -37,11 +43,12 @@ from .proactivity import (
     process_proactive_deliberation_due,
     process_proactive_feedback_learning_due,
     process_proactive_follow_up_due,
+    process_workspace_commitment_extraction_due,
+    process_work_follow_up_evaluate_due,
     process_ambient_interpretation_due,
 )
 from .redaction import safe_failure_reason
 from .sync_runtime import (
-    emit_email_thread_watch_signal,
     process_provider_event_received,
     process_provider_sync_due,
 )
@@ -51,6 +58,8 @@ PROACTIVE_RECOVERABLE_TASK_TYPES = (
     "ambient_interpretation_due",
     "proactive_deliberation_due",
     "proactive_follow_up_due",
+    "workspace_commitment_extraction_due",
+    "work_follow_up_evaluate_due",
     "proactive_feedback_learning_due",
     "proactive_action_execution_due",
 )
@@ -114,13 +123,6 @@ def process_due_email_thread_watches(
             for watch in watches:
                 if watch.condition == "no_reply_by_deadline":
                     watch.status = "due"
-                    emit_email_thread_watch_signal(
-                        db,
-                        watch=watch,
-                        signal_type="email_thread_watch_due",
-                        now=now,
-                        new_id_fn=new_id_fn,
-                    )
                 else:
                     watch.status = "failed"
                 watch.updated_at = now
@@ -134,10 +136,44 @@ def enqueue_background_task(
     payload: dict[str, Any],
     now: datetime,
     max_attempts: int = 3,
+    idempotency_key: str | None = None,
 ) -> BackgroundTaskRecord:
+    if idempotency_key is not None:
+        existing_task = db.scalar(
+            select(BackgroundTaskRecord)
+            .where(BackgroundTaskRecord.idempotency_key == idempotency_key)
+            .limit(1)
+        )
+        if existing_task is not None:
+            return existing_task
+    work_follow_up_loop_id = None
+    work_follow_up_loop_version = None
+    work_follow_up_scheduled_for = None
+    provider_write_receipt_id = None
+    if task_type == "work_follow_up_evaluate_due":
+        loop_id = payload.get("loop_id")
+        loop_version = payload.get("loop_version")
+        scheduled_for = payload.get("scheduled_for")
+        if not isinstance(loop_id, str) or not isinstance(loop_version, int):
+            raise RuntimeError("work_follow_up_evaluate_due task payload invalid")
+        if not isinstance(scheduled_for, str):
+            raise RuntimeError("work_follow_up_evaluate_due task scheduled_for missing")
+        work_follow_up_loop_id = loop_id
+        work_follow_up_loop_version = loop_version
+        work_follow_up_scheduled_for = datetime.fromisoformat(scheduled_for.replace("Z", "+00:00"))
+    if task_type == "provider_write_reconcile_due":
+        receipt_id = payload.get("provider_write_receipt_id")
+        if not isinstance(receipt_id, str) or not receipt_id:
+            raise RuntimeError("provider_write_reconcile_due task payload invalid")
+        provider_write_receipt_id = receipt_id
     task = BackgroundTaskRecord(
         id=_new_id("tsk"),
         task_type=task_type,
+        idempotency_key=idempotency_key,
+        work_follow_up_loop_id=work_follow_up_loop_id,
+        work_follow_up_loop_version=work_follow_up_loop_version,
+        work_follow_up_scheduled_for=work_follow_up_scheduled_for,
+        provider_write_receipt_id=provider_write_receipt_id,
         payload=payload,
         status="pending",
         attempts=0,
@@ -152,6 +188,15 @@ def enqueue_background_task(
     db.add(task)
     db.flush()
     return task
+
+
+def _work_follow_up_task_idempotency_key(
+    *,
+    loop_id: str,
+    loop_version: int,
+    scheduled_for: str,
+) -> str:
+    return f"work_follow_up_evaluate_due:{loop_id}:{loop_version}:{scheduled_for}"
 
 
 def claim_next_task(db: Session, *, worker_id: str, now: datetime) -> BackgroundTaskRecord | None:
@@ -259,6 +304,77 @@ def enqueue_due_worker_owned_ambient_task(
     )
 
 
+def enqueue_due_work_follow_up_evaluation_tasks(
+    db: Session,
+    *,
+    settings: AppSettings,
+    now: datetime,
+) -> int:
+    loops = db.scalars(
+        select(WorkFollowUpLoopRecord)
+        .where(
+            WorkFollowUpLoopRecord.state.in_(("active", "waiting", "snoozed")),
+            WorkFollowUpLoopRecord.next_check_at.is_not(None),
+            WorkFollowUpLoopRecord.next_check_at <= now,
+        )
+        .order_by(WorkFollowUpLoopRecord.next_check_at.asc(), WorkFollowUpLoopRecord.id.asc())
+        .with_for_update(skip_locked=True)
+        .limit(100)
+    ).all()
+    if not loops:
+        return 0
+
+    existing_tasks = db.scalars(
+        select(BackgroundTaskRecord).where(
+            BackgroundTaskRecord.task_type == "work_follow_up_evaluate_due",
+            BackgroundTaskRecord.status.in_(("pending", "running")),
+        )
+    ).all()
+    existing_keys: set[tuple[str, int, str | None]] = set()
+    for task in existing_tasks:
+        payload = task.payload if isinstance(task.payload, dict) else {}
+        loop_id = payload.get("loop_id")
+        loop_version = payload.get("loop_version")
+        scheduled_for = payload.get("scheduled_for")
+        if (
+            isinstance(loop_id, str)
+            and isinstance(loop_version, int)
+            and (isinstance(scheduled_for, str) or scheduled_for is None)
+        ):
+            existing_keys.add((loop_id, loop_version, scheduled_for))
+
+    enqueued = 0
+    for loop in loops:
+        if loop.next_check_at is None:
+            continue
+        scheduled_for = to_rfc3339(loop.next_check_at)
+        if (loop.id, loop.version, scheduled_for) in existing_keys:
+            continue
+        if (loop.id, loop.version, None) in existing_keys:
+            continue
+        idempotency_key = _work_follow_up_task_idempotency_key(
+            loop_id=loop.id,
+            loop_version=loop.version,
+            scheduled_for=scheduled_for,
+        )
+        enqueue_background_task(
+            db,
+            task_type="work_follow_up_evaluate_due",
+            payload={
+                "loop_id": loop.id,
+                "loop_version": loop.version,
+                "scheduled_for": scheduled_for,
+                "idempotency_key": idempotency_key,
+            },
+            now=now,
+            max_attempts=settings.proactive_worker_max_attempts,
+            idempotency_key=idempotency_key,
+        )
+        existing_keys.add((loop.id, loop.version, scheduled_for))
+        enqueued += 1
+    return enqueued
+
+
 def _google_runtime(settings: AppSettings) -> GoogleConnectorRuntime:
     return GoogleConnectorRuntime(
         oauth_client=DefaultGoogleOAuthClient(
@@ -318,6 +434,11 @@ def process_one_task(
     with session_factory() as db:
         with db.begin():
             now = _utcnow()
+            enqueue_due_work_follow_up_evaluation_tasks(
+                db,
+                settings=resolved_settings,
+                now=now,
+            )
             enqueue_due_worker_owned_ambient_task(db, settings=resolved_settings, now=now)
 
     if process_memory_projection_job(
@@ -336,6 +457,51 @@ def process_one_task(
             task_id = task.id
             task_type = task.task_type
             task_payload = dict(task.payload)
+            if task_type == "work_follow_up_evaluate_due":
+                if (
+                    task.work_follow_up_loop_id is None
+                    or task.work_follow_up_loop_version is None
+                    or task.work_follow_up_scheduled_for is None
+                ):
+                    task_payload = {"shape_error": "work_follow_up_evaluate_due task shape invalid"}
+                else:
+                    scheduled_for = to_rfc3339(task.work_follow_up_scheduled_for)
+                    idempotency_key = _work_follow_up_task_idempotency_key(
+                        loop_id=task.work_follow_up_loop_id,
+                        loop_version=task.work_follow_up_loop_version,
+                        scheduled_for=scheduled_for,
+                    )
+                    if task.idempotency_key != idempotency_key:
+                        task_payload = {
+                            "shape_error": ("work_follow_up_evaluate_due task idempotency mismatch")
+                        }
+                    else:
+                        task_payload = {
+                            "loop_id": task.work_follow_up_loop_id,
+                            "loop_version": task.work_follow_up_loop_version,
+                            "scheduled_for": scheduled_for,
+                            "idempotency_key": idempotency_key,
+                        }
+            if task_type == "provider_write_reconcile_due":
+                if task.provider_write_receipt_id is None:
+                    task_payload = {
+                        "shape_error": "provider_write_reconcile_due task shape invalid"
+                    }
+                else:
+                    expected_idempotency_key = (
+                        f"provider_write_reconcile:{task.provider_write_receipt_id}"
+                    )
+                    if task.idempotency_key != expected_idempotency_key:
+                        task_payload = {
+                            "shape_error": (
+                                "provider_write_reconcile_due task idempotency mismatch"
+                            )
+                        }
+                    else:
+                        task_payload = {
+                            "provider_write_receipt_id": task.provider_write_receipt_id,
+                            "idempotency_key": expected_idempotency_key,
+                        }
 
     try:
         match task_type:
@@ -359,6 +525,16 @@ def process_one_task(
                     action_attempt_id=action_attempt_id,
                     google_runtime=_google_runtime(resolved_settings),
                     agency_runtime=_agency_runtime(resolved_settings),
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+            case "provider_write_reconcile_due":
+                shape_error = _payload_text(task_payload, "shape_error")
+                if shape_error is not None:
+                    raise RuntimeError(shape_error)
+                process_provider_write_reconcile_due(
+                    session_factory=session_factory,
+                    task_payload=task_payload,
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                 )
@@ -425,6 +601,27 @@ def process_one_task(
                 process_proactive_follow_up_due(
                     session_factory=session_factory,
                     task_payload=task_payload,
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+            case "workspace_commitment_extraction_due":
+                process_workspace_commitment_extraction_due(
+                    session_factory=session_factory,
+                    task_payload=task_payload,
+                    settings=resolved_settings,
+                    model_adapter=model_adapter,
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+            case "work_follow_up_evaluate_due":
+                shape_error = _payload_text(task_payload, "shape_error")
+                if shape_error is not None:
+                    raise RuntimeError(shape_error)
+                process_work_follow_up_evaluate_due(
+                    session_factory=session_factory,
+                    task_payload=task_payload,
+                    settings=resolved_settings,
+                    model_adapter=model_adapter,
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                 )

@@ -16,14 +16,15 @@ from ariel.persistence import (
     ActionAttemptRecord,
     BackgroundTaskRecord,
     EmailThreadWatchRecord,
+    GoogleProviderObjectRecord,
     ProactiveCaseRecord,
     ProactiveObservationRecord,
+    ProviderEvidenceBlockRecord,
+    ProviderEvidenceRecord,
     SessionRecord,
     SyncCursorRecord,
     SyncRunRecord,
     TurnRecord,
-    WorkspaceItemEventRecord,
-    WorkspaceItemRecord,
 )
 from ariel.sync_runtime import process_provider_sync_due
 
@@ -56,9 +57,72 @@ class FakeGmailBootstrapProvider:
         raise AssertionError("empty Gmail cursor should bootstrap from profile")
 
 
+def gmail_message_read_output(
+    *,
+    message_id: str,
+    thread_id: str,
+    published_at: str,
+    body_text: str = "Thanks, I will follow up by Friday.",
+) -> dict[str, Any]:
+    return {
+        "schema_version": "google.gmail.message_evidence.v1",
+        "mode": "message",
+        "message": {
+            "provider_account_id": "con_google",
+            "message_id": message_id,
+            "thread_id": thread_id,
+            "history_id": "hist-2",
+            "rfc_message_id": f"<{message_id}@example.com>",
+            "subject": "Follow up",
+            "subject_key": "follow up",
+            "sender": {"email": "manager@example.com", "display_name": "Manager"},
+            "recipients": [{"email": "user@example.com", "display_name": "User"}],
+            "cc": [],
+            "bcc": [],
+            "reply_to": [],
+            "internal_date_ms": 1778173200000,
+            "header_date": published_at,
+            "direction": "received",
+            "labels": ["INBOX"],
+            "attachments": [],
+            "body": {
+                "preferred_mime_type": "text/plain",
+                "truncated": False,
+                "body_digest": "b" * 64,
+                "decode_notes": [],
+            },
+            "provider_url": f"https://mail.google.com/mail/u/0/#inbox/{message_id}",
+            "raw_payload_digest": "r" * 64,
+        },
+        "published_at": published_at,
+        "evidence": {
+            "source_kind": "gmail_message",
+            "message_id": message_id,
+            "thread_id": thread_id,
+            "body_digest": "b" * 64,
+            "blocks": [
+                {
+                    "block_id": "block-1",
+                    "kind": "body",
+                    "source_mime_type": "text/plain",
+                    "charset": "utf-8",
+                    "text": body_text,
+                    "digest": "d" * 64,
+                    "truncated": False,
+                }
+            ],
+            "truncated": False,
+            "decode_notes": [],
+        },
+        "read_outcome": {"status": "ok", "reason_code": None, "recovery": None},
+        "retrieved_at": published_at,
+    }
+
+
 @dataclass
 class FakePagedGmailProvider:
     history_calls: list[dict[str, str | None]] = field(default_factory=list)
+    read_calls: list[dict[str, Any]] = field(default_factory=list)
 
     def _request_json(self, **_: Any) -> dict[str, Any]:
         raise AssertionError("existing Gmail cursor should use history pages")
@@ -113,6 +177,110 @@ class FakePagedGmailProvider:
                 ],
             }
         raise AssertionError(f"unexpected page token: {page_token}")
+
+    def email_read(self, *, access_token: str, normalized_input: dict[str, Any]) -> dict[str, Any]:
+        assert access_token == "access-token"
+        self.read_calls.append(normalized_input)
+        message_id = normalized_input["message_id"]
+        assert normalized_input in [
+            {"message_id": "msg-1", "thread_id": None, "mode": "message"},
+            {"message_id": "msg-3", "thread_id": None, "mode": "message"},
+        ]
+        return gmail_message_read_output(
+            message_id=message_id,
+            thread_id="thr-1" if message_id == "msg-1" else "thr-3",
+            published_at="2026-05-07T12:00:00Z",
+        )
+
+
+@dataclass
+class FakeFullBodyGmailProvider:
+    read_calls: list[dict[str, Any]] = field(default_factory=list)
+
+    def _request_json(self, **_: Any) -> dict[str, Any]:
+        raise AssertionError("existing Gmail cursor should use history pages")
+
+    def email_list_history(self, **_: Any) -> dict[str, Any]:
+        return {
+            "historyId": "hist-2",
+            "history": [
+                {
+                    "id": "history-body",
+                    "messagesAdded": [
+                        {
+                            "message": {
+                                "id": "msg-body",
+                                "threadId": "thr-body",
+                                "labelIds": ["INBOX"],
+                                "internalDate": "1778173200000",
+                            }
+                        }
+                    ],
+                }
+            ],
+        }
+
+    def email_read(self, *, access_token: str, normalized_input: dict[str, Any]) -> dict[str, Any]:
+        assert access_token == "access-token"
+        self.read_calls.append(normalized_input)
+        assert normalized_input == {
+            "message_id": "msg-body",
+            "thread_id": None,
+            "mode": "message",
+        }
+        return {
+            "schema_version": "google.gmail.message_evidence.v1",
+            "mode": "message",
+            "message": {
+                "provider_account_id": "con_google",
+                "message_id": "msg-body",
+                "thread_id": "thr-body",
+                "history_id": "hist-2",
+                "rfc_message_id": "<msg-body@example.com>",
+                "subject": "Follow up on launch checklist",
+                "subject_key": "follow up on launch checklist",
+                "sender": {"email": "manager@example.com", "display_name": "Manager"},
+                "recipients": [{"email": "user@example.com", "display_name": "User"}],
+                "cc": [],
+                "bcc": [],
+                "reply_to": [],
+                "internal_date_ms": 1778173200000,
+                "header_date": "2026-05-07T09:00:00Z",
+                "direction": "received",
+                "labels": ["INBOX"],
+                "attachments": [],
+                "body": {
+                    "preferred_mime_type": "text/plain",
+                    "truncated": False,
+                    "body_digest": "b" * 64,
+                    "decode_notes": [],
+                },
+                "provider_url": "https://mail.google.com/mail/u/0/#inbox/msg-body",
+                "raw_payload_digest": "r" * 64,
+            },
+            "published_at": "2026-05-07T09:00:00Z",
+            "evidence": {
+                "source_kind": "gmail_message",
+                "message_id": "msg-body",
+                "thread_id": "thr-body",
+                "body_digest": "b" * 64,
+                "blocks": [
+                    {
+                        "block_id": "block-1",
+                        "kind": "body",
+                        "source_mime_type": "text/plain",
+                        "charset": "utf-8",
+                        "text": "Please send the launch checklist by Friday at 5pm.",
+                        "digest": "d" * 64,
+                        "truncated": False,
+                    }
+                ],
+                "truncated": False,
+                "decode_notes": [],
+            },
+            "read_outcome": {"status": "ok", "reason_code": None, "recovery": None},
+            "retrieved_at": "2026-05-07T09:01:00Z",
+        }
 
 
 @pytest.fixture(scope="session")
@@ -240,13 +408,9 @@ def test_gmail_sync_follows_history_pages_and_dedupes_replayed_events(
     with db_sessions() as db:
         with db.begin():
             runs = db.scalars(select(SyncRunRecord).order_by(SyncRunRecord.id.asc())).all()
-            events = db.scalars(
-                select(WorkspaceItemEventRecord).order_by(WorkspaceItemEventRecord.id.asc())
-            ).all()
-            ambient_tasks = db.scalars(
+            tasks = db.scalars(
                 select(BackgroundTaskRecord).order_by(BackgroundTaskRecord.id.asc())
             ).all()
-            workspace_item_count = db.scalar(select(func.count()).select_from(WorkspaceItemRecord))
             observation_count = db.scalar(
                 select(func.count()).select_from(ProactiveObservationRecord)
             )
@@ -258,18 +422,119 @@ def test_gmail_sync_follows_history_pages_and_dedupes_replayed_events(
         {"start_history_id": "hist-1", "page_token": "page-2"},
     ]
     assert providers[1].history_calls == providers[0].history_calls
-    assert [run.item_count for run in runs] == [4, 0]
+    assert providers[0].read_calls == [
+        {"message_id": "msg-1", "thread_id": None, "mode": "message"},
+        {"message_id": "msg-3", "thread_id": None, "mode": "message"},
+    ]
+    assert providers[1].read_calls == providers[0].read_calls
+    assert [run.item_count for run in runs] == [4, 4]
     assert [run.observation_count for run in runs] == [0, 0]
     assert [run.cursor_after for run in runs] == ["hist-3", "hist-3"]
-    assert workspace_item_count == 3
-    assert len(events) == 4
-    assert [task.task_type for task in ambient_tasks] == ["ambient_interpretation_due"] * 4
-    assert [task.payload for task in ambient_tasks] == [
-        {"workspace_item_event_id": event.id} for event in events
+    ambient_tasks = [task for task in tasks if task.task_type == "ambient_interpretation_due"]
+    extraction_tasks = [
+        task for task in tasks if task.task_type == "workspace_commitment_extraction_due"
     ]
-    assert [task.status for task in ambient_tasks] == ["pending"] * 4
+    assert ambient_tasks == []
+    assert [task.task_type for task in extraction_tasks] == [
+        "workspace_commitment_extraction_due",
+        "workspace_commitment_extraction_due",
+    ]
+    assert all(set(task.payload) == {"evidence_id"} for task in extraction_tasks)
     assert observation_count == 0
     assert case_count == 0
+
+
+def test_gmail_sync_hydrates_added_messages_into_body_evidence(
+    db_sessions: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    providers: list[FakeFullBodyGmailProvider] = []
+
+    class FakeGoogleConnectorRuntime:
+        workspace_provider: FakeFullBodyGmailProvider
+
+        def __init__(self, **_: Any) -> None:
+            self.workspace_provider = FakeFullBodyGmailProvider()
+            providers.append(self.workspace_provider)
+
+        def access_token_for_background_sync(self, **_: Any) -> str:
+            return "access-token"
+
+    monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
+    now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
+    new_id = IdFactory()
+    with db_sessions() as db:
+        with db.begin():
+            db.add(
+                SyncCursorRecord(
+                    id=new_id("cur"),
+                    provider="google",
+                    resource_type="gmail",
+                    resource_id="primary",
+                    cursor_value="hist-1",
+                    cursor_version=1,
+                    status="ready",
+                    last_successful_sync_at=None,
+                    last_error_code=None,
+                    last_error_at=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
+    process_provider_sync_due(
+        session_factory=db_sessions,
+        task_payload={"provider": "google", "resource_type": "gmail", "resource_id": "primary"},
+        settings=_settings(),
+        now_fn=lambda: now,
+        new_id_fn=new_id,
+    )
+
+    with db_sessions() as db:
+        with db.begin():
+            run = db.scalar(select(SyncRunRecord).limit(1))
+            provider_object = db.scalar(select(GoogleProviderObjectRecord).limit(1))
+            evidence = db.scalar(select(ProviderEvidenceRecord).limit(1))
+            block = db.scalar(select(ProviderEvidenceBlockRecord).limit(1))
+            tasks = db.scalars(
+                select(BackgroundTaskRecord).order_by(BackgroundTaskRecord.id.asc())
+            ).all()
+
+    assert len(providers) == 1
+    assert providers[0].read_calls == [
+        {"message_id": "msg-body", "thread_id": None, "mode": "message"}
+    ]
+    assert run is not None
+    assert run.status == "succeeded"
+    assert run.item_count == 1
+    assert provider_object is not None
+    assert provider_object.external_id == "msg-body"
+    assert provider_object.thread_external_id == "thr-body"
+    assert provider_object.content_digest == "r" * 64
+    assert provider_object.metadata_json == {
+        "history_id": "history-body",
+        "label_ids": ["INBOX"],
+        "change": "messagesAdded",
+        "subject": "Follow up on launch checklist",
+        "subject_key": "follow up on launch checklist",
+        "direction": "received",
+        "attachments": [],
+        "read_outcome": {"status": "ok", "reason_code": None, "recovery": None},
+    }
+    assert evidence is not None
+    assert evidence.provider_object_id == provider_object.id
+    assert evidence.external_id == "msg-body"
+    assert evidence.thread_external_id == "thr-body"
+    assert evidence.content_digest == "b" * 64
+    assert evidence.taint == "provider_untrusted"
+    assert block is not None
+    assert block.evidence_id == evidence.id
+    assert block.block_index == 0
+    assert block.block_kind == "body"
+    assert block.text == "Please send the launch checklist by Friday at 5pm."
+    assert block.digest == "d" * 64
+    assert [task.task_type for task in tasks] == ["workspace_commitment_extraction_due"]
+    assert tasks[0].payload == {"evidence_id": evidence.id}
 
 
 def test_gmail_sync_invalid_cursor_fails_closed_without_provider_call(
@@ -499,56 +764,19 @@ def test_gmail_sync_completes_thread_watch_on_reply(
             assert anchor_watch.matched_message_id is None
             run = db.scalar(select(SyncRunRecord).limit(1))
             assert run is not None
-            assert run.item_count == 6
-            signal_events = db.scalars(
-                select(WorkspaceItemEventRecord)
-                .join(
-                    WorkspaceItemRecord,
-                    WorkspaceItemEventRecord.workspace_item_id == WorkspaceItemRecord.id,
-                )
-                .where(
-                    WorkspaceItemRecord.provider == "ariel",
-                    WorkspaceItemRecord.item_type == "internal_state",
-                )
-                .order_by(WorkspaceItemRecord.external_id.asc())
-            ).all()
-            assert len(signal_events) == 2
-            signal_metadata = {
-                event.payload["metadata"]["watch_id"]: event.payload["metadata"]
-                for event in signal_events
-            }
-            assert signal_metadata["etw_reply"]["signal"] == "email_thread_watch_completed"
-            assert signal_metadata["etw_reply"]["matched_message_id"] == "msg-1"
-            assert signal_metadata["etw_overdue"]["signal"] == "email_thread_watch_due"
-            assert signal_metadata["etw_overdue"]["trigger_message_id"] == "msg-1"
-            message_events = db.scalars(
-                select(WorkspaceItemEventRecord)
-                .join(
-                    WorkspaceItemRecord,
-                    WorkspaceItemEventRecord.workspace_item_id == WorkspaceItemRecord.id,
-                )
-                .where(
-                    WorkspaceItemRecord.item_type == "email_message",
-                    WorkspaceItemRecord.external_id == "msg-1",
-                )
-            ).all()
-            message_signal_metadata = [
-                event.payload["metadata"]["email_thread_watch_signals"]
-                for event in message_events
-                if event.payload["metadata"]["email_thread_watch_signals"]
+            assert run.item_count == 4
+            tasks = db.scalars(select(BackgroundTaskRecord)).all()
+            ambient_tasks = [
+                task for task in tasks if task.task_type == "ambient_interpretation_due"
             ]
-            assert len(message_signal_metadata) == 1
-            assert {
-                signal["watch_id"]: signal["signal"] for signal in message_signal_metadata[0]
-            } == {
-                "etw_reply": "email_thread_watch_completed",
-                "etw_overdue": "email_thread_watch_due",
-            }
-            ambient_tasks = db.scalars(select(BackgroundTaskRecord)).all()
-            assert len(ambient_tasks) == 6
-            assert {task.payload["workspace_item_event_id"] for task in ambient_tasks} == {
-                event.id for event in db.scalars(select(WorkspaceItemEventRecord)).all()
-            }
+            extraction_tasks = [
+                task for task in tasks if task.task_type == "workspace_commitment_extraction_due"
+            ]
+            assert ambient_tasks == []
+            assert len(extraction_tasks) == 2
+            evidence_rows = db.scalars(select(ProviderEvidenceRecord)).all()
+            assert len(evidence_rows) == 2
+            assert {evidence.taint for evidence in evidence_rows} == {"provider_untrusted"}
 
 
 def test_gmail_sync_uses_message_time_for_thread_watch_deadline(
@@ -580,6 +808,21 @@ def test_gmail_sync_uses_message_time_for_thread_watch_deadline(
                     }
                 ],
             }
+
+        def email_read(
+            self, *, access_token: str, normalized_input: dict[str, Any]
+        ) -> dict[str, Any]:
+            assert access_token == "access-token"
+            assert normalized_input == {
+                "message_id": "msg-reply",
+                "thread_id": None,
+                "mode": "message",
+            }
+            return gmail_message_read_output(
+                message_id="msg-reply",
+                thread_id="thr-delay",
+                published_at="2026-05-08T11:00:00Z",
+            )
 
     class FakeGoogleConnectorRuntime:
         workspace_provider: FakeDelayedReplyProvider
@@ -725,6 +968,21 @@ def test_gmail_sync_does_not_complete_any_reply_watch_after_deadline(
                     }
                 ],
             }
+
+        def email_read(
+            self, *, access_token: str, normalized_input: dict[str, Any]
+        ) -> dict[str, Any]:
+            assert access_token == "access-token"
+            assert normalized_input == {
+                "message_id": "msg-late",
+                "thread_id": None,
+                "mode": "message",
+            }
+            return gmail_message_read_output(
+                message_id="msg-late",
+                thread_id="thr-late",
+                published_at="2026-05-08T13:00:00Z",
+            )
 
     class FakeGoogleConnectorRuntime:
         workspace_provider: FakeLateReplyProvider

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime
 from typing import Any
 
@@ -15,6 +16,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    text,
     UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -40,6 +42,7 @@ class SessionRecord(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    memory_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="normal")
     rotated_from_session_id: Mapped[str | None] = mapped_column(
         String(32),
         ForeignKey("sessions.id", ondelete="SET NULL"),
@@ -64,6 +67,10 @@ class SessionRecord(Base):
         CheckConstraint(
             "lifecycle_state IN ('active', 'rotating', 'closed', 'recovery_needed')",
             name="ck_session_lifecycle_state",
+        ),
+        CheckConstraint(
+            "memory_mode IN ('normal', 'temporary', 'no_memory')",
+            name="ck_session_memory_mode",
         ),
         CheckConstraint(
             (
@@ -346,8 +353,9 @@ class AIJudgmentRecord(Base):
         CheckConstraint(
             (
                 "judgment_type IN ('memory_curation', 'tool_result_interpretation', "
-                "'continuity_compaction', 'feedback_learning', "
-                "'ambient_interpretation', 'proactive_deliberation', 'model_output')"
+                "'memory_extraction', 'continuity_compaction', 'feedback_learning', "
+                "'ambient_interpretation', 'proactive_deliberation', 'model_output', "
+                "'workspace_commitment_extraction')"
             ),
             name="ck_ai_judgment_type",
         ),
@@ -435,6 +443,38 @@ class ActionAttemptRecord(Base):
             name="ck_action_attempt_policy_decision",
         ),
         Index("ix_turn_proposal_index_unique", "turn_id", "proposal_index", unique=True),
+    )
+
+
+class ActionPrivatePayloadRecord(Base):
+    __tablename__ = "action_private_payloads"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    action_attempt_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("action_attempts.id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    payload_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload_enc: Mapped[str] = mapped_column(Text, nullable=False)
+    encryption_key_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "payload_kind IN ('google_provider_write_input')",
+            name="ck_action_private_payload_kind",
+        ),
+        CheckConstraint(
+            "length(payload_digest) = 64",
+            name="ck_action_private_payload_digest",
+        ),
     )
 
 
@@ -1074,7 +1114,7 @@ class MemoryAssertionRecord(Base):
         CheckConstraint(
             "lifecycle_state IN "
             "('candidate', 'active', 'conflicted', 'superseded', 'retracted', "
-            "'rejected', 'deleted')",
+            "'stale', 'rejected', 'deleted', 'privacy_deleted')",
             name="ck_memory_assertion_lifecycle_state",
         ),
         CheckConstraint(
@@ -1234,6 +1274,60 @@ class MemoryReasoningTraceRecord(Base):
     )
 
 
+class MemoryActionTraceRecord(Base):
+    __tablename__ = "memory_action_traces"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    scope_key: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    trace_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    action_attempt_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("action_attempts.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    source_turn_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("turns.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    primary_evidence_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("memory_evidence.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    capability_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    outcome: Mapped[str] = mapped_column(String(32), nullable=False)
+    result_refs: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "trace_type IN ('proposal', 'policy_decision', 'approval_decision', "
+            "'execution', 'outcome', 'undo')",
+            name="ck_memory_action_trace_type",
+        ),
+        CheckConstraint(
+            "outcome IN ('succeeded', 'failed', 'denied', 'undone', 'unknown')",
+            name="ck_memory_action_trace_outcome",
+        ),
+        CheckConstraint(
+            "lifecycle_state IN ('active', 'stale', 'superseded', 'retracted', "
+            "'deleted', 'privacy_deleted')",
+            name="ck_memory_action_trace_lifecycle_state",
+        ),
+    )
+
+
 class MemoryProcedureRecord(Base):
     __tablename__ = "memory_procedures"
 
@@ -1311,7 +1405,7 @@ class MemoryReviewRecord(Base):
         CheckConstraint(
             "decision IN "
             "('pending', 'approved', 'rejected', 'auto_approved', "
-            "'needs_user_review', 'needs_operator_review')",
+            "'needs_user_review', 'needs_operator_review', 'merged', 'superseded')",
             name="ck_memory_review_decision",
         ),
     )
@@ -1346,7 +1440,7 @@ class MemoryConflictSetRecord(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "lifecycle_state IN ('open', 'resolved')",
+            "lifecycle_state IN ('open', 'resolved', 'ignored')",
             name="ck_memory_conflict_set_lifecycle_state",
         ),
         Index(
@@ -1422,6 +1516,129 @@ class MemorySalienceRecord(Base):
     )
 
 
+class MemoryScopeBindingRecord(Base):
+    __tablename__ = "memory_scope_bindings"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    scope_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    scope_key: Mapped[str] = mapped_column(Text, nullable=False)
+    actor_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    memory_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="normal")
+    extraction_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    recall_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "scope_type IN ('user', 'project', 'repo', 'session', 'thread', 'proactive_case')",
+            name="ck_memory_scope_binding_scope_type",
+        ),
+        CheckConstraint(
+            "memory_mode IN ('normal', 'temporary', 'no_memory')",
+            name="ck_memory_scope_binding_memory_mode",
+        ),
+        Index(
+            "ix_memory_scope_bindings_scope_actor_unique",
+            "scope_type",
+            "scope_key",
+            "actor_id",
+            unique=True,
+        ),
+    )
+
+
+class MemoryRetentionPolicyRecord(Base):
+    __tablename__ = "memory_retention_policies"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    scope_key: Mapped[str] = mapped_column(Text, nullable=False)
+    policy_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    pattern: Mapped[str] = mapped_column(Text, nullable=False)
+    retention_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "policy_kind IN ('never_remember', 'delete_after', 'review_after')",
+            name="ck_memory_retention_policy_kind",
+        ),
+        CheckConstraint(
+            "lifecycle_state IN ('active', 'deleted')",
+            name="ck_memory_retention_policy_lifecycle_state",
+        ),
+        CheckConstraint(
+            "(retention_days IS NULL) OR (retention_days > 0)",
+            name="ck_memory_retention_policy_days_positive",
+        ),
+        Index(
+            "ix_memory_retention_policies_unique",
+            "scope_key",
+            "policy_kind",
+            "pattern",
+            unique=True,
+        ),
+    )
+
+
+class MemorySensitivityLabelRecord(Base):
+    __tablename__ = "memory_sensitivity_labels"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    canonical_table: Mapped[str] = mapped_column(String(64), nullable=False)
+    canonical_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    label: Mapped[str] = mapped_column(String(32), nullable=False)
+    actor_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "canonical_table IN ('memory_evidence', 'memory_assertions', "
+            "'memory_episodes', 'memory_reasoning_traces', 'memory_action_traces', "
+            "'memory_procedures', 'project_state_snapshots')",
+            name="ck_memory_sensitivity_label_canonical_table",
+        ),
+        CheckConstraint(
+            "label IN ('personal', 'secret', 'regulated', 'source_confidential', 'public')",
+            name="ck_memory_sensitivity_label",
+        ),
+        CheckConstraint(
+            "lifecycle_state IN ('active', 'deleted')",
+            name="ck_memory_sensitivity_label_lifecycle_state",
+        ),
+        Index(
+            "ix_memory_sensitivity_labels_unique",
+            "canonical_table",
+            "canonical_id",
+            "label",
+            unique=True,
+        ),
+    )
+
+
 class MemoryVersionRecord(Base):
     __tablename__ = "memory_versions"
 
@@ -1454,7 +1671,11 @@ class MemoryVersionRecord(Base):
         CheckConstraint(
             "canonical_table IN ('memory_evidence', 'memory_entities', "
             "'memory_relationships', 'memory_assertions', 'memory_episodes', "
-            "'memory_reasoning_traces', 'memory_procedures', "
+            "'memory_reasoning_traces', 'memory_action_traces', 'memory_procedures', "
+            "'memory_topics', 'memory_topic_members', 'memory_deletions', "
+            "'memory_retention_policies', 'memory_sensitivity_labels', "
+            "'memory_temporal_projections', 'memory_symbol_projections', "
+            "'memory_export_artifacts', 'memory_eval_runs', "
             "'project_state_snapshots')",
             name="ck_memory_version_canonical_table",
         ),
@@ -1482,6 +1703,42 @@ class MemoryVersionRecord(Base):
     )
 
 
+class MemoryDeletionRecord(Base):
+    __tablename__ = "memory_deletions"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    target_table: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    deletion_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    actor_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    redaction_posture: Mapped[str] = mapped_column(String(32), nullable=False, default="none")
+    projection_invalidation: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "target_table IN ('memory_evidence', 'memory_assertions', "
+            "'memory_relationships', 'memory_episodes', 'memory_reasoning_traces', "
+            "'memory_action_traces', 'memory_procedures', 'memory_topics')",
+            name="ck_memory_deletion_target_table",
+        ),
+        CheckConstraint(
+            "deletion_type IN ('delete', 'privacy_delete', 'redact', 'retract')",
+            name="ck_memory_deletion_type",
+        ),
+        CheckConstraint(
+            "redaction_posture IN ('none', 'redacted', 'privacy_deleted')",
+            name="ck_memory_deletion_redaction_posture",
+        ),
+        Index("ix_memory_deletions_target", "target_table", "target_id"),
+    )
+
+
 class MemoryProjectionJobRecord(Base):
     __tablename__ = "memory_projection_jobs"
 
@@ -1504,7 +1761,8 @@ class MemoryProjectionJobRecord(Base):
     __table_args__ = (
         CheckConstraint(
             "projection_kind IN ('embedding', 'keyword', 'entity', 'graph', "
-            "'context_block', 'project_state')",
+            "'context_block', 'project_state', 'hot_index', 'topic_block', "
+            "'action_trace', 'temporal', 'symbol', 'export')",
             name="ck_memory_projection_job_kind",
         ),
         CheckConstraint(
@@ -1550,6 +1808,88 @@ class MemoryEmbeddingProjectionRecord(Base):
         Index(
             "ix_memory_embedding_projection_unique",
             "assertion_id",
+            "projection_version",
+            unique=True,
+        ),
+    )
+
+
+class MemoryTemporalProjectionRecord(Base):
+    __tablename__ = "memory_temporal_projections"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    canonical_table: Mapped[str] = mapped_column(String(64), nullable=False)
+    canonical_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    temporal_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    valid_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    projection_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "canonical_table IN ('memory_assertions', 'memory_episodes', "
+            "'memory_action_traces', 'memory_procedures', 'project_state_snapshots')",
+            name="ck_memory_temporal_projection_canonical_table",
+        ),
+        CheckConstraint(
+            "temporal_kind IN ('validity', 'occurrence', 'review', 'retention')",
+            name="ck_memory_temporal_projection_kind",
+        ),
+        CheckConstraint(
+            "(valid_to IS NULL) OR (valid_from IS NULL) OR (valid_from < valid_to)",
+            name="ck_memory_temporal_projection_valid_interval",
+        ),
+        Index(
+            "ix_memory_temporal_projections_unique",
+            "canonical_table",
+            "canonical_id",
+            "temporal_kind",
+            "projection_version",
+            unique=True,
+        ),
+    )
+
+
+class MemorySymbolProjectionRecord(Base):
+    __tablename__ = "memory_symbol_projections"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    canonical_table: Mapped[str] = mapped_column(String(64), nullable=False)
+    canonical_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    repo_key: Mapped[str] = mapped_column(Text, nullable=False)
+    symbol: Mapped[str] = mapped_column(Text, nullable=False)
+    path: Mapped[str] = mapped_column(Text, nullable=False)
+    language: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    projection_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "canonical_table IN ('memory_assertions', 'memory_episodes', "
+            "'memory_action_traces', 'memory_procedures', 'project_state_snapshots')",
+            name="ck_memory_symbol_projection_canonical_table",
+        ),
+        Index(
+            "ix_memory_symbol_projections_unique",
+            "canonical_table",
+            "canonical_id",
+            "repo_key",
+            "symbol",
+            "path",
             "projection_version",
             unique=True,
         ),
@@ -1679,14 +2019,25 @@ class MemoryContextBlockRecord(Base):
     block_type: Mapped[str] = mapped_column(String(32), nullable=False)
     scope_key: Mapped[str] = mapped_column(Text, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    topic_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("memory_topics.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
     source_assertion_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     source_episode_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     source_trace_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    source_action_trace_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     source_procedure_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     source_project_state_snapshot_ids: Mapped[list[str]] = mapped_column(
         JSONB,
         nullable=False,
         default=list,
+    )
+    source_memory_versions: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict
     )
     projection_version: Mapped[str] = mapped_column(String(32), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -1698,8 +2049,18 @@ class MemoryContextBlockRecord(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "block_type IN ('pinned_core', 'project_state', 'procedure', 'episodic', 'reasoning')",
+            "block_type IN ('hot_index', 'topic', 'pinned_core', 'project_state', "
+            "'procedure', 'episodic', 'reasoning')",
             name="ck_memory_context_block_type",
+        ),
+        CheckConstraint(
+            "lifecycle_state IN ('active', 'stale', 'superseded', 'deleted')",
+            name="ck_memory_context_block_lifecycle_state",
+        ),
+        CheckConstraint(
+            "(block_type = 'topic' AND topic_id IS NOT NULL) OR "
+            "(block_type != 'topic' AND topic_id IS NULL)",
+            name="ck_memory_context_block_topic_binding",
         ),
         Index(
             "ix_memory_context_blocks_unique",
@@ -1707,6 +2068,150 @@ class MemoryContextBlockRecord(Base):
             "scope_key",
             "projection_version",
             unique=True,
+            postgresql_where=(block_type != "topic"),
+        ),
+        Index(
+            "ix_memory_context_topic_blocks_unique",
+            "block_type",
+            "scope_key",
+            "topic_id",
+            "projection_version",
+            unique=True,
+            postgresql_where=(block_type == "topic"),
+        ),
+    )
+
+
+class MemoryTopicRecord(Base):
+    __tablename__ = "memory_topics"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    topic_key: Mapped[str] = mapped_column(Text, nullable=False)
+    family: Mapped[str] = mapped_column(String(64), nullable=False)
+    scope_key: Mapped[str] = mapped_column(Text, nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    projection_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "family IN ('user-profile', 'user-preferences', 'active-projects', "
+            "'repo-conventions', 'architecture-decisions', 'commitments', "
+            "'procedures', 'negative-knowledge', 'recent-failures', "
+            "'proactive-patterns', 'external-connectors', 'open-risks', "
+            "'resolved-conflicts')",
+            name="ck_memory_topic_family",
+        ),
+        CheckConstraint(
+            "lifecycle_state IN ('active', 'stale', 'superseded', 'deleted')",
+            name="ck_memory_topic_lifecycle_state",
+        ),
+        Index("ix_memory_topics_scope_key_unique", "scope_key", "topic_key", unique=True),
+    )
+
+
+class MemoryTopicMemberRecord(Base):
+    __tablename__ = "memory_topic_members"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    topic_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("memory_topics.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    canonical_table: Mapped[str] = mapped_column(String(64), nullable=False)
+    canonical_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    membership_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "canonical_table IN ('memory_assertions', 'memory_episodes', "
+            "'memory_reasoning_traces', 'memory_action_traces', 'memory_procedures', "
+            "'project_state_snapshots')",
+            name="ck_memory_topic_member_canonical_table",
+        ),
+        CheckConstraint(
+            "membership_kind IN ('source', 'pointer', 'summary')",
+            name="ck_memory_topic_member_kind",
+        ),
+        CheckConstraint("rank >= 0", name="ck_memory_topic_member_rank_nonnegative"),
+        Index(
+            "ix_memory_topic_members_unique",
+            "topic_id",
+            "canonical_table",
+            "canonical_id",
+            unique=True,
+        ),
+    )
+
+
+class MemoryExportArtifactRecord(Base):
+    __tablename__ = "memory_export_artifacts"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    scope_key: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    export_format: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    redaction_posture: Mapped[str] = mapped_column(String(32), nullable=False)
+    content: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    source_counts: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    actor_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "export_format IN ('json')",
+            name="ck_memory_export_artifact_format",
+        ),
+        CheckConstraint(
+            "status IN ('created', 'failed')",
+            name="ck_memory_export_artifact_status",
+        ),
+        CheckConstraint(
+            "redaction_posture IN ('none', 'redacted', 'privacy_deleted')",
+            name="ck_memory_export_artifact_redaction_posture",
+        ),
+    )
+
+
+class MemoryEvalRunRecord(Base):
+    __tablename__ = "memory_eval_runs"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    eval_name: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    metrics: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    cases: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('completed', 'failed')",
+            name="ck_memory_eval_run_status",
         ),
     )
 
@@ -2085,6 +2590,596 @@ class WorkspaceItemEventRecord(Base):
         CheckConstraint(
             "event_type IN ('created', 'updated', 'deleted', 'restored')",
             name="ck_workspace_item_event_type",
+        ),
+    )
+
+
+class GoogleProviderObjectRecord(Base):
+    __tablename__ = "google_provider_objects"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    provider_account_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    object_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    external_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    thread_external_id: Mapped[str | None] = mapped_column(String(256), nullable=True, index=True)
+    calendar_id: Mapped[str | None] = mapped_column(String(256), nullable=True, index=True)
+    ical_uid: Mapped[str | None] = mapped_column(String(256), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_timestamp: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    provider_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    content_digest: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "object_type IN ('gmail_message', 'gmail_thread', 'calendar_event', "
+            "'calendar_availability')",
+            name="ck_google_provider_object_type",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'deleted', 'stale', 'unavailable')",
+            name="ck_google_provider_object_status",
+        ),
+        CheckConstraint(
+            "(object_type != 'calendar_event') OR (calendar_id IS NOT NULL)",
+            name="ck_google_provider_object_calendar_identity",
+        ),
+        Index(
+            "ix_google_provider_object_identity_unique",
+            "provider_account_id",
+            "object_type",
+            "external_id",
+            unique=True,
+            postgresql_where=text("object_type != 'calendar_event'"),
+        ),
+        Index(
+            "ix_google_provider_objects_calendar_event_identity_unique",
+            "provider_account_id",
+            "object_type",
+            "calendar_id",
+            "external_id",
+            unique=True,
+            postgresql_where=text("object_type = 'calendar_event'"),
+        ),
+        Index(
+            "ix_google_provider_objects_thread",
+            "provider_account_id",
+            "thread_external_id",
+        ),
+    )
+
+
+class ProviderEvidenceRecord(Base):
+    __tablename__ = "provider_evidence"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    provider_object_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("google_provider_objects.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider_account_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    external_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    thread_external_id: Mapped[str | None] = mapped_column(String(256), nullable=True, index=True)
+    calendar_id: Mapped[str | None] = mapped_column(String(256), nullable=True, index=True)
+    source_uri: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_timestamp: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    content_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    taint: Mapped[str] = mapped_column(String(32), nullable=False)
+    sensitivity: Mapped[str] = mapped_column(String(32), nullable=False)
+    retention_policy: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="provider_source"
+    )
+    extraction_status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint("provider IN ('google')", name="ck_provider_evidence_provider"),
+        CheckConstraint(
+            "source_kind IN ('gmail_message', 'gmail_thread', 'calendar_event', "
+            "'calendar_availability')",
+            name="ck_provider_evidence_source_kind",
+        ),
+        CheckConstraint(
+            "taint IN ('provider_untrusted', 'provider_metadata', 'internal')",
+            name="ck_provider_evidence_taint",
+        ),
+        CheckConstraint(
+            "sensitivity IN ('normal', 'private', 'restricted')",
+            name="ck_provider_evidence_sensitivity",
+        ),
+        CheckConstraint(
+            "retention_policy IN ('provider_source', 'short_lived', 'user_pinned')",
+            name="ck_provider_evidence_retention_policy",
+        ),
+        CheckConstraint(
+            "extraction_status IN ('pending', 'extracted', 'not_actionable', 'failed')",
+            name="ck_provider_evidence_extraction_status",
+        ),
+        CheckConstraint(
+            "lifecycle_state IN ('available', 'superseded', 'redacted', 'deleted', "
+            "'stale', 'unavailable')",
+            name="ck_provider_evidence_lifecycle_state",
+        ),
+        Index(
+            "ix_provider_evidence_identity_digest_unique",
+            "provider_object_id",
+            "content_digest",
+            unique=True,
+        ),
+        Index(
+            "ix_provider_evidence_source",
+            "provider",
+            "provider_account_id",
+            "source_kind",
+            "external_id",
+        ),
+    )
+
+
+class ProviderEvidenceBlockRecord(Base):
+    __tablename__ = "provider_evidence_blocks"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    evidence_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("provider_evidence.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    block_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    block_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_offsets: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint("block_index >= 0", name="ck_provider_evidence_block_index"),
+        CheckConstraint(
+            "block_kind IN ('body', 'html_body', 'quote', 'forwarded', 'signature', "
+            "'calendar_description', 'availability')",
+            name="ck_provider_evidence_block_kind",
+        ),
+        Index(
+            "ix_provider_evidence_blocks_unique",
+            "evidence_id",
+            "block_index",
+            unique=True,
+        ),
+    )
+
+
+class WorkPersonRecord(Base):
+    __tablename__ = "work_people"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider_account_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    email_address: Mapped[str] = mapped_column(Text, nullable=False)
+    display_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    relation: Mapped[str] = mapped_column(String(32), nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint("provider IN ('google')", name="ck_work_person_provider"),
+        CheckConstraint(
+            "relation IN ('user', 'counterparty', 'unknown')",
+            name="ck_work_person_relation",
+        ),
+        Index(
+            "ix_work_people_email_unique",
+            "provider",
+            "provider_account_id",
+            "email_address",
+            unique=True,
+        ),
+    )
+
+
+class WorkThreadRecord(Base):
+    __tablename__ = "work_threads"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider_account_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    provider_thread_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    normalized_subject: Mapped[str] = mapped_column(Text, nullable=False)
+    participant_emails: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    last_inbound_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    last_outbound_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    last_evidence_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("provider_evidence.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint("provider IN ('google')", name="ck_work_thread_provider"),
+        CheckConstraint(
+            "state IN ('active', 'waiting_on_user', 'waiting_on_counterparty', "
+            "'resolved', 'stale')",
+            name="ck_work_thread_state",
+        ),
+        Index(
+            "ix_work_threads_provider_thread_unique",
+            "provider",
+            "provider_account_id",
+            "provider_thread_id",
+            unique=True,
+        ),
+    )
+
+
+class WorkCommitmentRecord(Base):
+    __tablename__ = "work_commitments"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider_account_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    owner: Mapped[str] = mapped_column(String(32), nullable=False)
+    requester_person_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("work_people.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    counterparty_person_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("work_people.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    thread_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("work_threads.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    dedupe_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    action_text: Mapped[str] = mapped_column(Text, nullable=False)
+    action_category: Mapped[str] = mapped_column(String(64), nullable=False)
+    due_start: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    due_end: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    timezone: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    priority: Mapped[str] = mapped_column(String(32), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    review_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    resolution_evidence_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("provider_evidence.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    superseded_by_commitment_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("work_commitments.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint("provider IN ('google')", name="ck_work_commitment_provider"),
+        CheckConstraint(
+            "owner IN ('user', 'counterparty', 'shared', 'unknown')",
+            name="ck_work_commitment_owner",
+        ),
+        CheckConstraint(
+            "priority IN ('critical', 'high', 'normal', 'low')",
+            name="ck_work_commitment_priority",
+        ),
+        CheckConstraint(
+            "confidence >= 0.0 AND confidence <= 1.0",
+            name="ck_work_commitment_confidence",
+        ),
+        CheckConstraint(
+            "(due_end IS NULL) OR (due_start IS NULL) OR (due_start < due_end)",
+            name="ck_work_commitment_due_interval",
+        ),
+        CheckConstraint(
+            "lifecycle_state IN ('candidate', 'needs_review', 'active', "
+            "'waiting_on_user', 'waiting_on_counterparty', 'scheduled', 'snoozed', "
+            "'resolved', 'superseded', 'dismissed', 'rejected', 'stale', 'expired', "
+            "'deleted')",
+            name="ck_work_commitment_lifecycle_state",
+        ),
+        CheckConstraint(
+            "review_state IN ('unreviewed', 'review_required', 'approved', 'edited', 'rejected')",
+            name="ck_work_commitment_review_state",
+        ),
+        CheckConstraint(
+            "(lifecycle_state != 'superseded') OR (superseded_by_commitment_id IS NOT NULL)",
+            name="ck_work_commitment_superseded_link",
+        ),
+        Index(
+            "ix_work_commitments_provider_state_due",
+            "provider",
+            "provider_account_id",
+            "lifecycle_state",
+            "due_start",
+            "id",
+        ),
+        Index(
+            "ix_work_commitments_thread_state",
+            "thread_id",
+            "lifecycle_state",
+            "updated_at",
+        ),
+        Index(
+            "ix_work_commitments_owner_lifecycle_state",
+            "owner",
+            "lifecycle_state",
+            "updated_at",
+        ),
+        Index(
+            "ix_work_commitments_active_source_unique",
+            "provider",
+            "provider_account_id",
+            "dedupe_digest",
+            unique=True,
+            postgresql_where=text(
+                "lifecycle_state IN ('active', 'waiting_on_user', "
+                "'waiting_on_counterparty', 'scheduled', 'snoozed')"
+            ),
+        ),
+    )
+
+
+class WorkCommitmentSourceRecord(Base):
+    __tablename__ = "work_commitment_sources"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    commitment_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("work_commitments.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    evidence_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("provider_evidence.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    block_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    source_role: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "source_role IN ('created', 'updated', 'resolved', 'superseded')",
+            name="ck_work_commitment_source_role",
+        ),
+        Index(
+            "ix_work_commitment_sources_unique",
+            "commitment_id",
+            "evidence_id",
+            "source_role",
+            unique=True,
+        ),
+    )
+
+
+class WorkFollowUpLoopRecord(Base):
+    __tablename__ = "work_follow_up_loops"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    commitment_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("work_commitments.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    thread_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("work_threads.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    loop_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    next_check_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    next_notification_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    stale_after: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    last_evaluated_evidence_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("provider_evidence.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    snoozed_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    last_feedback: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "(commitment_id IS NOT NULL AND thread_id IS NULL) OR "
+            "(commitment_id IS NULL AND thread_id IS NOT NULL)",
+            name="ck_work_follow_up_loop_owner",
+        ),
+        CheckConstraint(
+            "loop_kind IN ('due_date', 'waiting_for_reply', 'needs_user_reply')",
+            name="ck_work_follow_up_loop_kind",
+        ),
+        CheckConstraint(
+            "state IN ('active', 'waiting', 'snoozed', 'notified', 'resolved', "
+            "'stale', 'suppressed', 'deleted')",
+            name="ck_work_follow_up_loop_state",
+        ),
+        CheckConstraint("version > 0", name="ck_work_follow_up_loop_version"),
+        Index(
+            "ix_work_follow_up_loops_due",
+            "state",
+            "next_check_at",
+            "id",
+        ),
+    )
+
+
+class WorkFollowUpEventRecord(Base):
+    __tablename__ = "work_follow_up_events"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    loop_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("work_follow_up_loops.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    loop_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint("loop_version > 0", name="ck_work_follow_up_event_loop_version"),
+        CheckConstraint(
+            "event_type IN ('evaluated', 'scheduled', 'notified', 'suppressed', "
+            "'snoozed', 'dismissed', 'resolved', 'stale_noop', 'failed')",
+            name="ck_work_follow_up_event_type",
+        ),
+    )
+
+
+class ProviderWriteReceiptRecord(Base):
+    __tablename__ = "provider_write_receipts"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider_account_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    action_attempt_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("action_attempts.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    capability_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider_object_ids: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    request_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    response_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    ambiguity_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    provider_timestamp: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    provider_etag: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    provider_history_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    response_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint("provider IN ('google')", name="ck_provider_write_receipt_provider"),
+        CheckConstraint(
+            "capability_id IN ('cap.email.draft', 'cap.email.send', "
+            "'cap.email.archive', 'cap.email.trash', 'cap.email.labels.modify', "
+            "'cap.email.undo', 'cap.calendar.create_event', 'cap.calendar.update_event', "
+            "'cap.calendar.respond_to_event', 'cap.drive.share')",
+            name="ck_provider_write_receipt_capability",
+        ),
+        CheckConstraint(
+            "status IN ('executing', 'succeeded', 'failed', 'ambiguous')",
+            name="ck_provider_write_receipt_status",
+        ),
+        CheckConstraint(
+            "(status = 'ambiguous' AND ambiguity_reason IS NOT NULL) OR "
+            "(status != 'ambiguous' AND ambiguity_reason IS NULL)",
+            name="ck_provider_write_receipt_ambiguity_reason",
+        ),
+        Index(
+            "ix_provider_write_receipts_idempotency_unique",
+            "provider",
+            "provider_account_id",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=(idempotency_key.is_not(None)),
+        ),
+        Index(
+            "ix_provider_write_receipts_attempt_idempotency_unique",
+            "action_attempt_id",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=(idempotency_key.is_not(None)),
         ),
     )
 
@@ -2588,6 +3683,25 @@ class BackgroundTaskRecord(Base):
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     task_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    work_follow_up_loop_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("work_follow_up_loops.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    work_follow_up_loop_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    work_follow_up_scheduled_for: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
+    provider_write_receipt_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("provider_write_receipts.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -2616,13 +3730,35 @@ class BackgroundTaskRecord(Base):
                 "'provider_sync_due', 'memory_extract_turn', "
                 "'ambient_interpretation_due', 'proactive_deliberation_due', "
                 "'proactive_follow_up_due', 'proactive_feedback_learning_due', "
-                "'proactive_action_execution_due', 'execute_action_attempt')"
+                "'proactive_action_execution_due', 'execute_action_attempt', "
+                "'google_object_hydration_due', 'provider_evidence_extraction_due', "
+                "'workspace_commitment_extraction_due', 'work_follow_up_evaluate_due', "
+                "'provider_write_reconcile_due')"
             ),
             name="ck_background_task_type",
         ),
         CheckConstraint(
             "status IN ('pending', 'running', 'completed', 'failed', 'dead_letter')",
             name="ck_background_task_status",
+        ),
+        CheckConstraint(
+            "(task_type = 'work_follow_up_evaluate_due' "
+            "AND work_follow_up_loop_id IS NOT NULL "
+            "AND work_follow_up_loop_version IS NOT NULL "
+            "AND work_follow_up_loop_version > 0 "
+            "AND work_follow_up_scheduled_for IS NOT NULL) OR "
+            "(task_type != 'work_follow_up_evaluate_due' "
+            "AND work_follow_up_loop_id IS NULL "
+            "AND work_follow_up_loop_version IS NULL "
+            "AND work_follow_up_scheduled_for IS NULL)",
+            name="ck_background_task_work_follow_up_shape",
+        ),
+        CheckConstraint(
+            "(task_type = 'provider_write_reconcile_due' "
+            "AND provider_write_receipt_id IS NOT NULL) OR "
+            "(task_type != 'provider_write_reconcile_due' "
+            "AND provider_write_receipt_id IS NULL)",
+            name="ck_background_task_provider_write_reconcile_shape",
         ),
         CheckConstraint("attempts >= 0", name="ck_background_task_attempts_nonnegative"),
         CheckConstraint("max_attempts > 0", name="ck_background_task_max_attempts_positive"),
@@ -2631,6 +3767,26 @@ class BackgroundTaskRecord(Base):
             "status",
             "run_after",
             "created_at",
+        ),
+        Index(
+            "ix_background_tasks_idempotency_key_unique",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=(idempotency_key.is_not(None)),
+        ),
+        Index(
+            "ix_background_tasks_work_follow_up_unique",
+            "work_follow_up_loop_id",
+            "work_follow_up_loop_version",
+            "work_follow_up_scheduled_for",
+            unique=True,
+            postgresql_where=(task_type == "work_follow_up_evaluate_due"),
+        ),
+        Index(
+            "ix_background_tasks_provider_write_reconcile_unique",
+            "provider_write_receipt_id",
+            unique=True,
+            postgresql_where=(task_type == "provider_write_reconcile_due"),
         ),
     )
 
@@ -2788,7 +3944,8 @@ class NotificationRecord(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "source_type IN ('agency_event', 'proactive_turn', 'approval', 'connector_event')",
+            "source_type IN ('agency_event', 'proactive_turn', 'approval', 'connector_event', "
+            "'work_follow_up')",
             name="ck_notification_source_type",
         ),
         CheckConstraint("channel IN ('discord')", name="ck_notification_channel"),
@@ -2833,6 +3990,7 @@ def serialize_session(session: SessionRecord) -> dict[str, Any]:
         "id": session.id,
         "is_active": session.is_active,
         "lifecycle_state": session.lifecycle_state,
+        "memory_mode": session.memory_mode,
         "created_at": to_rfc3339(session.created_at),
         "updated_at": to_rfc3339(session.updated_at),
     }
@@ -3129,6 +4287,123 @@ def serialize_workspace_item_event(event: WorkspaceItemEventRecord) -> dict[str,
     }
 
 
+def serialize_google_provider_object(item: GoogleProviderObjectRecord) -> dict[str, Any]:
+    return {
+        "id": item.id,
+        "provider_account_id": redact_text(item.provider_account_id),
+        "object_type": item.object_type,
+        "external_id": redact_text(item.external_id),
+        "thread_external_id": redact_text(item.thread_external_id)
+        if item.thread_external_id
+        else None,
+        "calendar_id": redact_text(item.calendar_id) if item.calendar_id else None,
+        "ical_uid": redact_text(item.ical_uid) if item.ical_uid else None,
+        "status": item.status,
+        "source_timestamp": (
+            to_rfc3339(item.source_timestamp) if item.source_timestamp is not None else None
+        ),
+        "observed_at": to_rfc3339(item.observed_at),
+        "provider_url": redact_text(item.provider_url) if item.provider_url else None,
+        "metadata": redact_json_value(item.metadata_json),
+        "content_digest": item.content_digest,
+        "created_at": to_rfc3339(item.created_at),
+        "updated_at": to_rfc3339(item.updated_at),
+    }
+
+
+def serialize_provider_evidence(evidence: ProviderEvidenceRecord) -> dict[str, Any]:
+    return {
+        "id": evidence.id,
+        "provider_object_id": evidence.provider_object_id,
+        "provider": evidence.provider,
+        "provider_account_id": redact_text(evidence.provider_account_id),
+        "source_kind": evidence.source_kind,
+        "external_id": redact_text(evidence.external_id),
+        "thread_external_id": redact_text(evidence.thread_external_id)
+        if evidence.thread_external_id
+        else None,
+        "calendar_id": redact_text(evidence.calendar_id) if evidence.calendar_id else None,
+        "source_uri": redact_text(evidence.source_uri) if evidence.source_uri else None,
+        "source_timestamp": (
+            to_rfc3339(evidence.source_timestamp) if evidence.source_timestamp is not None else None
+        ),
+        "content_digest": evidence.content_digest,
+        "metadata": redact_json_value(evidence.metadata_json),
+        "taint": evidence.taint,
+        "sensitivity": evidence.sensitivity,
+        "retention_policy": evidence.retention_policy,
+        "extraction_status": evidence.extraction_status,
+        "lifecycle_state": evidence.lifecycle_state,
+        "observed_at": to_rfc3339(evidence.observed_at),
+        "created_at": to_rfc3339(evidence.created_at),
+        "updated_at": to_rfc3339(evidence.updated_at),
+    }
+
+
+def serialize_provider_evidence_block(block: ProviderEvidenceBlockRecord) -> dict[str, Any]:
+    return {
+        "id": block.id,
+        "evidence_id": block.evidence_id,
+        "block_index": block.block_index,
+        "block_kind": block.block_kind,
+        "text": redact_text(block.text),
+        "digest": block.digest,
+        "source_offsets": redact_json_value(block.source_offsets),
+        "metadata": redact_json_value(block.metadata_json),
+        "created_at": to_rfc3339(block.created_at),
+    }
+
+
+def serialize_work_commitment(commitment: WorkCommitmentRecord) -> dict[str, Any]:
+    return {
+        "id": commitment.id,
+        "provider": commitment.provider,
+        "provider_account_id": redact_text(commitment.provider_account_id),
+        "owner": commitment.owner,
+        "requester_person_id": commitment.requester_person_id,
+        "counterparty_person_id": commitment.counterparty_person_id,
+        "thread_id": commitment.thread_id,
+        "dedupe_digest": commitment.dedupe_digest,
+        "action_text": redact_text(commitment.action_text),
+        "action_category": commitment.action_category,
+        "due_start": to_rfc3339(commitment.due_start) if commitment.due_start else None,
+        "due_end": to_rfc3339(commitment.due_end) if commitment.due_end else None,
+        "timezone": commitment.timezone,
+        "priority": commitment.priority,
+        "confidence": commitment.confidence,
+        "lifecycle_state": commitment.lifecycle_state,
+        "review_state": commitment.review_state,
+        "resolution_evidence_id": commitment.resolution_evidence_id,
+        "superseded_by_commitment_id": commitment.superseded_by_commitment_id,
+        "metadata": redact_json_value(commitment.metadata_json),
+        "created_at": to_rfc3339(commitment.created_at),
+        "updated_at": to_rfc3339(commitment.updated_at),
+    }
+
+
+def serialize_work_follow_up_loop(loop: WorkFollowUpLoopRecord) -> dict[str, Any]:
+    return {
+        "id": loop.id,
+        "commitment_id": loop.commitment_id,
+        "thread_id": loop.thread_id,
+        "loop_kind": loop.loop_kind,
+        "state": loop.state,
+        "version": loop.version,
+        "next_check_at": to_rfc3339(loop.next_check_at) if loop.next_check_at else None,
+        "next_notification_at": (
+            to_rfc3339(loop.next_notification_at) if loop.next_notification_at else None
+        ),
+        "stale_after": to_rfc3339(loop.stale_after) if loop.stale_after else None,
+        "last_evaluated_evidence_id": loop.last_evaluated_evidence_id,
+        "snoozed_until": to_rfc3339(loop.snoozed_until) if loop.snoozed_until else None,
+        "last_feedback": loop.last_feedback,
+        "policy_version": loop.policy_version,
+        "metadata": redact_json_value(loop.metadata_json),
+        "created_at": to_rfc3339(loop.created_at),
+        "updated_at": to_rfc3339(loop.updated_at),
+    }
+
+
 def serialize_proactive_observation(observation: ProactiveObservationRecord) -> dict[str, Any]:
     return {
         "id": observation.id,
@@ -3403,14 +4678,20 @@ def serialize_action_attempt(
         "capability_contract_hash": action_attempt.capability_contract_hash,
         "impact_level": action_attempt.impact_level,
         "status": action_attempt.status,
-        "proposal_input": action_attempt.proposed_input,
+        "proposal_input": _redact_provider_write_input(
+            capability_id=action_attempt.capability_id,
+            payload=action_attempt.proposed_input,
+        ),
         "policy_decision": action_attempt.policy_decision,
         "policy_reason": action_attempt.policy_reason,
         "approval_required": action_attempt.approval_required,
         "approval": serialize_approval_request(approval) if approval is not None else None,
         "execution": {
             "status": _execution_view_status(action_attempt),
-            "output": action_attempt.execution_output,
+            "output": _redact_provider_write_output(
+                capability_id=action_attempt.capability_id,
+                payload=action_attempt.execution_output,
+            ),
             "error": action_attempt.execution_error,
         },
         "created_at": to_rfc3339(action_attempt.created_at),
@@ -3425,6 +4706,45 @@ def _redacted_optional_text(value: Any) -> str | None:
     if not normalized:
         return None
     return redact_text(normalized)
+
+
+def _provider_text_marker(value: str) -> dict[str, Any]:
+    return {
+        "redacted": True,
+        "digest": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+        "char_count": len(value),
+    }
+
+
+def _redact_provider_write_input(*, capability_id: str, payload: Any) -> Any:
+    if not isinstance(payload, dict):
+        return redact_json_value(payload)
+
+    redacted = dict(payload)
+    if capability_id in {"cap.email.draft", "cap.email.send"}:
+        body = redacted.get("body")
+        if isinstance(body, str):
+            redacted["body"] = _provider_text_marker(body)
+    if capability_id in {"cap.calendar.create_event", "cap.calendar.update_event"}:
+        description = redacted.get("description")
+        if isinstance(description, str):
+            redacted["description"] = _provider_text_marker(description)
+    return redact_json_value(redacted)
+
+
+def _redact_provider_write_output(*, capability_id: str, payload: Any) -> Any:
+    if not isinstance(payload, dict):
+        return redact_json_value(payload)
+    redacted = dict(payload)
+    if capability_id in {"cap.email.draft", "cap.email.send"}:
+        for container in (redacted, redacted.get("draft"), redacted.get("message")):
+            if isinstance(container, dict) and isinstance(container.get("body"), str):
+                container["body"] = _provider_text_marker(container["body"])
+    if capability_id in {"cap.calendar.create_event", "cap.calendar.update_event"}:
+        for container in (redacted, redacted.get("event")):
+            if isinstance(container, dict) and isinstance(container.get("description"), str):
+                container["description"] = _provider_text_marker(container["description"])
+    return redact_json_value(redacted)
 
 
 def serialize_artifact(artifact: ArtifactRecord) -> dict[str, Any]:
@@ -3505,7 +4825,12 @@ def _serialize_surface_action_lifecycle(
             execution_status = (
                 execution_status_raw if isinstance(execution_status_raw, str) else "not_executed"
             )
-            execution_output = redact_json_value(execution_payload.get("output"))
+            execution_output = _redact_provider_write_output(
+                capability_id=capability_id
+                if isinstance(capability_id, str)
+                else "unknown.capability",
+                payload=execution_payload.get("output"),
+            )
             execution_error = _redacted_optional_text(execution_payload.get("error"))
         else:
             execution_status = "not_executed"
@@ -3522,7 +4847,12 @@ def _serialize_surface_action_lifecycle(
                     "capability_id": (
                         capability_id if isinstance(capability_id, str) else "unknown.capability"
                     ),
-                    "input_summary": redact_json_value(action_attempt.get("proposal_input")),
+                    "input_summary": _redact_provider_write_input(
+                        capability_id=capability_id
+                        if isinstance(capability_id, str)
+                        else "unknown.capability",
+                        payload=action_attempt.get("proposal_input"),
+                    ),
                 },
                 "policy": {
                     "decision": policy_decision if isinstance(policy_decision, str) else "deny",

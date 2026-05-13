@@ -30,17 +30,10 @@ This directory is the canonical home for repository documentation.
 ### Code style
 
 - [ai-first.md](ai-first.md): AI owns judgment, deterministic code owns rails
-- [ai-first-judgment-cutover.md](ai-first-judgment-cutover.md): hard cutover
-  plan for AI-owned memory, tool synthesis, feedback, continuity, and ambient
-  interpretation
-- [ai-first-completion-cutover.md](ai-first-completion-cutover.md): final
-  completion plan for typed AI judgment failures, audit records, tool-result
-  interpretation, continuity durability, feedback auditability, and autonomy
-  rails
-- [ai-first-verification-gap-cutover.md](ai-first-verification-gap-cutover.md):
-  final hard-cutover plan for verified AI-first completion gaps
-- [ai-first-sota-gap-cutover.md](ai-first-sota-gap-cutover.md): final SOTA
-  hard-cutover plan for post-verification AI-first gaps
+- [agent-tooling.md](agent-tooling.md): terminal-first agent tooling, skills,
+  structured tools, security rails, and SOTA direction
+- [north-star-cutover.md](north-star-cutover.md): hard cutover spec for the
+  terminal-first, task-scoped-tool, Agency-centered product architecture
 - [simplicity.md](simplicity.md): fewer code paths, no speculative surface
 - [function-parameters.md](function-parameters.md): parameter conventions
 - [control-flow.md](control-flow.md): exhaustive branching and race-safety
@@ -53,12 +46,6 @@ This directory is the canonical home for repository documentation.
 
 ### Product operations
 
-- [email-decluttering-sota-cutover.md](email-decluttering-sota-cutover.md):
-  hard cutover plan for frontier email decluttering, mailbox mutations,
-  thread watches, auditability, and undo
-- [proactive-ai-deliberation-cutover.md](proactive-ai-deliberation-cutover.md):
-  hard cutover to event-triggered AI deliberation, ambient sensing, and
-  autonomous action
 - [production-runbook.md](production-runbook.md): production deployment, operations,
   ambient Discord chat, deterministic slash operations, health checks, recovery,
   and acceptance criteria

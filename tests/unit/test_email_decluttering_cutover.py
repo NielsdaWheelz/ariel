@@ -62,10 +62,18 @@ def test_email_mutations_require_idempotency_and_narrow_gmail_modify_scope() -> 
     assert archive is not None
     assert archive.validate_input({"message_ids": ["m1"]}) == (None, "schema_invalid")
     normalized, error = archive.validate_input(
-        {"message_ids": ["m1", "m1", "m2"], "idempotency_key": " k "}
+        {
+            "message_ids": ["m1", "m1", "m2"],
+            "idempotency_key": " k ",
+            "user_instruction_ref": "turn:turn_1",
+        }
     )
     assert error is None
-    assert normalized == {"message_ids": ["m1", "m2"], "idempotency_key": "k"}
+    assert normalized == {
+        "message_ids": ["m1", "m2"],
+        "idempotency_key": "k",
+        "user_instruction_ref": "turn:turn_1",
+    }
 
 
 def test_email_capabilities_do_not_request_broad_gmail_scope() -> None:
@@ -105,8 +113,17 @@ def test_email_response_tool_schemas_are_final_and_strict_where_possible() -> No
                 "maxItems": 1000,
             },
             "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 128},
+            "source_evidence_id": {"type": ["string", "null"]},
+            "commitment_id": {"type": ["string", "null"]},
+            "user_instruction_ref": {"type": ["string", "null"]},
         },
-        "required": ["message_ids", "idempotency_key"],
+        "required": [
+            "message_ids",
+            "idempotency_key",
+            "source_evidence_id",
+            "commitment_id",
+            "user_instruction_ref",
+        ],
         "additionalProperties": False,
     }
     assert (
@@ -140,6 +157,9 @@ def test_email_response_tool_schemas_are_final_and_strict_where_possible() -> No
             "maxItems": 100,
         },
         "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 128},
+        "source_evidence_id": {"type": ["string", "null"]},
+        "commitment_id": {"type": ["string", "null"]},
+        "user_instruction_ref": {"type": ["string", "null"]},
     }
 
 
@@ -153,6 +173,7 @@ def test_email_label_modify_contract_is_single_primary_shape() -> None:
             "add_labels": ["Receipts"],
             "remove_labels": [],
             "idempotency_key": "label-1",
+            "user_instruction_ref": "turn:turn_1",
         }
     )
 
@@ -162,6 +183,7 @@ def test_email_label_modify_contract_is_single_primary_shape() -> None:
         "add_labels": ["Receipts"],
         "remove_labels": [],
         "idempotency_key": "label-1",
+        "user_instruction_ref": "turn:turn_1",
     }
     assert capability.validate_input(
         {
@@ -169,6 +191,7 @@ def test_email_label_modify_contract_is_single_primary_shape() -> None:
             "add_labels": [],
             "remove_labels": [],
             "idempotency_key": "label-1",
+            "user_instruction_ref": "turn:turn_1",
         }
     ) == (None, "schema_invalid")
 

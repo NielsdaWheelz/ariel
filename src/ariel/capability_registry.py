@@ -48,6 +48,21 @@ AGENCY_CAPABILITY_IDS = {
 }
 DISCORD_CAPABILITY_IDS = {"cap.discord.no_response"}
 ATTACHMENT_CAPABILITY_IDS = {"cap.attachment.read"}
+MEMORY_CAPABILITY_IDS = {
+    "cap.memory.inspect",
+    "cap.memory.search",
+    "cap.memory.propose",
+    "cap.memory.review",
+    "cap.memory.correct",
+    "cap.memory.retract",
+    "cap.memory.delete",
+    "cap.memory.privacy_delete",
+    "cap.memory.redact_evidence",
+    "cap.memory.set_never_remember",
+    "cap.memory.resolve_conflict",
+    "cap.memory.consolidate",
+    "cap.memory.export",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,9 +206,19 @@ def _validate_calendar_list_input(
 def _validate_calendar_propose_slots_input(
     raw_input: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
-    if not set(raw_input.keys()).issubset(
-        {"window_start", "window_end", "duration_minutes", "attendees"}
-    ):
+    if set(raw_input.keys()) != {
+        "window_start",
+        "window_end",
+        "duration_minutes",
+        "attendees",
+        "timezone",
+        "source_evidence_ids",
+        "quoted_content_caveat",
+        "participants",
+        "proposed_windows",
+        "timezone_evidence",
+        "constraints",
+    }:
         return None, "schema_invalid"
 
     window_start = _normalize_rfc3339_like(raw_input.get("window_start"))
@@ -223,11 +248,119 @@ def _validate_calendar_propose_slots_input(
             return None, "schema_invalid"
         attendees.append(attendee)
 
+    timezone = _normalize_optional_text(raw_input.get("timezone"), max_length=64)
+    if timezone is None:
+        return None, "schema_invalid"
+
+    source_evidence_ids_raw = raw_input.get("source_evidence_ids")
+    if not isinstance(source_evidence_ids_raw, list) or len(source_evidence_ids_raw) > 20:
+        return None, "schema_invalid"
+    source_evidence_ids: list[str] = []
+    for evidence_id_raw in source_evidence_ids_raw:
+        evidence_id = _normalize_optional_text(evidence_id_raw, max_length=64)
+        if evidence_id is None:
+            return None, "schema_invalid"
+        source_evidence_ids.append(evidence_id)
+
+    quoted_content_caveat = raw_input.get("quoted_content_caveat")
+    if not isinstance(quoted_content_caveat, bool):
+        return None, "schema_invalid"
+
+    participants_raw = raw_input.get("participants")
+    if not isinstance(participants_raw, list) or len(participants_raw) > 20:
+        return None, "schema_invalid"
+    participants: list[str] = []
+    for participant_raw in participants_raw:
+        participant = _normalize_optional_text(participant_raw, max_length=320)
+        if participant is None:
+            return None, "schema_invalid"
+        participants.append(participant)
+
+    proposed_windows_raw = raw_input.get("proposed_windows")
+    if not isinstance(proposed_windows_raw, list) or len(proposed_windows_raw) > 20:
+        return None, "schema_invalid"
+    proposed_windows: list[dict[str, str]] = []
+    for proposed_window_raw in proposed_windows_raw:
+        if not isinstance(proposed_window_raw, dict):
+            return None, "schema_invalid"
+        proposed_start = _normalize_rfc3339_like(proposed_window_raw.get("start"))
+        proposed_end = _normalize_rfc3339_like(proposed_window_raw.get("end"))
+        if proposed_start is None or proposed_end is None:
+            return None, "schema_invalid"
+        proposed_start_dt = datetime.fromisoformat(proposed_start.replace("Z", "+00:00"))
+        proposed_end_dt = datetime.fromisoformat(proposed_end.replace("Z", "+00:00"))
+        if proposed_end_dt <= proposed_start_dt:
+            return None, "schema_invalid"
+        proposed_windows.append({"start": proposed_start, "end": proposed_end})
+
+    timezone_evidence = raw_input.get("timezone_evidence")
+    if not isinstance(timezone_evidence, dict) or set(timezone_evidence.keys()) != {
+        "source",
+        "rationale",
+        "confidence",
+    }:
+        return None, "schema_invalid"
+    timezone_evidence_source = _normalize_optional_text(
+        timezone_evidence.get("source"), max_length=128
+    )
+    if timezone_evidence.get("source") is not None and timezone_evidence_source is None:
+        return None, "schema_invalid"
+    timezone_evidence_rationale = _normalize_optional_text(
+        timezone_evidence.get("rationale"), max_length=500
+    )
+    if timezone_evidence.get("rationale") is not None and timezone_evidence_rationale is None:
+        return None, "schema_invalid"
+    timezone_confidence_raw = timezone_evidence.get("confidence")
+    if timezone_confidence_raw is None:
+        timezone_confidence = None
+    elif isinstance(timezone_confidence_raw, int | float) and not isinstance(
+        timezone_confidence_raw, bool
+    ):
+        timezone_confidence = float(timezone_confidence_raw)
+        if timezone_confidence < 0 or timezone_confidence > 1:
+            return None, "schema_invalid"
+    else:
+        return None, "schema_invalid"
+
+    constraints = raw_input.get("constraints")
+    if not isinstance(constraints, dict) or set(constraints.keys()) != {
+        "hard",
+        "soft",
+        "attendee_notes",
+    }:
+        return None, "schema_invalid"
+    hard_constraints = _normalize_optional_string_list(
+        constraints.get("hard"), max_items=20, max_length=500
+    )
+    soft_constraints = _normalize_optional_string_list(
+        constraints.get("soft"), max_items=20, max_length=500
+    )
+    attendee_notes = _normalize_optional_string_list(
+        constraints.get("attendee_notes"), max_items=20, max_length=500
+    )
+    if hard_constraints is None or soft_constraints is None or attendee_notes is None:
+        return None, "schema_invalid"
+
     return {
         "window_start": window_start,
         "window_end": window_end,
         "duration_minutes": duration_raw,
         "attendees": attendees,
+        "timezone": timezone,
+        "source_evidence_ids": source_evidence_ids,
+        "quoted_content_caveat": quoted_content_caveat,
+        "participants": participants,
+        "proposed_windows": proposed_windows,
+        "timezone_evidence": {
+            "source": timezone_evidence_source,
+            "rationale": timezone_evidence_rationale,
+            "confidence": timezone_confidence,
+        },
+        "constraints": {
+            "hard": hard_constraints,
+            "soft": soft_constraints,
+            "attendee_notes": attendee_notes,
+        },
     }, None
 
 
@@ -240,7 +373,43 @@ def _validate_email_search_input(
 def _validate_email_read_input(
     raw_input: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
-    return _validate_exact_text_input(raw_input, field_name="message_id", max_length=256)
+    if not set(raw_input.keys()).issubset({"message_id", "thread_id", "mode"}):
+        return None, "schema_invalid"
+
+    mode_raw = raw_input.get("mode")
+    if mode_raw is None:
+        mode = "message" if raw_input.get("message_id") is not None else "thread"
+    elif isinstance(mode_raw, str):
+        mode = mode_raw.strip().lower()
+    else:
+        return None, "schema_invalid"
+    if mode not in {"message", "thread", "thread_context"}:
+        return None, "schema_invalid"
+
+    raw_message_id = raw_input.get("message_id")
+    raw_thread_id = raw_input.get("thread_id")
+    message_id = _normalize_optional_text(raw_message_id, max_length=256)
+    thread_id = _normalize_optional_text(raw_thread_id, max_length=256)
+    if raw_message_id is None:
+        message_id = None
+    elif message_id is None:
+        return None, "schema_invalid"
+    if raw_thread_id is None:
+        thread_id = None
+    elif thread_id is None:
+        return None, "schema_invalid"
+    if message_id is None and thread_id is None:
+        return None, "schema_invalid"
+    if mode == "message" and message_id is None:
+        return None, "schema_invalid"
+    if mode in {"thread", "thread_context"} and thread_id is None and message_id is None:
+        return None, "schema_invalid"
+
+    return {
+        "message_id": message_id,
+        "thread_id": thread_id,
+        "mode": mode,
+    }, None
 
 
 def _validate_drive_search_input(
@@ -373,11 +542,49 @@ def _normalize_email_recipients(raw_value: Any) -> list[str] | None:
 _DRIVE_ALLOWED_SHARE_ROLES = {"reader", "commenter", "writer"}
 
 
+def _normalize_provider_write_authority(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, str] | None, str | None]:
+    idempotency_key = _normalize_optional_text(raw_input.get("idempotency_key"), max_length=128)
+    if idempotency_key is None:
+        return None, "schema_invalid"
+    authority: dict[str, str] = {"idempotency_key": idempotency_key}
+    for key in ("source_evidence_id", "commitment_id", "user_instruction_ref"):
+        value = _normalize_optional_text(raw_input.get(key), max_length=256)
+        if raw_input.get(key) is not None and value is None:
+            return None, "schema_invalid"
+        if value is not None:
+            authority[key] = value
+    if (
+        sum(
+            1
+            for key in ("source_evidence_id", "commitment_id", "user_instruction_ref")
+            if key in authority
+        )
+        != 1
+    ):
+        return None, "schema_invalid"
+    return authority, None
+
+
 def _validate_drive_share_input(
     raw_input: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
-    if not set(raw_input.keys()).issubset({"file_id", "grantee_email", "role"}):
+    if not set(raw_input.keys()).issubset(
+        {
+            "file_id",
+            "grantee_email",
+            "role",
+            "idempotency_key",
+            "source_evidence_id",
+            "commitment_id",
+            "user_instruction_ref",
+        }
+    ):
         return None, "schema_invalid"
+    authority, authority_error = _normalize_provider_write_authority(raw_input)
+    if authority is None:
+        return None, authority_error
 
     file_id_raw = raw_input.get("file_id")
     grantee_raw = raw_input.get("grantee_email")
@@ -401,6 +608,7 @@ def _validate_drive_share_input(
         "file_id": file_id,
         "grantee_email": grantee_email,
         "role": role,
+        **authority,
     }, None
 
 
@@ -408,9 +616,24 @@ def _validate_calendar_create_event_input(
     raw_input: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
     if not set(raw_input.keys()).issubset(
-        {"title", "start_time", "end_time", "description", "location", "attendees"}
+        {
+            "calendar_id",
+            "title",
+            "start_time",
+            "end_time",
+            "description",
+            "location",
+            "attendees",
+            "idempotency_key",
+            "source_evidence_id",
+            "commitment_id",
+            "user_instruction_ref",
+        }
     ):
         return None, "schema_invalid"
+    authority, authority_error = _normalize_provider_write_authority(raw_input)
+    if authority is None:
+        return None, authority_error
 
     title_raw = raw_input.get("title")
     if not isinstance(title_raw, str):
@@ -456,25 +679,186 @@ def _validate_calendar_create_event_input(
     if attendees is None:
         return None, "schema_invalid"
 
-    return {
+    calendar_id_raw = raw_input.get("calendar_id")
+    normalized: dict[str, Any] = {
         "title": title,
         "start_time": start_time,
         "end_time": end_time,
         "description": description,
         "location": location,
         "attendees": attendees,
-    }, None
+        **authority,
+    }
+    if isinstance(calendar_id_raw, str) and calendar_id_raw.strip():
+        normalized["calendar_id"] = calendar_id_raw.strip()
+    elif calendar_id_raw is not None:
+        return None, "schema_invalid"
+    return normalized, None
+
+
+def _validate_calendar_update_event_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not set(raw_input.keys()).issubset(
+        {
+            "calendar_id",
+            "event_id",
+            "title",
+            "start_time",
+            "end_time",
+            "description",
+            "location",
+            "attendees",
+            "idempotency_key",
+            "source_evidence_id",
+            "commitment_id",
+            "user_instruction_ref",
+        }
+    ):
+        return None, "schema_invalid"
+    authority, authority_error = _normalize_provider_write_authority(raw_input)
+    if authority is None:
+        return None, authority_error
+    event_id_raw = raw_input.get("event_id")
+    if not isinstance(event_id_raw, str) or not event_id_raw.strip():
+        return None, "schema_invalid"
+    normalized: dict[str, Any] = {"event_id": event_id_raw.strip(), **authority}
+    calendar_id_raw = raw_input.get("calendar_id")
+    if isinstance(calendar_id_raw, str) and calendar_id_raw.strip():
+        normalized["calendar_id"] = calendar_id_raw.strip()
+    elif calendar_id_raw is not None:
+        return None, "schema_invalid"
+
+    title_raw = raw_input.get("title")
+    if isinstance(title_raw, str):
+        title = title_raw.strip()
+        if not title or len(title) > 200:
+            return None, "schema_invalid"
+        normalized["title"] = title
+    elif title_raw is not None:
+        return None, "schema_invalid"
+
+    start_raw = raw_input.get("start_time")
+    end_raw = raw_input.get("end_time")
+    if start_raw is not None or end_raw is not None:
+        start_time = _normalize_rfc3339_like(start_raw)
+        end_time = _normalize_rfc3339_like(end_raw)
+        if start_time is None or end_time is None:
+            return None, "schema_invalid"
+        start_dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+        end_dt = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
+        if end_dt <= start_dt:
+            return None, "schema_invalid"
+        normalized["start_time"] = start_time
+        normalized["end_time"] = end_time
+
+    description_raw = raw_input.get("description")
+    if isinstance(description_raw, str):
+        if len(description_raw) > 4000:
+            return None, "schema_invalid"
+        normalized["description"] = description_raw.strip()
+    elif description_raw is not None:
+        return None, "schema_invalid"
+
+    location_raw = raw_input.get("location")
+    if isinstance(location_raw, str):
+        if len(location_raw) > 500:
+            return None, "schema_invalid"
+        normalized["location"] = location_raw.strip()
+    elif location_raw is not None:
+        return None, "schema_invalid"
+
+    if "attendees" in raw_input:
+        attendees_raw = raw_input.get("attendees")
+        if attendees_raw is not None:
+            attendees = _normalize_email_recipients(attendees_raw)
+            if attendees is None:
+                return None, "schema_invalid"
+            normalized["attendees"] = attendees
+
+    if set(normalized.keys()).issubset(
+        {
+            "event_id",
+            "calendar_id",
+            "idempotency_key",
+            "source_evidence_id",
+            "commitment_id",
+            "user_instruction_ref",
+        }
+    ):
+        return None, "schema_invalid"
+    return normalized, None
+
+
+def _validate_calendar_respond_to_event_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not set(raw_input.keys()).issubset(
+        {
+            "calendar_id",
+            "event_id",
+            "attendee_email",
+            "response_status",
+            "idempotency_key",
+            "source_evidence_id",
+            "commitment_id",
+            "user_instruction_ref",
+        }
+    ):
+        return None, "schema_invalid"
+    authority, authority_error = _normalize_provider_write_authority(raw_input)
+    if authority is None:
+        return None, authority_error
+    event_id_raw = raw_input.get("event_id")
+    attendee_email_raw = raw_input.get("attendee_email")
+    response_status = raw_input.get("response_status")
+    if not isinstance(event_id_raw, str) or not event_id_raw.strip():
+        return None, "schema_invalid"
+    recipients = _normalize_email_recipients([attendee_email_raw])
+    if recipients is None or len(recipients) != 1:
+        return None, "schema_invalid"
+    if response_status not in {"accepted", "declined", "tentative", "needsAction"}:
+        return None, "schema_invalid"
+    normalized: dict[str, Any] = {
+        "event_id": event_id_raw.strip(),
+        "attendee_email": recipients[0],
+        "response_status": response_status,
+        **authority,
+    }
+    calendar_id_raw = raw_input.get("calendar_id")
+    if isinstance(calendar_id_raw, str) and calendar_id_raw.strip():
+        normalized["calendar_id"] = calendar_id_raw.strip()
+    elif calendar_id_raw is not None:
+        return None, "schema_invalid"
+    return normalized, None
 
 
 def _validate_email_composition_input(
     raw_input: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
-    if set(raw_input.keys()) != {"to", "cc", "bcc", "subject", "body"}:
+    if not set(raw_input.keys()).issubset(
+        {
+            "to",
+            "cc",
+            "bcc",
+            "subject",
+            "body",
+            "idempotency_key",
+            "source_evidence_id",
+            "commitment_id",
+            "user_instruction_ref",
+        }
+    ):
         return None, "schema_invalid"
+    if "to" not in raw_input or "subject" not in raw_input or "body" not in raw_input:
+        return None, "schema_invalid"
+    authority, authority_error = _normalize_provider_write_authority(raw_input)
+    if authority is None:
+        return None, authority_error
 
     to_recipients = _normalize_email_recipients(raw_input.get("to"))
-    cc_recipients = _normalize_email_recipients(raw_input.get("cc"))
-    bcc_recipients = _normalize_email_recipients(raw_input.get("bcc"))
+    cc_recipients = _normalize_email_recipients(raw_input.get("cc", []))
+    bcc_recipients = _normalize_email_recipients(raw_input.get("bcc", []))
     if to_recipients is None or cc_recipients is None or bcc_recipients is None:
         return None, "schema_invalid"
     if not to_recipients and not cc_recipients and not bcc_recipients:
@@ -497,6 +881,7 @@ def _validate_email_composition_input(
         "bcc": bcc_recipients,
         "subject": subject,
         "body": body,
+        **authority,
     }, None
 
 
@@ -549,35 +934,47 @@ def _normalize_email_label_names(raw_value: Any) -> list[str] | None:
 def _validate_email_message_batch_mutation_input(
     raw_input: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
-    if set(raw_input.keys()) != {"message_ids", "idempotency_key"}:
+    if not set(raw_input.keys()).issubset(
+        {
+            "message_ids",
+            "idempotency_key",
+            "source_evidence_id",
+            "commitment_id",
+            "user_instruction_ref",
+        }
+    ):
         return None, "schema_invalid"
+    authority, authority_error = _normalize_provider_write_authority(raw_input)
+    if authority is None:
+        return None, authority_error
     message_ids = _normalize_email_message_ids(raw_input.get("message_ids"))
-    idempotency_key = _normalize_optional_text(raw_input.get("idempotency_key"), max_length=128)
-    if message_ids is None or idempotency_key is None:
+    if message_ids is None:
         return None, "schema_invalid"
-    return {"message_ids": message_ids, "idempotency_key": idempotency_key}, None
+    return {"message_ids": message_ids, **authority}, None
 
 
 def _validate_email_labels_modify_input(
     raw_input: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
-    if set(raw_input.keys()) != {
-        "message_ids",
-        "add_labels",
-        "remove_labels",
-        "idempotency_key",
-    }:
+    if not set(raw_input.keys()).issubset(
+        {
+            "message_ids",
+            "add_labels",
+            "remove_labels",
+            "idempotency_key",
+            "source_evidence_id",
+            "commitment_id",
+            "user_instruction_ref",
+        }
+    ):
         return None, "schema_invalid"
+    authority, authority_error = _normalize_provider_write_authority(raw_input)
+    if authority is None:
+        return None, authority_error
     message_ids = _normalize_email_message_ids(raw_input.get("message_ids"))
     add_labels = _normalize_email_label_names(raw_input.get("add_labels"))
     remove_labels = _normalize_email_label_names(raw_input.get("remove_labels"))
-    idempotency_key = _normalize_optional_text(raw_input.get("idempotency_key"), max_length=128)
-    if (
-        message_ids is None
-        or add_labels is None
-        or remove_labels is None
-        or idempotency_key is None
-    ):
+    if message_ids is None or add_labels is None or remove_labels is None:
         return None, "schema_invalid"
     if not add_labels and not remove_labels:
         return None, "schema_invalid"
@@ -587,20 +984,30 @@ def _validate_email_labels_modify_input(
         "message_ids": message_ids,
         "add_labels": add_labels,
         "remove_labels": remove_labels,
-        "idempotency_key": idempotency_key,
+        **authority,
     }, None
 
 
 def _validate_email_undo_input(
     raw_input: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
-    if set(raw_input.keys()) != {"undo_token", "idempotency_key"}:
+    if not set(raw_input.keys()).issubset(
+        {
+            "undo_token",
+            "idempotency_key",
+            "source_evidence_id",
+            "commitment_id",
+            "user_instruction_ref",
+        }
+    ):
         return None, "schema_invalid"
+    authority, authority_error = _normalize_provider_write_authority(raw_input)
+    if authority is None:
+        return None, authority_error
     undo_token = _normalize_optional_text(raw_input.get("undo_token"), max_length=512)
-    idempotency_key = _normalize_optional_text(raw_input.get("idempotency_key"), max_length=128)
-    if undo_token is None or idempotency_key is None:
+    if undo_token is None:
         return None, "schema_invalid"
-    return {"undo_token": undo_token, "idempotency_key": idempotency_key}, None
+    return {"undo_token": undo_token, **authority}, None
 
 
 _EMAIL_THREAD_WATCH_CONDITIONS = (
@@ -717,6 +1124,224 @@ def _validate_external_notify_input(
     if len(destination) > 500 or len(message) > 500:
         return None, "schema_invalid"
     return {"destination": destination, "message": message}, None
+
+
+_MEMORY_INSPECT_SECTIONS = {
+    "all",
+    "active_assertions",
+    "candidates",
+    "conflicts",
+    "project_state",
+    "evidence",
+    "procedures",
+    "action_traces",
+}
+_MEMORY_ASSERTION_TYPES = {
+    "fact",
+    "profile",
+    "preference",
+    "commitment",
+    "decision",
+    "project_state",
+    "procedure",
+    "domain_concept",
+}
+
+
+def _normalize_bounded_int(value: Any, *, minimum: int, maximum: int) -> int | None:
+    if not isinstance(value, int) or isinstance(value, bool):
+        return None
+    if value < minimum or value > maximum:
+        return None
+    return value
+
+
+def _normalize_optional_rfc3339_input(value: Any) -> str | None:
+    if value is None:
+        return None
+    return _normalize_rfc3339_like(value)
+
+
+def _validate_memory_inspect_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {"section", "limit"}:
+        return None, "schema_invalid"
+    section_raw = raw_input.get("section")
+    if not isinstance(section_raw, str):
+        return None, "schema_invalid"
+    section = section_raw.strip().lower()
+    limit = _normalize_bounded_int(raw_input.get("limit"), minimum=1, maximum=100)
+    if section not in _MEMORY_INSPECT_SECTIONS or limit is None:
+        return None, "schema_invalid"
+    return {"section": section, "limit": limit}, None
+
+
+def _validate_memory_search_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {"query", "limit"}:
+        return None, "schema_invalid"
+    query = _normalize_optional_text(raw_input.get("query"), max_length=1000)
+    limit = _normalize_bounded_int(raw_input.get("limit"), minimum=1, maximum=100)
+    if query is None or limit is None:
+        return None, "schema_invalid"
+    return {"query": query, "limit": limit}, None
+
+
+def _validate_memory_propose_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {
+        "subject_key",
+        "predicate",
+        "assertion_type",
+        "value",
+        "evidence_text",
+        "confidence",
+        "scope_key",
+        "is_multi_valued",
+        "valid_from",
+        "valid_to",
+    }:
+        return None, "schema_invalid"
+    subject_key = _normalize_optional_text(raw_input.get("subject_key"), max_length=200)
+    predicate = _normalize_optional_text(raw_input.get("predicate"), max_length=200)
+    assertion_type_raw = raw_input.get("assertion_type")
+    value = _normalize_optional_text(raw_input.get("value"), max_length=700)
+    evidence_text = _normalize_optional_text(raw_input.get("evidence_text"), max_length=12_000)
+    scope_key = _normalize_optional_text(raw_input.get("scope_key"), max_length=200)
+    confidence_raw = raw_input.get("confidence")
+    is_multi_valued_raw = raw_input.get("is_multi_valued")
+    valid_from = _normalize_optional_rfc3339_input(raw_input.get("valid_from"))
+    valid_to = _normalize_optional_rfc3339_input(raw_input.get("valid_to"))
+    if (
+        subject_key is None
+        or predicate is None
+        or not isinstance(assertion_type_raw, str)
+        or assertion_type_raw not in _MEMORY_ASSERTION_TYPES
+        or value is None
+        or evidence_text is None
+        or not isinstance(confidence_raw, int | float)
+        or isinstance(confidence_raw, bool)
+        or float(confidence_raw) < 0.0
+        or float(confidence_raw) > 1.0
+        or scope_key is None
+        or not isinstance(is_multi_valued_raw, bool)
+    ):
+        return None, "schema_invalid"
+    if raw_input.get("valid_from") is not None and valid_from is None:
+        return None, "schema_invalid"
+    if raw_input.get("valid_to") is not None and valid_to is None:
+        return None, "schema_invalid"
+    if valid_from is not None and valid_to is not None:
+        valid_from_dt = datetime.fromisoformat(valid_from.replace("Z", "+00:00"))
+        valid_to_dt = datetime.fromisoformat(valid_to.replace("Z", "+00:00"))
+        if valid_from_dt >= valid_to_dt:
+            return None, "schema_invalid"
+    return {
+        "subject_key": subject_key,
+        "predicate": predicate,
+        "assertion_type": assertion_type_raw,
+        "value": value,
+        "evidence_text": evidence_text,
+        "confidence": float(confidence_raw),
+        "scope_key": scope_key,
+        "is_multi_valued": is_multi_valued_raw,
+        "valid_from": valid_from,
+        "valid_to": valid_to,
+    }, None
+
+
+def _validate_memory_review_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {"assertion_id", "decision", "reason"}:
+        return None, "schema_invalid"
+    assertion_id = _normalize_optional_text(raw_input.get("assertion_id"), max_length=32)
+    decision_raw = raw_input.get("decision")
+    reason_raw = raw_input.get("reason")
+    if reason_raw is None:
+        reason = None
+    elif isinstance(reason_raw, str) and len(reason_raw.strip()) <= 500:
+        reason = " ".join(reason_raw.strip().split()) or None
+    else:
+        return None, "schema_invalid"
+    if assertion_id is None or decision_raw not in {"approve", "reject"}:
+        return None, "schema_invalid"
+    return {"assertion_id": assertion_id, "decision": decision_raw, "reason": reason}, None
+
+
+def _validate_memory_assertion_id_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {"assertion_id"}:
+        return None, "schema_invalid"
+    assertion_id = _normalize_optional_text(raw_input.get("assertion_id"), max_length=32)
+    if assertion_id is None:
+        return None, "schema_invalid"
+    return {"assertion_id": assertion_id}, None
+
+
+def _validate_memory_correct_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {"assertion_id", "value"}:
+        return None, "schema_invalid"
+    assertion_id = _normalize_optional_text(raw_input.get("assertion_id"), max_length=32)
+    value = _normalize_optional_text(raw_input.get("value"), max_length=500)
+    if assertion_id is None or value is None:
+        return None, "schema_invalid"
+    return {"assertion_id": assertion_id, "value": value}, None
+
+
+def _validate_memory_redact_evidence_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {"evidence_id", "reason"}:
+        return None, "schema_invalid"
+    evidence_id = _normalize_optional_text(raw_input.get("evidence_id"), max_length=32)
+    reason_raw = raw_input.get("reason")
+    if reason_raw is None:
+        reason = None
+    elif isinstance(reason_raw, str) and len(reason_raw.strip()) <= 500:
+        reason = " ".join(reason_raw.strip().split()) or None
+    else:
+        return None, "schema_invalid"
+    if evidence_id is None:
+        return None, "schema_invalid"
+    return {"evidence_id": evidence_id, "reason": reason}, None
+
+
+def _validate_memory_set_never_remember_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {"rule"}:
+        return None, "schema_invalid"
+    rule = _normalize_optional_text(raw_input.get("rule"), max_length=700)
+    if rule is None:
+        return None, "schema_invalid"
+    return {"rule": rule}, None
+
+
+def _validate_memory_resolve_conflict_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {"conflict_set_id", "assertion_id"}:
+        return None, "schema_invalid"
+    conflict_set_id = _normalize_optional_text(raw_input.get("conflict_set_id"), max_length=32)
+    assertion_id = _normalize_optional_text(raw_input.get("assertion_id"), max_length=32)
+    if conflict_set_id is None or assertion_id is None:
+        return None, "schema_invalid"
+    return {"conflict_set_id": conflict_set_id, "assertion_id": assertion_id}, None
+
+
+def _validate_empty_memory_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if raw_input:
+        return None, "schema_invalid"
+    return {}, None
 
 
 def _normalize_optional_text(value: Any, *, max_length: int) -> str | None:
@@ -887,6 +1512,11 @@ def _execute_write_note(input_payload: dict[str, Any]) -> dict[str, Any]:
 
 def _execute_write_draft(input_payload: dict[str, Any]) -> dict[str, Any]:
     return {"status": "drafted", "note": input_payload["note"]}
+
+
+def _execute_memory_runtime(input_payload: dict[str, Any]) -> dict[str, Any]:
+    del input_payload
+    raise RuntimeError("memory_runtime_not_bound")
 
 
 def _search_brave_base_url() -> str:
@@ -2078,6 +2708,14 @@ def _execute_google_calendar_create_event(_: dict[str, Any]) -> dict[str, Any]:
     raise RuntimeError("google_runtime_not_bound")
 
 
+def _execute_google_calendar_update_event(_: dict[str, Any]) -> dict[str, Any]:
+    raise RuntimeError("google_runtime_not_bound")
+
+
+def _execute_google_calendar_respond_to_event(_: dict[str, Any]) -> dict[str, Any]:
+    raise RuntimeError("google_runtime_not_bound")
+
+
 def _execute_google_email_draft(_: dict[str, Any]) -> dict[str, Any]:
     raise RuntimeError("google_runtime_not_bound")
 
@@ -2170,12 +2808,24 @@ def _declare_google_email_search_egress_intent(
 
 
 def _declare_google_email_read_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    thread_id = input_payload.get("thread_id")
+    mode = input_payload.get("mode")
+    if isinstance(thread_id, str) and thread_id:
+        return [
+            {
+                "destination": (
+                    f"https://gmail.googleapis.com/gmail/v1/users/me/threads/{thread_id}"
+                ),
+                "payload": {"thread_id": thread_id, "mode": mode},
+            }
+        ]
+    message_id = input_payload["message_id"]
     return [
         {
             "destination": (
-                f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{input_payload['message_id']}"
+                f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}"
             ),
-            "payload": {"message_id": input_payload["message_id"]},
+            "payload": {"message_id": message_id, "mode": mode},
         }
     ]
 
@@ -2183,11 +2833,16 @@ def _declare_google_email_read_egress_intent(input_payload: dict[str, Any]) -> l
 def _declare_google_calendar_create_event_egress_intent(
     input_payload: dict[str, Any],
 ) -> list[dict[str, Any]]:
+    calendar_id = quote(str(input_payload.get("calendar_id") or "primary"), safe="")
     payload: dict[str, Any] = {
         "title": input_payload["title"],
         "start_time": input_payload["start_time"],
         "end_time": input_payload["end_time"],
+        "idempotency_key": input_payload["idempotency_key"],
     }
+    for key in ("source_evidence_id", "commitment_id", "user_instruction_ref"):
+        if key in input_payload:
+            payload[key] = input_payload[key]
     if isinstance(input_payload.get("description"), str):
         payload["description"] = input_payload["description"]
     if isinstance(input_payload.get("location"), str):
@@ -2198,8 +2853,58 @@ def _declare_google_calendar_create_event_egress_intent(
         payload["attendees"] = attendees
     return [
         {
-            "destination": "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+            "destination": (
+                f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events"
+            ),
             "payload": payload,
+        }
+    ]
+
+
+def _declare_google_calendar_update_event_egress_intent(
+    input_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    calendar_id = quote(str(input_payload.get("calendar_id") or "primary"), safe="")
+    event_id = quote(str(input_payload["event_id"]), safe="")
+    payload = {
+        "event_id": input_payload["event_id"],
+        "idempotency_key": input_payload["idempotency_key"],
+    }
+    for key in ("source_evidence_id", "commitment_id", "user_instruction_ref"):
+        if key in input_payload:
+            payload[key] = input_payload[key]
+    for key in ("title", "start_time", "end_time", "description", "location", "attendees"):
+        if key in input_payload:
+            payload[key] = input_payload[key]
+    return [
+        {
+            "destination": (
+                f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events/{event_id}"
+            ),
+            "payload": payload,
+        }
+    ]
+
+
+def _declare_google_calendar_respond_to_event_egress_intent(
+    input_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    calendar_id = quote(str(input_payload.get("calendar_id") or "primary"), safe="")
+    event_id = quote(str(input_payload["event_id"]), safe="")
+    return [
+        {
+            "destination": (
+                f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events/{event_id}"
+            ),
+            "payload": {
+                "event_id": input_payload["event_id"],
+                "attendee_email": input_payload["attendee_email"],
+                "response_status": input_payload["response_status"],
+                "idempotency_key": input_payload["idempotency_key"],
+                "source_evidence_id": input_payload.get("source_evidence_id"),
+                "commitment_id": input_payload.get("commitment_id"),
+                "user_instruction_ref": input_payload.get("user_instruction_ref"),
+            },
         }
     ]
 
@@ -2339,14 +3044,19 @@ def _declare_google_drive_share_egress_intent(
     input_payload: dict[str, Any],
 ) -> list[dict[str, Any]]:
     file_id = input_payload["file_id"]
+    payload = {
+        "file_id": file_id,
+        "grantee_email": input_payload["grantee_email"],
+        "role": input_payload["role"],
+        "idempotency_key": input_payload["idempotency_key"],
+    }
+    for key in ("source_evidence_id", "commitment_id", "user_instruction_ref"):
+        if key in input_payload:
+            payload[key] = input_payload[key]
     return [
         {
             "destination": f"https://www.googleapis.com/drive/v3/files/{file_id}/permissions",
-            "payload": {
-                "file_id": file_id,
-                "grantee_email": input_payload["grantee_email"],
-                "role": input_payload["role"],
-            },
+            "payload": payload,
         }
     ]
 
@@ -2769,12 +3479,12 @@ def _declare_external_notify_egress_intent(input_payload: dict[str, Any]) -> lis
 _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
     "cap.calendar.list": CapabilityDefinition(
         capability_id="cap.calendar.list",
-        version="1.0",
+        version="2.0",
         impact_level="read",
         policy_decision="allow_inline",
         contract_metadata={
             "input_schema": "calendar_window_v1",
-            "output_schema": "calendar_list_v1",
+            "output_schema": "google_calendar_events_v1",
             "idempotency": "deterministic_read",
             "required_scopes": [_GOOGLE_CALENDAR_READ_SCOPE],
         },
@@ -2802,12 +3512,12 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
     ),
     "cap.email.search": CapabilityDefinition(
         capability_id="cap.email.search",
-        version="1.0",
+        version="2.0",
         impact_level="read",
         policy_decision="allow_inline",
         contract_metadata={
             "input_schema": "email_search_v1",
-            "output_schema": "email_search_results_v1",
+            "output_schema": "google_gmail_message_refs_v1",
             "idempotency": "deterministic_read",
             "required_scopes": [_GOOGLE_GMAIL_READ_SCOPE],
         },
@@ -2818,12 +3528,12 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
     ),
     "cap.email.read": CapabilityDefinition(
         capability_id="cap.email.read",
-        version="1.0",
+        version="2.0",
         impact_level="read",
         policy_decision="allow_inline",
         contract_metadata={
             "input_schema": "email_read_v1",
-            "output_schema": "email_read_result_v1",
+            "output_schema": "google_gmail_message_evidence_v1",
             "idempotency": "deterministic_read",
             "required_scopes": [_GOOGLE_GMAIL_READ_SCOPE],
         },
@@ -2907,13 +3617,45 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         contract_metadata={
             "input_schema": "calendar_create_event_v1",
             "output_schema": "calendar_create_result_v1",
-            "idempotency": "action_attempt_id",
+            "idempotency": "client_idempotency_key",
             "required_scopes": [_GOOGLE_CALENDAR_WRITE_SCOPE],
         },
         allowed_egress_destinations=_GOOGLE_ALLOWED_EGRESS_DESTINATIONS,
         validate_input=_validate_calendar_create_event_input,
         execute=_execute_google_calendar_create_event,
         declare_egress_intent=_declare_google_calendar_create_event_egress_intent,
+    ),
+    "cap.calendar.update_event": CapabilityDefinition(
+        capability_id="cap.calendar.update_event",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="requires_approval",
+        contract_metadata={
+            "input_schema": "calendar_update_event_v1",
+            "output_schema": "calendar_update_result_v1",
+            "idempotency": "client_idempotency_key",
+            "required_scopes": [_GOOGLE_CALENDAR_WRITE_SCOPE],
+        },
+        allowed_egress_destinations=_GOOGLE_ALLOWED_EGRESS_DESTINATIONS,
+        validate_input=_validate_calendar_update_event_input,
+        execute=_execute_google_calendar_update_event,
+        declare_egress_intent=_declare_google_calendar_update_event_egress_intent,
+    ),
+    "cap.calendar.respond_to_event": CapabilityDefinition(
+        capability_id="cap.calendar.respond_to_event",
+        version="1.0",
+        impact_level="external_send",
+        policy_decision="requires_approval",
+        contract_metadata={
+            "input_schema": "calendar_respond_to_event_v1",
+            "output_schema": "calendar_response_result_v1",
+            "idempotency": "client_idempotency_key",
+            "required_scopes": [_GOOGLE_CALENDAR_WRITE_SCOPE],
+        },
+        allowed_egress_destinations=_GOOGLE_ALLOWED_EGRESS_DESTINATIONS,
+        validate_input=_validate_calendar_respond_to_event_input,
+        execute=_execute_google_calendar_respond_to_event,
+        declare_egress_intent=_declare_google_calendar_respond_to_event_egress_intent,
     ),
     "cap.email.draft": CapabilityDefinition(
         capability_id="cap.email.draft",
@@ -3081,7 +3823,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         contract_metadata={
             "input_schema": "drive_share_v1",
             "output_schema": "drive_share_result_v1",
-            "idempotency": "action_attempt_id",
+            "idempotency": "client_idempotency_key",
             "required_scopes": [_GOOGLE_DRIVE_SHARE_SCOPE],
         },
         allowed_egress_destinations=_GOOGLE_ALLOWED_EGRESS_DESTINATIONS,
@@ -3234,6 +3976,204 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         execute=_execute_agency_runtime,
         declare_egress_intent=_declare_agency_request_pr_egress_intent,
     ),
+    "cap.memory.inspect": CapabilityDefinition(
+        capability_id="cap.memory.inspect",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "memory_inspect_v1",
+            "output_schema": "memory_projection_v1",
+            "idempotency": "deterministic_read",
+            "execution_mode": "memory_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_inspect_input,
+        execute=_execute_memory_runtime,
+    ),
+    "cap.memory.search": CapabilityDefinition(
+        capability_id="cap.memory.search",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "memory_search_v1",
+            "output_schema": "memory_search_results_v1",
+            "idempotency": "deterministic_read",
+            "execution_mode": "memory_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_search_input,
+        execute=_execute_memory_runtime,
+    ),
+    "cap.memory.propose": CapabilityDefinition(
+        capability_id="cap.memory.propose",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "memory_propose_v1",
+            "output_schema": "memory_mutation_result_v1",
+            "idempotency": "action_attempt_id",
+            "execution_mode": "memory_runtime_only",
+            "mutation": "candidate_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_propose_input,
+        execute=_execute_memory_runtime,
+    ),
+    "cap.memory.review": CapabilityDefinition(
+        capability_id="cap.memory.review",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="requires_approval",
+        contract_metadata={
+            "input_schema": "memory_review_v1",
+            "output_schema": "memory_mutation_result_v1",
+            "idempotency": "action_attempt_id",
+            "execution_mode": "memory_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_review_input,
+        execute=_execute_memory_runtime,
+    ),
+    "cap.memory.correct": CapabilityDefinition(
+        capability_id="cap.memory.correct",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="requires_approval",
+        contract_metadata={
+            "input_schema": "memory_correct_v1",
+            "output_schema": "memory_mutation_result_v1",
+            "idempotency": "action_attempt_id",
+            "execution_mode": "memory_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_correct_input,
+        execute=_execute_memory_runtime,
+    ),
+    "cap.memory.retract": CapabilityDefinition(
+        capability_id="cap.memory.retract",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="requires_approval",
+        contract_metadata={
+            "input_schema": "memory_assertion_id_v1",
+            "output_schema": "memory_mutation_result_v1",
+            "idempotency": "action_attempt_id",
+            "execution_mode": "memory_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_assertion_id_input,
+        execute=_execute_memory_runtime,
+    ),
+    "cap.memory.delete": CapabilityDefinition(
+        capability_id="cap.memory.delete",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="requires_approval",
+        contract_metadata={
+            "input_schema": "memory_assertion_id_v1",
+            "output_schema": "memory_mutation_result_v1",
+            "idempotency": "action_attempt_id",
+            "execution_mode": "memory_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_assertion_id_input,
+        execute=_execute_memory_runtime,
+    ),
+    "cap.memory.privacy_delete": CapabilityDefinition(
+        capability_id="cap.memory.privacy_delete",
+        version="1.0",
+        impact_level="write_irreversible",
+        policy_decision="requires_approval",
+        contract_metadata={
+            "input_schema": "memory_assertion_id_v1",
+            "output_schema": "memory_mutation_result_v1",
+            "idempotency": "action_attempt_id",
+            "execution_mode": "memory_runtime_only",
+            "redaction_posture": "privacy_deleted",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_assertion_id_input,
+        execute=_execute_memory_runtime,
+    ),
+    "cap.memory.redact_evidence": CapabilityDefinition(
+        capability_id="cap.memory.redact_evidence",
+        version="1.0",
+        impact_level="write_irreversible",
+        policy_decision="requires_approval",
+        contract_metadata={
+            "input_schema": "memory_redact_evidence_v1",
+            "output_schema": "memory_mutation_result_v1",
+            "idempotency": "action_attempt_id",
+            "execution_mode": "memory_runtime_only",
+            "redaction_posture": "redacted",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_redact_evidence_input,
+        execute=_execute_memory_runtime,
+    ),
+    "cap.memory.set_never_remember": CapabilityDefinition(
+        capability_id="cap.memory.set_never_remember",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="requires_approval",
+        contract_metadata={
+            "input_schema": "memory_set_never_remember_v1",
+            "output_schema": "memory_mutation_result_v1",
+            "idempotency": "action_attempt_id",
+            "execution_mode": "memory_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_set_never_remember_input,
+        execute=_execute_memory_runtime,
+    ),
+    "cap.memory.resolve_conflict": CapabilityDefinition(
+        capability_id="cap.memory.resolve_conflict",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="requires_approval",
+        contract_metadata={
+            "input_schema": "memory_resolve_conflict_v1",
+            "output_schema": "memory_mutation_result_v1",
+            "idempotency": "action_attempt_id",
+            "execution_mode": "memory_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_resolve_conflict_input,
+        execute=_execute_memory_runtime,
+    ),
+    "cap.memory.consolidate": CapabilityDefinition(
+        capability_id="cap.memory.consolidate",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="requires_approval",
+        contract_metadata={
+            "input_schema": "memory_empty_v1",
+            "output_schema": "memory_consolidation_result_v1",
+            "idempotency": "action_attempt_id",
+            "execution_mode": "memory_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_empty_memory_input,
+        execute=_execute_memory_runtime,
+    ),
+    "cap.memory.export": CapabilityDefinition(
+        capability_id="cap.memory.export",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "memory_empty_v1",
+            "output_schema": "memory_export_v1",
+            "idempotency": "deterministic_read",
+            "execution_mode": "memory_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_empty_memory_input,
+        execute=_execute_memory_runtime,
+    ),
     "cap.discord.no_response": CapabilityDefinition(
         capability_id="cap.discord.no_response",
         version="1.0",
@@ -3371,6 +4311,9 @@ _EMAIL_LABEL_LIST = {
     "maxItems": 100,
 }
 _IDEMPOTENCY_KEY_SCHEMA = {"type": "string", "minLength": 1, "maxLength": 128}
+_MEMORY_ASSERTION_ID_SCHEMA = {"type": "string", "minLength": 1, "maxLength": 32}
+_MEMORY_EVIDENCE_ID_SCHEMA = {"type": "string", "minLength": 1, "maxLength": 32}
+_MEMORY_LIMIT_SCHEMA = {"type": "integer", "minimum": 1, "maximum": 100}
 
 _RESPONSE_TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     "calendar_window_v1": _object_schema(
@@ -3385,14 +4328,49 @@ _RESPONSE_TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "window_end": {"type": "string"},
             "duration_minutes": {"type": "integer", "minimum": 5, "maximum": 480},
             "attendees": _STRING_LIST,
+            "timezone": {"type": "string", "minLength": 1, "maxLength": 64},
+            "source_evidence_ids": _STRING_LIST,
+            "quoted_content_caveat": {"type": "boolean"},
+            "participants": _STRING_LIST,
+            "proposed_windows": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"start": {"type": "string"}, "end": {"type": "string"}},
+                    "required": ["start", "end"],
+                    "additionalProperties": False,
+                },
+                "maxItems": 20,
+            },
+            "timezone_evidence": _object_schema(
+                {
+                    "source": _NULLABLE_STRING,
+                    "rationale": _NULLABLE_STRING,
+                    "confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+                }
+            ),
+            "constraints": _object_schema(
+                {
+                    "hard": _STRING_LIST,
+                    "soft": _STRING_LIST,
+                    "attendee_notes": _STRING_LIST,
+                }
+            ),
         }
     ),
     "email_search_v1": _object_schema(
         {"query": {"type": "string", "minLength": 1, "maxLength": 1000}}
     ),
-    "email_read_v1": _object_schema(
-        {"message_id": {"type": "string", "minLength": 1, "maxLength": 256}}
-    ),
+    "email_read_v1": {
+        "type": "object",
+        "properties": {
+            "message_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 256},
+            "thread_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 256},
+            "mode": {"type": "string", "enum": ["message", "thread", "thread_context"]},
+        },
+        "required": ["message_id", "thread_id", "mode"],
+        "additionalProperties": False,
+    },
     "drive_search_query_v1": _object_schema({"query": {"type": "string", "maxLength": 1000}}),
     "drive_read_v1": _object_schema({"file_id": {"type": "string", "maxLength": 256}}),
     "maps_directions_query_v1": _object_schema(
@@ -3414,12 +4392,48 @@ _RESPONSE_TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     ),
     "calendar_create_event_v1": _object_schema(
         {
+            "calendar_id": _NULLABLE_STRING,
             "title": {"type": "string", "maxLength": 200},
             "start_time": {"type": "string"},
             "end_time": {"type": "string"},
             "description": _NULLABLE_STRING,
             "location": _NULLABLE_STRING,
             "attendees": _STRING_LIST,
+            "idempotency_key": _IDEMPOTENCY_KEY_SCHEMA,
+            "source_evidence_id": _NULLABLE_STRING,
+            "commitment_id": _NULLABLE_STRING,
+            "user_instruction_ref": _NULLABLE_STRING,
+        }
+    ),
+    "calendar_update_event_v1": _object_schema(
+        {
+            "calendar_id": _NULLABLE_STRING,
+            "event_id": {"type": "string", "minLength": 1, "maxLength": 512},
+            "title": _NULLABLE_STRING,
+            "start_time": _NULLABLE_STRING,
+            "end_time": _NULLABLE_STRING,
+            "description": _NULLABLE_STRING,
+            "location": _NULLABLE_STRING,
+            "attendees": {"type": ["array", "null"], "items": {"type": "string"}},
+            "idempotency_key": _IDEMPOTENCY_KEY_SCHEMA,
+            "source_evidence_id": _NULLABLE_STRING,
+            "commitment_id": _NULLABLE_STRING,
+            "user_instruction_ref": _NULLABLE_STRING,
+        }
+    ),
+    "calendar_respond_to_event_v1": _object_schema(
+        {
+            "calendar_id": _NULLABLE_STRING,
+            "event_id": {"type": "string", "minLength": 1, "maxLength": 512},
+            "attendee_email": {"type": "string", "minLength": 3, "maxLength": 320},
+            "response_status": {
+                "type": "string",
+                "enum": ["accepted", "declined", "tentative", "needsAction"],
+            },
+            "idempotency_key": _IDEMPOTENCY_KEY_SCHEMA,
+            "source_evidence_id": _NULLABLE_STRING,
+            "commitment_id": _NULLABLE_STRING,
+            "user_instruction_ref": _NULLABLE_STRING,
         }
     ),
     "email_compose_v1": _object_schema(
@@ -3429,12 +4443,19 @@ _RESPONSE_TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "bcc": _EMAIL_RECIPIENT_LIST,
             "subject": {"type": "string", "minLength": 1, "maxLength": 998},
             "body": {"type": "string", "minLength": 1, "maxLength": 20000},
+            "idempotency_key": _IDEMPOTENCY_KEY_SCHEMA,
+            "source_evidence_id": _NULLABLE_STRING,
+            "commitment_id": _NULLABLE_STRING,
+            "user_instruction_ref": _NULLABLE_STRING,
         }
     ),
     "email_message_batch_mutation_v1": _object_schema(
         {
             "message_ids": _EMAIL_MESSAGE_ID_LIST,
             "idempotency_key": _IDEMPOTENCY_KEY_SCHEMA,
+            "source_evidence_id": _NULLABLE_STRING,
+            "commitment_id": _NULLABLE_STRING,
+            "user_instruction_ref": _NULLABLE_STRING,
         }
     ),
     "email_labels_modify_v1": _object_schema(
@@ -3443,12 +4464,18 @@ _RESPONSE_TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "add_labels": _EMAIL_LABEL_LIST,
             "remove_labels": _EMAIL_LABEL_LIST,
             "idempotency_key": _IDEMPOTENCY_KEY_SCHEMA,
+            "source_evidence_id": _NULLABLE_STRING,
+            "commitment_id": _NULLABLE_STRING,
+            "user_instruction_ref": _NULLABLE_STRING,
         }
     ),
     "email_undo_v1": _object_schema(
         {
             "undo_token": {"type": "string", "minLength": 1, "maxLength": 512},
             "idempotency_key": _IDEMPOTENCY_KEY_SCHEMA,
+            "source_evidence_id": _NULLABLE_STRING,
+            "commitment_id": _NULLABLE_STRING,
+            "user_instruction_ref": _NULLABLE_STRING,
         }
     ),
     "email_thread_watch_create_v1": _object_schema(
@@ -3473,6 +4500,10 @@ _RESPONSE_TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "file_id": {"type": "string", "maxLength": 256},
             "grantee_email": {"type": "string", "maxLength": 320},
             "role": {"type": "string", "enum": ["reader", "commenter", "writer"]},
+            "idempotency_key": _IDEMPOTENCY_KEY_SCHEMA,
+            "source_evidence_id": _NULLABLE_STRING,
+            "commitment_id": _NULLABLE_STRING,
+            "user_instruction_ref": _NULLABLE_STRING,
         }
     ),
     "url_extract_v1": _object_schema({"url": {"type": "string", "maxLength": 2048}}),
@@ -3531,6 +4562,86 @@ _RESPONSE_TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "force_with_lease": {"type": "boolean"},
         }
     ),
+    "memory_inspect_v1": _object_schema(
+        {
+            "section": {
+                "type": "string",
+                "enum": [
+                    "all",
+                    "active_assertions",
+                    "candidates",
+                    "conflicts",
+                    "project_state",
+                    "evidence",
+                    "procedures",
+                    "action_traces",
+                ],
+            },
+            "limit": _MEMORY_LIMIT_SCHEMA,
+        }
+    ),
+    "memory_search_v1": _object_schema(
+        {
+            "query": {"type": "string", "minLength": 1, "maxLength": 1000},
+            "limit": _MEMORY_LIMIT_SCHEMA,
+        }
+    ),
+    "memory_propose_v1": _object_schema(
+        {
+            "subject_key": {"type": "string", "minLength": 1, "maxLength": 200},
+            "predicate": {"type": "string", "minLength": 1, "maxLength": 200},
+            "assertion_type": {
+                "type": "string",
+                "enum": [
+                    "fact",
+                    "profile",
+                    "preference",
+                    "commitment",
+                    "decision",
+                    "project_state",
+                    "procedure",
+                    "domain_concept",
+                ],
+            },
+            "value": {"type": "string", "minLength": 1, "maxLength": 700},
+            "evidence_text": {"type": "string", "minLength": 1, "maxLength": 12000},
+            "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "scope_key": {"type": "string", "minLength": 1, "maxLength": 200},
+            "is_multi_valued": {"type": "boolean"},
+            "valid_from": _NULLABLE_STRING,
+            "valid_to": _NULLABLE_STRING,
+        }
+    ),
+    "memory_review_v1": _object_schema(
+        {
+            "assertion_id": _MEMORY_ASSERTION_ID_SCHEMA,
+            "decision": {"type": "string", "enum": ["approve", "reject"]},
+            "reason": _NULLABLE_STRING,
+        }
+    ),
+    "memory_correct_v1": _object_schema(
+        {
+            "assertion_id": _MEMORY_ASSERTION_ID_SCHEMA,
+            "value": {"type": "string", "minLength": 1, "maxLength": 500},
+        }
+    ),
+    "memory_assertion_id_v1": _object_schema({"assertion_id": _MEMORY_ASSERTION_ID_SCHEMA}),
+    "memory_redact_evidence_v1": _object_schema(
+        {
+            "evidence_id": _MEMORY_EVIDENCE_ID_SCHEMA,
+            "reason": _NULLABLE_STRING,
+        }
+    ),
+    "memory_set_never_remember_v1": _object_schema(
+        {"rule": {"type": "string", "minLength": 1, "maxLength": 700}}
+    ),
+    "memory_resolve_conflict_v1": _object_schema(
+        {
+            "conflict_set_id": {"type": "string", "minLength": 1, "maxLength": 32},
+            "assertion_id": _MEMORY_ASSERTION_ID_SCHEMA,
+        }
+    ),
+    "memory_empty_v1": _object_schema({}),
     "discord_no_response_v1": _object_schema({"reason": {"type": "string", "maxLength": 500}}),
     "text_v1": _object_schema({"text": {"type": "string", "maxLength": 4000}}),
     "note_v1": _object_schema({"note": {"type": "string", "maxLength": 500}}),
@@ -3543,15 +4654,17 @@ _RESPONSE_TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
 }
 
 _RESPONSE_TOOL_DESCRIPTIONS: dict[str, str] = {
-    "cap.calendar.list": "Read the owner's primary calendar for an explicit time window.",
+    "cap.calendar.list": "Read typed calendar event evidence for an explicit time window.",
     "cap.calendar.propose_slots": "Find candidate meeting slots in an explicit time window.",
-    "cap.email.search": "Search the owner's email by query.",
-    "cap.email.read": "Read one email message by provider message id.",
+    "cap.email.search": "Search the owner's email and return structured message refs.",
+    "cap.email.read": "Read bounded Gmail message or thread evidence by provider id.",
     "cap.drive.search": "Search the owner's Drive metadata.",
     "cap.drive.read": "Read a bounded Drive file excerpt.",
     "cap.maps.directions": "Fetch directions for an explicit origin and destination.",
     "cap.maps.search_places": "Search places with explicit location context.",
     "cap.calendar.create_event": "Create a calendar event after approval.",
+    "cap.calendar.update_event": "Update a calendar event after approval.",
+    "cap.calendar.respond_to_event": "RSVP to a calendar event after approval.",
     "cap.email.draft": "Create an email draft.",
     "cap.email.send": "Send an email after approval.",
     "cap.email.archive": "Archive email messages by provider message id after approval.",
@@ -3573,6 +4686,19 @@ _RESPONSE_TOOL_DESCRIPTIONS: dict[str, str] = {
     "cap.agency.status": "Read status for a tracked Agency job or task.",
     "cap.agency.artifacts": "Read diff and timeline artifacts for a tracked Agency job.",
     "cap.agency.request_pr": "Land Agency work and create or update a pull request after approval.",
+    "cap.memory.inspect": "Inspect stored memory, candidates, conflicts, evidence, and traces.",
+    "cap.memory.search": "Search stored memory by query.",
+    "cap.memory.propose": "Propose a reviewable memory candidate from explicit evidence.",
+    "cap.memory.review": "Approve or reject a reviewable memory candidate.",
+    "cap.memory.correct": "Correct an existing memory assertion.",
+    "cap.memory.retract": "Retract an existing memory assertion.",
+    "cap.memory.delete": "Delete an existing memory assertion.",
+    "cap.memory.privacy_delete": "Privacy-delete an assertion and linked evidence after approval.",
+    "cap.memory.redact_evidence": "Redact stored memory evidence after approval.",
+    "cap.memory.set_never_remember": "Record a durable never-remember preference after approval.",
+    "cap.memory.resolve_conflict": "Resolve an open memory conflict by choosing an assertion.",
+    "cap.memory.consolidate": "Queue memory projection consolidation work after approval.",
+    "cap.memory.export": "Export a redacted JSON snapshot of stored memory.",
     "cap.discord.no_response": (
         "Use when the right Discord behavior is to read the message and send no visible reply."
     ),

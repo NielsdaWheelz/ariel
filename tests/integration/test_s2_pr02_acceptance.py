@@ -11,7 +11,7 @@ from sqlalchemy import select
 from testcontainers.postgres import PostgresContainer
 
 from ariel.app import ModelAdapter, create_app
-from tests.integration.responses_helpers import responses_with_function_calls
+from tests.integration.responses_helpers import responses_message, responses_with_function_calls
 from ariel.persistence import ActionAttemptRecord
 
 
@@ -31,10 +31,27 @@ class ActionProposalAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         del tools, history, context_bundle
+        assistant_text = {
+            "tainted outbound": "blocked: taint_denied_untrusted_side_effect",
+            "egress deny": "blocked: egress_destination_denied",
+            "unsafe read": "blocked: guardrail_post_output_blocked",
+        }.get(user_message, f"assistant::{user_message}")
+        if any(
+            isinstance(item, dict) and item.get("type") == "function_call_output"
+            for item in input_items
+        ):
+            return responses_message(
+                assistant_text=assistant_text,
+                provider=self.provider,
+                model=self.model,
+                provider_response_id="resp_s2_pr02_123",
+                input_tokens=17,
+                output_tokens=13,
+            )
         proposals = self.proposals_by_message.get(user_message, [])
         return responses_with_function_calls(
             input_items=input_items,
-            assistant_text=f"assistant::{user_message}",
+            assistant_text=assistant_text,
             proposals=copy.deepcopy(proposals),
             provider=self.provider,
             model=self.model,

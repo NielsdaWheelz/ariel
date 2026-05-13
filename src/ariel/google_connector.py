@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage
 import json
@@ -23,6 +23,10 @@ from ariel.persistence import (
     GoogleConnectorRecord,
     GoogleOAuthStateRecord,
     to_rfc3339,
+)
+from ariel.google_workspace_normalization import (
+    normalize_calendar_event,
+    normalize_gmail_message,
 )
 from ariel.redaction import redact_json_value, safe_failure_reason
 
@@ -53,6 +57,8 @@ GOOGLE_READ_CAPABILITY_SCOPES: dict[str, set[str]] = {
 GOOGLE_READ_CAPABILITY_IDS = frozenset(GOOGLE_READ_CAPABILITY_SCOPES.keys())
 GOOGLE_WRITE_CAPABILITY_SCOPES: dict[str, set[str]] = {
     "cap.calendar.create_event": {GOOGLE_CALENDAR_WRITE_SCOPE},
+    "cap.calendar.update_event": {GOOGLE_CALENDAR_WRITE_SCOPE},
+    "cap.calendar.respond_to_event": {GOOGLE_CALENDAR_WRITE_SCOPE},
     "cap.email.draft": {GOOGLE_GMAIL_COMPOSE_SCOPE},
     "cap.email.send": {GOOGLE_GMAIL_SEND_SCOPE},
     "cap.email.archive": {GOOGLE_GMAIL_MODIFY_SCOPE},
@@ -98,8 +104,14 @@ _AUTH_FAILURE_RECOVERY: dict[TypedAuthFailureClass, str] = {
 _GOOGLE_TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
 _MAX_GOOGLE_RESULTS = 5
 _GMAIL_BATCH_MODIFY_LIMIT = 1000
+_MAX_CALENDAR_RESPONSE_BYTES = 262144
+_MAX_GMAIL_EVIDENCE_BLOCKS = 12
+_MAX_GMAIL_EVIDENCE_BLOCK_CHARS = 2000
+_MAX_GMAIL_MESSAGE_RESPONSE_BYTES = 262144
+_MAX_GMAIL_THREAD_RESPONSE_BYTES = 131072
 _MAX_DRIVE_READ_BYTES = 131072
 _MAX_DRIVE_READ_CHARS = 2000
+_GMAIL_SEARCH_EVIDENCE_STATUSES = frozenset({"needs_read"})
 _DRIVE_NATIVE_DOC_MIME_TYPE = "application/vnd.google-apps.document"
 _DRIVE_PLAIN_TEXT_EXPORT_MIME_TYPE = "text/plain"
 _DRIVE_TEXT_LIKE_MIME_TYPES = {
@@ -292,6 +304,20 @@ class GoogleWorkspaceProvider(Protocol):
     ) -> dict[str, Any]: ...
 
     def calendar_create_event(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]: ...
+
+    def calendar_update_event(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]: ...
+
+    def calendar_respond_to_event(
         self,
         *,
         access_token: str,
@@ -560,6 +586,7 @@ class DefaultGoogleWorkspaceProvider:
         params: dict[str, Any] | None = None,
         json_payload: dict[str, Any] | None = None,
         allow_empty_response: bool = False,
+        max_response_bytes: int | None = None,
     ) -> dict[str, Any]:
         attempts = max(1, self.max_attempts)
         for attempt in range(1, attempts + 1):
@@ -598,6 +625,8 @@ class DefaultGoogleWorkspaceProvider:
                 raise RuntimeError(f"google_request_failed:{status_code}")
             if allow_empty_response and (status_code in {204, 205} or not response.content):
                 return {}
+            if max_response_bytes is not None and len(response.content) > max_response_bytes:
+                raise RuntimeError("google_response_too_large")
             try:
                 payload = response.json()
             except ValueError as exc:
@@ -670,6 +699,7 @@ class DefaultGoogleWorkspaceProvider:
                 "orderBy": "startTime",
                 "maxResults": 50,
             },
+            max_response_bytes=_MAX_CALENDAR_RESPONSE_BYTES,
         )
         raw_items = payload.get("items")
         if not isinstance(raw_items, list):
@@ -689,38 +719,22 @@ class DefaultGoogleWorkspaceProvider:
             window_start=window_start,
             window_end=window_end,
         )
-        results: list[dict[str, Any]] = []
+        events: list[dict[str, Any]] = []
         for item in items:
-            summary_raw = item.get("summary")
-            summary = (
-                summary_raw.strip()
-                if isinstance(summary_raw, str) and summary_raw.strip()
-                else "event"
+            events.append(
+                asdict(
+                    normalize_calendar_event(
+                        item,
+                        provider_account_id="google",
+                        calendar_id="primary",
+                    )
+                )
             )
-            source_raw = item.get("htmlLink")
-            source = (
-                source_raw.strip()
-                if isinstance(source_raw, str) and source_raw.strip()
-                else f"calendar://{item.get('id', 'event')}"
-            )
-            start_dt = _parse_google_event_time(item.get("start"))
-            end_dt = _parse_google_event_time(item.get("end"))
-            if start_dt is None or end_dt is None:
-                snippet = summary
-            else:
-                snippet = f"{to_rfc3339(start_dt)} to {to_rfc3339(end_dt)} {summary}"
-            results.append(
-                {
-                    "title": summary,
-                    "source": source,
-                    "snippet": snippet,
-                    "published_at": _normalize_google_timestamp(item.get("updated")),
-                }
-            )
-            if len(results) >= _MAX_GOOGLE_RESULTS:
+            if len(events) >= _MAX_GOOGLE_RESULTS:
                 break
         return {
-            "results": results,
+            "schema_version": "google.calendar.events.v1",
+            "events": events,
             "retrieved_at": to_rfc3339(_utcnow()),
             "window_start": window_start,
             "window_end": window_end,
@@ -755,6 +769,7 @@ class DefaultGoogleWorkspaceProvider:
             url=f"{self.calendar_api_base_url}/calendars/{quote(calendar_id, safe='')}/events",
             access_token=access_token,
             params=params,
+            max_response_bytes=_MAX_CALENDAR_RESPONSE_BYTES,
         )
 
     def calendar_propose_slots(
@@ -785,26 +800,42 @@ class DefaultGoogleWorkspaceProvider:
             else []
         )
 
-        attendee_recovery_hint: str | None = None
+        freebusy_diagnostics: list[dict[str, str]] = []
         if attendees and attendee_intersection_enabled:
-            busy_intervals = self._freebusy_intervals(
+            busy_intervals, freebusy_diagnostics = self._freebusy_intervals(
                 access_token=access_token,
                 window_start=window_start,
                 window_end=window_end,
                 attendees=attendees,
             )
-            attendee_intersection_used = True
+            if busy_intervals is None:
+                busy_intervals = self._primary_busy_intervals(
+                    access_token=access_token,
+                    window_start=window_start,
+                    window_end=window_end,
+                )
+                availability_scope = "primary_calendar_only"
+                partial = True
+                partial_reason = "attendee_freebusy_unavailable"
+            else:
+                availability_scope = "all_attendees"
+                partial = False
+                partial_reason = None
         else:
             busy_intervals = self._primary_busy_intervals(
                 access_token=access_token,
                 window_start=window_start,
                 window_end=window_end,
             )
-            attendee_intersection_used = not bool(attendees)
+            availability_scope = "all_attendees" if not attendees else "primary_calendar_only"
+            partial = bool(attendees)
+            partial_reason = "attendee_freebusy_scope_missing" if attendees else None
             if attendees:
-                attendee_recovery_hint = (
-                    "Reconnect Google and grant attendee free/busy scope to include "
-                    "attendee intersection."
+                freebusy_diagnostics.append(
+                    {
+                        "calendar_id": "attendees",
+                        "reason_code": "freebusy_scope_missing",
+                    }
                 )
 
         slots = _propose_slots_from_busy_intervals(
@@ -813,37 +844,49 @@ class DefaultGoogleWorkspaceProvider:
             duration=timedelta(minutes=duration_minutes),
             busy_intervals=busy_intervals,
         )
-        results: list[dict[str, Any]] = [
+        slot_options = [
             {
-                "title": f"slot option {index}",
-                "source": "calendar://availability",
-                "snippet": (
-                    f"{to_rfc3339(slot_start)} to {to_rfc3339(slot_end)}"
-                    + (
-                        " works for all attendees"
-                        if attendee_intersection_used
-                        else " available on your calendar only"
-                    )
-                ),
-                "published_at": None,
+                "slot_id": f"slot_{index}",
+                "start": {"value": to_rfc3339(slot_start), "timezone": "UTC", "all_day": False},
+                "end": {"value": to_rfc3339(slot_end), "timezone": "UTC", "all_day": False},
+                "availability_scope": availability_scope,
+                "partial": partial,
             }
             for index, (slot_start, slot_end) in enumerate(slots, start=1)
         ]
-        if not results:
-            results = [
-                {
-                    "title": "no slots available",
-                    "source": "calendar://availability",
-                    "snippet": "No matching availability was found in the requested window.",
-                    "published_at": None,
-                }
+        source_evidence_refs = []
+        raw_source_evidence_ids = normalized_input.get("source_evidence_ids")
+        if isinstance(raw_source_evidence_ids, list):
+            source_evidence_refs = [
+                {"provider_evidence_id": evidence_id}
+                for evidence_id in raw_source_evidence_ids
+                if isinstance(evidence_id, str) and evidence_id.strip()
             ]
+        constraints_raw = normalized_input.get("constraints")
+        constraints = constraints_raw if isinstance(constraints_raw, dict) else {}
         return {
-            "results": results,
+            "schema_version": "google.calendar.slot_options.v1",
+            "slots": slot_options,
             "retrieved_at": to_rfc3339(_utcnow()),
+            "window_start": to_rfc3339(window_start),
+            "window_end": to_rfc3339(window_end),
+            "duration_minutes": duration_minutes,
             "attendees_considered": attendees,
-            "attendee_intersection_used": attendee_intersection_used,
-            "attendee_recovery_hint": attendee_recovery_hint,
+            "availability_scope": availability_scope,
+            "partial": partial,
+            "partial_reason": partial_reason,
+            "timezone": normalized_input.get("timezone") or "UTC",
+            "source_evidence_refs": source_evidence_refs,
+            "constraints_used": {
+                "duration_minutes": duration_minutes,
+                "timezone": normalized_input.get("timezone") or "UTC",
+                "quoted_content_caveat": normalized_input.get("quoted_content_caveat"),
+                "participants": normalized_input.get("participants", []),
+                "proposed_windows": normalized_input.get("proposed_windows", []),
+                **constraints,
+            },
+            "freebusy_diagnostics": freebusy_diagnostics,
+            "no_slots_reason": "no_slots_available" if not slot_options else None,
         }
 
     def _primary_busy_intervals(
@@ -874,7 +917,7 @@ class DefaultGoogleWorkspaceProvider:
         window_start: datetime,
         window_end: datetime,
         attendees: list[str],
-    ) -> list[tuple[datetime, datetime]]:
+    ) -> tuple[list[tuple[datetime, datetime]] | None, list[dict[str, str]]]:
         payload = self._request_json(
             method="POST",
             url=f"{self.calendar_api_base_url}/freeBusy",
@@ -884,17 +927,30 @@ class DefaultGoogleWorkspaceProvider:
                 "timeMax": to_rfc3339(window_end),
                 "items": [{"id": "primary"}] + [{"id": attendee} for attendee in attendees],
             },
+            max_response_bytes=_MAX_CALENDAR_RESPONSE_BYTES,
         )
         calendars_payload = payload.get("calendars")
         if not isinstance(calendars_payload, dict):
-            return []
+            return None, [{"calendar_id": "google_freebusy", "reason_code": "invalid_response"}]
         intervals: list[tuple[datetime, datetime]] = []
-        for calendar_state in calendars_payload.values():
+        diagnostics: list[dict[str, str]] = []
+        for calendar_id in ["primary", *attendees]:
+            calendar_state = calendars_payload.get(calendar_id)
             if not isinstance(calendar_state, dict):
-                continue
+                diagnostics.append({"calendar_id": calendar_id, "reason_code": "missing_calendar"})
+                return None, diagnostics
+            errors = calendar_state.get("errors")
+            if isinstance(errors, list) and errors:
+                for error in errors:
+                    reason = "freebusy_error"
+                    if isinstance(error, dict) and isinstance(error.get("reason"), str):
+                        reason = error["reason"][:80]
+                    diagnostics.append({"calendar_id": calendar_id, "reason_code": reason})
+                return None, diagnostics
             busy_payload = calendar_state.get("busy")
             if not isinstance(busy_payload, list):
-                continue
+                diagnostics.append({"calendar_id": calendar_id, "reason_code": "missing_busy"})
+                return None, diagnostics
             for busy_entry in busy_payload:
                 if not isinstance(busy_entry, dict):
                     continue
@@ -903,7 +959,7 @@ class DefaultGoogleWorkspaceProvider:
                 if busy_start is None or busy_end is None or busy_end <= busy_start:
                     continue
                 intervals.append((busy_start, busy_end))
-        return _merge_intervals(intervals)
+        return _merge_intervals(intervals), diagnostics
 
     def email_search(
         self,
@@ -936,27 +992,42 @@ class DefaultGoogleWorkspaceProvider:
                 access_token=access_token,
                 params={
                     "format": "metadata",
-                    "metadataHeaders": ["Subject", "From", "Date"],
+                    "metadataHeaders": ["Subject", "From", "To", "Cc", "Date"],
                 },
+                max_response_bytes=_MAX_GMAIL_THREAD_RESPONSE_BYTES,
             )
-            subject = _gmail_header_value(message_payload, "Subject") or f"message {message_id}"
-            sender = _gmail_header_value(message_payload, "From") or "unknown sender"
+            normalized = normalize_gmail_message(
+                message_payload,
+                provider_account_id="google",
+            )
             snippet_raw = message_payload.get("snippet")
-            snippet = (
-                f"{sender} - {snippet_raw.strip()}"
+            preview = (
+                snippet_raw.strip()
                 if isinstance(snippet_raw, str) and snippet_raw.strip()
-                else sender
+                else None
             )
             results.append(
                 {
-                    "title": subject,
-                    "source": f"https://mail.google.com/mail/u/0/#inbox/{message_id}",
-                    "snippet": snippet,
-                    "published_at": _gmail_internal_date_timestamp(message_payload),
+                    "message_id": normalized.message_id,
+                    "thread_id": normalized.thread_id,
+                    "history_id": normalized.history_id,
+                    "subject": normalized.subject,
+                    "subject_key": normalized.subject_key,
+                    "sender": asdict(normalized.sender) if normalized.sender else None,
+                    "recipients": [asdict(address) for address in normalized.recipients],
+                    "cc": [asdict(address) for address in normalized.cc],
+                    "header_date": normalized.header_date,
+                    "internal_date": _gmail_internal_date_timestamp(message_payload),
+                    "label_ids": list(normalized.labels),
+                    "direction": normalized.direction,
+                    "preview": preview,
+                    "provider_url": normalized.provider_url,
+                    "evidence_status": "needs_read",
                 }
             )
         return {
-            "results": results,
+            "schema_version": "google.gmail.message_refs.v1",
+            "messages": results,
             "retrieved_at": to_rfc3339(_utcnow()),
         }
 
@@ -966,29 +1037,265 @@ class DefaultGoogleWorkspaceProvider:
         access_token: str,
         normalized_input: dict[str, Any],
     ) -> dict[str, Any]:
-        message_id = str(normalized_input["message_id"])
-        payload = self._request_json(
-            method="GET",
-            url=f"{self.gmail_api_base_url}/users/me/messages/{message_id}",
-            access_token=access_token,
-            params={"format": "full"},
+        mode_raw = normalized_input.get("mode")
+        mode = mode_raw if mode_raw in {"message", "thread", "thread_context"} else "message"
+        message_id = (
+            str(normalized_input["message_id"])
+            if isinstance(normalized_input.get("message_id"), str)
+            else None
         )
-        subject = _gmail_header_value(payload, "Subject") or f"email {message_id}"
-        snippet_raw = payload.get("snippet")
-        snippet = (
-            snippet_raw.strip()
-            if isinstance(snippet_raw, str) and snippet_raw.strip()
-            else "(no preview)"
+        thread_id = (
+            str(normalized_input["thread_id"])
+            if isinstance(normalized_input.get("thread_id"), str)
+            else None
+        )
+
+        if mode == "message":
+            if message_id is None:
+                raise RuntimeError("schema_invalid")
+            return self._gmail_read_message_output(
+                access_token=access_token,
+                message_id=message_id,
+                mode=mode,
+            )
+
+        if thread_id is not None:
+            return self._gmail_read_thread_output(
+                access_token=access_token,
+                thread_id=thread_id,
+                mode=mode,
+                anchor_message_id=message_id,
+            )
+
+        if message_id is None:
+            raise RuntimeError("schema_invalid")
+        payload = self._gmail_message_payload_or_typed_unavailable(
+            access_token=access_token,
+            message_id=message_id,
+            mode=mode,
+        )
+        if payload.get("schema_version") == "google.gmail.message_evidence.v1":
+            return payload
+        normalized = normalize_gmail_message(payload, provider_account_id="google")
+        return self._gmail_read_thread_output(
+            access_token=access_token,
+            thread_id=normalized.thread_id,
+            mode=mode,
+            anchor_message_id=message_id,
+        )
+
+    def _gmail_read_message_output(
+        self,
+        *,
+        access_token: str,
+        message_id: str,
+        mode: str,
+    ) -> dict[str, Any]:
+        payload = self._gmail_message_payload_or_typed_unavailable(
+            access_token=access_token,
+            message_id=message_id,
+            mode=mode,
+        )
+        if payload.get("schema_version") == "google.gmail.message_evidence.v1":
+            return payload
+        normalized = normalize_gmail_message(payload, provider_account_id="google")
+        return self._gmail_message_evidence_output(
+            normalized=normalized,
+            payload=payload,
+            mode=mode,
+        )
+
+    def _gmail_message_payload_or_typed_unavailable(
+        self,
+        *,
+        access_token: str,
+        message_id: str,
+        mode: str,
+    ) -> dict[str, Any]:
+        try:
+            return self._request_json(
+                method="GET",
+                url=f"{self.gmail_api_base_url}/users/me/messages/{quote(message_id, safe='')}",
+                access_token=access_token,
+                params={"format": "full"},
+                max_response_bytes=_MAX_GMAIL_MESSAGE_RESPONSE_BYTES,
+            )
+        except RuntimeError as exc:
+            reason = safe_failure_reason(str(exc), fallback="gmail_read_unavailable")
+            if reason != "google_response_too_large":
+                raise
+            return _gmail_message_unavailable_output(
+                message_id=message_id,
+                thread_id=None,
+                mode=mode,
+                status="body_too_large",
+                reason_code="gmail_body_too_large",
+                recovery="Use narrower message context or ask for metadata only.",
+            )
+
+    def _gmail_message_evidence_output(
+        self,
+        *,
+        normalized: Any,
+        payload: dict[str, Any],
+        mode: str,
+    ) -> dict[str, Any]:
+        blocks = [asdict(block) for block in normalized.body.blocks]
+        read_outcome = _gmail_read_outcome(
+            block_count=len(blocks),
+            decode_notes=list(normalized.body.decode_notes),
         )
         return {
-            "results": [
-                {
-                    "title": subject,
-                    "source": f"https://mail.google.com/mail/u/0/#inbox/{message_id}",
-                    "snippet": snippet,
-                    "published_at": _gmail_internal_date_timestamp(payload),
-                }
-            ],
+            "schema_version": "google.gmail.message_evidence.v1",
+            "mode": mode,
+            "message": _gmail_message_metadata(normalized),
+            "published_at": _gmail_internal_date_timestamp(payload),
+            "evidence": {
+                "source_kind": "gmail_message",
+                "message_id": normalized.message_id,
+                "thread_id": normalized.thread_id,
+                "body_digest": normalized.body.body_digest,
+                "blocks": blocks,
+                "truncated": normalized.body.truncated,
+                "decode_notes": list(normalized.body.decode_notes),
+                "html_security": normalized.body.html_security,
+            },
+            "read_outcome": read_outcome,
+            "retrieved_at": to_rfc3339(_utcnow()),
+        }
+
+    def _gmail_read_thread_output(
+        self,
+        *,
+        access_token: str,
+        thread_id: str,
+        mode: str,
+        anchor_message_id: str | None,
+    ) -> dict[str, Any]:
+        try:
+            payload = self._request_json(
+                method="GET",
+                url=f"{self.gmail_api_base_url}/users/me/threads/{quote(thread_id, safe='')}",
+                access_token=access_token,
+                params={
+                    "format": "metadata",
+                    "metadataHeaders": ["Subject", "From", "To", "Cc", "Date"],
+                },
+                max_response_bytes=_MAX_GMAIL_THREAD_RESPONSE_BYTES,
+            )
+        except RuntimeError as exc:
+            reason = safe_failure_reason(str(exc), fallback="gmail_read_unavailable")
+            if reason != "google_response_too_large":
+                raise
+            return _gmail_thread_unavailable_output(
+                thread_id=thread_id,
+                mode=mode,
+                anchor_message_id=anchor_message_id,
+                status="body_too_large",
+                reason_code="gmail_body_too_large",
+                recovery="Use narrower thread context or ask for metadata only.",
+            )
+        raw_messages = payload.get("messages")
+        message_payloads = (
+            [item for item in raw_messages if isinstance(item, dict)]
+            if isinstance(raw_messages, list)
+            else []
+        )
+        full_message_payloads: list[dict[str, Any]] = []
+        for message_payload in message_payloads[:_MAX_GOOGLE_RESULTS]:
+            message_id = message_payload.get("id")
+            if not isinstance(message_id, str) or not message_id.strip():
+                continue
+            try:
+                full_message_payloads.append(
+                    self._request_json(
+                        method="GET",
+                        url=(
+                            f"{self.gmail_api_base_url}/users/me/messages/"
+                            f"{quote(message_id.strip(), safe='')}"
+                        ),
+                        access_token=access_token,
+                        params={"format": "full"},
+                        max_response_bytes=_MAX_GMAIL_MESSAGE_RESPONSE_BYTES,
+                    )
+                )
+            except RuntimeError as exc:
+                reason = safe_failure_reason(str(exc), fallback="gmail_read_unavailable")
+                if reason != "google_response_too_large":
+                    raise
+                return _gmail_thread_unavailable_output(
+                    thread_id=thread_id,
+                    mode=mode,
+                    anchor_message_id=anchor_message_id,
+                    status="body_too_large",
+                    reason_code="gmail_body_too_large",
+                    recovery="Use narrower thread context or ask for metadata only.",
+                )
+        normalized_messages = [
+            normalize_gmail_message(message_payload, provider_account_id="google")
+            for message_payload in full_message_payloads
+        ]
+        blocks: list[dict[str, Any]] = []
+        decode_notes: list[str] = []
+        body_digests: list[str] = []
+        truncated = False
+        for normalized in normalized_messages:
+            body_digests.append(normalized.body.body_digest)
+            decode_notes.extend(normalized.body.decode_notes)
+            truncated = truncated or normalized.body.truncated
+            for block in normalized.body.blocks:
+                block_payload = asdict(block)
+                block_payload["source_message_id"] = normalized.message_id
+                block_payload["source_thread_id"] = normalized.thread_id
+                blocks.append(block_payload)
+                if len(blocks) >= _MAX_GMAIL_EVIDENCE_BLOCKS:
+                    truncated = True
+                    break
+            if len(blocks) >= _MAX_GMAIL_EVIDENCE_BLOCKS:
+                break
+        body_digest = hashlib.sha256("|".join(body_digests).encode("utf-8")).hexdigest()
+        return {
+            "schema_version": "google.gmail.message_evidence.v1",
+            "mode": mode,
+            "thread": {
+                "thread_id": str(payload.get("id") or thread_id),
+                "history_id": str(payload.get("historyId"))
+                if payload.get("historyId") is not None
+                else None,
+                "message_count": len(normalized_messages),
+                "anchor_message_id": anchor_message_id,
+            },
+            "messages": [_gmail_message_metadata(normalized) for normalized in normalized_messages],
+            "published_at": _latest_gmail_internal_date(message_payloads),
+            "evidence": {
+                "source_kind": "gmail_thread",
+                "thread_id": str(payload.get("id") or thread_id),
+                "anchor_message_id": anchor_message_id,
+                "body_digest": body_digest,
+                "blocks": blocks,
+                "truncated": truncated,
+                "decode_notes": decode_notes,
+                "html_security": {
+                    "hidden_text_count": sum(
+                        int(message.body.html_security.get("hidden_text_count") or 0)
+                        for message in normalized_messages
+                    ),
+                    "link_mismatch_count": sum(
+                        int(message.body.html_security.get("link_mismatch_count") or 0)
+                        for message in normalized_messages
+                    ),
+                    "links": [
+                        link
+                        for message in normalized_messages
+                        for link in message.body.html_security.get("links", [])
+                        if isinstance(link, dict)
+                    ],
+                },
+            },
+            "read_outcome": _gmail_read_outcome(
+                block_count=len(blocks),
+                decode_notes=decode_notes,
+            ),
             "retrieved_at": to_rfc3339(_utcnow()),
         }
 
@@ -1747,6 +2054,7 @@ class DefaultGoogleWorkspaceProvider:
         access_token: str,
         normalized_input: dict[str, Any],
     ) -> dict[str, Any]:
+        calendar_id = str(normalized_input.get("calendar_id") or "primary")
         payload: dict[str, Any] = {
             "summary": str(normalized_input["title"]),
             "start": {"dateTime": str(normalized_input["start_time"])},
@@ -1764,29 +2072,162 @@ class DefaultGoogleWorkspaceProvider:
 
         created_payload = self._request_json(
             method="POST",
-            url=f"{self.calendar_api_base_url}/calendars/primary/events",
+            url=f"{self.calendar_api_base_url}/calendars/{quote(calendar_id, safe='')}/events",
             access_token=access_token,
             json_payload=payload,
+            max_response_bytes=_MAX_CALENDAR_RESPONSE_BYTES,
         )
         event_id_raw = created_payload.get("id")
         event_id = (
-            event_id_raw.strip()
-            if isinstance(event_id_raw, str) and event_id_raw.strip()
-            else "unknown"
+            event_id_raw.strip() if isinstance(event_id_raw, str) and event_id_raw.strip() else None
         )
+        if event_id is None:
+            raise RuntimeError("provider_result_unknown")
         source_raw = created_payload.get("htmlLink")
         source = (
             source_raw.strip()
             if isinstance(source_raw, str) and source_raw.strip()
             else f"calendar://{event_id}"
         )
+        etag = created_payload.get("etag")
+        updated = created_payload.get("updated")
+        ical_uid = created_payload.get("iCalUID")
+        provider_status = created_payload.get("status")
         return {
+            "schema_version": "google.calendar.create_result.v1",
             "status": "created",
             "event_id": event_id,
+            "calendar_id": calendar_id,
             "title": str(normalized_input["title"]),
             "start_time": str(normalized_input["start_time"]),
             "end_time": str(normalized_input["end_time"]),
             "provider_event_ref": source,
+            "etag": etag.strip() if isinstance(etag, str) and etag.strip() else None,
+            "updated": updated.strip() if isinstance(updated, str) and updated.strip() else None,
+            "ical_uid": ical_uid.strip()
+            if isinstance(ical_uid, str) and ical_uid.strip()
+            else None,
+            "provider_status": provider_status.strip()
+            if isinstance(provider_status, str) and provider_status.strip()
+            else None,
+            "executed_at": to_rfc3339(_utcnow()),
+        }
+
+    def calendar_update_event(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]:
+        calendar_id = str(normalized_input.get("calendar_id") or "primary")
+        event_id = str(normalized_input["event_id"])
+        payload: dict[str, Any] = {}
+        title_raw = normalized_input.get("title")
+        if isinstance(title_raw, str) and title_raw.strip():
+            payload["summary"] = title_raw.strip()
+        start_time = normalized_input.get("start_time")
+        end_time = normalized_input.get("end_time")
+        if isinstance(start_time, str) and isinstance(end_time, str):
+            payload["start"] = {"dateTime": start_time}
+            payload["end"] = {"dateTime": end_time}
+        description_raw = normalized_input.get("description")
+        if isinstance(description_raw, str):
+            payload["description"] = description_raw
+        location_raw = normalized_input.get("location")
+        if isinstance(location_raw, str):
+            payload["location"] = location_raw
+        attendees_raw = normalized_input.get("attendees")
+        if isinstance(attendees_raw, list):
+            payload["attendees"] = [{"email": attendee} for attendee in attendees_raw]
+        if not payload:
+            raise RuntimeError("schema_invalid")
+
+        updated_payload = self._request_json(
+            method="PATCH",
+            url=(
+                f"{self.calendar_api_base_url}/calendars/{quote(calendar_id, safe='')}"
+                f"/events/{quote(event_id, safe='')}"
+            ),
+            access_token=access_token,
+            json_payload=payload,
+            max_response_bytes=_MAX_CALENDAR_RESPONSE_BYTES,
+        )
+        updated_event_id = updated_payload.get("id")
+        html_link = updated_payload.get("htmlLink")
+        etag = updated_payload.get("etag")
+        updated = updated_payload.get("updated")
+        ical_uid = updated_payload.get("iCalUID")
+        provider_status = updated_payload.get("status")
+        return {
+            "schema_version": "google.calendar.update_result.v1",
+            "status": "updated",
+            "event_id": updated_event_id.strip()
+            if isinstance(updated_event_id, str) and updated_event_id.strip()
+            else event_id,
+            "calendar_id": calendar_id,
+            "provider_event_ref": html_link
+            if isinstance(html_link, str) and html_link.strip()
+            else f"calendar://{event_id}",
+            "etag": etag.strip() if isinstance(etag, str) and etag.strip() else None,
+            "updated": updated.strip() if isinstance(updated, str) and updated.strip() else None,
+            "ical_uid": ical_uid.strip()
+            if isinstance(ical_uid, str) and ical_uid.strip()
+            else None,
+            "provider_status": provider_status.strip()
+            if isinstance(provider_status, str) and provider_status.strip()
+            else None,
+            "executed_at": to_rfc3339(_utcnow()),
+        }
+
+    def calendar_respond_to_event(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]:
+        calendar_id = str(normalized_input.get("calendar_id") or "primary")
+        event_id = str(normalized_input["event_id"])
+        attendee_email = str(normalized_input["attendee_email"])
+        response_status = str(normalized_input["response_status"])
+        updated_payload = self._request_json(
+            method="PATCH",
+            url=(
+                f"{self.calendar_api_base_url}/calendars/{quote(calendar_id, safe='')}"
+                f"/events/{quote(event_id, safe='')}"
+            ),
+            access_token=access_token,
+            json_payload={
+                "attendeesOmitted": True,
+                "attendees": [{"email": attendee_email, "responseStatus": response_status}],
+            },
+            max_response_bytes=_MAX_CALENDAR_RESPONSE_BYTES,
+        )
+        updated_event_id = updated_payload.get("id")
+        html_link = updated_payload.get("htmlLink")
+        etag = updated_payload.get("etag")
+        updated = updated_payload.get("updated")
+        ical_uid = updated_payload.get("iCalUID")
+        provider_status = updated_payload.get("status")
+        return {
+            "schema_version": "google.calendar.response_result.v1",
+            "status": "responded",
+            "event_id": updated_event_id.strip()
+            if isinstance(updated_event_id, str) and updated_event_id.strip()
+            else event_id,
+            "calendar_id": calendar_id,
+            "response_status": response_status,
+            "provider_event_ref": html_link
+            if isinstance(html_link, str) and html_link.strip()
+            else f"calendar://{event_id}",
+            "etag": etag.strip() if isinstance(etag, str) and etag.strip() else None,
+            "updated": updated.strip() if isinstance(updated, str) and updated.strip() else None,
+            "ical_uid": ical_uid.strip()
+            if isinstance(ical_uid, str) and ical_uid.strip()
+            else None,
+            "provider_status": provider_status.strip()
+            if isinstance(provider_status, str) and provider_status.strip()
+            else None,
+            "executed_at": to_rfc3339(_utcnow()),
         }
 
     def email_create_draft(
@@ -1812,8 +2253,10 @@ class DefaultGoogleWorkspaceProvider:
         draft_id = (
             draft_id_raw.strip() if isinstance(draft_id_raw, str) and draft_id_raw.strip() else None
         )
+        if draft_id is None:
+            raise RuntimeError("provider_result_unknown")
         return {
-            "provider_draft_ref": f"gmail://draft/{draft_id}" if draft_id is not None else None,
+            "provider_draft_ref": f"gmail://draft/{draft_id}",
         }
 
     def email_send(
@@ -1833,8 +2276,10 @@ class DefaultGoogleWorkspaceProvider:
         message_id = (
             message_id_raw.strip()
             if isinstance(message_id_raw, str) and message_id_raw.strip()
-            else "unknown"
+            else None
         )
+        if message_id is None:
+            raise RuntimeError("provider_result_unknown")
         return {
             "status": "sent",
             "message_id": message_id,
@@ -2192,8 +2637,10 @@ class DefaultGoogleWorkspaceProvider:
         permission_id = (
             permission_id_raw.strip()
             if isinstance(permission_id_raw, str) and permission_id_raw.strip()
-            else "unknown"
+            else None
         )
+        if permission_id is None:
+            raise RuntimeError("provider_result_unknown")
         return {
             "status": "shared",
             "file_id": file_id,
@@ -2545,27 +2992,6 @@ def _propose_slots_from_busy_intervals(
     return slots
 
 
-def _gmail_header_value(payload: dict[str, Any], header_name: str) -> str | None:
-    payload_root = payload.get("payload")
-    if not isinstance(payload_root, dict):
-        return None
-    headers_raw = payload_root.get("headers")
-    if not isinstance(headers_raw, list):
-        return None
-    for header in headers_raw:
-        if not isinstance(header, dict):
-            continue
-        name_raw = header.get("name")
-        value_raw = header.get("value")
-        if not isinstance(name_raw, str) or not isinstance(value_raw, str):
-            continue
-        if name_raw.strip().lower() == header_name.lower():
-            value = value_raw.strip()
-            if value:
-                return value
-    return None
-
-
 def _gmail_internal_date_timestamp(payload: dict[str, Any]) -> str | None:
     internal_date_raw = payload.get("internalDate")
     if not isinstance(internal_date_raw, str) or not internal_date_raw.strip():
@@ -2578,6 +3004,165 @@ def _gmail_internal_date_timestamp(payload: dict[str, Any]) -> str | None:
         return None
     parsed = datetime.fromtimestamp(millis / 1000, tz=UTC)
     return to_rfc3339(parsed)
+
+
+def _latest_gmail_internal_date(payloads: list[dict[str, Any]]) -> str | None:
+    latest: str | None = None
+    for payload in payloads:
+        value = _gmail_internal_date_timestamp(payload)
+        if value is not None and (latest is None or value > latest):
+            latest = value
+    return latest
+
+
+def _gmail_message_metadata(normalized: Any) -> dict[str, Any]:
+    return {
+        "provider_account_id": normalized.provider_account_id,
+        "message_id": normalized.message_id,
+        "thread_id": normalized.thread_id,
+        "history_id": normalized.history_id,
+        "rfc_message_id": normalized.rfc_message_id,
+        "in_reply_to": normalized.in_reply_to,
+        "references": normalized.references,
+        "subject": normalized.subject,
+        "subject_key": normalized.subject_key,
+        "sender": asdict(normalized.sender) if normalized.sender else None,
+        "recipients": [asdict(address) for address in normalized.recipients],
+        "cc": [asdict(address) for address in normalized.cc],
+        "bcc": [asdict(address) for address in normalized.bcc],
+        "reply_to": [asdict(address) for address in normalized.reply_to],
+        "internal_date_ms": normalized.internal_date_ms,
+        "header_date": normalized.header_date,
+        "direction": normalized.direction,
+        "labels": list(normalized.labels),
+        "attachments": [asdict(attachment) for attachment in normalized.attachments],
+        "body": {
+            "preferred_mime_type": normalized.body.preferred_mime_type,
+            "truncated": normalized.body.truncated,
+            "body_digest": normalized.body.body_digest,
+            "decode_notes": list(normalized.body.decode_notes),
+            "html_security": normalized.body.html_security,
+        },
+        "provider_url": normalized.provider_url,
+        "raw_payload_digest": normalized.raw_payload_digest,
+    }
+
+
+def _gmail_read_outcome(
+    *,
+    block_count: int,
+    decode_notes: list[str],
+) -> dict[str, str | None]:
+    if block_count > 0:
+        return {"status": "ok", "reason_code": None, "recovery": None}
+    lowered_notes = [note.lower() for note in decode_notes]
+    if any("body too large" in note for note in lowered_notes):
+        return {
+            "status": "body_too_large",
+            "reason_code": "gmail_body_too_large",
+            "recovery": "Use narrower message context or ask for metadata only.",
+        }
+    if decode_notes:
+        return {
+            "status": "decode_failed",
+            "reason_code": "gmail_body_decode_failed",
+            "recovery": "Retry with another message or use Gmail directly for the raw content.",
+        }
+    return {
+        "status": "no_body",
+        "reason_code": "gmail_body_unavailable",
+        "recovery": "Use message metadata or read another message in the thread.",
+    }
+
+
+def _gmail_message_unavailable_output(
+    *,
+    message_id: str,
+    thread_id: str | None,
+    mode: str,
+    status: Literal["body_too_large", "decode_failed", "no_body"],
+    reason_code: str,
+    recovery: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "google.gmail.message_evidence.v1",
+        "mode": mode,
+        "message": {
+            "provider_account_id": "google",
+            "message_id": message_id,
+            "thread_id": thread_id,
+            "history_id": None,
+            "rfc_message_id": None,
+            "in_reply_to": None,
+            "references": [],
+            "subject": None,
+            "subject_key": None,
+            "sender": None,
+            "recipients": [],
+            "cc": [],
+            "header_date": None,
+            "internal_date": None,
+            "label_ids": [],
+            "direction": "unknown",
+            "provider_url": f"https://mail.google.com/mail/u/0/#all/{message_id}",
+            "raw_payload_digest": hashlib.sha256(message_id.encode("utf-8")).hexdigest(),
+            "attachments": [],
+        },
+        "published_at": None,
+        "evidence": {
+            "source_kind": "gmail_message",
+            "message_id": message_id,
+            "thread_id": thread_id,
+            "blocks": [],
+            "truncated": False,
+            "decode_notes": [reason_code],
+            "html_security": {},
+        },
+        "read_outcome": {
+            "status": status,
+            "reason_code": reason_code,
+            "recovery": recovery,
+        },
+        "retrieved_at": to_rfc3339(_utcnow()),
+    }
+
+
+def _gmail_thread_unavailable_output(
+    *,
+    thread_id: str,
+    mode: str,
+    anchor_message_id: str | None,
+    status: Literal["body_too_large", "decode_failed", "no_body"],
+    reason_code: str,
+    recovery: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "google.gmail.message_evidence.v1",
+        "mode": mode,
+        "thread": {
+            "thread_id": thread_id,
+            "history_id": None,
+            "message_count": 0,
+            "anchor_message_id": anchor_message_id,
+        },
+        "messages": [],
+        "published_at": None,
+        "evidence": {
+            "source_kind": "gmail_thread",
+            "thread_id": thread_id,
+            "anchor_message_id": anchor_message_id,
+            "blocks": [],
+            "truncated": False,
+            "decode_notes": [reason_code],
+            "html_security": {},
+        },
+        "read_outcome": {
+            "status": status,
+            "reason_code": reason_code,
+            "recovery": recovery,
+        },
+        "retrieved_at": to_rfc3339(_utcnow()),
+    }
 
 
 def _normalize_scope_list(raw_scopes: Any) -> list[str]:
@@ -2648,7 +3233,716 @@ def _classify_google_provider_failure(error_reason: str) -> str | None:
         return "provider_invalid_payload"
     if normalized == "google_request_unreachable":
         return "provider_unreachable"
+    if normalized == "google_response_too_large":
+        return "provider_response_too_large"
     return None
+
+
+def _has_non_empty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _is_string_or_none(value: Any) -> bool:
+    return value is None or isinstance(value, str)
+
+
+def _is_string_list(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def _has_only_keys(payload: dict[str, Any], allowed: set[str]) -> bool:
+    return all(isinstance(key, str) and key in allowed for key in payload)
+
+
+def _has_forbidden_text_key(payload: dict[str, Any], *, allowed: set[str]) -> bool:
+    for key in payload:
+        if not isinstance(key, str):
+            return True
+        normalized = key.lower()
+        if key not in allowed and (
+            "body" in normalized
+            or "description" in normalized
+            or "html" in normalized
+            or normalized in {"text", "raw", "content"}
+        ):
+            return True
+    return False
+
+
+def _is_result_list(value: Any) -> bool:
+    if not isinstance(value, list) or len(value) > _MAX_GOOGLE_RESULTS:
+        return False
+    for result in value:
+        if not isinstance(result, dict):
+            return False
+        if not _has_non_empty_string(result.get("title")):
+            return False
+        if not _has_non_empty_string(result.get("source")):
+            return False
+        if not isinstance(result.get("snippet"), str):
+            return False
+        if not _is_string_or_none(result.get("published_at")):
+            return False
+    return True
+
+
+def _is_calendar_person(value: Any) -> bool:
+    if value is None:
+        return True
+    if not isinstance(value, dict):
+        return False
+    return (
+        _is_string_or_none(value.get("email"))
+        and _is_string_or_none(value.get("display_name"))
+        and isinstance(value.get("self"), bool)
+    )
+
+
+def _is_calendar_datetime(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return (
+        _has_non_empty_string(value.get("value"))
+        and _is_string_or_none(value.get("timezone"))
+        and isinstance(value.get("all_day"), bool)
+    )
+
+
+def _is_calendar_text_blocks(value: Any) -> bool:
+    if not isinstance(value, list):
+        return False
+    if len(value) > _MAX_GMAIL_EVIDENCE_BLOCKS:
+        return False
+    allowed = {"block_id", "kind", "text", "digest", "truncated", "source_mime_type", "charset"}
+    for block in value:
+        if not isinstance(block, dict):
+            return False
+        if not _has_only_keys(block, allowed):
+            return False
+        if not _has_non_empty_string(block.get("block_id")):
+            return False
+        if block.get("kind") not in {"body", "quote", "signature", "forwarded"}:
+            return False
+        text = block.get("text")
+        if not _has_non_empty_string(text):
+            return False
+        if isinstance(text, str) and len(text) > _MAX_GMAIL_EVIDENCE_BLOCK_CHARS:
+            return False
+        if not _has_non_empty_string(block.get("digest")):
+            return False
+        if not isinstance(block.get("truncated"), bool):
+            return False
+        if not _has_non_empty_string(block.get("source_mime_type")):
+            return False
+        if not _is_string_or_none(block.get("charset")):
+            return False
+    return True
+
+
+def _is_calendar_attendees(value: Any) -> bool:
+    if not isinstance(value, list):
+        return False
+    for attendee in value:
+        if not isinstance(attendee, dict):
+            return False
+        if not _is_string_or_none(attendee.get("email")):
+            return False
+        if not _is_string_or_none(attendee.get("display_name")):
+            return False
+        if not _is_string_or_none(attendee.get("response_status")):
+            return False
+        for key in ("optional", "organizer", "self"):
+            if not isinstance(attendee.get(key), bool):
+                return False
+    return True
+
+
+def _is_google_calendar_events_output(payload: dict[str, Any]) -> bool:
+    if payload.get("schema_version") != "google.calendar.events.v1" or "results" in payload:
+        return False
+    if not _has_only_keys(
+        payload, {"schema_version", "events", "retrieved_at", "window_start", "window_end"}
+    ):
+        return False
+    if not _has_non_empty_string(payload.get("retrieved_at")):
+        return False
+    if not _has_non_empty_string(payload.get("window_start")):
+        return False
+    if not _has_non_empty_string(payload.get("window_end")):
+        return False
+    events = payload.get("events")
+    if not isinstance(events, list):
+        return False
+    for event in events:
+        if not isinstance(event, dict):
+            return False
+        allowed_event_keys = {
+            "event_id",
+            "calendar_id",
+            "provider_account_id",
+            "ical_uid",
+            "recurring_event_id",
+            "status",
+            "summary",
+            "description_blocks",
+            "organizer",
+            "creator",
+            "attendees",
+            "raw_payload_digest",
+            "start",
+            "end",
+            "all_day",
+            "recurrence",
+            "location",
+            "conference_data",
+            "reminders",
+            "updated",
+            "etag",
+            "provider_url",
+            "hangout_link",
+        }
+        if not _has_only_keys(event, allowed_event_keys):
+            return False
+        if _has_forbidden_text_key(event, allowed=allowed_event_keys):
+            return False
+        if not _has_non_empty_string(event.get("event_id")):
+            return False
+        if not _has_non_empty_string(event.get("calendar_id")):
+            return False
+        if not _has_non_empty_string(event.get("raw_payload_digest")):
+            return False
+        if not _is_string_or_none(event.get("provider_account_id")):
+            return False
+        if not _is_string_or_none(event.get("ical_uid")):
+            return False
+        if not _is_string_or_none(event.get("recurring_event_id")):
+            return False
+        status = event.get("status")
+        if status not in {"confirmed", "cancelled", "tentative"}:
+            return False
+        if not _is_string_or_none(event.get("summary")):
+            return False
+        if not _is_calendar_text_blocks(event.get("description_blocks")):
+            return False
+        if not _is_calendar_person(event.get("organizer")):
+            return False
+        if not _is_calendar_person(event.get("creator")):
+            return False
+        if not _is_calendar_attendees(event.get("attendees")):
+            return False
+        if not _is_calendar_datetime(event.get("start")):
+            return False
+        if not _is_calendar_datetime(event.get("end")):
+            return False
+        if not isinstance(event.get("all_day"), bool):
+            return False
+        if not _is_string_list(event.get("recurrence")):
+            return False
+        if not _has_non_empty_string(event.get("updated")):
+            return False
+        for key in ("location", "etag", "provider_url", "hangout_link"):
+            if not _is_string_or_none(event.get(key)):
+                return False
+        for key in ("conference_data", "reminders"):
+            if event.get(key) is not None and not isinstance(event.get(key), dict):
+                return False
+    return True
+
+
+def _is_google_calendar_write_result_output(
+    payload: dict[str, Any],
+    *,
+    schema_version: str,
+    status: str,
+) -> bool:
+    if payload.get("schema_version") != schema_version or payload.get("status") != status:
+        return False
+    for key in ("event_id", "calendar_id", "provider_event_ref", "executed_at"):
+        if not _has_non_empty_string(payload.get(key)):
+            return False
+    for key in ("etag", "updated"):
+        if not _is_string_or_none(payload.get(key)):
+            return False
+    provider_status = payload.get("provider_status")
+    if provider_status is not None and not isinstance(provider_status, str):
+        return False
+    ical_uid = payload.get("ical_uid")
+    if ical_uid is not None and not isinstance(ical_uid, str):
+        return False
+    if status == "responded" and payload.get("response_status") not in {
+        "accepted",
+        "declined",
+        "tentative",
+        "needsAction",
+    }:
+        return False
+    return True
+
+
+def _is_google_calendar_slot_options_output(payload: dict[str, Any]) -> bool:
+    if payload.get("schema_version") != "google.calendar.slot_options.v1" or "results" in payload:
+        return False
+    for key in ("retrieved_at", "window_start", "window_end"):
+        if not _has_non_empty_string(payload.get(key)):
+            return False
+    duration_minutes = payload.get("duration_minutes")
+    if not isinstance(duration_minutes, int) or duration_minutes <= 0:
+        return False
+    attendees = payload.get("attendees_considered")
+    if not isinstance(attendees, list) or not all(isinstance(item, str) for item in attendees):
+        return False
+    if payload.get("availability_scope") not in {"all_attendees", "primary_calendar_only"}:
+        return False
+    partial = payload.get("partial")
+    if not isinstance(partial, bool):
+        return False
+    partial_reason = payload.get("partial_reason")
+    if partial_reason is not None and not isinstance(partial_reason, str):
+        return False
+    if partial and not _has_non_empty_string(partial_reason):
+        return False
+    if not partial and partial_reason is not None:
+        return False
+    if not _has_non_empty_string(payload.get("timezone")):
+        return False
+    if "confidence" in payload:
+        return False
+    source_refs = payload.get("source_evidence_refs")
+    if not isinstance(source_refs, list):
+        return False
+    for source_ref in source_refs:
+        if not isinstance(source_ref, dict):
+            return False
+        if not _has_non_empty_string(source_ref.get("provider_evidence_id")):
+            return False
+    if not isinstance(payload.get("constraints_used"), dict):
+        return False
+    diagnostics = payload.get("freebusy_diagnostics")
+    if not isinstance(diagnostics, list):
+        return False
+    for diagnostic in diagnostics:
+        if not isinstance(diagnostic, dict):
+            return False
+        if not _has_non_empty_string(diagnostic.get("reason_code")):
+            return False
+        if not _has_non_empty_string(diagnostic.get("calendar_id")):
+            return False
+    no_slots_reason = payload.get("no_slots_reason")
+    if no_slots_reason is not None and no_slots_reason != "no_slots_available":
+        return False
+    slots = payload.get("slots")
+    if not isinstance(slots, list) or len(slots) > _MAX_GOOGLE_RESULTS:
+        return False
+    for slot in slots:
+        if not isinstance(slot, dict):
+            return False
+        if not _has_non_empty_string(slot.get("slot_id")):
+            return False
+        if not isinstance(slot.get("start"), dict) or not isinstance(slot.get("end"), dict):
+            return False
+        if not _has_non_empty_string(slot["start"].get("value")):
+            return False
+        if not _has_non_empty_string(slot["end"].get("value")):
+            return False
+        if not _has_non_empty_string(slot["start"].get("timezone")):
+            return False
+        if not _has_non_empty_string(slot["end"].get("timezone")):
+            return False
+        if not isinstance(slot["start"].get("all_day"), bool):
+            return False
+        if not isinstance(slot["end"].get("all_day"), bool):
+            return False
+        if slot.get("availability_scope") != payload.get("availability_scope"):
+            return False
+        if slot.get("partial") != partial:
+            return False
+        if "confidence" in slot:
+            return False
+    return True
+
+
+def _is_google_gmail_message_refs_output(payload: dict[str, Any]) -> bool:
+    if payload.get("schema_version") != "google.gmail.message_refs.v1" or "results" in payload:
+        return False
+    if not _has_non_empty_string(payload.get("retrieved_at")):
+        return False
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return False
+    for message in messages:
+        if not isinstance(message, dict):
+            return False
+        if not _has_non_empty_string(message.get("message_id")):
+            return False
+        if not _has_non_empty_string(message.get("thread_id")):
+            return False
+        if not _has_non_empty_string(message.get("provider_url")):
+            return False
+        for key in ("history_id", "subject", "subject_key", "direction"):
+            if not isinstance(message.get(key), str):
+                return False
+        if not isinstance(message.get("recipients"), list):
+            return False
+        if not isinstance(message.get("label_ids"), list):
+            return False
+        preview = message.get("preview")
+        if preview is not None and not isinstance(preview, str):
+            return False
+        if not _has_non_empty_string(message.get("internal_date")):
+            return False
+        if message.get("evidence_status") not in _GMAIL_SEARCH_EVIDENCE_STATUSES:
+            return False
+    return True
+
+
+def _gmail_message_metadata_is_bounded(message: dict[str, Any]) -> bool:
+    allowed = {
+        "provider_account_id",
+        "message_id",
+        "thread_id",
+        "history_id",
+        "rfc_message_id",
+        "in_reply_to",
+        "references",
+        "subject",
+        "subject_key",
+        "sender",
+        "recipients",
+        "cc",
+        "bcc",
+        "reply_to",
+        "internal_date",
+        "internal_date_ms",
+        "header_date",
+        "direction",
+        "labels",
+        "label_ids",
+        "attachments",
+        "body",
+        "provider_url",
+        "raw_payload_digest",
+    }
+    if not _has_only_keys(message, allowed):
+        return False
+    if _has_forbidden_text_key(message, allowed=allowed):
+        return False
+    body = message.get("body")
+    if body is None:
+        return True
+    if not isinstance(body, dict):
+        return False
+    allowed_body = {
+        "preferred_mime_type",
+        "truncated",
+        "body_digest",
+        "decode_notes",
+        "html_security",
+    }
+    if not _has_only_keys(body, allowed_body):
+        return False
+    if "text" in body or "html_text" in body or "blocks" in body:
+        return False
+    return True
+
+
+def _gmail_evidence_blocks_are_valid(blocks: Any) -> bool:
+    if not isinstance(blocks, list):
+        return False
+    if not blocks:
+        return False
+    if len(blocks) > _MAX_GMAIL_EVIDENCE_BLOCKS:
+        return False
+    for block in blocks:
+        if not isinstance(block, dict):
+            return False
+        allowed = {
+            "block_id",
+            "kind",
+            "text",
+            "digest",
+            "truncated",
+            "source_mime_type",
+            "charset",
+            "source_message_id",
+            "source_thread_id",
+        }
+        if not _has_only_keys(block, allowed):
+            return False
+        if not _has_non_empty_string(block.get("block_id")):
+            return False
+        if not _has_non_empty_string(block.get("kind")):
+            return False
+        text = block.get("text")
+        if not _has_non_empty_string(text):
+            return False
+        if isinstance(text, str) and len(text) > _MAX_GMAIL_EVIDENCE_BLOCK_CHARS:
+            return False
+        if not _has_non_empty_string(block.get("digest")):
+            return False
+    return True
+
+
+def _is_google_gmail_message_evidence_output(payload: dict[str, Any]) -> bool:
+    if payload.get("schema_version") != "google.gmail.message_evidence.v1" or "results" in payload:
+        return False
+    if not _has_only_keys(
+        payload,
+        {
+            "schema_version",
+            "mode",
+            "message",
+            "thread",
+            "messages",
+            "published_at",
+            "evidence",
+            "read_outcome",
+            "retrieved_at",
+        },
+    ):
+        return False
+    if not _has_non_empty_string(payload.get("retrieved_at")):
+        return False
+    mode = payload.get("mode", "message")
+    if mode not in {"message", "thread", "thread_context"}:
+        return False
+    evidence = payload.get("evidence")
+    if not isinstance(evidence, dict):
+        return False
+    allowed_evidence = {
+        "source_kind",
+        "message_id",
+        "thread_id",
+        "anchor_message_id",
+        "body_digest",
+        "blocks",
+        "truncated",
+        "decode_notes",
+        "html_security",
+    }
+    if not _has_only_keys(evidence, allowed_evidence):
+        return False
+    if _has_forbidden_text_key(evidence, allowed={"body_digest"}):
+        return False
+    read_outcome = payload.get("read_outcome")
+    if not isinstance(read_outcome, dict):
+        return False
+    if not _has_only_keys(read_outcome, {"status", "reason_code", "recovery"}):
+        return False
+    read_status = read_outcome.get("status")
+    if read_status not in {"ok", "body_too_large", "decode_failed", "no_body"}:
+        return False
+    if read_status == "ok" and not _has_non_empty_string(evidence.get("body_digest")):
+        return False
+    if read_status != "ok" and evidence.get("body_digest") is not None:
+        return False
+    blocks = evidence.get("blocks")
+    if read_status == "ok" and not _gmail_evidence_blocks_are_valid(blocks):
+        return False
+    if read_status != "ok" and (not isinstance(blocks, list) or blocks):
+        return False
+
+    if mode == "message":
+        message = payload.get("message")
+        if not isinstance(message, dict) or not _gmail_message_metadata_is_bounded(message):
+            return False
+        message_id = message.get("message_id")
+        if not _has_non_empty_string(message_id):
+            return False
+        thread_id = message.get("thread_id")
+        if not _has_non_empty_string(thread_id):
+            return False
+        evidence_message_id = evidence.get("message_id")
+        if not _has_non_empty_string(evidence_message_id) or evidence_message_id != message_id:
+            return False
+        if evidence.get("thread_id") != thread_id:
+            return False
+        if evidence.get("source_kind") != "gmail_message":
+            return False
+        return True
+
+    thread = payload.get("thread")
+    messages = payload.get("messages")
+    if not isinstance(thread, dict) or not isinstance(messages, list):
+        return False
+    if not _has_only_keys(
+        thread,
+        {"thread_id", "history_id", "message_count", "anchor_message_id"},
+    ):
+        return False
+    thread_id = thread.get("thread_id")
+    if not _has_non_empty_string(thread_id):
+        return False
+    if evidence.get("thread_id") != thread_id:
+        return False
+    if len(messages) > _MAX_GOOGLE_RESULTS:
+        return False
+    if evidence.get("source_kind") != "gmail_thread":
+        return False
+    for message in messages:
+        if not isinstance(message, dict):
+            return False
+        if not _has_non_empty_string(message.get("message_id")):
+            return False
+        if message.get("thread_id") != thread_id:
+            return False
+        if not _gmail_message_metadata_is_bounded(message):
+            return False
+    return True
+
+
+def _is_google_gmail_mutation_output(payload: dict[str, Any]) -> bool:
+    if payload.get("status") not in {
+        "archived",
+        "trashed",
+        "labels_modified",
+        "undone",
+        "failed",
+        "partially_failed",
+    }:
+        return False
+    if payload.get("operation") not in {"archive", "trash", "labels.modify", "undo"}:
+        return False
+    if not _is_string_list(payload.get("message_ids")):
+        return False
+    if not _is_string_list(payload.get("affected_message_ids")):
+        return False
+    if not isinstance(payload.get("before_state"), list):
+        return False
+    if not isinstance(payload.get("after_state"), list):
+        return False
+    if not isinstance(payload.get("before_labels"), dict):
+        return False
+    if not isinstance(payload.get("after_labels"), dict):
+        return False
+    if not isinstance(payload.get("provider_result"), dict):
+        return False
+    if not isinstance(payload.get("undo_supported"), bool):
+        return False
+    if not _has_non_empty_string(payload.get("executed_at")):
+        return False
+    return True
+
+
+def _is_google_email_draft_output(payload: dict[str, Any]) -> bool:
+    if payload.get("status") != "drafted_not_sent":
+        return False
+    if payload.get("delivery_state") != "draft_only" or payload.get("sent") is not False:
+        return False
+    draft = payload.get("draft")
+    if not isinstance(draft, dict):
+        return False
+    if not _is_string_list(draft.get("to")):
+        return False
+    if not _is_string_list(draft.get("cc")):
+        return False
+    if not _is_string_list(draft.get("bcc")):
+        return False
+    if not isinstance(draft.get("subject"), str):
+        return False
+    if not isinstance(draft.get("body"), str):
+        return False
+    return _has_non_empty_string(payload.get("provider_draft_ref"))
+
+
+def _is_google_email_send_output(payload: dict[str, Any]) -> bool:
+    if payload.get("status") != "sent":
+        return False
+    if not _has_non_empty_string(payload.get("message_id")):
+        return False
+    if not _has_non_empty_string(payload.get("provider_message_ref")):
+        return False
+    if not _is_string_list(payload.get("to")):
+        return False
+    return isinstance(payload.get("subject"), str)
+
+
+def _is_google_drive_search_output(payload: dict[str, Any]) -> bool:
+    if not _has_non_empty_string(payload.get("query")):
+        return False
+    if not _has_non_empty_string(payload.get("retrieved_at")):
+        return False
+    return _is_result_list(payload.get("results"))
+
+
+def _is_google_drive_read_output(payload: dict[str, Any]) -> bool:
+    if not _has_non_empty_string(payload.get("file_id")):
+        return False
+    if not _has_non_empty_string(payload.get("retrieved_at")):
+        return False
+    if not isinstance(payload.get("content_excerpt"), str):
+        return False
+    if not isinstance(payload.get("truncated"), bool):
+        return False
+    read_outcome = payload.get("read_outcome")
+    if not isinstance(read_outcome, dict):
+        return False
+    if read_outcome.get("status") not in {"ok", "unsupported", "too_large", "unavailable"}:
+        return False
+    if not _is_string_or_none(read_outcome.get("reason_code")):
+        return False
+    if not _is_string_or_none(read_outcome.get("recovery")):
+        return False
+    return _is_result_list(payload.get("results"))
+
+
+def _is_google_drive_share_output(payload: dict[str, Any]) -> bool:
+    if payload.get("status") != "shared":
+        return False
+    for key in ("file_id", "grantee_email", "role", "permission_id"):
+        if not _has_non_empty_string(payload.get(key)):
+            return False
+    return True
+
+
+def _is_typed_google_read_output(*, capability_id: str, payload: dict[str, Any]) -> bool:
+    if capability_id == "cap.calendar.list":
+        return _is_google_calendar_events_output(payload)
+    if capability_id == "cap.calendar.propose_slots":
+        return _is_google_calendar_slot_options_output(payload)
+    if capability_id == "cap.calendar.create_event":
+        return _is_google_calendar_write_result_output(
+            payload,
+            schema_version="google.calendar.create_result.v1",
+            status="created",
+        )
+    if capability_id == "cap.calendar.update_event":
+        return _is_google_calendar_write_result_output(
+            payload,
+            schema_version="google.calendar.update_result.v1",
+            status="updated",
+        )
+    if capability_id == "cap.calendar.respond_to_event":
+        return _is_google_calendar_write_result_output(
+            payload,
+            schema_version="google.calendar.response_result.v1",
+            status="responded",
+        )
+    if capability_id == "cap.email.search":
+        return _is_google_gmail_message_refs_output(payload)
+    if capability_id == "cap.email.read":
+        return _is_google_gmail_message_evidence_output(payload)
+    if capability_id in {
+        "cap.email.archive",
+        "cap.email.trash",
+        "cap.email.labels.modify",
+        "cap.email.undo",
+    }:
+        return _is_google_gmail_mutation_output(payload)
+    if capability_id == "cap.email.draft":
+        return _is_google_email_draft_output(payload)
+    if capability_id == "cap.email.send":
+        return _is_google_email_send_output(payload)
+    if capability_id == "cap.drive.search":
+        return _is_google_drive_search_output(payload)
+    if capability_id == "cap.drive.read":
+        return _is_google_drive_read_output(payload)
+    if capability_id == "cap.drive.share":
+        return _is_google_drive_share_output(payload)
+    return False
+
+
+def is_typed_google_read_output(*, capability_id: str, payload: dict[str, Any]) -> bool:
+    return _is_typed_google_read_output(capability_id=capability_id, payload=payload)
 
 
 def _canonical_draft_output(
@@ -3787,11 +5081,13 @@ class GoogleConnectorRuntime:
         now_fn: Callable[[], datetime],
         new_id_fn: Callable[[str], str],
     ) -> GoogleCapabilityExecutionResult:
-        access_token, granted_scopes, access_failure = self.prepare_capability_access(
-            db=db,
-            capability_id=capability_id,
-            now_fn=now_fn,
-            new_id_fn=new_id_fn,
+        access_token, granted_scopes, provider_account_id, access_failure = (
+            self.prepare_capability_access(
+                db=db,
+                capability_id=capability_id,
+                now_fn=now_fn,
+                new_id_fn=new_id_fn,
+            )
         )
         if access_failure is not None:
             return access_failure
@@ -3802,6 +5098,7 @@ class GoogleConnectorRuntime:
             normalized_input=normalized_input,
             access_token=access_token,
             granted_scopes=granted_scopes,
+            provider_account_id=provider_account_id,
         )
 
     def refresh_access_token_for_capability(
@@ -4054,12 +5351,13 @@ class GoogleConnectorRuntime:
         capability_id: str,
         now_fn: Callable[[], datetime],
         new_id_fn: Callable[[str], str],
-    ) -> tuple[str | None, set[str], GoogleCapabilityExecutionResult | None]:
+    ) -> tuple[str | None, set[str], str | None, GoogleCapabilityExecutionResult | None]:
         required_scopes = GOOGLE_CAPABILITY_SCOPES.get(capability_id)
         if required_scopes is None:
             return (
                 None,
                 set(),
+                None,
                 GoogleCapabilityExecutionResult(
                     status="failed",
                     output=None,
@@ -4069,9 +5367,12 @@ class GoogleConnectorRuntime:
             )
         connector = self._connector_for_update(db=db)
         if connector is None or connector.status == "not_connected":
-            return None, set(), self._typed_failure(failure_class="not_connected")
+            return None, set(), None, self._typed_failure(failure_class="not_connected")
         if connector.status == "revoked":
-            return None, set(), self._typed_failure(failure_class="access_revoked")
+            return None, set(), None, self._typed_failure(failure_class="access_revoked")
+        provider_account_id = connector.account_subject
+        if provider_account_id is None or not provider_account_id.strip():
+            return None, set(), None, self._typed_failure(failure_class="not_connected")
         granted_scopes = set(_normalize_scope_list(connector.granted_scopes))
         if not required_scopes.issubset(granted_scopes):
             _set_connector_error(
@@ -4080,7 +5381,12 @@ class GoogleConnectorRuntime:
                 now_fn=now_fn,
                 preserve_existing_blocking=True,
             )
-            return None, granted_scopes, self._typed_failure(failure_class="consent_required")
+            return (
+                None,
+                granted_scopes,
+                provider_account_id,
+                self._typed_failure(failure_class="consent_required"),
+            )
 
         try:
             access_token, refresh_failure = self._refresh_access_token_if_needed(
@@ -4094,6 +5400,7 @@ class GoogleConnectorRuntime:
             return (
                 None,
                 granted_scopes,
+                provider_account_id,
                 GoogleCapabilityExecutionResult(
                     status="failed",
                     output=None,
@@ -4102,10 +5409,15 @@ class GoogleConnectorRuntime:
                 ),
             )
         if refresh_failure is not None:
-            return None, granted_scopes, refresh_failure
+            return None, granted_scopes, provider_account_id, refresh_failure
         if access_token is None:
-            return None, granted_scopes, self._typed_failure(failure_class="token_expired")
-        return access_token, granted_scopes, None
+            return (
+                None,
+                granted_scopes,
+                provider_account_id,
+                self._typed_failure(failure_class="token_expired"),
+            )
+        return access_token, granted_scopes, provider_account_id, None
 
     def execute_provider_capability(
         self,
@@ -4114,6 +5426,7 @@ class GoogleConnectorRuntime:
         normalized_input: dict[str, Any],
         access_token: str,
         granted_scopes: set[str],
+        provider_account_id: str | None = None,
     ) -> GoogleCapabilityExecutionResult:
         attendee_intersection_enabled = GOOGLE_CALENDAR_FREEBUSY_SCOPE in granted_scopes
         try:
@@ -4130,6 +5443,16 @@ class GoogleConnectorRuntime:
                 )
             elif capability_id == "cap.calendar.create_event":
                 output_payload = self.workspace_provider.calendar_create_event(
+                    access_token=access_token,
+                    normalized_input=normalized_input,
+                )
+            elif capability_id == "cap.calendar.update_event":
+                output_payload = self.workspace_provider.calendar_update_event(
+                    access_token=access_token,
+                    normalized_input=normalized_input,
+                )
+            elif capability_id == "cap.calendar.respond_to_event":
+                output_payload = self.workspace_provider.calendar_respond_to_event(
                     access_token=access_token,
                     normalized_input=normalized_input,
                 )
@@ -4225,6 +5548,41 @@ class GoogleConnectorRuntime:
             )
 
         if not isinstance(output_payload, dict):
+            return GoogleCapabilityExecutionResult(
+                status="failed",
+                output=None,
+                auth_failure=None,
+                error="invalid_provider_output",
+            )
+        if provider_account_id is not None and provider_account_id.strip():
+            account_id = provider_account_id.strip()
+            if output_payload.get("schema_version") == "google.calendar.events.v1":
+                events = output_payload.get("events")
+                if isinstance(events, list):
+                    for event in events:
+                        if isinstance(event, dict):
+                            event["provider_account_id"] = account_id
+            elif output_payload.get("schema_version") == "google.gmail.message_refs.v1":
+                messages = output_payload.get("messages")
+                if isinstance(messages, list):
+                    for message in messages:
+                        if isinstance(message, dict):
+                            message["provider_account_id"] = account_id
+            elif output_payload.get("schema_version") == "google.gmail.message_evidence.v1":
+                message = output_payload.get("message")
+                if isinstance(message, dict):
+                    message["provider_account_id"] = account_id
+                messages = output_payload.get("messages")
+                if isinstance(messages, list):
+                    for thread_message in messages:
+                        if isinstance(thread_message, dict):
+                            thread_message["provider_account_id"] = account_id
+            else:
+                output_payload["provider_account_id"] = account_id
+        if not _is_typed_google_read_output(
+            capability_id=capability_id,
+            payload=output_payload,
+        ):
             return GoogleCapabilityExecutionResult(
                 status="failed",
                 output=None,

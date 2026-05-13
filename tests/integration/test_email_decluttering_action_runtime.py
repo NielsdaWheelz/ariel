@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import hashlib
 import json
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 from sqlalchemy import create_engine, select
@@ -29,15 +29,22 @@ from ariel.google_connector import (
     GOOGLE_CONNECTOR_ID,
     GOOGLE_GMAIL_MODIFY_SCOPE,
     GoogleCapabilityExecutionResult,
+    _encrypt_secret,
 )
 from ariel.persistence import (
     ActionAttemptRecord,
+    ActionPrivatePayloadRecord,
+    BackgroundTaskRecord,
     EmailActionRecord,
     EmailThreadWatchRecord,
     EventRecord,
     GoogleConnectorRecord,
+    MemoryActionTraceRecord,
+    MemoryEvidenceRecord,
+    ProviderWriteReceiptRecord,
     SessionRecord,
     TurnRecord,
+    serialize_action_attempt,
 )
 
 
@@ -94,7 +101,12 @@ class FakeWorkspaceProvider:
 class FakeGoogleRuntime:
     workspace_provider: FakeWorkspaceProvider
     execution_output: dict[str, Any] | None = None
+    execution_status: Literal["succeeded", "failed"] = "succeeded"
+    execution_error: str | None = None
     executions: list[dict[str, Any]] = field(default_factory=list)
+    encryption_secret: str = "test-secret"
+    encryption_key_version: str = "v1"
+    encryption_keys: str | None = None
 
     def refresh_access_token_for_capability(
         self,
@@ -123,9 +135,9 @@ class FakeGoogleRuntime:
         capability_id: str,
         now_fn: Any,
         new_id_fn: Any,
-    ) -> tuple[str, set[str], None]:
+    ) -> tuple[str, set[str], str, None]:
         del db, capability_id, now_fn, new_id_fn
-        return "tok_live", {GOOGLE_GMAIL_MODIFY_SCOPE}, None
+        return "tok_live", {GOOGLE_GMAIL_MODIFY_SCOPE}, PROVIDER_ACCOUNT_ID, None
 
     def execute_provider_capability(
         self,
@@ -134,16 +146,28 @@ class FakeGoogleRuntime:
         normalized_input: dict[str, Any],
         access_token: str,
         granted_scopes: set[str],
+        provider_account_id: str | None = None,
     ) -> GoogleCapabilityExecutionResult:
-        del capability_id, access_token, granted_scopes
+        del capability_id, access_token, granted_scopes, provider_account_id
         self.executions.append(normalized_input)
-        assert self.execution_output is not None
+        if self.execution_status == "succeeded":
+            assert self.execution_output is not None
         return GoogleCapabilityExecutionResult(
-            status="succeeded",
+            status=self.execution_status,
             output=self.execution_output,
             auth_failure=None,
-            error=None,
+            error=self.execution_error,
         )
+
+
+def _id_factory(suffix: str) -> Callable[[str], str]:
+    counters: dict[str, int] = {}
+
+    def new_id(prefix: str) -> str:
+        counters[prefix] = counters.get(prefix, 0) + 1
+        return f"{prefix}_{suffix}_{counters[prefix]}"
+
+    return new_id
 
 
 def _seed_action_attempt(
@@ -156,10 +180,41 @@ def _seed_action_attempt(
 ) -> str:
     capability = get_capability(capability_id)
     assert capability is not None
+    full_input = dict(proposed_input)
+    if capability_id in {
+        "cap.email.archive",
+        "cap.email.trash",
+        "cap.email.labels.modify",
+        "cap.email.undo",
+    } and not any(
+        isinstance(full_input.get(key), str) and full_input[key]
+        for key in ("source_evidence_id", "commitment_id", "user_instruction_ref")
+    ):
+        full_input["user_instruction_ref"] = "turn:turn_email"
+    stored_input = dict(full_input)
+    private_payload_required = False
+    private_keys = (
+        ("body",)
+        if capability_id in {"cap.email.draft", "cap.email.send"}
+        else ("description",)
+        if capability_id in {"cap.calendar.create_event", "cap.calendar.update_event"}
+        else ()
+    )
+    for key in private_keys:
+        value = stored_input.get(key)
+        if isinstance(value, str):
+            stored_input[key] = {
+                "redacted": True,
+                "digest": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+                "char_count": len(value),
+                "private_payload": True,
+            }
+            private_payload_required = True
+    private_payload_json = json.dumps(full_input, sort_keys=True, separators=(",", ":"))
     action_hash = payload_hash(
         canonical_action_payload(
             capability_id=capability_id,
-            input_payload=proposed_input,
+            input_payload=full_input,
         )
     )
     with session_factory() as db:
@@ -197,7 +252,7 @@ def _seed_action_attempt(
                     capability_version=capability.version,
                     capability_contract_hash=capability_contract_hash(capability),
                     impact_level=capability.impact_level,
-                    proposed_input=proposed_input,
+                    proposed_input=stored_input,
                     payload_hash=action_hash,
                     policy_decision="requires_approval",
                     policy_reason=None,
@@ -209,6 +264,26 @@ def _seed_action_attempt(
                     updated_at=NOW,
                 )
             )
+            db.flush()
+            if private_payload_required:
+                db.add(
+                    ActionPrivatePayloadRecord(
+                        id=f"app_{action_attempt_id}",
+                        action_attempt_id=action_attempt_id,
+                        payload_kind="google_provider_write_input",
+                        payload_digest=hashlib.sha256(
+                            private_payload_json.encode("utf-8")
+                        ).hexdigest(),
+                        payload_enc=_encrypt_secret(
+                            plaintext=private_payload_json,
+                            secret="test-secret",
+                            key_version="v1",
+                        ),
+                        encryption_key_version="v1",
+                        created_at=NOW,
+                        updated_at=NOW,
+                    )
+                )
     return action_hash
 
 
@@ -238,6 +313,117 @@ def _seed_google_connector(
                     updated_at=NOW,
                 )
             )
+
+
+def _seed_memory_action_trace(
+    session_factory: sessionmaker[Session],
+    *,
+    action_attempt_id: str,
+) -> None:
+    with session_factory() as db:
+        with db.begin():
+            db.add(
+                MemoryEvidenceRecord(
+                    id=f"mev_{action_attempt_id}",
+                    source_turn_id="turn_email",
+                    source_session_id="ses_email",
+                    actor_id="user:default",
+                    content_class="user_message",
+                    trust_boundary="trusted_user",
+                    lifecycle_state="available",
+                    source_uri=None,
+                    source_artifact_id=None,
+                    source_text="declutter email",
+                    evidence_snippet="declutter email",
+                    redaction_posture="none",
+                    metadata_json={},
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+            db.flush()
+            db.add(
+                MemoryActionTraceRecord(
+                    id=f"mat_{action_attempt_id}",
+                    scope_key="session:ses_email",
+                    trace_type="policy_decision",
+                    action_attempt_id=action_attempt_id,
+                    source_turn_id="turn_email",
+                    primary_evidence_id=f"mev_{action_attempt_id}",
+                    capability_id="cap.email.archive",
+                    summary="cap.email.archive unknown for proposal 1",
+                    outcome="unknown",
+                    result_refs={"execution_status": "executing"},
+                    lifecycle_state="active",
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+
+
+def test_memory_inspect_capability_executes_inline(
+    session_factory: sessionmaker[Session],
+) -> None:
+    events: list[dict[str, Any]] = []
+    with session_factory() as db:
+        with db.begin():
+            db.add(
+                SessionRecord(
+                    id="ses_memory",
+                    is_active=True,
+                    lifecycle_state="active",
+                    rotated_from_session_id=None,
+                    rotation_reason=None,
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+            turn = TurnRecord(
+                id="turn_memory",
+                session_id="ses_memory",
+                user_message="inspect memory",
+                assistant_message=None,
+                status="in_progress",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+            db.add(turn)
+            db.flush()
+
+            result = process_response_function_calls(
+                db=db,
+                session_id="ses_memory",
+                turn=turn,
+                assistant_message="",
+                function_calls_raw=[
+                    {
+                        "call_id": "call_memory_inspect",
+                        "name": response_tool_name_for_capability_id("cap.memory.inspect"),
+                        "arguments": json.dumps({"section": "all", "limit": 10}),
+                    }
+                ],
+                approval_ttl_seconds=300,
+                approval_actor_id="user:default",
+                add_event=lambda event_type, payload: events.append(
+                    {"event_type": event_type, "payload": payload}
+                ),
+                now_fn=lambda: NOW,
+                new_id_fn=lambda prefix: f"{prefix}_memory",
+            )
+
+    assert result.action_attempts[0].capability_id == "cap.memory.inspect"
+    assert result.action_attempts[0].status == "succeeded"
+    function_output = json.loads(result.function_call_outputs[0]["output"])
+    assert function_output["status"] == "succeeded"
+    assert function_output["capability_id"] == "cap.memory.inspect"
+    assert function_output["output"]["status"] == "inspected"
+    assert function_output["output"]["memory"]["active_assertions"] == []
+    assert [event["event_type"] for event in events] == [
+        "evt.action.proposed",
+        "evt.action.policy_decided",
+        "evt.action.execution.started",
+        "evt.action.execution.succeeded",
+    ]
 
 
 def test_email_action_partial_provider_failure_retries_without_false_success(
@@ -305,6 +491,18 @@ def test_email_action_partial_provider_failure_retries_without_false_success(
         assert email_action.after_state["messages"][0]["label_ids"] == ["TRASH"]
         assert email_action.provider_result["error"] == "google_upstream_500"
         assert email_action.intended_state["before_state"] == before_state
+        receipt = db.scalar(select(ProviderWriteReceiptRecord).limit(1))
+        assert receipt is not None
+        assert receipt.status == "failed"
+        assert receipt.provider_account_id == PROVIDER_ACCOUNT_ID
+        assert receipt.action_attempt_id == "act_partial"
+        assert receipt.request_digest == action_attempt.payload_hash
+        assert receipt.ambiguity_reason is None
+        assert receipt.idempotency_key is not None
+        assert "act_partial" not in receipt.idempotency_key
+        assert receipt.response_payload["error"] == "google_upstream_500"
+        assert receipt.response_payload["provider_result"]["mutated_message_ids"] == ["msg_ok"]
+        assert receipt.provider_object_ids["message_ids"] == ["msg_ok", "msg_fail"]
 
 
 def test_email_action_malformed_before_state_fails_before_provider_mutation(
@@ -347,6 +545,76 @@ def test_email_action_malformed_before_state_fails_before_provider_mutation(
         assert email_action.before_state == {}
 
 
+def test_email_action_provider_timeout_records_ambiguous_receipt_and_fails_closed(
+    session_factory: sessionmaker[Session],
+) -> None:
+    before_state = [{"message_id": "msg_1", "thread_id": "thr_1", "label_ids": ["INBOX"]}]
+    runtime = FakeGoogleRuntime(
+        workspace_provider=FakeWorkspaceProvider(before_state=before_state),
+        execution_output=None,
+        execution_status="failed",
+        execution_error="provider_timeout",
+    )
+    _seed_action_attempt(
+        session_factory,
+        action_attempt_id="act_timeout",
+        capability_id="cap.email.archive",
+        proposed_input={"message_ids": ["msg_1"], "idempotency_key": "archive-timeout"},
+        proposal_index=1,
+    )
+    new_id = _id_factory("timeout")
+
+    assert process_action_execution_task(
+        session_factory=session_factory,
+        action_attempt_id="act_timeout",
+        google_runtime=runtime,  # type: ignore[arg-type]
+        agency_runtime=None,
+        now_fn=lambda: NOW,
+        new_id_fn=new_id,
+    )
+
+    with session_factory() as db:
+        action_attempt = db.get(ActionAttemptRecord, "act_timeout")
+        assert action_attempt is not None
+        assert action_attempt.status == "failed"
+        assert action_attempt.execution_error == "provider_timeout"
+        email_action = db.scalar(select(EmailActionRecord).limit(1))
+        assert email_action is not None
+        assert email_action.status == "failed"
+        assert email_action.failure_code == "provider_timeout"
+        receipt = db.scalar(select(ProviderWriteReceiptRecord).limit(1))
+        assert receipt is not None
+        assert receipt.status == "ambiguous"
+        assert receipt.ambiguity_reason == "provider_timeout"
+        assert receipt.response_payload["error"] == "provider_timeout"
+        assert receipt.provider_object_ids["message_ids"] == ["msg_1"]
+        event_types = [
+            row[0]
+            for row in db.execute(
+                select(EventRecord.event_type).order_by(EventRecord.sequence.asc())
+            ).all()
+        ]
+        assert event_types == [
+            "evt.provider_write.reconcile_unavailable",
+            "evt.action.execution.failed",
+        ]
+        reconcile_event = db.scalar(
+            select(EventRecord)
+            .where(EventRecord.event_type == "evt.provider_write.reconcile_unavailable")
+            .limit(1)
+        )
+        assert reconcile_event is not None
+        assert reconcile_event.payload["provider_write_receipt_id"] == receipt.id
+        assert reconcile_event.payload["reconcile_task_enqueued"] is True
+        reconcile_task = db.scalar(
+            select(BackgroundTaskRecord)
+            .where(BackgroundTaskRecord.task_type == "provider_write_reconcile_due")
+            .limit(1)
+        )
+        assert reconcile_task is not None
+        assert reconcile_task.provider_write_receipt_id == receipt.id
+
+
 def test_email_action_success_redacts_undo_token_from_event_audit(
     session_factory: sessionmaker[Session],
 ) -> None:
@@ -374,6 +642,7 @@ def test_email_action_success_redacts_undo_token_from_event_audit(
         proposed_input={"message_ids": ["msg_1"], "idempotency_key": "archive-success"},
         proposal_index=1,
     )
+    _seed_memory_action_trace(session_factory, action_attempt_id="act_success")
 
     assert process_action_execution_task(
         session_factory=session_factory,
@@ -402,6 +671,110 @@ def test_email_action_success_redacts_undo_token_from_event_audit(
         )
         assert event is not None
         assert event.payload["output"]["undo_token"] == "[redacted]"
+        trace = db.get(MemoryActionTraceRecord, "mat_act_success")
+        assert trace is not None
+        assert trace.trace_type == "execution"
+        assert trace.outcome == "succeeded"
+        assert trace.summary == "cap.email.archive succeeded for proposal 1"
+        assert trace.result_refs["execution_status"] == "succeeded"
+        assert trace.result_refs["execution_output_available"] is True
+        receipt = db.scalar(select(ProviderWriteReceiptRecord).limit(1))
+        assert receipt is not None
+        assert receipt.status == "succeeded"
+        assert receipt.provider_account_id == PROVIDER_ACCOUNT_ID
+        assert receipt.action_attempt_id == "act_success"
+        assert receipt.request_digest == action_attempt.payload_hash
+        assert receipt.ambiguity_reason is None
+        assert receipt.idempotency_key is not None
+        assert "act_success" not in receipt.idempotency_key
+        assert receipt.response_payload["email_action_id"] == email_action.id
+        assert receipt.provider_object_ids["message_ids"] == ["msg_1"]
+        assert receipt.response_payload["undo_token"] == "[redacted]"
+        assert isinstance(receipt.response_digest, str)
+        assert len(receipt.response_digest) == 64
+
+
+def test_email_draft_write_receipt_redacts_body_and_records_authority(
+    session_factory: sessionmaker[Session],
+) -> None:
+    runtime = FakeGoogleRuntime(
+        workspace_provider=FakeWorkspaceProvider(before_state=[]),
+        execution_output={
+            "status": "drafted_not_sent",
+            "delivery_state": "draft_only",
+            "sent": False,
+            "draft": {
+                "to": ["teammate@example.com"],
+                "subject": "Follow up",
+                "body": "Private draft body should not be in receipts.",
+            },
+            "provider_draft_ref": "gmail-draft-1",
+            "history_id": "hist_draft_1",
+            "provider_timestamp": "2026-05-08T12:00:01Z",
+        },
+    )
+    _seed_action_attempt(
+        session_factory,
+        action_attempt_id="act_draft",
+        capability_id="cap.email.draft",
+        proposed_input={
+            "to": ["teammate@example.com"],
+            "subject": "Follow up",
+            "body": "Private draft body should not be in receipts.",
+            "idempotency_key": "draft-private-body",
+            "user_instruction_ref": "turn:turn_email",
+        },
+        proposal_index=1,
+    )
+
+    assert process_action_execution_task(
+        session_factory=session_factory,
+        action_attempt_id="act_draft",
+        google_runtime=runtime,  # type: ignore[arg-type]
+        agency_runtime=None,
+        now_fn=lambda: NOW,
+        new_id_fn=lambda prefix: f"{prefix}_draft",
+    )
+
+    with session_factory() as db:
+        action_attempt = db.get(ActionAttemptRecord, "act_draft")
+        assert action_attempt is not None
+        assert action_attempt.status == "succeeded", action_attempt.execution_error
+        assert action_attempt.execution_output is not None
+        assert action_attempt.proposed_input["body"]["private_payload"] is True
+        assert "Private draft body should not be in receipts." not in json.dumps(
+            action_attempt.proposed_input,
+            sort_keys=True,
+        )
+        assert action_attempt.execution_output["draft"]["body_redacted"]["redacted"] is True
+        serialized_attempt = serialize_action_attempt(action_attempt, approval=None)
+        serialized_json = json.dumps(serialized_attempt, sort_keys=True)
+        assert "Private draft body should not be in receipts." not in serialized_json
+        assert serialized_attempt["proposal_input"]["body"]["redacted"] is True
+        private_payload = db.scalar(select(ActionPrivatePayloadRecord).limit(1))
+        assert private_payload is not None
+        assert "Private draft body should not be in receipts." not in private_payload.payload_enc
+        receipt = db.scalar(select(ProviderWriteReceiptRecord).limit(1))
+        assert receipt is not None
+        assert receipt.status == "succeeded"
+        assert receipt.provider_history_id == "hist_draft_1"
+        assert receipt.provider_timestamp == datetime(2026, 5, 8, 12, 0, 1, tzinfo=UTC)
+        assert isinstance(receipt.response_digest, str)
+        assert len(receipt.response_digest) == 64
+        assert receipt.response_payload["authority"]["source_type"] == "user_instruction_ref"
+        assert receipt.response_payload["authority"]["turn_id"] == "turn_email"
+        receipt_json = json.dumps(receipt.response_payload, sort_keys=True)
+        assert "Private draft body should not be in receipts." not in receipt_json
+        event = db.scalar(
+            select(EventRecord)
+            .where(EventRecord.event_type == "evt.action.execution.succeeded")
+            .limit(1)
+        )
+        assert event is not None
+        assert "Private draft body should not be in receipts." not in json.dumps(
+            event.payload,
+            sort_keys=True,
+        )
 
 
 def test_email_action_idempotency_replay_returns_existing_result_without_provider_call(

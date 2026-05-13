@@ -15,6 +15,8 @@ from testcontainers.postgres import PostgresContainer
 from ariel.app import ModelAdapter, ModelAdapterError, create_app
 from tests.integration.responses_helpers import responses_message, responses_with_function_calls
 from ariel.db import run_migrations
+from ariel.google_connector import GOOGLE_CONNECTOR_ID
+from ariel.persistence import GoogleConnectorRecord, WorkCommitmentRecord, WorkFollowUpLoopRecord
 
 
 def _parse_utc_rfc3339(value: str) -> datetime:
@@ -134,13 +136,48 @@ class AttachmentReadAdapter:
     ) -> dict[str, Any]:
         del tools, user_message, history
         if context_bundle.get("origin") == "tool_result_interpretation":
-            return responses_with_function_calls(
-                input_items=input_items,
-                assistant_text="",
-                proposals=[],
+            interpreter_input = json.loads(
+                next(
+                    item["content"]
+                    for item in input_items
+                    if item.get("role") == "user" and isinstance(item.get("content"), str)
+                )
+            )
+            selected_output_refs = [
+                output["output_ref"]
+                for output in interpreter_input["audited_tool_outputs"]
+                if isinstance(output, dict) and isinstance(output.get("output_ref"), str)
+            ]
+            return responses_message(
+                assistant_text=json.dumps(
+                    {
+                        "findings": ["attachment output requires interpreted answer context"],
+                        "contradictions": [],
+                        "uncertainty": [],
+                        "selected_output_refs": selected_output_refs,
+                        "omitted_output_refs": [],
+                        "citation_refs": interpreter_input["citation_refs"],
+                        "artifact_refs": interpreter_input["artifact_refs"],
+                        "recommended_next_evidence": [],
+                        "confidence": 0.91,
+                    },
+                    sort_keys=True,
+                ),
                 provider=self.provider,
                 model=self.model,
                 provider_response_id="resp_attachment_interpreter_123",
+                input_tokens=7,
+                output_tokens=5,
+            )
+        if any(
+            isinstance(item, dict) and item.get("type") == "function_call_output"
+            for item in input_items
+        ):
+            return responses_message(
+                assistant_text="attachment content: quarterly revenue increased [1]",
+                provider=self.provider,
+                model=self.model,
+                provider_response_id="resp_attachment_final_123",
                 input_tokens=7,
                 output_tokens=5,
             )
@@ -1013,6 +1050,291 @@ def test_pr01_turn_context_is_bounded_ordered_and_auditable(
         assert fourth_context_meta["recent_window"]["included_turn_count"] == 1
         assert fourth_context_meta["recent_window"]["omitted_turn_count"] == 2
         assert fourth_context_meta["recent_window"]["included_turn_ids"] == [turns[2]["id"]]
+
+
+def test_pr01_context_includes_open_google_commitments_and_due_follow_up_loops(
+    postgres_url: str,
+) -> None:
+    adapter = CapturingAttachmentAdapter()
+    with _build_client(postgres_url, adapter) as client:
+        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
+        now = datetime(2026, 5, 13, 12, 0, tzinfo=UTC)
+        with cast(Any, client.app).state.session_factory() as db:
+            with db.begin():
+                db.add(
+                    GoogleConnectorRecord(
+                        id=GOOGLE_CONNECTOR_ID,
+                        provider="google",
+                        status="connected",
+                        account_subject="acct_google",
+                        account_email="user@example.com",
+                        granted_scopes=[],
+                        access_token_enc=None,
+                        refresh_token_enc=None,
+                        access_token_expires_at=None,
+                        token_obtained_at=None,
+                        encryption_key_version="v1",
+                        last_error_code=None,
+                        last_error_at=None,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                db.add(
+                    WorkCommitmentRecord(
+                        id="wcm_context_open",
+                        provider="google",
+                        provider_account_id="acct_google",
+                        owner="user",
+                        requester_person_id=None,
+                        counterparty_person_id=None,
+                        thread_id=None,
+                        dedupe_digest="wkc_relevant",
+                        action_text="Send the invoice pack to Dana before the Friday review.",
+                        action_category="deliverable",
+                        due_start=datetime(2026, 5, 15, 9, 30, tzinfo=UTC),
+                        due_end=None,
+                        timezone="UTC",
+                        priority="high",
+                        confidence=0.91,
+                        lifecycle_state="active",
+                        review_state="approved",
+                        resolution_evidence_id=None,
+                        superseded_by_commitment_id=None,
+                        metadata_json={},
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                db.add(
+                    WorkCommitmentRecord(
+                        id="wcm_context_other_account",
+                        provider="google",
+                        provider_account_id="acct_other",
+                        owner="user",
+                        requester_person_id=None,
+                        counterparty_person_id=None,
+                        thread_id=None,
+                        dedupe_digest="wkc_other_account",
+                        action_text="Other account work should stay out of this context.",
+                        action_category="deliverable",
+                        due_start=datetime(2026, 5, 13, 13, 30, tzinfo=UTC),
+                        due_end=None,
+                        timezone="UTC",
+                        priority="critical",
+                        confidence=0.9,
+                        lifecycle_state="active",
+                        review_state="approved",
+                        resolution_evidence_id=None,
+                        superseded_by_commitment_id=None,
+                        metadata_json={},
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                db.add(
+                    WorkCommitmentRecord(
+                        id="wcm_context_candidate",
+                        provider="google",
+                        provider_account_id="acct_google",
+                        owner="user",
+                        requester_person_id=None,
+                        counterparty_person_id=None,
+                        thread_id=None,
+                        dedupe_digest="wkc_candidate",
+                        action_text="Candidate work should render only as review.",
+                        action_category="deliverable",
+                        due_start=datetime(2026, 5, 13, 13, 30, tzinfo=UTC),
+                        due_end=None,
+                        timezone="UTC",
+                        priority="normal",
+                        confidence=0.7,
+                        lifecycle_state="candidate",
+                        review_state="review_required",
+                        resolution_evidence_id=None,
+                        superseded_by_commitment_id=None,
+                        metadata_json={},
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                db.add(
+                    WorkCommitmentRecord(
+                        id="wcm_context_done",
+                        provider="google",
+                        provider_account_id="acct_google",
+                        owner="user",
+                        requester_person_id=None,
+                        counterparty_person_id=None,
+                        thread_id=None,
+                        dedupe_digest="wkc_resolved",
+                        action_text="Already resolved work should stay out of context.",
+                        action_category="deliverable",
+                        due_start=datetime(2026, 5, 14, 9, 30, tzinfo=UTC),
+                        due_end=None,
+                        timezone="UTC",
+                        priority="normal",
+                        confidence=0.9,
+                        lifecycle_state="resolved",
+                        review_state="approved",
+                        resolution_evidence_id=None,
+                        superseded_by_commitment_id=None,
+                        metadata_json={},
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                db.add(
+                    WorkFollowUpLoopRecord(
+                        id="wfl_context_terminal",
+                        commitment_id="wcm_context_done",
+                        thread_id=None,
+                        loop_kind="due_date",
+                        state="active",
+                        version=1,
+                        next_check_at=datetime(2020, 1, 1, tzinfo=UTC),
+                        next_notification_at=None,
+                        stale_after=None,
+                        last_evaluated_evidence_id=None,
+                        snoozed_until=None,
+                        last_feedback=None,
+                        policy_version="test-policy",
+                        metadata_json={},
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                db.add(
+                    WorkFollowUpLoopRecord(
+                        id="wfl_context_due",
+                        commitment_id="wcm_context_open",
+                        thread_id=None,
+                        loop_kind="due_date",
+                        state="active",
+                        version=1,
+                        next_check_at=datetime(2020, 1, 1, tzinfo=UTC),
+                        next_notification_at=None,
+                        stale_after=None,
+                        last_evaluated_evidence_id=None,
+                        snoozed_until=None,
+                        last_feedback=None,
+                        policy_version="test-policy",
+                        metadata_json={},
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                db.add(
+                    WorkFollowUpLoopRecord(
+                        id="wfl_context_other_account",
+                        commitment_id="wcm_context_other_account",
+                        thread_id=None,
+                        loop_kind="due_date",
+                        state="active",
+                        version=1,
+                        next_check_at=datetime(2020, 1, 1, tzinfo=UTC),
+                        next_notification_at=None,
+                        stale_after=None,
+                        last_evaluated_evidence_id=None,
+                        snoozed_until=None,
+                        last_feedback=None,
+                        policy_version="test-policy",
+                        metadata_json={},
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                db.add(
+                    WorkFollowUpLoopRecord(
+                        id="wfl_context_future",
+                        commitment_id="wcm_context_open",
+                        thread_id=None,
+                        loop_kind="due_date",
+                        state="active",
+                        version=1,
+                        next_check_at=datetime(2099, 1, 1, tzinfo=UTC),
+                        next_notification_at=None,
+                        stale_after=None,
+                        last_evaluated_evidence_id=None,
+                        snoozed_until=None,
+                        last_feedback=None,
+                        policy_version="test-policy",
+                        metadata_json={},
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+
+        response = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "what work needs attention?"},
+        )
+
+        assert response.status_code == 200
+        work_context = adapter.context_bundles[0]["open_commitments_and_jobs"]
+        assert work_context["provider_account_id"] == "acct_google"
+        assert work_context["open_commitments"] == [
+            {
+                "id": "wcm_context_open",
+                "provider": "google",
+                "owner": "user",
+                "action_text": "Send the invoice pack to Dana before the Friday review.",
+                "action_category": "deliverable",
+                "due_start": "2026-05-15T09:30:00Z",
+                "due_end": None,
+                "timezone": "UTC",
+                "priority": "high",
+                "lifecycle_state": "active",
+                "review_state": "approved",
+                "thread_id": None,
+                "source_refs": [],
+            }
+        ]
+        assert work_context["commitment_review_prompts"] == [
+            {
+                "id": "wcm_context_candidate",
+                "provider": "google",
+                "owner": "user",
+                "action_text": "Candidate work should render only as review.",
+                "action_category": "deliverable",
+                "due_start": "2026-05-13T13:30:00Z",
+                "due_end": None,
+                "timezone": "UTC",
+                "priority": "normal",
+                "lifecycle_state": "candidate",
+                "review_state": "review_required",
+                "thread_id": None,
+                "source_refs": [],
+            }
+        ]
+        assert work_context["due_follow_up_loops"][0]["id"] == "wfl_context_due"
+        assert work_context["due_follow_up_loops"][0]["commitment_action_text"] == (
+            "Send the invoice pack to Dana before the Friday review."
+        )
+        assert "wfl_context_future" not in {
+            loop["id"] for loop in work_context["due_follow_up_loops"]
+        }
+        assert "wfl_context_terminal" not in {
+            loop["id"] for loop in work_context["due_follow_up_loops"]
+        }
+        assert "wfl_context_other_account" not in {
+            loop["id"] for loop in work_context["due_follow_up_loops"]
+        }
+
+        rendered_context = "\n".join(
+            item["content"]
+            for item in adapter.input_items[0]
+            if item.get("role") == "system" and isinstance(item.get("content"), str)
+        )
+        assert "open work commitments:" in rendered_context
+        assert "wcm_context_open: high: active: Send the invoice pack" in rendered_context
+        assert "due follow-up loops:" in rendered_context
+        assert "wfl_context_due: due_date: active" in rendered_context
+        assert "work commitments needing review:" in rendered_context
+        assert "wcm_context_candidate: candidate: review_required" in rendered_context
+        assert "wcm_context_done" not in rendered_context
+        assert "wcm_context_other_account" not in rendered_context
+        assert "wfl_context_future" not in rendered_context
 
 
 def test_pr01_context_audit_is_stable_even_if_adapter_mutates_context_bundle(

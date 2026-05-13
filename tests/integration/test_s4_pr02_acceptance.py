@@ -3,17 +3,15 @@ from __future__ import annotations
 import copy
 from collections.abc import Generator
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from typing import Any, cast
 
 from fastapi.testclient import TestClient
 import pytest
+from sqlalchemy import select
 from testcontainers.postgres import PostgresContainer
-import ulid
 
-from ariel.action_runtime import process_action_execution_task
 from ariel.app import ModelAdapter, create_app
-from ariel.google_connector import GoogleConnectorRuntime
+from ariel.persistence import ProviderWriteReceiptRecord
 from tests.integration.responses_helpers import responses_with_function_calls
 
 
@@ -42,7 +40,23 @@ class ActionProposalAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         del tools, history, context_bundle
-        proposals = self.proposals_by_message.get(user_message, [])
+        proposals = copy.deepcopy(self.proposals_by_message.get(user_message, []))
+        current_turn_ref = None
+        for item in input_items:
+            content = item.get("content")
+            if not isinstance(content, str):
+                continue
+            for line in content.splitlines():
+                if line.startswith("- current user instruction: "):
+                    current_turn_ref = line.removeprefix("- current user instruction: ").strip()
+        for proposal in proposals:
+            input_payload = proposal.get("input")
+            if (
+                current_turn_ref is not None
+                and isinstance(input_payload, dict)
+                and input_payload.get("user_instruction_ref") == "turn:current"
+            ):
+                input_payload["user_instruction_ref"] = current_turn_ref
         assistant_text = self.assistant_text_by_message.get(
             user_message,
             f"assistant::{user_message}",
@@ -50,7 +64,7 @@ class ActionProposalAdapter:
         return responses_with_function_calls(
             input_items=input_items,
             assistant_text=assistant_text,
-            proposals=copy.deepcopy(proposals),
+            proposals=proposals,
             provider=self.provider,
             model=self.model,
             provider_response_id="resp_s4_pr02_123",
@@ -152,12 +166,31 @@ class FakeGoogleWorkspaceProvider:
     ) -> dict[str, Any]:
         del access_token
         return {
-            "results": [
+            "schema_version": "google.calendar.events.v1",
+            "events": [
                 {
-                    "title": "team sync",
-                    "source": "calendar://primary",
-                    "snippet": "today 10:00-10:30 team sync",
-                    "published_at": None,
+                    "provider_account_id": "google",
+                    "calendar_id": "primary",
+                    "event_id": "evt-team-sync",
+                    "status": "confirmed",
+                    "summary": "team sync",
+                    "description_blocks": [],
+                    "attendees": [],
+                    "start": {
+                        "value": "2026-03-04T10:00:00Z",
+                        "timezone": "UTC",
+                        "all_day": False,
+                    },
+                    "end": {
+                        "value": "2026-03-04T10:30:00Z",
+                        "timezone": "UTC",
+                        "all_day": False,
+                    },
+                    "all_day": False,
+                    "recurrence": [],
+                    "updated": "2026-03-03T09:00:00Z",
+                    "provider_url": "https://calendar.google.com/event?eid=evt-team-sync",
+                    "raw_payload_digest": "c" * 64,
                 }
             ],
             "retrieved_at": "2026-03-03T12:00:00Z",
@@ -174,18 +207,37 @@ class FakeGoogleWorkspaceProvider:
     ) -> dict[str, Any]:
         del access_token, attendee_intersection_enabled
         return {
-            "results": [
+            "schema_version": "google.calendar.slot_options.v1",
+            "slots": [
                 {
-                    "title": "slot option 1",
-                    "source": "calendar://availability",
-                    "snippet": "wed 10:30-11:00 works for all attendees",
-                    "published_at": None,
+                    "slot_id": "slot_1",
+                    "start": {
+                        "value": "2026-03-04T10:30:00Z",
+                        "timezone": "UTC",
+                        "all_day": False,
+                    },
+                    "end": {
+                        "value": "2026-03-04T11:00:00Z",
+                        "timezone": "UTC",
+                        "all_day": False,
+                    },
+                    "availability_scope": "all_attendees",
+                    "partial": False,
                 }
             ],
             "retrieved_at": "2026-03-03T12:00:00Z",
+            "window_start": normalized_input["window_start"],
+            "window_end": normalized_input["window_end"],
+            "duration_minutes": normalized_input["duration_minutes"],
             "attendees_considered": normalized_input.get("attendees", []),
-            "attendee_intersection_used": True,
-            "attendee_recovery_hint": None,
+            "availability_scope": "all_attendees",
+            "partial": False,
+            "partial_reason": None,
+            "timezone": "UTC",
+            "source_evidence_refs": [],
+            "constraints_used": {},
+            "freebusy_diagnostics": [],
+            "no_slots_reason": None,
         }
 
     def calendar_create_event(
@@ -203,12 +255,19 @@ class FakeGoogleWorkspaceProvider:
             }
         )
         return {
+            "schema_version": "google.calendar.create_result.v1",
             "status": "created",
             "event_id": f"evt_{len(self.calendar_create_calls)}",
+            "calendar_id": normalized_input.get("calendar_id", "primary"),
             "title": normalized_input["title"],
             "start_time": normalized_input["start_time"],
             "end_time": normalized_input["end_time"],
             "provider_event_ref": f"calendar://evt_{len(self.calendar_create_calls)}",
+            "etag": f"etag_{len(self.calendar_create_calls)}",
+            "updated": "2026-03-03T12:00:00Z",
+            "ical_uid": f"ical_{len(self.calendar_create_calls)}@google.com",
+            "provider_status": "confirmed",
+            "executed_at": "2026-03-03T12:00:01Z",
         }
 
     def email_search(
@@ -219,7 +278,8 @@ class FakeGoogleWorkspaceProvider:
     ) -> dict[str, Any]:
         del access_token, normalized_input
         return {
-            "results": [],
+            "schema_version": "google.gmail.message_refs.v1",
+            "messages": [],
             "retrieved_at": "2026-03-03T12:00:00Z",
         }
 
@@ -231,7 +291,22 @@ class FakeGoogleWorkspaceProvider:
     ) -> dict[str, Any]:
         del access_token, normalized_input
         return {
-            "results": [],
+            "schema_version": "google.gmail.message_evidence.v1",
+            "message": {"message_id": "msg-1"},
+            "evidence": {
+                "source_kind": "gmail_message",
+                "message_id": "msg-1",
+                "body_digest": "f" * 64,
+                "blocks": [
+                    {
+                        "block_id": "gmail:msg-1:body:0",
+                        "kind": "body",
+                        "text": "message evidence",
+                        "digest": "a" * 64,
+                    }
+                ],
+            },
+            "read_outcome": {"status": "ok", "reason_code": None, "recovery": None},
             "retrieved_at": "2026-03-03T12:00:00Z",
         }
 
@@ -320,34 +395,6 @@ def _event_types(turn_payload: dict[str, Any]) -> list[str]:
     return [event["event_type"] for event in turn_payload["events"]]
 
 
-def _new_id(prefix: str) -> str:
-    return f"{prefix}_{ulid.new().str.lower()}"
-
-
-def _run_queued_action(client: TestClient, action_attempt_id: str) -> None:
-    app_state = cast(Any, client.app).state
-    process_action_execution_task(
-        session_factory=app_state.session_factory,
-        action_attempt_id=action_attempt_id,
-        google_runtime=GoogleConnectorRuntime(
-            oauth_client=app_state.google_oauth_client,
-            workspace_provider=app_state.google_workspace_provider,
-            redirect_uri=str(app_state.google_oauth_redirect_uri),
-            oauth_state_ttl_seconds=int(app_state.google_oauth_state_ttl_seconds),
-            encryption_secret=str(app_state.connector_encryption_secret),
-            encryption_key_version=str(app_state.connector_encryption_key_version),
-            encryption_keys=(
-                str(app_state.connector_encryption_keys)
-                if app_state.connector_encryption_keys is not None
-                else None
-            ),
-        ),
-        agency_runtime=None,
-        now_fn=lambda: datetime.now(tz=UTC),
-        new_id_fn=_new_id,
-    )
-
-
 def _bind_google_fakes(
     client: TestClient,
     *,
@@ -383,6 +430,8 @@ def test_s4_pr02_write_scope_remediation_reconnect_is_capability_intent_driven_a
                         "title": "kickoff",
                         "start_time": "2026-03-04T10:00:00Z",
                         "end_time": "2026-03-04T10:30:00Z",
+                        "idempotency_key": "calendar-kickoff-1",
+                        "user_instruction_ref": "turn:current",
                     },
                 }
             ]
@@ -507,6 +556,8 @@ def test_s4_pr02_calendar_create_requires_approval_and_executes_exactly_once(
                         "start_time": "2026-03-04T15:00:00Z",
                         "end_time": "2026-03-04T15:30:00Z",
                         "attendees": ["team@example.com"],
+                        "idempotency_key": "calendar-launch-review-1",
+                        "user_instruction_ref": "turn:current",
                     },
                 }
             ]
@@ -576,6 +627,17 @@ def test_s4_pr02_calendar_create_requires_approval_and_executes_exactly_once(
             "evt.action.execution.started"
         )
         assert len(workspace_provider.calendar_create_calls) == 1
+        with cast(Any, client.app).state.session_factory() as db:
+            receipt = db.scalar(select(ProviderWriteReceiptRecord).limit(1))
+            assert receipt is not None
+            assert receipt.capability_id == "cap.calendar.create_event"
+            assert receipt.status == "succeeded"
+            assert "act_" not in receipt.idempotency_key
+            assert receipt.provider_object_ids["event_id"] == "evt_1"
+            assert receipt.provider_object_ids["calendar_id"] == "primary"
+            assert receipt.provider_object_ids["etag"] == "etag_1"
+            assert receipt.response_payload["schema_version"] == "google.calendar.create_result.v1"
+            assert receipt.response_payload["updated"] == "2026-03-03T12:00:00Z"
 
 
 def test_s4_pr02_email_draft_queues_then_executes_as_draft_only_without_send_side_effect(
@@ -590,10 +652,15 @@ def test_s4_pr02_email_draft_queues_then_executes_as_draft_only_without_send_sid
                         "to": ["Teammate@Example.com"],
                         "subject": "Follow up",
                         "body": "Can we sync tomorrow at 10am?",
+                        "idempotency_key": "draft-follow-up-1",
+                        "user_instruction_ref": "turn:current",
                     },
                 }
             ]
-        }
+        },
+        assistant_text_by_message={
+            "draft follow-up": "Approval is required before I create that draft.",
+        },
     )
     oauth_client = FakeGoogleOAuthClient(
         tokens_by_code={
@@ -627,14 +694,19 @@ def test_s4_pr02_email_draft_queues_then_executes_as_draft_only_without_send_sid
         payload = sent.json()
         attempt = _surface_attempt(payload["turn"])
         assert attempt["proposal"]["capability_id"] == "cap.email.draft"
-        assert attempt["policy"]["decision"] == "allow_inline"
-        assert attempt["approval"]["status"] == "not_requested"
-        assert attempt["execution"]["status"] == "in_progress"
+        assert attempt["policy"]["decision"] == "requires_approval"
+        assert attempt["approval"]["status"] == "pending"
+        assert attempt["execution"]["status"] == "not_executed"
         assert attempt["execution"]["output"] is None
         assert len(workspace_provider.email_draft_calls) == 0
         assert len(workspace_provider.email_send_calls) == 0
 
-        _run_queued_action(client, attempt["action_attempt_id"])
+        approval_ref = _approval_ref(payload["turn"])
+        approved = client.post(
+            "/v1/approvals",
+            json={"approval_ref": approval_ref, "decision": "approve", "actor_id": "user.local"},
+        )
+        assert approved.status_code == 200
 
         timeline = client.get(f"/v1/sessions/{session_id}/events")
         assert timeline.status_code == 200
@@ -648,12 +720,79 @@ def test_s4_pr02_email_draft_queues_then_executes_as_draft_only_without_send_sid
         assert output["sent"] is False
         assert output["draft"]["to"] == ["teammate@example.com"]
         assert output["draft"]["subject"] == "Follow up"
-        assert output["draft"]["body"] == "Can we sync tomorrow at 10am?"
+        assert output["draft"]["body_redacted"]["redacted"] is True
 
         assistant_message = payload["assistant"]["message"].lower()
-        assert "queued" in assistant_message
+        assert "approval" in assistant_message
         assert len(workspace_provider.email_draft_calls) == 1
         assert len(workspace_provider.email_send_calls) == 0
+
+
+def test_s4_pr02_user_instruction_authority_requires_real_turn_id(
+    postgres_url: str,
+) -> None:
+    adapter = ActionProposalAdapter(
+        proposals_by_message={
+            "draft with slug authority": [
+                {
+                    "capability_id": "cap.email.draft",
+                    "input": {
+                        "to": ["ops@example.com"],
+                        "subject": "status",
+                        "body": "hello",
+                        "idempotency_key": "draft-slug-authority-1",
+                        "user_instruction_ref": "turn:draft-with-slug-authority",
+                    },
+                }
+            ]
+        }
+    )
+    oauth_client = FakeGoogleOAuthClient(
+        tokens_by_code={
+            "connect-compose": FakeTokenBundle(
+                account_subject="sub_slug_ref",
+                account_email="slug-ref@example.com",
+                granted_scopes=[
+                    GOOGLE_CALENDAR_READ_SCOPE,
+                    GOOGLE_GMAIL_READ_SCOPE,
+                    GOOGLE_GMAIL_COMPOSE_SCOPE,
+                ],
+                access_token="tok_access_slug_ref",
+                refresh_token="tok_refresh_slug_ref",
+            )
+        }
+    )
+    workspace_provider = FakeGoogleWorkspaceProvider()
+    with _build_client(postgres_url, adapter) as client:
+        _bind_google_fakes(
+            client,
+            oauth_client=oauth_client,
+            workspace_provider=workspace_provider,
+        )
+        _connect_google(client, code="connect-compose")
+        session_id = _session_id(client)
+
+        sent = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "draft with slug authority"},
+        )
+        assert sent.status_code == 200
+        approved = client.post(
+            "/v1/approvals",
+            json={
+                "approval_ref": _approval_ref(sent.json()["turn"]),
+                "decision": "approve",
+                "actor_id": "user.local",
+            },
+        )
+        assert approved.status_code == 200
+
+        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        assert timeline.status_code == 200
+        attempt = _surface_attempt(timeline.json()["turns"][-1])
+        assert attempt["execution"]["status"] == "failed"
+        assert attempt["execution"]["error"] == "provider_user_instruction_not_found"
+        assert len(workspace_provider.email_draft_calls) == 0
 
 
 def test_s4_pr02_email_send_requires_approval_and_executes_exactly_once(
@@ -668,6 +807,8 @@ def test_s4_pr02_email_send_requires_approval_and_executes_exactly_once(
                         "to": ["client@example.com"],
                         "subject": "Status update",
                         "body": "All milestones are on track.",
+                        "idempotency_key": "send-follow-up-1",
+                        "user_instruction_ref": "turn:current",
                     },
                 }
             ]
@@ -747,6 +888,8 @@ def test_s4_pr02_draft_and_send_are_distinct_lifecycle_units_with_independent_hi
                         "to": ["client@example.com"],
                         "subject": "Proposal draft",
                         "body": "Draft body.",
+                        "idempotency_key": "draft-note-1",
+                        "user_instruction_ref": "turn:current",
                     },
                     "influenced_by_untrusted_content": False,
                 }
@@ -758,6 +901,8 @@ def test_s4_pr02_draft_and_send_are_distinct_lifecycle_units_with_independent_hi
                         "to": ["client@example.com"],
                         "subject": "Proposal draft",
                         "body": "Draft body.",
+                        "idempotency_key": "send-note-1",
+                        "user_instruction_ref": "turn:current",
                     },
                     "influenced_by_untrusted_content": False,
                 }
@@ -792,11 +937,19 @@ def test_s4_pr02_draft_and_send_are_distinct_lifecycle_units_with_independent_hi
 
         drafted = client.post(f"/v1/sessions/{session_id}/message", json={"message": "draft note"})
         assert drafted.status_code == 200
-        draft_attempt = _surface_attempt(drafted.json()["turn"])
+        draft_turn = drafted.json()["turn"]
+        draft_attempt = _surface_attempt(draft_turn)
         assert draft_attempt["proposal"]["capability_id"] == "cap.email.draft"
-        assert draft_attempt["approval"]["status"] == "not_requested"
-        assert draft_attempt["execution"]["status"] == "in_progress"
-        _run_queued_action(client, draft_attempt["action_attempt_id"])
+        assert draft_attempt["approval"]["status"] == "pending"
+        draft_approved = client.post(
+            "/v1/approvals",
+            json={
+                "approval_ref": _approval_ref(draft_turn),
+                "decision": "approve",
+                "actor_id": "user.local",
+            },
+        )
+        assert draft_approved.status_code == 200
 
         send_proposed = client.post(
             f"/v1/sessions/{session_id}/message", json={"message": "send note"}
@@ -827,7 +980,7 @@ def test_s4_pr02_draft_and_send_are_distinct_lifecycle_units_with_independent_hi
         send_attempt_final = _surface_attempt(send_turn_final)
 
         assert draft_attempt_final["action_attempt_id"] != send_attempt_final["action_attempt_id"]
-        assert draft_attempt_final["approval"]["status"] == "not_requested"
+        assert draft_attempt_final["approval"]["status"] == "approved"
         assert send_attempt_final["approval"]["status"] == "approved"
         assert draft_attempt_final["execution"]["status"] == "succeeded"
         assert send_attempt_final["execution"]["status"] == "succeeded"
@@ -903,12 +1056,16 @@ def test_s4_pr02_write_paths_return_typed_auth_failures_with_recovery_guidance(
                             "title": "Risk review",
                             "start_time": "2026-03-05T10:00:00Z",
                             "end_time": "2026-03-05T10:30:00Z",
+                            "idempotency_key": "calendar-risk-review-1",
+                            "user_instruction_ref": "turn:current",
                         }
                         if capability_id == "cap.calendar.create_event"
                         else {
                             "to": ["ops@example.com"],
                             "subject": "status",
                             "body": "hello",
+                            "idempotency_key": "email-write-1",
+                            "user_instruction_ref": "turn:current",
                         }
                     ),
                 }

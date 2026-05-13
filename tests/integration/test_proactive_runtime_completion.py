@@ -18,9 +18,12 @@ from ariel.memory import AIJudgmentFailure
 from ariel.persistence import (
     AIJudgmentRecord,
     AutonomyScopeRecord,
+    MemoryAssertionEvidenceRecord,
     MemoryAssertionRecord,
+    MemoryReviewRecord,
     ProactiveActionExecutionRecord,
     ProactiveActionPlanRecord,
+    ProactiveCaseEventRecord,
     ProactiveCaseRecord,
     ProactiveContextSnapshotRecord,
     ProactiveDecisionRecord,
@@ -78,45 +81,31 @@ class ToolCallingProactiveAdapter:
         del user_message, history, context_bundle
         self.calls += 1
         if not any(item.get("type") == "function_call_output" for item in input_items):
-            assert any(tool.get("name") == "cap_framework_read_echo" for tool in tools)
+            assert tools == []
             return {
                 "provider": "provider.proactive-test",
                 "model": "model.proactive-test",
-                "provider_response_id": "resp_proactive_tool",
+                "provider_response_id": "resp_proactive_tool_denied",
                 "output": [
                     {
-                        "type": "function_call",
-                        "id": "fc_tool_1",
-                        "call_id": "call_tool_1",
-                        "name": "cap_framework_read_echo",
-                        "arguments": json.dumps({"text": "fresh eta"}),
-                        "status": "completed",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": json.dumps(
+                                    _decision_payload(
+                                        decision="speak_now",
+                                        user_visible_message="Leave now from the case evidence.",
+                                        tool_refs=[],
+                                    )
+                                ),
+                            }
+                        ],
                     }
                 ],
             }
-        return {
-            "provider": "provider.proactive-test",
-            "model": "model.proactive-test",
-            "provider_response_id": "resp_proactive_tool_done",
-            "output": [
-                {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "output_text",
-                            "text": json.dumps(
-                                _decision_payload(
-                                    decision="speak_now",
-                                    user_visible_message="Leave now based on fresh eta.",
-                                    tool_refs=["call_tool_1"],
-                                )
-                            ),
-                        }
-                    ],
-                }
-            ],
-        }
+        raise AssertionError("case-scoped proactive test should not reach a tool round")
 
 
 _id_counter = 0
@@ -345,7 +334,7 @@ def test_proactive_memory_curation_failure_is_case_audited_before_deliberation(
             assert db.scalar(select(func.count()).select_from(ProactiveActionPlanRecord)) == 0
 
 
-def test_deliberation_can_call_read_only_tool_and_store_tool_output(
+def test_deliberation_does_not_expose_generic_read_tools(
     postgres_url: str,
 ) -> None:
     now = datetime(2026, 5, 7, 12, 2, tzinfo=UTC)
@@ -360,21 +349,19 @@ def test_deliberation_can_call_read_only_tool_and_store_tool_output(
                 decision = db.scalar(select(ProactiveDecisionRecord).limit(1))
                 turn = db.scalar(select(ProactiveTurnRecord).limit(1))
 
-                assert adapter.calls == 2
+                assert adapter.calls == 1
                 assert snapshot is not None
-                assert snapshot.context["tool_outputs"][0]["result"]["output"] == {
-                    "text": "fresh eta"
-                }
-                assert any(
+                assert snapshot.context["tool_outputs"] == []
+                assert not any(
                     item.get("type") == "function_call_output" for item in snapshot.model_input
                 )
                 assert decision is not None
-                assert decision.tool_refs == ["call_tool_1"]
+                assert decision.tool_refs == []
                 assert turn is not None
-                assert turn.message == "Leave now based on fresh eta."
+                assert turn.message == "Leave now from the case evidence."
 
 
-def test_remember_creates_active_memory_assertion_and_ask_user_sets_asked(
+def test_remember_creates_reviewable_memory_candidate_and_ask_user_sets_asked(
     postgres_url: str,
 ) -> None:
     now = datetime(2026, 5, 7, 12, 5, tzinfo=UTC)
@@ -408,6 +395,17 @@ def test_remember_creates_active_memory_assertion_and_ask_user_sets_asked(
         with _session_factory(client)() as db:
             with db.begin():
                 assertion = db.scalar(select(MemoryAssertionRecord).limit(1))
+                assertion_evidence = db.scalar(select(MemoryAssertionEvidenceRecord).limit(1))
+                review = db.scalar(select(MemoryReviewRecord).limit(1))
+                remember_event = db.scalar(
+                    select(ProactiveCaseEventRecord)
+                    .where(
+                        ProactiveCaseEventRecord.case_id == remember_case_id,
+                        ProactiveCaseEventRecord.event_type == "resolved",
+                    )
+                    .order_by(ProactiveCaseEventRecord.created_at.desc())
+                    .limit(1)
+                )
                 asked_case = db.get(ProactiveCaseRecord, ask_case_id)
                 turn = db.scalar(
                     select(ProactiveTurnRecord).where(ProactiveTurnRecord.case_id == ask_case_id)
@@ -416,7 +414,14 @@ def test_remember_creates_active_memory_assertion_and_ask_user_sets_asked(
                 assert assertion is not None
                 assert assertion.subject_key == "project:phoenix"
                 assert assertion.object_value == {"text": "Ship tomorrow."}
-                assert assertion.lifecycle_state == "active"
+                assert assertion.lifecycle_state == "candidate"
+                assert assertion_evidence is not None
+                assert assertion_evidence.assertion_id == assertion.id
+                assert review is not None
+                assert review.assertion_id == assertion.id
+                assert review.decision == "needs_user_review"
+                assert remember_event is not None
+                assert remember_event.payload["memory_candidate_assertion_id"] == assertion.id
                 assert asked_case is not None
                 assert asked_case.status == "asked"
                 assert turn is not None

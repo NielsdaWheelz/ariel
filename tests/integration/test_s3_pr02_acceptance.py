@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from collections.abc import Callable, Generator
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -12,7 +13,7 @@ from testcontainers.postgres import PostgresContainer
 import ariel.action_runtime as action_runtime_module
 import ariel.policy_engine as policy_engine_module
 from ariel.app import ModelAdapter, create_app
-from tests.integration.responses_helpers import responses_with_function_calls
+from tests.integration.responses_helpers import responses_message, responses_with_function_calls
 from ariel.capability_registry import (
     CapabilityDefinition,
     get_capability as registry_get_capability,
@@ -34,11 +35,53 @@ class ActionProposalAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        del tools, history, context_bundle
+        del tools, history
+        if context_bundle.get("origin") == "tool_result_interpretation":
+            interpreter_input = context_bundle.get("tool_result_interpreter_input")
+            if not isinstance(interpreter_input, dict):
+                interpreter_input = {}
+            audited_outputs = interpreter_input.get("audited_tool_outputs")
+            selected_output_refs = []
+            if isinstance(audited_outputs, list):
+                selected_output_refs = [
+                    output["output_ref"]
+                    for output in audited_outputs
+                    if isinstance(output, dict) and isinstance(output.get("output_ref"), str)
+                ]
+            return responses_message(
+                assistant_text=json.dumps(
+                    {
+                        "findings": ["tool evidence inspected"],
+                        "contradictions": [],
+                        "uncertainty": [],
+                        "selected_output_refs": selected_output_refs,
+                        "omitted_output_refs": [],
+                        "citation_refs": interpreter_input.get("citation_refs", []),
+                        "artifact_refs": interpreter_input.get("artifact_refs", []),
+                        "recommended_next_evidence": [],
+                        "confidence": 0.9,
+                    },
+                    sort_keys=True,
+                ),
+                provider=self.provider,
+                model=self.model,
+                provider_response_id="resp_s3_pr02_interpreter",
+                input_tokens=34,
+                output_tokens=19,
+            )
+        assistant_text = {
+            "news update": "EU AI transparency and enforcement updates are active [1][2].",
+            "news egress deny": "blocked: egress_destination_denied",
+            "news recency": "Freshness note: one source is stale and one has missing or ambiguous timing [1][2].",
+            "weather explicit": "Tokyo tomorrow forecast timestamp 2026-03-03T13:00:00Z [1].",
+            "weather missing location": "Which city or location should I use?",
+            "weather timeout": "uncertain because the weather provider timed out; retry later.",
+            "weather egress deny": "blocked: egress_destination_denied",
+        }.get(user_message, f"assistant::{user_message}")
         proposals = self.proposals_by_message.get(user_message, [])
         return responses_with_function_calls(
             input_items=input_items,
-            assistant_text=f"assistant::{user_message}",
+            assistant_text=assistant_text,
             proposals=copy.deepcopy(proposals),
             provider=self.provider,
             model=self.model,

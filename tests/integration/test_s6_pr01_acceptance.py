@@ -7,9 +7,11 @@ from typing import Any, cast
 
 from fastapi.testclient import TestClient
 import pytest
+from sqlalchemy import select
 from testcontainers.postgres import PostgresContainer
 
 from ariel.app import ModelAdapter, create_app
+from ariel.persistence import ProviderWriteReceiptRecord
 from tests.integration.responses_helpers import responses_with_function_calls
 
 
@@ -40,7 +42,23 @@ class ActionProposalAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         del tools, history, context_bundle
-        proposals = self.proposals_by_message.get(user_message, [])
+        proposals = copy.deepcopy(self.proposals_by_message.get(user_message, []))
+        current_turn_ref = None
+        for item in input_items:
+            content = item.get("content")
+            if not isinstance(content, str):
+                continue
+            for line in content.splitlines():
+                if line.startswith("- current user instruction: "):
+                    current_turn_ref = line.removeprefix("- current user instruction: ").strip()
+        for proposal in proposals:
+            input_payload = proposal.get("input")
+            if (
+                current_turn_ref is not None
+                and isinstance(input_payload, dict)
+                and input_payload.get("user_instruction_ref") == "turn:current"
+            ):
+                input_payload["user_instruction_ref"] = current_turn_ref
         assistant_text = self.assistant_text_by_message.get(
             user_message,
             f"assistant::{user_message}",
@@ -48,7 +66,7 @@ class ActionProposalAdapter:
         return responses_with_function_calls(
             input_items=input_items,
             assistant_text=assistant_text,
-            proposals=copy.deepcopy(proposals),
+            proposals=proposals,
             provider=self.provider,
             model=self.model,
             provider_response_id="resp_s6_pr01_123",
@@ -157,8 +175,14 @@ class FakeGoogleWorkspaceProvider:
         access_token: str,
         normalized_input: dict[str, Any],
     ) -> dict[str, Any]:
-        del access_token, normalized_input
-        return {"results": [], "retrieved_at": "2026-03-06T12:00:00Z"}
+        del access_token
+        return {
+            "schema_version": "google.calendar.events.v1",
+            "events": [],
+            "retrieved_at": "2026-03-06T12:00:00Z",
+            "window_start": normalized_input["window_start"],
+            "window_end": normalized_input["window_end"],
+        }
 
     def calendar_propose_slots(
         self,
@@ -168,7 +192,23 @@ class FakeGoogleWorkspaceProvider:
         attendee_intersection_enabled: bool,
     ) -> dict[str, Any]:
         del access_token, normalized_input, attendee_intersection_enabled
-        return {"results": [], "retrieved_at": "2026-03-06T12:00:00Z"}
+        return {
+            "schema_version": "google.calendar.slot_options.v1",
+            "slots": [],
+            "retrieved_at": "2026-03-06T12:00:00Z",
+            "window_start": "2026-03-06T00:00:00Z",
+            "window_end": "2026-03-07T00:00:00Z",
+            "duration_minutes": 30,
+            "attendees_considered": [],
+            "availability_scope": "all_attendees",
+            "partial": False,
+            "partial_reason": None,
+            "timezone": "UTC",
+            "source_evidence_refs": [],
+            "constraints_used": {},
+            "freebusy_diagnostics": [],
+            "no_slots_reason": "no_slots_available",
+        }
 
     def email_search(
         self,
@@ -177,7 +217,11 @@ class FakeGoogleWorkspaceProvider:
         normalized_input: dict[str, Any],
     ) -> dict[str, Any]:
         del access_token, normalized_input
-        return {"results": [], "retrieved_at": "2026-03-06T12:00:00Z"}
+        return {
+            "schema_version": "google.gmail.message_refs.v1",
+            "messages": [],
+            "retrieved_at": "2026-03-06T12:00:00Z",
+        }
 
     def email_read(
         self,
@@ -185,8 +229,27 @@ class FakeGoogleWorkspaceProvider:
         access_token: str,
         normalized_input: dict[str, Any],
     ) -> dict[str, Any]:
-        del access_token, normalized_input
-        return {"results": [], "retrieved_at": "2026-03-06T12:00:00Z"}
+        del access_token
+        message_id = normalized_input["message_id"]
+        return {
+            "schema_version": "google.gmail.message_evidence.v1",
+            "message": {"message_id": message_id},
+            "evidence": {
+                "source_kind": "gmail_message",
+                "message_id": message_id,
+                "body_digest": "f" * 64,
+                "blocks": [
+                    {
+                        "block_id": f"gmail:{message_id}:body:0",
+                        "kind": "body",
+                        "text": "availability request",
+                        "digest": "a" * 64,
+                    }
+                ],
+            },
+            "read_outcome": {"status": "ok", "reason_code": None, "recovery": None},
+            "retrieved_at": "2026-03-06T12:00:00Z",
+        }
 
     def calendar_create_event(
         self,
@@ -196,12 +259,19 @@ class FakeGoogleWorkspaceProvider:
     ) -> dict[str, Any]:
         del access_token, normalized_input
         return {
+            "schema_version": "google.calendar.create_result.v1",
             "status": "created",
             "event_id": "evt_ignored",
+            "calendar_id": "primary",
             "title": "ignored",
             "start_time": "2026-03-06T10:00:00Z",
             "end_time": "2026-03-06T10:30:00Z",
             "provider_event_ref": "calendar://ignored",
+            "etag": "etag_ignored",
+            "updated": "2026-03-06T12:00:00Z",
+            "ical_uid": "evt_ignored@google.com",
+            "provider_status": "confirmed",
+            "executed_at": "2026-03-06T12:00:01Z",
         }
 
     def email_create_draft(
@@ -467,7 +537,11 @@ def test_s6_pr01_drive_search_and_read_execute_inline_with_retrieval_citations(
             "read launch plan": [
                 {"capability_id": "cap.drive.read", "input": {"file_id": "drv_plan"}}
             ],
-        }
+        },
+        assistant_text_by_message={
+            "find launch plan": "I found the Q3 launch plan. [1]",
+            "read launch plan": "The launch plan excerpt is available. [1]",
+        },
     )
     oauth_client = FakeGoogleOAuthClient(
         tokens_by_code={
@@ -550,7 +624,10 @@ def test_s6_pr01_drive_read_typed_outcomes_are_explicit_and_recoverable(
     adapter = ActionProposalAdapter(
         proposals_by_message={
             message: [{"capability_id": "cap.drive.read", "input": {"file_id": file_id}}]
-        }
+        },
+        assistant_text_by_message={
+            message: f"The Drive read outcome is {expected_status}; {expected_hint}.",
+        },
     )
     oauth_client = FakeGoogleOAuthClient(
         tokens_by_code={
@@ -669,6 +746,8 @@ def test_s6_pr01_drive_share_is_approval_gated_exact_payload_and_exactly_once(
                         "file_id": "drv_plan",
                         "grantee_email": "partner@example.com",
                         "role": "reader",
+                        "idempotency_key": "drive-share-launch-plan-1",
+                        "user_instruction_ref": "turn:current",
                     },
                 }
             ]
@@ -742,11 +821,31 @@ def test_s6_pr01_drive_share_is_approval_gated_exact_payload_and_exactly_once(
         )
 
         assert len(workspace_provider.drive_share_calls) == 1
-        assert workspace_provider.drive_share_calls[0]["normalized_input"] == {
+        normalized_share_input = workspace_provider.drive_share_calls[0]["normalized_input"]
+        assert normalized_share_input == {
             "file_id": "drv_plan",
             "grantee_email": "partner@example.com",
             "role": "reader",
+            "idempotency_key": "drive-share-launch-plan-1",
+            "user_instruction_ref": normalized_share_input["user_instruction_ref"],
         }
+        assert normalized_share_input["user_instruction_ref"].startswith("turn:")
+        with cast(Any, client.app).state.session_factory() as db:
+            receipts = db.scalars(select(ProviderWriteReceiptRecord)).all()
+        assert len(receipts) == 1
+        receipt = receipts[0]
+        assert receipt.capability_id == "cap.drive.share"
+        assert receipt.status == "succeeded"
+        assert receipt.provider_object_ids["file_id"] == "drv_plan"
+        assert receipt.provider_object_ids["permission_id"] == "perm_1"
+        assert (
+            receipt.provider_object_ids["user_instruction_ref"]
+            == normalized_share_input["user_instruction_ref"]
+        )
+        assert (
+            receipt.response_payload["authority"]["user_instruction_ref"]
+            == (normalized_share_input["user_instruction_ref"])
+        )
 
 
 @pytest.mark.parametrize(
@@ -779,7 +878,10 @@ def test_s6_pr01_drive_auth_scope_failures_are_typed_and_recoverable(
             "read strategy doc": [
                 {"capability_id": "cap.drive.read", "input": {"file_id": "drv_auth"}}
             ]
-        }
+        },
+        assistant_text_by_message={
+            "read strategy doc": f"{expected_class}: connect, reconnect, then retry.",
+        },
     )
     oauth_client = FakeGoogleOAuthClient(
         tokens_by_code={
@@ -868,7 +970,10 @@ def test_s6_pr01_drive_provider_failures_are_typed_and_recoverable(
             "find risk register": [
                 {"capability_id": "cap.drive.search", "input": {"query": "risk register"}}
             ]
-        }
+        },
+        assistant_text_by_message={
+            "find risk register": f"{expected_class}: {expected_hint}.",
+        },
     )
     oauth_client = FakeGoogleOAuthClient(
         tokens_by_code={

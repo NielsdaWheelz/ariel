@@ -499,7 +499,7 @@ def test_google_provider_event_ingress_is_token_bound_deduped_and_conflict_safe(
                 assert task_type == "provider_sync_due"
 
 
-def test_google_calendar_sync_creates_workspace_state_and_proactive_case(
+def test_google_calendar_sync_persists_provider_evidence_without_ambient_case(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -511,8 +511,11 @@ def test_google_calendar_sync_creates_workspace_state_and_proactive_case(
                     {
                         "id": "event-1",
                         "summary": "Design review",
+                        "description": "Please prepare design review notes by Friday.",
                         "status": "confirmed",
                         "updated": "2026-04-30T12:00:00Z",
+                        "start": {"dateTime": "2026-05-01T17:00:00Z", "timeZone": "UTC"},
+                        "end": {"dateTime": "2026-05-01T17:30:00Z", "timeZone": "UTC"},
                         "htmlLink": "https://calendar.google.com/event?eid=event-1",
                     }
                 ],
@@ -548,13 +551,6 @@ def test_google_calendar_sync_creates_workspace_state_and_proactive_case(
             settings=settings,
             worker_id="worker-sync",
         )
-        assert process_one_task(
-            session_factory=_session_factory(client),
-            settings=settings,
-            worker_id="worker-ambient",
-            model_adapter=DurableWorkflowAdapter(),
-        )
-
         sync_runs = client.get("/v1/sync-runs")
         assert sync_runs.status_code == 200
         assert sync_runs.json()["sync_runs"][0]["status"] == "succeeded"
@@ -562,34 +558,55 @@ def test_google_calendar_sync_creates_workspace_state_and_proactive_case(
 
         workspace_items = client.get("/v1/workspace-items")
         assert workspace_items.status_code == 200
-        workspace_item = workspace_items.json()["workspace_items"][0]
-        assert workspace_item["item_type"] == "calendar_event"
-        assert workspace_item["external_id"] == "event-1"
-        assert workspace_item["metadata"]["resource_id"] == "primary"
+        assert workspace_items.json()["workspace_items"] == []
 
         observations = client.get("/v1/proactive/observations", params={"status": "linked"})
         assert observations.status_code == 200
-        observation = observations.json()["observations"][0]
-        assert observation["source_type"] == "workspace_item"
-        assert observation["workspace_item_id"] == workspace_item["id"]
-        assert observation["observation_type"] == "workspace_delta"
+        assert observations.json()["observations"] == []
 
         cases = client.get("/v1/proactive/cases")
         assert cases.status_code == 200
-        proactive_case = cases.json()["cases"][0]
-        assert proactive_case["case_key"] == f"workspace-item:{workspace_item['id']}"
-        assert proactive_case["latest_observation_id"] == observation["id"]
+        assert cases.json()["cases"] == []
 
         with _session_factory(client)() as db:
             with db.begin():
-                task_type = db.execute(
-                    text(
-                        "SELECT task_type FROM background_tasks "
-                        "WHERE status = 'pending' "
-                        "ORDER BY created_at DESC LIMIT 1"
+                evidence = (
+                    db.execute(
+                        text(
+                            "SELECT id, source_kind, external_id, calendar_id, source_uri, "
+                            "extraction_status, lifecycle_state "
+                            "FROM provider_evidence "
+                            "WHERE source_kind = 'calendar_event' "
+                            "ORDER BY created_at DESC LIMIT 1"
+                        )
                     )
-                ).scalar_one()
-                assert task_type == "proactive_deliberation_due"
+                    .mappings()
+                    .one()
+                )
+                assert evidence["external_id"] == "event-1"
+                assert evidence["calendar_id"] == "primary"
+                assert evidence["source_uri"] == "https://calendar.google.com/event?eid=event-1"
+                assert evidence["extraction_status"] == "pending"
+                assert evidence["lifecycle_state"] == "available"
+
+                pending_tasks = (
+                    db.execute(
+                        text(
+                            "SELECT task_type, payload FROM background_tasks "
+                            "WHERE status = 'pending' "
+                            "ORDER BY created_at ASC"
+                        )
+                    )
+                    .mappings()
+                    .all()
+                )
+                assert {
+                    "task_type": "workspace_commitment_extraction_due",
+                    "payload": {"evidence_id": evidence["id"]},
+                } in [dict(task) for task in pending_tasks]
+                assert all(
+                    task["task_type"] != "ambient_interpretation_due" for task in pending_tasks
+                )
 
 
 def test_proactive_interpretation_deliberates_speaks_and_acknowledges_case_and_turn(

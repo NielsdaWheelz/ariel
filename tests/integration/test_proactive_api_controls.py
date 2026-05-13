@@ -829,6 +829,8 @@ def test_autonomy_scope_enforces_target_recipient_and_payload_shape(
             "bcc": "list",
             "subject": "string",
             "body": "string",
+            "idempotency_key": "string",
+            "user_instruction_ref": "string",
         },
         "allow_extra": False,
     }
@@ -842,6 +844,8 @@ def test_autonomy_scope_enforces_target_recipient_and_payload_shape(
             "bcc": [],
             "subject": "Status",
             "body": "Please review the blocked job.",
+            "idempotency_key": "scope-email-draft",
+            "user_instruction_ref": "turn:scope-email",
         },
         "risk_tier": "low",
     }
@@ -975,6 +979,8 @@ def test_autonomy_scope_selection_checks_later_full_scope(
             "bcc": "list",
             "subject": "string",
             "body": "string",
+            "idempotency_key": "string",
+            "user_instruction_ref": "string",
         },
         "allow_extra": False,
     }
@@ -988,6 +994,8 @@ def test_autonomy_scope_selection_checks_later_full_scope(
             "bcc": [],
             "subject": "Status",
             "body": "Please review the blocked job.",
+            "idempotency_key": "multi-scope-email-draft",
+            "user_instruction_ref": "turn:multi-scope-email",
         },
         "risk_tier": "low",
     }
@@ -1062,6 +1070,8 @@ def test_autonomy_scope_selection_does_not_union_partial_scopes(
             "bcc": "list",
             "subject": "string",
             "body": "string",
+            "idempotency_key": "string",
+            "user_instruction_ref": "string",
         },
         "allow_extra": False,
     }
@@ -1075,6 +1085,8 @@ def test_autonomy_scope_selection_does_not_union_partial_scopes(
             "bcc": [],
             "subject": "Status",
             "body": "Please review the blocked job.",
+            "idempotency_key": "partial-scope-email-draft",
+            "user_instruction_ref": "turn:partial-scope-email",
         },
         "risk_tier": "low",
     }
@@ -1152,6 +1164,8 @@ def test_autonomy_scope_missing_target_or_recipient_scope_denies_writes(
             "bcc": "list",
             "subject": "string",
             "body": "string",
+            "idempotency_key": "string",
+            "user_instruction_ref": "string",
         },
         "allow_extra": False,
     }
@@ -1165,6 +1179,8 @@ def test_autonomy_scope_missing_target_or_recipient_scope_denies_writes(
             "bcc": [],
             "subject": "Status",
             "body": "Please review the blocked job.",
+            "idempotency_key": "missing-scope-email-draft",
+            "user_instruction_ref": "turn:missing-scope-email",
         },
         "risk_tier": "low",
     }

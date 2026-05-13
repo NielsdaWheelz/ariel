@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 import hmac
 import hashlib
 import json
 import re
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, AsyncIterator, Literal, Protocol
 from urllib.parse import urlparse
 
@@ -47,6 +47,7 @@ from ariel.db import missing_required_tables, reset_schema_for_tests
 from ariel.google_connector import (
     DefaultGoogleOAuthClient,
     DefaultGoogleWorkspaceProvider,
+    GOOGLE_CONNECTOR_ID,
     GoogleConnectorError,
     GoogleConnectorRuntime,
 )
@@ -58,19 +59,27 @@ from ariel.memory import (
     MEMORY_PROJECTION_VERSION,
     approve_candidate,
     build_memory_context,
+    consolidate_memory,
     context_text,
     correct_assertion,
     create_relationship,
     delete_assertion,
+    export_memory,
+    import_memory_candidates,
     list_memory,
+    privacy_delete_assertion,
     propose_memory_candidate,
     record_rotation_context_block,
     record_turn_memory_evidence,
+    redact_evidence,
     reject_candidate,
+    retry_projection_job,
     resolve_conflict,
     retract_assertion,
+    run_memory_eval,
     search_memory,
     set_assertion_priority,
+    set_never_remember_rule,
     validate_continuity_compaction_payload,
 )
 from ariel.persistence import (
@@ -80,14 +89,18 @@ from ariel.persistence import (
     AutonomyScopeRecord,
     AgencyEventRecord,
     ArtifactRecord,
+    BackgroundTaskRecord,
     CaptureRecord,
     ConnectorSubscriptionRecord,
     EmailActionRecord,
     EmailThreadWatchRecord,
     EventRecord,
+    GoogleConnectorRecord,
     JobEventRecord,
     JobRecord,
     MemoryAssertionRecord,
+    MemoryActionTraceRecord,
+    MemoryScopeBindingRecord,
     NotificationRecord,
     ProactiveFeedbackRecord,
     ProactiveActionExecutionRecord,
@@ -101,6 +114,7 @@ from ariel.persistence import (
     ProactivePolicyValidationRecord,
     ProactiveTurnRecord,
     ProjectStateSnapshotRecord,
+    ProviderEvidenceRecord,
     ProviderEventRecord,
     SessionRecord,
     SessionRotationRecord,
@@ -108,6 +122,10 @@ from ariel.persistence import (
     SyncRunRecord,
     TurnIdempotencyRecord,
     TurnRecord,
+    WorkCommitmentRecord,
+    WorkCommitmentSourceRecord,
+    WorkFollowUpEventRecord,
+    WorkFollowUpLoopRecord,
     WorkspaceItemEventRecord,
     WorkspaceItemRecord,
     serialize_agency_event,
@@ -137,6 +155,8 @@ from ariel.persistence import (
     serialize_sync_cursor,
     serialize_sync_run,
     serialize_turn,
+    serialize_work_commitment,
+    serialize_work_follow_up_loop,
     serialize_workspace_item,
     serialize_workspace_item_event,
     to_rfc3339,
@@ -180,6 +200,7 @@ from ariel.response_contracts import (
 )
 from ariel.weather_state import get_weather_default_location_state, set_weather_default_location
 from ariel.worker import enqueue_background_task
+from ariel.workspace_reasoning import CommitmentState, validate_lifecycle_transition
 
 
 def _utcnow() -> datetime:
@@ -268,13 +289,51 @@ _CONTEXT_SECTION_ORDER = (
 
 _CONTEXT_AUDIT_SCHEMA_VERSION = "1.0"
 _MAX_OPEN_COMMITMENTS_IN_CONTEXT = 12
+_MAX_DUE_FOLLOW_UP_LOOPS_IN_CONTEXT = 12
+_MAX_WORK_ACTION_TEXT_CHARS = 240
 _MAX_ARTIFACTS_IN_CONTEXT = 8
+_NORMAL_OPEN_WORK_COMMITMENT_STATES = (
+    "active",
+    "waiting_on_user",
+    "waiting_on_counterparty",
+    "scheduled",
+    "snoozed",
+)
+_REVIEW_WORK_COMMITMENT_STATES = (
+    "candidate",
+    "needs_review",
+)
+_OPEN_WORK_COMMITMENT_STATES = (
+    *_NORMAL_OPEN_WORK_COMMITMENT_STATES,
+    *_REVIEW_WORK_COMMITMENT_STATES,
+)
+_TERMINAL_WORK_COMMITMENT_STATES = (
+    "resolved",
+    "superseded",
+    "dismissed",
+    "rejected",
+    "stale",
+    "expired",
+    "deleted",
+)
+_OPEN_WORK_FOLLOW_UP_LOOP_STATES = (
+    "active",
+    "waiting",
+    "snoozed",
+    "notified",
+    "suppressed",
+)
 
 _POLICY_SYSTEM_INSTRUCTIONS = (
     "You are Ariel, a private assistant for one active user session.",
     "If user intent is clear, answer directly in this turn.",
     "If user intent is ambiguous or conflicting, ask for the missing details instead of guessing.",
     "If the user asks about details not present in this context, state uncertainty and ask for recovery details.",
+    (
+        "For Google write actions, cite exactly one authority: source_evidence_id, "
+        "commitment_id, or user_instruction_ref. Use user_instruction_ref=turn:<turn_id> "
+        "only for an explicit user instruction shown in the turn-id context."
+    ),
     "If the right Discord behavior is to listen without a visible reply, call cap.discord.no_response.",
     "Discord attachments are metadata until cap.attachment.read is called; attachment_ref is not content.",
 )
@@ -366,6 +425,65 @@ class MessageRequest(BaseModel):
         return value
 
 
+class SessionMemoryModeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    memory_mode: Literal["normal", "temporary", "no_memory"]
+
+
+class WorkCommitmentSnoozeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    snoozed_until: datetime
+
+    @field_validator("snoozed_until")
+    @classmethod
+    def _snoozed_until_must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("snoozed_until must include a timezone")
+        return value
+
+
+class WorkCommitmentEditRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action_text: str | None = Field(default=None, min_length=1, max_length=2000)
+    action_category: str | None = Field(default=None, min_length=1, max_length=64)
+    due_start: datetime | None = None
+    due_end: datetime | None = None
+    timezone: str | None = Field(default=None, max_length=64)
+    priority: Literal["critical", "high", "normal", "low"] | None = None
+
+    @field_validator("action_text", "action_category", "timezone")
+    @classmethod
+    def _optional_text_must_not_be_blank(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = " ".join(value.strip().split())
+        return normalized or None
+
+    @field_validator("due_start", "due_end")
+    @classmethod
+    def _due_values_must_be_timezone_aware(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("due datetimes must include a timezone")
+        return value
+
+    @model_validator(mode="after")
+    def _must_include_edit_and_valid_interval(self) -> WorkCommitmentEditRequest:
+        if not self.model_fields_set:
+            raise ValueError("at least one edit field is required")
+        if (
+            self.due_start is not None
+            and self.due_end is not None
+            and self.due_start > self.due_end
+        ):
+            raise ValueError("due_start must be before or equal to due_end")
+        return self
+
+
 class MemoryCorrectionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -384,6 +502,47 @@ class MemoryRejectRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reason: str | None = Field(default=None, max_length=500)
+
+
+class MemoryReasonRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class MemoryNeverRememberRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope_key: str = Field(default="global", min_length=1, max_length=200)
+    pattern: str = Field(min_length=1, max_length=500)
+    reason: str | None = Field(default=None, max_length=500)
+
+    @field_validator("scope_key", "pattern")
+    @classmethod
+    def _never_remember_text_must_not_be_blank(cls, value: str) -> str:
+        normalized = " ".join(value.strip().split())
+        if not normalized:
+            raise ValueError("never-remember fields must not be blank")
+        return normalized
+
+
+class MemoryExportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope_key: str = Field(default="global", min_length=1, max_length=200)
+
+
+class MemoryImportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    candidates: list[MemoryCandidateRequest] = Field(default_factory=list, max_length=50)
+
+
+class MemoryEvalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    eval_name: str = Field(default="memory eval", min_length=1, max_length=200)
+    cases: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
 
 
 class MemoryConflictResolutionRequest(BaseModel):
@@ -1034,6 +1193,27 @@ def _build_responses_input_items(
     if not isinstance(recent_turns, list):
         recent_turns = []
 
+    turn_ref_lines: list[str] = []
+    current_turn = context_bundle.get("current_turn")
+    if isinstance(current_turn, dict):
+        current_turn_id = current_turn.get("turn_id")
+        if isinstance(current_turn_id, str) and current_turn_id:
+            turn_ref_lines.append(f"- current user instruction: turn:{current_turn_id}")
+    for prior_turn in recent_turns:
+        if not isinstance(prior_turn, dict):
+            continue
+        turn_id = prior_turn.get("turn_id")
+        prior_user_message = prior_turn.get("user_message")
+        if isinstance(turn_id, str) and turn_id and isinstance(prior_user_message, str):
+            turn_ref_lines.append(f"- prior user instruction: turn:{turn_id} {prior_user_message}")
+    if turn_ref_lines:
+        input_items.append(
+            {
+                "role": "system",
+                "content": "turn-id context for write authority:\n" + "\n".join(turn_ref_lines),
+            }
+        )
+
     memory_context = context_bundle.get("memory_context")
     if isinstance(memory_context, dict):
         rendered_memory_context = context_text(memory_context)
@@ -1042,6 +1222,90 @@ def _build_responses_input_items(
 
     open_commitments_and_jobs = context_bundle.get("open_commitments_and_jobs")
     if isinstance(open_commitments_and_jobs, dict):
+        commitments_raw = open_commitments_and_jobs.get("open_commitments")
+        if isinstance(commitments_raw, list) and commitments_raw:
+            commitment_lines: list[str] = []
+            for commitment in commitments_raw:
+                if not isinstance(commitment, dict):
+                    continue
+                commitment_id = commitment.get("id")
+                action = commitment.get("action_text")
+                state = commitment.get("lifecycle_state")
+                priority = commitment.get("priority")
+                due_start = commitment.get("due_start")
+                if (
+                    isinstance(commitment_id, str)
+                    and isinstance(action, str)
+                    and isinstance(state, str)
+                    and isinstance(priority, str)
+                ):
+                    line = f"- {commitment_id}: {priority}: {state}: {action}"
+                    if isinstance(due_start, str):
+                        line = f"{line} due_start={due_start}"
+                    commitment_lines.append(line)
+            if commitment_lines:
+                input_items.append(
+                    {
+                        "role": "system",
+                        "content": "open work commitments:\n" + "\n".join(commitment_lines),
+                    }
+                )
+
+        review_prompts_raw = open_commitments_and_jobs.get("commitment_review_prompts")
+        if isinstance(review_prompts_raw, list) and review_prompts_raw:
+            review_lines: list[str] = []
+            for commitment in review_prompts_raw:
+                if not isinstance(commitment, dict):
+                    continue
+                commitment_id = commitment.get("id")
+                action = commitment.get("action_text")
+                state = commitment.get("lifecycle_state")
+                review_state = commitment.get("review_state")
+                if (
+                    isinstance(commitment_id, str)
+                    and isinstance(action, str)
+                    and isinstance(state, str)
+                    and isinstance(review_state, str)
+                ):
+                    review_lines.append(f"- {commitment_id}: {state}: {review_state}: {action}")
+            if review_lines:
+                input_items.append(
+                    {
+                        "role": "system",
+                        "content": "work commitments needing review:\n" + "\n".join(review_lines),
+                    }
+                )
+
+        loops_raw = open_commitments_and_jobs.get("due_follow_up_loops")
+        if isinstance(loops_raw, list) and loops_raw:
+            loop_lines: list[str] = []
+            for loop in loops_raw:
+                if not isinstance(loop, dict):
+                    continue
+                loop_id = loop.get("id")
+                loop_kind = loop.get("loop_kind")
+                state = loop.get("state")
+                next_check_at = loop.get("next_check_at")
+                action = loop.get("commitment_action_text")
+                if (
+                    isinstance(loop_id, str)
+                    and isinstance(loop_kind, str)
+                    and isinstance(state, str)
+                ):
+                    line = f"- {loop_id}: {loop_kind}: {state}"
+                    if isinstance(next_check_at, str):
+                        line = f"{line} next_check_at={next_check_at}"
+                    if isinstance(action, str) and action:
+                        line = f"{line} action={action}"
+                    loop_lines.append(line)
+            if loop_lines:
+                input_items.append(
+                    {
+                        "role": "system",
+                        "content": "due follow-up loops:\n" + "\n".join(loop_lines),
+                    }
+                )
+
         jobs_raw = open_commitments_and_jobs.get("open_jobs")
         if isinstance(jobs_raw, list) and jobs_raw:
             job_lines: list[str] = []
@@ -1208,6 +1472,23 @@ def _call_tool_result_interpreter(
         "output_count": len(response_output) if isinstance(response_output, list) else None,
         "text_present": bool(text),
     }
+
+    def raise_schema_error(reason: str) -> None:
+        raise ModelAdapterError(
+            safe_reason=reason,
+            status_code=502,
+            code="E_AI_JUDGMENT_SCHEMA",
+            message="AI tool-result interpretation failed",
+            retryable=False,
+            provider=provider,
+            model=model,
+            usage=usage,
+            provider_response_id=provider_response_id,
+            parse_status="schema_invalid",
+            validation_status="invalid",
+            raw_output_shape=raw_output_shape,
+        )
+
     try:
         output = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -1226,21 +1507,9 @@ def _call_tool_result_interpreter(
             raw_output_shape=raw_output_shape,
         ) from exc
     if not isinstance(output, dict):
-        raise ModelAdapterError(
-            safe_reason="tool-result interpreter returned non-object JSON",
-            status_code=502,
-            code="E_AI_JUDGMENT_SCHEMA",
-            message="AI tool-result interpretation failed",
-            retryable=False,
-            provider=provider,
-            model=model,
-            usage=usage,
-            provider_response_id=provider_response_id,
-            parse_status="schema_invalid",
-            validation_status="invalid",
-            raw_output_shape=raw_output_shape,
-        )
-    for key in (
+        raise_schema_error("tool-result interpreter returned non-object JSON")
+
+    required_keys = {
         "findings",
         "contradictions",
         "uncertainty",
@@ -1249,39 +1518,53 @@ def _call_tool_result_interpreter(
         "citation_refs",
         "artifact_refs",
         "recommended_next_evidence",
-    ):
-        if not isinstance(output.get(key), list):
-            raise ModelAdapterError(
-                safe_reason=f"tool-result interpreter omitted {key}",
-                status_code=502,
-                code="E_AI_JUDGMENT_SCHEMA",
-                message="AI tool-result interpretation failed",
-                retryable=False,
-                provider=provider,
-                model=model,
-                usage=usage,
-                provider_response_id=provider_response_id,
-                parse_status="schema_invalid",
-                validation_status="invalid",
-                raw_output_shape=raw_output_shape,
-            )
+        "confidence",
+    }
+    if set(output.keys()) != required_keys:
+        raise_schema_error("tool-result interpreter returned unexpected schema keys")
+
+    for key in ("findings", "contradictions", "uncertainty", "recommended_next_evidence"):
+        values = output[key]
+        if not isinstance(values, list):
+            raise_schema_error(f"tool-result interpreter returned non-list {key}")
+        for value in values:
+            if not isinstance(value, str) or not value.strip():
+                raise_schema_error(f"tool-result interpreter returned invalid {key}")
+
+    audited_output_refs = {
+        audited.get("output_ref")
+        for audited in interpreter_input.get("audited_tool_outputs", [])
+        if isinstance(audited, dict) and isinstance(audited.get("output_ref"), str)
+    }
+    for key in ("selected_output_refs", "omitted_output_refs"):
+        values = output[key]
+        if not isinstance(values, list):
+            raise_schema_error(f"tool-result interpreter returned non-list {key}")
+        for value in values:
+            if not isinstance(value, str) or value not in audited_output_refs:
+                raise_schema_error(f"tool-result interpreter returned unknown {key}")
+
+    for key in ("citation_refs", "artifact_refs"):
+        values = output[key]
+        if not isinstance(values, list):
+            raise_schema_error(f"tool-result interpreter returned non-list {key}")
+        allowed_values = interpreter_input.get(key)
+        if not isinstance(allowed_values, list):
+            allowed_values = []
+        for value in values:
+            if value not in allowed_values:
+                raise_schema_error(f"tool-result interpreter returned unknown {key}")
+
     confidence = output.get("confidence")
-    if not isinstance(confidence, int | float):
-        raise ModelAdapterError(
-            safe_reason="tool-result interpreter omitted confidence",
-            status_code=502,
-            code="E_AI_JUDGMENT_SCHEMA",
-            message="AI tool-result interpretation failed",
-            retryable=False,
-            provider=provider,
-            model=model,
-            usage=usage,
-            provider_response_id=provider_response_id,
-            parse_status="schema_invalid",
-            validation_status="invalid",
-            raw_output_shape=raw_output_shape,
-        )
-    output["confidence"] = max(0.0, min(float(confidence), 1.0))
+    if (
+        not isinstance(confidence, int | float)
+        or isinstance(confidence, bool)
+        or float(confidence) < 0.0
+        or float(confidence) > 1.0
+        or float(confidence) != float(confidence)
+    ):
+        raise_schema_error("tool-result interpreter returned invalid confidence")
+    output["confidence"] = float(confidence)
     return {
         "output": output,
         "provider": response.get("provider"),
@@ -1370,6 +1653,74 @@ def _estimate_context_tokens(*, context_bundle: dict[str, Any], user_message: st
 
     open_commitments_and_jobs = context_bundle.get("open_commitments_and_jobs")
     if isinstance(open_commitments_and_jobs, dict):
+        commitments_raw = open_commitments_and_jobs.get("open_commitments")
+        if isinstance(commitments_raw, list):
+            for commitment in commitments_raw:
+                if not isinstance(commitment, dict):
+                    continue
+                for key in (
+                    "id",
+                    "provider",
+                    "owner",
+                    "action_text",
+                    "action_category",
+                    "due_start",
+                    "due_end",
+                    "timezone",
+                    "priority",
+                    "lifecycle_state",
+                    "review_state",
+                    "thread_id",
+                ):
+                    raw_value = commitment.get(key)
+                    if isinstance(raw_value, str):
+                        token_total += _estimate_text_tokens(raw_value)
+
+        review_prompts_raw = open_commitments_and_jobs.get("commitment_review_prompts")
+        if isinstance(review_prompts_raw, list):
+            for commitment in review_prompts_raw:
+                if not isinstance(commitment, dict):
+                    continue
+                for key in (
+                    "id",
+                    "provider",
+                    "owner",
+                    "action_text",
+                    "action_category",
+                    "due_start",
+                    "due_end",
+                    "timezone",
+                    "priority",
+                    "lifecycle_state",
+                    "review_state",
+                    "thread_id",
+                ):
+                    raw_value = commitment.get(key)
+                    if isinstance(raw_value, str):
+                        token_total += _estimate_text_tokens(raw_value)
+
+        loops_raw = open_commitments_and_jobs.get("due_follow_up_loops")
+        if isinstance(loops_raw, list):
+            for loop in loops_raw:
+                if not isinstance(loop, dict):
+                    continue
+                for key in (
+                    "id",
+                    "commitment_id",
+                    "thread_id",
+                    "loop_kind",
+                    "state",
+                    "next_check_at",
+                    "next_notification_at",
+                    "snoozed_until",
+                    "stale_after",
+                    "last_feedback",
+                    "commitment_action_text",
+                ):
+                    raw_value = loop.get(key)
+                    if isinstance(raw_value, str):
+                        token_total += _estimate_text_tokens(raw_value)
+
         jobs_raw = open_commitments_and_jobs.get("open_jobs")
         if isinstance(jobs_raw, list):
             for job in jobs_raw:
@@ -2140,6 +2491,376 @@ def _open_jobs_context(*, db: Session) -> list[dict[str, Any]]:
     return [serialize_job(job) for job in jobs]
 
 
+def _active_google_provider_account_id(db: Session) -> str | None:
+    connector = db.scalar(
+        select(GoogleConnectorRecord)
+        .where(
+            GoogleConnectorRecord.id == GOOGLE_CONNECTOR_ID,
+            GoogleConnectorRecord.status == "connected",
+        )
+        .limit(1)
+    )
+    if connector is None or not isinstance(connector.account_subject, str):
+        return None
+    account_subject = connector.account_subject.strip()
+    return account_subject or None
+
+
+def _work_commitment_attention_suppressed(commitment: WorkCommitmentRecord) -> bool:
+    metadata = commitment.metadata_json if isinstance(commitment.metadata_json, dict) else {}
+    return isinstance(metadata.get("attention_suppressed_at"), str)
+
+
+def _commitment_source_details(
+    *,
+    db: Session,
+    commitment_ids: Sequence[str],
+) -> dict[str, list[dict[str, Any]]]:
+    if not commitment_ids:
+        return {}
+    rows = db.execute(
+        select(WorkCommitmentSourceRecord, ProviderEvidenceRecord)
+        .join(
+            ProviderEvidenceRecord,
+            ProviderEvidenceRecord.id == WorkCommitmentSourceRecord.evidence_id,
+        )
+        .where(WorkCommitmentSourceRecord.commitment_id.in_(list(commitment_ids)))
+        .order_by(
+            WorkCommitmentSourceRecord.created_at.asc(),
+            WorkCommitmentSourceRecord.id.asc(),
+        )
+    ).all()
+    by_commitment: dict[str, list[dict[str, Any]]] = {}
+    for source, evidence in rows:
+        by_commitment.setdefault(source.commitment_id, []).append(
+            {
+                "source_role": source.source_role,
+                "evidence_id": source.evidence_id,
+                "block_ids": list(source.block_ids),
+                "evidence": {
+                    "provider": evidence.provider,
+                    "source_kind": evidence.source_kind,
+                    "external_id": redact_text(evidence.external_id),
+                    "thread_external_id": redact_text(evidence.thread_external_id)
+                    if evidence.thread_external_id
+                    else None,
+                    "calendar_id": redact_text(evidence.calendar_id)
+                    if evidence.calendar_id
+                    else None,
+                    "source_uri": redact_text(evidence.source_uri) if evidence.source_uri else None,
+                    "source_timestamp": (
+                        to_rfc3339(evidence.source_timestamp)
+                        if evidence.source_timestamp is not None
+                        else None
+                    ),
+                    "content_digest": evidence.content_digest,
+                    "observed_at": to_rfc3339(evidence.observed_at),
+                },
+            }
+        )
+    return by_commitment
+
+
+def _work_commitment_payload(
+    *,
+    db: Session,
+    commitment: WorkCommitmentRecord,
+    loops: Sequence[WorkFollowUpLoopRecord],
+) -> dict[str, Any]:
+    source_refs = _commitment_source_details(db=db, commitment_ids=[commitment.id]).get(
+        commitment.id, []
+    )
+    return {
+        "commitment": serialize_work_commitment(commitment),
+        "follow_up_loops": [serialize_work_follow_up_loop(loop) for loop in loops],
+        "why_reminded": {
+            "commitment_id": commitment.id,
+            "attention_suppressed": _work_commitment_attention_suppressed(commitment),
+            "source_refs": source_refs,
+            "loop_refs": [
+                {
+                    "id": loop.id,
+                    "loop_kind": loop.loop_kind,
+                    "state": loop.state,
+                    "version": loop.version,
+                    "next_check_at": to_rfc3339(loop.next_check_at) if loop.next_check_at else None,
+                    "next_notification_at": (
+                        to_rfc3339(loop.next_notification_at) if loop.next_notification_at else None
+                    ),
+                    "stale_after": to_rfc3339(loop.stale_after) if loop.stale_after else None,
+                    "last_evaluated_evidence_id": loop.last_evaluated_evidence_id,
+                    "last_feedback": loop.last_feedback,
+                    "policy_version": loop.policy_version,
+                }
+                for loop in loops
+            ],
+        },
+    }
+
+
+def _validate_work_commitment_transition(
+    commitment: WorkCommitmentRecord,
+    target: CommitmentState,
+) -> None:
+    try:
+        current = CommitmentState(commitment.lifecycle_state)
+    except ValueError as exc:
+        raise ApiError(
+            status_code=409,
+            code="E_WORK_COMMITMENT_INVALID_STATE",
+            message="work commitment lifecycle state is invalid",
+            details={
+                "commitment_id": commitment.id,
+                "lifecycle_state": commitment.lifecycle_state,
+            },
+            retryable=False,
+        ) from exc
+    validation = validate_lifecycle_transition(current, target, user_action=True)
+    if validation.allowed:
+        return
+    raise ApiError(
+        status_code=409,
+        code="E_WORK_COMMITMENT_TRANSITION_NOT_ALLOWED",
+        message="work commitment lifecycle transition is not allowed",
+        details={
+            "commitment_id": commitment.id,
+            "lifecycle_state": commitment.lifecycle_state,
+            "target_lifecycle_state": target.value,
+            "reason": validation.reason,
+        },
+        retryable=False,
+    )
+
+
+def _ack_work_follow_up_notifications(
+    *,
+    db: Session,
+    loop_ids: Sequence[str],
+    now: datetime,
+) -> None:
+    if not loop_ids:
+        return
+    notifications = db.scalars(
+        select(NotificationRecord)
+        .where(
+            NotificationRecord.source_type == "work_follow_up",
+            NotificationRecord.source_id.in_(loop_ids),
+            NotificationRecord.status.in_(("pending", "delivered")),
+        )
+        .with_for_update()
+    ).all()
+    for notification in notifications:
+        notification.status = "acknowledged"
+        notification.acked_at = now
+        notification.updated_at = now
+
+
+def _enqueue_work_follow_up_evaluate_task(
+    *,
+    db: Session,
+    loop: WorkFollowUpLoopRecord,
+    run_after: datetime,
+    now: datetime,
+) -> None:
+    scheduled_for = to_rfc3339(run_after)
+    idempotency_key = f"work_follow_up_evaluate_due:{loop.id}:{loop.version}:{scheduled_for}"
+    existing_task_id = db.scalar(
+        select(BackgroundTaskRecord.id)
+        .where(BackgroundTaskRecord.idempotency_key == idempotency_key)
+        .limit(1)
+    )
+    if existing_task_id is not None:
+        return
+    db.add(
+        BackgroundTaskRecord(
+            id=_new_id("tsk"),
+            task_type="work_follow_up_evaluate_due",
+            idempotency_key=idempotency_key,
+            work_follow_up_loop_id=loop.id,
+            work_follow_up_loop_version=loop.version,
+            work_follow_up_scheduled_for=run_after,
+            payload={
+                "loop_id": loop.id,
+                "loop_version": loop.version,
+                "scheduled_for": scheduled_for,
+                "idempotency_key": idempotency_key,
+            },
+            status="pending",
+            attempts=0,
+            max_attempts=3,
+            error=None,
+            claimed_by=None,
+            run_after=run_after,
+            last_heartbeat=None,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+
+def _open_commitments_and_jobs_context(
+    *,
+    db: Session,
+    now: datetime,
+    provider_account_id: str | None,
+) -> dict[str, Any]:
+    def action_text(raw: str) -> str:
+        text = redact_text(raw).strip()
+        if len(text) <= _MAX_WORK_ACTION_TEXT_CHARS:
+            return text
+        return text[: _MAX_WORK_ACTION_TEXT_CHARS - 3].rstrip() + "..."
+
+    if provider_account_id is None:
+        return {
+            "provider": "google",
+            "provider_account_id": None,
+            "open_jobs": _open_jobs_context(db=db),
+            "open_commitments": [],
+            "commitment_review_prompts": [],
+            "due_follow_up_loops": [],
+        }
+
+    commitments = db.scalars(
+        select(WorkCommitmentRecord)
+        .where(
+            WorkCommitmentRecord.provider == "google",
+            WorkCommitmentRecord.provider_account_id == provider_account_id,
+            WorkCommitmentRecord.lifecycle_state.in_(_NORMAL_OPEN_WORK_COMMITMENT_STATES),
+        )
+        .order_by(
+            WorkCommitmentRecord.due_start.is_(None).asc(),
+            WorkCommitmentRecord.due_start.asc(),
+            WorkCommitmentRecord.updated_at.desc(),
+            WorkCommitmentRecord.id.asc(),
+        )
+        .limit(_MAX_OPEN_COMMITMENTS_IN_CONTEXT * 2)
+    ).all()
+    commitments = commitments[:_MAX_OPEN_COMMITMENTS_IN_CONTEXT]
+    review_prompts = db.scalars(
+        select(WorkCommitmentRecord)
+        .where(
+            WorkCommitmentRecord.provider == "google",
+            WorkCommitmentRecord.provider_account_id == provider_account_id,
+            WorkCommitmentRecord.lifecycle_state.in_(_REVIEW_WORK_COMMITMENT_STATES),
+        )
+        .order_by(WorkCommitmentRecord.updated_at.desc(), WorkCommitmentRecord.id.asc())
+        .limit(_MAX_OPEN_COMMITMENTS_IN_CONTEXT)
+    ).all()
+    due_loops = (
+        db.execute(
+            select(WorkFollowUpLoopRecord)
+            .join(
+                WorkCommitmentRecord,
+                WorkCommitmentRecord.id == WorkFollowUpLoopRecord.commitment_id,
+            )
+            .where(
+                WorkFollowUpLoopRecord.state.in_(("active", "waiting", "snoozed")),
+                WorkFollowUpLoopRecord.next_check_at.is_not(None),
+                WorkFollowUpLoopRecord.next_check_at <= now,
+                WorkCommitmentRecord.provider == "google",
+                WorkCommitmentRecord.provider_account_id == provider_account_id,
+                WorkCommitmentRecord.lifecycle_state.in_(_NORMAL_OPEN_WORK_COMMITMENT_STATES),
+            )
+            .order_by(WorkFollowUpLoopRecord.next_check_at.asc(), WorkFollowUpLoopRecord.id.asc())
+            .limit(_MAX_DUE_FOLLOW_UP_LOOPS_IN_CONTEXT)
+        )
+        .scalars()
+        .all()
+    )
+
+    commitments_by_id = {commitment.id: commitment for commitment in commitments}
+    loop_commitment_ids = [
+        loop.commitment_id for loop in due_loops if loop.commitment_id is not None
+    ]
+    if loop_commitment_ids:
+        for commitment in db.scalars(
+            select(WorkCommitmentRecord).where(WorkCommitmentRecord.id.in_(loop_commitment_ids))
+        ).all():
+            commitments_by_id[commitment.id] = commitment
+    source_refs = _commitment_source_details(
+        db=db,
+        commitment_ids=[
+            commitment.id
+            for commitment in [*commitments, *review_prompts, *commitments_by_id.values()]
+        ],
+    )
+
+    return {
+        "provider": "google",
+        "provider_account_id": redact_text(provider_account_id),
+        "open_jobs": _open_jobs_context(db=db),
+        "open_commitments": [
+            {
+                "id": commitment.id,
+                "provider": commitment.provider,
+                "owner": commitment.owner,
+                "action_text": action_text(commitment.action_text),
+                "action_category": commitment.action_category,
+                "due_start": to_rfc3339(commitment.due_start) if commitment.due_start else None,
+                "due_end": to_rfc3339(commitment.due_end) if commitment.due_end else None,
+                "timezone": commitment.timezone,
+                "priority": commitment.priority,
+                "lifecycle_state": commitment.lifecycle_state,
+                "review_state": commitment.review_state,
+                "thread_id": commitment.thread_id,
+                "source_refs": source_refs.get(commitment.id, []),
+            }
+            for commitment in commitments
+        ],
+        "commitment_review_prompts": [
+            {
+                "id": commitment.id,
+                "provider": commitment.provider,
+                "owner": commitment.owner,
+                "action_text": action_text(commitment.action_text),
+                "action_category": commitment.action_category,
+                "due_start": to_rfc3339(commitment.due_start) if commitment.due_start else None,
+                "due_end": to_rfc3339(commitment.due_end) if commitment.due_end else None,
+                "timezone": commitment.timezone,
+                "priority": commitment.priority,
+                "lifecycle_state": commitment.lifecycle_state,
+                "review_state": commitment.review_state,
+                "thread_id": commitment.thread_id,
+                "source_refs": source_refs.get(commitment.id, []),
+            }
+            for commitment in review_prompts
+        ],
+        "due_follow_up_loops": [
+            {
+                "id": loop.id,
+                "commitment_id": loop.commitment_id,
+                "thread_id": loop.thread_id,
+                "loop_kind": loop.loop_kind,
+                "state": loop.state,
+                "next_check_at": to_rfc3339(loop.next_check_at) if loop.next_check_at else None,
+                "next_notification_at": (
+                    to_rfc3339(loop.next_notification_at) if loop.next_notification_at else None
+                ),
+                "snoozed_until": to_rfc3339(loop.snoozed_until) if loop.snoozed_until else None,
+                "stale_after": to_rfc3339(loop.stale_after) if loop.stale_after else None,
+                "last_feedback": loop.last_feedback,
+                "commitment_action_text": (
+                    action_text(commitments_by_id[loop.commitment_id].action_text)
+                    if loop.commitment_id is not None and loop.commitment_id in commitments_by_id
+                    else None
+                ),
+                "why_reminded": {
+                    "reason": "follow_up_loop_due",
+                    "policy_version": loop.policy_version,
+                    "last_evaluated_evidence_id": loop.last_evaluated_evidence_id,
+                    "source_refs": (
+                        source_refs.get(loop.commitment_id, [])
+                        if loop.commitment_id is not None
+                        else []
+                    ),
+                },
+            }
+            for loop in due_loops
+            if loop.commitment_id is not None and loop.commitment_id in commitments_by_id
+        ],
+    }
+
+
 def _relevant_artifacts_and_observations_context(
     *,
     db: Session,
@@ -2233,17 +2954,18 @@ def _rotate_active_session(
         .where(TurnRecord.session_id == prior_session_id)
         .order_by(TurnRecord.created_at.asc(), TurnRecord.id.asc())
     ).all()
-    record_rotation_context_block(
-        db=db,
-        rotation_id=rotation_id,
-        prior_session_id=prior_session_id,
-        new_session_id=rotated_session_id,
-        rotation_reason=reason,
-        prior_turns=prior_turns,
-        settings=settings,
-        now_fn=_utcnow,
-        new_id_fn=_new_id,
-    )
+    if active_session.memory_mode == "normal":
+        record_rotation_context_block(
+            db=db,
+            rotation_id=rotation_id,
+            prior_session_id=prior_session_id,
+            new_session_id=rotated_session_id,
+            rotation_reason=reason,
+            prior_turns=prior_turns,
+            settings=settings,
+            now_fn=_utcnow,
+            new_id_fn=_new_id,
+        )
 
     active_session.is_active = False
     active_session.lifecycle_state = "closed"
@@ -2253,6 +2975,7 @@ def _rotate_active_session(
         id=rotated_session_id,
         is_active=True,
         lifecycle_state="active",
+        memory_mode=active_session.memory_mode,
         rotated_from_session_id=prior_session_id,
         rotation_reason=reason,
         created_at=now,
@@ -2395,6 +3118,12 @@ def _context_bundle_audit_metadata(context_bundle: dict[str, Any]) -> dict[str, 
         if isinstance(policy_system_instructions_raw, list)
         else []
     )
+    current_turn_raw = context_bundle.get("current_turn")
+    current_turn_id = (
+        current_turn_raw.get("turn_id")
+        if isinstance(current_turn_raw, dict) and isinstance(current_turn_raw.get("turn_id"), str)
+        else None
+    )
 
     recent_window_raw = context_bundle.get("recent_window")
     recent_window = recent_window_raw if isinstance(recent_window_raw, dict) else {}
@@ -2412,6 +3141,7 @@ def _context_bundle_audit_metadata(context_bundle: dict[str, Any]) -> dict[str, 
         "schema_version": _CONTEXT_AUDIT_SCHEMA_VERSION,
         "section_order": section_order,
         "policy_instruction_count": len(policy_system_instructions),
+        "current_turn_id": current_turn_id,
         "recent_window": {
             "max_recent_turns": max_recent_turns if isinstance(max_recent_turns, int) else 0,
             "included_turn_count": included_turn_count
@@ -2653,6 +3383,7 @@ def create_app(
                 "sync_runs": "/v1/sync-runs",
                 "email_actions": "/v1/email/actions",
                 "email_thread_watches": "/v1/email/thread-watches",
+                "work_commitments": "/v1/work/commitments",
                 "workspace_items": "/v1/workspace-items",
                 "proactive_observations": "/v1/proactive/observations",
                 "proactive_cases": "/v1/proactive/cases",
@@ -2898,6 +3629,64 @@ def create_app(
                 active_session = _get_or_create_active_session(db)
             return {"ok": True, "session": serialize_session(active_session)}
 
+    @app.put("/v1/sessions/{session_id}/memory-mode", response_model=None)
+    def put_session_memory_mode(
+        session_id: str,
+        payload: SessionMemoryModeRequest,
+    ) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                session = db.scalar(
+                    select(SessionRecord).where(SessionRecord.id == session_id).limit(1)
+                )
+                if session is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_SESSION_NOT_FOUND",
+                        message="session not found",
+                        details={"session_id": session_id},
+                        retryable=False,
+                    )
+                now = _utcnow()
+                session.memory_mode = payload.memory_mode
+                session.updated_at = now
+                binding = db.scalar(
+                    select(MemoryScopeBindingRecord)
+                    .where(
+                        MemoryScopeBindingRecord.scope_type == "session",
+                        MemoryScopeBindingRecord.scope_key == session.id,
+                        MemoryScopeBindingRecord.actor_id == str(app.state.approval_actor_id),
+                    )
+                    .limit(1)
+                )
+                if binding is None:
+                    db.add(
+                        MemoryScopeBindingRecord(
+                            id=_new_id("msb"),
+                            scope_type="session",
+                            scope_key=session.id,
+                            actor_id=str(app.state.approval_actor_id),
+                            memory_mode=payload.memory_mode,
+                            extraction_enabled=payload.memory_mode == "normal",
+                            recall_enabled=payload.memory_mode == "normal",
+                            reason="session memory mode updated",
+                            expires_at=None,
+                            metadata_json={"source": "session_memory_mode_endpoint"},
+                            created_at=now,
+                            updated_at=now,
+                        )
+                    )
+                else:
+                    binding.memory_mode = payload.memory_mode
+                    binding.extraction_enabled = payload.memory_mode == "normal"
+                    binding.recall_enabled = payload.memory_mode == "normal"
+                    binding.reason = "session memory mode updated"
+                    binding.expires_at = None
+                    binding.metadata_json = {"source": "session_memory_mode_endpoint"}
+                    binding.updated_at = now
+                return {"ok": True, "session": serialize_session(session)}
+
     @app.post("/v1/sessions/rotate", response_model=None)
     def rotate_active_session(request: Request) -> JSONResponse | dict[str, Any]:
         _ensure_schema_ready()
@@ -2990,7 +3779,14 @@ def create_app(
         bounded_limit = max(1, min(limit, 100))
         with session_factory() as db:
             with db.begin():
-                results = search_memory(db, query=q, limit=bounded_limit, settings=settings)
+                active_session = _get_or_create_active_session(db)
+                results = search_memory(
+                    db,
+                    query=q,
+                    limit=bounded_limit,
+                    settings=settings,
+                    current_session_id=active_session.id,
+                )
                 try:
                     return build_surface_memory_search_response(
                         schema_version="memory.sota.v1",
@@ -3055,13 +3851,21 @@ def create_app(
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
-                approve_candidate(
+                events = approve_candidate(
                     db,
                     assertion_id=assertion_id,
                     actor_id=str(app.state.approval_actor_id),
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                 )
+                if not events:
+                    raise ApiError(
+                        status_code=409,
+                        code="E_MEMORY_OPERATION_NOT_APPLICABLE",
+                        message="memory candidate cannot be approved directly",
+                        details={"assertion_id": assertion_id},
+                        retryable=False,
+                    )
                 payload = list_memory(db)
                 try:
                     return build_surface_memory_response(**payload)
@@ -3076,7 +3880,7 @@ def create_app(
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
-                reject_candidate(
+                events = reject_candidate(
                     db,
                     assertion_id=assertion_id,
                     actor_id=str(app.state.approval_actor_id),
@@ -3084,6 +3888,14 @@ def create_app(
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                 )
+                if not events:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_MEMORY_ASSERTION_NOT_FOUND",
+                        message="memory candidate was not found",
+                        details={"assertion_id": assertion_id},
+                        retryable=False,
+                    )
                 memory_payload = list_memory(db)
                 try:
                     return build_surface_memory_response(**memory_payload)
@@ -3099,7 +3911,7 @@ def create_app(
         with session_factory() as db:
             with db.begin():
                 active_session = _get_or_create_active_session(db)
-                correct_assertion(
+                events = correct_assertion(
                     db,
                     assertion_id=assertion_id,
                     value=payload.value,
@@ -3108,6 +3920,14 @@ def create_app(
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                 )
+                if not events:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_MEMORY_ASSERTION_NOT_FOUND",
+                        message="memory assertion was not found",
+                        details={"assertion_id": assertion_id},
+                        retryable=False,
+                    )
                 memory_payload = list_memory(db)
                 try:
                     return build_surface_memory_response(**memory_payload)
@@ -3119,13 +3939,21 @@ def create_app(
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
-                retract_assertion(
+                events = retract_assertion(
                     db,
                     assertion_id=assertion_id,
                     actor_id=str(app.state.approval_actor_id),
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                 )
+                if not events:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_MEMORY_ASSERTION_NOT_FOUND",
+                        message="memory assertion was not found",
+                        details={"assertion_id": assertion_id},
+                        retryable=False,
+                    )
                 payload = list_memory(db)
                 try:
                     return build_surface_memory_response(**payload)
@@ -3137,16 +3965,114 @@ def create_app(
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
-                delete_assertion(
+                events = delete_assertion(
                     db,
                     assertion_id=assertion_id,
                     actor_id=str(app.state.approval_actor_id),
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                 )
+                if not events:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_MEMORY_ASSERTION_NOT_FOUND",
+                        message="memory assertion was not found",
+                        details={"assertion_id": assertion_id},
+                        retryable=False,
+                    )
                 payload = list_memory(db)
                 try:
                     return build_surface_memory_response(**payload)
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.post("/v1/memory/assertions/{assertion_id}/privacy-delete", response_model=None)
+    def post_memory_assertion_privacy_delete(
+        assertion_id: str,
+        payload: MemoryReasonRequest | None = None,
+    ) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                events = privacy_delete_assertion(
+                    db,
+                    assertion_id=assertion_id,
+                    actor_id=str(app.state.approval_actor_id),
+                    reason=payload.reason if payload is not None else None,
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+                if not events:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_MEMORY_ASSERTION_NOT_FOUND",
+                        message="memory assertion was not found",
+                        details={"assertion_id": assertion_id},
+                        retryable=False,
+                    )
+                memory_payload = list_memory(db)
+                try:
+                    return build_surface_memory_response(**memory_payload)
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.post("/v1/memory/evidence/{evidence_id}/redact", response_model=None)
+    def post_memory_evidence_redact(
+        evidence_id: str,
+        payload: MemoryReasonRequest | None = None,
+    ) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                events = redact_evidence(
+                    db,
+                    evidence_id=evidence_id,
+                    actor_id=str(app.state.approval_actor_id),
+                    reason=payload.reason if payload is not None else None,
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+                if not events:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_MEMORY_EVIDENCE_NOT_FOUND",
+                        message="memory evidence was not found",
+                        details={"evidence_id": evidence_id},
+                        retryable=False,
+                    )
+                memory_payload = list_memory(db)
+                try:
+                    return build_surface_memory_response(**memory_payload)
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.post("/v1/memory/never-remember", response_model=None)
+    def post_memory_never_remember(
+        payload: MemoryNeverRememberRequest,
+    ) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                rule = set_never_remember_rule(
+                    db,
+                    scope_key=payload.scope_key,
+                    pattern=payload.pattern,
+                    actor_id=str(app.state.approval_actor_id),
+                    reason=payload.reason,
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+                if rule is None:
+                    raise ApiError(
+                        status_code=422,
+                        code="E_MEMORY_RULE_INVALID",
+                        message="never-remember rule is invalid",
+                        details={},
+                        retryable=False,
+                    )
+                memory_payload = list_memory(db)
+                try:
+                    return build_surface_memory_response(**memory_payload)
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
 
@@ -3155,13 +4081,21 @@ def create_app(
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
-                set_assertion_priority(
+                updated = set_assertion_priority(
                     db,
                     assertion_id=assertion_id,
                     priority="pinned",
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                 )
+                if updated is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_MEMORY_ASSERTION_NOT_FOUND",
+                        message="active memory assertion was not found",
+                        details={"assertion_id": assertion_id},
+                        retryable=False,
+                    )
                 payload = list_memory(db)
                 try:
                     return build_surface_memory_response(**payload)
@@ -3173,13 +4107,21 @@ def create_app(
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
-                set_assertion_priority(
+                updated = set_assertion_priority(
                     db,
                     assertion_id=assertion_id,
                     priority="deprioritized",
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                 )
+                if updated is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_MEMORY_ASSERTION_NOT_FOUND",
+                        message="active memory assertion was not found",
+                        details={"assertion_id": assertion_id},
+                        retryable=False,
+                    )
                 payload = list_memory(db)
                 try:
                     return build_surface_memory_response(**payload)
@@ -3215,7 +4157,7 @@ def create_app(
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
-                resolve_conflict(
+                events = resolve_conflict(
                     db,
                     conflict_set_id=conflict_set_id,
                     assertion_id=payload.assertion_id,
@@ -3223,6 +4165,17 @@ def create_app(
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                 )
+                if not events:
+                    raise ApiError(
+                        status_code=409,
+                        code="E_MEMORY_CONFLICT_NOT_APPLICABLE",
+                        message="memory conflict could not be resolved",
+                        details={
+                            "conflict_set_id": conflict_set_id,
+                            "assertion_id": payload.assertion_id,
+                        },
+                        retryable=False,
+                    )
                 memory_payload = list_memory(db)
                 try:
                     return build_surface_memory_response(**memory_payload)
@@ -3249,6 +4202,244 @@ def create_app(
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
 
+    @app.get("/v1/memory/topics", response_model=None)
+    def get_memory_topics() -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                payload = list_memory(db)
+                topic_context_blocks = [
+                    block for block in payload["context_blocks"] if block["block_type"] == "topic"
+                ]
+                try:
+                    return build_surface_memory_response(
+                        schema_version=payload["schema_version"],
+                        active_assertions=[],
+                        candidates=[],
+                        conflicts=[],
+                        project_state=[],
+                        evidence=[],
+                        procedures=[],
+                        topics=payload["topics"],
+                        context_blocks=topic_context_blocks,
+                        projection_health=payload["projection_health"],
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/memory/hot-index", response_model=None)
+    def get_memory_hot_index() -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                payload = list_memory(db)
+                hot_index_blocks = [
+                    block
+                    for block in payload["context_blocks"]
+                    if block["block_type"] == "hot_index"
+                ]
+                try:
+                    return build_surface_memory_response(
+                        schema_version=payload["schema_version"],
+                        active_assertions=[],
+                        candidates=[],
+                        conflicts=[],
+                        project_state=[],
+                        evidence=[],
+                        procedures=[],
+                        context_blocks=hot_index_blocks,
+                        projection_health=payload["projection_health"],
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/memory/action-traces", response_model=None)
+    def get_memory_action_traces() -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                payload = list_memory(db)
+                try:
+                    return build_surface_memory_response(
+                        schema_version=payload["schema_version"],
+                        active_assertions=[],
+                        candidates=[],
+                        conflicts=[],
+                        project_state=[],
+                        evidence=[],
+                        procedures=[],
+                        action_traces=payload["action_traces"],
+                        projection_health=payload["projection_health"],
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/memory/deletions", response_model=None)
+    def get_memory_deletions() -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                payload = list_memory(db)
+                try:
+                    return build_surface_memory_response(
+                        schema_version=payload["schema_version"],
+                        active_assertions=[],
+                        candidates=[],
+                        conflicts=[],
+                        project_state=[],
+                        evidence=[],
+                        procedures=[],
+                        deletions=payload["deletions"],
+                        projection_health=payload["projection_health"],
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/memory/scope-bindings", response_model=None)
+    def get_memory_scope_bindings() -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                payload = list_memory(db)
+                try:
+                    return build_surface_memory_response(
+                        schema_version=payload["schema_version"],
+                        active_assertions=[],
+                        candidates=[],
+                        conflicts=[],
+                        project_state=[],
+                        evidence=[],
+                        procedures=[],
+                        scope_bindings=payload["scope_bindings"],
+                        projection_health=payload["projection_health"],
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.post("/v1/memory/consolidate", response_model=None)
+    def post_memory_consolidate(payload: MemoryExportRequest) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                consolidate_memory(
+                    db,
+                    scope_key=payload.scope_key,
+                    actor_id=str(app.state.approval_actor_id),
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+                memory_payload = list_memory(db)
+                try:
+                    return build_surface_memory_response(**memory_payload)
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.post("/v1/memory/export", response_model=None)
+    def post_memory_export(payload: MemoryExportRequest) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                export_memory(
+                    db,
+                    scope_key=payload.scope_key,
+                    actor_id=str(app.state.approval_actor_id),
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+                memory_payload = list_memory(db)
+                try:
+                    return build_surface_memory_response(**memory_payload)
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.post("/v1/memory/import", response_model=None)
+    def post_memory_import(payload: MemoryImportRequest) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                active_session = _get_or_create_active_session(db)
+                import_memory_candidates(
+                    db,
+                    source_session_id=active_session.id,
+                    actor_id=str(app.state.approval_actor_id),
+                    candidates=[candidate.model_dump() for candidate in payload.candidates],
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+                memory_payload = list_memory(db)
+                try:
+                    return build_surface_memory_response(**memory_payload)
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.post("/v1/memory/evals", response_model=None)
+    def post_memory_eval(payload: MemoryEvalRequest) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                run_memory_eval(
+                    db,
+                    eval_name=payload.eval_name,
+                    cases=payload.cases,
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+                memory_payload = list_memory(db)
+                try:
+                    return build_surface_memory_response(**memory_payload)
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/memory/evals/{eval_run_id}", response_model=None)
+    def get_memory_eval(eval_run_id: str) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                payload = list_memory(db)
+                for run in payload["eval_runs"]:
+                    if run["id"] == eval_run_id:
+                        try:
+                            return build_surface_memory_response(
+                                schema_version=payload["schema_version"],
+                                active_assertions=[],
+                                candidates=[],
+                                conflicts=[],
+                                project_state=[],
+                                evidence=[],
+                                procedures=[],
+                                eval_runs=[run],
+                                projection_health=payload["projection_health"],
+                            )
+                        except ResponseContractViolation as exc:
+                            raise _response_contract_error(exc) from exc
+                raise ApiError(
+                    status_code=404,
+                    code="E_MEMORY_EVAL_NOT_FOUND",
+                    message="memory eval run was not found",
+                    details={"eval_run_id": eval_run_id},
+                    retryable=False,
+                )
+
+    @app.post("/v1/memory/projection-jobs/{job_id}/retry", response_model=None)
+    def post_memory_projection_job_retry(job_id: str) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                retried_job = retry_projection_job(db, job_id=job_id, now_fn=_utcnow)
+                if retried_job is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_MEMORY_PROJECTION_JOB_NOT_FOUND",
+                        message="memory projection job was not found",
+                        details={"job_id": job_id},
+                        retryable=False,
+                    )
+                memory_payload = list_memory(db)
+                try:
+                    return build_surface_memory_response(**memory_payload)
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
     @app.post("/v1/memory/relationships", response_model=None)
     def post_memory_relationship(
         payload: MemoryRelationshipRequest,
@@ -3269,19 +4460,18 @@ def create_app(
                     new_id_fn=_new_id,
                 )
                 if relationship is None:
-                    return JSONResponse(
+                    raise ApiError(
                         status_code=404,
-                        content={
-                            "ok": False,
-                            "error": {
-                                "code": "E_MEMORY_RELATIONSHIP_TARGET_NOT_FOUND",
-                                "message": "memory relationship target not found",
-                                "details": {},
-                                "retryable": False,
-                            },
-                        },
+                        code="E_MEMORY_RELATIONSHIP_TARGET_NOT_FOUND",
+                        message="memory relationship target not found",
+                        details={},
+                        retryable=False,
                     )
-                return {"ok": True, "relationship": relationship}
+                memory_payload = list_memory(db)
+                try:
+                    return build_surface_memory_response(**memory_payload)
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
 
     @app.get("/v1/weather/default-location")
     def get_weather_default_location() -> dict[str, Any]:
@@ -3482,6 +4672,7 @@ def create_app(
         discord_context: dict[str, Any] | None,
         discord_attachment_sources: list[dict[str, Any]] | None = None,
         ingress_runtime_provenance: RuntimeProvenance | None = None,
+        execute_google_reads_outside_transaction: bool = False,
     ) -> TurnExecutionOutcome:
         active_session = db.scalar(
             select(SessionRecord)
@@ -3508,12 +4699,15 @@ def create_app(
         pre_rotation_memory_context = {
             "schema_version": MEMORY_CONTEXT_SCHEMA_VERSION,
             "projection_version": MEMORY_PROJECTION_VERSION,
+            "hot_index": [],
+            "topic_index": [],
             "pinned_core": [],
             "project_state": [],
             "commitments_and_decisions": [],
             "semantic_assertions": [],
             "episodic_evidence": [],
             "procedural_memory": [],
+            "action_traces": [],
             "conflicts": [],
             "recall_window": {
                 "max_selected_memories": int(app.state.max_recalled_assertions),
@@ -3532,9 +4726,11 @@ def create_app(
                 "selected_memory_count": 0,
             },
         }
-        pre_rotation_open_commitments_and_jobs = {
-            "open_jobs": _open_jobs_context(db=db),
-        }
+        pre_rotation_open_commitments_and_jobs = _open_commitments_and_jobs_context(
+            db=db,
+            now=_utcnow(),
+            provider_account_id=_active_google_provider_account_id(db),
+        )
         pre_rotation_context_bundle = _build_turn_context_bundle(
             prior_turns=prior_turns,
             max_recent_turns=int(app.state.max_recent_turns),
@@ -3976,9 +5172,11 @@ def create_app(
             parse_status=memory_curation_parse_status,
             validation_status="valid",
         )
-        open_commitments_and_jobs = {
-            "open_jobs": _open_jobs_context(db=db),
-        }
+        open_commitments_and_jobs = _open_commitments_and_jobs_context(
+            db=db,
+            now=_utcnow(),
+            provider_account_id=_active_google_provider_account_id(db),
+        )
         context_bundle = _build_turn_context_bundle(
             prior_turns=prior_turns,
             max_recent_turns=int(app.state.max_recent_turns),
@@ -3990,6 +5188,10 @@ def create_app(
                 prior_turns=prior_turns,
             ),
         )
+        context_bundle["current_turn"] = {
+            "turn_id": turn.id,
+            "user_instruction_ref": f"turn:{turn.id}",
+        }
         context_metadata = _context_bundle_audit_metadata(context_bundle)
         if (
             memory_recall_event_payload["selected_memory_count"]
@@ -4554,12 +5756,39 @@ def create_app(
 
                     output_items = candidate_response.get("output")
                     if not isinstance(output_items, list):
-                        raise RuntimeError("model response missing Responses output items")
+                        provider_response_id = candidate_response.get("provider_response_id")
+                        raise ModelAdapterError(
+                            safe_reason="model response missing Responses output items",
+                            status_code=502,
+                            code="E_MODEL_OUTPUT_SCHEMA",
+                            message="model response failed output contract",
+                            retryable=False,
+                            provider=candidate_response.get("provider")
+                            if isinstance(candidate_response.get("provider"), str)
+                            else app.state.model_adapter.provider,
+                            model=candidate_response.get("model")
+                            if isinstance(candidate_response.get("model"), str)
+                            else app.state.model_adapter.model,
+                            usage=candidate_response.get("usage")
+                            if isinstance(candidate_response.get("usage"), dict)
+                            else None,
+                            provider_response_id=provider_response_id
+                            if isinstance(provider_response_id, str)
+                            else None,
+                            parse_status="schema_invalid",
+                            validation_status="invalid",
+                            raw_output_shape={
+                                "output_type": type(output_items).__name__,
+                                "output_count": None,
+                                "text_present": False,
+                            },
+                        )
                     assistant_text = _extract_responses_assistant_text(output_items)
                     function_calls = _extract_responses_function_calls(output_items)
                     if function_calls:
                         function_processing = process_response_function_calls(
                             db=db,
+                            session_factory=session_factory,
                             session_id=effective_session_id,
                             turn=turn,
                             assistant_message=assistant_text,
@@ -4571,6 +5800,9 @@ def create_app(
                             new_id_fn=_new_id,
                             runtime_provenance=runtime_provenance,
                             google_runtime=_google_runtime(),
+                            execute_google_reads_outside_transaction=(
+                                execute_google_reads_outside_transaction
+                            ),
                             agency_runtime=_agency_runtime(),
                             attachment_runtime=app.state.attachment_runtime,
                         )
@@ -4774,7 +6006,33 @@ def create_app(
                             break
                         continue
                     if not assistant_text:
-                        raise RuntimeError("model response missing assistant_text")
+                        provider_response_id = candidate_response.get("provider_response_id")
+                        raise ModelAdapterError(
+                            safe_reason="model response missing assistant_text",
+                            status_code=502,
+                            code="E_MODEL_OUTPUT_REQUIRED",
+                            message="model response failed output contract",
+                            retryable=False,
+                            provider=candidate_response.get("provider")
+                            if isinstance(candidate_response.get("provider"), str)
+                            else app.state.model_adapter.provider,
+                            model=candidate_response.get("model")
+                            if isinstance(candidate_response.get("model"), str)
+                            else app.state.model_adapter.model,
+                            usage=candidate_response.get("usage")
+                            if isinstance(candidate_response.get("usage"), dict)
+                            else None,
+                            provider_response_id=provider_response_id
+                            if isinstance(provider_response_id, str)
+                            else None,
+                            parse_status="missing_output",
+                            validation_status="not_validated",
+                            raw_output_shape={
+                                "output_type": "list",
+                                "output_count": len(output_items),
+                                "text_present": False,
+                            },
+                        )
                     response_tokens = _response_tokens_from_model_payload(
                         candidate_response,
                         assistant_text=assistant_text,
@@ -4919,39 +6177,81 @@ def create_app(
             assert assistant_response is not None
             assistant_message = assistant_response["assistant_text"]
             turn.assistant_message = assistant_message
-            memory_events, user_evidence_id = record_turn_memory_evidence(
-                db,
-                session_id=effective_session_id,
-                source_turn_id=turn.id,
-                user_message=user_message,
-                assistant_message=assistant_message,
-                actor_id=str(app.state.approval_actor_id),
-                now_fn=_utcnow,
-                new_id_fn=_new_id,
-            )
-            for memory_event in memory_events:
-                event_type = memory_event.get("event_type")
-                payload_data = memory_event.get("payload")
-                if isinstance(event_type, str) and isinstance(payload_data, dict):
-                    add_event(event_type, payload_data)
-            task = enqueue_background_task(
-                db,
-                task_type="memory_extract_turn",
-                payload={
-                    "session_id": effective_session_id,
-                    "turn_id": turn.id,
-                    "evidence_id": user_evidence_id,
-                },
-                now=_utcnow(),
-            )
-            add_event(
-                "evt.memory.extraction_queued",
-                {
-                    "task_id": task.id,
-                    "turn_id": turn.id,
-                    "evidence_id": user_evidence_id,
-                },
-            )
+            if active_session.memory_mode == "normal":
+                memory_events, user_evidence_id = record_turn_memory_evidence(
+                    db,
+                    session_id=effective_session_id,
+                    source_turn_id=turn.id,
+                    user_message=user_message,
+                    assistant_message=assistant_message,
+                    actor_id=str(app.state.approval_actor_id),
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+                for memory_event in memory_events:
+                    event_type = memory_event.get("event_type")
+                    payload_data = memory_event.get("payload")
+                    if isinstance(event_type, str) and isinstance(payload_data, dict):
+                        add_event(event_type, payload_data)
+                now_memory_trace = _utcnow()
+                for action_attempt in created_action_attempts:
+                    outcome = "unknown"
+                    if action_attempt.status == "succeeded":
+                        outcome = "succeeded"
+                    elif action_attempt.status == "failed":
+                        outcome = "failed"
+                    elif (
+                        action_attempt.status in {"rejected", "denied", "expired"}
+                        or action_attempt.policy_decision == "deny"
+                    ):
+                        outcome = "denied"
+                    db.add(
+                        MemoryActionTraceRecord(
+                            id=_new_id("mat"),
+                            scope_key=f"session:{effective_session_id}",
+                            trace_type=(
+                                "execution"
+                                if action_attempt.status in {"executing", "succeeded", "failed"}
+                                else "policy_decision"
+                            ),
+                            action_attempt_id=action_attempt.id,
+                            source_turn_id=turn.id,
+                            primary_evidence_id=user_evidence_id,
+                            capability_id=action_attempt.capability_id,
+                            summary=(
+                                f"{action_attempt.capability_id} {outcome} "
+                                f"for proposal {action_attempt.proposal_index}"
+                            ),
+                            outcome=outcome,
+                            result_refs={
+                                "impact_level": action_attempt.impact_level,
+                                "policy_decision": action_attempt.policy_decision,
+                                "approval_required": action_attempt.approval_required,
+                                "execution_error": action_attempt.execution_error,
+                            },
+                            lifecycle_state="active",
+                            created_at=now_memory_trace,
+                            updated_at=now_memory_trace,
+                        )
+                    )
+                task = enqueue_background_task(
+                    db,
+                    task_type="memory_extract_turn",
+                    payload={
+                        "session_id": effective_session_id,
+                        "turn_id": turn.id,
+                        "evidence_id": user_evidence_id,
+                    },
+                    now=_utcnow(),
+                )
+                add_event(
+                    "evt.memory.extraction_queued",
+                    {
+                        "task_id": task.id,
+                        "turn_id": turn.id,
+                        "evidence_id": user_evidence_id,
+                    },
+                )
 
             turn.status = "completed"
             turn.updated_at = _utcnow()
@@ -5064,7 +6364,9 @@ def create_app(
         )
 
         with session_factory() as db:
-            with db.begin():
+            # This turn path commits explicitly so inline Google reads can commit the
+            # proposed action before making a provider request.
+            with nullcontext():
                 _acquire_session_turn_lock(db, session_id=request_session_id)
 
                 existing_idempotency = (
@@ -5256,6 +6558,7 @@ def create_app(
                     user_message=payload.message,
                     discord_context=discord_context,
                     discord_attachment_sources=discord_attachment_sources,
+                    execute_google_reads_outside_transaction=True,
                 )
                 persist_idempotency_result(
                     turn_id=turn_outcome.turn_id,
@@ -5263,6 +6566,7 @@ def create_app(
                     status_code=turn_outcome.status_code,
                     response_payload=turn_outcome.response_payload,
                 )
+                db.commit()
                 if turn_outcome.status_code == 200:
                     return turn_outcome.response_payload
                 return JSONResponse(
@@ -5635,6 +6939,7 @@ def create_app(
                         decision=payload.decision,
                         actor_id=actor_id,
                         reason=payload.reason,
+                        google_runtime=_google_runtime(),
                         now_fn=_utcnow,
                         new_id_fn=_new_id,
                     )
@@ -6320,6 +7625,762 @@ def create_app(
                     )
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/work/commitments")
+    def get_work_commitments(
+        provider_account_id: str,
+        provider: Literal["google"] = "google",
+        include_review_prompts: bool = False,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 200))
+        with session_factory() as db:
+            with db.begin():
+                commitments = db.scalars(
+                    select(WorkCommitmentRecord)
+                    .where(
+                        WorkCommitmentRecord.provider == provider,
+                        WorkCommitmentRecord.provider_account_id == provider_account_id,
+                        WorkCommitmentRecord.lifecycle_state.in_(
+                            _OPEN_WORK_COMMITMENT_STATES
+                            if include_review_prompts
+                            else _NORMAL_OPEN_WORK_COMMITMENT_STATES
+                        ),
+                    )
+                    .order_by(
+                        WorkCommitmentRecord.due_start.asc().nulls_last(),
+                        WorkCommitmentRecord.updated_at.desc(),
+                        WorkCommitmentRecord.id.asc(),
+                    )
+                    .limit(bounded_limit)
+                ).all()
+                loop_rows = (
+                    db.scalars(
+                        select(WorkFollowUpLoopRecord)
+                        .where(
+                            WorkFollowUpLoopRecord.commitment_id.in_(
+                                [commitment.id for commitment in commitments]
+                            )
+                        )
+                        .order_by(
+                            WorkFollowUpLoopRecord.updated_at.desc(),
+                            WorkFollowUpLoopRecord.id.asc(),
+                        )
+                    ).all()
+                    if commitments
+                    else []
+                )
+                loops_by_commitment_id: dict[str, list[WorkFollowUpLoopRecord]] = {}
+                for loop in loop_rows:
+                    if loop.commitment_id is None:
+                        continue
+                    loops_by_commitment_id.setdefault(loop.commitment_id, []).append(loop)
+                return {
+                    "ok": True,
+                    "work_commitments": [
+                        _work_commitment_payload(
+                            db=db,
+                            commitment=commitment,
+                            loops=loops_by_commitment_id.get(commitment.id, []),
+                        )
+                        for commitment in commitments
+                    ],
+                }
+
+    @app.get("/v1/work/commitments/{commitment_id}")
+    def get_work_commitment(commitment_id: str, provider_account_id: str) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                commitment = db.scalar(
+                    select(WorkCommitmentRecord)
+                    .where(
+                        WorkCommitmentRecord.id == commitment_id,
+                        WorkCommitmentRecord.provider_account_id == provider_account_id,
+                    )
+                    .limit(1)
+                )
+                if commitment is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_WORK_COMMITMENT_NOT_FOUND",
+                        message="work commitment not found",
+                        details={"commitment_id": commitment_id},
+                        retryable=False,
+                    )
+                loops = db.scalars(
+                    select(WorkFollowUpLoopRecord)
+                    .where(WorkFollowUpLoopRecord.commitment_id == commitment.id)
+                    .order_by(
+                        WorkFollowUpLoopRecord.updated_at.desc(),
+                        WorkFollowUpLoopRecord.id.asc(),
+                    )
+                ).all()
+                return {
+                    "ok": True,
+                    "work_commitment": _work_commitment_payload(
+                        db=db,
+                        commitment=commitment,
+                        loops=loops,
+                    ),
+                }
+
+    @app.post("/v1/work/commitments/{commitment_id}/resolve")
+    def resolve_work_commitment(commitment_id: str, provider_account_id: str) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                commitment = db.scalar(
+                    select(WorkCommitmentRecord)
+                    .where(
+                        WorkCommitmentRecord.id == commitment_id,
+                        WorkCommitmentRecord.provider_account_id == provider_account_id,
+                    )
+                    .with_for_update()
+                    .limit(1)
+                )
+                if commitment is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_WORK_COMMITMENT_NOT_FOUND",
+                        message="work commitment not found",
+                        details={"commitment_id": commitment_id},
+                        retryable=False,
+                    )
+                _validate_work_commitment_transition(commitment, CommitmentState.RESOLVED)
+                now = _utcnow()
+                commitment.lifecycle_state = "resolved"
+                commitment.review_state = "approved"
+                commitment.updated_at = now
+                loops = db.scalars(
+                    select(WorkFollowUpLoopRecord)
+                    .where(WorkFollowUpLoopRecord.commitment_id == commitment.id)
+                    .with_for_update()
+                    .order_by(
+                        WorkFollowUpLoopRecord.updated_at.desc(),
+                        WorkFollowUpLoopRecord.id.asc(),
+                    )
+                ).all()
+                loop_ids = [loop.id for loop in loops]
+                for loop in loops:
+                    if loop.state not in _OPEN_WORK_FOLLOW_UP_LOOP_STATES:
+                        continue
+                    loop.state = "resolved"
+                    loop.version += 1
+                    loop.next_check_at = None
+                    loop.next_notification_at = None
+                    loop.snoozed_until = None
+                    loop.updated_at = now
+                    db.add(
+                        WorkFollowUpEventRecord(
+                            id=_new_id("wfe"),
+                            loop_id=loop.id,
+                            loop_version=loop.version,
+                            event_type="resolved",
+                            payload={"source": "api", "commitment_id": commitment.id},
+                            created_at=now,
+                        )
+                    )
+                _ack_work_follow_up_notifications(db=db, loop_ids=loop_ids, now=now)
+                return {
+                    "ok": True,
+                    "work_commitment": _work_commitment_payload(
+                        db=db,
+                        commitment=commitment,
+                        loops=loops,
+                    ),
+                }
+
+    @app.post("/v1/work/commitments/{commitment_id}/approve")
+    def approve_work_commitment(commitment_id: str, provider_account_id: str) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                commitment = db.scalar(
+                    select(WorkCommitmentRecord)
+                    .where(
+                        WorkCommitmentRecord.id == commitment_id,
+                        WorkCommitmentRecord.provider_account_id == provider_account_id,
+                    )
+                    .with_for_update()
+                    .limit(1)
+                )
+                if commitment is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_WORK_COMMITMENT_NOT_FOUND",
+                        message="work commitment not found",
+                        details={"commitment_id": commitment_id},
+                        retryable=False,
+                    )
+                metadata = (
+                    commitment.metadata_json if isinstance(commitment.metadata_json, dict) else {}
+                )
+                approved_lifecycle_raw = metadata.get("approved_lifecycle_state")
+                try:
+                    approved_lifecycle = (
+                        CommitmentState(approved_lifecycle_raw)
+                        if isinstance(approved_lifecycle_raw, str)
+                        else CommitmentState.ACTIVE
+                    )
+                except ValueError:
+                    approved_lifecycle = CommitmentState.ACTIVE
+                if approved_lifecycle.value in _TERMINAL_WORK_COMMITMENT_STATES:
+                    approved_lifecycle = CommitmentState.ACTIVE
+                _validate_work_commitment_transition(commitment, approved_lifecycle)
+                now = _utcnow()
+                commitment.lifecycle_state = approved_lifecycle.value
+                commitment.review_state = "approved"
+                commitment.updated_at = now
+                loops = db.scalars(
+                    select(WorkFollowUpLoopRecord)
+                    .where(WorkFollowUpLoopRecord.commitment_id == commitment.id)
+                    .with_for_update()
+                    .order_by(
+                        WorkFollowUpLoopRecord.updated_at.desc(),
+                        WorkFollowUpLoopRecord.id.asc(),
+                    )
+                ).all()
+                open_loops = [
+                    loop for loop in loops if loop.state in _OPEN_WORK_FOLLOW_UP_LOOP_STATES
+                ]
+                due_at = commitment.due_end or commitment.due_start
+                next_check_at = None
+                if due_at is not None:
+                    next_check_at = (
+                        now if due_at <= now + timedelta(days=1) else due_at - timedelta(days=1)
+                    )
+                elif approved_lifecycle == CommitmentState.WAITING_ON_USER:
+                    next_check_at = now + timedelta(days=1)
+                elif approved_lifecycle == CommitmentState.WAITING_ON_COUNTERPARTY:
+                    next_check_at = now + timedelta(days=3)
+                if not open_loops and next_check_at is not None:
+                    loop_kind_raw = metadata.get("loop_kind")
+                    loop_kind = loop_kind_raw if isinstance(loop_kind_raw, str) else "due_date"
+                    if loop_kind not in {"due_date", "waiting_for_reply", "needs_user_reply"}:
+                        if approved_lifecycle == CommitmentState.WAITING_ON_USER:
+                            loop_kind = "needs_user_reply"
+                        elif approved_lifecycle == CommitmentState.WAITING_ON_COUNTERPARTY:
+                            loop_kind = "waiting_for_reply"
+                        else:
+                            loop_kind = "due_date"
+                    loop = WorkFollowUpLoopRecord(
+                        id=_new_id("wfl"),
+                        commitment_id=commitment.id,
+                        thread_id=None,
+                        loop_kind=loop_kind,
+                        state="active",
+                        version=1,
+                        next_check_at=next_check_at,
+                        next_notification_at=next_check_at,
+                        stale_after=(due_at if due_at is not None else next_check_at)
+                        + timedelta(days=14),
+                        last_evaluated_evidence_id=metadata.get("source_evidence_id")
+                        if isinstance(metadata.get("source_evidence_id"), str)
+                        else None,
+                        snoozed_until=None,
+                        last_feedback=None,
+                        policy_version="work-follow-up-v1",
+                        metadata_json={"source": "work_commitment_approval"},
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    db.add(loop)
+                    db.flush()
+                    db.add(
+                        WorkFollowUpEventRecord(
+                            id=_new_id("wfe"),
+                            loop_id=loop.id,
+                            loop_version=loop.version,
+                            event_type="scheduled",
+                            payload={"source": "api", "commitment_id": commitment.id},
+                            created_at=now,
+                        )
+                    )
+                    _enqueue_work_follow_up_evaluate_task(
+                        db=db,
+                        loop=loop,
+                        run_after=next_check_at,
+                        now=now,
+                    )
+                    loops = [loop, *loops]
+                return {
+                    "ok": True,
+                    "work_commitment": _work_commitment_payload(
+                        db=db,
+                        commitment=commitment,
+                        loops=loops,
+                    ),
+                }
+
+    @app.post("/v1/work/commitments/{commitment_id}/edit")
+    def edit_work_commitment(
+        commitment_id: str,
+        provider_account_id: str,
+        payload: WorkCommitmentEditRequest,
+    ) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                commitment = db.scalar(
+                    select(WorkCommitmentRecord)
+                    .where(
+                        WorkCommitmentRecord.id == commitment_id,
+                        WorkCommitmentRecord.provider_account_id == provider_account_id,
+                    )
+                    .with_for_update()
+                    .limit(1)
+                )
+                if commitment is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_WORK_COMMITMENT_NOT_FOUND",
+                        message="work commitment not found",
+                        details={"commitment_id": commitment_id},
+                        retryable=False,
+                    )
+                if commitment.lifecycle_state in _TERMINAL_WORK_COMMITMENT_STATES:
+                    raise ApiError(
+                        status_code=409,
+                        code="E_WORK_COMMITMENT_NOT_OPEN",
+                        message="work commitment is not open",
+                        details={
+                            "commitment_id": commitment_id,
+                            "lifecycle_state": commitment.lifecycle_state,
+                        },
+                        retryable=False,
+                    )
+                due_start_changed = "due_start" in payload.model_fields_set
+                due_end_changed = "due_end" in payload.model_fields_set
+                previous_due_at = commitment.due_end or commitment.due_start
+                due_start = payload.due_start if due_start_changed else commitment.due_start
+                due_end = payload.due_end if due_end_changed else commitment.due_end
+                if due_start is not None and due_end is not None and due_start > due_end:
+                    raise ApiError(
+                        status_code=422,
+                        code="E_WORK_COMMITMENT_EDIT_INVALID",
+                        message="due_start must be before or equal to due_end",
+                        details={"commitment_id": commitment_id},
+                        retryable=False,
+                    )
+                now = _utcnow()
+                if payload.action_text is not None:
+                    commitment.action_text = payload.action_text
+                if payload.action_category is not None:
+                    commitment.action_category = payload.action_category
+                if due_start_changed:
+                    commitment.due_start = payload.due_start
+                if due_end_changed:
+                    commitment.due_end = payload.due_end
+                if payload.timezone is not None:
+                    commitment.timezone = payload.timezone
+                if payload.priority is not None:
+                    commitment.priority = payload.priority
+                commitment.review_state = "edited"
+                commitment.updated_at = now
+                loops = db.scalars(
+                    select(WorkFollowUpLoopRecord)
+                    .where(WorkFollowUpLoopRecord.commitment_id == commitment.id)
+                    .with_for_update()
+                    .order_by(
+                        WorkFollowUpLoopRecord.updated_at.desc(),
+                        WorkFollowUpLoopRecord.id.asc(),
+                    )
+                ).all()
+                if due_start_changed or due_end_changed:
+                    due_at = commitment.due_end or commitment.due_start
+                    for loop in loops:
+                        if loop.state not in _OPEN_WORK_FOLLOW_UP_LOOP_STATES:
+                            continue
+                        loop.version += 1
+                        loop.snoozed_until = None
+                        loop.updated_at = now
+                        if due_at is None:
+                            loop.state = "suppressed"
+                            loop.next_check_at = None
+                            loop.next_notification_at = None
+                            db.add(
+                                WorkFollowUpEventRecord(
+                                    id=_new_id("wfe"),
+                                    loop_id=loop.id,
+                                    loop_version=loop.version,
+                                    event_type="suppressed",
+                                    payload={
+                                        "source": "api",
+                                        "commitment_id": commitment.id,
+                                        "reason": "due_removed",
+                                        "previous_due_at": to_rfc3339(previous_due_at)
+                                        if previous_due_at is not None
+                                        else None,
+                                    },
+                                    created_at=now,
+                                )
+                            )
+                            continue
+                        next_check_at = (
+                            now if due_at <= now + timedelta(days=1) else due_at - timedelta(days=1)
+                        )
+                        loop.state = "active"
+                        loop.next_check_at = next_check_at
+                        loop.next_notification_at = next_check_at
+                        loop.stale_after = due_at + timedelta(days=14)
+                        db.add(
+                            WorkFollowUpEventRecord(
+                                id=_new_id("wfe"),
+                                loop_id=loop.id,
+                                loop_version=loop.version,
+                                event_type="scheduled",
+                                payload={
+                                    "source": "api",
+                                    "commitment_id": commitment.id,
+                                    "reason": "due_edited",
+                                    "previous_due_at": to_rfc3339(previous_due_at)
+                                    if previous_due_at is not None
+                                    else None,
+                                    "next_check_at": to_rfc3339(next_check_at),
+                                },
+                                created_at=now,
+                            )
+                        )
+                        _enqueue_work_follow_up_evaluate_task(
+                            db=db,
+                            loop=loop,
+                            run_after=next_check_at,
+                            now=now,
+                        )
+                return {
+                    "ok": True,
+                    "work_commitment": _work_commitment_payload(
+                        db=db,
+                        commitment=commitment,
+                        loops=loops,
+                    ),
+                }
+
+    @app.post("/v1/work/commitments/{commitment_id}/reject")
+    def reject_work_commitment(commitment_id: str, provider_account_id: str) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                commitment = db.scalar(
+                    select(WorkCommitmentRecord)
+                    .where(
+                        WorkCommitmentRecord.id == commitment_id,
+                        WorkCommitmentRecord.provider_account_id == provider_account_id,
+                    )
+                    .with_for_update()
+                    .limit(1)
+                )
+                if commitment is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_WORK_COMMITMENT_NOT_FOUND",
+                        message="work commitment not found",
+                        details={"commitment_id": commitment_id},
+                        retryable=False,
+                    )
+                _validate_work_commitment_transition(commitment, CommitmentState.REJECTED)
+                now = _utcnow()
+                commitment.lifecycle_state = "rejected"
+                commitment.review_state = "rejected"
+                commitment.updated_at = now
+                loops = db.scalars(
+                    select(WorkFollowUpLoopRecord)
+                    .where(WorkFollowUpLoopRecord.commitment_id == commitment.id)
+                    .with_for_update()
+                    .order_by(
+                        WorkFollowUpLoopRecord.updated_at.desc(),
+                        WorkFollowUpLoopRecord.id.asc(),
+                    )
+                ).all()
+                loop_ids = [loop.id for loop in loops]
+                for loop in loops:
+                    if loop.state not in _OPEN_WORK_FOLLOW_UP_LOOP_STATES:
+                        continue
+                    loop.state = "resolved"
+                    loop.version += 1
+                    loop.next_check_at = None
+                    loop.next_notification_at = None
+                    loop.snoozed_until = None
+                    loop.updated_at = now
+                    db.add(
+                        WorkFollowUpEventRecord(
+                            id=_new_id("wfe"),
+                            loop_id=loop.id,
+                            loop_version=loop.version,
+                            event_type="resolved",
+                            payload={
+                                "source": "api",
+                                "commitment_id": commitment.id,
+                                "resolution": "rejected",
+                            },
+                            created_at=now,
+                        )
+                    )
+                _ack_work_follow_up_notifications(db=db, loop_ids=loop_ids, now=now)
+                return {
+                    "ok": True,
+                    "work_commitment": _work_commitment_payload(
+                        db=db,
+                        commitment=commitment,
+                        loops=loops,
+                    ),
+                }
+
+    @app.post("/v1/work/commitments/{commitment_id}/dismiss")
+    def dismiss_work_commitment(commitment_id: str, provider_account_id: str) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                commitment = db.scalar(
+                    select(WorkCommitmentRecord)
+                    .where(
+                        WorkCommitmentRecord.id == commitment_id,
+                        WorkCommitmentRecord.provider_account_id == provider_account_id,
+                    )
+                    .with_for_update()
+                    .limit(1)
+                )
+                if commitment is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_WORK_COMMITMENT_NOT_FOUND",
+                        message="work commitment not found",
+                        details={"commitment_id": commitment_id},
+                        retryable=False,
+                    )
+                if commitment.lifecycle_state in _TERMINAL_WORK_COMMITMENT_STATES:
+                    raise ApiError(
+                        status_code=409,
+                        code="E_WORK_COMMITMENT_NOT_OPEN",
+                        message="work commitment is not open",
+                        details={
+                            "commitment_id": commitment_id,
+                            "lifecycle_state": commitment.lifecycle_state,
+                        },
+                        retryable=False,
+                    )
+                now = _utcnow()
+                commitment.updated_at = now
+                loops = db.scalars(
+                    select(WorkFollowUpLoopRecord)
+                    .where(WorkFollowUpLoopRecord.commitment_id == commitment.id)
+                    .with_for_update()
+                    .order_by(
+                        WorkFollowUpLoopRecord.updated_at.desc(),
+                        WorkFollowUpLoopRecord.id.asc(),
+                    )
+                ).all()
+                for loop in loops:
+                    if loop.state not in _OPEN_WORK_FOLLOW_UP_LOOP_STATES:
+                        continue
+                    loop.version += 1
+                    loop.state = "waiting"
+                    loop.next_check_at = now + timedelta(days=1)
+                    loop.next_notification_at = loop.next_check_at
+                    loop.metadata_json = {
+                        **(loop.metadata_json if isinstance(loop.metadata_json, dict) else {}),
+                        "last_dismissed_at": to_rfc3339(now),
+                    }
+                    loop.updated_at = now
+                    db.add(
+                        WorkFollowUpEventRecord(
+                            id=_new_id("wfe"),
+                            loop_id=loop.id,
+                            loop_version=loop.version,
+                            event_type="dismissed",
+                            payload={
+                                "source": "api",
+                                "commitment_id": commitment.id,
+                                "reason": "dismissed",
+                                "next_check_at": to_rfc3339(loop.next_check_at),
+                            },
+                            created_at=now,
+                        )
+                    )
+                    _enqueue_work_follow_up_evaluate_task(
+                        db=db,
+                        loop=loop,
+                        run_after=loop.next_check_at,
+                        now=now,
+                    )
+                _ack_work_follow_up_notifications(
+                    db=db,
+                    loop_ids=[loop.id for loop in loops],
+                    now=now,
+                )
+                return {
+                    "ok": True,
+                    "work_commitment": _work_commitment_payload(
+                        db=db,
+                        commitment=commitment,
+                        loops=loops,
+                    ),
+                }
+
+    @app.delete("/v1/work/commitments/{commitment_id}")
+    def delete_work_commitment(commitment_id: str, provider_account_id: str) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                commitment = db.scalar(
+                    select(WorkCommitmentRecord)
+                    .where(
+                        WorkCommitmentRecord.id == commitment_id,
+                        WorkCommitmentRecord.provider_account_id == provider_account_id,
+                    )
+                    .with_for_update()
+                    .limit(1)
+                )
+                if commitment is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_WORK_COMMITMENT_NOT_FOUND",
+                        message="work commitment not found",
+                        details={"commitment_id": commitment_id},
+                        retryable=False,
+                    )
+                _validate_work_commitment_transition(commitment, CommitmentState.DELETED)
+                now = _utcnow()
+                commitment.lifecycle_state = "deleted"
+                commitment.updated_at = now
+                loops = db.scalars(
+                    select(WorkFollowUpLoopRecord)
+                    .where(WorkFollowUpLoopRecord.commitment_id == commitment.id)
+                    .with_for_update()
+                    .order_by(
+                        WorkFollowUpLoopRecord.updated_at.desc(),
+                        WorkFollowUpLoopRecord.id.asc(),
+                    )
+                ).all()
+                loop_ids = [loop.id for loop in loops]
+                for loop in loops:
+                    if loop.state == "deleted":
+                        continue
+                    loop.state = "deleted"
+                    loop.version += 1
+                    loop.next_check_at = None
+                    loop.next_notification_at = None
+                    loop.snoozed_until = None
+                    loop.updated_at = now
+                    db.add(
+                        WorkFollowUpEventRecord(
+                            id=_new_id("wfe"),
+                            loop_id=loop.id,
+                            loop_version=loop.version,
+                            event_type="resolved",
+                            payload={
+                                "source": "api",
+                                "commitment_id": commitment.id,
+                                "resolution": "deleted",
+                            },
+                            created_at=now,
+                        )
+                    )
+                _ack_work_follow_up_notifications(db=db, loop_ids=loop_ids, now=now)
+                return {
+                    "ok": True,
+                    "work_commitment": _work_commitment_payload(
+                        db=db,
+                        commitment=commitment,
+                        loops=loops,
+                    ),
+                }
+
+    @app.post("/v1/work/commitments/{commitment_id}/snooze")
+    def snooze_work_commitment(
+        commitment_id: str,
+        provider_account_id: str,
+        payload: WorkCommitmentSnoozeRequest,
+    ) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                commitment = db.scalar(
+                    select(WorkCommitmentRecord)
+                    .where(
+                        WorkCommitmentRecord.id == commitment_id,
+                        WorkCommitmentRecord.provider_account_id == provider_account_id,
+                    )
+                    .with_for_update()
+                    .limit(1)
+                )
+                if commitment is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_WORK_COMMITMENT_NOT_FOUND",
+                        message="work commitment not found",
+                        details={"commitment_id": commitment_id},
+                        retryable=False,
+                    )
+                now = _utcnow()
+                if payload.snoozed_until <= now:
+                    raise ApiError(
+                        status_code=422,
+                        code="E_WORK_COMMITMENT_SNOOZE_INVALID",
+                        message="snoozed_until must be in the future",
+                        details={"commitment_id": commitment_id},
+                        retryable=False,
+                    )
+                if commitment.lifecycle_state in _TERMINAL_WORK_COMMITMENT_STATES:
+                    raise ApiError(
+                        status_code=409,
+                        code="E_WORK_COMMITMENT_NOT_OPEN",
+                        message="work commitment is not open",
+                        details={
+                            "commitment_id": commitment_id,
+                            "lifecycle_state": commitment.lifecycle_state,
+                        },
+                        retryable=False,
+                    )
+                commitment.updated_at = now
+                loops = db.scalars(
+                    select(WorkFollowUpLoopRecord)
+                    .where(WorkFollowUpLoopRecord.commitment_id == commitment.id)
+                    .with_for_update()
+                    .order_by(
+                        WorkFollowUpLoopRecord.updated_at.desc(),
+                        WorkFollowUpLoopRecord.id.asc(),
+                    )
+                ).all()
+                for loop in loops:
+                    if loop.state not in _OPEN_WORK_FOLLOW_UP_LOOP_STATES:
+                        continue
+                    loop.state = "snoozed"
+                    loop.version += 1
+                    loop.next_check_at = payload.snoozed_until
+                    loop.next_notification_at = payload.snoozed_until
+                    loop.snoozed_until = payload.snoozed_until
+                    loop.updated_at = now
+                    db.add(
+                        WorkFollowUpEventRecord(
+                            id=_new_id("wfe"),
+                            loop_id=loop.id,
+                            loop_version=loop.version,
+                            event_type="snoozed",
+                            payload={
+                                "source": "api",
+                                "commitment_id": commitment.id,
+                                "snoozed_until": to_rfc3339(payload.snoozed_until),
+                            },
+                            created_at=now,
+                        )
+                    )
+                    _enqueue_work_follow_up_evaluate_task(
+                        db=db,
+                        loop=loop,
+                        run_after=payload.snoozed_until,
+                        now=now,
+                    )
+                return {
+                    "ok": True,
+                    "work_commitment": _work_commitment_payload(
+                        db=db,
+                        commitment=commitment,
+                        loops=loops,
+                    ),
+                }
 
     @app.get("/v1/workspace-items")
     def get_workspace_items(

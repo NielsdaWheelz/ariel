@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from collections.abc import Generator
 from dataclasses import dataclass, field
 from typing import Any, cast
@@ -12,7 +13,7 @@ from testcontainers.postgres import PostgresContainer
 
 import ariel.capability_registry as capability_registry_module
 from ariel.app import ModelAdapter, ModelAdapterError, create_app
-from tests.integration.responses_helpers import responses_with_function_calls
+from tests.integration.responses_helpers import responses_message, responses_with_function_calls
 
 
 @dataclass
@@ -32,18 +33,54 @@ class SharedContentAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        del tools, history, context_bundle
+        del tools, history
         self.seen_user_messages.append(user_message)
         if self.failure is not None:
             raise self.failure
+        if context_bundle.get("origin") == "tool_result_interpretation":
+            interpreter_input = context_bundle.get("tool_result_interpreter_input")
+            if not isinstance(interpreter_input, dict):
+                interpreter_input = {}
+            audited_outputs = interpreter_input.get("audited_tool_outputs")
+            selected_output_refs = []
+            if isinstance(audited_outputs, list):
+                selected_output_refs = [
+                    output["output_ref"]
+                    for output in audited_outputs
+                    if isinstance(output, dict) and isinstance(output.get("output_ref"), str)
+                ]
+            return responses_message(
+                assistant_text=json.dumps(
+                    {
+                        "findings": ["shared content evidence inspected"],
+                        "contradictions": [],
+                        "uncertainty": [],
+                        "selected_output_refs": selected_output_refs,
+                        "omitted_output_refs": [],
+                        "citation_refs": interpreter_input.get("citation_refs", []),
+                        "artifact_refs": interpreter_input.get("artifact_refs", []),
+                        "recommended_next_evidence": [],
+                        "confidence": 0.9,
+                    },
+                    sort_keys=True,
+                ),
+                provider=self.provider,
+                model=self.model,
+                provider_response_id="resp_s8_pr02_interpreter",
+                input_tokens=34,
+                output_tokens=21,
+            )
         function_calls = (
             copy.deepcopy(self.proposals_for_shared_content)
             if "capture_kind: shared_content" in user_message
             else []
         )
+        assistant_text = f"assistant::{user_message}"
+        if "capture_kind: shared_content" in user_message:
+            assistant_text = "The shared source supports the summary [1]."
         return responses_with_function_calls(
             input_items=input_items,
-            assistant_text=f"assistant::{user_message}",
+            assistant_text=assistant_text,
             proposals=function_calls,
             provider=self.provider,
             model=self.model,

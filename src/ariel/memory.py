@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 import json
 from typing import Any
 
@@ -12,25 +12,37 @@ from sqlalchemy.orm import Session, sessionmaker
 from .config import AppSettings
 from .persistence import (
     AIJudgmentRecord,
+    MemoryActionTraceRecord,
     MemoryAssertionEvidenceRecord,
     MemoryAssertionRecord,
     MemoryConflictMemberRecord,
     MemoryConflictSetRecord,
     MemoryContextBlockRecord,
+    MemoryDeletionRecord,
     MemoryEmbeddingProjectionRecord,
     MemoryEntityProjectionRecord,
     MemoryEntityRecord,
+    MemoryEvalRunRecord,
     MemoryEpisodeRecord,
     MemoryEvidenceRecord,
+    MemoryExportArtifactRecord,
     MemoryGraphProjectionRecord,
     MemoryKeywordProjectionRecord,
     MemoryProcedureRecord,
     MemoryProjectionJobRecord,
     MemoryRelationshipRecord,
     MemoryReviewRecord,
+    MemoryRetentionPolicyRecord,
     MemorySalienceRecord,
+    MemoryScopeBindingRecord,
+    MemorySensitivityLabelRecord,
+    MemorySymbolProjectionRecord,
+    MemoryTemporalProjectionRecord,
+    MemoryTopicMemberRecord,
+    MemoryTopicRecord,
     MemoryVersionRecord,
     ProjectStateSnapshotRecord,
+    SessionRecord,
     TurnRecord,
     to_rfc3339,
 )
@@ -139,6 +151,93 @@ def _weighted_terms(value: str) -> dict[str, float]:
     for term in _terms(value):
         weights[term] = weights.get(term, 0.0) + 1.0
     return weights
+
+
+def session_allows_memory_operation(
+    db: Session,
+    *,
+    session_id: str,
+    operation: str,
+) -> tuple[bool, dict[str, Any]]:
+    session = db.get(SessionRecord, session_id)
+    if session is None:
+        return False, {
+            "session_id": session_id,
+            "operation": operation,
+            "memory_mode": "missing_session",
+            "binding_id": None,
+            "reason": "session not found",
+        }
+
+    now = datetime.now(UTC)
+    binding = db.scalar(
+        select(MemoryScopeBindingRecord)
+        .where(
+            MemoryScopeBindingRecord.scope_type == "session",
+            MemoryScopeBindingRecord.scope_key == session_id,
+            (MemoryScopeBindingRecord.expires_at.is_(None))
+            | (MemoryScopeBindingRecord.expires_at > now),
+        )
+        .order_by(MemoryScopeBindingRecord.updated_at.desc(), MemoryScopeBindingRecord.id.asc())
+        .limit(1)
+    )
+
+    if session.memory_mode != "normal":
+        return False, {
+            "session_id": session_id,
+            "operation": operation,
+            "memory_mode": session.memory_mode,
+            "binding_id": binding.id if binding is not None else None,
+            "reason": f"session memory mode is {session.memory_mode}",
+        }
+
+    if binding is None:
+        return True, {
+            "session_id": session_id,
+            "operation": operation,
+            "memory_mode": session.memory_mode,
+            "binding_id": None,
+            "reason": "session memory mode allows operation",
+        }
+
+    if operation == "recall":
+        allowed = binding.memory_mode == "normal" and binding.recall_enabled
+    else:
+        allowed = binding.memory_mode == "normal" and binding.extraction_enabled
+    return allowed, {
+        "session_id": session_id,
+        "operation": operation,
+        "memory_mode": binding.memory_mode,
+        "binding_id": binding.id,
+        "reason": binding.reason or "session memory binding applied",
+    }
+
+
+def _never_remember_rule_for_text(
+    db: Session,
+    *,
+    source_session_id: str,
+    scope_key: str,
+    text: str,
+) -> MemoryRetentionPolicyRecord | None:
+    text_lower = text.lower()
+    for rule in db.scalars(
+        select(MemoryRetentionPolicyRecord)
+        .where(
+            MemoryRetentionPolicyRecord.lifecycle_state == "active",
+            MemoryRetentionPolicyRecord.policy_kind == "never_remember",
+            MemoryRetentionPolicyRecord.scope_key.in_(
+                ("global", scope_key, f"session:{source_session_id}")
+            ),
+        )
+        .order_by(
+            MemoryRetentionPolicyRecord.created_at.asc(), MemoryRetentionPolicyRecord.id.asc()
+        )
+    ).all():
+        pattern = rule.pattern.strip().lower()
+        if pattern == "*" or (pattern and pattern in text_lower):
+            return rule
+    return None
 
 
 def embed_memory_text(text: str, *, settings: AppSettings) -> list[float]:
@@ -351,6 +450,33 @@ def _record_version(
     )
 
 
+def _record_deletion(
+    db: Session,
+    *,
+    target_table: str = "memory_assertions",
+    target_id: str,
+    deletion_type: str,
+    actor_id: str,
+    reason: str,
+    redaction_posture: str = "none",
+    now: datetime,
+    new_id_fn: Callable[[str], str],
+) -> None:
+    db.add(
+        MemoryDeletionRecord(
+            id=new_id_fn("mdl"),
+            target_table=target_table,
+            target_id=target_id,
+            deletion_type=deletion_type,
+            actor_id=actor_id,
+            reason=reason,
+            redaction_posture=redaction_posture,
+            projection_invalidation={target_table: target_id},
+            created_at=now,
+        )
+    )
+
+
 def _event_payload(
     assertion: MemoryAssertionRecord, *, evidence_id: str | None = None
 ) -> dict[str, Any]:
@@ -390,7 +516,7 @@ def _active_single_assertions(
     )
 
 
-def _delete_projection_rows(db: Session, *, assertion_id: str) -> None:
+def _delete_projection_rows(db: Session, *, assertion_id: str, now: datetime) -> None:
     db.execute(
         delete(MemoryEmbeddingProjectionRecord).where(
             MemoryEmbeddingProjectionRecord.assertion_id == assertion_id
@@ -417,6 +543,49 @@ def _delete_projection_rows(db: Session, *, assertion_id: str) -> None:
     db.execute(
         delete(MemorySalienceRecord).where(MemorySalienceRecord.assertion_id == assertion_id)
     )
+    db.execute(
+        delete(MemoryTopicMemberRecord).where(
+            MemoryTopicMemberRecord.canonical_table == "memory_assertions",
+            MemoryTopicMemberRecord.canonical_id == assertion_id,
+        )
+    )
+    db.execute(
+        delete(MemoryTemporalProjectionRecord).where(
+            MemoryTemporalProjectionRecord.canonical_table == "memory_assertions",
+            MemoryTemporalProjectionRecord.canonical_id == assertion_id,
+        )
+    )
+    db.execute(
+        delete(MemorySymbolProjectionRecord).where(
+            MemorySymbolProjectionRecord.canonical_table == "memory_assertions",
+            MemorySymbolProjectionRecord.canonical_id == assertion_id,
+        )
+    )
+    for procedure in db.scalars(
+        select(MemoryProcedureRecord).where(
+            MemoryProcedureRecord.lifecycle_state == "active",
+            MemoryProcedureRecord.source_assertion_id == assertion_id,
+        )
+    ).all():
+        procedure.lifecycle_state = "deleted"
+        procedure.valid_to = now
+        procedure.updated_at = now
+    for snapshot in db.scalars(
+        select(ProjectStateSnapshotRecord).where(
+            ProjectStateSnapshotRecord.lifecycle_state == "active",
+            ProjectStateSnapshotRecord.source_assertion_ids.contains([assertion_id]),
+        )
+    ).all():
+        snapshot.lifecycle_state = "deleted"
+        snapshot.updated_at = now
+    for block in db.scalars(
+        select(MemoryContextBlockRecord).where(
+            MemoryContextBlockRecord.lifecycle_state == "active",
+            MemoryContextBlockRecord.source_assertion_ids.contains([assertion_id]),
+        )
+    ).all():
+        block.lifecycle_state = "deleted"
+        block.updated_at = now
 
 
 def _record_projection_rows(
@@ -427,7 +596,7 @@ def _record_projection_rows(
     now: datetime,
     new_id_fn: Callable[[str], str],
 ) -> None:
-    _delete_projection_rows(db, assertion_id=assertion.id)
+    _delete_projection_rows(db, assertion_id=assertion.id, now=now)
     search_text = _assertion_search_text(assertion)
     db.add(
         MemoryKeywordProjectionRecord(
@@ -465,6 +634,21 @@ def _record_projection_rows(
             max_retries=3,
             error=None,
             run_after=now,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    db.add(
+        MemoryTemporalProjectionRecord(
+            id=new_id_fn("mtpj"),
+            canonical_table="memory_assertions",
+            canonical_id=assertion.id,
+            temporal_kind="validity",
+            valid_from=assertion.valid_from,
+            valid_to=assertion.valid_to,
+            occurred_at=None,
+            projection_version=MEMORY_PROJECTION_VERSION,
+            metadata_json={"source": "assertion_validity"},
             created_at=now,
             updated_at=now,
         )
@@ -592,13 +776,6 @@ def _record_salience(
     now: datetime,
     new_id_fn: Callable[[str], str],
 ) -> None:
-    score = 1.0 + assertion.confidence
-    if assertion.assertion_type in {"commitment", "decision", "project_state"}:
-        score += 2.0
-    if user_priority == "pinned":
-        score += 10.0
-    if user_priority == "deprioritized":
-        score = 0.1
     row = db.scalar(
         select(MemorySalienceRecord)
         .where(MemorySalienceRecord.assertion_id == assertion.id)
@@ -615,7 +792,7 @@ def _record_salience(
                 id=new_id_fn("msl"),
                 assertion_id=assertion.id,
                 user_priority=user_priority,
-                score=score,
+                score=0.0,
                 signals=signals,
                 created_at=now,
                 updated_at=now,
@@ -623,7 +800,7 @@ def _record_salience(
         )
         return
     row.user_priority = user_priority
-    row.score = score
+    row.score = 0.0
     row.signals = signals
     row.updated_at = now
 
@@ -638,6 +815,7 @@ def _record_project_snapshot(
     if assertion.assertion_type != "project_state":
         return
     text = _assertion_text(assertion)
+    source_versions = {"memory_assertions": {assertion.id: assertion.updated_at.isoformat()}}
     snapshot = ProjectStateSnapshotRecord(
         id=new_id_fn("pss"),
         project_key=assertion.subject_key.removeprefix("project:"),
@@ -656,6 +834,58 @@ def _record_project_snapshot(
         updated_at=now,
     )
     db.add(snapshot)
+    topic_key = f"{assertion.subject_key}:project-state"
+    topic = db.scalar(
+        select(MemoryTopicRecord)
+        .where(
+            MemoryTopicRecord.scope_key == assertion.subject_key,
+            MemoryTopicRecord.topic_key == topic_key,
+        )
+        .limit(1)
+    )
+    if topic is None:
+        topic = MemoryTopicRecord(
+            id=new_id_fn("mtp"),
+            topic_key=topic_key,
+            family="active-projects",
+            scope_key=assertion.subject_key,
+            title=f"{assertion.subject_key} project state",
+            summary=text,
+            lifecycle_state="active",
+            projection_version=MEMORY_PROJECTION_VERSION,
+            metadata_json={"subject_key": assertion.subject_key},
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(topic)
+        db.flush()
+    else:
+        topic.summary = text
+        topic.lifecycle_state = "active"
+        topic.projection_version = MEMORY_PROJECTION_VERSION
+        topic.updated_at = now
+    topic_member = db.scalar(
+        select(MemoryTopicMemberRecord)
+        .where(
+            MemoryTopicMemberRecord.topic_id == topic.id,
+            MemoryTopicMemberRecord.canonical_table == "memory_assertions",
+            MemoryTopicMemberRecord.canonical_id == assertion.id,
+        )
+        .limit(1)
+    )
+    if topic_member is None:
+        db.add(
+            MemoryTopicMemberRecord(
+                id=new_id_fn("mtm"),
+                topic_id=topic.id,
+                canonical_table="memory_assertions",
+                canonical_id=assertion.id,
+                membership_kind="source",
+                rank=0,
+                metadata_json={"assertion_type": assertion.assertion_type},
+                created_at=now,
+            )
+        )
     block = db.scalar(
         select(MemoryContextBlockRecord)
         .where(
@@ -672,21 +902,102 @@ def _record_project_snapshot(
                 block_type="project_state",
                 scope_key=assertion.subject_key,
                 content=f"{assertion.subject_key}: {text}",
+                topic_id=None,
+                lifecycle_state="active",
                 source_assertion_ids=[assertion.id],
                 source_episode_ids=[],
                 source_trace_ids=[],
+                source_action_trace_ids=[],
                 source_procedure_ids=[],
                 source_project_state_snapshot_ids=[snapshot.id],
+                source_memory_versions=source_versions,
+                projection_version=MEMORY_PROJECTION_VERSION,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    else:
+        block.content = f"{assertion.subject_key}: {text}"
+        block.lifecycle_state = "active"
+        block.source_assertion_ids = [assertion.id]
+        block.source_project_state_snapshot_ids = [snapshot.id]
+        block.source_memory_versions = source_versions
+        block.updated_at = now
+    hot_block = db.scalar(
+        select(MemoryContextBlockRecord)
+        .where(
+            MemoryContextBlockRecord.block_type == "hot_index",
+            MemoryContextBlockRecord.scope_key == assertion.subject_key,
+            MemoryContextBlockRecord.projection_version == MEMORY_PROJECTION_VERSION,
+        )
+        .limit(1)
+    )
+    if hot_block is None:
+        db.add(
+            MemoryContextBlockRecord(
+                id=new_id_fn("mcb"),
+                block_type="hot_index",
+                scope_key=assertion.subject_key,
+                content=f"project state: {assertion.subject_key}: {text}",
+                topic_id=None,
+                lifecycle_state="active",
+                source_assertion_ids=[assertion.id],
+                source_episode_ids=[],
+                source_trace_ids=[],
+                source_action_trace_ids=[],
+                source_procedure_ids=[],
+                source_project_state_snapshot_ids=[snapshot.id],
+                source_memory_versions=source_versions,
+                projection_version=MEMORY_PROJECTION_VERSION,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    else:
+        hot_block.content = f"project state: {assertion.subject_key}: {text}"
+        hot_block.lifecycle_state = "active"
+        hot_block.source_assertion_ids = [assertion.id]
+        hot_block.source_project_state_snapshot_ids = [snapshot.id]
+        hot_block.source_memory_versions = source_versions
+        hot_block.updated_at = now
+    topic_block = db.scalar(
+        select(MemoryContextBlockRecord)
+        .where(
+            MemoryContextBlockRecord.block_type == "topic",
+            MemoryContextBlockRecord.scope_key == assertion.subject_key,
+            MemoryContextBlockRecord.projection_version == MEMORY_PROJECTION_VERSION,
+        )
+        .limit(1)
+    )
+    if topic_block is None:
+        db.add(
+            MemoryContextBlockRecord(
+                id=new_id_fn("mcb"),
+                block_type="topic",
+                scope_key=assertion.subject_key,
+                content=text,
+                topic_id=topic.id,
+                lifecycle_state="active",
+                source_assertion_ids=[assertion.id],
+                source_episode_ids=[],
+                source_trace_ids=[],
+                source_action_trace_ids=[],
+                source_procedure_ids=[],
+                source_project_state_snapshot_ids=[snapshot.id],
+                source_memory_versions=source_versions,
                 projection_version=MEMORY_PROJECTION_VERSION,
                 created_at=now,
                 updated_at=now,
             )
         )
         return
-    block.content = f"{assertion.subject_key}: {text}"
-    block.source_assertion_ids = [assertion.id]
-    block.source_project_state_snapshot_ids = [snapshot.id]
-    block.updated_at = now
+    topic_block.content = text
+    topic_block.topic_id = topic.id
+    topic_block.lifecycle_state = "active"
+    topic_block.source_assertion_ids = [assertion.id]
+    topic_block.source_project_state_snapshot_ids = [snapshot.id]
+    topic_block.source_memory_versions = source_versions
+    topic_block.updated_at = now
 
 
 def _record_procedure(
@@ -880,7 +1191,7 @@ def _activate_assertion(
             existing.superseded_by_assertion_id = assertion.id
             existing.valid_to = now
             existing.updated_at = now
-            _delete_projection_rows(db, assertion_id=existing.id)
+            _delete_projection_rows(db, assertion_id=existing.id, now=now)
             _record_version(
                 db,
                 table="memory_assertions",
@@ -1075,6 +1386,23 @@ def propose_memory_candidate(
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
 ) -> list[dict[str, Any]]:
+    allowed, _policy = session_allows_memory_operation(
+        db,
+        session_id=source_session_id,
+        operation="write",
+    )
+    if not allowed:
+        return []
+    if (
+        _never_remember_rule_for_text(
+            db,
+            source_session_id=source_session_id,
+            scope_key=scope_key,
+            text=evidence_text,
+        )
+        is not None
+    ):
+        return []
     now = now_fn()
     evidence = _record_evidence(
         db,
@@ -1180,7 +1508,7 @@ def approve_candidate(
     new_id_fn: Callable[[str], str],
 ) -> list[dict[str, Any]]:
     assertion = db.get(MemoryAssertionRecord, assertion_id)
-    if assertion is None or assertion.lifecycle_state not in {"candidate", "conflicted"}:
+    if assertion is None or assertion.lifecycle_state != "candidate":
         return []
     now = now_fn()
     events = [{"event_type": "evt.memory.candidate_approved", "payload": _event_payload(assertion)}]
@@ -1211,7 +1539,7 @@ def reject_candidate(
     now = now_fn()
     assertion.lifecycle_state = "rejected"
     assertion.updated_at = now
-    _delete_projection_rows(db, assertion_id=assertion.id)
+    _delete_projection_rows(db, assertion_id=assertion.id, now=now)
     _record_review(
         db,
         assertion_id=assertion.id,
@@ -1288,7 +1616,7 @@ def correct_assertion(
     old_assertion.superseded_by_assertion_id = new_assertion.id
     old_assertion.valid_to = now
     old_assertion.updated_at = now
-    _delete_projection_rows(db, assertion_id=old_assertion.id)
+    _delete_projection_rows(db, assertion_id=old_assertion.id, now=now)
     events = [
         {"event_type": "evt.memory.evidence_recorded", "payload": {"evidence_id": evidence.id}},
         {"event_type": "evt.memory.assertion_superseded", "payload": _event_payload(old_assertion)},
@@ -1320,7 +1648,16 @@ def retract_assertion(
     assertion.lifecycle_state = "retracted"
     assertion.valid_to = now
     assertion.updated_at = now
-    _delete_projection_rows(db, assertion_id=assertion.id)
+    _delete_projection_rows(db, assertion_id=assertion.id, now=now)
+    _record_deletion(
+        db,
+        target_id=assertion.id,
+        deletion_type="retract",
+        actor_id=actor_id,
+        reason="assertion retracted",
+        now=now,
+        new_id_fn=new_id_fn,
+    )
     _record_version(
         db,
         table="memory_assertions",
@@ -1350,7 +1687,16 @@ def delete_assertion(
     assertion.lifecycle_state = "deleted"
     assertion.valid_to = now
     assertion.updated_at = now
-    _delete_projection_rows(db, assertion_id=assertion.id)
+    _delete_projection_rows(db, assertion_id=assertion.id, now=now)
+    _record_deletion(
+        db,
+        target_id=assertion.id,
+        deletion_type="delete",
+        actor_id=actor_id,
+        reason="assertion deleted",
+        now=now,
+        new_id_fn=new_id_fn,
+    )
     _record_version(
         db,
         table="memory_assertions",
@@ -1363,6 +1709,186 @@ def delete_assertion(
         new_id_fn=new_id_fn,
     )
     return [{"event_type": "evt.memory.assertion_deleted", "payload": _event_payload(assertion)}]
+
+
+def privacy_delete_assertion(
+    db: Session,
+    *,
+    assertion_id: str,
+    actor_id: str,
+    reason: str | None,
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> list[dict[str, Any]]:
+    assertion = db.get(MemoryAssertionRecord, assertion_id)
+    if assertion is None:
+        return []
+    now = now_fn()
+    assertion.lifecycle_state = "privacy_deleted"
+    assertion.object_value = {"text": "[privacy_deleted]"}
+    assertion.valid_to = now
+    assertion.updated_at = now
+    _delete_projection_rows(db, assertion_id=assertion.id, now=now)
+    evidence_ids = [
+        evidence_id
+        for evidence_id in db.scalars(
+            select(MemoryAssertionEvidenceRecord.evidence_id).where(
+                MemoryAssertionEvidenceRecord.assertion_id == assertion.id
+            )
+        ).all()
+        if isinstance(evidence_id, str)
+    ]
+    for evidence_id in evidence_ids:
+        evidence = db.get(MemoryEvidenceRecord, evidence_id)
+        if evidence is None:
+            continue
+        evidence.lifecycle_state = "privacy_deleted"
+        evidence.source_text = "[privacy_deleted]"
+        evidence.evidence_snippet = "[privacy_deleted]"
+        evidence.redaction_posture = "privacy_deleted"
+        evidence.updated_at = now
+        _record_deletion(
+            db,
+            target_table="memory_evidence",
+            target_id=evidence.id,
+            deletion_type="privacy_delete",
+            actor_id=actor_id,
+            reason=reason or "evidence privacy deleted",
+            redaction_posture="privacy_deleted",
+            now=now,
+            new_id_fn=new_id_fn,
+        )
+        _record_version(
+            db,
+            table="memory_evidence",
+            record_id=evidence.id,
+            change_type="privacy_deleted",
+            actor_id=actor_id,
+            reason=reason or "evidence privacy deleted",
+            new_state={
+                "lifecycle_state": "privacy_deleted",
+                "redaction_posture": "privacy_deleted",
+            },
+            now=now,
+            new_id_fn=new_id_fn,
+        )
+    _record_deletion(
+        db,
+        target_id=assertion.id,
+        deletion_type="privacy_delete",
+        actor_id=actor_id,
+        reason=reason or "assertion privacy deleted",
+        redaction_posture="privacy_deleted",
+        now=now,
+        new_id_fn=new_id_fn,
+    )
+    _record_version(
+        db,
+        table="memory_assertions",
+        record_id=assertion.id,
+        change_type="privacy_deleted",
+        actor_id=actor_id,
+        reason=reason or "assertion privacy deleted",
+        new_state={"lifecycle_state": "privacy_deleted", "redaction_posture": "privacy_deleted"},
+        now=now,
+        new_id_fn=new_id_fn,
+    )
+    return [
+        {
+            "event_type": "evt.memory.assertion_deleted",
+            "payload": {
+                **_event_payload(assertion),
+                "deletion_type": "privacy_delete",
+                "evidence_ids": evidence_ids,
+            },
+        }
+    ]
+
+
+def redact_evidence(
+    db: Session,
+    *,
+    evidence_id: str,
+    actor_id: str,
+    reason: str | None,
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> list[dict[str, Any]]:
+    evidence = db.get(MemoryEvidenceRecord, evidence_id)
+    if evidence is None:
+        return []
+    now = now_fn()
+    evidence.lifecycle_state = "redacted"
+    evidence.source_text = "[redacted]"
+    evidence.evidence_snippet = "[redacted]"
+    evidence.redaction_posture = "redacted"
+    evidence.updated_at = now
+    _record_deletion(
+        db,
+        target_table="memory_evidence",
+        target_id=evidence.id,
+        deletion_type="redact",
+        actor_id=actor_id,
+        reason=reason or "evidence redacted",
+        redaction_posture="redacted",
+        now=now,
+        new_id_fn=new_id_fn,
+    )
+    _record_version(
+        db,
+        table="memory_evidence",
+        record_id=evidence.id,
+        change_type="redacted",
+        actor_id=actor_id,
+        reason=reason or "evidence redacted",
+        new_state={"lifecycle_state": "redacted", "redaction_posture": "redacted"},
+        now=now,
+        new_id_fn=new_id_fn,
+    )
+    events = [
+        {"event_type": "evt.memory.assertion_retracted", "payload": {"evidence_id": evidence.id}}
+    ]
+    for assertion_id in db.scalars(
+        select(MemoryAssertionEvidenceRecord.assertion_id).where(
+            MemoryAssertionEvidenceRecord.evidence_id == evidence.id
+        )
+    ).all():
+        assertion = db.get(MemoryAssertionRecord, assertion_id)
+        if assertion is None or assertion.lifecycle_state not in {
+            "active",
+            "candidate",
+            "conflicted",
+        }:
+            continue
+        assertion.lifecycle_state = "retracted"
+        assertion.valid_to = now
+        assertion.updated_at = now
+        _delete_projection_rows(db, assertion_id=assertion.id, now=now)
+        _record_deletion(
+            db,
+            target_id=assertion.id,
+            deletion_type="redact",
+            actor_id=actor_id,
+            reason=reason or "source evidence redacted",
+            redaction_posture="redacted",
+            now=now,
+            new_id_fn=new_id_fn,
+        )
+        _record_version(
+            db,
+            table="memory_assertions",
+            record_id=assertion.id,
+            change_type="redacted",
+            actor_id=actor_id,
+            reason=reason or "source evidence redacted",
+            new_state={"lifecycle_state": "retracted", "redaction_posture": "redacted"},
+            now=now,
+            new_id_fn=new_id_fn,
+        )
+        events.append(
+            {"event_type": "evt.memory.assertion_retracted", "payload": _event_payload(assertion)}
+        )
+    return events
 
 
 def set_assertion_priority(
@@ -1386,6 +1912,79 @@ def set_assertion_priority(
     return serialize_assertion(assertion)
 
 
+def set_never_remember_rule(
+    db: Session,
+    *,
+    scope_key: str,
+    pattern: str,
+    actor_id: str,
+    reason: str | None,
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> dict[str, Any] | None:
+    normalized_pattern = _clean_text(pattern, max_chars=500).lower()
+    if not normalized_pattern:
+        return None
+    now = now_fn()
+    rule = db.scalar(
+        select(MemoryRetentionPolicyRecord)
+        .where(
+            MemoryRetentionPolicyRecord.scope_key == scope_key,
+            MemoryRetentionPolicyRecord.policy_kind == "never_remember",
+            MemoryRetentionPolicyRecord.pattern == normalized_pattern,
+        )
+        .limit(1)
+    )
+    if rule is None:
+        rule = MemoryRetentionPolicyRecord(
+            id=new_id_fn("mrp"),
+            scope_key=scope_key,
+            policy_kind="never_remember",
+            pattern=normalized_pattern,
+            retention_days=None,
+            lifecycle_state="active",
+            reason=reason,
+            metadata_json={"actor_id": actor_id},
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(rule)
+        db.flush()
+        change_type = "created"
+    else:
+        rule.lifecycle_state = "active"
+        rule.reason = reason
+        rule.metadata_json = {"actor_id": actor_id}
+        rule.updated_at = now
+        change_type = "updated"
+    _record_version(
+        db,
+        table="memory_retention_policies",
+        record_id=rule.id,
+        change_type=change_type,
+        actor_id=actor_id,
+        reason=reason or "never-remember rule set",
+        new_state={
+            "scope_key": rule.scope_key,
+            "policy_kind": rule.policy_kind,
+            "pattern": rule.pattern,
+            "lifecycle_state": rule.lifecycle_state,
+        },
+        now=now,
+        new_id_fn=new_id_fn,
+    )
+    return {
+        "id": rule.id,
+        "scope_key": rule.scope_key,
+        "policy_kind": rule.policy_kind,
+        "pattern": rule.pattern,
+        "state": rule.lifecycle_state,
+        "reason": rule.reason,
+        "created_at": to_rfc3339(rule.created_at),
+        "updated_at": to_rfc3339(rule.updated_at),
+    }
+
+
 def resolve_conflict(
     db: Session,
     *,
@@ -1399,6 +1998,18 @@ def resolve_conflict(
     assertion = db.get(MemoryAssertionRecord, assertion_id)
     if conflict is None or assertion is None or conflict.lifecycle_state != "open":
         return []
+    member_ids = [
+        row.assertion_id
+        for row in db.scalars(
+            select(MemoryConflictMemberRecord)
+            .where(MemoryConflictMemberRecord.conflict_set_id == conflict.id)
+            .order_by(
+                MemoryConflictMemberRecord.created_at.asc(), MemoryConflictMemberRecord.id.asc()
+            )
+        ).all()
+    ]
+    if assertion.id not in member_ids:
+        return []
     now = now_fn()
     conflict.lifecycle_state = "resolved"
     conflict.resolution_assertion_id = assertion.id
@@ -1410,6 +2021,49 @@ def resolve_conflict(
         now=now,
         new_id_fn=new_id_fn,
     )
+    for losing_id in member_ids:
+        if losing_id == assertion.id:
+            continue
+        losing_assertion = db.get(MemoryAssertionRecord, losing_id)
+        if losing_assertion is None:
+            continue
+        if losing_assertion.lifecycle_state in {
+            "active",
+            "candidate",
+            "conflicted",
+            "superseded",
+        }:
+            losing_assertion.lifecycle_state = "rejected"
+            losing_assertion.valid_to = losing_assertion.valid_to or now
+            losing_assertion.superseded_by_assertion_id = None
+            losing_assertion.updated_at = now
+            _delete_projection_rows(db, assertion_id=losing_assertion.id, now=now)
+            _record_review(
+                db,
+                assertion_id=losing_assertion.id,
+                decision="rejected",
+                actor_id=actor_id,
+                reason="conflict resolved in favor of another assertion",
+                now=now,
+                new_id_fn=new_id_fn,
+            )
+            _record_version(
+                db,
+                table="memory_assertions",
+                record_id=losing_assertion.id,
+                change_type="reviewed",
+                actor_id=actor_id,
+                reason="conflict loser rejected",
+                new_state={"lifecycle_state": "rejected"},
+                now=now,
+                new_id_fn=new_id_fn,
+            )
+            events.append(
+                {
+                    "event_type": "evt.memory.candidate_rejected",
+                    "payload": _event_payload(losing_assertion),
+                }
+            )
     events.append(
         {
             "event_type": "evt.memory.conflict_resolved",
@@ -1492,6 +2146,301 @@ def create_relationship(
         "source_entity_id": source.id,
         "target_entity_id": target.id,
         "relationship_type": relationship.relationship_type,
+    }
+
+
+def consolidate_memory(
+    db: Session,
+    *,
+    scope_key: str,
+    actor_id: str,
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> dict[str, Any]:
+    now = now_fn()
+    assertions = db.scalars(
+        select(MemoryAssertionRecord)
+        .where(MemoryAssertionRecord.lifecycle_state == "active")
+        .order_by(MemoryAssertionRecord.updated_at.desc(), MemoryAssertionRecord.id.asc())
+        .limit(50)
+    ).all()
+    if scope_key != "global":
+        assertions = [
+            assertion
+            for assertion in assertions
+            if assertion.scope_key == scope_key or assertion.subject_key == scope_key
+        ]
+
+    source_assertion_ids = [assertion.id for assertion in assertions[:12]]
+    content = json.dumps({"source_assertion_ids": source_assertion_ids}, sort_keys=True)
+    block = db.scalar(
+        select(MemoryContextBlockRecord)
+        .where(
+            MemoryContextBlockRecord.block_type == "hot_index",
+            MemoryContextBlockRecord.scope_key == scope_key,
+            MemoryContextBlockRecord.projection_version == MEMORY_PROJECTION_VERSION,
+        )
+        .limit(1)
+    )
+    if block is None:
+        block = MemoryContextBlockRecord(
+            id=new_id_fn("mcb"),
+            block_type="hot_index",
+            scope_key=scope_key,
+            content=content,
+            topic_id=None,
+            lifecycle_state="active",
+            source_assertion_ids=source_assertion_ids,
+            source_episode_ids=[],
+            source_trace_ids=[],
+            source_action_trace_ids=[],
+            source_procedure_ids=[],
+            source_project_state_snapshot_ids=[],
+            source_memory_versions={},
+            projection_version=MEMORY_PROJECTION_VERSION,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(block)
+    else:
+        block.content = content
+        block.lifecycle_state = "active"
+        block.source_assertion_ids = source_assertion_ids
+        block.updated_at = now
+    return {
+        "scope_key": scope_key,
+        "context_block_id": block.id,
+        "source_assertion_ids": source_assertion_ids,
+        "updated_at": to_rfc3339(block.updated_at),
+    }
+
+
+def export_memory(
+    db: Session,
+    *,
+    scope_key: str,
+    actor_id: str,
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> dict[str, Any]:
+    now = now_fn()
+    payload = list_memory(db)
+    if scope_key != "global":
+        payload["active_assertions"] = [
+            item
+            for item in payload["active_assertions"]
+            if item["scope_key"] == scope_key or item["subject_key"] == scope_key
+        ]
+        payload["project_state"] = [
+            item
+            for item in payload["project_state"]
+            if f"project:{item['project_key']}" == scope_key
+        ]
+        payload["procedures"] = [
+            item for item in payload["procedures"] if item["scope_key"] == scope_key
+        ]
+    artifact = MemoryExportArtifactRecord(
+        id=new_id_fn("mea"),
+        scope_key=scope_key,
+        export_format="json",
+        status="created",
+        redaction_posture="redacted",
+        content=payload,
+        source_counts={
+            "active_assertions": len(payload["active_assertions"]),
+            "project_state": len(payload["project_state"]),
+            "procedures": len(payload["procedures"]),
+        },
+        actor_id=actor_id,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(artifact)
+    db.flush()
+    _record_version(
+        db,
+        table="memory_export_artifacts",
+        record_id=artifact.id,
+        change_type="exported",
+        actor_id=actor_id,
+        reason="memory exported",
+        new_state={"scope_key": artifact.scope_key, "source_counts": artifact.source_counts},
+        now=now,
+        new_id_fn=new_id_fn,
+    )
+    return {
+        "id": artifact.id,
+        "scope_key": artifact.scope_key,
+        "export_format": artifact.export_format,
+        "status": artifact.status,
+        "redaction_posture": artifact.redaction_posture,
+        "source_counts": artifact.source_counts,
+        "content": artifact.content,
+        "created_at": to_rfc3339(artifact.created_at),
+    }
+
+
+def import_memory_candidates(
+    db: Session,
+    *,
+    source_session_id: str,
+    actor_id: str,
+    candidates: Sequence[dict[str, Any]],
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> list[str]:
+    imported_ids: list[str] = []
+    for item in candidates[:50]:
+        evidence_text = item.get("evidence_text")
+        subject_key = item.get("subject_key")
+        predicate = item.get("predicate")
+        assertion_type = item.get("assertion_type")
+        value = item.get("value")
+        confidence = item.get("confidence")
+        scope_key = item.get("scope_key")
+        is_multi_valued = item.get("is_multi_valued")
+        if not (
+            isinstance(evidence_text, str)
+            and isinstance(subject_key, str)
+            and isinstance(predicate, str)
+            and isinstance(assertion_type, str)
+            and isinstance(value, str)
+            and isinstance(confidence, int | float)
+            and isinstance(scope_key, str)
+            and isinstance(is_multi_valued, bool)
+        ):
+            continue
+        events = propose_memory_candidate(
+            db,
+            source_session_id=source_session_id,
+            actor_id=actor_id,
+            evidence_text=evidence_text,
+            subject_key=subject_key,
+            predicate=predicate,
+            assertion_type=assertion_type,
+            value=value,
+            confidence=float(confidence),
+            scope_key=scope_key,
+            is_multi_valued=is_multi_valued,
+            valid_from=None,
+            valid_to=None,
+            extraction_model=None,
+            extraction_prompt_version="memory-import-v1",
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        for event in events:
+            payload = event.get("payload")
+            if (
+                event.get("event_type") == "evt.memory.candidate_proposed"
+                and isinstance(payload, dict)
+                and isinstance(payload.get("assertion_id"), str)
+            ):
+                imported_ids.append(payload["assertion_id"])
+    return imported_ids
+
+
+def run_memory_eval(
+    db: Session,
+    *,
+    eval_name: str,
+    cases: Sequence[dict[str, Any]],
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> dict[str, Any]:
+    now = now_fn()
+    active_count = (
+        db.scalar(
+            select(func.count())
+            .select_from(MemoryAssertionRecord)
+            .where(MemoryAssertionRecord.lifecycle_state == "active")
+        )
+        or 0
+    )
+    candidate_count = (
+        db.scalar(
+            select(func.count())
+            .select_from(MemoryAssertionRecord)
+            .where(MemoryAssertionRecord.lifecycle_state.in_(("candidate", "conflicted")))
+        )
+        or 0
+    )
+    conflict_count = (
+        db.scalar(
+            select(func.count())
+            .select_from(MemoryConflictSetRecord)
+            .where(MemoryConflictSetRecord.lifecycle_state == "open")
+        )
+        or 0
+    )
+    failed_projection_count = (
+        db.scalar(
+            select(func.count())
+            .select_from(MemoryProjectionJobRecord)
+            .where(MemoryProjectionJobRecord.lifecycle_state.in_(("failed", "dead_letter")))
+        )
+        or 0
+    )
+    run = MemoryEvalRunRecord(
+        id=new_id_fn("mer"),
+        eval_name=_clean_text(eval_name, max_chars=200) or "memory eval",
+        status="completed",
+        metrics={
+            "active_assertions": int(active_count),
+            "pending_candidates": int(candidate_count),
+            "open_conflicts": int(conflict_count),
+            "failed_projection_jobs": int(failed_projection_count),
+            "case_count": len(cases),
+        },
+        cases=[item for item in cases if isinstance(item, dict)][:100],
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(run)
+    db.flush()
+    _record_version(
+        db,
+        table="memory_eval_runs",
+        record_id=run.id,
+        change_type="created",
+        actor_id="system",
+        reason="memory eval completed",
+        new_state={"metrics": run.metrics},
+        now=now,
+        new_id_fn=new_id_fn,
+    )
+    return {
+        "id": run.id,
+        "eval_name": run.eval_name,
+        "status": run.status,
+        "metrics": run.metrics,
+        "cases": run.cases,
+        "created_at": to_rfc3339(run.created_at),
+        "updated_at": to_rfc3339(run.updated_at),
+    }
+
+
+def retry_projection_job(
+    db: Session,
+    *,
+    job_id: str,
+    now_fn: Callable[[], datetime],
+) -> dict[str, Any] | None:
+    job = db.get(MemoryProjectionJobRecord, job_id)
+    if job is None:
+        return None
+    now = now_fn()
+    job.lifecycle_state = "pending"
+    job.error = None
+    job.run_after = now
+    job.updated_at = now
+    return {
+        "id": job.id,
+        "projection_kind": job.projection_kind,
+        "target_table": job.target_table,
+        "target_id": job.target_id,
+        "state": job.lifecycle_state,
+        "run_after": to_rfc3339(job.run_after),
     }
 
 
@@ -2107,6 +3056,61 @@ def list_memory(db: Session) -> dict[str, Any]:
         )
         .limit(50)
     ).all()
+    action_traces = db.scalars(
+        select(MemoryActionTraceRecord)
+        .where(MemoryActionTraceRecord.lifecycle_state == "active")
+        .order_by(MemoryActionTraceRecord.updated_at.desc(), MemoryActionTraceRecord.id.asc())
+        .limit(50)
+    ).all()
+    topics = db.scalars(
+        select(MemoryTopicRecord)
+        .where(MemoryTopicRecord.lifecycle_state == "active")
+        .order_by(MemoryTopicRecord.updated_at.desc(), MemoryTopicRecord.id.asc())
+        .limit(50)
+    ).all()
+    context_blocks = db.scalars(
+        select(MemoryContextBlockRecord)
+        .where(MemoryContextBlockRecord.lifecycle_state == "active")
+        .order_by(MemoryContextBlockRecord.updated_at.desc(), MemoryContextBlockRecord.id.asc())
+        .limit(50)
+    ).all()
+    deletions = db.scalars(
+        select(MemoryDeletionRecord)
+        .order_by(MemoryDeletionRecord.created_at.desc(), MemoryDeletionRecord.id.desc())
+        .limit(50)
+    ).all()
+    scope_bindings = db.scalars(
+        select(MemoryScopeBindingRecord)
+        .order_by(MemoryScopeBindingRecord.updated_at.desc(), MemoryScopeBindingRecord.id.asc())
+        .limit(50)
+    ).all()
+    retention_policies = db.scalars(
+        select(MemoryRetentionPolicyRecord)
+        .order_by(
+            MemoryRetentionPolicyRecord.updated_at.desc(), MemoryRetentionPolicyRecord.id.asc()
+        )
+        .limit(50)
+    ).all()
+    sensitivity_labels = db.scalars(
+        select(MemorySensitivityLabelRecord)
+        .where(MemorySensitivityLabelRecord.lifecycle_state == "active")
+        .order_by(
+            MemorySensitivityLabelRecord.updated_at.desc(), MemorySensitivityLabelRecord.id.asc()
+        )
+        .limit(50)
+    ).all()
+    export_artifacts = db.scalars(
+        select(MemoryExportArtifactRecord)
+        .order_by(
+            MemoryExportArtifactRecord.created_at.desc(), MemoryExportArtifactRecord.id.desc()
+        )
+        .limit(20)
+    ).all()
+    eval_runs = db.scalars(
+        select(MemoryEvalRunRecord)
+        .order_by(MemoryEvalRunRecord.created_at.desc(), MemoryEvalRunRecord.id.desc())
+        .limit(20)
+    ).all()
     return {
         "schema_version": MEMORY_CONTEXT_SCHEMA_VERSION,
         "active_assertions": [
@@ -2162,6 +3166,139 @@ def list_memory(db: Session) -> dict[str, Any]:
             }
             for procedure in procedures
         ],
+        "action_traces": [
+            {
+                "id": trace.id,
+                "scope_key": trace.scope_key,
+                "trace_type": trace.trace_type,
+                "action_attempt_id": trace.action_attempt_id,
+                "source_turn_id": trace.source_turn_id,
+                "capability_id": trace.capability_id,
+                "summary": redact_text(trace.summary),
+                "outcome": trace.outcome,
+                "primary_evidence_id": trace.primary_evidence_id,
+                "result_refs": trace.result_refs,
+                "created_at": to_rfc3339(trace.created_at),
+                "updated_at": to_rfc3339(trace.updated_at),
+            }
+            for trace in action_traces
+        ],
+        "topics": [
+            {
+                "id": topic.id,
+                "topic_key": topic.topic_key,
+                "family": topic.family,
+                "scope_key": topic.scope_key,
+                "title": topic.title,
+                "summary": redact_text(topic.summary),
+                "state": topic.lifecycle_state,
+                "projection_version": topic.projection_version,
+                "created_at": to_rfc3339(topic.created_at),
+                "updated_at": to_rfc3339(topic.updated_at),
+            }
+            for topic in topics
+        ],
+        "context_blocks": [
+            {
+                "id": block.id,
+                "block_type": block.block_type,
+                "scope_key": block.scope_key,
+                "topic_id": block.topic_id,
+                "content": redact_text(block.content),
+                "state": block.lifecycle_state,
+                "source_assertion_ids": block.source_assertion_ids,
+                "source_episode_ids": block.source_episode_ids,
+                "source_trace_ids": block.source_trace_ids,
+                "source_action_trace_ids": block.source_action_trace_ids,
+                "source_procedure_ids": block.source_procedure_ids,
+                "source_project_state_snapshot_ids": block.source_project_state_snapshot_ids,
+                "projection_version": block.projection_version,
+                "created_at": to_rfc3339(block.created_at),
+                "updated_at": to_rfc3339(block.updated_at),
+            }
+            for block in context_blocks
+        ],
+        "deletions": [
+            {
+                "id": deletion.id,
+                "target_table": deletion.target_table,
+                "target_id": deletion.target_id,
+                "deletion_type": deletion.deletion_type,
+                "actor_id": deletion.actor_id,
+                "reason": deletion.reason,
+                "redaction_posture": deletion.redaction_posture,
+                "created_at": to_rfc3339(deletion.created_at),
+            }
+            for deletion in deletions
+        ],
+        "scope_bindings": [
+            {
+                "id": binding.id,
+                "scope_type": binding.scope_type,
+                "scope_key": binding.scope_key,
+                "actor_id": binding.actor_id,
+                "memory_mode": binding.memory_mode,
+                "extraction_enabled": binding.extraction_enabled,
+                "recall_enabled": binding.recall_enabled,
+                "reason": binding.reason,
+                "expires_at": to_rfc3339(binding.expires_at) if binding.expires_at else None,
+                "created_at": to_rfc3339(binding.created_at),
+                "updated_at": to_rfc3339(binding.updated_at),
+            }
+            for binding in scope_bindings
+        ],
+        "retention_policies": [
+            {
+                "id": policy.id,
+                "scope_key": policy.scope_key,
+                "policy_kind": policy.policy_kind,
+                "pattern": policy.pattern,
+                "retention_days": policy.retention_days,
+                "state": policy.lifecycle_state,
+                "reason": policy.reason,
+                "created_at": to_rfc3339(policy.created_at),
+                "updated_at": to_rfc3339(policy.updated_at),
+            }
+            for policy in retention_policies
+        ],
+        "sensitivity_labels": [
+            {
+                "id": label.id,
+                "canonical_table": label.canonical_table,
+                "canonical_id": label.canonical_id,
+                "label": label.label,
+                "actor_id": label.actor_id,
+                "state": label.lifecycle_state,
+                "reason": label.reason,
+                "created_at": to_rfc3339(label.created_at),
+                "updated_at": to_rfc3339(label.updated_at),
+            }
+            for label in sensitivity_labels
+        ],
+        "export_artifacts": [
+            {
+                "id": artifact.id,
+                "scope_key": artifact.scope_key,
+                "export_format": artifact.export_format,
+                "status": artifact.status,
+                "redaction_posture": artifact.redaction_posture,
+                "source_counts": artifact.source_counts,
+                "created_at": to_rfc3339(artifact.created_at),
+                "updated_at": to_rfc3339(artifact.updated_at),
+            }
+            for artifact in export_artifacts
+        ],
+        "eval_runs": [
+            {
+                "id": run.id,
+                "eval_name": run.eval_name,
+                "status": run.status,
+                "metrics": run.metrics,
+                "created_at": to_rfc3339(run.created_at),
+                "updated_at": to_rfc3339(run.updated_at),
+            }
+            for run in eval_runs
+        ],
         "projection_health": {
             "projection_version": MEMORY_PROJECTION_VERSION,
             "pending_jobs": db.scalar(
@@ -2174,6 +3311,12 @@ def list_memory(db: Session) -> dict[str, Any]:
                 select(func.count())
                 .select_from(MemoryProjectionJobRecord)
                 .where(MemoryProjectionJobRecord.lifecycle_state.in_(("failed", "dead_letter")))
+            )
+            or 0,
+            "running_jobs": db.scalar(
+                select(func.count())
+                .select_from(MemoryProjectionJobRecord)
+                .where(MemoryProjectionJobRecord.lifecycle_state == "running")
             )
             or 0,
         },
@@ -2470,14 +3613,31 @@ def search_memory(
     query: str,
     limit: int,
     settings: AppSettings | None = None,
+    current_session_id: str | None = None,
 ) -> list[dict[str, Any]]:
     memory_context, _ = build_memory_context(
         db,
         user_message=query,
         max_recalled_assertions=limit,
         settings=settings,
+        current_session_id=current_session_id,
     )
-    return list(memory_context["semantic_assertions"])
+    recall_window = memory_context.get("recall_window")
+    if not isinstance(recall_window, dict):
+        return []
+    selected_ids = {
+        item.get("id")
+        for item in recall_window.get("selected_memories", [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    results = []
+    for item in recall_window.get("candidate_memories", []):
+        if isinstance(item, dict) and item.get("id") in selected_ids:
+            memory_id = item.get("id")
+            kind = item.get("kind")
+            if isinstance(memory_id, str) and isinstance(kind, str):
+                results.append({"id": memory_id, "kind": kind})
+    return results[:limit]
 
 
 def build_memory_context(
@@ -2489,6 +3649,62 @@ def build_memory_context(
     current_session_id: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     resolved_settings = settings or AppSettings()
+    context: dict[str, Any]
+    event_payload: dict[str, Any]
+    memory_policy: dict[str, Any] | None = None
+    if current_session_id is not None:
+        allowed, memory_policy = session_allows_memory_operation(
+            db,
+            session_id=current_session_id,
+            operation="recall",
+        )
+        if not allowed:
+            context = {
+                "schema_version": MEMORY_CONTEXT_SCHEMA_VERSION,
+                "projection_version": MEMORY_PROJECTION_VERSION,
+                "hot_index": [],
+                "topic_index": [],
+                "pinned_core": [],
+                "project_state": [],
+                "commitments_and_decisions": [],
+                "semantic_assertions": [],
+                "episodic_evidence": [],
+                "procedural_memory": [],
+                "action_traces": [],
+                "conflicts": [],
+                "recall_window": {
+                    "max_selected_memories": max_recalled_assertions,
+                    "selected_memory_count": 0,
+                    "memory_candidate_count": 0,
+                    "omitted_memory_count": 0,
+                    "selected_memory_ids": [],
+                    "selected_memories": [],
+                    "omitted_memories": [],
+                    "candidate_memory_ids": [],
+                    "candidate_memories": [],
+                    "curation_rationale": (f"Memory recall skipped: {memory_policy['reason']}."),
+                    "curation_uncertainty": "",
+                    "curation_confidence": 1.0,
+                    "curation_model": None,
+                    "curation_prompt_version": MEMORY_CURATION_PROMPT_VERSION,
+                    "curation_parse_status": "not_required_no_candidates",
+                    "curation_provider_response_id": None,
+                },
+                "memory_policy": memory_policy,
+                "projection_health": {
+                    "projection_version": MEMORY_PROJECTION_VERSION,
+                    "selected_assertion_count": 0,
+                    "selected_memory_count": 0,
+                },
+            }
+            event_payload = {
+                "schema_version": MEMORY_CONTEXT_SCHEMA_VERSION,
+                "projection_version": MEMORY_PROJECTION_VERSION,
+                **context["recall_window"],
+                "conflict_ids": [],
+                "memory_policy": memory_policy,
+            }
+            return context, event_payload
     candidate_limit = max(50, max_recalled_assertions * 8)
     query_terms = set(_terms(user_message))
     entity_rows = db.scalars(select(MemoryEntityRecord)).all()
@@ -2586,20 +3802,32 @@ def build_memory_context(
             candidate_ids.add(row.canonical_id)
             entity_ids_by_assertion_id.setdefault(row.canonical_id, []).append(row.entity_id)
 
-    candidate_assertions = (
-        db.scalars(
-            select(MemoryAssertionRecord)
-            .where(
-                MemoryAssertionRecord.lifecycle_state == "active",
-                MemoryAssertionRecord.id.in_(candidate_ids or {""}),
-            )
-            .order_by(MemoryAssertionRecord.updated_at.desc(), MemoryAssertionRecord.id.asc())
-            .limit(candidate_limit)
-        ).all()
-        if candidate_ids
-        else []
-    )
-    candidate_ids = {assertion.id for assertion in candidate_assertions}
+    candidate_assertions: list[MemoryAssertionRecord] = []
+    if candidate_ids:
+        candidate_assertions.extend(
+            db.scalars(
+                select(MemoryAssertionRecord)
+                .where(
+                    MemoryAssertionRecord.lifecycle_state == "active",
+                    MemoryAssertionRecord.id.in_(candidate_ids),
+                )
+                .order_by(MemoryAssertionRecord.updated_at.desc(), MemoryAssertionRecord.id.asc())
+                .limit(candidate_limit)
+            ).all()
+        )
+    seen_candidate_ids = {assertion.id for assertion in candidate_assertions}
+    for assertion in db.scalars(
+        select(MemoryAssertionRecord)
+        .where(MemoryAssertionRecord.lifecycle_state == "active")
+        .order_by(MemoryAssertionRecord.updated_at.desc(), MemoryAssertionRecord.id.asc())
+        .limit(candidate_limit)
+    ).all():
+        if assertion.id not in seen_candidate_ids:
+            candidate_assertions.append(assertion)
+            seen_candidate_ids.add(assertion.id)
+        if len(candidate_assertions) >= candidate_limit:
+            break
+    candidate_ids = seen_candidate_ids
     evidence_refs = _evidence_refs_by_assertion(
         db, [assertion.id for assertion in candidate_assertions]
     )
@@ -2645,9 +3873,16 @@ def build_memory_context(
             "vector_distance": vector_distance_by_assertion_id.get(assertion.id),
             "keyword_terms": keyword_terms_by_assertion_id.get(assertion.id, []),
             "entity_ids": sorted(entity_ids_by_assertion_id.get(assertion.id, [])),
+            "candidate_source": "retrieval_match"
+            if (
+                assertion.id in vector_distance_by_assertion_id
+                or assertion.id in keyword_terms_by_assertion_id
+                or assertion.id in entity_ids_by_assertion_id
+            )
+            else "recency_fallback",
             "updated_at_order": len(candidate_payloads) + 1,
         }
-        candidate_payload["retrieval_rank"] = len(candidate_payloads) + 1
+        candidate_payload["transport_order"] = len(candidate_payloads) + 1
         candidate_payload["conflict_status"] = (
             {
                 "state": "open",
@@ -2684,7 +3919,7 @@ def build_memory_context(
                     "source": "active_project_state",
                     "updated_at_order": len(candidate_payloads) + 1,
                 },
-                "retrieval_rank": len(candidate_payloads) + 1,
+                "transport_order": len(candidate_payloads) + 1,
                 "projection_version": MEMORY_PROJECTION_VERSION,
                 "updated_at": to_rfc3339(snapshot.updated_at),
             }
@@ -2719,7 +3954,7 @@ def build_memory_context(
                     "source": "active_episode",
                     "occurred_at_order": len(candidate_payloads) + 1,
                 },
-                "retrieval_rank": len(candidate_payloads) + 1,
+                "transport_order": len(candidate_payloads) + 1,
                 "projection_version": MEMORY_PROJECTION_VERSION,
                 "occurred_at": to_rfc3339(episode.occurred_at),
             }
@@ -2751,9 +3986,108 @@ def build_memory_context(
                     "source": "approved_procedure",
                     "updated_at_order": len(candidate_payloads) + 1,
                 },
-                "retrieval_rank": len(candidate_payloads) + 1,
+                "transport_order": len(candidate_payloads) + 1,
                 "projection_version": MEMORY_PROJECTION_VERSION,
                 "updated_at": to_rfc3339(procedure.updated_at),
+            }
+        )
+
+    action_trace_query = select(MemoryActionTraceRecord).where(
+        MemoryActionTraceRecord.lifecycle_state == "active"
+    )
+    if current_session_id is not None:
+        action_trace_query = action_trace_query.where(
+            MemoryActionTraceRecord.scope_key != f"session:{current_session_id}"
+        )
+    candidate_action_traces = db.scalars(
+        action_trace_query.order_by(
+            MemoryActionTraceRecord.updated_at.desc(), MemoryActionTraceRecord.id.asc()
+        ).limit(8)
+    ).all()
+    for trace in candidate_action_traces:
+        candidate_payloads.append(
+            {
+                "id": trace.id,
+                "kind": "action_trace",
+                "scope_key": trace.scope_key,
+                "trace_type": trace.trace_type,
+                "action_attempt_id": trace.action_attempt_id,
+                "source_turn_id": trace.source_turn_id,
+                "capability_id": trace.capability_id,
+                "summary": redact_text(trace.summary),
+                "outcome": trace.outcome,
+                "primary_evidence_id": trace.primary_evidence_id,
+                "trust_boundary": "reviewed_memory",
+                "taint": {"provenance_status": "reviewed_memory"},
+                "retrieval_features": {
+                    "source": "active_action_trace",
+                    "updated_at_order": len(candidate_payloads) + 1,
+                },
+                "transport_order": len(candidate_payloads) + 1,
+                "updated_at": to_rfc3339(trace.updated_at),
+            }
+        )
+
+    candidate_hot_blocks = db.scalars(
+        select(MemoryContextBlockRecord)
+        .where(
+            MemoryContextBlockRecord.block_type == "hot_index",
+            MemoryContextBlockRecord.lifecycle_state == "active",
+            MemoryContextBlockRecord.projection_version == MEMORY_PROJECTION_VERSION,
+        )
+        .order_by(MemoryContextBlockRecord.updated_at.desc(), MemoryContextBlockRecord.id.asc())
+        .limit(8)
+    ).all()
+    for block in candidate_hot_blocks:
+        candidate_payloads.append(
+            {
+                "id": block.id,
+                "kind": "hot_index",
+                "scope_key": block.scope_key,
+                "content": redact_text(block.content),
+                "source_assertion_ids": block.source_assertion_ids,
+                "source_project_state_snapshot_ids": block.source_project_state_snapshot_ids,
+                "trust_boundary": "reviewed_memory",
+                "taint": {"provenance_status": "reviewed_memory"},
+                "retrieval_features": {
+                    "source": "active_hot_index",
+                    "updated_at_order": len(candidate_payloads) + 1,
+                },
+                "transport_order": len(candidate_payloads) + 1,
+                "projection_version": block.projection_version,
+                "updated_at": to_rfc3339(block.updated_at),
+            }
+        )
+
+    candidate_topic_blocks = db.scalars(
+        select(MemoryContextBlockRecord)
+        .where(
+            MemoryContextBlockRecord.block_type == "topic",
+            MemoryContextBlockRecord.lifecycle_state == "active",
+            MemoryContextBlockRecord.projection_version == MEMORY_PROJECTION_VERSION,
+        )
+        .order_by(MemoryContextBlockRecord.updated_at.desc(), MemoryContextBlockRecord.id.asc())
+        .limit(8)
+    ).all()
+    for block in candidate_topic_blocks:
+        candidate_payloads.append(
+            {
+                "id": block.id,
+                "kind": "topic",
+                "topic_id": block.topic_id,
+                "scope_key": block.scope_key,
+                "content": redact_text(block.content),
+                "source_assertion_ids": block.source_assertion_ids,
+                "source_project_state_snapshot_ids": block.source_project_state_snapshot_ids,
+                "trust_boundary": "reviewed_memory",
+                "taint": {"provenance_status": "reviewed_memory"},
+                "retrieval_features": {
+                    "source": "active_topic",
+                    "updated_at_order": len(candidate_payloads) + 1,
+                },
+                "transport_order": len(candidate_payloads) + 1,
+                "projection_version": block.projection_version,
+                "updated_at": to_rfc3339(block.updated_at),
             }
         )
 
@@ -2806,13 +4140,19 @@ def build_memory_context(
         for memory_id in selected_by_kind.get("semantic_assertion", [])
         if memory_id in assertions_by_id
     ]
-    semantic_assertions = [
-        serialize_assertion(
+    candidate_payloads_by_id = {item["id"]: item for item in candidate_payloads}
+    semantic_assertions = []
+    for assertion in selected_assertions:
+        serialized = serialize_assertion(
             assertion,
             evidence_refs=evidence_refs.get(assertion.id, []),
         )
-        for assertion in selected_assertions
-    ]
+        candidate_payload = candidate_payloads_by_id.get(assertion.id, {})
+        serialized["conflict_status"] = candidate_payload.get(
+            "conflict_status", {"state": "none", "conflict_ids": []}
+        )
+        serialized["retrieval_features"] = candidate_payload.get("retrieval_features", {})
+        semantic_assertions.append(serialized)
     conflicts = db.scalars(
         select(MemoryConflictSetRecord)
         .where(MemoryConflictSetRecord.lifecycle_state == "open")
@@ -2836,6 +4176,24 @@ def build_memory_context(
         for memory_id in selected_by_kind.get("procedure", [])
         if memory_id in procedures_by_id
     ]
+    action_traces_by_id = {trace.id: trace for trace in candidate_action_traces}
+    action_traces = [
+        action_traces_by_id[memory_id]
+        for memory_id in selected_by_kind.get("action_trace", [])
+        if memory_id in action_traces_by_id
+    ]
+    hot_blocks_by_id = {block.id: block for block in candidate_hot_blocks}
+    hot_blocks = [
+        hot_blocks_by_id[memory_id]
+        for memory_id in selected_by_kind.get("hot_index", [])
+        if memory_id in hot_blocks_by_id
+    ]
+    topic_blocks_by_id = {block.id: block for block in candidate_topic_blocks}
+    topic_blocks = [
+        topic_blocks_by_id[memory_id]
+        for memory_id in selected_by_kind.get("topic", [])
+        if memory_id in topic_blocks_by_id
+    ]
     recall_window: dict[str, Any] = {
         "max_selected_memories": max_recalled_assertions,
         "selected_memory_count": len(curation["selected_memories"]),
@@ -2857,6 +4215,31 @@ def build_memory_context(
     context = {
         "schema_version": MEMORY_CONTEXT_SCHEMA_VERSION,
         "projection_version": MEMORY_PROJECTION_VERSION,
+        "hot_index": [
+            {
+                "id": block.id,
+                "scope_key": block.scope_key,
+                "content": redact_text(block.content),
+                "source_assertion_ids": block.source_assertion_ids,
+                "source_project_state_snapshot_ids": block.source_project_state_snapshot_ids,
+                "projection_version": block.projection_version,
+                "updated_at": to_rfc3339(block.updated_at),
+            }
+            for block in hot_blocks
+        ],
+        "topic_index": [
+            {
+                "id": block.id,
+                "topic_id": block.topic_id,
+                "scope_key": block.scope_key,
+                "content": redact_text(block.content),
+                "source_assertion_ids": block.source_assertion_ids,
+                "source_project_state_snapshot_ids": block.source_project_state_snapshot_ids,
+                "projection_version": block.projection_version,
+                "updated_at": to_rfc3339(block.updated_at),
+            }
+            for block in topic_blocks
+        ],
         "pinned_core": [
             item for item in semantic_assertions if item["type"] in {"profile", "preference"}
         ],
@@ -2874,9 +4257,7 @@ def build_memory_context(
             for snapshot in project_snapshots
         ],
         "commitments_and_decisions": [
-            serialize_assertion(assertion, evidence_refs=evidence_refs.get(assertion.id, []))
-            for assertion in selected_assertions
-            if assertion.assertion_type in {"commitment", "decision"}
+            item for item in semantic_assertions if item["type"] in {"commitment", "decision"}
         ][:12],
         "semantic_assertions": semantic_assertions,
         "episodic_evidence": [
@@ -2901,8 +4282,24 @@ def build_memory_context(
             }
             for procedure in procedures
         ],
+        "action_traces": [
+            {
+                "id": trace.id,
+                "scope_key": trace.scope_key,
+                "trace_type": trace.trace_type,
+                "action_attempt_id": trace.action_attempt_id,
+                "source_turn_id": trace.source_turn_id,
+                "capability_id": trace.capability_id,
+                "summary": redact_text(trace.summary),
+                "outcome": trace.outcome,
+                "primary_evidence_id": trace.primary_evidence_id,
+                "updated_at": to_rfc3339(trace.updated_at),
+            }
+            for trace in action_traces
+        ],
         "conflicts": [_serialize_conflict(conflict) for conflict in conflicts],
         "recall_window": recall_window,
+        "memory_policy": memory_policy,
         "projection_health": {
             "projection_version": MEMORY_PROJECTION_VERSION,
             "selected_assertion_count": len(selected_assertions),
@@ -2914,17 +4311,28 @@ def build_memory_context(
         "projection_version": MEMORY_PROJECTION_VERSION,
         **recall_window,
         "conflict_ids": [conflict.id for conflict in conflicts],
+        "memory_policy": memory_policy,
     }
     return context, event_payload
 
 
 def context_text(memory_context: dict[str, Any]) -> str:
     lines = ["memory context:"]
+    for item in memory_context.get("hot_index", []):
+        if isinstance(item, dict) and isinstance(item.get("content"), str):
+            lines.append("- hot: " + item["content"])
+    for item in memory_context.get("topic_index", []):
+        if isinstance(item, dict) and isinstance(item.get("content"), str):
+            lines.append("- topic: " + item["content"])
     for item in memory_context.get("project_state", []):
         if isinstance(item, dict) and isinstance(item.get("summary"), str):
             lines.append("- project: " + item["summary"])
     for item in memory_context.get("commitments_and_decisions", []):
         if isinstance(item, dict) and isinstance(item.get("value"), str):
+            conflict_status = item.get("conflict_status")
+            if isinstance(conflict_status, dict) and conflict_status.get("state") == "open":
+                lines.append("- conflicted commitment/decision: " + item["value"])
+                continue
             lines.append("- commitment/decision: " + item["value"])
     for item in memory_context.get("semantic_assertions", []):
         if not isinstance(item, dict):
@@ -2934,6 +4342,20 @@ def context_text(memory_context: dict[str, Any]) -> str:
         predicate = item.get("predicate")
         value = item.get("value")
         if all(isinstance(part, str) for part in (memory_type, subject_key, predicate, value)):
+            conflict_status = item.get("conflict_status")
+            if isinstance(conflict_status, dict) and conflict_status.get("state") == "open":
+                conflict_ids = conflict_status.get("conflict_ids")
+                conflict_suffix = (
+                    f" conflicts={','.join(conflict_ids)}"
+                    if isinstance(conflict_ids, list)
+                    and all(isinstance(conflict_id, str) for conflict_id in conflict_ids)
+                    else ""
+                )
+                lines.append(
+                    f"- conflict: {memory_type}: {subject_key} {predicate} = {value}"
+                    f"{conflict_suffix}"
+                )
+                continue
             lines.append(f"- {memory_type}: {subject_key} {predicate} = {value}")
             evidence_refs = item.get("evidence_refs")
             if isinstance(evidence_refs, list) and evidence_refs:
@@ -2946,6 +4368,9 @@ def context_text(memory_context: dict[str, Any]) -> str:
     for item in memory_context.get("procedural_memory", []):
         if isinstance(item, dict) and isinstance(item.get("instruction"), str):
             lines.append("- procedure: " + item["instruction"])
+    for item in memory_context.get("action_traces", []):
+        if isinstance(item, dict) and isinstance(item.get("summary"), str):
+            lines.append("- action: " + item["summary"])
     conflicts = memory_context.get("conflicts")
     if isinstance(conflicts, list) and conflicts:
         lines.append("- unresolved memory conflicts exist; state uncertainty when relevant")
@@ -2978,8 +4403,6 @@ def process_memory_extract_turn(
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
 ) -> None:
-    if not settings.openai_api_key:
-        raise RuntimeError("memory extraction requires ARIEL_OPENAI_API_KEY")
     evidence_id = task_payload.get("evidence_id")
     session_id = task_payload.get("session_id")
     if not isinstance(evidence_id, str) or not isinstance(session_id, str):
@@ -2987,10 +4410,30 @@ def process_memory_extract_turn(
 
     with session_factory() as db:
         with db.begin():
+            allowed, _policy = session_allows_memory_operation(
+                db,
+                session_id=session_id,
+                operation="extract",
+            )
+            if not allowed:
+                return
             evidence = db.get(MemoryEvidenceRecord, evidence_id)
             if evidence is None or evidence.lifecycle_state != "available":
                 return
+            if (
+                _never_remember_rule_for_text(
+                    db,
+                    source_session_id=session_id,
+                    scope_key="global",
+                    text=evidence.source_text,
+                )
+                is not None
+            ):
+                return
             source_text = evidence.source_text
+
+    if not settings.openai_api_key:
+        raise RuntimeError("memory extraction requires ARIEL_OPENAI_API_KEY")
 
     prompt = (
         "Extract durable Ariel memory candidates from the evidence. "
@@ -3000,55 +4443,226 @@ def process_memory_extract_turn(
         "project_state, procedure, or domain_concept. Return an empty array when the "
         "evidence has no durable memory."
     )
-    response = httpx.post(
-        "https://api.openai.com/v1/responses",
-        headers={
-            "authorization": f"Bearer {settings.openai_api_key}",
-            "content-type": "application/json",
-        },
-        json={
-            "model": settings.model_name,
-            "input": [
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": source_text},
-            ],
-            "store": False,
-            "text": {"verbosity": "low"},
-        },
-        timeout=settings.model_timeout_seconds,
-    )
+    provider_response_id: str | None = None
+    try:
+        response = httpx.post(
+            "https://api.openai.com/v1/responses",
+            headers={
+                "authorization": f"Bearer {settings.openai_api_key}",
+                "content-type": "application/json",
+            },
+            json={
+                "model": settings.model_name,
+                "input": [
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": source_text},
+                ],
+                "store": False,
+                "text": {"verbosity": "low"},
+            },
+            timeout=settings.model_timeout_seconds,
+        )
+    except httpx.HTTPError as exc:
+        with session_factory() as db:
+            with db.begin():
+                now = now_fn()
+                db.add(
+                    AIJudgmentRecord(
+                        id=new_id_fn("ajg"),
+                        judgment_type="memory_extraction",
+                        source_type="memory_evidence",
+                        source_id=evidence_id,
+                        status="failed",
+                        model=settings.model_name,
+                        prompt_version="memory-extraction-v1",
+                        provider_response_id=None,
+                        input_summary="memory extraction for turn evidence",
+                        input_refs={"session_id": session_id, "evidence_id": evidence_id},
+                        selected=[],
+                        omitted=[],
+                        output={},
+                        rationale=None,
+                        uncertainty=None,
+                        confidence=None,
+                        parse_status="missing_output",
+                        validation_status="not_validated",
+                        failure_code="E_AI_JUDGMENT_REQUIRED",
+                        failure_reason=_clean_text(str(exc), max_chars=500),
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+        raise RuntimeError("memory extraction model request failed") from exc
     if response.status_code >= 400:
+        with session_factory() as db:
+            with db.begin():
+                now = now_fn()
+                db.add(
+                    AIJudgmentRecord(
+                        id=new_id_fn("ajg"),
+                        judgment_type="memory_extraction",
+                        source_type="memory_evidence",
+                        source_id=evidence_id,
+                        status="failed",
+                        model=settings.model_name,
+                        prompt_version="memory-extraction-v1",
+                        provider_response_id=None,
+                        input_summary="memory extraction for turn evidence",
+                        input_refs={"session_id": session_id, "evidence_id": evidence_id},
+                        selected=[],
+                        omitted=[],
+                        output={"status_code": response.status_code},
+                        rationale=None,
+                        uncertainty=None,
+                        confidence=None,
+                        parse_status="missing_output",
+                        validation_status="not_validated",
+                        failure_code="E_AI_JUDGMENT_REQUIRED",
+                        failure_reason=f"HTTP {response.status_code}",
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
         raise RuntimeError(f"memory extraction model returned HTTP {response.status_code}")
-    text = _extract_output_text(response.json().get("output"))
+    response_payload = response.json()
+    raw_provider_response_id = (
+        response_payload.get("id") if isinstance(response_payload, dict) else None
+    )
+    provider_response_id = (
+        raw_provider_response_id if isinstance(raw_provider_response_id, str) else None
+    )
+    text = _extract_output_text(
+        response_payload.get("output") if isinstance(response_payload, dict) else None
+    )
     try:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
+        with session_factory() as db:
+            with db.begin():
+                now = now_fn()
+                db.add(
+                    AIJudgmentRecord(
+                        id=new_id_fn("ajg"),
+                        judgment_type="memory_extraction",
+                        source_type="memory_evidence",
+                        source_id=evidence_id,
+                        status="failed",
+                        model=settings.model_name,
+                        prompt_version="memory-extraction-v1",
+                        provider_response_id=provider_response_id,
+                        input_summary="memory extraction for turn evidence",
+                        input_refs={"session_id": session_id, "evidence_id": evidence_id},
+                        selected=[],
+                        omitted=[],
+                        output={},
+                        rationale=None,
+                        uncertainty=None,
+                        confidence=None,
+                        parse_status="invalid_json",
+                        validation_status="invalid",
+                        failure_code="E_AI_JUDGMENT_INVALID_JSON",
+                        failure_reason="memory extraction model returned malformed JSON",
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
         raise RuntimeError("memory extraction model returned malformed JSON") from exc
     candidates = payload.get("candidates")
+    allowed_assertion_types = {
+        "fact",
+        "profile",
+        "preference",
+        "commitment",
+        "decision",
+        "project_state",
+        "procedure",
+        "domain_concept",
+    }
+    schema_error = None
     if not isinstance(candidates, list):
-        raise RuntimeError("memory extraction JSON missing candidates array")
+        schema_error = "memory extraction JSON missing candidates array"
+    elif len(candidates) > 8:
+        schema_error = "memory extraction JSON returned too many candidates"
+    else:
+        for raw_candidate in candidates:
+            if not isinstance(raw_candidate, dict) or set(raw_candidate.keys()) != {
+                "subject_key",
+                "predicate",
+                "assertion_type",
+                "value",
+                "confidence",
+                "is_multi_valued",
+            }:
+                schema_error = "memory extraction candidate schema invalid"
+                break
+            confidence = raw_candidate.get("confidence")
+            if (
+                not isinstance(raw_candidate.get("subject_key"), str)
+                or not raw_candidate["subject_key"].strip()
+                or not isinstance(raw_candidate.get("predicate"), str)
+                or not raw_candidate["predicate"].strip()
+                or raw_candidate.get("assertion_type") not in allowed_assertion_types
+                or not isinstance(raw_candidate.get("value"), str)
+                or not raw_candidate["value"].strip()
+                or isinstance(confidence, bool)
+                or not isinstance(confidence, int | float)
+                or float(confidence) < 0.0
+                or float(confidence) > 1.0
+                or float(confidence) != float(confidence)
+                or not isinstance(raw_candidate.get("is_multi_valued"), bool)
+            ):
+                schema_error = "memory extraction candidate schema invalid"
+                break
+    if schema_error is not None:
+        with session_factory() as db:
+            with db.begin():
+                now = now_fn()
+                db.add(
+                    AIJudgmentRecord(
+                        id=new_id_fn("ajg"),
+                        judgment_type="memory_extraction",
+                        source_type="memory_evidence",
+                        source_id=evidence_id,
+                        status="failed",
+                        model=settings.model_name,
+                        prompt_version="memory-extraction-v1",
+                        provider_response_id=provider_response_id,
+                        input_summary="memory extraction for turn evidence",
+                        input_refs={"session_id": session_id, "evidence_id": evidence_id},
+                        selected=[],
+                        omitted=[],
+                        output={},
+                        rationale=None,
+                        uncertainty=None,
+                        confidence=None,
+                        parse_status="schema_invalid",
+                        validation_status="invalid",
+                        failure_code="E_AI_JUDGMENT_SCHEMA",
+                        failure_reason=schema_error,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+        raise RuntimeError(schema_error)
 
     with session_factory() as db:
         with db.begin():
-            for raw_candidate in candidates[:8]:
-                if not isinstance(raw_candidate, dict):
-                    continue
+            allowed, _policy = session_allows_memory_operation(
+                db,
+                session_id=session_id,
+                operation="extract",
+            )
+            if not allowed:
+                return
+            proposed_candidate_ids: list[str] = []
+            for raw_candidate in candidates:
                 subject_key = raw_candidate.get("subject_key")
                 predicate = raw_candidate.get("predicate")
                 assertion_type = raw_candidate.get("assertion_type")
                 value = raw_candidate.get("value")
                 confidence = raw_candidate.get("confidence")
                 is_multi_valued = raw_candidate.get("is_multi_valued")
-                if not (
-                    isinstance(subject_key, str)
-                    and isinstance(predicate, str)
-                    and isinstance(assertion_type, str)
-                    and isinstance(value, str)
-                    and isinstance(confidence, int | float)
-                    and isinstance(is_multi_valued, bool)
-                ):
-                    continue
-                propose_memory_candidate(
+                memory_events = propose_memory_candidate(
                     db,
                     source_session_id=session_id,
                     actor_id="system",
@@ -3067,3 +4681,40 @@ def process_memory_extract_turn(
                     now_fn=now_fn,
                     new_id_fn=new_id_fn,
                 )
+                for event in memory_events:
+                    payload_data = event.get("payload")
+                    if (
+                        event.get("event_type") == "evt.memory.candidate_proposed"
+                        and isinstance(payload_data, dict)
+                        and isinstance(payload_data.get("assertion_id"), str)
+                    ):
+                        proposed_candidate_ids.append(payload_data["assertion_id"])
+            now = now_fn()
+            db.add(
+                AIJudgmentRecord(
+                    id=new_id_fn("ajg"),
+                    judgment_type="memory_extraction",
+                    source_type="memory_evidence",
+                    source_id=evidence_id,
+                    status="succeeded",
+                    model=settings.model_name,
+                    prompt_version="memory-extraction-v1",
+                    provider_response_id=provider_response_id,
+                    input_summary="memory extraction for turn evidence",
+                    input_refs={"session_id": session_id, "evidence_id": evidence_id},
+                    selected=[
+                        {"assertion_id": assertion_id} for assertion_id in proposed_candidate_ids
+                    ],
+                    omitted=[],
+                    output={"candidate_count": len(proposed_candidate_ids)},
+                    rationale="extracted durable memory candidates from evidence",
+                    uncertainty=None,
+                    confidence=None,
+                    parse_status="parsed",
+                    validation_status="valid",
+                    failure_code=None,
+                    failure_reason=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )

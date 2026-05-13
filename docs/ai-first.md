@@ -120,6 +120,11 @@ answer, and whether uncertainty should be surfaced.
 Deterministic code must not author final answers from tool output except typed
 failure envelopes that stop the turn.
 
+Agent capability surfaces follow [agent-tooling.md](agent-tooling.md): default
+to terminal-first work, promote repeated procedures into skills, and add
+structured tools only for current capability, safety, correctness, audit, or
+cost reasons.
+
 ## Memory
 
 Memory storage is canonical in Ariel-owned persistence. Memory judgment is

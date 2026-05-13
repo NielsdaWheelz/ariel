@@ -137,21 +137,6 @@ def list_jobs(
     return _format_jobs_for_discord(jobs)
 
 
-def list_memory(
-    *,
-    ariel_base_url: str,
-) -> str:
-    with httpx.Client(timeout=60.0) as client:
-        response = client.get(f"{ariel_base_url}/v1/memory")
-        payload = _json_response_payload(response)
-        if response.status_code >= 400 or payload.get("ok") is not True:
-            raise ArielDiscordError(_safe_ariel_error_message(payload))
-    assertions = payload.get("active_assertions")
-    if not isinstance(assertions, list):
-        raise ArielDiscordError("Ariel returned an invalid memory response.")
-    return _format_memory_for_discord(assertions)
-
-
 def record_capture(
     *,
     ariel_base_url: str,
@@ -361,13 +346,6 @@ class ArielDiscordBot(commands.Bot):
         )
         self.tree.add_command(
             app_commands.Command(
-                name="memory",
-                description="List Ariel memory.",
-                callback=self._slash_memory,
-            )
-        )
-        self.tree.add_command(
-            app_commands.Command(
                 name="capture",
                 description="Record a text capture without invoking the assistant.",
                 callback=self._slash_capture,
@@ -415,23 +393,6 @@ class ArielDiscordBot(commands.Bot):
 
         await interaction.response.defer(thinking=True, ephemeral=True)
         content = await self._run_discord_ops_command(list_jobs)
-        await interaction.followup.send(
-            format_discord_message(content),
-            ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-
-    async def _slash_memory(self, interaction: discord.Interaction) -> None:
-        if not self._interaction_is_allowed(interaction):
-            await interaction.response.send_message(
-                "This Ariel command is limited to the configured Discord user and home server.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            return
-
-        await interaction.response.defer(thinking=True, ephemeral=True)
-        content = await self._run_discord_ops_command(list_memory)
         await interaction.followup.send(
             format_discord_message(content),
             ephemeral=True,
@@ -984,31 +945,6 @@ def _format_jobs_for_discord(jobs: list[Any]) -> str:
             lines.append(f"- {job_id}: {status}: {title}")
     if len(lines) == 1:
         raise ArielDiscordError("Ariel returned an invalid jobs response.")
-    return "\n".join(lines)
-
-
-def _format_memory_for_discord(items: list[Any]) -> str:
-    active_items = []
-    for item in items:
-        if not isinstance(item, dict) or item.get("state") != "active":
-            continue
-        subject_key = item.get("subject_key")
-        predicate = item.get("predicate")
-        value = item.get("value")
-        if (
-            isinstance(subject_key, str)
-            and isinstance(predicate, str)
-            and isinstance(value, str)
-            and value.strip()
-        ):
-            active_items.append((f"{subject_key} {predicate}", value.strip()))
-
-    if not active_items:
-        return "No active memory."
-
-    lines = ["Active memory:"]
-    for assertion_label, value in active_items[:10]:
-        lines.append(f"- {assertion_label}: {value}")
     return "\n".join(lines)
 
 

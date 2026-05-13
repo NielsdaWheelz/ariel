@@ -17,7 +17,6 @@ ACTIVE_AI_FIRST_DOC_PATHS = (
     "docs/ai-first.md",
     "docs/modules",
     "docs/production-runbook.md",
-    "docs/proactive-ai-deliberation-cutover.md",
 )
 LEGACY_SURFACE_PATHS = (*ACTIVE_AI_FIRST_DOC_PATHS, *RUNTIME_PATHS, "tests")
 
@@ -159,7 +158,8 @@ def test_old_ambient_derivation_route_task_and_wording_are_absent(pattern: str) 
 
 
 def test_old_proactive_attention_runtime_surfaces_are_absent() -> None:
-    _assert_absent("attention_")
+    _assert_absent("attention_ranking_due")
+    _assert_absent("attention_item")
 
 
 @pytest.mark.parametrize(
@@ -188,8 +188,6 @@ def test_readme_and_env_example_do_not_describe_legacy_ambient_derivation(
         "included_memory_count",
         "candidate_memory_count",
         "max_recalled_items",
-        "rank_score",
-        "rank_reason",
         "evt.turn.limit_reached",
     ],
 )
@@ -315,12 +313,12 @@ def test_unconfigured_ambient_source_types_are_absent_from_runtime_constraints(
     )
 
 
-def test_provider_sync_runtime_only_queues_ambient_interpretation() -> None:
+def test_provider_sync_runtime_does_not_queue_ambient_interpretation() -> None:
     sync_runtime = ROOT / "src/ariel/sync_runtime.py"
     source = sync_runtime.read_text()
 
-    assert 'task_type="ambient_interpretation_due"' in source
-    assert "workspace_item_event_id" in source
+    assert 'task_type="ambient_interpretation_due"' not in source
+    assert "workspace_item_event_id" not in source
     for pattern in (
         "ProactiveCaseRecord",
         "ProactiveObservationRecord",

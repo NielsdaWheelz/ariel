@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from testcontainers.postgres import PostgresContainer
 
 from ariel.app import ModelAdapter, create_app
-from tests.integration.responses_helpers import responses_with_function_calls
+from tests.integration.responses_helpers import responses_message, responses_with_function_calls
 
 
 @dataclass
@@ -30,10 +30,34 @@ class ActionProposalAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         del tools, history, context_bundle
+        if any(
+            isinstance(item, dict) and item.get("type") == "function_call_output"
+            for item in input_items
+        ):
+            assistant_text = f"assistant::{user_message}"
+            if user_message == "run read":
+                assistant_text = "read result: my token is [REDACTED]"
+            elif user_message == "queue write":
+                assistant_text = "approval required before this action can run"
+            elif user_message == "unsafe action":
+                assistant_text = "blocked: the requested action was denied"
+            return responses_message(
+                assistant_text=assistant_text,
+                provider=self.provider,
+                model=self.model,
+                provider_response_id="resp_s2_pr01_123",
+                input_tokens=13,
+                output_tokens=11,
+            )
         proposals = self.proposals_by_message.get(user_message, [])
+        assistant_text = f"assistant::{user_message}"
+        if user_message == "queue write":
+            assistant_text = "approval required before this action can run"
+        elif user_message == "unsafe action":
+            assistant_text = "blocked: the requested action was denied"
         return responses_with_function_calls(
             input_items=input_items,
-            assistant_text=f"assistant::{user_message}",
+            assistant_text=assistant_text,
             proposals=copy.deepcopy(proposals),
             provider=self.provider,
             model=self.model,

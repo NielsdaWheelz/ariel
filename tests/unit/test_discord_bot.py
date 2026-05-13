@@ -25,7 +25,6 @@ from ariel.discord_bot import (
     get_status,
     inspect_proactive_case,
     list_jobs,
-    list_memory,
     more_aggressive_proactive_pattern,
     record_capture,
     refresh_job,
@@ -360,7 +359,7 @@ def test_discord_bot_registers_only_deterministic_ops_slash_commands() -> None:
 
     assert bot.tree.get_command("status") is not None
     assert bot.tree.get_command("jobs") is not None
-    assert bot.tree.get_command("memory") is not None
+    assert bot.tree.get_command("memory") is None
     assert bot.tree.get_command("capture") is not None
 
 
@@ -1043,51 +1042,6 @@ def test_jobs_command_fetches_job_list(monkeypatch: pytest.MonkeyPatch) -> None:
     assert fake_clients[0].calls == [
         {"method": "GET", "url": "http://127.0.0.1:8000/v1/jobs?limit=10"}
     ]
-
-
-def test_memory_command_fetches_memory_projection(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_clients: list[FakeHttpClient] = []
-
-    def fake_client(*, timeout: float) -> FakeHttpClient:
-        assert timeout == 60.0
-        client = FakeHttpClient(
-            responses=[
-                httpx.Response(
-                    200,
-                    json={
-                        "ok": True,
-                        "schema_version": "memory.sota.v1",
-                        "active_assertions": [
-                            {
-                                "subject_key": "user:default",
-                                "predicate": "preference.notebook_style",
-                                "state": "active",
-                                "value": "short bullets",
-                            },
-                        ],
-                        "candidates": [],
-                        "conflicts": [],
-                        "project_state": [],
-                        "evidence": [],
-                        "procedures": [],
-                        "projection_health": {
-                            "projection_version": "embedding-v1",
-                            "pending_jobs": 0,
-                            "failed_jobs": 0,
-                        },
-                    },
-                )
-            ]
-        )
-        fake_clients.append(client)
-        return client
-
-    monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
-
-    message = list_memory(ariel_base_url="http://127.0.0.1:8000")
-
-    assert message == "Active memory:\n- user:default preference.notebook_style: short bullets"
-    assert fake_clients[0].calls == [{"method": "GET", "url": "http://127.0.0.1:8000/v1/memory"}]
 
 
 def test_capture_command_records_capture_without_message_endpoint(

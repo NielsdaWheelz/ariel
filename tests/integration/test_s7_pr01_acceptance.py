@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from collections.abc import Callable, Generator
 from dataclasses import dataclass, field, replace
 from typing import Any, cast
@@ -13,7 +14,7 @@ import ariel.action_runtime as action_runtime_module
 import ariel.capability_registry as capability_registry_module
 import ariel.policy_engine as policy_engine_module
 from ariel.app import ModelAdapter, create_app
-from tests.integration.responses_helpers import responses_with_function_calls
+from tests.integration.responses_helpers import responses_message, responses_with_function_calls
 from ariel.capability_registry import (
     CapabilityDefinition,
     get_capability as registry_get_capability,
@@ -36,10 +37,51 @@ class ActionProposalAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        del tools, history, context_bundle
+        del tools, history
+        if context_bundle.get("origin") == "tool_result_interpretation":
+            interpreter_input = context_bundle.get("tool_result_interpreter_input")
+            if not isinstance(interpreter_input, dict):
+                interpreter_input = {}
+            audited_outputs = interpreter_input.get("audited_tool_outputs")
+            selected_output_refs = []
+            if isinstance(audited_outputs, list):
+                selected_output_refs = [
+                    output["output_ref"]
+                    for output in audited_outputs
+                    if isinstance(output, dict) and isinstance(output.get("output_ref"), str)
+                ]
+            return responses_message(
+                assistant_text=json.dumps(
+                    {
+                        "findings": ["web extraction evidence inspected"],
+                        "contradictions": [],
+                        "uncertainty": [],
+                        "selected_output_refs": selected_output_refs,
+                        "omitted_output_refs": [],
+                        "citation_refs": interpreter_input.get("citation_refs", []),
+                        "artifact_refs": interpreter_input.get("artifact_refs", []),
+                        "recommended_next_evidence": [],
+                        "confidence": 0.9,
+                    },
+                    sort_keys=True,
+                ),
+                provider=self.provider,
+                model=self.model,
+                provider_response_id="resp_s7_pr01_interpreter",
+                input_tokens=47,
+                output_tokens=31,
+            )
         proposals = self.proposals_by_message.get(user_message, [])
         assistant_text = self.assistant_text_by_message.get(
-            user_message, f"assistant::{user_message}"
+            user_message,
+            {
+                "extract url": "The extracted article supports the launch details [1].",
+                "egress deny": "blocked by the allowlist.",
+                "retry extraction": "The recovered extraction is available [1].",
+                "malformed final url": "provider_invalid_payload",
+                "ipv6 extraction": "The IPv6 extraction is available [1].",
+                "large extraction": "Partial extraction only; narrow or focus the request [1].",
+            }.get(user_message, f"assistant::{user_message}"),
         )
         return responses_with_function_calls(
             input_items=input_items,
@@ -276,7 +318,10 @@ def test_s7_pr01_url_safety_preflight_fails_closed_before_provider_dispatch(
     adapter = ActionProposalAdapter(
         proposals_by_message={
             "unsafe url": [{"capability_id": "cap.web.extract", "input": {"url": input_url}}]
-        }
+        },
+        assistant_text_by_message={
+            "unsafe url": f"{expected_error}: provide a {expected_hint} URL."
+        },
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
@@ -334,7 +379,8 @@ def test_s7_pr01_web_extract_egress_contract_failures_block_before_execute(
                     "input": {"url": "https://example.com/research/article"},
                 }
             ]
-        }
+        },
+        assistant_text_by_message={"intent failure": expected_error},
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
@@ -475,7 +521,8 @@ def test_s7_pr01_provider_retry_exhaustion_fails_once_with_typed_error(
                     "input": {"url": "https://example.com/research/article"},
                 }
             ]
-        }
+        },
+        assistant_text_by_message={"retry exhaustion": "provider_upstream_failure: retry later."},
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
@@ -532,7 +579,8 @@ def test_s7_pr01_typed_url_extraction_failures_are_actionable_and_auditable(
                     "input": {"url": "https://example.com/research/article"},
                 }
             ]
-        }
+        },
+        assistant_text_by_message={"failing extraction": f"{expected_error}: {expected_hint}."},
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
@@ -729,7 +777,7 @@ def test_s7_pr01_mixed_turn_with_web_extract_preserves_grounding_and_lifecycle_i
             ]
         },
         assistant_text_by_message={
-            "mixed turn": "i am fully certain without citing anything.",
+            "mixed turn": "The extracted source supports the answer [1].",
         },
     )
     with _build_client(postgres_url, adapter) as client:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import os
 from typing import Any
 
@@ -21,6 +22,10 @@ def _response(*, status_code: int, payload: dict[str, Any]) -> httpx.Response:
 def _text_response(*, status_code: int, text: str, url: str) -> httpx.Response:
     request = httpx.Request("GET", url)
     return httpx.Response(status_code=status_code, text=text, request=request)
+
+
+def _b64url(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
 
 
 def test_connector_token_cipher_round_trip_uses_aead_envelope_format() -> None:
@@ -91,10 +96,113 @@ def test_google_calendar_capability_validators_reject_inverted_windows() -> None
             "window_end": "2026-03-05T09:00:00Z",
             "duration_minutes": 30,
             "attendees": [],
+            "timezone": "UTC",
+            "source_evidence_ids": [],
+            "quoted_content_caveat": False,
+            "participants": [],
+            "proposed_windows": [],
+            "timezone_evidence": {
+                "source": None,
+                "rationale": None,
+                "confidence": None,
+            },
+            "constraints": {"hard": [], "soft": [], "attendee_notes": []},
         }
     )
     assert normalized_slots is None
     assert slots_error == "schema_invalid"
+
+    calendar_create = get_capability("cap.calendar.create_event")
+    assert calendar_create is not None
+    normalized_create, create_error = calendar_create.validate_input(
+        {
+            "title": "Risk review",
+            "start_time": "2026-03-05T10:00:00Z",
+            "end_time": "2026-03-05T10:30:00Z",
+            "idempotency_key": "cal-create-1",
+            "user_instruction_ref": "turn:create-risk-review",
+        }
+    )
+    assert create_error is None
+    assert normalized_create is not None
+    assert normalized_create["idempotency_key"] == "cal-create-1"
+
+    calendar_update = get_capability("cap.calendar.update_event")
+    assert calendar_update is not None
+    assert calendar_update.validate_input({"event_id": "evt_1", "title": "Risk review"}) == (
+        None,
+        "schema_invalid",
+    )
+    normalized_update, update_error = calendar_update.validate_input(
+        {
+            "event_id": "evt_1",
+            "title": "Risk review",
+            "idempotency_key": "cal-update-1",
+            "source_evidence_id": "pev_1",
+        }
+    )
+    assert update_error is None
+    assert normalized_update is not None
+    assert normalized_update["source_evidence_id"] == "pev_1"
+    normalized_update_with_null_attendees, update_null_attendees_error = (
+        calendar_update.validate_input(
+            {
+                "event_id": "evt_1",
+                "title": "Risk review",
+                "attendees": None,
+                "idempotency_key": "cal-update-2",
+                "source_evidence_id": "pev_1",
+            }
+        )
+    )
+    assert update_null_attendees_error is None
+    assert normalized_update_with_null_attendees is not None
+    assert "attendees" not in normalized_update_with_null_attendees
+
+    calendar_response = get_capability("cap.calendar.respond_to_event")
+    assert calendar_response is not None
+    normalized_response, response_error = calendar_response.validate_input(
+        {
+            "event_id": "evt_1",
+            "attendee_email": "User@Example.com",
+            "response_status": "accepted",
+            "idempotency_key": "cal-rsvp-1",
+            "commitment_id": "wkc_1",
+        }
+    )
+    assert response_error is None
+    assert normalized_response is not None
+    assert normalized_response["attendee_email"] == "user@example.com"
+
+
+def test_google_email_read_validator_accepts_message_or_thread_modes() -> None:
+    email_read = get_capability("cap.email.read")
+    assert email_read is not None
+
+    normalized_message, message_error = email_read.validate_input(
+        {"message_id": " msg_1 ", "thread_id": None, "mode": "message"}
+    )
+    assert message_error is None
+    assert normalized_message == {
+        "message_id": "msg_1",
+        "thread_id": None,
+        "mode": "message",
+    }
+
+    normalized_thread, thread_error = email_read.validate_input(
+        {"message_id": None, "thread_id": " thr_1 ", "mode": "thread"}
+    )
+    assert thread_error is None
+    assert normalized_thread == {
+        "message_id": None,
+        "thread_id": "thr_1",
+        "mode": "thread",
+    }
+
+    assert email_read.validate_input({"thread_id": "thr_1", "mode": "message"}) == (
+        None,
+        "schema_invalid",
+    )
 
 
 def test_default_workspace_provider_calendar_list_calls_google_events_endpoint(
@@ -155,7 +263,143 @@ def test_default_workspace_provider_calendar_list_calls_google_events_endpoint(
     assert call["headers"]["authorization"].startswith("Bearer ")
     assert call["params"]["timeMin"] == "2026-03-04T00:00:00Z"
     assert call["params"]["timeMax"] == "2026-03-05T00:00:00Z"
-    assert output["results"][0]["title"] == "team sync"
+    assert output["schema_version"] == "google.calendar.events.v1"
+    assert output["events"][0]["summary"] == "team sync"
+    assert output["events"][0]["event_id"] == "evt_1"
+    assert len(output["events"][0]["raw_payload_digest"]) == 64
+    assert output["events"][0]["start"]["value"] == "2026-03-04T10:00:00Z"
+
+
+def test_default_workspace_provider_calendar_slots_do_not_overstate_freebusy_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def fake_request(
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+        json: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        del method, headers, params, json, timeout
+        calls.append(url)
+        if url.endswith("/calendar/v3/freeBusy"):
+            return _response(
+                status_code=200,
+                payload={
+                    "calendars": {
+                        "primary": {"busy": []},
+                        "lead@example.com": {
+                            "errors": [{"reason": "notFound"}],
+                            "busy": [],
+                        },
+                    }
+                },
+            )
+        return _response(status_code=200, payload={"items": []})
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    provider = DefaultGoogleWorkspaceProvider(timeout_seconds=5.0, max_attempts=1)
+    output = provider.calendar_propose_slots(
+        access_token="tok_live",
+        normalized_input={
+            "window_start": "2026-03-04T10:00:00Z",
+            "window_end": "2026-03-04T11:00:00Z",
+            "duration_minutes": 30,
+            "attendees": ["lead@example.com"],
+            "timezone": "UTC",
+            "source_evidence_ids": [],
+            "quoted_content_caveat": False,
+            "participants": ["lead@example.com"],
+            "proposed_windows": [],
+            "timezone_evidence": {
+                "source": None,
+                "rationale": None,
+                "confidence": None,
+            },
+            "constraints": {"hard": [], "soft": [], "attendee_notes": []},
+        },
+        attendee_intersection_enabled=True,
+    )
+
+    assert calls[0].endswith("/calendar/v3/freeBusy")
+    assert calls[1].endswith("/calendar/v3/calendars/primary/events")
+    assert output["availability_scope"] == "primary_calendar_only"
+    assert output["partial"] is True
+    assert output["partial_reason"] == "attendee_freebusy_unavailable"
+    assert output["slots"][0]["availability_scope"] == "primary_calendar_only"
+
+
+def test_default_workspace_provider_calendar_update_and_rsvp_patch_google_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_request(
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+        json: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        del headers, params, timeout
+        calls.append({"method": method, "url": url, "json": json or {}})
+        return _response(
+            status_code=200,
+            payload={
+                "id": "evt_1",
+                "etag": "etag_evt_1",
+                "updated": "2026-03-03T12:00:00Z",
+                "iCalUID": "evt_1@google.com",
+                "status": "confirmed",
+                "htmlLink": "https://calendar.google.com/event?eid=evt_1",
+            },
+        )
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    provider = DefaultGoogleWorkspaceProvider(timeout_seconds=5.0, max_attempts=1)
+
+    updated = provider.calendar_update_event(
+        access_token="tok_live",
+        normalized_input={
+            "calendar_id": "primary",
+            "event_id": "evt_1",
+            "title": "Risk review",
+            "start_time": "2026-03-04T10:00:00Z",
+            "end_time": "2026-03-04T10:30:00Z",
+            "idempotency_key": "cal-update-1",
+            "source_evidence_id": "pev_1",
+        },
+    )
+    responded = provider.calendar_respond_to_event(
+        access_token="tok_live",
+        normalized_input={
+            "calendar_id": "primary",
+            "event_id": "evt_1",
+            "attendee_email": "user@example.com",
+            "response_status": "accepted",
+            "idempotency_key": "cal-rsvp-1",
+            "commitment_id": "wkc_1",
+        },
+    )
+
+    assert calls[0]["method"] == "PATCH"
+    assert calls[0]["url"].endswith("/calendar/v3/calendars/primary/events/evt_1")
+    assert calls[0]["json"]["summary"] == "Risk review"
+    assert calls[0]["json"]["start"] == {"dateTime": "2026-03-04T10:00:00Z"}
+    assert calls[1]["json"] == {
+        "attendeesOmitted": True,
+        "attendees": [{"email": "user@example.com", "responseStatus": "accepted"}],
+    }
+    assert updated["schema_version"] == "google.calendar.update_result.v1"
+    assert updated["etag"] == "etag_evt_1"
+    assert responded["schema_version"] == "google.calendar.response_result.v1"
+    assert responded["response_status"] == "accepted"
 
 
 def test_default_workspace_provider_retries_transient_errors_before_success(
@@ -182,9 +426,13 @@ def test_default_workspace_provider_retries_transient_errors_before_success(
             status_code=200,
             payload={
                 "id": "msg_1",
-                "snippet": "payment confirmed",
+                "threadId": "thr_1",
                 "internalDate": "1709462400000",
-                "payload": {"headers": [{"name": "Subject", "value": "Invoice #44"}]},
+                "payload": {
+                    "mimeType": "text/plain",
+                    "headers": [{"name": "Subject", "value": "Invoice #44"}],
+                    "body": {"data": _b64url(b"payment confirmed")},
+                },
             },
         )
 
@@ -196,8 +444,128 @@ def test_default_workspace_provider_retries_transient_errors_before_success(
     )
 
     assert len(calls) == 2
-    assert output["results"][0]["title"] == "Invoice #44"
-    assert "payment confirmed" in output["results"][0]["snippet"]
+    assert output["schema_version"] == "google.gmail.message_evidence.v1"
+    assert output["message"]["subject"] == "Invoice #44"
+    assert "text" not in output["message"]["body"]
+    assert "html_text" not in output["message"]["body"]
+    assert output["evidence"]["blocks"][0]["text"] == "payment confirmed"
+    assert output["read_outcome"]["status"] == "ok"
+
+
+def test_default_workspace_provider_email_search_fetches_to_cc_and_body_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_request(
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+        json: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        del headers, json, timeout
+        calls.append({"method": method, "url": url, "params": params or {}})
+        if url.endswith("/users/me/messages"):
+            return _response(status_code=200, payload={"messages": [{"id": "msg_1"}]})
+        return _response(
+            status_code=200,
+            payload={
+                "id": "msg_1",
+                "threadId": "thr_1",
+                "snippet": "short preview",
+                "payload": {
+                    "headers": [
+                        {"name": "Subject", "value": "Invoice"},
+                        {"name": "From", "value": "Ada <ada@example.com>"},
+                        {"name": "To", "value": "User <user@example.com>"},
+                        {"name": "Cc", "value": "Ops <ops@example.com>"},
+                    ]
+                },
+            },
+        )
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    provider = DefaultGoogleWorkspaceProvider(timeout_seconds=5.0, max_attempts=1)
+    output = provider.email_search(
+        access_token="tok_live",
+        normalized_input={"query": "invoice"},
+    )
+
+    assert calls[1]["params"]["metadataHeaders"] == ["Subject", "From", "To", "Cc", "Date"]
+    message = output["messages"][0]
+    assert message["recipients"][0]["email"] == "user@example.com"
+    assert message["cc"][0]["email"] == "ops@example.com"
+    assert message["evidence_status"] == "needs_read"
+
+
+def test_default_workspace_provider_email_read_supports_thread_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_request(
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+        json: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        del headers, json, timeout
+        calls.append({"method": method, "url": url, "params": params or {}})
+        if url.endswith("/gmail/v1/users/me/threads/thr_1"):
+            return _response(
+                status_code=200,
+                payload={
+                    "id": "thr_1",
+                    "historyId": "88",
+                    "messages": [{"id": "msg_1"}, {"id": "msg_2"}],
+                },
+            )
+        message_id = url.rsplit("/", 1)[-1]
+        body = b"first message" if message_id == "msg_1" else b"second message"
+        return _response(
+            status_code=200,
+            payload={
+                "id": message_id,
+                "threadId": "thr_1",
+                "internalDate": "1709462400000" if message_id == "msg_1" else "1709462500000",
+                "payload": {
+                    "mimeType": "text/plain",
+                    "headers": [
+                        {"name": "Subject", "value": "Invoice"},
+                        {"name": "To", "value": "user@example.com"},
+                        {"name": "Cc", "value": "ops@example.com"},
+                    ],
+                    "body": {"data": _b64url(body)},
+                },
+            },
+        )
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    provider = DefaultGoogleWorkspaceProvider(timeout_seconds=5.0, max_attempts=1)
+    output = provider.email_read(
+        access_token="tok_live",
+        normalized_input={"thread_id": "thr_1", "message_id": None, "mode": "thread"},
+    )
+
+    assert calls[0]["url"].endswith("/gmail/v1/users/me/threads/thr_1")
+    assert calls[0]["params"]["format"] == "metadata"
+    assert calls[1]["url"].endswith("/gmail/v1/users/me/messages/msg_1")
+    assert calls[2]["url"].endswith("/gmail/v1/users/me/messages/msg_2")
+    assert output["mode"] == "thread"
+    assert output["thread"]["thread_id"] == "thr_1"
+    assert [message["message_id"] for message in output["messages"]] == ["msg_1", "msg_2"]
+    assert output["messages"][0]["cc"][0]["email"] == "ops@example.com"
+    assert output["evidence"]["source_kind"] == "gmail_thread"
+    assert [block["source_message_id"] for block in output["evidence"]["blocks"]] == [
+        "msg_1",
+        "msg_2",
+    ]
 
 
 def test_default_workspace_provider_drive_search_builds_safe_query_and_shared_drive_params(

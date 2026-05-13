@@ -18,6 +18,7 @@ class SurfaceSessionContract(BaseModel):
     id: str
     is_active: bool
     lifecycle_state: str
+    memory_mode: Literal["normal", "temporary", "no_memory"]
     created_at: str
     updated_at: str
 
@@ -56,6 +57,8 @@ SurfaceEventType = Literal[
     "evt.action.execution.started",
     "evt.action.execution.succeeded",
     "evt.action.execution.failed",
+    "evt.action.execution.retrying",
+    "evt.provider_write.reconcile_unavailable",
 ]
 
 
@@ -100,6 +103,7 @@ class SurfaceContextMetadataContract(BaseModel):
     schema_version: str
     section_order: list[str]
     policy_instruction_count: int
+    current_turn_id: str | None = None
     recent_window: SurfaceContextRecentWindowContract
 
 
@@ -197,6 +201,7 @@ class SurfaceEventMemoryCuratedPayloadContract(BaseModel):
     curation_parse_status: str
     curation_provider_response_id: str | None = None
     conflict_ids: list[str]
+    memory_policy: dict[str, Any] | None = None
 
 
 class SurfaceEventAssistantEmittedPayloadContract(BaseModel):
@@ -329,21 +334,103 @@ class SurfaceEventActionExecutionFailedPayloadContract(BaseModel):
     approval_ref: str | None = None
 
 
-class SurfaceEventMemoryPayloadContract(BaseModel):
-    model_config = ConfigDict(extra="allow")
+class SurfaceEventActionExecutionRetryingPayloadContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action_attempt_id: str
+    error: str
+
+
+class SurfaceEventProviderWriteReconcileUnavailablePayloadContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action_attempt_id: str
+    provider_write_receipt_id: str
+    status: Literal["succeeded", "failed", "ambiguous"]
+    reason: str
+    reconcile_task_enqueued: bool
+    reconcile_task_id: str | None = None
+
+
+class SurfaceEventMemoryAssertionPayloadContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    assertion_id: str
+    subject_key: str
+    predicate: str
+    assertion_type: str
+    lifecycle_state: str
+    value_preview: str
+    confidence: float
+    evidence_id: str | None = None
+    deletion_type: str | None = None
+    evidence_ids: list[str] | None = None
+
+
+class SurfaceEventMemoryEvidencePayloadContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_id: str
+    source_turn_id: str | None = None
+    source_session_id: str | None = None
+    content_class: str | None = None
+    trust_boundary: str | None = None
+
+
+class SurfaceEventMemoryProjectionRebuiltPayloadContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    assertion_id: str
+    projection_version: str
+    projection_kinds: list[str]
+    queued_projection_kinds: list[str]
+
+
+class SurfaceEventMemoryConflictOpenedPayloadContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    conflict_set_id: str
+    subject_key: str
+    predicate: str
+    assertion_ids: list[str]
+
+
+class SurfaceEventMemoryConflictResolvedPayloadContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    conflict_set_id: str
+    resolution_assertion_id: str
+
+
+class SurfaceEventMemoryRecallOmittedPayloadContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    kind: str
+    reason: str
+
+
+class SurfaceEventMemoryExtractionQueuedPayloadContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    task_id: str
+    turn_id: str
+    evidence_id: str
 
 
 class SurfaceEventAIJudgmentPayloadContract(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
     judgment_type: Literal[
         "memory_curation",
         "tool_result_interpretation",
+        "memory_extraction",
         "continuity_compaction",
         "feedback_learning",
         "ambient_interpretation",
         "proactive_deliberation",
         "model_output",
+        "workspace_commitment_extraction",
     ]
     parse_status: (
         Literal[
@@ -356,6 +443,7 @@ class SurfaceEventAIJudgmentPayloadContract(BaseModel):
         | None
     ) = None
     validation_status: Literal["valid", "invalid", "not_validated"] | None = None
+    code: str | None = None
     failure_code: (
         Literal[
             "E_AI_JUDGMENT_REQUIRED",
@@ -368,6 +456,22 @@ class SurfaceEventAIJudgmentPayloadContract(BaseModel):
         ]
         | None
     ) = None
+    failure_reason: str | None = None
+    prompt_version: str | None = None
+    source_id: str | None = None
+    source_turn_ids: list[str] | None = None
+    input_refs: dict[str, Any] | None = None
+    retryable: bool | None = None
+    provider: str | None = None
+    model: str | None = None
+    usage: dict[str, Any] | None = None
+    provider_response_id: str | None = None
+    response_output_shape: dict[str, Any] | None = None
+    reason_codes: list[str] | None = None
+    attempt: int | None = None
+    max_model_attempts: int | None = None
+    last_tool_result_interpreter_judgment_id: str | None = None
+    omitted_turn_count: int | None = None
 
 
 class SurfaceEventEnvelopeContract(BaseModel):
@@ -699,6 +803,140 @@ class SurfaceMemoryProjectionHealthContract(BaseModel):
     projection_version: str
     pending_jobs: int
     failed_jobs: int
+    running_jobs: int = 0
+
+
+class SurfaceMemoryActionTraceContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    scope_key: str
+    trace_type: str
+    action_attempt_id: str | None
+    source_turn_id: str | None
+    capability_id: str | None
+    summary: str
+    outcome: str
+    primary_evidence_id: str
+    result_refs: Any
+    created_at: str
+    updated_at: str
+
+
+class SurfaceMemoryTopicContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    topic_key: str
+    family: str
+    scope_key: str
+    title: str
+    summary: str
+    state: str
+    projection_version: str
+    created_at: str
+    updated_at: str
+
+
+class SurfaceMemoryContextBlockContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    block_type: str
+    scope_key: str
+    topic_id: str | None
+    content: str
+    state: str
+    source_assertion_ids: list[str]
+    source_episode_ids: list[str]
+    source_trace_ids: list[str]
+    source_action_trace_ids: list[str]
+    source_procedure_ids: list[str]
+    source_project_state_snapshot_ids: list[str]
+    projection_version: str
+    created_at: str
+    updated_at: str
+
+
+class SurfaceMemoryDeletionContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    target_table: str
+    target_id: str
+    deletion_type: str
+    actor_id: str
+    reason: str | None
+    redaction_posture: str
+    created_at: str
+
+
+class SurfaceMemoryScopeBindingContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    scope_type: str
+    scope_key: str
+    actor_id: str
+    memory_mode: str
+    extraction_enabled: bool
+    recall_enabled: bool
+    reason: str | None
+    expires_at: str | None
+    created_at: str
+    updated_at: str
+
+
+class SurfaceMemoryRetentionPolicyContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    scope_key: str
+    policy_kind: str
+    pattern: str
+    retention_days: int | None
+    state: str
+    reason: str | None
+    created_at: str
+    updated_at: str
+
+
+class SurfaceMemorySensitivityLabelContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    canonical_table: str
+    canonical_id: str
+    label: str
+    actor_id: str
+    state: str
+    reason: str | None
+    created_at: str
+    updated_at: str
+
+
+class SurfaceMemoryExportArtifactContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    scope_key: str
+    export_format: str
+    status: str
+    redaction_posture: str
+    source_counts: Any
+    created_at: str
+    updated_at: str
+
+
+class SurfaceMemoryEvalRunContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    eval_name: str
+    status: str
+    metrics: Any
+    created_at: str
+    updated_at: str
 
 
 class SurfaceMemoryResponseContract(BaseModel):
@@ -712,7 +950,23 @@ class SurfaceMemoryResponseContract(BaseModel):
     project_state: list[SurfaceProjectStateContract]
     evidence: list[SurfaceMemoryEvidenceContract]
     procedures: list[SurfaceMemoryProcedureContract]
+    action_traces: list[SurfaceMemoryActionTraceContract] = []
+    topics: list[SurfaceMemoryTopicContract] = []
+    context_blocks: list[SurfaceMemoryContextBlockContract] = []
+    deletions: list[SurfaceMemoryDeletionContract] = []
+    scope_bindings: list[SurfaceMemoryScopeBindingContract] = []
+    retention_policies: list[SurfaceMemoryRetentionPolicyContract] = []
+    sensitivity_labels: list[SurfaceMemorySensitivityLabelContract] = []
+    export_artifacts: list[SurfaceMemoryExportArtifactContract] = []
+    eval_runs: list[SurfaceMemoryEvalRunContract] = []
     projection_health: SurfaceMemoryProjectionHealthContract
+
+
+class SurfaceMemorySearchResultContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    kind: str
 
 
 class SurfaceMemorySearchResponseContract(BaseModel):
@@ -720,7 +974,7 @@ class SurfaceMemorySearchResponseContract(BaseModel):
 
     ok: bool
     schema_version: str
-    results: list[SurfaceMemoryAssertionContract]
+    results: list[SurfaceMemorySearchResultContract]
 
 
 class SurfaceConnectorSubscriptionContract(BaseModel):
@@ -1354,36 +1608,6 @@ def _project_surface_session(raw_session: Any) -> dict[str, Any]:
     return _validate_contract("surface_session", SurfaceSessionContract, session_payload)
 
 
-def _default_surface_context_metadata() -> dict[str, Any]:
-    return {
-        "schema_version": "1.0",
-        "section_order": [
-            "policy_system_instructions",
-            "recent_active_session_turns",
-            "memory_context",
-            "open_commitments_and_jobs",
-            "relevant_artifacts_and_observations",
-        ],
-        "policy_instruction_count": 0,
-        "recent_window": {
-            "max_recent_turns": 0,
-            "included_turn_count": 0,
-            "omitted_turn_count": 0,
-            "included_turn_ids": [],
-        },
-    }
-
-
-def _coerce_surface_model_usage(raw_usage: Any) -> dict[str, Any] | None:
-    if not isinstance(raw_usage, dict):
-        return None
-    usage: dict[str, Any] = {}
-    for key in ("input_tokens", "output_tokens", "total_tokens"):
-        value = raw_usage.get(key)
-        usage[key] = int(value) if isinstance(value, int) else None
-    return usage
-
-
 def _project_surface_event_payload(
     event_type: SurfaceEventType, raw_payload: Any
 ) -> dict[str, Any]:
@@ -1425,36 +1649,22 @@ def _project_surface_event_payload(
             payload,
         )
     if event_type == "evt.model.started":
-        context_payload = payload.get("context")
-        normalized_payload = dict(payload)
-        if not isinstance(context_payload, dict):
-            normalized_payload["context"] = _default_surface_context_metadata()
-        if not isinstance(normalized_payload.get("attempt"), int):
-            normalized_payload["attempt"] = 1
         return _validate_contract(
             "surface_event_payload.evt.model.started",
             SurfaceEventModelStartedPayloadContract,
-            normalized_payload,
+            payload,
         )
     if event_type == "evt.model.completed":
-        normalized_payload = dict(payload)
-        normalized_payload["usage"] = _coerce_surface_model_usage(payload.get("usage"))
-        if not isinstance(normalized_payload.get("attempt"), int):
-            normalized_payload["attempt"] = 1
         return _validate_contract(
             "surface_event_payload.evt.model.completed",
             SurfaceEventModelCompletedPayloadContract,
-            normalized_payload,
+            payload,
         )
     if event_type == "evt.model.failed":
-        normalized_payload = dict(payload)
-        normalized_payload["usage"] = _coerce_surface_model_usage(payload.get("usage"))
-        if not isinstance(normalized_payload.get("attempt"), int):
-            normalized_payload["attempt"] = 1
         return _validate_contract(
             "surface_event_payload.evt.model.failed",
             SurfaceEventModelFailedPayloadContract,
-            normalized_payload,
+            payload,
         )
     if event_type == "evt.action.proposed":
         return _validate_contract(
@@ -1510,10 +1720,78 @@ def _project_surface_event_payload(
             SurfaceEventActionExecutionFailedPayloadContract,
             payload,
         )
-    if event_type.startswith("evt.memory."):
+    if event_type == "evt.action.execution.retrying":
+        return _validate_contract(
+            "surface_event_payload.evt.action.execution.retrying",
+            SurfaceEventActionExecutionRetryingPayloadContract,
+            payload,
+        )
+    if event_type == "evt.provider_write.reconcile_unavailable":
+        return _validate_contract(
+            "surface_event_payload.evt.provider_write.reconcile_unavailable",
+            SurfaceEventProviderWriteReconcileUnavailablePayloadContract,
+            payload,
+        )
+    if event_type == "evt.memory.evidence_recorded":
+        return _validate_contract(
+            "surface_event_payload.evt.memory.evidence_recorded",
+            SurfaceEventMemoryEvidencePayloadContract,
+            payload,
+        )
+    if event_type in {
+        "evt.memory.candidate_proposed",
+        "evt.memory.review_required",
+        "evt.memory.candidate_approved",
+        "evt.memory.candidate_rejected",
+        "evt.memory.assertion_activated",
+        "evt.memory.assertion_superseded",
+        "evt.memory.assertion_deleted",
+    }:
         return _validate_contract(
             f"surface_event_payload.{event_type}",
-            SurfaceEventMemoryPayloadContract,
+            SurfaceEventMemoryAssertionPayloadContract,
+            payload,
+        )
+    if event_type == "evt.memory.assertion_retracted":
+        if "assertion_id" in payload:
+            return _validate_contract(
+                "surface_event_payload.evt.memory.assertion_retracted",
+                SurfaceEventMemoryAssertionPayloadContract,
+                payload,
+            )
+        return _validate_contract(
+            "surface_event_payload.evt.memory.assertion_retracted",
+            SurfaceEventMemoryEvidencePayloadContract,
+            payload,
+        )
+    if event_type == "evt.memory.conflict_opened":
+        return _validate_contract(
+            "surface_event_payload.evt.memory.conflict_opened",
+            SurfaceEventMemoryConflictOpenedPayloadContract,
+            payload,
+        )
+    if event_type == "evt.memory.conflict_resolved":
+        return _validate_contract(
+            "surface_event_payload.evt.memory.conflict_resolved",
+            SurfaceEventMemoryConflictResolvedPayloadContract,
+            payload,
+        )
+    if event_type == "evt.memory.projection_rebuilt":
+        return _validate_contract(
+            "surface_event_payload.evt.memory.projection_rebuilt",
+            SurfaceEventMemoryProjectionRebuiltPayloadContract,
+            payload,
+        )
+    if event_type == "evt.memory.recall_omitted_item":
+        return _validate_contract(
+            "surface_event_payload.evt.memory.recall_omitted_item",
+            SurfaceEventMemoryRecallOmittedPayloadContract,
+            payload,
+        )
+    if event_type == "evt.memory.extraction_queued":
+        return _validate_contract(
+            "surface_event_payload.evt.memory.extraction_queued",
+            SurfaceEventMemoryExtractionQueuedPayloadContract,
             payload,
         )
     raise ResponseContractViolation(
@@ -1738,21 +2016,44 @@ def build_surface_memory_response(
     evidence: Any,
     procedures: Any,
     projection_health: Any,
+    action_traces: Any = None,
+    topics: Any = None,
+    context_blocks: Any = None,
+    deletions: Any = None,
+    scope_bindings: Any = None,
+    retention_policies: Any = None,
+    sensitivity_labels: Any = None,
+    export_artifacts: Any = None,
+    eval_runs: Any = None,
 ) -> dict[str, Any]:
+    payload = {
+        "ok": True,
+        "schema_version": schema_version,
+        "active_assertions": active_assertions,
+        "candidates": candidates,
+        "conflicts": conflicts,
+        "project_state": project_state,
+        "evidence": evidence,
+        "procedures": procedures,
+        "projection_health": projection_health,
+    }
+    for key, value in (
+        ("action_traces", action_traces),
+        ("topics", topics),
+        ("context_blocks", context_blocks),
+        ("deletions", deletions),
+        ("scope_bindings", scope_bindings),
+        ("retention_policies", retention_policies),
+        ("sensitivity_labels", sensitivity_labels),
+        ("export_artifacts", export_artifacts),
+        ("eval_runs", eval_runs),
+    ):
+        if value is not None:
+            payload[key] = value
     return _validate_contract(
         "surface_memory_response",
         SurfaceMemoryResponseContract,
-        {
-            "ok": True,
-            "schema_version": schema_version,
-            "active_assertions": active_assertions if isinstance(active_assertions, list) else [],
-            "candidates": candidates if isinstance(candidates, list) else [],
-            "conflicts": conflicts if isinstance(conflicts, list) else [],
-            "project_state": project_state if isinstance(project_state, list) else [],
-            "evidence": evidence if isinstance(evidence, list) else [],
-            "procedures": procedures if isinstance(procedures, list) else [],
-            "projection_health": projection_health if isinstance(projection_health, dict) else {},
-        },
+        payload,
     )
 
 
@@ -1763,7 +2064,7 @@ def build_surface_memory_search_response(*, schema_version: Any, results: Any) -
         {
             "ok": True,
             "schema_version": schema_version,
-            "results": results if isinstance(results, list) else [],
+            "results": results,
         },
     )
 

@@ -26,7 +26,7 @@ FORBIDDEN_SURFACE_KEYS = {
 MESSAGE_RESPONSE_KEYS = {"ok", "session", "turn", "assistant"}
 TIMELINE_RESPONSE_KEYS = {"ok", "session_id", "turns"}
 APPROVAL_RESPONSE_KEYS = {"ok", "approval", "assistant"}
-SESSION_KEYS = {"id", "is_active", "lifecycle_state", "created_at", "updated_at"}
+SESSION_KEYS = {"id", "is_active", "lifecycle_state", "memory_mode", "created_at", "updated_at"}
 ASSISTANT_KEYS = {"message", "sources", "silent"}
 TURN_KEYS = {
     "id",
@@ -204,8 +204,15 @@ def _assert_surface_event_payload(event: dict[str, Any]) -> None:
         assert isinstance(context, dict)
         _assert_keys(
             context,
-            {"schema_version", "section_order", "policy_instruction_count", "recent_window"},
+            {
+                "schema_version",
+                "section_order",
+                "policy_instruction_count",
+                "current_turn_id",
+                "recent_window",
+            },
         )
+        assert isinstance(context["current_turn_id"], str)
         recent_window = context["recent_window"]
         assert isinstance(recent_window, dict)
         _assert_keys(

@@ -10,6 +10,7 @@ from ariel.action_runtime import RuntimeProvenance, process_response_function_ca
 from ariel.app import ModelAdapterError, _call_tool_result_interpreter
 from ariel.capability_registry import (
     capability_id_for_response_tool_name,
+    get_capability,
     response_tool_definitions,
     response_tool_name_for_capability_id,
 )
@@ -69,6 +70,50 @@ def test_attachment_read_response_tool_contract_is_strict() -> None:
         "required": ["attachment_ref", "intent"],
         "additionalProperties": False,
     }
+
+
+def test_memory_response_tools_are_exposed_to_the_model() -> None:
+    expected_capability_ids = {
+        "cap.memory.inspect",
+        "cap.memory.search",
+        "cap.memory.propose",
+        "cap.memory.review",
+        "cap.memory.correct",
+        "cap.memory.retract",
+        "cap.memory.delete",
+        "cap.memory.privacy_delete",
+        "cap.memory.redact_evidence",
+        "cap.memory.set_never_remember",
+        "cap.memory.resolve_conflict",
+        "cap.memory.consolidate",
+        "cap.memory.export",
+    }
+    tools_by_name = {tool["name"]: tool for tool in response_tool_definitions()}
+
+    assert {
+        capability_id
+        for name in tools_by_name
+        if (capability_id := capability_id_for_response_tool_name(name)) is not None
+        and capability_id.startswith("cap.memory.")
+    } == expected_capability_ids
+    for capability_id in expected_capability_ids:
+        capability = get_capability(capability_id)
+        assert capability is not None
+        assert response_tool_name_for_capability_id(capability_id) in tools_by_name
+        assert capability.allowed_egress_destinations == ()
+
+    inspect_capability = get_capability("cap.memory.inspect")
+    search_capability = get_capability("cap.memory.search")
+    export_capability = get_capability("cap.memory.export")
+    review_capability = get_capability("cap.memory.review")
+    assert inspect_capability is not None
+    assert search_capability is not None
+    assert export_capability is not None
+    assert review_capability is not None
+    assert inspect_capability.policy_decision == "allow_inline"
+    assert search_capability.policy_decision == "allow_inline"
+    assert export_capability.policy_decision == "allow_inline"
+    assert review_capability.policy_decision == "requires_approval"
 
 
 def test_action_runtime_has_no_deterministic_tool_result_synthesizer() -> None:
@@ -160,7 +205,7 @@ def test_tool_result_interpreter_success_preserves_provider_metadata() -> None:
         model_adapter=cast(Any, InterpreterAdapter()),
         interpreter_input={
             "judgment_type": "tool_result_interpretation",
-            "audited_tool_outputs": [],
+            "audited_tool_outputs": [{"output_ref": "out_1"}],
         },
     )
 
@@ -173,6 +218,85 @@ def test_tool_result_interpreter_success_preserves_provider_metadata() -> None:
         "output_count": 1,
         "text_present": True,
     }
+
+
+@pytest.mark.parametrize(
+    "interpreter_output",
+    [
+        {
+            "findings": [],
+            "contradictions": [],
+            "uncertainty": [],
+            "selected_output_refs": [],
+            "omitted_output_refs": [],
+            "citation_refs": [],
+            "artifact_refs": [],
+            "recommended_next_evidence": [],
+            "confidence": 0.8,
+            "extra": "not allowed",
+        },
+        {
+            "findings": [],
+            "contradictions": [],
+            "uncertainty": [],
+            "selected_output_refs": ["missing_ref"],
+            "omitted_output_refs": [],
+            "citation_refs": [],
+            "artifact_refs": [],
+            "recommended_next_evidence": [],
+            "confidence": 0.8,
+        },
+        {
+            "findings": [],
+            "contradictions": [],
+            "uncertainty": [],
+            "selected_output_refs": [],
+            "omitted_output_refs": [],
+            "citation_refs": [],
+            "artifact_refs": [],
+            "recommended_next_evidence": [],
+            "confidence": 1.1,
+        },
+    ],
+)
+def test_tool_result_interpreter_rejects_non_contract_output(
+    interpreter_output: dict[str, Any],
+) -> None:
+    class InterpreterAdapter:
+        def create_response(self, **kwargs: Any) -> dict[str, Any]:
+            del kwargs
+            return {
+                "provider": "provider.test",
+                "model": "model.test",
+                "provider_response_id": "resp_interpreter_invalid_contract",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": json.dumps(interpreter_output, sort_keys=True),
+                            }
+                        ],
+                    }
+                ],
+            }
+
+    with pytest.raises(ModelAdapterError) as exc_info:
+        _call_tool_result_interpreter(
+            model_adapter=cast(Any, InterpreterAdapter()),
+            interpreter_input={
+                "judgment_type": "tool_result_interpretation",
+                "audited_tool_outputs": [{"output_ref": "out_1"}],
+                "citation_refs": [],
+                "artifact_refs": [],
+            },
+        )
+
+    assert exc_info.value.code == "E_AI_JUDGMENT_SCHEMA"
+    assert exc_info.value.validation_status == "invalid"
+    assert exc_info.value.provider_response_id == "resp_interpreter_invalid_contract"
 
 
 def test_process_response_function_calls_returns_function_call_output_for_inline_capability() -> (

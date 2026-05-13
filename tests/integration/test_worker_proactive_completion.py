@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Generator
 from datetime import UTC, datetime, timedelta
-import json
 from typing import Any, cast
 
 import pytest
@@ -17,74 +16,10 @@ from ariel.persistence import (
     BackgroundTaskRecord,
     ConnectorSubscriptionRecord,
     EmailThreadWatchRecord,
-    ProactiveCaseRecord,
-    ProactiveObservationRecord,
     SessionRecord,
     TurnRecord,
-    WorkspaceItemEventRecord,
-    WorkspaceItemRecord,
 )
 from ariel.worker import enqueue_background_task, process_one_task
-
-
-class WatchAmbientAdapter:
-    def __init__(self) -> None:
-        self.candidates: list[dict[str, Any]] = []
-
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        del tools, user_message, history
-        assert context_bundle["origin"] == "ambient_interpretation"
-        raw_content = input_items[1]["content"]
-        assert isinstance(raw_content, str)
-        payload = json.loads(raw_content)
-        self.candidates = [
-            candidate for candidate in payload["candidates"] if isinstance(candidate, dict)
-        ]
-        candidate = self.candidates[0]
-        return {
-            "provider": "provider.watch-test",
-            "model": "model.watch-test",
-            "provider_response_id": "resp_watch_test",
-            "output": [
-                {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "output_text",
-                            "text": json.dumps(
-                                {
-                                    "observations": [
-                                        {
-                                            "candidate_id": str(candidate["candidate_id"]),
-                                            "observation_key": "email-thread-watch-due",
-                                            "case_key": "email-thread-watch:etw_due",
-                                            "observation_type": "email_thread_watch_due",
-                                            "subject": "Email thread watch due",
-                                            "summary": "The watched thread reached its deadline.",
-                                            "payload": {"watch_id": "etw_due"},
-                                            "evidence": {"watch_id": "etw_due"},
-                                            "rationale": "The watch due signal should resurface.",
-                                        }
-                                    ],
-                                    "omitted": [],
-                                    "rationale": "Fixture selected the watch signal.",
-                                },
-                                sort_keys=True,
-                            ),
-                        }
-                    ],
-                }
-            ],
-        }
 
 
 @pytest.fixture(scope="session")
@@ -104,7 +39,7 @@ def session_factory(postgres_url: str) -> Generator[sessionmaker[Session], None,
         engine.dispose()
 
 
-def test_worker_resurfaces_due_email_thread_watches_through_ambient_proactivity(
+def test_worker_marks_due_email_thread_watches_without_ambient_bridge(
     session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -203,66 +138,29 @@ def test_worker_resurfaces_due_email_thread_watches_through_ambient_proactivity(
             assert completed_watch.status == "failed"
             assert completed_watch.completed_at is None
             assert future_watch.status == "active"
-            watch_events = db.scalars(
-                select(WorkspaceItemEventRecord)
-                .join(
-                    WorkspaceItemRecord,
-                    WorkspaceItemEventRecord.workspace_item_id == WorkspaceItemRecord.id,
+            internal_item_count = db.execute(
+                text(
+                    "SELECT COUNT(*) FROM workspace_items "
+                    "WHERE provider = 'ariel' "
+                    "AND item_type = 'internal_state' "
+                    "AND external_id = 'email-thread-watch:etw_due'"
                 )
-                .where(
-                    WorkspaceItemRecord.provider == "ariel",
-                    WorkspaceItemRecord.item_type == "internal_state",
-                    WorkspaceItemRecord.external_id == "email-thread-watch:etw_due",
-                )
-            ).all()
-            assert len(watch_events) == 1
-            assert watch_events[0].payload["metadata"]["signal"] == "email_thread_watch_due"
-            assert watch_events[0].payload["metadata"]["watch_id"] == "etw_due"
+            ).scalar_one()
+            assert internal_item_count == 0
             ambient_task = db.scalar(
                 select(BackgroundTaskRecord).where(
                     BackgroundTaskRecord.task_type == "ambient_interpretation_due"
                 )
             )
-            assert ambient_task is not None
-            assert ambient_task.payload == {"workspace_item_event_id": watch_events[0].id}
-            assert ambient_task.status == "pending"
-
-    adapter = WatchAmbientAdapter()
-    assert process_one_task(
-        session_factory=session_factory,
-        settings=cast(Any, AppSettings)(_env_file=None),
-        worker_id="w-watch",
-        model_adapter=adapter,
-    )
-
-    assert len(adapter.candidates) == 1
-    assert adapter.candidates[0]["source_type"] == "workspace_item"
-    raw_event = adapter.candidates[0]["raw_event"]
-    assert raw_event["workspace_item"]["metadata"]["signal"] == "email_thread_watch_due"
-
-    with session_factory() as db:
-        with db.begin():
-            observation = db.scalar(select(ProactiveObservationRecord))
-            case = db.scalar(select(ProactiveCaseRecord))
+            assert ambient_task is None
             proactive_task = db.scalar(
                 select(BackgroundTaskRecord).where(
                     BackgroundTaskRecord.task_type == "proactive_deliberation_due"
                 )
             )
-            ambient_task = db.scalar(
-                select(BackgroundTaskRecord).where(
-                    BackgroundTaskRecord.task_type == "ambient_interpretation_due"
-                )
-            )
-            assert observation is not None
-            assert observation.observation_type == "email_thread_watch_due"
-            assert observation.payload == {"watch_id": "etw_due"}
-            assert case is not None
-            assert case.latest_observation_id == observation.id
-            assert proactive_task is not None
-            assert proactive_task.payload == {"case_id": case.id}
-            assert ambient_task is not None
-            assert ambient_task.status == "completed"
+            assert proactive_task is None
+            assert db.execute(text("SELECT COUNT(*) FROM proactive_observations")).scalar_one() == 0
+            assert db.execute(text("SELECT COUNT(*) FROM proactive_cases")).scalar_one() == 0
 
 
 def test_worker_processes_pending_provider_sync_before_due_thread_watch_sweep(

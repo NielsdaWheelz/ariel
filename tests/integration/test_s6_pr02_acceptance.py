@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from collections.abc import Callable, Generator
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -14,7 +15,7 @@ import ariel.action_runtime as action_runtime_module
 import ariel.capability_registry as capability_registry_module
 import ariel.policy_engine as policy_engine_module
 from ariel.app import ModelAdapter, create_app
-from tests.integration.responses_helpers import responses_with_function_calls
+from tests.integration.responses_helpers import responses_message, responses_with_function_calls
 from ariel.capability_registry import CapabilityDefinition
 from ariel.google_connector import ConnectorTokenCipher
 
@@ -24,6 +25,7 @@ class ActionProposalAdapter:
     provider: str = "provider.s6-pr02"
     model: str = "model.s6-pr02-v1"
     proposals_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    assistant_text_by_message: dict[str, str] = field(default_factory=dict)
 
     def create_response(
         self,
@@ -34,11 +36,55 @@ class ActionProposalAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        del tools, history, context_bundle
+        del tools, history
+        if context_bundle.get("origin") == "tool_result_interpretation":
+            interpreter_input = context_bundle.get("tool_result_interpreter_input")
+            if not isinstance(interpreter_input, dict):
+                interpreter_input = {}
+            audited_outputs = interpreter_input.get("audited_tool_outputs")
+            selected_output_refs = []
+            if isinstance(audited_outputs, list):
+                selected_output_refs = [
+                    output["output_ref"]
+                    for output in audited_outputs
+                    if isinstance(output, dict) and isinstance(output.get("output_ref"), str)
+                ]
+            return responses_message(
+                assistant_text=json.dumps(
+                    {
+                        "findings": ["maps evidence inspected"],
+                        "contradictions": [],
+                        "uncertainty": [],
+                        "selected_output_refs": selected_output_refs,
+                        "omitted_output_refs": [],
+                        "citation_refs": interpreter_input.get("citation_refs", []),
+                        "artifact_refs": interpreter_input.get("artifact_refs", []),
+                        "recommended_next_evidence": [],
+                        "confidence": 0.9,
+                    },
+                    sort_keys=True,
+                ),
+                provider=self.provider,
+                model=self.model,
+                provider_response_id="resp_s6_pr02_interpreter",
+                input_tokens=41,
+                output_tokens=26,
+            )
         proposals = self.proposals_by_message.get(user_message, [])
+        assistant_text = self.assistant_text_by_message.get(
+            user_message,
+            {
+                "route to airport": "The driving route to SEA is available [1].",
+                "find nearby coffee": "Nearby coffee options are available [1][2].",
+                "missing places location": "Please provide nearby location context; I cannot infer the location.",
+                "maps egress deny": "maps runtime failure: allowlist blocked this request.",
+                "maps while google disconnected": "Maps route is available [1].",
+                "mixed retrieval": "Route and construction updates are available [1][2].",
+            }.get(user_message, f"assistant::{user_message}"),
+        )
         return responses_with_function_calls(
             input_items=input_items,
-            assistant_text=f"assistant::{user_message}",
+            assistant_text=assistant_text,
             proposals=copy.deepcopy(proposals),
             provider=self.provider,
             model=self.model,
@@ -300,7 +346,10 @@ def test_s6_pr02_maps_directions_missing_required_route_fields_asks_explicit_cla
             "missing route field": [
                 {"capability_id": "cap.maps.directions", "input": input_payload},
             ]
-        }
+        },
+        assistant_text_by_message={
+            "missing route field": f"Please provide {expected_hint}; I cannot infer location."
+        },
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
@@ -379,7 +428,10 @@ def test_s6_pr02_maps_credentials_failures_are_typed_and_recoverable(
                     },
                 }
             ]
-        }
+        },
+        assistant_text_by_message={
+            "maps credentials failure": f"{expected_error}: contact the {expected_hint}."
+        },
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
@@ -476,7 +528,8 @@ def test_s6_pr02_maps_provider_failures_are_typed_and_recoverable(
                     },
                 }
             ]
-        }
+        },
+        assistant_text_by_message={"maps runtime failure": f"{expected_error}: {expected_hint}."},
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)

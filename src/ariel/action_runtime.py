@@ -18,6 +18,7 @@ from ariel.capability_registry import (
     ATTACHMENT_CAPABILITY_IDS,
     CapabilityDefinition,
     DISCORD_CAPABILITY_IDS,
+    MEMORY_CAPABILITY_IDS,
     canonical_action_payload,
     capability_id_for_response_tool_name,
     capability_contract_hash,
@@ -35,21 +36,48 @@ from ariel.google_connector import (
     GOOGLE_CAPABILITY_IDS,
     GOOGLE_CONNECTOR_ID,
     GOOGLE_READ_CAPABILITY_IDS,
+    GOOGLE_WRITE_CAPABILITY_IDS,
     GoogleCapabilityExecutionResult,
     GoogleConnectorRuntime,
+    _decrypt_secret,
+    _encrypt_secret,
+)
+from ariel.memory import (
+    approve_candidate,
+    consolidate_memory,
+    correct_assertion,
+    delete_assertion,
+    export_memory,
+    list_memory,
+    privacy_delete_assertion,
+    propose_memory_candidate,
+    redact_evidence,
+    reject_candidate,
+    resolve_conflict,
+    retract_assertion,
+    search_memory,
+    set_never_remember_rule,
 )
 from ariel.persistence import (
     ActionAttemptRecord,
+    ActionPrivatePayloadRecord,
     ApprovalRequestRecord,
     ArtifactRecord,
     BackgroundTaskRecord,
     EmailActionRecord,
     EmailThreadWatchRecord,
     GoogleConnectorRecord,
+    GoogleProviderObjectRecord,
+    MemoryActionTraceRecord,
+    ProviderEvidenceBlockRecord,
+    ProviderEvidenceRecord,
+    ProviderWriteReceiptRecord,
     TurnRecord,
+    WorkCommitmentRecord,
     to_rfc3339,
 )
 from ariel.policy_engine import evaluate_proposal
+from ariel.redaction import safe_failure_reason
 from ariel.weather_state import resolve_weather_location
 
 _SIDE_EFFECT_EXECUTION_LOCK_ID = 24_310_002
@@ -76,9 +104,13 @@ _EMAIL_TRANSIENT_PROVIDER_ERRORS = {
     "provider_unreachable",
     "token_expired",
 }
+_MAX_GMAIL_EVIDENCE_BLOCKS = 12
+_MAX_GMAIL_EVIDENCE_BLOCK_CHARS = 2000
+_GOOGLE_RECEIPT_CAPABILITY_IDS = GOOGLE_WRITE_CAPABILITY_IDS
 
 ModelDeclaredTaintStatus = Literal["missing", "true", "false", "malformed"]
 ProposalProvenanceStatus = Literal["clean", "tainted", "ambiguous"]
+ProviderWriteReceiptStatus = Literal["executing", "succeeded", "failed", "ambiguous"]
 
 
 class ActionRuntimeError(Exception):
@@ -195,6 +227,140 @@ def _email_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _json_digest(value: Any) -> str:
+    return _email_hash(json.dumps(jsonable_encoder(value), sort_keys=True, separators=(",", ":")))
+
+
+def _google_private_input_keys(capability_id: str) -> tuple[str, ...]:
+    if capability_id in {"cap.email.draft", "cap.email.send"}:
+        return ("body",)
+    if capability_id in {"cap.calendar.create_event", "cap.calendar.update_event"}:
+        return ("description",)
+    return ()
+
+
+def _private_payload_marker(value: str) -> dict[str, Any]:
+    return {
+        "redacted": True,
+        "digest": _email_hash(value),
+        "char_count": len(value),
+        "private_payload": True,
+    }
+
+
+def _stored_action_input_payload(
+    *,
+    capability_id: str,
+    input_payload: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    private_keys = _google_private_input_keys(capability_id)
+    if not private_keys:
+        return input_payload, None
+
+    stored_payload = dict(input_payload)
+    private_payload_required = False
+    for key in private_keys:
+        value = stored_payload.get(key)
+        if isinstance(value, str):
+            stored_payload[key] = _private_payload_marker(value)
+            private_payload_required = True
+    return stored_payload, dict(input_payload) if private_payload_required else None
+
+
+def _store_action_private_payload(
+    *,
+    db: Session,
+    action_attempt: ActionAttemptRecord,
+    private_payload: dict[str, Any],
+    google_runtime: GoogleConnectorRuntime,
+    now: datetime,
+    new_id_fn: Callable[[str], str],
+) -> None:
+    db.add(
+        ActionPrivatePayloadRecord(
+            id=new_id_fn("app"),
+            action_attempt_id=action_attempt.id,
+            payload_kind="google_provider_write_input",
+            payload_digest=_json_digest(private_payload),
+            payload_enc=_encrypt_secret(
+                plaintext=json.dumps(
+                    jsonable_encoder(private_payload),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                secret=google_runtime.encryption_secret,
+                key_version=google_runtime.encryption_key_version,
+                encryption_keys=google_runtime.encryption_keys,
+            ),
+            encryption_key_version=google_runtime.encryption_key_version,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    db.flush()
+
+
+def _full_action_input_payload(
+    *,
+    db: Session,
+    action_attempt: ActionAttemptRecord,
+    google_runtime: GoogleConnectorRuntime | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    stored_payload = action_attempt.proposed_input
+    if not isinstance(stored_payload, dict):
+        return None, "action_input_invalid"
+
+    private_payload_required = False
+    for key in _google_private_input_keys(action_attempt.capability_id):
+        value = stored_payload.get(key)
+        if isinstance(value, str):
+            return None, "private_action_payload_not_sealed"
+        if isinstance(value, dict) and value.get("private_payload") is True:
+            private_payload_required = True
+
+    if not private_payload_required:
+        return dict(stored_payload), None
+    if google_runtime is None:
+        return None, "google_runtime_not_bound"
+
+    private_payload_record = db.scalar(
+        select(ActionPrivatePayloadRecord)
+        .where(
+            ActionPrivatePayloadRecord.action_attempt_id == action_attempt.id,
+            ActionPrivatePayloadRecord.payload_kind == "google_provider_write_input",
+        )
+        .limit(1)
+    )
+    if private_payload_record is None:
+        return None, "private_action_payload_missing"
+    try:
+        plaintext = _decrypt_secret(
+            ciphertext=private_payload_record.payload_enc,
+            secret=google_runtime.encryption_secret,
+            expected_key_version=google_runtime.encryption_key_version,
+            encryption_keys=google_runtime.encryption_keys,
+        )
+        decoded_payload = json.loads(plaintext)
+    except (RuntimeError, ValueError):
+        return None, "private_action_payload_unreadable"
+    if not isinstance(decoded_payload, dict):
+        return None, "private_action_payload_invalid"
+    full_payload = jsonable_encoder(decoded_payload)
+    if not isinstance(full_payload, dict):
+        return None, "private_action_payload_invalid"
+    if _json_digest(full_payload) != private_payload_record.payload_digest:
+        return None, "private_action_payload_digest_mismatch"
+    expected_hash = payload_hash(
+        canonical_action_payload(
+            capability_id=action_attempt.capability_id,
+            input_payload=full_payload,
+        )
+    )
+    if expected_hash != action_attempt.payload_hash:
+        return None, "private_action_payload_hash_mismatch"
+    return full_payload, None
+
+
 def _email_idempotency_key(
     *,
     capability_id: str,
@@ -293,6 +459,116 @@ def _email_thread_ids_from_state(state: dict[str, Any]) -> list[str]:
     return thread_ids
 
 
+def _redacted_provider_text_marker(value: Any) -> dict[str, Any]:
+    marker: dict[str, Any] = {"redacted": True}
+    if isinstance(value, str):
+        marker["digest"] = _email_hash(value)
+        marker["char_count"] = len(value)
+    return marker
+
+
+def _redact_google_action_input_for_event(
+    *,
+    capability_id: str,
+    input_payload: dict[str, Any],
+) -> dict[str, Any]:
+    redacted = dict(input_payload)
+    if capability_id in {"cap.calendar.create_event", "cap.calendar.update_event"}:
+        description = redacted.get("description")
+        if isinstance(description, str):
+            redacted["description"] = _redacted_provider_text_marker(description)
+    if capability_id in {"cap.email.draft", "cap.email.send"}:
+        body = redacted.get("body")
+        if isinstance(body, str):
+            redacted["body"] = _redacted_provider_text_marker(body)
+    return redacted
+
+
+def _redact_evidence_blocks(raw_blocks: Any) -> list[dict[str, Any]]:
+    redacted_blocks: list[dict[str, Any]] = []
+    for block in raw_blocks if isinstance(raw_blocks, list) else []:
+        if not isinstance(block, dict):
+            continue
+        redacted_block = dict(block)
+        text = redacted_block.pop("text", None)
+        if isinstance(text, str):
+            redacted_block["text_redacted"] = True
+            redacted_block["text_digest"] = str(redacted_block.get("digest") or _email_hash(text))
+            redacted_block["text_char_count"] = len(text)
+        redacted_blocks.append(redacted_block)
+    return redacted_blocks
+
+
+def _redact_google_provider_output(
+    *,
+    capability_id: str,
+    output_payload: dict[str, Any],
+) -> dict[str, Any]:
+    redacted = jsonable_encoder(output_payload)
+    if not isinstance(redacted, dict):
+        return {}
+
+    if capability_id == "cap.email.read":
+        evidence = redacted.get("evidence")
+        if isinstance(evidence, dict):
+            evidence["blocks"] = _redact_evidence_blocks(evidence.get("blocks"))
+        message = redacted.get("message")
+        if isinstance(message, dict):
+            for key in ("body", "body_text", "body_html", "snippet"):
+                value = message.pop(key, None)
+                if isinstance(value, str):
+                    message[f"{key}_redacted"] = _redacted_provider_text_marker(value)
+        return redacted
+
+    if capability_id == "cap.calendar.list":
+        events = redacted.get("events")
+        if isinstance(events, list):
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                event["description_blocks"] = _redact_evidence_blocks(
+                    event.get("description_blocks")
+                )
+                description = event.pop("description", None)
+                if isinstance(description, str):
+                    event["description_redacted"] = _redacted_provider_text_marker(description)
+        return redacted
+
+    if capability_id in {
+        "cap.calendar.create_event",
+        "cap.calendar.update_event",
+        "cap.calendar.respond_to_event",
+    }:
+        description = redacted.pop("description", None)
+        if isinstance(description, str):
+            redacted["description_redacted"] = _redacted_provider_text_marker(description)
+        event = redacted.get("event")
+        if isinstance(event, dict):
+            event_description = event.pop("description", None)
+            if isinstance(event_description, str):
+                event["description_redacted"] = _redacted_provider_text_marker(event_description)
+            event["description_blocks"] = _redact_evidence_blocks(event.get("description_blocks"))
+        return redacted
+
+    if capability_id in {"cap.email.draft", "cap.email.send"}:
+        body = redacted.pop("body", None)
+        if isinstance(body, str):
+            redacted["body_redacted"] = _redacted_provider_text_marker(body)
+        draft = redacted.get("draft")
+        if isinstance(draft, dict):
+            draft_body = draft.pop("body", None)
+            if isinstance(draft_body, str):
+                draft["body_redacted"] = _redacted_provider_text_marker(draft_body)
+        message = redacted.get("message")
+        if isinstance(message, dict):
+            message_body = message.pop("body", None)
+            if isinstance(message_body, str):
+                message["body_redacted"] = _redacted_provider_text_marker(message_body)
+        return redacted
+
+    return redacted
+
+
 def _append_action_execution_event(
     *,
     db: Session,
@@ -343,6 +619,325 @@ def _fail_action_execution(
         now_fn=now_fn,
         new_id_fn=new_id_fn,
     )
+    _update_memory_action_traces(
+        db=db,
+        action_attempt=action_attempt,
+        now_fn=now_fn,
+    )
+
+
+def _trace_outcome_for_action_status(action_attempt: ActionAttemptRecord) -> str:
+    if action_attempt.status == "succeeded":
+        return "succeeded"
+    if action_attempt.status == "failed":
+        return "failed"
+    if (
+        action_attempt.status in {"rejected", "denied", "expired"}
+        or action_attempt.policy_decision == "deny"
+    ):
+        return "denied"
+    return "unknown"
+
+
+def _update_memory_action_traces(
+    *,
+    db: Session,
+    action_attempt: ActionAttemptRecord,
+    now_fn: Callable[[], datetime],
+) -> None:
+    traces = db.scalars(
+        select(MemoryActionTraceRecord)
+        .where(MemoryActionTraceRecord.action_attempt_id == action_attempt.id)
+        .with_for_update()
+    ).all()
+    if not traces:
+        return
+    now = now_fn()
+    outcome = _trace_outcome_for_action_status(action_attempt)
+    result_refs = {
+        "impact_level": action_attempt.impact_level,
+        "policy_decision": action_attempt.policy_decision,
+        "approval_required": action_attempt.approval_required,
+        "execution_error": action_attempt.execution_error,
+        "execution_status": action_attempt.status,
+        "execution_output_available": action_attempt.execution_output is not None,
+    }
+    for trace in traces:
+        if action_attempt.status in {"executing", "succeeded", "failed"}:
+            trace.trace_type = "execution"
+        trace.outcome = outcome
+        trace.summary = (
+            f"{action_attempt.capability_id} {outcome} for proposal {action_attempt.proposal_index}"
+        )
+        trace.result_refs = result_refs
+        trace.updated_at = now
+
+
+def _memory_actor_id(*, db: Session, action_attempt: ActionAttemptRecord) -> str:
+    approval = db.scalar(
+        select(ApprovalRequestRecord)
+        .where(ApprovalRequestRecord.action_attempt_id == action_attempt.id)
+        .order_by(ApprovalRequestRecord.created_at.desc(), ApprovalRequestRecord.id.desc())
+        .limit(1)
+    )
+    if approval is not None and approval.actor_id:
+        return approval.actor_id
+    return "assistant"
+
+
+def _parse_memory_timestamp(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise RuntimeError("schema_invalid")
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+
+
+def _memory_action_trace_payloads(db: Session, *, limit: int) -> list[dict[str, Any]]:
+    traces = db.scalars(
+        select(MemoryActionTraceRecord)
+        .where(MemoryActionTraceRecord.lifecycle_state == "active")
+        .order_by(MemoryActionTraceRecord.updated_at.desc(), MemoryActionTraceRecord.id.asc())
+        .limit(limit)
+    ).all()
+    return [
+        {
+            "id": trace.id,
+            "scope_key": trace.scope_key,
+            "trace_type": trace.trace_type,
+            "action_attempt_id": trace.action_attempt_id,
+            "source_turn_id": trace.source_turn_id,
+            "capability_id": trace.capability_id,
+            "summary": trace.summary,
+            "outcome": trace.outcome,
+            "primary_evidence_id": trace.primary_evidence_id,
+            "result_refs": trace.result_refs,
+            "updated_at": to_rfc3339(trace.updated_at),
+        }
+        for trace in traces
+    ]
+
+
+def _bounded_memory_payload(
+    db: Session,
+    *,
+    section: str,
+    limit: int,
+) -> dict[str, Any]:
+    payload = dict(list_memory(db))
+    payload["action_traces"] = _memory_action_trace_payloads(db, limit=limit)
+    list_keys = (
+        "active_assertions",
+        "candidates",
+        "conflicts",
+        "project_state",
+        "evidence",
+        "procedures",
+        "action_traces",
+    )
+    for key in list_keys:
+        value = payload.get(key)
+        if not isinstance(value, list):
+            payload[key] = []
+            continue
+        payload[key] = value[:limit] if section in {"all", key} else []
+    return payload
+
+
+def _execute_memory_capability(
+    *,
+    db: Session,
+    capability_id: str,
+    normalized_input: dict[str, Any],
+    action_attempt: ActionAttemptRecord,
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> dict[str, Any]:
+    actor_id = _memory_actor_id(db=db, action_attempt=action_attempt)
+    if capability_id == "cap.memory.inspect":
+        return {
+            "status": "inspected",
+            "memory": _bounded_memory_payload(
+                db,
+                section=str(normalized_input["section"]),
+                limit=int(normalized_input["limit"]),
+            ),
+        }
+    if capability_id == "cap.memory.search":
+        results = search_memory(
+            db,
+            query=str(normalized_input["query"]),
+            limit=int(normalized_input["limit"]),
+            current_session_id=action_attempt.session_id,
+        )
+        return {"status": "searched", "schema_version": "memory.sota.v1", "results": results}
+    if capability_id == "cap.memory.export":
+        artifact = export_memory(
+            db,
+            scope_key="global",
+            actor_id=actor_id,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        return {"status": "exported", "format": "json", "export": artifact}
+    if capability_id == "cap.memory.propose":
+        events = propose_memory_candidate(
+            db,
+            source_session_id=action_attempt.session_id,
+            actor_id=actor_id,
+            evidence_text=str(normalized_input["evidence_text"]),
+            subject_key=str(normalized_input["subject_key"]),
+            predicate=str(normalized_input["predicate"]),
+            assertion_type=str(normalized_input["assertion_type"]),
+            value=str(normalized_input["value"]),
+            confidence=float(normalized_input["confidence"]),
+            scope_key=str(normalized_input["scope_key"]),
+            is_multi_valued=bool(normalized_input["is_multi_valued"]),
+            valid_from=_parse_memory_timestamp(normalized_input.get("valid_from")),
+            valid_to=_parse_memory_timestamp(normalized_input.get("valid_to")),
+            extraction_model=None,
+            extraction_prompt_version=None,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        return {
+            "status": "proposed",
+            "events": events,
+            "memory": _bounded_memory_payload(db, section="all", limit=20),
+        }
+    if capability_id == "cap.memory.review":
+        if normalized_input["decision"] == "approve":
+            events = approve_candidate(
+                db,
+                assertion_id=str(normalized_input["assertion_id"]),
+                actor_id=actor_id,
+                now_fn=now_fn,
+                new_id_fn=new_id_fn,
+            )
+            status = "approved"
+        else:
+            events = reject_candidate(
+                db,
+                assertion_id=str(normalized_input["assertion_id"]),
+                actor_id=actor_id,
+                reason=normalized_input.get("reason"),
+                now_fn=now_fn,
+                new_id_fn=new_id_fn,
+            )
+            status = "rejected"
+        return {
+            "status": status if events else "not_found",
+            "events": events,
+            "memory": _bounded_memory_payload(db, section="all", limit=20),
+        }
+    if capability_id == "cap.memory.correct":
+        events = correct_assertion(
+            db,
+            assertion_id=str(normalized_input["assertion_id"]),
+            value=str(normalized_input["value"]),
+            source_session_id=action_attempt.session_id,
+            actor_id=actor_id,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        return {
+            "status": "corrected" if events else "not_found",
+            "events": events,
+            "memory": _bounded_memory_payload(db, section="all", limit=20),
+        }
+    if capability_id == "cap.memory.retract":
+        events = retract_assertion(
+            db,
+            assertion_id=str(normalized_input["assertion_id"]),
+            actor_id=actor_id,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        return {
+            "status": "retracted" if events else "not_found",
+            "events": events,
+            "memory": _bounded_memory_payload(db, section="all", limit=20),
+        }
+    if capability_id == "cap.memory.delete":
+        events = delete_assertion(
+            db,
+            assertion_id=str(normalized_input["assertion_id"]),
+            actor_id=actor_id,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        return {
+            "status": "deleted" if events else "not_found",
+            "events": events,
+            "memory": _bounded_memory_payload(db, section="all", limit=20),
+        }
+    if capability_id == "cap.memory.privacy_delete":
+        events = privacy_delete_assertion(
+            db,
+            assertion_id=str(normalized_input["assertion_id"]),
+            actor_id=actor_id,
+            reason="memory privacy delete requested",
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        return {
+            "status": "privacy_deleted" if events else "not_found",
+            "events": events,
+            "memory": _bounded_memory_payload(db, section="all", limit=20),
+        }
+    if capability_id == "cap.memory.redact_evidence":
+        events = redact_evidence(
+            db,
+            evidence_id=str(normalized_input["evidence_id"]),
+            actor_id=actor_id,
+            reason=str(normalized_input.get("reason") or "memory evidence redacted"),
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        return {
+            "status": "redacted" if events else "not_found",
+            "events": events,
+            "memory": _bounded_memory_payload(db, section="all", limit=20),
+        }
+    if capability_id == "cap.memory.set_never_remember":
+        rule = set_never_remember_rule(
+            db,
+            scope_key="global",
+            pattern=str(normalized_input["rule"]),
+            actor_id=actor_id,
+            reason="never-remember rule requested",
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        return {
+            "status": "recorded" if rule is not None else "invalid",
+            "rule": rule,
+            "memory": _bounded_memory_payload(db, section="all", limit=20),
+        }
+    if capability_id == "cap.memory.resolve_conflict":
+        events = resolve_conflict(
+            db,
+            conflict_set_id=str(normalized_input["conflict_set_id"]),
+            assertion_id=str(normalized_input["assertion_id"]),
+            actor_id=actor_id,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        return {
+            "status": "resolved" if events else "not_found",
+            "events": events,
+            "memory": _bounded_memory_payload(db, section="all", limit=20),
+        }
+    if capability_id == "cap.memory.consolidate":
+        result = consolidate_memory(
+            db,
+            scope_key="global",
+            actor_id=actor_id,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        return {"status": "consolidated", "consolidation": result}
+    raise RuntimeError("unknown_memory_capability")
 
 
 def approval_execution_failure_message(error: str) -> str:
@@ -747,12 +1342,168 @@ def _extract_search_source_candidates(
 ) -> list[GroundedSourceCandidate]:
     if not isinstance(output_payload, dict):
         return []
-    raw_results = output_payload.get("results")
-    if not isinstance(raw_results, list):
-        return []
 
     retrieved_at = _parse_rfc3339_timestamp(output_payload.get("retrieved_at")) or now_fn()
     candidates: list[GroundedSourceCandidate] = []
+
+    raw_message = output_payload.get("message")
+    if isinstance(raw_message, dict):
+        subject_raw = raw_message.get("subject")
+        subject = (
+            subject_raw.strip() if isinstance(subject_raw, str) and subject_raw.strip() else "email"
+        )
+        source_raw = raw_message.get("provider_url")
+        source = (
+            source_raw.strip()
+            if isinstance(source_raw, str) and source_raw.strip()
+            else "gmail://message"
+        )
+        published_at = _parse_rfc3339_timestamp(output_payload.get("published_at"))
+        raw_evidence = output_payload.get("evidence")
+        evidence = raw_evidence if isinstance(raw_evidence, dict) else {}
+        raw_blocks = evidence.get("blocks")
+        blocks = raw_blocks if isinstance(raw_blocks, list) else []
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            text_raw = block.get("text")
+            if isinstance(text_raw, str) and text_raw.strip():
+                snippet = _truncate_snippet(text_raw)
+            else:
+                block_id = block.get("block_id")
+                digest = block.get("digest") or block.get("text_digest")
+                if not isinstance(block_id, str) and not isinstance(digest, str):
+                    continue
+                snippet = _truncate_snippet(
+                    "Gmail body evidence recorded: "
+                    f"block={block_id if isinstance(block_id, str) else 'unknown'} "
+                    f"digest={digest if isinstance(digest, str) else 'unknown'}"
+                )
+            if not snippet:
+                continue
+            candidates.append(
+                GroundedSourceCandidate(
+                    title=subject,
+                    source=source,
+                    snippet=snippet,
+                    retrieved_at=retrieved_at,
+                    published_at=published_at,
+                )
+            )
+        return candidates
+
+    raw_thread = output_payload.get("thread")
+    raw_evidence = output_payload.get("evidence")
+    if isinstance(raw_thread, dict) and isinstance(raw_evidence, dict):
+        thread_id_raw = raw_thread.get("thread_id")
+        thread_id = (
+            thread_id_raw.strip()
+            if isinstance(thread_id_raw, str) and thread_id_raw.strip()
+            else "thread"
+        )
+        title = "email thread"
+        source = f"gmail://thread/{thread_id}"
+        raw_messages_for_title = output_payload.get("messages")
+        if isinstance(raw_messages_for_title, list):
+            for message in raw_messages_for_title:
+                if not isinstance(message, dict):
+                    continue
+                subject_raw = message.get("subject")
+                if isinstance(subject_raw, str) and subject_raw.strip():
+                    title = subject_raw.strip()
+                source_raw = message.get("provider_url")
+                if isinstance(source_raw, str) and source_raw.strip():
+                    source = source_raw.strip()
+                break
+        published_at = _parse_rfc3339_timestamp(output_payload.get("published_at"))
+        raw_blocks = raw_evidence.get("blocks")
+        blocks = raw_blocks if isinstance(raw_blocks, list) else []
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            text_raw = block.get("text")
+            if isinstance(text_raw, str) and text_raw.strip():
+                snippet = _truncate_snippet(text_raw)
+            else:
+                block_id = block.get("block_id")
+                digest = block.get("digest") or block.get("text_digest")
+                if not isinstance(block_id, str) and not isinstance(digest, str):
+                    continue
+                snippet = _truncate_snippet(
+                    "Gmail thread body evidence recorded: "
+                    f"block={block_id if isinstance(block_id, str) else 'unknown'} "
+                    f"digest={digest if isinstance(digest, str) else 'unknown'}"
+                )
+            if not snippet:
+                continue
+            candidates.append(
+                GroundedSourceCandidate(
+                    title=title,
+                    source=source,
+                    snippet=snippet,
+                    retrieved_at=retrieved_at,
+                    published_at=published_at,
+                )
+            )
+        return candidates
+
+    raw_events = output_payload.get("events")
+    if isinstance(raw_events, list):
+        for raw_event in raw_events:
+            if not isinstance(raw_event, dict):
+                continue
+            summary_raw = raw_event.get("summary")
+            source_raw = raw_event.get("provider_url")
+            start_raw = raw_event.get("start")
+            end_raw = raw_event.get("end")
+            updated_raw = raw_event.get("updated")
+            title = (
+                summary_raw.strip()
+                if isinstance(summary_raw, str) and summary_raw.strip()
+                else "calendar event"
+            )
+            source = (
+                source_raw.strip()
+                if isinstance(source_raw, str) and source_raw.strip()
+                else f"calendar://{raw_event.get('event_id', 'event')}"
+            )
+            start_value = start_raw.get("value") if isinstance(start_raw, dict) else None
+            end_value = end_raw.get("value") if isinstance(end_raw, dict) else None
+            snippet_parts = [
+                item
+                for item in (
+                    start_value if isinstance(start_value, str) else None,
+                    "to",
+                    end_value if isinstance(end_value, str) else None,
+                    title,
+                )
+                if item
+            ]
+            raw_blocks = raw_event.get("description_blocks")
+            blocks = raw_blocks if isinstance(raw_blocks, list) else []
+            if blocks and isinstance(blocks[0], dict):
+                block_id = blocks[0].get("block_id")
+                digest = blocks[0].get("digest") or blocks[0].get("text_digest")
+                if isinstance(block_id, str) or isinstance(digest, str):
+                    snippet_parts.append(
+                        "calendar description evidence recorded: "
+                        f"block={block_id if isinstance(block_id, str) else 'unknown'} "
+                        f"digest={digest if isinstance(digest, str) else 'unknown'}"
+                    )
+            candidates.append(
+                GroundedSourceCandidate(
+                    title=title,
+                    source=source,
+                    snippet=_truncate_snippet(" ".join(snippet_parts)),
+                    retrieved_at=retrieved_at,
+                    published_at=_parse_rfc3339_timestamp(updated_raw),
+                )
+            )
+        return candidates
+
+    raw_results = output_payload.get("results")
+    if not isinstance(raw_results, list):
+        return []
     for raw_result in raw_results:
         if not isinstance(raw_result, dict):
             continue
@@ -827,6 +1578,1193 @@ def _persist_retrieval_artifacts(
     return assistant_sources
 
 
+def _persist_google_provider_evidence(
+    *,
+    db: Session,
+    capability_id: str,
+    output_payload: dict[str, Any],
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> list[dict[str, Any]]:
+    now = now_fn()
+    provider_account_id_raw = output_payload.get("provider_account_id")
+    provider_account_id = (
+        provider_account_id_raw.strip()
+        if isinstance(provider_account_id_raw, str) and provider_account_id_raw.strip()
+        else None
+    )
+
+    def evidence_ref(stored: ProviderEvidenceRecord) -> dict[str, Any]:
+        block_ids = db.scalars(
+            select(ProviderEvidenceBlockRecord.id)
+            .where(ProviderEvidenceBlockRecord.evidence_id == stored.id)
+            .order_by(ProviderEvidenceBlockRecord.block_index.asc())
+        ).all()
+        return {
+            "provider_evidence_id": stored.id,
+            "read_receipt_id": stored.id,
+            "source_kind": stored.source_kind,
+            "external_id": stored.external_id,
+            "thread_external_id": stored.thread_external_id,
+            "block_ids": block_ids,
+            "citation_refs": [
+                {"kind": "provider_evidence_block", "block_id": block_id} for block_id in block_ids
+            ],
+        }
+
+    if capability_id == "cap.email.read":
+        message = output_payload.get("message")
+        evidence = output_payload.get("evidence")
+        read_outcome = output_payload.get("read_outcome")
+        if not isinstance(read_outcome, dict):
+            return []
+        read_status = read_outcome.get("status")
+        if read_status not in {"ok", "body_too_large", "decode_failed", "no_body"}:
+            return []
+        raw_blocks = evidence.get("blocks") if isinstance(evidence, dict) else None
+        if not isinstance(raw_blocks, list):
+            return []
+        if read_status == "ok" and not raw_blocks:
+            return []
+        if read_status != "ok" and raw_blocks:
+            return []
+        if len(raw_blocks) > _MAX_GMAIL_EVIDENCE_BLOCKS:
+            return []
+        if read_status == "ok":
+            for block in raw_blocks:
+                if not isinstance(block, dict):
+                    return []
+                text = block.get("text")
+                if not isinstance(text, str) or not text.strip():
+                    return []
+                if len(text) > _MAX_GMAIL_EVIDENCE_BLOCK_CHARS:
+                    return []
+        if not isinstance(evidence, dict):
+            return []
+        if not isinstance(message, dict) or not isinstance(evidence, dict):
+            thread = output_payload.get("thread")
+            if not isinstance(thread, dict) or not isinstance(evidence, dict):
+                return []
+            if provider_account_id is None:
+                messages = output_payload.get("messages")
+                if isinstance(messages, list):
+                    for candidate in messages:
+                        if not isinstance(candidate, dict):
+                            continue
+                        account_raw = candidate.get("provider_account_id")
+                        if isinstance(account_raw, str) and account_raw.strip():
+                            provider_account_id = account_raw.strip()
+                            break
+            if provider_account_id is None:
+                return []
+            thread_id = thread.get("thread_id")
+            if not isinstance(thread_id, str) or not thread_id:
+                return []
+            source_timestamp = _parse_rfc3339_timestamp(output_payload.get("published_at"))
+            provider_url = f"https://mail.google.com/mail/u/0/#all/{thread_id}"
+            messages = output_payload.get("messages")
+            if isinstance(messages, list):
+                for candidate in messages:
+                    if not isinstance(candidate, dict):
+                        continue
+                    candidate_url = candidate.get("provider_url")
+                    if isinstance(candidate_url, str) and candidate_url.strip():
+                        provider_url = candidate_url.strip()
+                        break
+            provider_object = db.scalar(
+                select(GoogleProviderObjectRecord)
+                .where(
+                    GoogleProviderObjectRecord.provider_account_id == provider_account_id,
+                    GoogleProviderObjectRecord.object_type == "gmail_thread",
+                    GoogleProviderObjectRecord.external_id == thread_id,
+                )
+                .with_for_update()
+                .limit(1)
+            )
+            if provider_object is None:
+                provider_object = GoogleProviderObjectRecord(
+                    id=new_id_fn("gpo"),
+                    provider_account_id=provider_account_id,
+                    object_type="gmail_thread",
+                    external_id=thread_id,
+                    thread_external_id=thread_id,
+                    calendar_id=None,
+                    ical_uid=None,
+                    status="active",
+                    source_timestamp=source_timestamp,
+                    observed_at=now,
+                    provider_url=provider_url,
+                    metadata_json={
+                        "mode": output_payload.get("mode"),
+                        "message_count": thread.get("message_count"),
+                        "anchor_message_id": thread.get("anchor_message_id"),
+                    },
+                    content_digest=evidence.get("body_digest")
+                    if isinstance(evidence.get("body_digest"), str)
+                    else None,
+                    created_at=now,
+                    updated_at=now,
+                )
+                db.add(provider_object)
+                db.flush()
+            else:
+                provider_object.thread_external_id = thread_id
+                provider_object.status = "active"
+                provider_object.source_timestamp = source_timestamp
+                provider_object.observed_at = now
+                provider_object.provider_url = provider_url
+                provider_object.content_digest = (
+                    evidence.get("body_digest")
+                    if isinstance(evidence.get("body_digest"), str)
+                    else provider_object.content_digest
+                )
+                provider_object.updated_at = now
+
+            content_digest = evidence.get("body_digest")
+            if not isinstance(content_digest, str) or not content_digest:
+                return []
+            existing = db.scalar(
+                select(ProviderEvidenceRecord)
+                .where(
+                    ProviderEvidenceRecord.provider_object_id == provider_object.id,
+                    ProviderEvidenceRecord.content_digest == content_digest,
+                )
+                .limit(1)
+            )
+            if existing is not None:
+                return [evidence_ref(existing)]
+            stored = ProviderEvidenceRecord(
+                id=new_id_fn("pev"),
+                provider_object_id=provider_object.id,
+                provider="google",
+                provider_account_id=provider_account_id,
+                source_kind="gmail_thread",
+                external_id=thread_id,
+                thread_external_id=thread_id,
+                calendar_id=None,
+                source_uri=provider_url,
+                source_timestamp=source_timestamp,
+                content_digest=content_digest,
+                metadata_json={
+                    "mode": output_payload.get("mode"),
+                    "decode_notes": evidence.get("decode_notes", []),
+                    "html_security": evidence.get("html_security"),
+                    "read_outcome": read_outcome,
+                    "anchor_message_id": thread.get("anchor_message_id"),
+                },
+                taint="provider_untrusted",
+                sensitivity="private",
+                retention_policy="provider_source",
+                extraction_status="pending" if read_status == "ok" else "failed",
+                lifecycle_state="available" if read_status == "ok" else "unavailable",
+                observed_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(stored)
+            db.flush()
+            block_count = 0
+            for index, block in enumerate(raw_blocks if isinstance(raw_blocks, list) else []):
+                if not isinstance(block, dict) or not isinstance(block.get("text"), str):
+                    continue
+                kind = block.get("kind")
+                db.add(
+                    ProviderEvidenceBlockRecord(
+                        id=new_id_fn("peb"),
+                        evidence_id=stored.id,
+                        block_index=index,
+                        block_kind=kind
+                        if kind in {"body", "quote", "signature", "forwarded"}
+                        else "body",
+                        text=block["text"],
+                        digest=str(block.get("digest") or _email_hash(block["text"])),
+                        source_offsets={
+                            "block_id": block.get("block_id"),
+                            "source_message_id": block.get("source_message_id"),
+                            "source_thread_id": block.get("source_thread_id"),
+                        },
+                        metadata_json={
+                            "source_mime_type": block.get("source_mime_type"),
+                            "charset": block.get("charset"),
+                            "truncated": block.get("truncated"),
+                        },
+                        created_at=now,
+                    )
+                )
+                block_count += 1
+            if block_count:
+                db.add(
+                    BackgroundTaskRecord(
+                        id=new_id_fn("tsk"),
+                        task_type="workspace_commitment_extraction_due",
+                        payload={"evidence_id": stored.id},
+                        status="pending",
+                        attempts=0,
+                        max_attempts=3,
+                        error=None,
+                        claimed_by=None,
+                        run_after=now,
+                        last_heartbeat=None,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+            return [evidence_ref(stored)]
+        if provider_account_id is None:
+            account_raw = message.get("provider_account_id")
+            if isinstance(account_raw, str) and account_raw.strip():
+                provider_account_id = account_raw.strip()
+        if provider_account_id is None:
+            return []
+        message_id = message.get("message_id")
+        if not isinstance(message_id, str) or not message_id:
+            return []
+        source_timestamp = _parse_rfc3339_timestamp(output_payload.get("published_at"))
+        provider_object = db.scalar(
+            select(GoogleProviderObjectRecord)
+            .where(
+                GoogleProviderObjectRecord.provider_account_id == provider_account_id,
+                GoogleProviderObjectRecord.object_type == "gmail_message",
+                GoogleProviderObjectRecord.external_id == message_id,
+            )
+            .with_for_update()
+            .limit(1)
+        )
+        if provider_object is None:
+            provider_object = GoogleProviderObjectRecord(
+                id=new_id_fn("gpo"),
+                provider_account_id=provider_account_id,
+                object_type="gmail_message",
+                external_id=message_id,
+                thread_external_id=message.get("thread_id")
+                if isinstance(message.get("thread_id"), str)
+                else None,
+                calendar_id=None,
+                ical_uid=None,
+                status="active",
+                source_timestamp=source_timestamp,
+                observed_at=now,
+                provider_url=message.get("provider_url")
+                if isinstance(message.get("provider_url"), str)
+                else None,
+                metadata_json={
+                    "subject": message.get("subject"),
+                    "subject_key": message.get("subject_key"),
+                    "direction": message.get("direction"),
+                    "labels": message.get("labels"),
+                    "attachments": message.get("attachments"),
+                },
+                content_digest=message.get("raw_payload_digest")
+                if isinstance(message.get("raw_payload_digest"), str)
+                else None,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(provider_object)
+            db.flush()
+        else:
+            provider_object.thread_external_id = (
+                message.get("thread_id") if isinstance(message.get("thread_id"), str) else None
+            )
+            provider_object.status = "active"
+            provider_object.source_timestamp = source_timestamp
+            provider_object.observed_at = now
+            provider_object.provider_url = (
+                message.get("provider_url")
+                if isinstance(message.get("provider_url"), str)
+                else None
+            )
+            provider_object.content_digest = (
+                message.get("raw_payload_digest")
+                if isinstance(message.get("raw_payload_digest"), str)
+                else provider_object.content_digest
+            )
+            provider_object.updated_at = now
+
+        if read_status != "ok":
+            return []
+
+        content_digest = evidence.get("body_digest")
+        if not isinstance(content_digest, str) or not content_digest:
+            return []
+        existing = db.scalar(
+            select(ProviderEvidenceRecord)
+            .where(
+                ProviderEvidenceRecord.provider_object_id == provider_object.id,
+                ProviderEvidenceRecord.content_digest == content_digest,
+            )
+            .limit(1)
+        )
+        if existing is not None:
+            return [evidence_ref(existing)]
+        stored = ProviderEvidenceRecord(
+            id=new_id_fn("pev"),
+            provider_object_id=provider_object.id,
+            provider="google",
+            provider_account_id=provider_account_id,
+            source_kind="gmail_message",
+            external_id=message_id,
+            thread_external_id=message.get("thread_id")
+            if isinstance(message.get("thread_id"), str)
+            else None,
+            calendar_id=None,
+            source_uri=message.get("provider_url")
+            if isinstance(message.get("provider_url"), str)
+            else None,
+            source_timestamp=source_timestamp,
+            content_digest=content_digest,
+            metadata_json={
+                "decode_notes": evidence.get("decode_notes", []),
+                "html_security": evidence.get("html_security"),
+                "read_outcome": read_outcome,
+            },
+            taint="provider_untrusted",
+            sensitivity="private",
+            retention_policy="provider_source",
+            extraction_status="pending" if read_status == "ok" else "failed",
+            lifecycle_state="available" if read_status == "ok" else "unavailable",
+            observed_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(stored)
+        db.flush()
+        block_count = 0
+        for index, block in enumerate(raw_blocks if isinstance(raw_blocks, list) else []):
+            if not isinstance(block, dict) or not isinstance(block.get("text"), str):
+                continue
+            kind = block.get("kind")
+            db.add(
+                ProviderEvidenceBlockRecord(
+                    id=new_id_fn("peb"),
+                    evidence_id=stored.id,
+                    block_index=index,
+                    block_kind=kind
+                    if kind in {"body", "quote", "signature", "forwarded"}
+                    else "body",
+                    text=block["text"],
+                    digest=str(block.get("digest") or _email_hash(block["text"])),
+                    source_offsets={"block_id": block.get("block_id")},
+                    metadata_json={
+                        "source_mime_type": block.get("source_mime_type"),
+                        "charset": block.get("charset"),
+                        "truncated": block.get("truncated"),
+                    },
+                    created_at=now,
+                )
+            )
+            block_count += 1
+        if block_count:
+            db.add(
+                BackgroundTaskRecord(
+                    id=new_id_fn("tsk"),
+                    task_type="workspace_commitment_extraction_due",
+                    payload={"evidence_id": stored.id},
+                    status="pending",
+                    attempts=0,
+                    max_attempts=3,
+                    error=None,
+                    claimed_by=None,
+                    run_after=now,
+                    last_heartbeat=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        return [evidence_ref(stored)]
+
+    if capability_id == "cap.calendar.propose_slots":
+        if provider_account_id is None:
+            return []
+        slots = output_payload.get("slots")
+        if not isinstance(slots, list):
+            return []
+        content_payload = {
+            "schema_version": output_payload.get("schema_version"),
+            "window_start": output_payload.get("window_start"),
+            "window_end": output_payload.get("window_end"),
+            "duration_minutes": output_payload.get("duration_minutes"),
+            "attendees_considered": output_payload.get("attendees_considered"),
+            "availability_scope": output_payload.get("availability_scope"),
+            "partial": output_payload.get("partial"),
+            "partial_reason": output_payload.get("partial_reason"),
+            "timezone": output_payload.get("timezone"),
+            "source_evidence_refs": output_payload.get("source_evidence_refs"),
+            "constraints_used": output_payload.get("constraints_used"),
+            "freebusy_diagnostics": output_payload.get("freebusy_diagnostics"),
+            "slots": slots,
+            "no_slots_reason": output_payload.get("no_slots_reason"),
+        }
+        content_digest = _email_hash(
+            json.dumps(content_payload, sort_keys=True, separators=(",", ":"))
+        )
+        external_id = f"availability:{content_digest[:32]}"
+        source_timestamp = _parse_rfc3339_timestamp(output_payload.get("retrieved_at"))
+        provider_object = db.scalar(
+            select(GoogleProviderObjectRecord)
+            .where(
+                GoogleProviderObjectRecord.provider_account_id == provider_account_id,
+                GoogleProviderObjectRecord.object_type == "calendar_availability",
+                GoogleProviderObjectRecord.external_id == external_id,
+            )
+            .with_for_update()
+            .limit(1)
+        )
+        if provider_object is None:
+            provider_object = GoogleProviderObjectRecord(
+                id=new_id_fn("gpo"),
+                provider_account_id=provider_account_id,
+                object_type="calendar_availability",
+                external_id=external_id,
+                thread_external_id=None,
+                calendar_id=None,
+                ical_uid=None,
+                status="active",
+                source_timestamp=source_timestamp,
+                observed_at=now,
+                provider_url=f"calendar://availability/{content_digest[:16]}",
+                metadata_json=content_payload,
+                content_digest=content_digest,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(provider_object)
+            db.flush()
+        else:
+            provider_object.status = "active"
+            provider_object.source_timestamp = source_timestamp
+            provider_object.observed_at = now
+            provider_object.provider_url = f"calendar://availability/{content_digest[:16]}"
+            provider_object.metadata_json = content_payload
+            provider_object.content_digest = content_digest
+            provider_object.updated_at = now
+
+        existing = db.scalar(
+            select(ProviderEvidenceRecord)
+            .where(
+                ProviderEvidenceRecord.provider_object_id == provider_object.id,
+                ProviderEvidenceRecord.content_digest == content_digest,
+            )
+            .limit(1)
+        )
+        if existing is not None:
+            return [evidence_ref(existing)]
+        stored = ProviderEvidenceRecord(
+            id=new_id_fn("pev"),
+            provider_object_id=provider_object.id,
+            provider="google",
+            provider_account_id=provider_account_id,
+            source_kind="calendar_availability",
+            external_id=external_id,
+            thread_external_id=None,
+            calendar_id=None,
+            source_uri=f"calendar://availability/{content_digest[:16]}",
+            source_timestamp=source_timestamp,
+            content_digest=content_digest,
+            metadata_json=content_payload,
+            taint="provider_untrusted",
+            sensitivity="private",
+            retention_policy="provider_source",
+            extraction_status="pending",
+            lifecycle_state="available",
+            observed_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(stored)
+        db.flush()
+        block_texts: list[str] = []
+        for slot in slots:
+            if not isinstance(slot, dict):
+                continue
+            start = slot.get("start")
+            end = slot.get("end")
+            start_value = start.get("value") if isinstance(start, dict) else None
+            end_value = end.get("value") if isinstance(end, dict) else None
+            if not isinstance(start_value, str) or not isinstance(end_value, str):
+                continue
+            availability_scope = slot.get("availability_scope")
+            partial = slot.get("partial")
+            block_texts.append(
+                f"{start_value} to {end_value} availability_scope={availability_scope} partial={partial}"
+            )
+        if not block_texts and output_payload.get("no_slots_reason") == "no_slots_available":
+            block_texts.append("No matching availability was found in the requested window.")
+        for index, text in enumerate(block_texts):
+            db.add(
+                ProviderEvidenceBlockRecord(
+                    id=new_id_fn("peb"),
+                    evidence_id=stored.id,
+                    block_index=index,
+                    block_kind="availability",
+                    text=text,
+                    digest=_email_hash(text),
+                    source_offsets={"slot_index": index},
+                    metadata_json={},
+                    created_at=now,
+                )
+            )
+        return [evidence_ref(stored)]
+
+    if capability_id != "cap.calendar.list":
+        return []
+    raw_events = output_payload.get("events")
+    stored_refs: list[dict[str, Any]] = []
+    for event in raw_events if isinstance(raw_events, list) else []:
+        if not isinstance(event, dict):
+            continue
+        event_id = event.get("event_id")
+        if not isinstance(event_id, str) or not event_id:
+            continue
+        calendar_id = event.get("calendar_id")
+        if not isinstance(calendar_id, str) or not calendar_id:
+            continue
+        event_provider_account_id_raw = event.get("provider_account_id")
+        event_provider_account_id = (
+            event_provider_account_id_raw.strip()
+            if isinstance(event_provider_account_id_raw, str)
+            and event_provider_account_id_raw.strip()
+            else provider_account_id
+        )
+        if event_provider_account_id is None:
+            continue
+        source_timestamp = _parse_rfc3339_timestamp(event.get("updated"))
+        provider_object = db.scalar(
+            select(GoogleProviderObjectRecord)
+            .where(
+                GoogleProviderObjectRecord.provider_account_id == event_provider_account_id,
+                GoogleProviderObjectRecord.object_type == "calendar_event",
+                GoogleProviderObjectRecord.calendar_id == calendar_id,
+                GoogleProviderObjectRecord.external_id == event_id,
+            )
+            .with_for_update()
+            .limit(1)
+        )
+        if provider_object is None:
+            provider_object = GoogleProviderObjectRecord(
+                id=new_id_fn("gpo"),
+                provider_account_id=event_provider_account_id,
+                object_type="calendar_event",
+                external_id=event_id,
+                thread_external_id=None,
+                calendar_id=calendar_id,
+                ical_uid=event.get("ical_uid") if isinstance(event.get("ical_uid"), str) else None,
+                status="deleted" if event.get("status") == "cancelled" else "active",
+                source_timestamp=source_timestamp,
+                observed_at=now,
+                provider_url=event.get("provider_url")
+                if isinstance(event.get("provider_url"), str)
+                else None,
+                metadata_json={
+                    "summary": event.get("summary"),
+                    "start": event.get("start"),
+                    "end": event.get("end"),
+                    "attendees": event.get("attendees"),
+                    "organizer": event.get("organizer"),
+                },
+                content_digest=event.get("raw_payload_digest")
+                if isinstance(event.get("raw_payload_digest"), str)
+                else None,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(provider_object)
+            db.flush()
+        else:
+            provider_object.status = "deleted" if event.get("status") == "cancelled" else "active"
+            provider_object.source_timestamp = source_timestamp
+            provider_object.observed_at = now
+            provider_object.provider_url = (
+                event.get("provider_url") if isinstance(event.get("provider_url"), str) else None
+            )
+            provider_object.content_digest = (
+                event.get("raw_payload_digest")
+                if isinstance(event.get("raw_payload_digest"), str)
+                else provider_object.content_digest
+            )
+            provider_object.updated_at = now
+        content_digest = event.get("raw_payload_digest")
+        if not isinstance(content_digest, str) or not content_digest:
+            continue
+        existing = db.scalar(
+            select(ProviderEvidenceRecord)
+            .where(
+                ProviderEvidenceRecord.provider_object_id == provider_object.id,
+                ProviderEvidenceRecord.content_digest == content_digest,
+            )
+            .limit(1)
+        )
+        if existing is not None:
+            stored_refs.append(evidence_ref(existing))
+            continue
+        event_deleted = event.get("status") == "cancelled"
+        stored = ProviderEvidenceRecord(
+            id=new_id_fn("pev"),
+            provider_object_id=provider_object.id,
+            provider="google",
+            provider_account_id=event_provider_account_id,
+            source_kind="calendar_event",
+            external_id=event_id,
+            thread_external_id=None,
+            calendar_id=calendar_id,
+            source_uri=event.get("provider_url")
+            if isinstance(event.get("provider_url"), str)
+            else None,
+            source_timestamp=source_timestamp,
+            content_digest=content_digest,
+            metadata_json={"summary": event.get("summary"), "status": event.get("status")},
+            taint="provider_untrusted",
+            sensitivity="private",
+            retention_policy="provider_source",
+            extraction_status="not_actionable" if event_deleted else "pending",
+            lifecycle_state="deleted" if event_deleted else "available",
+            observed_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(stored)
+        db.flush()
+        raw_blocks = event.get("description_blocks")
+        block_count = 0
+        for index, block in enumerate(raw_blocks if isinstance(raw_blocks, list) else []):
+            if not isinstance(block, dict) or not isinstance(block.get("text"), str):
+                continue
+            db.add(
+                ProviderEvidenceBlockRecord(
+                    id=new_id_fn("peb"),
+                    evidence_id=stored.id,
+                    block_index=index,
+                    block_kind="calendar_description",
+                    text=block["text"],
+                    digest=str(block.get("digest") or _email_hash(block["text"])),
+                    source_offsets={"block_id": block.get("block_id")},
+                    metadata_json={"truncated": block.get("truncated")},
+                    created_at=now,
+                )
+            )
+            block_count += 1
+        if block_count:
+            db.add(
+                BackgroundTaskRecord(
+                    id=new_id_fn("tsk"),
+                    task_type="workspace_commitment_extraction_due",
+                    payload={"evidence_id": stored.id},
+                    status="pending",
+                    attempts=0,
+                    max_attempts=3,
+                    error=None,
+                    claimed_by=None,
+                    run_after=now,
+                    last_heartbeat=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        stored_refs.append(evidence_ref(stored))
+    return stored_refs
+
+
+def _provider_write_response_string(
+    payload: dict[str, Any],
+    *,
+    keys: tuple[str, ...],
+) -> str | None:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    provider_result = payload.get("provider_result")
+    if isinstance(provider_result, dict):
+        for key in keys:
+            value = provider_result.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _provider_write_response_timestamp(payload: dict[str, Any]) -> datetime | None:
+    for key in ("provider_timestamp", "updated", "created", "sent_at"):
+        value = payload.get(key)
+        parsed = _parse_rfc3339_timestamp(value)
+        if parsed is not None:
+            return parsed
+    provider_result = payload.get("provider_result")
+    if isinstance(provider_result, dict):
+        for key in ("provider_timestamp", "updated", "created", "sent_at"):
+            parsed = _parse_rfc3339_timestamp(provider_result.get(key))
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _latest_approval_ref(db: Session, *, action_attempt_id: str) -> str | None:
+    approval_id = db.scalar(
+        select(ApprovalRequestRecord.id)
+        .where(ApprovalRequestRecord.action_attempt_id == action_attempt_id)
+        .order_by(ApprovalRequestRecord.created_at.desc(), ApprovalRequestRecord.id.desc())
+        .limit(1)
+    )
+    return approval_id if isinstance(approval_id, str) else None
+
+
+def _provider_source_evidence_target_error(
+    *,
+    action_attempt: ActionAttemptRecord,
+    input_payload: dict[str, Any],
+    source_evidence: ProviderEvidenceRecord,
+) -> str | None:
+    if action_attempt.capability_id in _EMAIL_MUTATION_CAPABILITY_IDS:
+        message_ids = input_payload.get("message_ids")
+        if not isinstance(message_ids, list):
+            return None
+        if source_evidence.source_kind not in {"gmail_message", "gmail_thread"}:
+            return "provider_source_evidence_target_mismatch"
+        message_id_values = {
+            message_id for message_id in message_ids if isinstance(message_id, str)
+        }
+        if (
+            source_evidence.source_kind == "gmail_message"
+            and source_evidence.external_id not in message_id_values
+        ):
+            return "provider_source_evidence_target_mismatch"
+    if action_attempt.capability_id in {
+        "cap.calendar.update_event",
+        "cap.calendar.respond_to_event",
+    }:
+        if source_evidence.source_kind != "calendar_event":
+            return "provider_source_evidence_target_mismatch"
+        event_id = input_payload.get("event_id")
+        if isinstance(event_id, str) and source_evidence.external_id != event_id:
+            return "provider_source_evidence_target_mismatch"
+        calendar_id = input_payload.get("calendar_id")
+        if (
+            isinstance(calendar_id, str)
+            and source_evidence.calendar_id is not None
+            and source_evidence.calendar_id != calendar_id
+        ):
+            return "provider_source_evidence_target_mismatch"
+    return None
+
+
+def _provider_write_authority_payload(
+    *,
+    db: Session,
+    action_attempt: ActionAttemptRecord,
+    normalized_input: dict[str, Any] | None,
+    provider_account_id: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    input_payload = normalized_input if isinstance(normalized_input, dict) else {}
+    authority: dict[str, str] = {}
+    for key in ("source_evidence_id", "commitment_id", "user_instruction_ref"):
+        value = input_payload.get(key)
+        if isinstance(value, str) and value.strip():
+            authority[key] = value.strip()
+
+    if action_attempt.capability_id in _GOOGLE_RECEIPT_CAPABILITY_IDS and len(authority) != 1:
+        return None, "provider_write_authority_invalid"
+
+    source_evidence_id = authority.get("source_evidence_id")
+    if source_evidence_id is not None:
+        source_evidence = db.scalar(
+            select(ProviderEvidenceRecord)
+            .where(
+                ProviderEvidenceRecord.id == source_evidence_id,
+                ProviderEvidenceRecord.provider == "google",
+                ProviderEvidenceRecord.provider_account_id == provider_account_id,
+                ProviderEvidenceRecord.lifecycle_state == "available",
+            )
+            .limit(1)
+        )
+        if source_evidence is None:
+            return None, "provider_source_evidence_not_found"
+        target_error = _provider_source_evidence_target_error(
+            action_attempt=action_attempt,
+            input_payload=input_payload,
+            source_evidence=source_evidence,
+        )
+        if target_error is not None:
+            return None, target_error
+
+    commitment_id = authority.get("commitment_id")
+    if commitment_id is not None:
+        commitment_exists = db.scalar(
+            select(WorkCommitmentRecord.id)
+            .where(
+                WorkCommitmentRecord.id == commitment_id,
+                WorkCommitmentRecord.provider == "google",
+                WorkCommitmentRecord.provider_account_id == provider_account_id,
+                WorkCommitmentRecord.lifecycle_state.in_(
+                    (
+                        "active",
+                        "waiting_on_user",
+                        "waiting_on_counterparty",
+                        "scheduled",
+                        "snoozed",
+                    )
+                ),
+            )
+            .limit(1)
+        )
+        if commitment_exists is None:
+            return None, "provider_commitment_not_live"
+
+    user_instruction_ref = authority.get("user_instruction_ref")
+    instruction_turn_id = None
+    if user_instruction_ref is not None:
+        if not user_instruction_ref.startswith("turn:"):
+            return None, "provider_user_instruction_ref_invalid"
+        instruction_turn_id = user_instruction_ref.removeprefix("turn:").strip()
+        if not instruction_turn_id:
+            return None, "provider_user_instruction_ref_invalid"
+        instruction_turn = db.scalar(
+            select(TurnRecord)
+            .where(
+                TurnRecord.id == instruction_turn_id,
+                TurnRecord.session_id == action_attempt.session_id,
+            )
+            .limit(1)
+        )
+        if instruction_turn is None:
+            return None, "provider_user_instruction_not_found"
+
+    if not authority:
+        return None, None
+
+    authority_payload: dict[str, Any] = {
+        "source_type": next(iter(authority)),
+        **authority,
+        "turn_id": instruction_turn_id or action_attempt.turn_id,
+        "action_turn_id": action_attempt.turn_id,
+        "session_id": action_attempt.session_id,
+    }
+    approval_ref = _latest_approval_ref(db, action_attempt_id=action_attempt.id)
+    if approval_ref is not None:
+        authority_payload["approval_ref"] = approval_ref
+    return authority_payload, None
+
+
+def _record_provider_write_receipt(
+    *,
+    db: Session,
+    action_attempt: ActionAttemptRecord,
+    status: ProviderWriteReceiptStatus,
+    normalized_input: dict[str, Any] | None,
+    provider_account_id: str | None,
+    output_payload: dict[str, Any] | None = None,
+    error: str | None = None,
+    ambiguity_reason: str | None = None,
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> ProviderWriteReceiptRecord:
+    resolved_provider_account_id = (
+        provider_account_id or _current_google_provider_account_id(db) or "google"
+    )
+    idempotency_key = _provider_write_idempotency_key(
+        action_attempt=action_attempt,
+        provider_account_id=resolved_provider_account_id,
+        normalized_input=normalized_input,
+    )
+    receipt = db.scalar(
+        select(ProviderWriteReceiptRecord)
+        .where(
+            ProviderWriteReceiptRecord.provider == "google",
+            ProviderWriteReceiptRecord.provider_account_id == resolved_provider_account_id,
+            ProviderWriteReceiptRecord.idempotency_key == idempotency_key,
+        )
+        .with_for_update()
+        .limit(1)
+    )
+    raw_response_payload = dict(output_payload) if output_payload is not None else {}
+    if error is not None:
+        raw_response_payload["error"] = error
+    response_digest = _json_digest(raw_response_payload)
+    response_payload = _redact_google_provider_output(
+        capability_id=action_attempt.capability_id,
+        output_payload=raw_response_payload,
+    )
+    if "undo_token" in response_payload:
+        response_payload["undo_token"] = "[redacted]"
+    authority_payload, authority_error = _provider_write_authority_payload(
+        db=db,
+        action_attempt=action_attempt,
+        normalized_input=normalized_input,
+        provider_account_id=resolved_provider_account_id,
+    )
+    if authority_payload is not None:
+        response_payload["authority"] = authority_payload
+    elif authority_error is not None:
+        response_payload["authority_error"] = authority_error
+    provider_object_ids = _provider_write_object_ids(
+        normalized_input=normalized_input,
+        response_payload=response_payload,
+    )
+    if authority_payload is not None:
+        for key in ("source_evidence_id", "commitment_id", "user_instruction_ref"):
+            value = authority_payload.get(key)
+            if isinstance(value, str):
+                provider_object_ids[key] = value
+    provider_timestamp = _provider_write_response_timestamp(raw_response_payload)
+    provider_etag = _provider_write_response_string(
+        raw_response_payload,
+        keys=("etag", "provider_etag"),
+    )
+    provider_history_id = _provider_write_response_string(
+        raw_response_payload,
+        keys=("history_id", "provider_history_id"),
+    )
+    now = now_fn()
+    if receipt is None:
+        receipt = ProviderWriteReceiptRecord(
+            id=new_id_fn("pwr"),
+            provider="google",
+            provider_account_id=resolved_provider_account_id,
+            action_attempt_id=action_attempt.id,
+            capability_id=action_attempt.capability_id,
+            idempotency_key=idempotency_key,
+            status=status,
+            provider_object_ids=provider_object_ids,
+            request_digest=action_attempt.payload_hash,
+            response_payload=response_payload,
+            ambiguity_reason=ambiguity_reason if status == "ambiguous" else None,
+            provider_timestamp=provider_timestamp,
+            provider_etag=provider_etag,
+            provider_history_id=provider_history_id,
+            response_digest=response_digest,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(receipt)
+        db.flush()
+        return receipt
+    if receipt.capability_id != action_attempt.capability_id:
+        raise RuntimeError("idempotency_key_input_mismatch")
+    if receipt.request_digest != action_attempt.payload_hash:
+        raise RuntimeError("idempotency_key_input_mismatch")
+    if receipt.status == "succeeded":
+        return receipt
+    receipt.status = status
+    receipt.provider_object_ids = provider_object_ids
+    receipt.response_payload = response_payload
+    receipt.ambiguity_reason = ambiguity_reason if status == "ambiguous" else None
+    receipt.provider_timestamp = provider_timestamp
+    receipt.provider_etag = provider_etag
+    receipt.provider_history_id = provider_history_id
+    receipt.response_digest = response_digest
+    receipt.updated_at = now
+    return receipt
+
+
+def _provider_write_idempotency_key(
+    *,
+    action_attempt: ActionAttemptRecord,
+    provider_account_id: str,
+    normalized_input: dict[str, Any] | None,
+) -> str:
+    client_key_raw = (
+        normalized_input.get("idempotency_key") if isinstance(normalized_input, dict) else None
+    )
+    if isinstance(client_key_raw, str) and client_key_raw.strip():
+        raw = (
+            f"{action_attempt.capability_id}\x1fgoogle\x1f"
+            f"{provider_account_id}\x1f{client_key_raw.strip()}"
+        )
+        return "provider-write:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return f"provider-write:{action_attempt.id}:{action_attempt.payload_hash}"
+
+
+def _provider_write_object_ids(
+    *,
+    normalized_input: dict[str, Any] | None,
+    response_payload: dict[str, Any],
+) -> dict[str, Any]:
+    provider_result = response_payload.get("provider_result")
+    sources = [
+        normalized_input if isinstance(normalized_input, dict) else {},
+        response_payload,
+        provider_result if isinstance(provider_result, dict) else {},
+    ]
+    provider_object_ids: dict[str, Any] = {}
+    for source in sources:
+        for key in (
+            "message_id",
+            "message_ids",
+            "mutated_message_ids",
+            "attempted_message_ids",
+            "thread_id",
+            "thread_ids",
+            "draft_id",
+            "event_id",
+            "calendar_id",
+            "etag",
+            "updated",
+            "ical_uid",
+            "file_id",
+            "permission_id",
+            "grantee_email",
+            "role",
+            "provider_message_ref",
+            "provider_draft_ref",
+            "provider_event_ref",
+        ):
+            value = source.get(key)
+            if value is not None and key not in provider_object_ids:
+                provider_object_ids[key] = value
+    return provider_object_ids
+
+
+def _provider_write_success_identity_error(
+    *,
+    capability_id: str,
+    provider_object_ids: dict[str, Any],
+) -> str | None:
+    if capability_id == "cap.email.draft":
+        if not (
+            isinstance(provider_object_ids.get("draft_id"), str)
+            or isinstance(provider_object_ids.get("provider_draft_ref"), str)
+        ):
+            return "provider_write_identity_missing"
+        return None
+    if capability_id == "cap.email.send":
+        if not (
+            isinstance(provider_object_ids.get("message_id"), str)
+            or isinstance(provider_object_ids.get("provider_message_ref"), str)
+        ):
+            return "provider_write_identity_missing"
+        return None
+    if capability_id in _EMAIL_MUTATION_CAPABILITY_IDS:
+        message_ids = provider_object_ids.get("message_ids")
+        if not isinstance(message_ids, list) or not message_ids:
+            return "provider_write_identity_missing"
+        return None
+    if capability_id in {
+        "cap.calendar.create_event",
+        "cap.calendar.update_event",
+        "cap.calendar.respond_to_event",
+    }:
+        if not isinstance(provider_object_ids.get("event_id"), str) or not isinstance(
+            provider_object_ids.get("calendar_id"),
+            str,
+        ):
+            return "provider_write_identity_missing"
+        return None
+    if capability_id == "cap.drive.share":
+        for key in ("file_id", "permission_id", "grantee_email", "role"):
+            if not isinstance(provider_object_ids.get(key), str):
+                return "provider_write_identity_missing"
+        return None
+    return None
+
+
+def _provider_write_receipt_for_attempt(
+    *,
+    db: Session,
+    action_attempt: ActionAttemptRecord,
+    provider_account_id: str | None,
+    normalized_input: dict[str, Any] | None,
+) -> ProviderWriteReceiptRecord | None:
+    resolved_provider_account_id = (
+        provider_account_id or _current_google_provider_account_id(db) or "google"
+    )
+    idempotency_key = _provider_write_idempotency_key(
+        action_attempt=action_attempt,
+        provider_account_id=resolved_provider_account_id,
+        normalized_input=normalized_input,
+    )
+    return db.scalar(
+        select(ProviderWriteReceiptRecord)
+        .where(
+            ProviderWriteReceiptRecord.provider == "google",
+            ProviderWriteReceiptRecord.provider_account_id == resolved_provider_account_id,
+            ProviderWriteReceiptRecord.idempotency_key == idempotency_key,
+        )
+        .with_for_update()
+        .limit(1)
+    )
+
+
+def _provider_account_id_from_execution_output(
+    action_attempt: ActionAttemptRecord,
+) -> str | None:
+    output = action_attempt.execution_output
+    if not isinstance(output, dict):
+        return None
+    provider_account_id = output.get("provider_account_id")
+    if isinstance(provider_account_id, str) and provider_account_id.strip():
+        return provider_account_id.strip()
+    return None
+
+
+def _provider_write_failure_receipt_status(
+    *,
+    error: str,
+    output_payload: dict[str, Any] | None,
+) -> ProviderWriteReceiptStatus:
+    if output_payload is not None:
+        return "failed"
+    if error == "provider_result_unknown" or _email_provider_error_is_retryable(error):
+        return "ambiguous"
+    return "failed"
+
+
+def _append_provider_write_reconcile_unavailable_event(
+    *,
+    db: Session,
+    action_attempt: ActionAttemptRecord,
+    receipt: ProviderWriteReceiptRecord,
+    reason: str,
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> None:
+    now = now_fn()
+    idempotency_key = f"provider_write_reconcile:{receipt.id}"
+    reconcile_task = db.scalar(
+        select(BackgroundTaskRecord)
+        .where(BackgroundTaskRecord.idempotency_key == idempotency_key)
+        .limit(1)
+    )
+    if reconcile_task is None:
+        reconcile_task = BackgroundTaskRecord(
+            id=new_id_fn("tsk"),
+            task_type="provider_write_reconcile_due",
+            idempotency_key=idempotency_key,
+            work_follow_up_loop_id=None,
+            work_follow_up_loop_version=None,
+            work_follow_up_scheduled_for=None,
+            provider_write_receipt_id=receipt.id,
+            payload={
+                "provider_write_receipt_id": receipt.id,
+                "action_attempt_id": action_attempt.id,
+                "receipt_response_digest": receipt.response_digest,
+            },
+            status="pending",
+            attempts=0,
+            max_attempts=3,
+            error=None,
+            claimed_by=None,
+            run_after=now,
+            last_heartbeat=None,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(reconcile_task)
+        db.flush()
+    _append_action_execution_event(
+        db=db,
+        action_attempt=action_attempt,
+        event_type="evt.provider_write.reconcile_unavailable",
+        payload_data={
+            "action_attempt_id": action_attempt.id,
+            "provider_write_receipt_id": receipt.id,
+            "status": receipt.status,
+            "reason": reason,
+            "reconcile_task_enqueued": True,
+            "reconcile_task_id": reconcile_task.id,
+        },
+        now_fn=lambda: now,
+        new_id_fn=new_id_fn,
+    )
+
+
 def _response_function_call_output(*, call_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "type": "function_call_output",
@@ -835,9 +2773,68 @@ def _response_function_call_output(*, call_id: str, payload: dict[str, Any]) -> 
     }
 
 
+def process_provider_write_reconcile_due(
+    *,
+    session_factory: sessionmaker[Session],
+    task_payload: dict[str, Any],
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> bool:
+    receipt_id = task_payload.get("provider_write_receipt_id")
+    if not isinstance(receipt_id, str) or not receipt_id:
+        raise RuntimeError("provider_write_reconcile_due missing provider_write_receipt_id")
+
+    with session_factory() as db:
+        with db.begin():
+            receipt = db.scalar(
+                select(ProviderWriteReceiptRecord)
+                .where(ProviderWriteReceiptRecord.id == receipt_id)
+                .with_for_update()
+                .limit(1)
+            )
+            if receipt is None:
+                raise RuntimeError("provider_write_receipt_not_found")
+            action_attempt = db.scalar(
+                select(ActionAttemptRecord)
+                .where(ActionAttemptRecord.id == receipt.action_attempt_id)
+                .with_for_update()
+                .limit(1)
+            )
+            if action_attempt is None:
+                raise RuntimeError("provider_write_action_attempt_not_found")
+            if receipt.status != "ambiguous":
+                return False
+
+            now = now_fn()
+            response_payload = dict(receipt.response_payload)
+            response_payload["reconciliation"] = {
+                "status": "indeterminate",
+                "reason": "provider_reconcile_requires_provider_specific_probe",
+                "checked_at": to_rfc3339(now),
+            }
+            receipt.response_payload = response_payload
+            receipt.updated_at = now
+            _append_action_execution_event(
+                db=db,
+                action_attempt=action_attempt,
+                event_type="evt.provider_write.reconcile_unavailable",
+                payload_data={
+                    "action_attempt_id": action_attempt.id,
+                    "provider_write_receipt_id": receipt.id,
+                    "status": receipt.status,
+                    "reason": "provider_reconcile_requires_provider_specific_probe",
+                    "reconcile_task_enqueued": False,
+                },
+                now_fn=lambda: now,
+                new_id_fn=new_id_fn,
+            )
+            return True
+
+
 def process_response_function_calls(
     *,
     db: Session,
+    session_factory: sessionmaker[Session] | None = None,
     session_id: str,
     turn: TurnRecord,
     assistant_message: str,
@@ -849,6 +2846,7 @@ def process_response_function_calls(
     new_id_fn: Callable[[str], str],
     runtime_provenance: RuntimeProvenance | None = None,
     google_runtime: GoogleConnectorRuntime | None = None,
+    execute_google_reads_outside_transaction: bool = False,
     agency_runtime: Any | None = None,
     attachment_runtime: AttachmentContentRuntime | None = None,
 ) -> FunctionCallProcessingResult:
@@ -880,6 +2878,7 @@ def process_response_function_calls(
         is_agency_capability_call = capability_id in AGENCY_CAPABILITY_IDS
         is_discord_capability_call = capability_id in DISCORD_CAPABILITY_IDS
         is_attachment_capability_call = capability_id in ATTACHMENT_CAPABILITY_IDS
+        is_memory_capability_call = capability_id in MEMORY_CAPABILITY_IDS
         is_retrieval_call = capability_id in _GROUNDED_RETRIEVAL_CAPABILITIES
         is_weather_forecast_call = capability_id == "cap.weather.forecast"
         if is_retrieval_call:
@@ -930,6 +2929,10 @@ def process_response_function_calls(
             if evaluation.normalized_input is not None
             else input_payload
         )
+        stored_input_payload, private_input_payload = _stored_action_input_payload(
+            capability_id=capability_id,
+            input_payload=frozen_input_payload,
+        )
         frozen_payload = canonical_action_payload(
             capability_id=capability_id,
             input_payload=frozen_input_payload,
@@ -949,7 +2952,7 @@ def process_response_function_calls(
                 else payload_hash({"capability_id": capability_id, "contract": "unknown"})
             ),
             impact_level=evaluation.impact_level,
-            proposed_input=frozen_input_payload,
+            proposed_input=stored_input_payload,
             payload_hash=payload_hash(frozen_payload),
             policy_decision="deny",
             policy_reason=None,
@@ -962,6 +2965,15 @@ def process_response_function_calls(
         )
         db.add(action_attempt)
         db.flush()
+        if private_input_payload is not None and google_runtime is not None:
+            _store_action_private_payload(
+                db=db,
+                action_attempt=action_attempt,
+                private_payload=private_input_payload,
+                google_runtime=google_runtime,
+                now=now_action,
+                new_id_fn=new_id_fn,
+            )
         created_action_attempts.append(action_attempt)
         if call_id:
             call_ids_by_attempt_id[action_attempt.id] = call_id
@@ -971,10 +2983,34 @@ def process_response_function_calls(
             {
                 "action_attempt_id": action_attempt.id,
                 "capability_id": action_attempt.capability_id,
-                "input": action_attempt.proposed_input,
+                "input": _redact_google_action_input_for_event(
+                    capability_id=action_attempt.capability_id,
+                    input_payload=action_attempt.proposed_input,
+                )
+                if is_google_capability_call
+                else action_attempt.proposed_input,
                 "taint": taint_payload,
             },
         )
+
+        if private_input_payload is not None and google_runtime is None:
+            action_attempt.status = "rejected"
+            action_attempt.policy_decision = "deny"
+            action_attempt.policy_reason = "private_action_payload_storage_unavailable"
+            action_attempt.updated_at = now_fn()
+            blocked_reasons.append(f"{capability_id}: private_action_payload_storage_unavailable")
+            if call_id:
+                function_call_outputs.append(
+                    _response_function_call_output(
+                        call_id=call_id,
+                        payload={
+                            "status": "blocked",
+                            "capability_id": capability_id,
+                            "reason": "private_action_payload_storage_unavailable",
+                        },
+                    )
+                )
+            continue
 
         if evaluation.decision == "deny":
             action_attempt.status = "rejected"
@@ -1363,17 +3399,60 @@ def process_response_function_calls(
         )
         execution_result: ExecutionResult | GoogleCapabilityExecutionResult
         if is_google_capability_call and google_runtime is not None:
-            _acquire_side_effect_execution_lock(
-                db=db,
-                impact_level=evaluation.capability.impact_level,
-            )
-            google_execution_result = google_runtime.execute_capability(
-                db=db,
-                capability_id=capability_id,
-                normalized_input=evaluation.normalized_input,
-                now_fn=now_fn,
-                new_id_fn=new_id_fn,
-            )
+            if (
+                execute_google_reads_outside_transaction
+                and capability_id in GOOGLE_READ_CAPABILITY_IDS
+                and session_factory is not None
+            ):
+                db.flush()
+                db.commit()
+                google_runtime.refresh_access_token_for_capability(
+                    session_factory=session_factory,
+                    capability_id=capability_id,
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
+                with session_factory() as access_db:
+                    with access_db.begin():
+                        (
+                            access_token,
+                            granted_scopes,
+                            provider_account_id,
+                            access_failure,
+                        ) = google_runtime.prepare_capability_access_without_refresh(
+                            db=access_db,
+                            capability_id=capability_id,
+                            now_fn=now_fn,
+                        )
+                if access_failure is not None:
+                    google_execution_result = access_failure
+                elif access_token is None:
+                    google_execution_result = GoogleCapabilityExecutionResult(
+                        status="failed",
+                        output=None,
+                        auth_failure=None,
+                        error="token_expired",
+                    )
+                else:
+                    google_execution_result = google_runtime.execute_provider_capability(
+                        capability_id=capability_id,
+                        normalized_input=evaluation.normalized_input,
+                        access_token=access_token,
+                        granted_scopes=granted_scopes,
+                        provider_account_id=provider_account_id,
+                    )
+            else:
+                _acquire_side_effect_execution_lock(
+                    db=db,
+                    impact_level=evaluation.capability.impact_level,
+                )
+                google_execution_result = google_runtime.execute_capability(
+                    db=db,
+                    capability_id=capability_id,
+                    normalized_input=evaluation.normalized_input,
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
             if (
                 google_execution_result.status == "succeeded"
                 and google_execution_result.output is not None
@@ -1446,6 +3525,31 @@ def process_response_function_calls(
                 output=None,
                 error="attachment_runtime_not_bound",
             )
+        elif is_memory_capability_call:
+            try:
+                memory_output = _execute_memory_capability(
+                    db=db,
+                    capability_id=capability_id,
+                    normalized_input=evaluation.normalized_input,
+                    action_attempt=action_attempt,
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
+            except Exception as exc:  # noqa: BLE001
+                execution_result = ExecutionResult(
+                    status="failed",
+                    output=None,
+                    error=safe_failure_reason(
+                        str(exc),
+                        fallback=f"unexpected {exc.__class__.__name__}",
+                    ),
+                )
+            else:
+                execution_result = ExecutionResult(
+                    status="succeeded",
+                    output=memory_output,
+                    error=None,
+                )
         else:
             _acquire_side_effect_execution_lock(
                 db=db,
@@ -1456,6 +3560,71 @@ def process_response_function_calls(
                 normalized_input=evaluation.normalized_input,
             )
         if execution_result.status == "succeeded" and execution_result.output is not None:
+            if is_google_capability_call and isinstance(execution_result.output, dict):
+                output_payload = execution_result.output
+                provider_evidence_refs = _persist_google_provider_evidence(
+                    db=db,
+                    capability_id=capability_id,
+                    output_payload=output_payload,
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
+                if provider_evidence_refs:
+                    output_payload["provider_evidence_refs"] = provider_evidence_refs
+                elif capability_id == "cap.email.read":
+                    read_outcome_raw = output_payload.get("read_outcome")
+                    read_outcome = read_outcome_raw if isinstance(read_outcome_raw, dict) else {}
+                    if read_outcome.get("status") == "ok":
+                        execution_result = ExecutionResult(
+                            status="failed",
+                            output=None,
+                            error="gmail_read_evidence_missing",
+                        )
+                elif capability_id == "cap.calendar.list":
+                    raw_events = output_payload.get("events")
+                    if isinstance(raw_events, list) and raw_events:
+                        execution_result = ExecutionResult(
+                            status="failed",
+                            output=None,
+                            error="calendar_event_evidence_missing",
+                        )
+                if execution_result.status == "succeeded":
+                    execution_result = ExecutionResult(
+                        status="succeeded",
+                        output=_redact_google_provider_output(
+                            capability_id=capability_id,
+                            output_payload=output_payload,
+                        ),
+                        error=None,
+                    )
+            if execution_result.status != "succeeded" or execution_result.output is None:
+                error_reason = execution_result.error or "execution_output_missing"
+                if call_id:
+                    function_call_outputs.append(
+                        _response_function_call_output(
+                            call_id=call_id,
+                            payload={
+                                "status": "failed",
+                                "capability_id": capability_id,
+                                "error": error_reason,
+                            },
+                        )
+                    )
+                action_attempt.execution_output = None
+                action_attempt.execution_error = error_reason
+                action_attempt.status = "failed"
+                action_attempt.updated_at = now_fn()
+                blocked_reasons.append(f"{capability_id}: {error_reason}")
+                if is_retrieval_call:
+                    retrieval_errors.append(error_reason)
+                add_event(
+                    "evt.action.execution.failed",
+                    {
+                        "action_attempt_id": action_attempt.id,
+                        "error": error_reason,
+                    },
+                )
+                continue
             action_attempt.execution_output = execution_result.output
             action_attempt.execution_error = None
             action_attempt.status = "succeeded"
@@ -1521,7 +3690,11 @@ def process_response_function_calls(
                         )
                         retrieval_sources.extend(persisted_sources)
                     else:
-                        retrieval_errors.append("insufficient_evidence")
+                        retrieval_errors.append(
+                            "gmail_read_required"
+                            if capability_id == "cap.email.search"
+                            else "insufficient_evidence"
+                        )
             add_event(
                 "evt.action.execution.succeeded",
                 {
@@ -1773,6 +3946,7 @@ def resolve_approval_decision(
     decision: Literal["approve", "deny"],
     actor_id: str,
     reason: str | None,
+    google_runtime: GoogleConnectorRuntime | None = None,
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
 ) -> ApprovalDecisionResult:
@@ -1888,10 +4062,41 @@ def resolve_approval_decision(
             assistant_message="approval denied. action was not executed.",
         )
 
+    full_input_payload, full_input_error = _full_action_input_payload(
+        db=db,
+        action_attempt=action_attempt,
+        google_runtime=google_runtime,
+    )
+    if full_input_error is not None or full_input_payload is None:
+        approval.status = "expired"
+        approval.decision_reason = full_input_error or "private_action_payload_invalid"
+        approval.decided_at = now
+        approval.updated_at = now
+        action_attempt.status = "failed"
+        action_attempt.execution_error = full_input_error or "private_action_payload_invalid"
+        action_attempt.policy_reason = "private_action_payload_invalid"
+        action_attempt.updated_at = now
+        add_approval_event(
+            "evt.action.execution.failed",
+            {
+                "action_attempt_id": action_attempt.id,
+                "approval_ref": approval.id,
+                "error": action_attempt.execution_error,
+            },
+        )
+        db.flush()
+        raise ActionRuntimeError(
+            status_code=409,
+            code="E_APPROVAL_PAYLOAD_MISMATCH",
+            message="approval payload mismatch",
+            details={"approval_ref": approval.id},
+            retryable=False,
+        )
+
     expected_hash = payload_hash(
         canonical_action_payload(
             capability_id=action_attempt.capability_id,
-            input_payload=action_attempt.proposed_input,
+            input_payload=full_input_payload,
         )
     )
     if expected_hash != approval.payload_hash or expected_hash != action_attempt.payload_hash:
@@ -1969,7 +4174,7 @@ def resolve_approval_decision(
                 },
             )
         else:
-            normalized_input, input_error = capability.validate_input(action_attempt.proposed_input)
+            normalized_input, input_error = capability.validate_input(full_input_payload)
             if input_error is not None or normalized_input is None:
                 action_attempt.status = "failed"
                 action_attempt.execution_error = "schema_invalid"
@@ -2042,8 +4247,8 @@ def process_action_execution_task(
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
 ) -> bool:
-    provider_call: tuple[str, dict[str, Any], str, set[str]] | None = None
-    email_provider_call: tuple[str, str, dict[str, Any], str, set[str]] | None = None
+    provider_call: tuple[str, dict[str, Any], str, set[str], str | None] | None = None
+    email_provider_call: tuple[str, str, dict[str, Any], str, set[str], str] | None = None
     email_undo_prior_action_id: str | None = None
     email_lock_parts: tuple[str, ...] | None = None
     agency_call: tuple[str, dict[str, Any], dict[str, Any]] | None = None
@@ -2052,6 +4257,8 @@ def process_action_execution_task(
     thread_watch_result: dict[str, Any] | None = None
     execution_result: ExecutionResult | GoogleCapabilityExecutionResult | None = None
     retryable_provider_error: str | None = None
+    provider_write_failure_payload: dict[str, Any] | None = None
+    provider_write_failure_status: ProviderWriteReceiptStatus | None = None
 
     if google_runtime is not None:
         with session_factory() as db:
@@ -2094,19 +4301,124 @@ def process_action_execution_task(
                 )
                 return True
             if (
-                action_attempt.capability_id not in _EMAIL_MUTATION_CAPABILITY_IDS
-                and action_attempt.capability_id not in _EMAIL_THREAD_WATCH_CAPABILITY_IDS
-                and isinstance(action_attempt.execution_output, dict)
+                isinstance(action_attempt.execution_output, dict)
                 and action_attempt.execution_output.get("dispatch_state") == "provider_call_started"
             ):
-                _fail_action_execution(
-                    db=db,
-                    action_attempt=action_attempt,
-                    error="provider_result_unknown",
-                    now_fn=now_fn,
-                    new_id_fn=new_id_fn,
+                dispatch_capability = get_capability(action_attempt.capability_id)
+                dispatch_normalized_input: dict[str, Any] | None = None
+                if dispatch_capability is not None:
+                    dispatch_full_input, dispatch_full_error = _full_action_input_payload(
+                        db=db,
+                        action_attempt=action_attempt,
+                        google_runtime=google_runtime,
+                    )
+                    if dispatch_full_error is None and dispatch_full_input is not None:
+                        dispatch_normalized_input, _ = dispatch_capability.validate_input(
+                            dispatch_full_input
+                        )
+                dispatch_provider_account_id = _provider_account_id_from_execution_output(
+                    action_attempt
                 )
-                return True
+                if action_attempt.capability_id in _GOOGLE_RECEIPT_CAPABILITY_IDS:
+                    existing_receipt = _provider_write_receipt_for_attempt(
+                        db=db,
+                        action_attempt=action_attempt,
+                        provider_account_id=dispatch_provider_account_id,
+                        normalized_input=dispatch_normalized_input,
+                    )
+                    if existing_receipt is not None and existing_receipt.request_digest != (
+                        action_attempt.payload_hash
+                    ):
+                        _fail_action_execution(
+                            db=db,
+                            action_attempt=action_attempt,
+                            error="idempotency_key_input_mismatch",
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        return True
+                    if existing_receipt is not None and existing_receipt.status == "succeeded":
+                        action_attempt.status = "succeeded"
+                        action_attempt.execution_output = existing_receipt.response_payload
+                        action_attempt.execution_error = None
+                        action_attempt.updated_at = now_fn()
+                        event_output = dict(existing_receipt.response_payload)
+                        if "undo_token" in event_output:
+                            event_output["undo_token"] = "[redacted]"
+                        _append_action_execution_event(
+                            db=db,
+                            action_attempt=action_attempt,
+                            event_type="evt.action.execution.succeeded",
+                            payload_data={
+                                "action_attempt_id": action_attempt.id,
+                                "output": event_output,
+                                "replayed_provider_write_receipt_id": existing_receipt.id,
+                            },
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        _update_memory_action_traces(
+                            db=db,
+                            action_attempt=action_attempt,
+                            now_fn=now_fn,
+                        )
+                        return True
+                    existing_error = (
+                        existing_receipt.response_payload.get("error")
+                        if existing_receipt is not None
+                        and isinstance(existing_receipt.response_payload, dict)
+                        else None
+                    )
+                    if (
+                        action_attempt.capability_id in _EMAIL_MUTATION_CAPABILITY_IDS
+                        and existing_receipt is not None
+                        and existing_receipt.status == "failed"
+                        and isinstance(existing_error, str)
+                        and _email_provider_error_is_retryable(existing_error)
+                    ):
+                        pass
+                    else:
+                        receipt = existing_receipt
+                        if receipt is None or receipt.status != "ambiguous":
+                            receipt = _record_provider_write_receipt(
+                                db=db,
+                                action_attempt=action_attempt,
+                                status="ambiguous",
+                                normalized_input=dispatch_normalized_input,
+                                provider_account_id=dispatch_provider_account_id,
+                                error="provider_result_unknown",
+                                ambiguity_reason="provider_result_unknown",
+                                now_fn=now_fn,
+                                new_id_fn=new_id_fn,
+                            )
+                        _append_provider_write_reconcile_unavailable_event(
+                            db=db,
+                            action_attempt=action_attempt,
+                            receipt=receipt,
+                            reason="provider_result_unknown",
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        _fail_action_execution(
+                            db=db,
+                            action_attempt=action_attempt,
+                            error="provider_result_unknown",
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        return True
+                elif (
+                    action_attempt.capability_id not in _EMAIL_MUTATION_CAPABILITY_IDS
+                    and action_attempt.capability_id not in _EMAIL_THREAD_WATCH_CAPABILITY_IDS
+                ):
+                    _fail_action_execution(
+                        db=db,
+                        action_attempt=action_attempt,
+                        error="provider_result_unknown",
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
+                    return True
 
             capability = get_capability(action_attempt.capability_id)
             if capability is None:
@@ -2131,7 +4443,21 @@ def process_action_execution_task(
                     new_id_fn=new_id_fn,
                 )
                 return True
-            normalized_input, input_error = capability.validate_input(action_attempt.proposed_input)
+            full_input_payload, full_input_error = _full_action_input_payload(
+                db=db,
+                action_attempt=action_attempt,
+                google_runtime=google_runtime,
+            )
+            if full_input_error is not None or full_input_payload is None:
+                _fail_action_execution(
+                    db=db,
+                    action_attempt=action_attempt,
+                    error=full_input_error or "private_action_payload_invalid",
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
+                return True
+            normalized_input, input_error = capability.validate_input(full_input_payload)
             if input_error is not None or normalized_input is None:
                 _fail_action_execution(
                     db=db,
@@ -2152,6 +4478,50 @@ def process_action_execution_task(
                     error=preflight_error,
                     now_fn=now_fn,
                     new_id_fn=new_id_fn,
+                )
+                return True
+
+            if action_attempt.capability_id in MEMORY_CAPABILITY_IDS:
+                try:
+                    memory_output = _execute_memory_capability(
+                        db=db,
+                        capability_id=action_attempt.capability_id,
+                        normalized_input=normalized_input,
+                        action_attempt=action_attempt,
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    _fail_action_execution(
+                        db=db,
+                        action_attempt=action_attempt,
+                        error=safe_failure_reason(
+                            str(exc),
+                            fallback=f"unexpected {exc.__class__.__name__}",
+                        ),
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
+                    return True
+                action_attempt.status = "succeeded"
+                action_attempt.execution_output = memory_output
+                action_attempt.execution_error = None
+                action_attempt.updated_at = now_fn()
+                _append_action_execution_event(
+                    db=db,
+                    action_attempt=action_attempt,
+                    event_type="evt.action.execution.succeeded",
+                    payload_data={
+                        "action_attempt_id": action_attempt.id,
+                        "output": memory_output,
+                    },
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
+                _update_memory_action_traces(
+                    db=db,
+                    action_attempt=action_attempt,
+                    now_fn=now_fn,
                 )
                 return True
 
@@ -2359,6 +4729,11 @@ def process_action_execution_task(
                     now_fn=now_fn,
                     new_id_fn=new_id_fn,
                 )
+                _update_memory_action_traces(
+                    db=db,
+                    action_attempt=action_attempt,
+                    now_fn=now_fn,
+                )
                 return True
 
             if action_attempt.capability_id in _EMAIL_MUTATION_CAPABILITY_IDS:
@@ -2409,6 +4784,21 @@ def process_action_execution_task(
                         new_id_fn=new_id_fn,
                     )
                     return True
+                _, authority_error = _provider_write_authority_payload(
+                    db=db,
+                    action_attempt=action_attempt,
+                    normalized_input=normalized_input,
+                    provider_account_id=provider_account_id,
+                )
+                if authority_error is not None:
+                    _fail_action_execution(
+                        db=db,
+                        action_attempt=action_attempt,
+                        error=authority_error,
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
+                    return True
                 idempotency_key = _email_idempotency_key(
                     capability_id=action_attempt.capability_id,
                     provider_account_id=provider_account_id,
@@ -2449,6 +4839,11 @@ def process_action_execution_task(
                             },
                             now_fn=now_fn,
                             new_id_fn=new_id_fn,
+                        )
+                        _update_memory_action_traces(
+                            db=db,
+                            action_attempt=action_attempt,
+                            now_fn=now_fn,
                         )
                         return True
                     elif email_action.status == "failed":
@@ -2571,6 +4966,7 @@ def process_action_execution_task(
                 action_attempt.execution_output = {
                     "dispatch_state": "provider_call_started",
                     "email_action_id": email_action.id,
+                    "provider_account_id": provider_account_id,
                 }
                 action_attempt.updated_at = now_fn()
                 email_provider_call = (
@@ -2579,6 +4975,7 @@ def process_action_execution_task(
                     provider_input,
                     access_token,
                     granted_scopes,
+                    provider_account_id,
                 )
             elif action_attempt.capability_id in GOOGLE_CAPABILITY_IDS:
                 if google_runtime is None:
@@ -2590,7 +4987,7 @@ def process_action_execution_task(
                         new_id_fn=new_id_fn,
                     )
                     return True
-                access_token, granted_scopes, _, access_failure = (
+                access_token, granted_scopes, provider_account_id, access_failure = (
                     google_runtime.prepare_capability_access_without_refresh(
                         db=db,
                         capability_id=action_attempt.capability_id,
@@ -2619,13 +5016,121 @@ def process_action_execution_task(
                         new_id_fn=new_id_fn,
                     )
                     return True
-                action_attempt.execution_output = {"dispatch_state": "provider_call_started"}
+                if (
+                    action_attempt.capability_id in _GOOGLE_RECEIPT_CAPABILITY_IDS
+                    and provider_account_id is None
+                ):
+                    _fail_action_execution(
+                        db=db,
+                        action_attempt=action_attempt,
+                        error="google_account_identity_missing",
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
+                    return True
+                if action_attempt.capability_id in _GOOGLE_RECEIPT_CAPABILITY_IDS:
+                    assert provider_account_id is not None
+                    existing_receipt = _provider_write_receipt_for_attempt(
+                        db=db,
+                        action_attempt=action_attempt,
+                        provider_account_id=provider_account_id,
+                        normalized_input=normalized_input,
+                    )
+                    if existing_receipt is not None and existing_receipt.request_digest != (
+                        action_attempt.payload_hash
+                    ):
+                        _fail_action_execution(
+                            db=db,
+                            action_attempt=action_attempt,
+                            error="idempotency_key_input_mismatch",
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        return True
+                    if existing_receipt is not None and existing_receipt.status == "succeeded":
+                        action_attempt.status = "succeeded"
+                        action_attempt.execution_output = existing_receipt.response_payload
+                        action_attempt.execution_error = None
+                        action_attempt.updated_at = now_fn()
+                        event_output = dict(existing_receipt.response_payload)
+                        if "undo_token" in event_output:
+                            event_output["undo_token"] = "[redacted]"
+                        _append_action_execution_event(
+                            db=db,
+                            action_attempt=action_attempt,
+                            event_type="evt.action.execution.succeeded",
+                            payload_data={
+                                "action_attempt_id": action_attempt.id,
+                                "output": event_output,
+                                "replayed_provider_write_receipt_id": existing_receipt.id,
+                            },
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        _update_memory_action_traces(
+                            db=db,
+                            action_attempt=action_attempt,
+                            now_fn=now_fn,
+                        )
+                        return True
+                    if existing_receipt is not None:
+                        if existing_receipt.status == "executing":
+                            _fail_action_execution(
+                                db=db,
+                                action_attempt=action_attempt,
+                                error="provider_write_in_progress",
+                                now_fn=now_fn,
+                                new_id_fn=new_id_fn,
+                            )
+                            return True
+                        _fail_action_execution(
+                            db=db,
+                            action_attempt=action_attempt,
+                            error=str(
+                                existing_receipt.response_payload.get("error")
+                                or "provider_write_failed"
+                            ),
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        return True
+                    _, authority_error = _provider_write_authority_payload(
+                        db=db,
+                        action_attempt=action_attempt,
+                        normalized_input=normalized_input,
+                        provider_account_id=provider_account_id,
+                    )
+                    if authority_error is not None:
+                        _fail_action_execution(
+                            db=db,
+                            action_attempt=action_attempt,
+                            error=authority_error,
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        return True
+                action_attempt.execution_output = {
+                    "dispatch_state": "provider_call_started",
+                    "provider_account_id": provider_account_id,
+                }
+                if action_attempt.capability_id in _GOOGLE_RECEIPT_CAPABILITY_IDS:
+                    _record_provider_write_receipt(
+                        db=db,
+                        action_attempt=action_attempt,
+                        status="executing",
+                        normalized_input=normalized_input,
+                        provider_account_id=provider_account_id,
+                        output_payload={"dispatch_state": "provider_call_started"},
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
                 action_attempt.updated_at = now_fn()
                 provider_call = (
                     action_attempt.capability_id,
                     normalized_input,
                     access_token,
                     granted_scopes,
+                    provider_account_id,
                 )
             elif action_attempt.capability_id in AGENCY_CAPABILITY_IDS:
                 if agency_runtime is None:
@@ -2680,9 +5185,14 @@ def process_action_execution_task(
                 local_call = (capability, normalized_input)
 
     if email_provider_call is not None:
-        email_action_id, capability_id, normalized_input, access_token, granted_scopes = (
-            email_provider_call
-        )
+        (
+            email_action_id,
+            capability_id,
+            normalized_input,
+            access_token,
+            granted_scopes,
+            provider_account_id,
+        ) = email_provider_call
         assert google_runtime is not None
         lock_db: Session | None = None
         lock_id: int | None = None
@@ -2749,12 +5259,14 @@ def process_action_execution_task(
                 normalized_input,
                 access_token,
                 granted_scopes,
+                provider_account_id,
             )
             execution_result = google_runtime.execute_provider_capability(
                 capability_id=capability_id,
                 normalized_input=normalized_input,
                 access_token=access_token,
                 granted_scopes=granted_scopes,
+                provider_account_id=provider_account_id,
             )
         finally:
             if lock_db is not None and lock_id is not None:
@@ -2765,13 +5277,16 @@ def process_action_execution_task(
                 lock_db.commit()
                 lock_db.close()
     elif provider_call is not None:
-        capability_id, normalized_input, access_token, granted_scopes = provider_call
+        capability_id, normalized_input, access_token, granted_scopes, provider_account_id = (
+            provider_call
+        )
         assert google_runtime is not None
         execution_result = google_runtime.execute_provider_capability(
             capability_id=capability_id,
             normalized_input=normalized_input,
             access_token=access_token,
             granted_scopes=granted_scopes,
+            provider_account_id=provider_account_id,
         )
     elif agency_call is not None:
         capability_id, normalized_input, agency_context = agency_call
@@ -2854,7 +5369,9 @@ def process_action_execution_task(
                         error=None,
                     )
             if email_provider_call is not None:
-                email_action_id, capability_id, provider_input, _, _ = email_provider_call
+                email_action_id, capability_id, provider_input, _, _, provider_account_id = (
+                    email_provider_call
+                )
                 email_action = db.scalar(
                     select(EmailActionRecord)
                     .where(EmailActionRecord.id == email_action_id)
@@ -2932,6 +5449,8 @@ def process_action_execution_task(
                     }:
                         provider_error = str(provider_status)
                     if provider_error is not None:
+                        provider_write_failure_payload = dict(execution_result.output)
+                        provider_write_failure_status = "failed"
                         if _email_provider_error_is_retryable(provider_error):
                             email_action.status = "executing"
                             email_action.failure_code = None
@@ -2978,7 +5497,14 @@ def process_action_execution_task(
                         and execution_result.auth_failure is not None
                     ):
                         error = execution_result.auth_failure.failure_class
-                    if _email_provider_error_is_retryable(error):
+                    provider_write_failure_status = _provider_write_failure_receipt_status(
+                        error=error,
+                        output_payload=None,
+                    )
+                    if (
+                        provider_write_failure_status != "ambiguous"
+                        and _email_provider_error_is_retryable(error)
+                    ):
                         email_action.status = "executing"
                         email_action.failure_code = None
                         retryable_provider_error = error
@@ -2988,25 +5514,161 @@ def process_action_execution_task(
                     email_action.provider_result = {"error": error}
                     email_action.updated_at = now_fn()
             if retryable_provider_error is not None:
-                action_attempt.execution_error = retryable_provider_error
-                action_attempt.updated_at = now_fn()
-                _append_action_execution_event(
-                    db=db,
-                    action_attempt=action_attempt,
-                    event_type="evt.action.execution.retrying",
-                    payload_data={
-                        "action_attempt_id": action_attempt.id,
-                        "error": retryable_provider_error,
-                    },
-                    now_fn=now_fn,
-                    new_id_fn=new_id_fn,
-                )
+                if action_attempt.capability_id in _GOOGLE_RECEIPT_CAPABILITY_IDS:
+                    receipt_status = provider_write_failure_status or (
+                        _provider_write_failure_receipt_status(
+                            error=retryable_provider_error,
+                            output_payload=provider_write_failure_payload,
+                        )
+                    )
+                    receipt = _record_provider_write_receipt(
+                        db=db,
+                        action_attempt=action_attempt,
+                        status=receipt_status,
+                        normalized_input=(
+                            provider_input if email_provider_call is not None else None
+                        ),
+                        provider_account_id=(
+                            provider_account_id if email_provider_call is not None else None
+                        ),
+                        output_payload=provider_write_failure_payload,
+                        error=retryable_provider_error,
+                        ambiguity_reason=retryable_provider_error
+                        if receipt_status == "ambiguous"
+                        else None,
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
+                    if receipt_status == "ambiguous":
+                        _append_provider_write_reconcile_unavailable_event(
+                            db=db,
+                            action_attempt=action_attempt,
+                            receipt=receipt,
+                            reason=retryable_provider_error,
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        _fail_action_execution(
+                            db=db,
+                            action_attempt=action_attempt,
+                            error=retryable_provider_error,
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        retryable_provider_error = None
+                    else:
+                        action_attempt.execution_error = retryable_provider_error
+                        action_attempt.updated_at = now_fn()
+                        _append_action_execution_event(
+                            db=db,
+                            action_attempt=action_attempt,
+                            event_type="evt.action.execution.retrying",
+                            payload_data={
+                                "action_attempt_id": action_attempt.id,
+                                "error": retryable_provider_error,
+                            },
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                else:
+                    action_attempt.execution_error = retryable_provider_error
+                    action_attempt.updated_at = now_fn()
+                    _append_action_execution_event(
+                        db=db,
+                        action_attempt=action_attempt,
+                        event_type="evt.action.execution.retrying",
+                        payload_data={
+                            "action_attempt_id": action_attempt.id,
+                            "error": retryable_provider_error,
+                        },
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
             elif execution_result.status == "succeeded" and execution_result.output is not None:
+                provider_write_normalized_input = None
+                provider_write_provider_account_id = None
+                if email_provider_call is not None:
+                    (
+                        _,
+                        _,
+                        provider_write_normalized_input,
+                        _,
+                        _,
+                        provider_write_provider_account_id,
+                    ) = email_provider_call
+                elif provider_call is not None:
+                    (
+                        _,
+                        provider_write_normalized_input,
+                        _,
+                        _,
+                        provider_write_provider_account_id,
+                    ) = provider_call
+                if action_attempt.capability_id in _GOOGLE_RECEIPT_CAPABILITY_IDS and isinstance(
+                    execution_result.output, dict
+                ):
+                    provider_write_identity_error = _provider_write_success_identity_error(
+                        capability_id=action_attempt.capability_id,
+                        provider_object_ids=_provider_write_object_ids(
+                            normalized_input=provider_write_normalized_input,
+                            response_payload=execution_result.output,
+                        ),
+                    )
+                    if provider_write_identity_error is not None:
+                        receipt = _record_provider_write_receipt(
+                            db=db,
+                            action_attempt=action_attempt,
+                            status="ambiguous",
+                            normalized_input=provider_write_normalized_input,
+                            provider_account_id=provider_write_provider_account_id,
+                            output_payload=execution_result.output,
+                            error=provider_write_identity_error,
+                            ambiguity_reason=provider_write_identity_error,
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        _append_provider_write_reconcile_unavailable_event(
+                            db=db,
+                            action_attempt=action_attempt,
+                            receipt=receipt,
+                            reason=provider_write_identity_error,
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        _fail_action_execution(
+                            db=db,
+                            action_attempt=action_attempt,
+                            error=provider_write_identity_error,
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        return True
+                public_output = execution_result.output
+                if action_attempt.capability_id in _GOOGLE_RECEIPT_CAPABILITY_IDS and isinstance(
+                    execution_result.output, dict
+                ):
+                    public_output = _redact_google_provider_output(
+                        capability_id=action_attempt.capability_id,
+                        output_payload=execution_result.output,
+                    )
                 action_attempt.status = "succeeded"
-                action_attempt.execution_output = execution_result.output
+                action_attempt.execution_output = public_output
                 action_attempt.execution_error = None
                 action_attempt.updated_at = now_fn()
-                event_output = dict(execution_result.output)
+                if action_attempt.capability_id in _GOOGLE_RECEIPT_CAPABILITY_IDS and isinstance(
+                    execution_result.output, dict
+                ):
+                    _record_provider_write_receipt(
+                        db=db,
+                        action_attempt=action_attempt,
+                        status="succeeded",
+                        normalized_input=provider_write_normalized_input,
+                        provider_account_id=provider_write_provider_account_id,
+                        output_payload=execution_result.output,
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
+                event_output = dict(public_output)
                 if "undo_token" in event_output:
                     event_output["undo_token"] = "[redacted]"
                 _append_action_execution_event(
@@ -3020,7 +5682,31 @@ def process_action_execution_task(
                     now_fn=now_fn,
                     new_id_fn=new_id_fn,
                 )
+                _update_memory_action_traces(
+                    db=db,
+                    action_attempt=action_attempt,
+                    now_fn=now_fn,
+                )
             else:
+                provider_write_normalized_input = None
+                provider_write_provider_account_id = None
+                if email_provider_call is not None:
+                    (
+                        _,
+                        _,
+                        provider_write_normalized_input,
+                        _,
+                        _,
+                        provider_write_provider_account_id,
+                    ) = email_provider_call
+                elif provider_call is not None:
+                    (
+                        _,
+                        provider_write_normalized_input,
+                        _,
+                        _,
+                        provider_write_provider_account_id,
+                    ) = provider_call
                 error = execution_result.error or "execution_output_missing"
                 if (
                     isinstance(execution_result, GoogleCapabilityExecutionResult)
@@ -3032,6 +5718,37 @@ def process_action_execution_task(
                             db=db,
                             execution_result=execution_result,
                             now_fn=now_fn,
+                        )
+                if action_attempt.capability_id in _GOOGLE_RECEIPT_CAPABILITY_IDS:
+                    failure_payload = provider_write_failure_payload
+                    if failure_payload is None and isinstance(execution_result.output, dict):
+                        failure_payload = execution_result.output
+                    receipt_status = provider_write_failure_status or (
+                        _provider_write_failure_receipt_status(
+                            error=error,
+                            output_payload=failure_payload,
+                        )
+                    )
+                    receipt = _record_provider_write_receipt(
+                        db=db,
+                        action_attempt=action_attempt,
+                        status=receipt_status,
+                        normalized_input=provider_write_normalized_input,
+                        provider_account_id=provider_write_provider_account_id,
+                        output_payload=failure_payload,
+                        error=error,
+                        ambiguity_reason=error if receipt_status == "ambiguous" else None,
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
+                    if receipt_status == "ambiguous":
+                        _append_provider_write_reconcile_unavailable_event(
+                            db=db,
+                            action_attempt=action_attempt,
+                            receipt=receipt,
+                            reason=error,
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
                         )
                 _fail_action_execution(
                     db=db,

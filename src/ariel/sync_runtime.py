@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 import hashlib
+import json
 from typing import Any, cast
 
 from sqlalchemy import select, text
@@ -14,16 +16,19 @@ from ariel.google_connector import (
     DefaultGoogleWorkspaceProvider,
     GOOGLE_CONNECTOR_ID,
     GoogleConnectorRuntime,
+    is_typed_google_read_output,
 )
+from ariel.google_workspace_normalization import normalize_calendar_event
 from ariel.persistence import (
     BackgroundTaskRecord,
     EmailThreadWatchRecord,
     GoogleConnectorRecord,
+    GoogleProviderObjectRecord,
+    ProviderEvidenceBlockRecord,
+    ProviderEvidenceRecord,
     ProviderEventRecord,
     SyncCursorRecord,
     SyncRunRecord,
-    WorkspaceItemEventRecord,
-    WorkspaceItemRecord,
     to_rfc3339,
 )
 
@@ -31,6 +36,47 @@ from ariel.persistence import (
 def _provider_sync_lock_id(*parts: str) -> int:
     digest = hashlib.sha256("\x1f".join(parts).encode("utf-8")).digest()
     return int.from_bytes(digest[:8], "big") & 0x7FFF_FFFF_FFFF_FFFF
+
+
+def _json_digest(payload: dict[str, Any]) -> str:
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _enqueue_workspace_commitment_extraction_due(
+    db: Session,
+    *,
+    evidence_id: str,
+    now: datetime,
+    new_id_fn: Callable[[str], str],
+) -> None:
+    existing_task_id = db.scalar(
+        select(BackgroundTaskRecord.id)
+        .where(
+            BackgroundTaskRecord.task_type == "workspace_commitment_extraction_due",
+            BackgroundTaskRecord.status.in_(("pending", "running")),
+            BackgroundTaskRecord.payload["evidence_id"].as_string() == evidence_id,
+        )
+        .limit(1)
+    )
+    if existing_task_id is not None:
+        return
+    db.add(
+        BackgroundTaskRecord(
+            id=new_id_fn("tsk"),
+            task_type="workspace_commitment_extraction_due",
+            payload={"evidence_id": evidence_id},
+            status="pending",
+            attempts=0,
+            max_attempts=3,
+            error=None,
+            claimed_by=None,
+            run_after=now,
+            last_heartbeat=None,
+            created_at=now,
+            updated_at=now,
+        )
+    )
 
 
 def _acquire_provider_sync_lock(
@@ -65,7 +111,9 @@ def _provider_account_id_for_sync(db: Session) -> str:
         .where(GoogleConnectorRecord.id == GOOGLE_CONNECTOR_ID)
         .limit(1)
     )
-    return account_subject or GOOGLE_CONNECTOR_ID
+    if isinstance(account_subject, str) and account_subject.strip():
+        return account_subject.strip()
+    return GOOGLE_CONNECTOR_ID
 
 
 def process_provider_event_received(
@@ -254,6 +302,7 @@ def process_provider_sync_due(
     )
 
     outputs: list[dict[str, Any]] = []
+    sync_provider_account_id = GOOGLE_CONNECTOR_ID
     try:
         sync_capability_id = {
             "calendar": "cap.calendar.list",
@@ -283,6 +332,7 @@ def process_provider_sync_due(
                         now_fn=now_fn,
                         new_id_fn=new_id_fn,
                     )
+                sync_provider_account_id = _provider_account_id_for_sync(db)
         if resource_type == "calendar":
             page_token: str | None = None
             while True:
@@ -349,6 +399,126 @@ def process_provider_sync_due(
         raise
 
     try:
+        gmail_read_outputs: dict[str, dict[str, Any]] = {}
+        if resource_type == "gmail":
+            email_read = getattr(runtime.workspace_provider, "email_read", None)
+            seen_message_ids: set[str] = set()
+            for output in outputs:
+                raw_histories = output.get("history")
+                histories = raw_histories if isinstance(raw_histories, list) else []
+                for history in histories:
+                    if not isinstance(history, dict):
+                        continue
+                    for key in ("messagesAdded", "labelsAdded", "labelsRemoved"):
+                        raw_entries = history.get(key)
+                        entries = raw_entries if isinstance(raw_entries, list) else []
+                        for entry in entries:
+                            message = entry.get("message") if isinstance(entry, dict) else None
+                            if not isinstance(message, dict):
+                                continue
+                            message_id = _payload_text(message, "id")
+                            if message_id is None or message_id in seen_message_ids:
+                                continue
+                            seen_message_ids.add(message_id)
+                            if not callable(email_read):
+                                raise RuntimeError("gmail_sync_email_read_unavailable")
+                            try:
+                                read_output = email_read(
+                                    access_token=access_token,
+                                    normalized_input={
+                                        "message_id": message_id,
+                                        "thread_id": None,
+                                        "mode": "message",
+                                    },
+                                )
+                            except RuntimeError as exc:
+                                reason = str(exc).strip()
+                                if reason == "resource_not_found":
+                                    reason_code = "gmail_message_unavailable"
+                                    status = "no_body"
+                                    recovery = "The message changed or disappeared before sync could read it."
+                                elif reason == "google_response_too_large":
+                                    reason_code = "gmail_body_too_large"
+                                    status = "body_too_large"
+                                    recovery = (
+                                        "Use narrower message context or ask for metadata only."
+                                    )
+                                else:
+                                    raise
+                                read_output = {
+                                    "schema_version": "google.gmail.message_evidence.v1",
+                                    "mode": "message",
+                                    "message": {
+                                        "provider_account_id": sync_provider_account_id,
+                                        "message_id": message_id,
+                                        "thread_id": _payload_text(message, "threadId"),
+                                        "history_id": None,
+                                        "rfc_message_id": None,
+                                        "in_reply_to": None,
+                                        "references": [],
+                                        "subject": None,
+                                        "subject_key": None,
+                                        "sender": None,
+                                        "recipients": [],
+                                        "cc": [],
+                                        "header_date": None,
+                                        "internal_date": None,
+                                        "label_ids": [
+                                            label_id
+                                            for label_id in message.get("labelIds", [])
+                                            if isinstance(label_id, str)
+                                        ]
+                                        if isinstance(message.get("labelIds"), list)
+                                        else [],
+                                        "direction": "unknown",
+                                        "provider_url": (
+                                            f"https://mail.google.com/mail/u/0/#all/{message_id}"
+                                        ),
+                                        "raw_payload_digest": hashlib.sha256(
+                                            message_id.encode("utf-8")
+                                        ).hexdigest(),
+                                        "attachments": [],
+                                    },
+                                    "published_at": None,
+                                    "evidence": {
+                                        "source_kind": "gmail_message",
+                                        "message_id": message_id,
+                                        "thread_id": _payload_text(message, "threadId"),
+                                        "blocks": [],
+                                        "truncated": False,
+                                        "decode_notes": [reason_code],
+                                        "html_security": {},
+                                    },
+                                    "read_outcome": {
+                                        "status": status,
+                                        "reason_code": reason_code,
+                                        "recovery": recovery,
+                                    },
+                                    "retrieved_at": to_rfc3339(now_fn()),
+                                }
+                                if isinstance(read_output, dict):
+                                    read_message = read_output.get("message")
+                                    if isinstance(read_message, dict):
+                                        read_message["provider_account_id"] = (
+                                            sync_provider_account_id
+                                        )
+                            if not _gmail_sync_read_output_valid(read_output):
+                                raise RuntimeError("gmail_sync_read_output_invalid")
+                            gmail_read_outputs[message_id] = read_output
+    except Exception as exc:
+        _mark_sync_failed(
+            session_factory=session_factory,
+            provider_event_id=provider_event_id,
+            sync_run_id=sync_run_id,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            error=str(exc),
+            now=now_fn(),
+        )
+        _release_provider_sync_lock(lock_db, lock_id)
+        raise
+
+    try:
         with session_factory() as db:
             with db.begin():
                 event = (
@@ -395,7 +565,7 @@ def process_provider_sync_due(
                 item_count = 0
                 observation_count = 0
                 cursor_after = cursor_before
-                provider_account_id = _provider_account_id_for_sync(db)
+                provider_account_id = sync_provider_account_id
                 if resource_type == "calendar":
                     for output in outputs:
                         cursor_after = _payload_text(output, "nextSyncToken") or cursor_after
@@ -406,6 +576,7 @@ def process_provider_sync_due(
                                 db,
                                 cast(dict[str, Any], item),
                                 resource_id=resource_id,
+                                provider_account_id=provider_account_id,
                                 provider_event_id=provider_event_id,
                                 now=now,
                                 new_id_fn=new_id_fn,
@@ -426,6 +597,7 @@ def process_provider_sync_due(
                                     provider_event_id=provider_event_id,
                                     now=now,
                                     new_id_fn=new_id_fn,
+                                    gmail_read_outputs=gmail_read_outputs,
                                 )
                                 item_count += added
                                 observation_count += observations
@@ -475,32 +647,231 @@ def _sync_calendar_item(
     item: dict[str, Any],
     *,
     resource_id: str,
+    provider_account_id: str,
     provider_event_id: str | None,
     now: datetime,
     new_id_fn: Callable[[str], str],
 ) -> bool:
+    del provider_event_id
     external_id = _payload_text(item, "id")
     if external_id is None:
         return False
     status = "deleted" if item.get("status") == "cancelled" else "active"
-    title = _payload_text(item, "summary") or "Calendar event"
     updated = _payload_text(item, "updated") or to_rfc3339(now)
-    return _upsert_workspace_item_event(
-        db,
-        provider="google",
-        item_type="calendar_event",
-        external_id=external_id,
-        title=title,
-        summary=title,
-        source_uri=_payload_text(item, "htmlLink"),
-        status=status,
-        metadata={"resource_id": resource_id, "updated": updated},
-        event_type="deleted" if status == "deleted" else "updated",
-        event_dedupe_key=f"google:calendar:{resource_id}:{external_id}:{status}:{updated}",
-        provider_event_id=provider_event_id,
-        now=now,
-        new_id_fn=new_id_fn,
+    normalized = normalize_calendar_event(
+        item,
+        provider_account_id=provider_account_id,
+        calendar_id=resource_id,
     )
+    metadata = {
+        "summary": normalized.summary,
+        "status": normalized.status,
+        "start": asdict(normalized.start),
+        "end": asdict(normalized.end),
+        "all_day": normalized.all_day,
+        "attendees": [asdict(attendee) for attendee in normalized.attendees],
+        "organizer": asdict(normalized.organizer) if normalized.organizer else None,
+        "creator": asdict(normalized.creator) if normalized.creator else None,
+        "ical_uid": normalized.ical_uid,
+        "recurring_event_id": normalized.recurring_event_id,
+        "recurrence": list(normalized.recurrence),
+        "location": normalized.location,
+        "conference_data": normalized.conference_data,
+        "reminders": normalized.reminders,
+        "updated": normalized.updated,
+        "etag": normalized.etag,
+        "provider_url": normalized.provider_url,
+        "hangout_link": normalized.hangout_link,
+        "raw_payload_digest": normalized.raw_payload_digest,
+    }
+    content_digest = normalized.raw_payload_digest
+    provider_object = db.scalar(
+        select(GoogleProviderObjectRecord)
+        .where(
+            GoogleProviderObjectRecord.provider_account_id == provider_account_id,
+            GoogleProviderObjectRecord.object_type == "calendar_event",
+            GoogleProviderObjectRecord.calendar_id == resource_id,
+            GoogleProviderObjectRecord.external_id == external_id,
+        )
+        .with_for_update()
+        .limit(1)
+    )
+    if provider_object is None:
+        provider_object = GoogleProviderObjectRecord(
+            id=new_id_fn("gpo"),
+            provider_account_id=provider_account_id,
+            object_type="calendar_event",
+            external_id=external_id,
+            thread_external_id=None,
+            calendar_id=resource_id,
+            ical_uid=normalized.ical_uid,
+            status=status,
+            source_timestamp=_parse_provider_timestamp(updated),
+            observed_at=now,
+            provider_url=normalized.provider_url,
+            metadata_json=metadata,
+            content_digest=content_digest,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(provider_object)
+        db.flush()
+    else:
+        provider_object.status = status
+        provider_object.source_timestamp = _parse_provider_timestamp(updated)
+        provider_object.observed_at = now
+        provider_object.provider_url = normalized.provider_url
+        provider_object.metadata_json = metadata
+        provider_object.content_digest = content_digest
+        provider_object.updated_at = now
+
+    if status == "deleted":
+        evidence_rows = db.scalars(
+            select(ProviderEvidenceRecord)
+            .where(
+                ProviderEvidenceRecord.provider_object_id == provider_object.id,
+                ProviderEvidenceRecord.lifecycle_state != "deleted",
+                ProviderEvidenceRecord.content_digest != content_digest,
+            )
+            .with_for_update()
+        ).all()
+        for evidence_row in evidence_rows:
+            evidence_row.lifecycle_state = "deleted"
+            evidence_row.updated_at = now
+        cancellation_evidence = db.scalar(
+            select(ProviderEvidenceRecord)
+            .where(
+                ProviderEvidenceRecord.provider_object_id == provider_object.id,
+                ProviderEvidenceRecord.content_digest == content_digest,
+            )
+            .limit(1)
+        )
+        if cancellation_evidence is None:
+            cancellation_evidence = ProviderEvidenceRecord(
+                id=new_id_fn("pev"),
+                provider_object_id=provider_object.id,
+                provider="google",
+                provider_account_id=provider_account_id,
+                source_kind="calendar_event",
+                external_id=external_id,
+                thread_external_id=None,
+                calendar_id=resource_id,
+                source_uri=normalized.provider_url,
+                source_timestamp=_parse_provider_timestamp(updated),
+                content_digest=content_digest,
+                metadata_json=metadata,
+                taint="provider_untrusted",
+                sensitivity="private",
+                retention_policy="provider_source",
+                extraction_status="not_actionable",
+                lifecycle_state="deleted",
+                observed_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(cancellation_evidence)
+        else:
+            cancellation_evidence.lifecycle_state = "deleted"
+            cancellation_evidence.extraction_status = "not_actionable"
+            cancellation_evidence.updated_at = now
+        return True
+
+    evidence = db.scalar(
+        select(ProviderEvidenceRecord)
+        .where(
+            ProviderEvidenceRecord.provider_object_id == provider_object.id,
+            ProviderEvidenceRecord.content_digest == content_digest,
+        )
+        .with_for_update()
+        .limit(1)
+    )
+    if evidence is not None and evidence.lifecycle_state != "available":
+        return True
+    if evidence is None:
+        enqueue_extraction = False
+        superseded_rows = db.scalars(
+            select(ProviderEvidenceRecord)
+            .where(
+                ProviderEvidenceRecord.provider_object_id == provider_object.id,
+                ProviderEvidenceRecord.lifecycle_state == "available",
+            )
+            .with_for_update()
+        ).all()
+        for superseded_row in superseded_rows:
+            superseded_row.lifecycle_state = "superseded"
+            superseded_row.updated_at = now
+        evidence = ProviderEvidenceRecord(
+            id=new_id_fn("pev"),
+            provider_object_id=provider_object.id,
+            provider="google",
+            provider_account_id=provider_account_id,
+            source_kind="calendar_event",
+            external_id=external_id,
+            thread_external_id=None,
+            calendar_id=resource_id,
+            source_uri=normalized.provider_url,
+            source_timestamp=_parse_provider_timestamp(updated),
+            content_digest=content_digest,
+            metadata_json=metadata,
+            taint="provider_untrusted",
+            sensitivity="private",
+            retention_policy="provider_source",
+            extraction_status="pending",
+            lifecycle_state="available",
+            observed_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(evidence)
+        db.flush()
+        existing_block_id = db.scalar(
+            select(ProviderEvidenceBlockRecord.id)
+            .where(ProviderEvidenceBlockRecord.evidence_id == evidence.id)
+            .limit(1)
+        )
+        block_count = 0
+        if existing_block_id is None:
+            for index, block in enumerate(normalized.description_blocks):
+                db.add(
+                    ProviderEvidenceBlockRecord(
+                        id=new_id_fn("peb"),
+                        evidence_id=evidence.id,
+                        block_index=index,
+                        block_kind="calendar_description",
+                        text=block.text,
+                        digest=block.digest,
+                        source_offsets={"block_id": block.block_id},
+                        metadata_json={
+                            "source_mime_type": block.source_mime_type,
+                            "truncated": block.truncated,
+                        },
+                        created_at=now,
+                    )
+                )
+                block_count += 1
+        if block_count:
+            enqueue_extraction = True
+        elif existing_block_id is not None and evidence.extraction_status == "pending":
+            enqueue_extraction = True
+        if enqueue_extraction:
+            _enqueue_workspace_commitment_extraction_due(
+                db,
+                evidence_id=evidence.id,
+                now=now,
+                new_id_fn=new_id_fn,
+            )
+    elif evidence.metadata_json != metadata:
+        evidence.metadata_json = metadata
+        evidence.extraction_status = "pending"
+        evidence.observed_at = now
+        evidence.updated_at = now
+        _enqueue_workspace_commitment_extraction_due(
+            db,
+            evidence_id=evidence.id,
+            now=now,
+            new_id_fn=new_id_fn,
+        )
+    return True
 
 
 def _gmail_bootstrap_history_id(
@@ -520,6 +891,45 @@ def _gmail_bootstrap_history_id(
     return _payload_text(payload, "historyId") if isinstance(payload, dict) else None
 
 
+def _gmail_sync_read_output_valid(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if is_typed_google_read_output(capability_id="cap.email.read", payload=value):
+        return True
+    if value.get("schema_version") != "google.gmail.message_evidence.v1":
+        return False
+    if not isinstance(value.get("retrieved_at"), str) or not value["retrieved_at"].strip():
+        return False
+    read_outcome = value.get("read_outcome")
+    if not isinstance(read_outcome, dict):
+        return False
+    if read_outcome.get("status") not in {"body_too_large", "decode_failed", "no_body"}:
+        return False
+    evidence = value.get("evidence")
+    if not isinstance(evidence, dict) or evidence.get("source_kind") != "gmail_message":
+        return False
+    blocks = evidence.get("blocks")
+    if not isinstance(blocks, list) or blocks:
+        return False
+    message = value.get("message")
+    if not isinstance(message, dict):
+        return False
+    message_id = message.get("message_id")
+    return isinstance(message_id, str) and bool(message_id.strip())
+
+
+def _parse_provider_timestamp(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
 def _sync_gmail_history(
     db: Session,
     history: dict[str, Any],
@@ -529,16 +939,13 @@ def _sync_gmail_history(
     provider_event_id: str | None,
     now: datetime,
     new_id_fn: Callable[[str], str],
+    gmail_read_outputs: dict[str, dict[str, Any]],
 ) -> tuple[int, int]:
+    del resource_id, provider_event_id
     history_id = _payload_text(history, "id") or to_rfc3339(now)
     item_count = 0
     observation_count = 0
-    for key, status in (
-        ("messagesAdded", "active"),
-        ("labelsAdded", "active"),
-        ("labelsRemoved", "active"),
-        ("messagesDeleted", "deleted"),
-    ):
+    for key in ("messagesAdded", "labelsAdded", "labelsRemoved", "messagesDeleted"):
         raw_entries = history.get(key)
         entries = raw_entries if isinstance(raw_entries, list) else []
         for entry in entries:
@@ -556,7 +963,317 @@ def _sync_gmail_history(
                 if isinstance(label_ids_raw, list)
                 else []
             )
-            thread_watch_signals: list[dict[str, Any]] = []
+            object_status = "deleted" if key == "messagesDeleted" else "active"
+            content_digest = _json_digest(message)
+            read_output = gmail_read_outputs.get(message_id) if key != "messagesDeleted" else None
+            read_message = read_output.get("message") if isinstance(read_output, dict) else None
+            read_evidence = read_output.get("evidence") if isinstance(read_output, dict) else None
+            read_outcome = read_output.get("read_outcome") if isinstance(read_output, dict) else {}
+            read_status = read_outcome.get("status") if isinstance(read_outcome, dict) else None
+            if isinstance(read_message, dict) and isinstance(read_evidence, dict):
+                read_thread_id = _payload_text(read_message, "thread_id")
+                thread_id = read_thread_id or thread_id
+                raw_payload_digest = _payload_text(read_message, "raw_payload_digest")
+                content_digest = raw_payload_digest or content_digest
+                published_at = (
+                    _parse_provider_timestamp(_payload_text(read_output, "published_at"))
+                    if isinstance(read_output, dict)
+                    else None
+                )
+                if published_at is not None:
+                    message_received_at = published_at
+            provider_object = db.scalar(
+                select(GoogleProviderObjectRecord)
+                .where(
+                    GoogleProviderObjectRecord.provider_account_id == provider_account_id,
+                    GoogleProviderObjectRecord.object_type == "gmail_message",
+                    GoogleProviderObjectRecord.external_id == message_id,
+                )
+                .with_for_update()
+                .limit(1)
+            )
+            if provider_object is None:
+                provider_object = GoogleProviderObjectRecord(
+                    id=new_id_fn("gpo"),
+                    provider_account_id=provider_account_id,
+                    object_type="gmail_message",
+                    external_id=message_id,
+                    thread_external_id=thread_id,
+                    calendar_id=None,
+                    ical_uid=None,
+                    status=object_status,
+                    source_timestamp=message_received_at,
+                    observed_at=now,
+                    provider_url=_payload_text(read_message, "provider_url")
+                    if isinstance(read_message, dict)
+                    else f"https://mail.google.com/mail/u/0/#all/{message_id}",
+                    metadata_json={
+                        "history_id": history_id,
+                        "label_ids": label_ids,
+                        "change": key,
+                        "subject": read_message.get("subject")
+                        if isinstance(read_message, dict)
+                        else None,
+                        "subject_key": read_message.get("subject_key")
+                        if isinstance(read_message, dict)
+                        else None,
+                        "direction": read_message.get("direction")
+                        if isinstance(read_message, dict)
+                        else None,
+                        "attachments": read_message.get("attachments")
+                        if isinstance(read_message, dict)
+                        else None,
+                        "read_outcome": read_outcome if isinstance(read_outcome, dict) else None,
+                    },
+                    content_digest=content_digest,
+                    created_at=now,
+                    updated_at=now,
+                )
+                db.add(provider_object)
+                db.flush()
+            else:
+                provider_object.thread_external_id = thread_id
+                provider_object.status = object_status
+                provider_object.source_timestamp = message_received_at
+                provider_object.observed_at = now
+                provider_object.provider_url = (
+                    _payload_text(read_message, "provider_url")
+                    if isinstance(read_message, dict)
+                    else f"https://mail.google.com/mail/u/0/#all/{message_id}"
+                )
+                provider_object.metadata_json = {
+                    "history_id": history_id,
+                    "label_ids": label_ids,
+                    "change": key,
+                    "subject": read_message.get("subject")
+                    if isinstance(read_message, dict)
+                    else None,
+                    "subject_key": read_message.get("subject_key")
+                    if isinstance(read_message, dict)
+                    else None,
+                    "direction": read_message.get("direction")
+                    if isinstance(read_message, dict)
+                    else None,
+                    "attachments": read_message.get("attachments")
+                    if isinstance(read_message, dict)
+                    else None,
+                    "read_outcome": read_outcome if isinstance(read_outcome, dict) else None,
+                }
+                provider_object.content_digest = content_digest
+                provider_object.updated_at = now
+            item_count += 1
+            if object_status == "deleted":
+                evidence_rows = db.scalars(
+                    select(ProviderEvidenceRecord)
+                    .where(
+                        ProviderEvidenceRecord.provider_object_id == provider_object.id,
+                        ProviderEvidenceRecord.lifecycle_state != "deleted",
+                    )
+                    .with_for_update()
+                ).all()
+                for evidence_row in evidence_rows:
+                    evidence_row.lifecycle_state = "deleted"
+                    evidence_row.updated_at = now
+                observation_count += len(evidence_rows)
+            elif read_status != "ok" and isinstance(read_outcome, dict):
+                unavailable_digest = content_digest
+                if isinstance(read_evidence, dict):
+                    body_digest = _payload_text(read_evidence, "body_digest")
+                    unavailable_digest = body_digest or unavailable_digest
+                existing_unavailable = db.scalar(
+                    select(ProviderEvidenceRecord)
+                    .where(
+                        ProviderEvidenceRecord.provider_object_id == provider_object.id,
+                        ProviderEvidenceRecord.content_digest == unavailable_digest,
+                    )
+                    .with_for_update()
+                    .limit(1)
+                )
+                unavailable_metadata = {
+                    "history_id": history_id,
+                    "label_ids": label_ids,
+                    "change": key,
+                    "read_outcome": read_outcome,
+                    "decode_notes": read_evidence.get("decode_notes", [])
+                    if isinstance(read_evidence, dict)
+                    else [],
+                    "html_security": read_evidence.get("html_security")
+                    if isinstance(read_evidence, dict)
+                    else None,
+                }
+                if existing_unavailable is None:
+                    db.add(
+                        ProviderEvidenceRecord(
+                            id=new_id_fn("pev"),
+                            provider_object_id=provider_object.id,
+                            provider="google",
+                            provider_account_id=provider_account_id,
+                            source_kind="gmail_message",
+                            external_id=message_id,
+                            thread_external_id=thread_id,
+                            calendar_id=None,
+                            source_uri=provider_object.provider_url,
+                            source_timestamp=message_received_at,
+                            content_digest=unavailable_digest,
+                            metadata_json=unavailable_metadata,
+                            taint="provider_untrusted",
+                            sensitivity="private",
+                            retention_policy="provider_source",
+                            extraction_status="failed",
+                            lifecycle_state="unavailable",
+                            observed_at=now,
+                            created_at=now,
+                            updated_at=now,
+                        )
+                    )
+                elif existing_unavailable.lifecycle_state == "unavailable":
+                    existing_unavailable.thread_external_id = thread_id
+                    existing_unavailable.source_uri = provider_object.provider_url
+                    existing_unavailable.source_timestamp = message_received_at
+                    existing_unavailable.metadata_json = unavailable_metadata
+                    existing_unavailable.lifecycle_state = "unavailable"
+                    existing_unavailable.extraction_status = "failed"
+                    existing_unavailable.observed_at = now
+                    existing_unavailable.updated_at = now
+                observation_count += 1
+            if read_status == "ok" and isinstance(read_evidence, dict):
+                evidence_content_digest = content_digest
+                body_digest = _payload_text(read_evidence, "body_digest")
+                if body_digest is not None:
+                    evidence_content_digest = body_digest
+                existing_evidence = db.scalar(
+                    select(ProviderEvidenceRecord)
+                    .where(
+                        ProviderEvidenceRecord.provider_object_id == provider_object.id,
+                        ProviderEvidenceRecord.content_digest == evidence_content_digest,
+                    )
+                    .with_for_update()
+                    .limit(1)
+                )
+                evidence_metadata = {
+                    "history_id": history_id,
+                    "label_ids": label_ids,
+                    "change": key,
+                    "decode_notes": read_evidence.get("decode_notes", []),
+                    "html_security": read_evidence.get("html_security"),
+                }
+                if (
+                    existing_evidence is not None
+                    and existing_evidence.lifecycle_state != "available"
+                ):
+                    continue
+                if existing_evidence is None:
+                    enqueue_extraction = False
+                    superseded_rows = db.scalars(
+                        select(ProviderEvidenceRecord)
+                        .where(
+                            ProviderEvidenceRecord.provider_object_id == provider_object.id,
+                            ProviderEvidenceRecord.content_digest != evidence_content_digest,
+                            ProviderEvidenceRecord.lifecycle_state == "available",
+                        )
+                        .with_for_update()
+                    ).all()
+                    for superseded_row in superseded_rows:
+                        superseded_row.lifecycle_state = "superseded"
+                        superseded_row.updated_at = now
+                    evidence = ProviderEvidenceRecord(
+                        id=new_id_fn("pev"),
+                        provider_object_id=provider_object.id,
+                        provider="google",
+                        provider_account_id=provider_account_id,
+                        source_kind="gmail_message",
+                        external_id=message_id,
+                        thread_external_id=thread_id,
+                        calendar_id=None,
+                        source_uri=provider_object.provider_url,
+                        source_timestamp=message_received_at,
+                        content_digest=evidence_content_digest,
+                        metadata_json=evidence_metadata,
+                        taint="provider_untrusted",
+                        sensitivity="private",
+                        retention_policy="provider_source",
+                        extraction_status="pending",
+                        lifecycle_state="available",
+                        observed_at=now,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    db.add(evidence)
+                    db.flush()
+                    existing_block_id = db.scalar(
+                        select(ProviderEvidenceBlockRecord.id)
+                        .where(ProviderEvidenceBlockRecord.evidence_id == evidence.id)
+                        .limit(1)
+                    )
+                    raw_blocks = read_evidence.get("blocks")
+                    block_count = 0
+                    if existing_block_id is None:
+                        for index, block in enumerate(
+                            raw_blocks if isinstance(raw_blocks, list) else []
+                        ):
+                            if not isinstance(block, dict) or not isinstance(
+                                block.get("text"), str
+                            ):
+                                continue
+                            kind = block.get("kind")
+                            db.add(
+                                ProviderEvidenceBlockRecord(
+                                    id=new_id_fn("peb"),
+                                    evidence_id=evidence.id,
+                                    block_index=index,
+                                    block_kind=kind
+                                    if kind in {"body", "quote", "signature", "forwarded"}
+                                    else "body",
+                                    text=block["text"],
+                                    digest=str(
+                                        block.get("digest") or _json_digest({"text": block["text"]})
+                                    ),
+                                    source_offsets={
+                                        "block_id": block.get("block_id"),
+                                        "source_message_id": block.get("source_message_id"),
+                                    },
+                                    metadata_json={
+                                        "source_mime_type": block.get("source_mime_type"),
+                                        "charset": block.get("charset"),
+                                        "truncated": block.get("truncated"),
+                                    },
+                                    created_at=now,
+                                )
+                            )
+                            block_count += 1
+                    if block_count:
+                        enqueue_extraction = True
+                    elif existing_block_id is not None and evidence.extraction_status == "pending":
+                        enqueue_extraction = True
+                    if enqueue_extraction:
+                        _enqueue_workspace_commitment_extraction_due(
+                            db,
+                            evidence_id=evidence.id,
+                            now=now,
+                            new_id_fn=new_id_fn,
+                        )
+                else:
+                    labels_changed = existing_evidence.metadata_json.get("label_ids") != label_ids
+                    existing_evidence.thread_external_id = thread_id
+                    existing_evidence.source_uri = provider_object.provider_url
+                    existing_evidence.source_timestamp = message_received_at
+                    existing_evidence.metadata_json = evidence_metadata
+                    existing_evidence.observed_at = now
+                    existing_evidence.updated_at = now
+                    if labels_changed or key in {"labelsAdded", "labelsRemoved"}:
+                        existing_evidence.extraction_status = "pending"
+                        existing_block_id = db.scalar(
+                            select(ProviderEvidenceBlockRecord.id)
+                            .where(ProviderEvidenceBlockRecord.evidence_id == existing_evidence.id)
+                            .limit(1)
+                        )
+                        if existing_block_id is not None:
+                            _enqueue_workspace_commitment_extraction_due(
+                                db,
+                                evidence_id=existing_evidence.id,
+                                now=now,
+                                new_id_fn=new_id_fn,
+                            )
             if key == "messagesAdded" and thread_id is not None:
                 watches = db.scalars(
                     select(EmailThreadWatchRecord)
@@ -573,13 +1290,12 @@ def _sync_gmail_history(
                         continue
                     if (
                         watch.condition == "no_reply_by_deadline"
-                        and message_received_at > watch.deadline
+                        and message_received_at >= watch.deadline
                     ):
                         watch.status = "due"
-                        signal_type = "email_thread_watch_due"
                     elif (
                         watch.condition == "any_reply_arrives"
-                        and message_received_at > watch.deadline
+                        and message_received_at >= watch.deadline
                     ):
                         watch.status = "failed"
                         watch.updated_at = now
@@ -589,58 +1305,7 @@ def _sync_gmail_history(
                         watch.matched_message_id = message_id
                         watch.matched_at = message_received_at
                         watch.completed_at = now
-                        signal_type = "email_thread_watch_completed"
                     watch.updated_at = now
-                    signal_changed = emit_email_thread_watch_signal(
-                        db,
-                        watch=watch,
-                        signal_type=signal_type,
-                        now=now,
-                        new_id_fn=new_id_fn,
-                        trigger_message_id=message_id,
-                    )
-                    item_count += 1 if signal_changed else 0
-                    thread_watch_signals.append(
-                        {
-                            "signal": signal_type,
-                            "watch_id": watch.id,
-                            "watch_status": watch.status,
-                            "condition": watch.condition,
-                            "deadline": to_rfc3339(watch.deadline),
-                            "message_received_at": to_rfc3339(message_received_at),
-                            "matched_message_id": watch.matched_message_id,
-                            "matched_at": (
-                                to_rfc3339(watch.matched_at)
-                                if watch.matched_at is not None
-                                else None
-                            ),
-                            "signal_emitted": signal_changed,
-                        }
-                    )
-            changed = _upsert_workspace_item_event(
-                db,
-                provider="google",
-                item_type="email_message",
-                external_id=message_id,
-                title=f"Email message {message_id}",
-                summary=f"Gmail history {key} for message {message_id}.",
-                source_uri=f"https://mail.google.com/mail/u/0/#inbox/{message_id}",
-                status=status,
-                metadata={
-                    "resource_id": resource_id,
-                    "history_id": history_id,
-                    "change": key,
-                    "thread_id": thread_id,
-                    "label_ids": label_ids,
-                    "email_thread_watch_signals": thread_watch_signals,
-                },
-                event_type="deleted" if status == "deleted" else "updated",
-                event_dedupe_key=f"google:gmail:{resource_id}:{message_id}:{history_id}:{key}",
-                provider_event_id=provider_event_id,
-                now=now,
-                new_id_fn=new_id_fn,
-            )
-            item_count += 1 if changed else 0
     return item_count, observation_count
 
 
@@ -656,70 +1321,6 @@ def _gmail_message_received_at(message: dict[str, Any], *, fallback: datetime) -
     return fallback
 
 
-def emit_email_thread_watch_signal(
-    db: Session,
-    *,
-    watch: EmailThreadWatchRecord,
-    signal_type: str,
-    now: datetime,
-    new_id_fn: Callable[[str], str],
-    trigger_message_id: str | None = None,
-) -> bool:
-    matched_message_id = (
-        watch.matched_message_id if signal_type == "email_thread_watch_completed" else None
-    )
-    metadata = {
-        "signal": signal_type,
-        "watch_id": watch.id,
-        "provider": watch.provider,
-        "provider_account_id": watch.provider_account_id,
-        "provider_thread_id": watch.provider_thread_id,
-        "anchor_message_id": watch.anchor_message_id,
-        "condition": watch.condition,
-        "deadline": to_rfc3339(watch.deadline),
-        "note": watch.note,
-        "watch_status": watch.status,
-        "matched_message_id": matched_message_id,
-        "matched_at": to_rfc3339(watch.matched_at) if watch.matched_at is not None else None,
-        "completed_at": (
-            to_rfc3339(watch.completed_at) if watch.completed_at is not None else None
-        ),
-        "trigger_message_id": trigger_message_id,
-        "signaled_at": to_rfc3339(now),
-    }
-    signal_key = (
-        to_rfc3339(watch.deadline)
-        if signal_type == "email_thread_watch_due"
-        else str(matched_message_id or to_rfc3339(watch.completed_at or now))
-    )
-    title = (
-        "Email thread watch due"
-        if signal_type == "email_thread_watch_due"
-        else "Email thread watch completed"
-    )
-    summary = (
-        f"Thread {watch.provider_thread_id} reached its reply deadline."
-        if signal_type == "email_thread_watch_due"
-        else f"Thread {watch.provider_thread_id} received a watched reply."
-    )
-    return _upsert_workspace_item_event(
-        db,
-        provider="ariel",
-        item_type="internal_state",
-        external_id=f"email-thread-watch:{watch.id}",
-        title=title,
-        summary=summary,
-        source_uri=None,
-        status="active",
-        metadata=metadata,
-        event_type="updated",
-        event_dedupe_key=f"ariel:email-thread-watch:{watch.id}:{signal_type}:{signal_key}",
-        provider_event_id=None,
-        now=now,
-        new_id_fn=new_id_fn,
-    )
-
-
 def _sync_drive_change(
     db: Session,
     change: dict[str, Any],
@@ -729,130 +1330,8 @@ def _sync_drive_change(
     now: datetime,
     new_id_fn: Callable[[str], str],
 ) -> bool:
-    file_id = _payload_text(change, "fileId")
-    raw_file_payload = change.get("file")
-    file_payload = (
-        cast(dict[str, Any], raw_file_payload) if isinstance(raw_file_payload, dict) else {}
-    )
-    if file_id is None:
-        file_id = _payload_text(file_payload, "id")
-    if file_id is None:
-        return False
-    status = "deleted" if change.get("removed") is True else "active"
-    title = _payload_text(file_payload, "name") or f"Drive file {file_id}"
-    changed_at = _payload_text(change, "time") or _payload_text(file_payload, "modifiedTime")
-    changed_at = changed_at or to_rfc3339(now)
-    return _upsert_workspace_item_event(
-        db,
-        provider="google",
-        item_type="drive_file",
-        external_id=file_id,
-        title=title,
-        summary=title,
-        source_uri=_payload_text(file_payload, "webViewLink"),
-        status=status,
-        metadata={"resource_id": resource_id, "changed_at": changed_at},
-        event_type="deleted" if status == "deleted" else "updated",
-        event_dedupe_key=f"google:drive:{resource_id}:{file_id}:{status}:{changed_at}",
-        provider_event_id=provider_event_id,
-        now=now,
-        new_id_fn=new_id_fn,
-    )
-
-
-def _upsert_workspace_item_event(
-    db: Session,
-    *,
-    provider: str,
-    item_type: str,
-    external_id: str,
-    title: str,
-    summary: str,
-    source_uri: str | None,
-    status: str,
-    metadata: dict[str, Any],
-    event_type: str,
-    event_dedupe_key: str,
-    provider_event_id: str | None,
-    now: datetime,
-    new_id_fn: Callable[[str], str],
-) -> bool:
-    existing_event = db.scalar(
-        select(WorkspaceItemEventRecord)
-        .where(WorkspaceItemEventRecord.dedupe_key == event_dedupe_key)
-        .limit(1)
-    )
-    if existing_event is not None:
-        return False
-
-    item = db.scalar(
-        select(WorkspaceItemRecord)
-        .where(
-            WorkspaceItemRecord.provider == provider,
-            WorkspaceItemRecord.item_type == item_type,
-            WorkspaceItemRecord.external_id == external_id,
-        )
-        .with_for_update()
-        .limit(1)
-    )
-    if item is None:
-        item = WorkspaceItemRecord(
-            id=new_id_fn("wki"),
-            provider=provider,
-            item_type=item_type,
-            external_id=external_id,
-            title=title,
-            summary=summary,
-            source_uri=source_uri,
-            status=status,
-            item_metadata=metadata,
-            observed_at=now,
-            deleted_at=now if status == "deleted" else None,
-            created_at=now,
-            updated_at=now,
-        )
-        db.add(item)
-        db.flush()
-        item_event_type = "deleted" if status == "deleted" else "created"
-    else:
-        item.title = title
-        item.summary = summary
-        item.source_uri = source_uri
-        item.status = status
-        item.item_metadata = metadata
-        item.observed_at = now
-        item.deleted_at = now if status == "deleted" else None
-        item.updated_at = now
-        item_event_type = event_type
-
-    event = WorkspaceItemEventRecord(
-        id=new_id_fn("wie"),
-        workspace_item_id=item.id,
-        dedupe_key=event_dedupe_key,
-        provider_event_id=provider_event_id,
-        event_type=item_event_type,
-        payload={"title": title, "status": status, "metadata": metadata},
-        created_at=now,
-    )
-    db.add(event)
-    db.flush()
-    db.add(
-        BackgroundTaskRecord(
-            id=new_id_fn("tsk"),
-            task_type="ambient_interpretation_due",
-            payload={"workspace_item_event_id": event.id},
-            status="pending",
-            attempts=0,
-            max_attempts=3,
-            error=None,
-            claimed_by=None,
-            run_after=now,
-            last_heartbeat=None,
-            created_at=now,
-            updated_at=now,
-        )
-    )
-    return True
+    del db, change, resource_id, provider_event_id, now, new_id_fn
+    return False
 
 
 def _mark_sync_failed(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from collections.abc import Generator
 from dataclasses import dataclass, field
 from typing import Any, cast
@@ -11,7 +12,7 @@ from sqlalchemy import text
 from testcontainers.postgres import PostgresContainer
 
 from ariel.app import ModelAdapter, create_app
-from tests.integration.responses_helpers import responses_with_function_calls
+from tests.integration.responses_helpers import responses_message, responses_with_function_calls
 
 
 GOOGLE_CALENDAR_READ_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
@@ -35,11 +36,50 @@ class ActionProposalAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        del tools, history, context_bundle
+        del tools, history
+        if context_bundle.get("origin") == "tool_result_interpretation":
+            interpreter_input = context_bundle.get("tool_result_interpreter_input")
+            if not isinstance(interpreter_input, dict):
+                interpreter_input = {}
+            audited_outputs = interpreter_input.get("audited_tool_outputs")
+            selected_output_refs = []
+            if isinstance(audited_outputs, list):
+                selected_output_refs = [
+                    output["output_ref"]
+                    for output in audited_outputs
+                    if isinstance(output, dict) and isinstance(output.get("output_ref"), str)
+                ]
+            return responses_message(
+                assistant_text=json.dumps(
+                    {
+                        "findings": ["workspace evidence inspected"],
+                        "contradictions": [],
+                        "uncertainty": [],
+                        "selected_output_refs": selected_output_refs,
+                        "omitted_output_refs": [],
+                        "citation_refs": interpreter_input.get("citation_refs", []),
+                        "artifact_refs": interpreter_input.get("artifact_refs", []),
+                        "recommended_next_evidence": [],
+                        "confidence": 0.9,
+                    },
+                    sort_keys=True,
+                ),
+                provider=self.provider,
+                model=self.model,
+                provider_response_id="resp_s4_pr01_interpreter",
+                input_tokens=31,
+                output_tokens=20,
+            )
         proposals = self.proposals_by_message.get(user_message, [])
         assistant_text = self.assistant_text_by_message.get(
             user_message,
-            f"assistant::{user_message}",
+            {
+                "show schedule": "schedule: team sync and design review.",
+                "propose slots": "availability: two slots are available.",
+                "search inbox": "invoice #44 appears in the inbox.",
+                "open inbox item": "email msg-1 is available for review.",
+                "plan team sync": "attendee availability is limited to user-calendar-only; reconnect to include attendee calendars.",
+            }.get(user_message, f"assistant::{user_message}"),
         )
         return responses_with_function_calls(
             input_items=input_items,
@@ -147,18 +187,55 @@ class FakeGoogleWorkspaceProvider:
         if "cap.calendar.list" in self.fail_scope_missing_for:
             raise RuntimeError("insufficient_permissions")
         return {
-            "results": [
+            "schema_version": "google.calendar.events.v1",
+            "events": [
                 {
-                    "title": "team sync",
-                    "source": "calendar://primary",
-                    "snippet": "today 10:00-10:30 team sync (zoom)",
-                    "published_at": None,
+                    "provider_account_id": "google",
+                    "calendar_id": "primary",
+                    "event_id": "evt-team-sync",
+                    "status": "confirmed",
+                    "summary": "team sync",
+                    "description_blocks": [],
+                    "attendees": [],
+                    "start": {
+                        "value": "2026-03-04T10:00:00Z",
+                        "timezone": "UTC",
+                        "all_day": False,
+                    },
+                    "end": {
+                        "value": "2026-03-04T10:30:00Z",
+                        "timezone": "UTC",
+                        "all_day": False,
+                    },
+                    "all_day": False,
+                    "recurrence": [],
+                    "updated": "2026-03-03T09:00:00Z",
+                    "provider_url": "https://calendar.google.com/event?eid=evt-team-sync",
+                    "raw_payload_digest": "c" * 64,
                 },
                 {
-                    "title": "design review",
-                    "source": "calendar://primary",
-                    "snippet": "today 15:00-15:45 design review",
-                    "published_at": None,
+                    "provider_account_id": "google",
+                    "calendar_id": "primary",
+                    "event_id": "evt-design-review",
+                    "status": "confirmed",
+                    "summary": "design review",
+                    "description_blocks": [],
+                    "attendees": [],
+                    "start": {
+                        "value": "2026-03-04T15:00:00Z",
+                        "timezone": "UTC",
+                        "all_day": False,
+                    },
+                    "end": {
+                        "value": "2026-03-04T15:45:00Z",
+                        "timezone": "UTC",
+                        "all_day": False,
+                    },
+                    "all_day": False,
+                    "recurrence": [],
+                    "updated": "2026-03-03T09:00:00Z",
+                    "provider_url": "https://calendar.google.com/event?eid=evt-design-review",
+                    "raw_payload_digest": "d" * 64,
                 },
             ],
             "retrieved_at": "2026-03-03T12:00:00Z",
@@ -179,46 +256,102 @@ class FakeGoogleWorkspaceProvider:
         attendees = normalized_input.get("attendees", [])
         if attendee_intersection_enabled:
             return {
-                "results": [
+                "schema_version": "google.calendar.slot_options.v1",
+                "slots": [
                     {
-                        "title": "slot option 1",
-                        "source": "calendar://availability",
-                        "snippet": "wed 10:30-11:00 works for all attendees",
-                        "published_at": None,
+                        "slot_id": "slot_1",
+                        "start": {
+                            "value": "2026-03-04T10:30:00Z",
+                            "timezone": "UTC",
+                            "all_day": False,
+                        },
+                        "end": {
+                            "value": "2026-03-04T11:00:00Z",
+                            "timezone": "UTC",
+                            "all_day": False,
+                        },
+                        "availability_scope": "all_attendees",
+                        "partial": False,
                     },
                     {
-                        "title": "slot option 2",
-                        "source": "calendar://availability",
-                        "snippet": "wed 14:00-14:30 works for all attendees",
-                        "published_at": None,
+                        "slot_id": "slot_2",
+                        "start": {
+                            "value": "2026-03-04T14:00:00Z",
+                            "timezone": "UTC",
+                            "all_day": False,
+                        },
+                        "end": {
+                            "value": "2026-03-04T14:30:00Z",
+                            "timezone": "UTC",
+                            "all_day": False,
+                        },
+                        "availability_scope": "all_attendees",
+                        "partial": False,
                     },
                 ],
                 "retrieved_at": "2026-03-03T12:00:00Z",
+                "window_start": normalized_input["window_start"],
+                "window_end": normalized_input["window_end"],
+                "duration_minutes": normalized_input["duration_minutes"],
                 "attendees_considered": attendees,
-                "attendee_intersection_used": True,
-                "attendee_recovery_hint": None,
+                "availability_scope": "all_attendees",
+                "partial": False,
+                "partial_reason": None,
+                "timezone": "UTC",
+                "source_evidence_refs": [],
+                "constraints_used": {},
+                "freebusy_diagnostics": [],
+                "no_slots_reason": None,
             }
         return {
-            "results": [
+            "schema_version": "google.calendar.slot_options.v1",
+            "slots": [
                 {
-                    "title": "slot option 1",
-                    "source": "calendar://availability",
-                    "snippet": "wed 09:30-10:00 available on your calendar only",
-                    "published_at": None,
+                    "slot_id": "slot_1",
+                    "start": {
+                        "value": "2026-03-04T09:30:00Z",
+                        "timezone": "UTC",
+                        "all_day": False,
+                    },
+                    "end": {
+                        "value": "2026-03-04T10:00:00Z",
+                        "timezone": "UTC",
+                        "all_day": False,
+                    },
+                    "availability_scope": "primary_calendar_only",
+                    "partial": True,
                 },
                 {
-                    "title": "slot option 2",
-                    "source": "calendar://availability",
-                    "snippet": "wed 16:00-16:30 available on your calendar only",
-                    "published_at": None,
+                    "slot_id": "slot_2",
+                    "start": {
+                        "value": "2026-03-04T16:00:00Z",
+                        "timezone": "UTC",
+                        "all_day": False,
+                    },
+                    "end": {
+                        "value": "2026-03-04T16:30:00Z",
+                        "timezone": "UTC",
+                        "all_day": False,
+                    },
+                    "availability_scope": "primary_calendar_only",
+                    "partial": True,
                 },
             ],
             "retrieved_at": "2026-03-03T12:00:00Z",
+            "window_start": normalized_input["window_start"],
+            "window_end": normalized_input["window_end"],
+            "duration_minutes": normalized_input["duration_minutes"],
             "attendees_considered": attendees,
-            "attendee_intersection_used": False,
-            "attendee_recovery_hint": (
-                "Reconnect Google and grant attendee free/busy scope to include attendee intersection."
-            ),
+            "availability_scope": "primary_calendar_only",
+            "partial": True,
+            "partial_reason": "attendee_freebusy_scope_missing",
+            "timezone": "UTC",
+            "source_evidence_refs": [],
+            "constraints_used": {},
+            "freebusy_diagnostics": [
+                {"calendar_id": "attendees", "reason_code": "freebusy_scope_missing"}
+            ],
+            "no_slots_reason": None,
         }
 
     def email_search(
@@ -232,12 +365,27 @@ class FakeGoogleWorkspaceProvider:
             raise RuntimeError("insufficient_permissions")
         query = normalized_input["query"]
         return {
-            "results": [
+            "schema_version": "google.gmail.message_refs.v1",
+            "messages": [
                 {
-                    "title": "invoice from acme",
-                    "source": "gmail://msg-1",
-                    "snippet": f"subject: invoice #44 matches query `{query}`",
-                    "published_at": "2026-03-02T09:00:00Z",
+                    "message_id": "msg-1",
+                    "thread_id": "thr-1",
+                    "history_id": "hist-1",
+                    "subject": "invoice from acme",
+                    "subject_key": "invoice from acme",
+                    "sender": {
+                        "raw": "Acme Billing <billing@acme.test>",
+                        "name": "Acme Billing",
+                        "email": "billing@acme.test",
+                    },
+                    "recipients": [],
+                    "header_date": "2026-03-02T09:00:00Z",
+                    "internal_date": "2026-03-02T09:00:00Z",
+                    "label_ids": ["INBOX"],
+                    "direction": "received",
+                    "preview": f"subject: invoice #44 matches query `{query}`",
+                    "provider_url": "https://mail.google.com/mail/u/0/#all/msg-1",
+                    "evidence_status": "needs_read",
                 }
             ],
             "retrieved_at": "2026-03-03T12:00:00Z",
@@ -254,14 +402,47 @@ class FakeGoogleWorkspaceProvider:
             raise RuntimeError("insufficient_permissions")
         message_id = normalized_input["message_id"]
         return {
-            "results": [
-                {
-                    "title": f"email {message_id}",
-                    "source": f"gmail://{message_id}",
-                    "snippet": "body preview: payment confirmed for invoice #44",
-                    "published_at": "2026-03-02T09:00:00Z",
-                }
-            ],
+            "schema_version": "google.gmail.message_evidence.v1",
+            "message": {
+                "provider_account_id": "google",
+                "message_id": message_id,
+                "thread_id": "thr-1",
+                "history_id": "hist-1",
+                "subject": f"email {message_id}",
+                "subject_key": f"email {message_id}",
+                "sender": {
+                    "raw": "Acme Billing <billing@acme.test>",
+                    "name": "Acme Billing",
+                    "email": "billing@acme.test",
+                },
+                "recipients": [],
+                "direction": "received",
+                "labels": ["INBOX"],
+                "attachments": [],
+                "provider_url": f"https://mail.google.com/mail/u/0/#all/{message_id}",
+                "raw_payload_digest": "e" * 64,
+            },
+            "published_at": "2026-03-02T09:00:00Z",
+            "evidence": {
+                "source_kind": "gmail_message",
+                "message_id": message_id,
+                "thread_id": "thr-1",
+                "body_digest": "f" * 64,
+                "blocks": [
+                    {
+                        "block_id": f"gmail:{message_id}:body:0",
+                        "kind": "body",
+                        "text": "body preview: payment confirmed for invoice #44",
+                        "digest": "a" * 64,
+                        "truncated": False,
+                        "source_mime_type": "text/plain",
+                        "charset": "utf-8",
+                    }
+                ],
+                "truncated": False,
+                "decode_notes": [],
+            },
+            "read_outcome": {"status": "ok", "reason_code": None, "recovery": None},
             "retrieved_at": "2026-03-03T12:00:00Z",
         }
 
@@ -512,6 +693,17 @@ def test_s4_pr01_calendar_and_email_read_caps_execute_allowlisted_without_approv
                         "window_end": "2026-03-05T00:00:00Z",
                         "duration_minutes": 30,
                         "attendees": ["teammate@example.com"],
+                        "timezone": "UTC",
+                        "source_evidence_ids": [],
+                        "quoted_content_caveat": False,
+                        "participants": ["teammate@example.com"],
+                        "proposed_windows": [],
+                        "timezone_evidence": {
+                            "source": None,
+                            "rationale": None,
+                            "confidence": None,
+                        },
+                        "constraints": {"hard": [], "soft": [], "attendee_notes": []},
                     },
                 }
             ],
@@ -558,11 +750,12 @@ def test_s4_pr01_calendar_and_email_read_caps_execute_allowlisted_without_approv
             if message == "show schedule":
                 assert "schedule" in rendered_message
             if message == "propose slots":
-                assert "slot" in rendered_message
+                assert "availability" in rendered_message
             if message == "search inbox":
                 assert "invoice" in rendered_message
             if message == "open inbox item":
-                assert "payment confirmed" in rendered_message
+                assert "payment confirmed" not in rendered_message
+                assert "email msg-1" in rendered_message
 
 
 def test_s4_pr01_attendee_slot_fallback_is_explicit_and_recoverable_without_freebusy_scope(
@@ -578,6 +771,17 @@ def test_s4_pr01_attendee_slot_fallback_is_explicit_and_recoverable_without_free
                         "window_end": "2026-03-05T00:00:00Z",
                         "duration_minutes": 30,
                         "attendees": ["a@example.com", "b@example.com"],
+                        "timezone": "UTC",
+                        "source_evidence_ids": [],
+                        "quoted_content_caveat": False,
+                        "participants": ["a@example.com", "b@example.com"],
+                        "proposed_windows": [],
+                        "timezone_evidence": {
+                            "source": None,
+                            "rationale": None,
+                            "confidence": None,
+                        },
+                        "constraints": {"hard": [], "soft": [], "attendee_notes": []},
                     },
                 }
             ]
@@ -640,7 +844,8 @@ def test_s4_pr01_typed_auth_scope_failures_are_deterministic_and_recoverable(
             "read emails": [
                 {"capability_id": "cap.email.search", "input": {"query": "latest invoice"}}
             ]
-        }
+        },
+        assistant_text_by_message={"read emails": f"{expected_class} connect reconnect retry"},
     )
     oauth_client = FakeGoogleOAuthClient(
         tokens_by_code={

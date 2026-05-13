@@ -1,184 +1,337 @@
-# Memory SOTA Hard Cutover
+# Memory North Star Hard Cutover
 
 ## Scope
 
-This document defines Ariel's hard cutover from command-pattern and keyword-ish
-memory into a production memory architecture with typed canonical state, temporal
-graph retrieval, evidence-backed recall, AI-curated context assembly, and
-operator-visible lifecycle controls.
+This document defines Ariel's hard cutover to a gold-standard long-memory
+architecture for personal assistance, coding continuity, proactive behavior, and
+operator-visible audit.
 
-The cutover covers durable user memory, project state, episodic evidence, action
-and reasoning traces, procedural memory, candidate extraction, review, conflict
-resolution, temporal validity, salience, retrieval projections, and context
-assembly.
+The design combines the useful parts of current frontier systems:
+
+- Claude Code-style compact hot index plus lazy topic memory.
+- Letta/MemGPT-style core, recall, and archival memory separation.
+- LangMem-style semantic, episodic, and procedural memory taxonomy.
+- Zep/Graphiti-style temporal graph, provenance, and validity windows.
+- Cursor/Windsurf/Devin-style memory inbox, rules, and knowledge promotion.
+- Cline-style project memory bank discipline.
+- Aider/Sourcegraph-style code map and symbol-aware retrieval.
+- ChatGPT/Gemini/Claude-style user controls for inspect, edit, delete, export,
+  and temporary/no-memory modes.
+
+PostgreSQL remains Ariel's canonical memory state. Markdown files, compact
+indexes, embeddings, graph caches, and summaries are projections.
+
+This document covers memory storage, extraction, review, consolidation, recall,
+context assembly, privacy, evaluation, APIs, AI-mediated operations, worker jobs,
+proactive integration, and hard-cutover cleanup.
 
 Memory follows [../ai-first.md](../ai-first.md): AI owns extraction judgment,
-relevance judgment, omission judgment, and continuity interpretation;
-deterministic code owns canonical state, lifecycle rails, candidate retrieval,
-policy, provenance, and audit.
-
-[../ai-first-completion-cutover.md](../ai-first-completion-cutover.md) owns the
-current completion plan for typed memory curation failures, durable curation
-audit records, continuity durability, and file-ownership simplification. That
-completion plan supersedes any older aspirational split that would add modules
-without a clear readability payoff.
-
-It does not cover model provider hosted memory, prompt caching, generic document
-RAG, model fine-tuning, or transcript storage except when transcript content is
-preserved as explicit memory evidence.
+relevance judgment, consolidation judgment, omission judgment, relationship
+interpretation, and continuity interpretation. Deterministic code owns
+canonical state, schemas, lifecycle invariants, policy, access, budgets,
+provenance, audit, and fail-closed behavior.
 
 ## Cutover Policy
 
 - This is a hard cutover.
 - Do not keep legacy memory code.
 - Do not dual-write old and new memory stores.
-- Do not add compatibility shims for old memory classes, keys, endpoints, events,
-  database rows, or tests.
-- Do not preserve the current `/v1/memory` response shape unless every field is
+- Do not keep compatibility shims for old memory classes, helpers, events,
+  endpoints, response fields, database tables, or tests.
+- Do not preserve the old `/v1/memory` response shape unless every field is
   native to the new contract.
-- Do not fall back to command parsing, lexical keyword recall, transcript replay,
-  provider-hosted memory, or long-context full-history replay when memory
-  retrieval fails.
-- Keyword/BM25 match may be one signal inside the new candidate retrieval service.
-  It must not be a standalone fallback path.
-- If memory context required by policy cannot be assembled, fail closed with a
-  typed error and an auditable event.
-- Deterministic code may omit context only because access, lifecycle, or budget
-  rails exclude it. AI memory curation may omit context for relevance only with
-  an auditable reason.
-- Existing narrow memory rows are not a compatibility contract.
+- Do not fall back to command parsing, lexical keyword recall, vector-only
+  recall, transcript replay, provider-hosted memory, markdown-only memory,
+  rolling-summary-only memory, or long-context full-history replay.
+- Do not let any path directly create active trusted memory without evidence,
+  lifecycle policy, review policy, projection invalidation, and audit.
+- Do not let proactive decisions bypass the same memory lifecycle used by user
+  turns.
+- Do not let untrusted tool, web, file, or assistant content become active
+  trusted memory without explicit review policy.
+- Do not silently omit required memory context. Fail closed with a typed error
+  and an auditable event when policy requires memory and memory cannot be
+  assembled.
+- Deterministic code may omit candidates only because access, lifecycle, scope,
+  trust, or budget rails exclude them. AI curation may omit for relevance only
+  with an auditable reason.
 - Any preservation of production memories must be a one-time import into the new
-  canonical schema before cutover. Runtime code must not contain import adapters.
+  canonical schema before the cutover. Runtime code must not contain import
+  adapters.
 - No intermediate state is production-shippable while old and new memory systems
   are both reachable.
+
+## Thesis
+
+Memory is not personalization magic. Memory is an evidence-backed operating
+system for continuity.
+
+Every durable memory moves through this lifecycle:
+
+1. Evidence is recorded.
+2. AI proposes typed memory candidates.
+3. Deterministic rails validate shape, scope, trust, sensitivity, and authority.
+4. Review policy promotes, rejects, routes, conflicts, or queues candidates.
+5. Canonical state changes produce versions, events, and projection jobs.
+6. Retrieval produces bounded candidates with provenance and diagnostics.
+7. AI curation selects the context that matters now and explains omissions.
+8. Consolidation periodically merges, supersedes, prunes, and rebuilds hot
+   context projections without erasing audit history.
+
+## Goals
+
+- Preserve cross-session continuity without replaying transcripts.
+- Preserve project and coding continuity across chats, sessions, branches, and
+  proactive work.
+- Make memory inspectable, editable, correctable, deletable, exportable, and
+  auditable.
+- Keep memory scoped by user, project, repo, thread, proactive case, source, and
+  temporary/no-memory mode.
+- Represent uncertainty, contradiction, staleness, and temporal validity
+  explicitly.
+- Preserve source provenance for every active memory and every derived
+  projection.
+- Separate canonical memory from retrieval projections.
+- Keep the turn hot path fast by enqueueing extraction, projection, and
+  consolidation work.
+- Make memory recall bounded, explainable, and observable.
+- Preserve negative knowledge: failed approaches, rejected hypotheses, checked
+  files, insufficient tests, and user corrections.
+- Turn repeated successful behavior into reviewed procedural memory.
+- Turn durable team or repo knowledge into versionable rule projections when
+  appropriate.
+- Keep memory safe under retries, concurrency, process restarts, background job
+  failure, redaction, and privacy deletion.
+- Evaluate memory quality with product-specific long-memory tests, not only row
+  persistence tests.
+
+## Non-Goals
+
+- No provider-hosted memory as canonical memory.
+- No model fine-tuning.
+- No prompt cache as memory.
+- No generic enterprise document RAG in this cutover.
+- No hidden personalization store.
+- No secret vault replacement.
+- No transcript archive marketed as memory.
+- No vector database as canonical memory.
+- No graph database as canonical memory.
+- No markdown directory as canonical memory.
+- No deterministic product brain that decides memory relevance.
+- No backward compatibility for old memory APIs or response shapes.
+- No external dependency on Zep, Mem0, Letta, LangGraph, Neo4j, or any managed
+  memory product for correctness.
+- No multi-agent theater. Add specialized model calls only when the input,
+  authority, and output contract are bounded.
 
 ## Target Behavior
 
 ### User Experience
 
-- Ariel remembers durable preferences, profile facts, commitments, decisions,
-  project state, and recurring procedural instructions across sessions.
-- Ariel distinguishes working memory, semantic memory, episodic memory, and
-  procedural memory.
+- Ariel remembers durable user preferences, profile facts, commitments,
+  decisions, project state, recurring workflows, and important corrections.
+- Ariel distinguishes working memory, hot core memory, semantic memory,
+  episodic memory, procedural memory, project memory, reasoning/action memory,
+  and archival evidence.
 - Ariel can answer:
   - "what do you remember?"
+  - "what did you recall for this turn?"
   - "why do you think that?"
   - "where did that come from?"
   - "what changed?"
+  - "what are you unsure about?"
+  - "what did you ignore?"
   - "forget this"
   - "correct this"
+  - "never remember this type of thing"
   - "prioritize this"
   - "show history"
+  - "export memory"
 - Ariel surfaces unresolved contradictions as uncertainty instead of silently
-  choosing one fact.
-- Ariel can maintain long-range project state without replaying full transcripts
-  or relying on one rolling summary.
-- Ariel remembers only useful high-level details. It does not treat memory as a
-  store for secrets, arbitrary transcript chunks, large templates, or verbatim
-  blocks.
-- Ariel exposes memory controls that are understandable to an operator:
-  inspect, approve, reject, correct, retract, delete, prioritize, deprioritize,
-  resolve conflicts, export, and audit history.
+  choosing one claim.
+- Ariel admits when relevant memory is unavailable, stale, deleted, redacted, or
+  outside the current scope.
+- Ariel exposes a memory inbox with approve, edit, reject, merge, mark stale,
+  and never-remember controls.
+- Ariel exposes recall diagnostics: selected memories, omitted memories,
+  candidate count, scope filters, projection health, source evidence, curation
+  rationale, and conflict warnings.
+- Ariel supports temporary/no-memory sessions that still preserve operational
+  audit but do not extract or recall user memory.
+- Ariel never stores secrets as ordinary memory. Secret-like content is redacted,
+  blocked, or routed to a dedicated future secret-handling flow.
 
-### Write Behavior
+### Coding And Project Continuity
 
-- Every memory write starts from evidence.
-- Evidence records identify source turn, session, actor, content class, trust
-  boundary, timestamp, source URI or artifact when applicable, and redaction
-  posture.
-- Model extraction creates candidate assertions, episodes, relationship facts,
-  and procedure proposals. It does not directly mutate active trusted memory.
-- Review policy promotes, rejects, routes, conflicts, or queues candidates.
-- Corrections supersede prior assertions. They do not overwrite history.
-- Delete and privacy deletion remove or invalidate all derived projections.
-- Tool outputs, web content, files, quoted user-provided text, and assistant
-  guesses cannot become trusted memory without explicit user or system-owned
-  review.
-- Explicit user memory commands are one ingress path, not the canonical
-  extraction engine.
-- Background extraction is the default. The primary turn path records the turn
-  and enqueues memory work; it does not run full consolidation.
+- Ariel remembers repo conventions, architecture decisions, active risks,
+  accepted patterns, known bad paths, command recipes, test gates, review
+  feedback, CI quirks, deployment constraints, and file ownership boundaries.
+- Ariel remembers execution-critical state, not just summaries:
+  - files already inspected
+  - commands already run
+  - tests that passed or failed
+  - hypotheses rejected
+  - assumptions corrected by the user
+  - blockers and next actions
+  - branch, PR, issue, and incident context
+- Ariel promotes repeated coding lessons into reviewed procedural memory or
+  versionable project-rule projections.
+- Ariel can export a repo memory pack for other tools as a projection, not as
+  canonical state.
+- Ariel can ingest project rule files as evidence with provenance and trust
+  labels, not as unreviewed active memory.
 
-### Recall Behavior
+### Proactive Behavior
 
-- The AI memory curator assembles memory context from bounded, validated
-  candidates:
-  - pinned core memory
-  - current project state
-  - active commitments and unresolved decisions
-  - relevant semantic assertions
-  - relevant episodic evidence snippets
-  - relevant action and reasoning traces
-  - reviewed procedural memory
-  - unresolved conflicts that affect the turn
-- Candidate retrieval uses structured filters, semantic similarity,
-  BM25/full-text match, entity match, graph distance, temporal validity, salience,
-  confidence, verification age, source quality, task relevance, and ordering
-  features.
-- Every candidate and selected memory includes id, lifecycle state, source
-  evidence ids, evidence snippet or evidence reference, candidate-order features,
-  AI selection or omission reason, validity interval, source trust, and
-  projection version.
-- Token budget enforcement is deterministic. Relevance selection and omission
-  judgment are AI-owned and emit omitted-item diagnostics.
-- Recall never includes superseded, rejected, retracted, or deleted assertions in
-  normal context.
-- Recall never includes conflicted facts as if they were active facts. It returns
-  conflict warnings and candidate evidence for uncertainty handling.
-- The master model sees the AI-curated memory bundle. It does not see raw
-  database rows unless an explicit inspection tool is called.
+- Proactive observations can propose memory candidates.
+- Proactive decisions cannot directly create active memory.
+- Proactive "remember" actions go through evidence recording, candidate
+  extraction or structured proposal, review policy, conflict detection,
+  projection invalidation, and audit.
+- Proactive corrections feed memory as user-correction evidence and can
+  supersede prior memories or procedures.
+- Proactive recurring patterns can become procedural memory only after review.
 
-## Structure
+### Failure Behavior
+
+- If memory extraction fails, the turn succeeds only if memory extraction is
+  non-required for that path, and the failure is auditable.
+- If memory curation is required and fails, the request fails closed with a
+  typed AI judgment error.
+- If projections are stale or failed, retrieval exposes projection health and
+  uses only valid canonical state plus healthy projections. It does not use
+  legacy fallback recall.
+- If deletion or redaction affects recalled memory, future recall excludes the
+  invalidated memory and all invalidated projections.
+
+## Memory Structure
 
 ### Memory Types
 
-- Working memory: active thread state, recent turns, scratch state, open tool
-  results, in-flight jobs, and action state. This is lossless and scoped.
-- Semantic memory: durable typed facts about users, projects, repos, preferences,
-  commitments, decisions, procedures, and domain concepts.
+- Working memory: active thread state, recent turns, open tool results,
+  in-flight jobs, action state, pending approvals, and current scratch context.
+- Hot core memory: a compact, always-considered context block containing
+  currently important user, project, scope, conflict, and procedure pointers.
+- Semantic memory: typed durable facts about users, projects, repos, artifacts,
+  preferences, commitments, decisions, risks, people, organizations, and domain
+  concepts.
 - Episodic memory: timestamped evidence episodes, source snippets, task events,
-  action outcomes, and decision history.
-- Procedural memory: reviewed operating rules that can influence Ariel's future
-  behavior.
-- Project memory: compact project state, active risks, milestones, decisions,
-  open questions, and repo-specific conventions.
-- Reasoning memory: selected past task traces that explain how Ariel solved or
-  failed to solve a task, used as examples and diagnostics.
+  action outcomes, decision history, provider events, and proactive observations.
+- Procedural memory: reviewed instructions about how Ariel should work in a
+  scope.
+- Project memory: compact state for active projects, repos, branches, PRs,
+  issues, milestones, open questions, and risks.
+- Reasoning/action memory: selected traces of successful paths, failed paths,
+  diagnostics, user corrections, and action outcomes.
+- Negative memory: durable "do not repeat" knowledge such as rejected
+  approaches, invalid assumptions, unsafe operations, already-checked areas, and
+  insufficient evidence.
+- Archival evidence: source records and artifacts that are not injected by
+  default but remain inspectable and retrievable by explicit tools.
+
+### Hot Index
+
+The hot index is Ariel's version of Claude Code's `MEMORY.md`, but it is a
+rebuildable projection from canonical state.
+
+The hot index:
+
+- is compact enough to consider on every turn
+- is scoped to the active user, project, repo, thread, and task where possible
+- contains stable pointers, not large details
+- names topic blocks that may be relevant
+- includes active conflict warnings
+- includes active commitments and deadlines
+- includes pinned preferences and high-priority procedures
+- includes "do not repeat" items that affect current work
+- includes projection version and rebuild timestamp
+- never contains secrets or large verbatim content
+- is rebuilt by consolidation and explicit projection jobs
+
+Budget target:
+
+- default hot index budget: 1,500 tokens
+- hard maximum hot index budget: 2,500 tokens
+- every item must carry ids or topic pointers so details can be fetched on
+  demand
+
+### Topic Blocks
+
+Topic blocks are Ariel's lazy memory files, but canonical state remains in
+PostgreSQL.
+
+Required topic block families:
+
+- `user-profile`
+- `user-preferences`
+- `active-projects`
+- `repo-conventions`
+- `architecture-decisions`
+- `commitments`
+- `procedures`
+- `negative-knowledge`
+- `recent-failures`
+- `proactive-patterns`
+- `external-connectors`
+- `open-risks`
+- `resolved-conflicts`
+
+Topic blocks:
+
+- are rebuilt projections
+- contain concise summaries plus canonical ids
+- are selected by AI curation or explicit inspection
+- can be exported to markdown for human review or cross-tool use
+- cannot be edited as canonical state unless edits flow back through memory
+  mutation APIs
 
 ### Canonical Records
 
 Canonical state must be normalized enough to inspect and audit:
 
 - evidence records
+- source artifact records
 - entity records
 - relationship records
 - semantic assertion records
-- episodic episode records
-- action/reasoning trace records
-- procedural rule records
-- project state snapshots
 - assertion-evidence links
+- episodic episode records
+- reasoning/action trace records
+- procedural rule records
+- negative memory records or typed assertions
+- project state snapshots
+- topic definitions
+- topic membership records
 - review decisions
 - conflict sets and members
-- salience records
+- salience and feedback records
+- retention, sensitivity, and scope records
+- memory versions
+- deletion and redaction records
 - projection jobs
-- memory versions and deletion/redaction records
+- AI judgment records
 
 ### Projections
 
-The following are rebuildable projections, not canonical memory:
+The following are rebuildable projections:
 
 - vector embeddings
-- BM25 or PostgreSQL full-text indexes
+- PostgreSQL full-text or BM25 indexes
 - entity mention indexes
-- entity-linking caches
 - graph traversal caches
 - temporal search indexes
+- symbol and repo map projections
 - reranker feature rows
-- compact pinned context blocks
-- project state context blocks
-- procedure context blocks
+- hot index blocks
+- topic blocks
+- project state blocks
+- procedure blocks
+- markdown export files
+- cross-agent memory packs
 - evaluation fixtures derived from canonical evidence
+
+Projection failure must be observable and must not silently corrupt active
+memory.
 
 ## Architecture
 
@@ -200,31 +353,35 @@ The following are rebuildable projections, not canonical memory:
    - assertion type
    - scope
    - confidence
+   - sensitivity
    - temporal validity
-   - lifecycle
+   - lifecycle state
    - source evidence links
-   - extraction model and prompt version
+   - extraction model
+   - extraction prompt version
 
 3. Temporal memory graph
 
    Entities and relationships for users, projects, repos, artifacts, files,
    tasks, commitments, decisions, risks, preferences, procedures, people, and
-   organizations. Relationships have provenance and validity windows.
+   organizations. Relationships have evidence, confidence, validity windows, and
+   lifecycle state.
 
 4. Episodic and reasoning layer
 
    Episodes capture what happened, when, where it came from, and what outcome it
-   produced. Reasoning traces capture selected tool paths, failures, user
-   corrections, and successful patterns.
+   produced. Reasoning/action traces capture selected tool paths, failures, user
+   corrections, successful patterns, action receipts, and diagnostic decisions.
 
 5. Review and conflict control plane
 
-   Candidate review state, promotion decisions, rejection reasons, conflict
-   sets, resolution winners, review actor ids, and audit history.
+   Candidate review state, promotion decisions, rejection reasons, merge
+   decisions, conflict sets, resolution winners, review actor ids, and audit
+   history.
 
-6. Salience feature model
+6. Salience and feedback layer
 
-   Stored, inspectable candidate-order features:
+   Stored, inspectable signals:
 
    - user priority
    - project relevance
@@ -237,207 +394,137 @@ The following are rebuildable projections, not canonical memory:
    - source trust
    - retrieval feedback
    - user correction history
+   - negative feedback
+   - deletion and never-remember preferences
 
 7. Retrieval projection layer
 
-   Rebuildable indexes and summaries. Projection failure must be observable and
-   must not silently corrupt active memory.
+   Rebuildable indexes and summaries. Projection rows identify the canonical
+   source row, projection kind, projection version, source versions, and build
+   timestamp.
 
 8. Candidate retrieval service
 
    Gathers eligible candidates and provenance. It combines scope filters,
-   semantic search, BM25, graph traversal, temporal filtering, salience, and
-   candidate ordering into one bounded candidate pool. It does not decide final
+   lifecycle filters, semantic search, full-text search, entity match, graph
+   traversal, temporal filtering, salience, source trust, project linkage, and
+   budget ordering into one bounded candidate pool. It does not decide final
    relevance.
 
 9. AI memory curator
 
-   Decides which candidates matter for the current turn, how conflicts affect
-   uncertainty, and which items to omit. It returns bounded context sections with
-   ids, snippets, provenance, uncertainty markers, and omission diagnostics.
+   Decides which candidates matter for the current turn, which details to
+   include, how conflicts affect uncertainty, and which items to omit. It
+   returns bounded context sections with ids, snippets, provenance, uncertainty
+   markers, and omission diagnostics.
 
-### Request Flow
+10. Consolidation service
 
-1. The request is admitted and the current session/thread state is loaded.
-2. The candidate retrieval service gathers eligible memory evidence from
-   canonical memory and healthy projections.
-3. The AI memory curator emits a bounded, structured context bundle with
-   selection and omission reasons.
-4. The master model receives only the curated context bundle and current user
-   message.
-5. The assistant response, tool calls, action outcomes, and surfaced sources are
-   persisted.
-6. Background memory tasks are enqueued for extraction, consolidation, graph
-   update, salience recomputation, and projection rebuild.
-7. Review policy decides whether candidates become active, require review,
-   conflict, or are rejected.
-8. The next turn reads only canonical memory plus current projection versions.
+    Periodically merges duplicates, proposes supersessions, updates topic
+    blocks, rebuilds the hot index, detects stale claims, opens conflicts, and
+    proposes durable procedures. It does not bypass lifecycle or review policy.
 
-### Background Work
+### Write Flow
 
-- Extraction, reflection, consolidation, salience recomputation, conflict
-  detection, entity linking, graph edge maintenance, context block generation,
-  and projection rebuilds run outside the primary response path.
-- Background tasks are durable PostgreSQL tasks.
-- Task claiming uses `FOR UPDATE SKIP LOCKED`.
-- Mutations use transaction boundaries that preserve memory invariants.
-- Logical resources use advisory locks when concurrent updates can target the
-  same memory subject, entity, project, or conflict set.
-- Background task failure never invokes legacy recall or legacy extraction.
-- Dead-lettered tasks are inspectable and retryable.
+1. Ingress records source evidence from user turns, captures, tool outputs,
+   attachments, workspace events, proactive observations, action outcomes, and
+   corrections.
+2. The hot path enqueues memory extraction or structured memory proposal tasks
+   unless the session is no-memory.
+3. AI extraction receives bounded evidence and returns typed candidate payloads.
+4. Deterministic validation rejects malformed candidates and labels scope,
+   sensitivity, trust, source, and policy posture.
+5. Review policy chooses:
+   - auto-approve
+   - needs user review
+   - needs operator review
+   - reject
+   - route to conflict
+   - route to consolidation
+6. Candidate activation records versions, evidence links, salience rows, events,
+   and projection jobs.
+7. Conflicting single-valued claims open a conflict set instead of silently
+   overwriting.
+8. Corrections create new evidence and supersede old assertions.
+9. Retraction removes a memory from normal recall but keeps audit.
+10. Privacy deletion invalidates canonical content and derived projections.
 
-### Candidate Retrieval And AI Curation
+### Recall Flow
 
-The candidate retrieval service receives:
+1. The request is admitted and scope is resolved.
+2. Access, no-memory, retention, sensitivity, and lifecycle rails determine
+   eligible memory scopes.
+3. The hot index for the scope is loaded.
+4. Candidate retrieval gathers bounded candidates from canonical memory and
+   healthy projections.
+5. AI curation selects relevant memory, conflict warnings, topic blocks, and
+   omitted-item diagnostics.
+6. Deterministic budget enforcement validates the final bundle shape and token
+   limit.
+7. The master model receives only the curated memory bundle, current working
+   context, and user request.
+8. The recall decision is recorded as an AI judgment with selected ids, omitted
+   ids, rationale, uncertainty, prompt version, provider response id, and
+   projection health.
+9. The assistant response and action outcomes become new evidence for future
+   memory work when policy allows.
 
-- user id
-- organization or workspace id when present
-- session id
-- current project id when known
-- current turn text
-- tool/action context
-- open jobs and commitments
-- allowed memory scopes
-- maximum context budget
-- current time
+### Consolidation Flow
 
-The candidate retrieval service returns:
+Consolidation is Ariel's audited version of Claude Code AutoDream.
 
-- eligible pinned context blocks
-- eligible project state blocks
-- ordered semantic assertion candidates
-- ordered episodic evidence candidates
-- ordered reasoning trace candidates
-- reviewed procedural rules
-- conflict warnings
-- omitted-item diagnostics
-- projection health diagnostics
+Triggers:
 
-The AI memory curator receives the candidate pool and returns the memory bundle
-shown to the master assistant.
+- session rotation
+- memory candidate backlog
+- projection drift
+- conflict backlog
+- user request
+- scheduled worker cadence
+- repeated user corrections
+- repeated successful procedures
+- project milestone or PR completion
 
-The AI memory curator returns:
+Phases:
 
-- selected memory sections
-- selection reasons
-- omitted relevant candidates with omission reasons
-- uncertainty and conflict notes
-- provenance references
-- model and prompt version
+1. Orient
 
-### Candidate Ordering
+   Load hot index, topic blocks, recent memory versions, projection health,
+   conflict backlog, and candidate backlog for the scope.
 
-Candidate ordering is deterministic for identical inputs and database state.
-Candidate ordering bounds the service output. It does not decide semantic
-importance for the turn.
+2. Gather signal
 
-Candidate ordering inputs:
+   Inspect recent evidence, selected episodes, corrections, failed actions,
+   successful action paths, stale topic blocks, and project state changes.
 
-- structured scope filters
-- semantic vector similarity
-- BM25/full-text score
-- entity match
-- graph distance to current entities
-- temporal validity
-- assertion lifecycle
-- confidence
-- salience
-- recency
-- verification age
-- source trust
-- user priority
-- project/task linkage
-- open commitment linkage
-- reranker feature score
+3. Propose changes
 
-Ties are resolved by stable ids after semantic score, salience, priority, and
-timestamp. AI selection can choose lower-ordered candidates when the current turn
-makes them relevant.
+   Return typed proposals for merges, supersessions, stale markers, new topic
+   memberships, hot index changes, project-state updates, procedural memories,
+   negative memories, and conflict openings.
 
-## Final State
+4. Validate and route
 
-- `src/ariel/app.py` contains route wiring and request handling only.
-- `src/ariel/memory.py` contains domain lifecycle operations, candidate
-  retrieval, and AI curation while that keeps the current control flow easiest
-  to read.
-- `src/ariel/memory_extraction.py` owns evidence normalization and candidate
-  extraction.
-- `src/ariel/memory_projection.py` owns projection job execution and rebuilds.
-- `src/ariel/memory_retrieval.py` and `src/ariel/memory_curation.py` are created
-  only if the split clearly makes the current implementation easier to skim.
-  They are not required as empty architecture placeholders.
-- `src/ariel/persistence.py` owns ORM models for canonical memory and
-  projections.
-- Memory APIs expose new contracts only.
-- Memory events expose new event concepts only.
-- Old command-pattern extraction is removed from production recall/write paths.
-- Old memory response shapes, constants, table names, helper names, tests, and
-  compatibility assumptions are gone.
-- The system has local long-memory evals that run against PostgreSQL and fail
-  when recall regresses.
+   Deterministic rails validate payloads and route them through the normal memory
+   lifecycle. Consolidation does not directly mutate active trusted memory
+   except for rebuilding projections from already-active canonical state.
 
-## Rules
+5. Rebuild projections
 
-- PostgreSQL is canonical memory state.
-- Provider-hosted memory is never canonical.
-- Embeddings are projections, not memory.
-- Graph edges, validity windows, and provenance are canonical rails.
-  Relationship interpretation remains AI-owned.
-- Temporal validity is first-class.
-- Evidence snippets are first-class recall items.
-- Review is first-class.
-- Conflict is first-class.
-- Deletion and redaction are first-class.
-- Salience is first-class and inspectable.
-- Project state is separate from generic memory assertions but links to them.
-- Procedural memory can affect assistant behavior only when active and reviewed.
-- Untrusted content cannot create active trusted memory without review.
-- Hidden instructions from retrieved memory must not bypass policy.
-- Memory candidate retrieval must be bounded and auditable. Memory relevance and
-  context selection are AI-owned.
-- Memory failures must be typed, surfaced, and auditable.
-- Managed products such as Zep, Mem0, Letta, LangGraph, or Neo4j Agent Memory are
-  reference models, not required runtime dependencies.
+   Rebuild hot index, topic blocks, embeddings, full-text rows, entity
+   projections, graph caches, and project-state blocks as needed.
 
-## Goals
+6. Audit
 
-- Build a robust semantic personal and project model.
-- Support multi-session project continuity.
-- Preserve provenance from derived memory back to source evidence.
-- Represent changing facts with temporal validity windows.
-- Support temporal and relationship-aware recall.
-- Detect and represent conflicts explicitly.
-- Make memory reviewable, correctable, deletable, explainable, exportable, and
-  auditable.
-- Keep context bounded without losing long-range continuity.
-- Keep memory safe under concurrency, retries, process restarts, and background
-  worker failure.
-- Use hybrid retrieval instead of vector-only or keyword-only recall.
-- Evaluate rail invariants and AI memory behavior, not just row persistence.
-
-## Non-Goals
-
-- No provider-hosted memory as canonical memory.
-- No vector-only memory system.
-- No keyword-only memory system.
-- No full-transcript replay strategy.
-- No rolling-summary-only strategy.
-- No regex or command parser as canonical extraction.
-- No compatibility with the current `/v1/memory` response shape.
-- No compatibility with current memory event names.
-- No external managed memory dependency as a requirement for correctness.
-- No model weight updates or fine-tuning.
-- No generic enterprise document RAG in this cutover.
-- No partial shipping state where both old and new memory systems are reachable.
-- No memory of secrets unless explicitly approved by policy and protected by a
-  dedicated secret-handling flow.
+   Record AI judgment, selected sources, omitted sources, changes proposed,
+   changes applied, rejected changes, projection versions, and latency.
 
 ## Data Model
 
-Exact names can change during implementation, but the final schema must express
-these concepts directly.
+Existing table names can be retained when they already match the new contract.
+The final schema must directly express these concepts.
 
-### Required Tables
+### Required Canonical Tables
 
 - `memory_evidence`
 - `memory_entities`
@@ -446,19 +533,41 @@ these concepts directly.
 - `memory_assertion_evidence`
 - `memory_episodes`
 - `memory_reasoning_traces`
+- `memory_action_traces`
 - `memory_procedures`
 - `memory_reviews`
 - `memory_conflict_sets`
 - `memory_conflict_members`
 - `memory_salience`
+- `memory_scope_bindings`
+- `memory_retention_policies`
+- `memory_sensitivity_labels`
+- `memory_topics`
+- `memory_topic_members`
 - `memory_versions`
+- `memory_deletions`
+- `project_state_snapshots`
+
+### Required Projection Tables
+
 - `memory_projection_jobs`
 - `memory_embedding_projections`
 - `memory_keyword_projections`
 - `memory_entity_projections`
 - `memory_graph_projections`
+- `memory_temporal_projections`
+- `memory_symbol_projections`
 - `memory_context_blocks`
-- `project_state_snapshots`
+- `memory_export_artifacts`
+
+### Required Evaluation Tables Or Fixtures
+
+- `memory_eval_cases`
+- `memory_eval_runs`
+- `memory_eval_results`
+
+These can be local fixtures instead of production tables if production does not
+need persistent eval history.
 
 ### Required Lifecycles
 
@@ -468,9 +577,17 @@ Assertions:
 - `active`
 - `conflicted`
 - `superseded`
+- `stale`
 - `retracted`
 - `rejected`
 - `deleted`
+- `privacy_deleted`
+
+Evidence:
+
+- `available`
+- `redacted`
+- `privacy_deleted`
 
 Reviews:
 
@@ -480,6 +597,14 @@ Reviews:
 - `auto_approved`
 - `needs_user_review`
 - `needs_operator_review`
+- `merged`
+- `superseded`
+
+Conflicts:
+
+- `open`
+- `resolved`
+- `ignored`
 
 Projection jobs:
 
@@ -489,89 +614,185 @@ Projection jobs:
 - `failed`
 - `dead_letter`
 
-Evidence:
+Topic blocks and context blocks:
 
-- `available`
-- `redacted`
-- `privacy_deleted`
+- `active`
+- `stale`
+- `superseded`
+- `deleted`
 
 ### Required Invariants
 
 - Every active assertion links to at least one evidence record.
-- Exactly one active assertion can own a single-valued predicate for a subject and
-  scope.
+- Every active relationship links to at least one evidence record.
+- Every active procedure links to evidence and review state.
+- Exactly one active assertion can own a single-valued predicate for a subject
+  and scope.
 - Multi-valued predicates must declare that they are multi-valued in the schema
   or type registry.
 - A conflicted assertion must belong to an open conflict set.
 - A superseded assertion must identify its superseding assertion.
+- A stale assertion must identify staleness evidence or consolidation rationale.
 - A retracted, rejected, deleted, or privacy-deleted assertion cannot be recalled
   in normal context.
+- Privacy-deleted evidence cannot be used to rebuild projections.
 - Relationship edges must link to evidence and validity intervals.
-- A projection row must identify the canonical row and projection version that
-  produced it.
-- A context block must be rebuildable from canonical assertions, episodes, graph
-  records, and project state.
+- Projection rows must identify canonical source ids, projection version, and
+  source memory version.
+- Hot index and topic blocks must be rebuildable from canonical state.
 - Deleting or redacting canonical memory invalidates all derived projections.
 - No raw anonymous dictionaries cross module boundaries for typed memory
   concepts.
 
-## Types
+## Retrieval
 
-Use Pydantic models for semantic values and JSONB payloads.
+### Candidate Retrieval Inputs
 
-Required typed concepts:
+- actor id
+- user id
+- organization or workspace id when present
+- session id
+- Discord channel/thread context when present
+- current project id
+- current repo id and branch when present
+- current turn text
+- tool/action context
+- open jobs, cases, commitments, approvals, and incidents
+- allowed memory scopes
+- no-memory mode
+- maximum candidate budget
+- maximum context budget
+- current time
 
-- `MemorySubject`
-- `MemoryPredicate`
-- `MemoryObject`
-- `MemoryAssertionValue`
-- `MemoryRelationship`
-- `MemoryEpisode`
-- `MemoryReasoningTrace`
-- `TemporalScope`
-- `ValidityInterval`
-- `EvidenceRef`
-- `EvidenceSnippet`
-- `ReviewDecision`
-- `ConflictResolution`
-- `SalienceSignals`
-- `RecallReason`
-- `ProjectionVersion`
-- `ProjectState`
-- `ContextBlock`
-- `MemoryContextBundle`
+### Candidate Retrieval Signals
 
-## API and Events
+- scope filters
+- lifecycle state
+- trust boundary
+- sensitivity label
+- retention policy
+- semantic vector similarity
+- full-text or BM25 match
+- entity match
+- graph distance
+- temporal validity
+- assertion confidence
+- salience score
+- user priority
+- project/task linkage
+- open commitment linkage
+- source quality
+- verification age
+- recency
+- frequency
+- correction history
+- conflict state
+- procedure applicability
+- topic membership
+- symbol and repo map match
 
-### API
+### Candidate Retrieval Outputs
 
-Rewrite memory APIs around the new concepts.
+- hot index block
+- candidate topic blocks
+- ordered semantic assertion candidates
+- ordered episodic candidates
+- ordered reasoning/action trace candidates
+- reviewed procedural rules
+- project state candidates
+- negative memory candidates
+- conflict warnings
+- projection health diagnostics
+- deterministic rail omissions
+- candidate-order features
 
-Required endpoints or equivalent slash commands:
+### AI Curation Outputs
+
+- selected memory sections
+- selected topic blocks
+- selected candidate ids
+- selection reasons
+- omitted relevant candidate ids
+- omission reasons
+- uncertainty notes
+- conflict handling notes
+- source evidence refs
+- source projection versions
+- confidence
+- model
+- prompt version
+- provider response id
+
+AI curation must account for every candidate in the bounded candidate set as
+selected or omitted.
+
+## APIs And Commands
+
+### HTTP APIs
+
+The memory API is rewritten around the new concepts.
+
+Required endpoints or equivalent routes:
 
 - list active memory
+- list hot index for a scope
+- list topic blocks for a scope
+- inspect topic block
 - search memory
-- inspect memory with provenance
+- inspect memory assertion
 - inspect evidence
 - inspect memory history
+- inspect recall for a turn
 - list candidates needing review
 - approve candidate
 - reject candidate
+- edit candidate
+- merge candidates
 - correct assertion
 - retract assertion
 - delete assertion
+- privacy-delete assertion
 - redact evidence
-- export memory
-- import one-time cutover memory
 - prioritize assertion
 - deprioritize assertion
+- set never-remember rule
 - inspect conflict set
 - resolve conflict set
 - inspect project state
 - inspect projection health
 - retry projection job
+- run consolidation for a scope
+- inspect consolidation result
+- export memory
+- import one-time cutover memory
+- run memory eval
+- inspect memory eval result
 
-No endpoint preserves current response shape for compatibility.
+No endpoint preserves old response fields for compatibility.
+
+### AI-Mediated Operations
+
+Discord memory commands are not part of the final product. Users ask Ariel about
+memory in normal language, and Ariel handles the request through model memory
+capabilities guarded by deterministic policy.
+
+Required model-accessible operations:
+
+- inspect active memory
+- inspect pending candidates
+- inspect recall diagnostics
+- inspect unresolved conflicts
+- inspect projection health
+- propose memory
+- approve, reject, edit, merge, correct, retract, delete, privacy-delete, and
+  redact memory where policy allows
+- set never-remember rules
+- run consolidation for the active scope
+- create export artifacts
+- toggle memory mode for the current session or scope
+
+Every operation is bounded, typed, policy-checked, and auditable. The model does
+not receive raw database access.
 
 ### Events
 
@@ -579,68 +800,97 @@ Required event concepts:
 
 - memory evidence recorded
 - memory evidence redacted
+- memory evidence privacy-deleted
 - memory candidate proposed
 - memory review required
 - memory candidate approved
 - memory candidate rejected
+- memory candidate merged
 - memory assertion activated
 - memory assertion superseded
+- memory assertion marked stale
 - memory assertion retracted
 - memory assertion deleted
+- memory assertion privacy-deleted
 - memory relationship linked
 - memory conflict opened
 - memory conflict resolved
+- memory salience changed
+- memory topic rebuilt
+- memory hot index rebuilt
 - memory projection queued
 - memory projection rebuilt
 - memory projection failed
 - memory recalled
 - memory recall omitted item
+- memory consolidation queued
+- memory consolidation completed
 - memory import completed
 - memory export completed
+- memory eval completed
 
-Events must include ids, lifecycle state, projection version when relevant, and
-enough metadata to reconstruct behavior.
+Events must include ids, lifecycle state, actor id, projection version when
+relevant, source evidence ids when relevant, and enough metadata to reconstruct
+behavior.
 
 ## Files
 
 ### Source Files
 
 - `src/ariel/app.py`
-  - FastAPI route wiring and request handling only.
-  - Remove old extraction, mutation, and recall helpers.
+  - Route wiring and request handling only.
+  - Removes old memory response assumptions.
+  - Calls memory services through typed APIs.
 - `src/ariel/persistence.py`
-  - ORM models for canonical memory, review, conflict, salience, versions, and
-    projections.
-  - Remove old memory item/revision models.
-- `src/ariel/memory.py`
-  - Domain services for assertion lifecycle, review decisions, conflict
-    operations, project state operations, candidate retrieval, AI curation, and
-    deletion/redaction workflows.
+  - ORM models for canonical memory, review, conflict, salience, versions,
+    scopes, retention, topics, projections, and eval history when persisted.
 - `src/ariel/memory_models.py`
-  - Pydantic models and owned types for memory values, evidence, recall, and
-    projection payloads.
+  - Pydantic models and owned types for memory values, evidence, candidates,
+    recall bundles, topics, projections, reviews, conflicts, deletion, and evals.
+- `src/ariel/memory_lifecycle.py`
+  - Candidate creation, activation, correction, merge, supersession, staleness,
+    retraction, deletion, privacy deletion, review, and conflict operations.
+- `src/ariel/memory_policy.py`
+  - Trust, sensitivity, no-memory, auto-approval, review routing, retention, and
+    never-remember rules.
 - `src/ariel/memory_extraction.py`
-  - Evidence normalization, candidate extraction, entity extraction, relationship
-    extraction, and procedure proposal generation.
+  - AI extraction contracts for assertions, episodes, relationships,
+    procedures, project state, action traces, and negative memory.
 - `src/ariel/memory_projection.py`
-  - Projection rebuild jobs for embeddings, BM25/full-text rows, entity indexes,
-    graph caches, compact context blocks, and project state blocks.
+  - Projection rebuild jobs for embeddings, full-text, entity indexes, graph
+    caches, temporal indexes, symbol maps, hot index blocks, topic blocks, and
+    export artifacts.
 - `src/ariel/memory_retrieval.py`
-  - Optional extraction point for candidate retrieval only when it removes real
-    complexity from `memory.py`.
+  - Candidate retrieval service with hybrid retrieval and deterministic rails.
 - `src/ariel/memory_curation.py`
-  - Optional extraction point for AI curation only when it removes real
-    complexity from `memory.py`.
+  - AI memory curation contract and validation.
+- `src/ariel/memory_consolidation.py`
+  - Audited consolidation flow for merges, supersessions, topic rebuilds, hot
+    index rebuilds, staleness detection, and procedure proposals.
+- `src/ariel/memory_export.py`
+  - Export/import artifacts and cross-agent memory pack projections.
 - `src/ariel/memory_eval.py`
-  - Local long-memory evaluation runner and fixtures.
+  - Local long-memory eval runner, fixtures, scoring, and result serialization.
 - `src/ariel/response_contracts.py`
-  - New memory API and event contracts.
+  - New memory API, recall diagnostics, AI operation, and event contracts.
 - `src/ariel/worker.py`
-  - Executes durable memory projection and extraction tasks.
+  - Executes extraction, projection, consolidation, export, import, and eval
+    jobs.
+- `src/ariel/proactivity.py`
+  - Removes direct active memory writes.
+  - Emits evidence and structured memory proposals through the standard memory
+    lifecycle.
 - `src/ariel/action_runtime.py`
-  - Emits action/reasoning evidence and preserves fail-closed conflict posture.
+  - Emits action trace evidence and action outcome memory candidates.
+- `src/ariel/capability_registry.py`
+  - Exposes memory inspection, recall diagnostics, and mutation capabilities to
+    the model only where authority and policy allow.
 - `src/ariel/config.py`
-  - New `ARIEL_` settings only when a real implementation needs them.
+  - Adds settings only for real implementation needs, such as budgets,
+    consolidation cadence, eval toggles, and export paths.
+
+`src/ariel/memory.py` can remain as a thin facade during implementation only if
+it does not keep legacy logic. The final state must keep module ownership clear.
 
 ### Migration Files
 
@@ -648,16 +898,19 @@ enough metadata to reconstruct behavior.
 - The migration removes old memory tables unless the same migration transforms
   them into the new canonical tables.
 - Runtime code must not reference old memory table names after the migration.
-- The migration creates new memory tables and projection tables.
-- The migration must not create compatibility views for old memory APIs.
+- The migration creates required canonical and projection tables.
+- The migration must not create compatibility views for old APIs.
 
 ### Test Files
 
 - `tests/unit/test_memory_models.py`
+- `tests/unit/test_memory_policy.py`
 - `tests/unit/test_memory_lifecycle.py`
 - `tests/unit/test_memory_extraction.py`
 - `tests/unit/test_memory_projection.py`
 - `tests/unit/test_memory_retrieval.py`
+- `tests/unit/test_memory_curation.py`
+- `tests/unit/test_memory_consolidation.py`
 - `tests/unit/test_memory_conflicts.py`
 - `tests/unit/test_memory_context_bundle.py`
 - `tests/integration/test_memory_cutover_acceptance.py`
@@ -666,19 +919,24 @@ enough metadata to reconstruct behavior.
 - `tests/integration/test_memory_projection_jobs.py`
 - `tests/integration/test_memory_temporal_graph.py`
 - `tests/integration/test_memory_privacy_deletion.py`
+- `tests/integration/test_memory_proactive_integration.py`
+- `tests/integration/test_memory_discord_operations.py`
 - `tests/integration/test_memory_eval_acceptance.py`
 
 ## Acceptance Criteria
 
 ### Code Removal
 
-- No production references to the old regex memory parser remain.
-- No production references to old memory classes remain.
-- No production references to old memory recall helper names remain.
+- No production references to old memory parser behavior remain.
+- No production references to old memory helper names remain.
+- No production references to old memory response shape assumptions remain.
 - No old memory API compatibility layer remains.
 - No lexical fallback path exists.
+- No vector-only fallback path exists.
 - No transcript replay fallback exists.
 - No provider-hosted memory fallback exists.
+- No markdown-canonical memory path exists.
+- No direct active-memory write path bypasses lifecycle.
 - No dual-write path exists.
 
 ### Persistence
@@ -688,162 +946,252 @@ enough metadata to reconstruct behavior.
 - All semantic JSONB fields have typed Pydantic ingress and egress models.
 - Every active assertion links to evidence.
 - Every active relationship links to evidence.
-- Supersession, conflict membership, redaction, projection invalidation, and
-  deletion invariants are enforced by application code and tested.
+- Every active procedure links to evidence and review state.
+- Supersession, conflict membership, staleness, redaction, projection
+  invalidation, and deletion invariants are enforced and tested.
+- Privacy deletion prevents future projection rebuilds from deleted evidence.
 
 ### Extraction
 
-- Explicit memory commands create reviewed or auto-approved assertions according
+- User turns, captures, proactive observations, action outcomes, and corrections
+  can create evidence.
+- AI extraction can propose assertions, episodes, relationships, project-state
+  updates, procedures, action traces, and negative memories.
+- Extraction records model name, prompt version, confidence, source evidence,
+  parse status, validation status, and provider response id.
+- Explicit user memory requests create candidates or reviewed memories according
   to policy.
-- Non-command user statements can create candidates through model extraction.
-- Untrusted tool, web, file, quoted, and assistant content cannot create active
-  memory without review.
-- Extraction records model name, prompt version, confidence, source evidence, and
-  parse diagnostics.
-- Extraction can propose entities, relationships, semantic assertions, episodes,
-  project state updates, and procedure changes.
+- Tool, web, file, assistant, and quoted content cannot create active trusted
+  memory without review policy.
+- Extraction respects no-memory mode and never-remember rules.
 
-### Retrieval
+### Review And Lifecycle
+
+- Candidate review supports approve, edit, reject, merge, mark stale, and route
+  to conflict.
+- Correction supersedes prior assertions and activates the corrected assertion
+  according to policy.
+- Retraction removes assertions from normal recall and invalidates projections.
+- Delete and privacy deletion invalidate derived projections.
+- Conflicting single-valued candidates open conflict sets.
+- Resolved conflicts preserve history and evidence.
+- Salience and priority changes are auditable.
+
+### Retrieval And Curation
 
 - Candidate retrieval is deterministic for identical inputs and database state.
 - Candidate retrieval uses hybrid retrieval with structured filters, vector
-  similarity, BM25/full-text, entity matching, graph traversal, temporal
-  validity, salience, and candidate-order features.
+  similarity, full-text or BM25, entity match, graph traversal, temporal
+  validity, salience, source trust, topic membership, and project linkage.
 - AI memory curation decides which candidates matter for the current turn.
+- AI memory curation accounts for every candidate as selected or omitted.
 - Recall returns provenance, evidence snippets, candidate-order features,
-  AI selection reasons, AI omission reasons, validity windows, and projection
-  versions.
-- Recall emits deterministic rail omissions and AI relevance omissions under
-  budget pressure.
-- Unresolved conflicts appear as uncertainty in context when relevant.
-- Temporal questions use validity intervals and event times rather than latest row
-  order alone.
+  selection reasons, omission reasons, validity windows, source trust, conflict
+  status, projection versions, and projection health.
+- Recall never includes superseded, rejected, retracted, deleted, or
+  privacy-deleted assertions in normal context.
+- Recall never includes conflicted facts as settled facts.
+- Temporal questions use validity intervals and event times.
 - Graph questions can use relationship distance and entity neighborhoods.
 - Keyword-only and vector-only retrieval tests fail the acceptance suite.
 
-### Behavior
+### Hot Index And Topics
 
-- Correction supersedes prior assertions and activates the corrected assertion.
-- Forget/retract removes assertion from normal recall and invalidates projections.
-- Delete/privacy deletion invalidates projections and prevents future recall.
-- Conflicting candidates open a conflict set.
-- Project state persists across session rotation without relying on a generic
-  rolling summary.
-- Procedural memory influences behavior only when active and reviewed.
-- Evidence snippets explain why Ariel recalled a memory.
+- Hot index is rebuilt from canonical memory.
+- Hot index includes ids or topic pointers for all details.
+- Hot index stays within configured token budgets.
+- Topic blocks are rebuilt projections with source ids and projection versions.
+- Topic blocks can be lazily selected by curation.
+- Markdown exports are projections only and cannot become canonical by editing
+  files directly.
 
-### API
+### Consolidation
 
-- Users can list, inspect, search, correct, delete, redact, export, prioritize,
-  and deprioritize memories.
-- Users can inspect candidate memories before approval when review is required.
+- Consolidation can be scheduled, manually queued, and triggered by session
+  rotation or memory churn.
+- Consolidation records input sources, selected sources, omitted sources,
+  proposed changes, applied changes, rejected changes, and projection versions.
+- Consolidation can propose merges, supersessions, staleness markers,
+  procedures, negative memories, topic changes, and hot index changes.
+- Consolidation does not bypass review policy for canonical changes.
+- Consolidation rebuilds projections from active canonical state only.
+
+### Proactive Integration
+
+- Proactive remember decisions do not directly create active assertions.
+- Proactive cases emit evidence and memory candidates through the standard
+  lifecycle.
+- Proactive corrections create correction evidence.
+- Proactive feedback can change salience, procedures, or never-remember rules
+  only through audited memory operations.
+
+### API And AI Operations
+
+- Users can list, search, inspect, correct, delete, privacy-delete, redact,
+  export, prioritize, deprioritize, and consolidate memory.
+- Users can inspect pending candidates before approval when review is required.
 - Users can inspect conflicts and resolution history.
-- Users can inspect evidence and memory versions.
-- `/v1/memory` or its replacement returns the new projection only.
+- Users can inspect evidence, memory versions, projection health, and recall
+  diagnostics.
+- No Discord memory commands remain.
+- AI memory operations are bounded, deterministic, policy-checked, and auditable.
 - Old response fields are not preserved unless they are native fields in the new
   contract.
 
+### Privacy And Consent
+
+- No-memory mode prevents user memory extraction and recall for the selected
+  scope while preserving operational audit.
+- Never-remember rules prevent future extraction of configured content classes.
+- Sensitive content is labeled, redacted, blocked, or routed to review.
+- Deletion semantics are explicit: retract, delete, privacy-delete, and redact
+  have different effects and are visible to the user.
+- Export includes source ids, projection versions, and redaction posture.
+
 ### Evaluation
 
-- Add a local long-memory evaluation fixture with:
-  - information extraction
-  - multi-session reasoning
-  - temporal reasoning
-  - knowledge updates
-  - abstention
-  - conflict handling
-  - project continuity
-  - relationship reasoning
-  - deletion and redaction
-  - procedural memory adherence
-- The eval includes at least one case where vector similarity alone chooses the
-  wrong memory and graph or temporal filtering fixes it.
-- The eval includes at least one case where keyword matching alone chooses the
-  wrong memory and semantic/entity retrieval fixes it.
-- The eval includes at least one case where the correct answer is to abstain.
-- The eval includes at least one deletion/correction case.
-- The eval records answer accuracy, candidate recall, curation precision,
-  omitted relevant memories, context tokens, projection latency, extraction
-  latency, and curation latency.
+Add a local long-memory evaluation suite covering:
+
+- durable preference recall
+- project continuity
+- multi-session reasoning
+- temporal reasoning
+- knowledge updates
+- stale fact replacement
+- contradiction handling
+- deletion and redaction compliance
+- abstention
+- graph relationship reasoning
+- procedural memory adherence
+- negative memory adherence
+- proactive correction learning
+- hot index budget pressure
+- topic lazy loading
+- recall diagnostics
+
+The eval includes at least:
+
+- one case where vector similarity alone chooses the wrong memory
+- one case where keyword matching alone chooses the wrong memory
+- one case where temporal validity changes the answer
+- one case where conflict uncertainty must be surfaced
+- one case where the correct answer is to abstain
+- one correction/supersession case
+- one deletion/privacy deletion case
+- one no-memory mode case
+- one proactive feedback case
+
+The eval records:
+
+- answer accuracy
+- candidate recall
+- curation precision
+- selected relevant memory count
+- omitted relevant memory count
+- conflict handling accuracy
+- context tokens
+- extraction latency
+- retrieval latency
+- curation latency
+- projection latency
+- consolidation latency
 
 ### Operations
 
 - Projection jobs are observable.
-- Dead-lettered projection jobs are inspectable and retryable.
-- Memory recall emits diagnostics for omitted candidates and projection failures.
-- Memory curation emits selection and omission reasons for the bundle shown to
-  the master assistant.
-- Memory import/export is observable.
+- Dead-lettered jobs are inspectable and retryable.
+- Memory recall emits diagnostics for omitted candidates and projection
+  failures.
+- Memory extraction emits parse and validation diagnostics.
+- Memory curation emits selection and omission reasons.
+- Consolidation emits proposed and applied changes.
+- Import/export is observable.
 - Redaction and deletion produce auditable records.
-- No failed background job can silently corrupt active memory.
+- Background job failure cannot silently corrupt active memory.
 
 ### Verification
 
 - `make verify` passes.
-- Integration tests pass against PostgreSQL.
-- A grep check confirms removed legacy helper names and old memory class
-  constants are not present in production code.
-- A grep check confirms no runtime references to old memory table names remain.
-- Memory eval acceptance tests pass before the cutover branch is considered
-  ready.
+- PostgreSQL integration tests pass.
+- Memory eval acceptance tests pass.
+- A grep check confirms removed legacy helper names are not present in
+  production code.
+- A grep check confirms no runtime references to old memory table names remain
+  unless those tables are retained as native new-schema tables.
+- A grep check confirms no direct active-memory writes bypass lifecycle.
+- A grep check confirms no provider-hosted memory or transcript replay fallback
+  exists.
 
 ## Key Decisions
 
-- PostgreSQL remains canonical memory state.
-- Graph memory is first-class in Ariel's schema. A future external graph database
-  can be a projection backend only if Postgres remains canonical.
-- Embeddings, BM25 rows, graph caches, and summaries are projections.
+- PostgreSQL is canonical memory state.
+- Claude-style hot index and topic files are implemented as projections, not
+  canonical storage.
+- Markdown export is a projection and cross-tool affordance, not the source of
+  truth.
+- Provider-hosted memory is not canonical and is not a fallback.
+- External managed memory products are reference models, not required runtime
+  dependencies.
+- Embeddings, full-text rows, graph caches, temporal indexes, hot index blocks,
+  topic blocks, and repo maps are projections.
 - Hybrid candidate retrieval is required.
 - Temporal validity is required.
 - Evidence snippets are required.
-- Review, conflict, salience, deletion, and redaction are required.
-- Background consolidation is required for production quality.
-- The hot path reads memory and enqueues memory work; it does not run full
-  consolidation.
-- Explicit user commands remain useful UX, but AI extraction proposes memory
-  candidates and deterministic lifecycle rails plus explicit user/operator
-  review promote or reject them.
-- Provider-side memory is not canonical.
-- The cutover does not preserve old runtime APIs or schema.
-- The implementation starts with Ariel-owned infrastructure, not a required
-  dependency on Zep, Mem0, Letta, LangGraph, Neo4j Agent Memory, or any managed
-  memory product.
-
-## Reference Models
-
-- LangGraph: short-term thread memory plus long-term semantic, episodic, and
-  procedural namespaces.
-- Letta/MemGPT: core in-context memory, recall memory, archival memory, and
-  self-editing memory tools.
-- Zep/Graphiti: temporal context graph with entities, relationships, validity
-  windows, provenance episodes, and hybrid retrieval.
-- Mem0: explicit memory lifecycle operations, entity linking, hybrid retrieval,
-  graph memory, reranking, and production API surfaces.
-- Neo4j Agent Memory: graph-native short-term, long-term, and reasoning memory.
-- GraphRAG: local, global, and DRIFT-style graph retrieval for static document
-  corpora; useful as a retrieval reference, not as Ariel's canonical memory.
-- LongMemEval and LoCoMo: evaluation coverage for cross-session, temporal,
-  update, abstention, multi-hop, and long-range reasoning behavior.
+- Review is required.
+- Conflict is required.
+- Salience is required.
+- Deletion and redaction are required.
+- Consolidation is required.
+- The hot path records evidence and enqueues memory work. It does not run full
+  extraction, projection, or consolidation unless policy explicitly requires a
+  blocking memory judgment.
+- AI curation owns relevance. Deterministic ordering only bounds transport and
+  budget.
+- Proactive memory uses the same lifecycle as user-turn memory.
+- Old runtime APIs and schema are not preserved.
 
 ## Implementation Plan
 
-Implementation can be split into reviewable commits, but no intermediate state is
-production-shippable until the old system is removed.
+Implementation can be split into reviewable commits, but no intermediate state
+is production-shippable until the old system is removed.
 
-1. Add typed memory models and the new canonical schema.
-2. Add one-time import tooling for any production memories worth preserving.
-3. Remove old memory parser, helpers, schema references, events, and API
-   compatibility assumptions from production code.
-4. Add evidence recording and candidate extraction behind the new domain service.
-5. Add entity and relationship extraction with temporal validity.
-6. Add review, correction, delete, redaction, conflict, and salience operations.
-7. Add durable background tasks for extraction, projection, consolidation, and
-   retry/dead-letter behavior.
-8. Add projection rebuilders for embeddings, BM25/full-text, entity indexes,
-   graph caches, context blocks, and project state blocks.
-9. Add candidate retrieval and AI curation contracts.
-10. Rewrite memory APIs and events around the new contracts.
-11. Replace model-loop memory recall with the new context bundle.
-12. Add acceptance, integration, and long-memory eval coverage.
-13. Run `make verify`, PostgreSQL integration tests, eval acceptance, and legacy
+1. Define typed memory models and response contracts.
+2. Add the hard-cutover Alembic migration.
+3. Move memory lifecycle operations behind typed services.
+4. Remove legacy memory helpers, response assumptions, and fallback paths.
+5. Add evidence recording for all ingress paths, including proactive and action
+   outcomes.
+6. Add AI extraction contracts for assertions, episodes, relationships,
+   procedures, project state, action traces, and negative memory.
+7. Add review, correction, merge, conflict, staleness, deletion, redaction,
+   priority, and never-remember operations.
+8. Add projection rebuilders for embeddings, full-text, entities, graph,
+   temporal indexes, symbol maps, hot index, and topic blocks.
+9. Add hybrid candidate retrieval and AI curation contracts.
+10. Replace turn and proactive memory recall with the new context bundle.
+11. Add consolidation jobs and projection rebuild triggers.
+12. Rewrite memory APIs and AI-mediated operations around new contracts.
+13. Add import/export and cross-agent memory pack projections.
+14. Add long-memory eval fixtures and acceptance tests.
+15. Run `make verify`, PostgreSQL integration tests, memory evals, and legacy
     grep checks.
+
+## Final State
+
+- Ariel has one memory system.
+- Memory is evidence-backed, typed, scoped, temporal, auditable, and
+  inspectable.
+- Every memory write starts from evidence.
+- Every active memory has provenance.
+- Every memory mutation has version history.
+- Every projection is rebuildable.
+- Every recall is explainable.
+- Every omission is attributable to a rail or AI curation reason.
+- Every conflict is explicit.
+- Every deletion and redaction invalidates derived context.
+- Every proactive memory follows the same lifecycle as turn memory.
+- Hot index and topic blocks provide Claude-style low-cost continuity without
+  turning markdown into canonical state.
+- Long-memory evals protect against regression.
+- No legacy memory code, compatibility route, fallback recall path, or direct
+  active-write bypass remains.
