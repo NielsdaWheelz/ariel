@@ -294,6 +294,79 @@ class MutatingContextAdapter:
         )
 
 
+def _strategy_response(
+    *,
+    provider: str,
+    model: str,
+    selected_capability_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    return responses_message(
+        assistant_text=json.dumps(
+            {
+                "decision": "selected_tools" if selected_capability_ids else "no_tools",
+                "selected_capability_ids": selected_capability_ids or [],
+                "rationale": "test strategy",
+                "unavailable_reason": None,
+                "confidence": 1.0,
+            },
+            sort_keys=True,
+        ),
+        provider=provider,
+        model=model,
+        provider_response_id="resp_tool_strategy_123",
+        input_tokens=3,
+        output_tokens=2,
+    )
+
+
+@dataclass
+class StrategyAwareTestAdapter:
+    inner: ModelAdapter
+    selected_capability_ids: list[str]
+    provider: str = ""
+    model: str = ""
+
+    def __post_init__(self) -> None:
+        self.provider = str(getattr(self.inner, "provider", "provider.test"))
+        self.model = str(getattr(self.inner, "model", "model.test"))
+
+    def create_response(
+        self,
+        *,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
+        history: list[dict[str, Any]],
+        context_bundle: dict[str, Any],
+    ) -> dict[str, Any]:
+        if context_bundle.get("origin") == "tool_strategy":
+            del input_items, tools, user_message, history
+            return _strategy_response(
+                provider=self.provider,
+                model=self.model,
+                selected_capability_ids=self.selected_capability_ids,
+            )
+        return self.inner.create_response(
+            input_items=input_items,
+            tools=tools,
+            user_message=user_message,
+            history=history,
+            context_bundle=context_bundle,
+        )
+
+
+def _wrap_strategy_adapter(adapter: ModelAdapter) -> StrategyAwareTestAdapter:
+    selected_capability_ids: list[str] = []
+    if isinstance(adapter, DiscordNoResponseAdapter):
+        selected_capability_ids = ["cap.discord.no_response"]
+    elif isinstance(adapter, AttachmentReadAdapter):
+        selected_capability_ids = ["cap.attachment.read"]
+    return StrategyAwareTestAdapter(
+        inner=adapter,
+        selected_capability_ids=selected_capability_ids,
+    )
+
+
 @pytest.fixture(scope="session")
 def postgres_url() -> Generator[str, None, None]:
     with PostgresContainer("pgvector/pgvector:pg16") as postgres:
@@ -311,7 +384,7 @@ def fresh_postgres_url() -> Generator[str, None, None]:
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
     app = create_app(
         database_url=postgres_url,
-        model_adapter=adapter,
+        model_adapter=_wrap_strategy_adapter(adapter),
         reset_database=True,
     )
     return TestClient(app)
@@ -1451,6 +1524,7 @@ def test_single_active_session_and_ordered_turn_event_chain(postgres_url: str) -
 
         expected_types = [
             "evt.turn.started",
+            "evt.ai_judgment.completed",
             "evt.model.started",
             "evt.model.completed",
             "evt.memory.evidence_recorded",
@@ -1519,6 +1593,7 @@ def test_model_failure_is_auditable_and_turn_terminates_failed(postgres_url: str
         event_types = [event["event_type"] for event in turn["events"]]
         assert event_types == [
             "evt.turn.started",
+            "evt.ai_judgment.completed",
             "evt.model.started",
             "evt.model.failed",
             "evt.turn.failed",
@@ -1687,12 +1762,11 @@ def test_default_runtime_model_requires_server_secret_credentials(
         event_types = [event["event_type"] for event in events]
         assert event_types == [
             "evt.turn.started",
-            "evt.model.started",
-            "evt.model.failed",
+            "evt.ai_judgment.failed",
             "evt.turn.failed",
         ]
         failure_payload = next(
-            event["payload"] for event in events if event["event_type"] == "evt.model.failed"
+            event["payload"] for event in events if event["event_type"] == "evt.ai_judgment.failed"
         )
         assert "credential" in failure_payload["failure_reason"].lower()
         assert "sk-" not in failure_payload["failure_reason"]
@@ -1759,7 +1833,7 @@ def test_restart_preserves_history_and_appends_to_same_active_session(postgres_u
 
     restarted_app = create_app(
         database_url=postgres_url,
-        model_adapter=adapter,
+        model_adapter=_wrap_strategy_adapter(adapter),
         reset_database=False,
     )
     with TestClient(restarted_app) as second_client:
@@ -1941,6 +2015,7 @@ def test_pr02_response_budget_exhaustion_is_emitted_before_terminal_failed(
         event_types = [event["event_type"] for event in turn["events"]]
         assert event_types == [
             "evt.turn.started",
+            "evt.ai_judgment.completed",
             "evt.model.started",
             "evt.model.completed",
             "evt.assistant.emitted",
@@ -1982,6 +2057,7 @@ def test_pr02_response_budget_uses_reported_output_tokens_when_present(
         event_types = [event["event_type"] for event in turn["events"]]
         assert event_types == [
             "evt.turn.started",
+            "evt.ai_judgment.completed",
             "evt.model.started",
             "evt.model.completed",
             "evt.assistant.emitted",
@@ -2069,6 +2145,7 @@ def test_pr02_wall_time_budget_takes_precedence_if_multiple_limits_exhaust(
         event_types = [event["event_type"] for event in turn["events"]]
         assert event_types == [
             "evt.turn.started",
+            "evt.ai_judgment.completed",
             "evt.model.started",
             "evt.model.failed",
             "evt.assistant.emitted",

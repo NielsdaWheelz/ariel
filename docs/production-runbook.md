@@ -81,8 +81,14 @@ Required core settings:
 
 ```sh
 ARIEL_DATABASE_URL=postgresql+psycopg://ariel:<password>@127.0.0.1:5432/ariel
+ARIEL_DEPLOYMENT_MODE=production
 ARIEL_BIND_HOST=127.0.0.1
 ARIEL_BIND_PORT=8000
+ARIEL_LOCAL_AUTH_REQUIRED=true
+ARIEL_LOCAL_AUTH_TOKEN=<32-plus-char-url-safe-random-token>
+ARIEL_CONNECTOR_ENCRYPTION_SECRET=<non-dev-connector-secret>
+ARIEL_CONNECTOR_ENCRYPTION_KEY_VERSION=v1
+ARIEL_CONNECTOR_ENCRYPTION_KEYS='{"v1":"<base64url-16-24-or-32-byte-key>"}'
 ARIEL_OPENAI_API_KEY=<openai-api-key>
 ARIEL_MODEL_NAME=gpt-5.5
 ARIEL_MODEL_REASONING_EFFORT=medium
@@ -103,7 +109,7 @@ ARIEL_DISCORD_NOTIFICATION_TIMEOUT_SECONDS=10.0
 
 `ARIEL_DISCORD_GUILD_ID` is the one home guild. Owner DMs are also accepted. Ambient
 messages are the Discord AI surface; `/ariel` and `/ask` are gone. `/status`, `/jobs`,
-`/memory`, and `/capture` are deterministic operational commands only. They expose
+and `/capture` are deterministic operational commands only. They expose
 rails, state, and operator controls; they do not decide user intent, memory relevance,
 tool strategy, or response content. Do not use `ARIEL_DISCORD_CHANNEL_ID` as a
 one-channel-only chat gate; it is the default notification and thread parent when a
@@ -145,9 +151,10 @@ scheduler process. The worker orchestrates AI judgment while deterministic code
 enforces validation, replay, idempotency, policy, audit, and recovery. Ambient
 interpretation is worker-owned and runs on
 `ARIEL_PROACTIVE_AMBIENT_INTERVAL_SECONDS` or source-event tasks. No public replay
-route owns normal sensing. Proactive deliberation can call read-only tools for at most
-`ARIEL_PROACTIVE_DELIBERATION_TOOL_ROUNDS` rounds before it must return a
-structured decision or fail closed.
+route owns normal sensing. `ARIEL_PROACTIVE_DELIBERATION_TOOL_ROUNDS` is retained
+only as a denial-round limit when the model emits unadvertised function calls.
+The proactive model is not given tools; it must return a structured decision or
+fail closed.
 
 Configured ambient source families are workspace item events, Google connector
 health, captures, jobs, approval requests, and reviewed memory assertions.
@@ -234,35 +241,36 @@ make verify
 Inspect proactive state through the typed API:
 
 ```sh
-curl -s http://127.0.0.1:8000/v1/connectors/google/subscriptions
-curl -s http://127.0.0.1:8000/v1/connectors/google/sync-cursors
-curl -s http://127.0.0.1:8000/v1/provider-events
-curl -s http://127.0.0.1:8000/v1/sync-runs
-curl -s http://127.0.0.1:8000/v1/workspace-items
-curl -s http://127.0.0.1:8000/v1/proactive/observations
-curl -s http://127.0.0.1:8000/v1/proactive/cases
-curl -s http://127.0.0.1:8000/v1/proactive/turns
-curl -s http://127.0.0.1:8000/v1/proactive/autonomy-scopes
-curl -s http://127.0.0.1:8000/v1/proactive/learning-records
+export ARIEL_LOCAL_AUTH_TOKEN=<local-api-token>
+curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" http://127.0.0.1:8000/v1/connectors/google/subscriptions
+curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" http://127.0.0.1:8000/v1/connectors/google/sync-cursors
+curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" http://127.0.0.1:8000/v1/provider-events
+curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" http://127.0.0.1:8000/v1/sync-runs
+curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" http://127.0.0.1:8000/v1/workspace-items
+curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" http://127.0.0.1:8000/v1/proactive/observations
+curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" http://127.0.0.1:8000/v1/proactive/cases
+curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" http://127.0.0.1:8000/v1/proactive/turns
+curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" http://127.0.0.1:8000/v1/proactive/autonomy-scopes
+curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" http://127.0.0.1:8000/v1/proactive/learning-records
 ```
 
 Inspect one proactive case end to end:
 
 ```sh
 case_id=<case-id>
-curl -s "http://127.0.0.1:8000/v1/proactive/cases/${case_id}"
-curl -s "http://127.0.0.1:8000/v1/proactive/cases/${case_id}/events"
-curl -s "http://127.0.0.1:8000/v1/proactive/cases/${case_id}/context-snapshots"
-curl -s "http://127.0.0.1:8000/v1/proactive/cases/${case_id}/decisions"
-curl -s "http://127.0.0.1:8000/v1/proactive/cases/${case_id}/validations"
-curl -s "http://127.0.0.1:8000/v1/proactive/cases/${case_id}/actions"
+curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" "http://127.0.0.1:8000/v1/proactive/cases/${case_id}"
+curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" "http://127.0.0.1:8000/v1/proactive/cases/${case_id}/events"
+curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" "http://127.0.0.1:8000/v1/proactive/cases/${case_id}/context-snapshots"
+curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" "http://127.0.0.1:8000/v1/proactive/cases/${case_id}/decisions"
+curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" "http://127.0.0.1:8000/v1/proactive/cases/${case_id}/validations"
+curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" "http://127.0.0.1:8000/v1/proactive/cases/${case_id}/actions"
 ```
 
 Force sync when replaying or diagnosing a specific source. Provider ingestion
 queues ambient interpretation for each durable source event.
 
 ```sh
-curl -X POST 'http://127.0.0.1:8000/v1/connectors/google/sync?resource_type=calendar&resource_id=primary'
+curl -X POST -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" 'http://127.0.0.1:8000/v1/connectors/google/sync?resource_type=calendar&resource_id=primary'
 ```
 
 System health:
@@ -276,7 +284,7 @@ Network health:
 
 ```sh
 ss -ltnp
-curl -fsS http://127.0.0.1:8000/health
+curl -fsS http://127.0.0.1:8000/v1/health
 ```
 
 Expected state:
@@ -372,8 +380,8 @@ Proactive worker:
 - Ariel API binds to `127.0.0.1` and is not publicly reachable.
 - Discord is the production ingress for ambient chat, approvals, jobs, and status
   through one configured home guild plus owner DMs.
-- No `/ariel` or `/ask` AI slash commands are registered; `/status`, `/jobs`, `/memory`,
-  and `/capture` are deterministic operational rails only.
+- No `/ariel` or `/ask` AI slash commands are registered; `/status`, `/jobs`, and
+  `/capture` are deterministic operational rails only.
 - Responses API is the only production model path.
 - No legacy provider, Chat Completions, compatibility flag, or fallback provider is
   configured.

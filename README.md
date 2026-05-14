@@ -64,7 +64,7 @@ links still flow through normal URL extraction/search capabilities.
 when the model calls `cap.discord.no_response`, Ariel records the audited tool output and
 sends no visible assistant text.
 
-`/ariel` and `/ask` are gone. `/status`, `/jobs`, `/memory`, and `/capture` are
+`/ariel` and `/ask` are gone. `/status`, `/jobs`, and `/capture` are
 deterministic operational commands only and do not route free-form prompts to the model.
 
 ## proactive AI deliberation
@@ -402,6 +402,18 @@ slice-8 adds first-class quick capture ingress for bounded text, url, and shared
 - capture ingress failures are durable and typed (`E_CAPTURE_*`) and are explicitly separated from
   in-turn failures (`capture.terminal_state="turn_created"` with typed `error`).
 
+local runtime auth config:
+
+- `ARIEL_DEPLOYMENT_MODE` (default `development`; production requires local auth)
+- `ARIEL_LOCAL_AUTH_REQUIRED` (default `false`)
+- `ARIEL_LOCAL_AUTH_TOKEN` (required when local auth is enabled; 32+ URL-safe random chars)
+
+generate a local auth token with:
+
+```bash
+python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
+```
+
 google connector runtime config:
 
 - `ARIEL_GOOGLE_OAUTH_CLIENT_ID`
@@ -410,8 +422,8 @@ google connector runtime config:
 - `ARIEL_GOOGLE_OAUTH_STATE_TTL_SECONDS` (default `600`)
 - `ARIEL_GOOGLE_OAUTH_TIMEOUT_SECONDS` (default `10.0`)
 - `ARIEL_CONNECTOR_ENCRYPTION_KEY_VERSION` (default `v1`)
-- `ARIEL_CONNECTOR_ENCRYPTION_KEYS` (recommended for production key rotation)
-- `ARIEL_CONNECTOR_ENCRYPTION_SECRET` (fallback/dev secret path only)
+- `ARIEL_CONNECTOR_ENCRYPTION_KEYS` (required in production; active version must be present)
+- `ARIEL_CONNECTOR_ENCRYPTION_SECRET` (legacy fallback/dev secret path only; dev default is rejected in production)
 
 `ARIEL_CONNECTOR_ENCRYPTION_KEYS` accepts either:
 
@@ -419,6 +431,7 @@ google connector runtime config:
 - comma list: `v1:<base64url-key>,v2:<base64url-key>`
 
 use 16/24/32-byte keys (base64url encoded). keep previous key versions configured during rotation windows.
+production startup fails without a keyring, with a missing active key version, or with the dev fallback secret.
 
 search capability runtime config:
 
@@ -589,7 +602,9 @@ proactive worker settings:
 
 - `ARIEL_PROACTIVE_AMBIENT_INTERVAL_SECONDS` (default `60`) controls how often the worker queues ambient interpretation.
 - `ARIEL_PROACTIVE_WORKER_MAX_ATTEMPTS` (default `5`) is the retry budget for worker-owned ambient and provider-renewal follow-up tasks.
-- `ARIEL_PROACTIVE_DELIBERATION_TOOL_ROUNDS` (default `2`) bounds read-only tool rounds during proactive deliberation.
+- `ARIEL_PROACTIVE_DELIBERATION_TOOL_ROUNDS` (default `2`) bounds denial
+  rounds when proactive deliberation emits unadvertised function calls. The
+  proactive model is not given tools.
 
 connection-string values (`user/password/database/port`) can be any values you want, as long as:
 
@@ -621,9 +636,12 @@ if migrations are missing, `/v1/*` endpoints return `E_SCHEMA_NOT_READY` (503) u
 smoke-check the key surfaces:
 
 ```bash
+export ARIEL_LOCAL_AUTH_TOKEN=<local-api-token>
 curl -sS http://127.0.0.1:8000/v1/health
-curl -sS http://127.0.0.1:8000/v1/sessions/active
+curl -sS http://127.0.0.1:8000/v1/sessions/active \
+  -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}"
 curl -sS -X POST http://127.0.0.1:8000/v1/captures \
+  -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" \
   -H "content-type: application/json" \
   -H "Idempotency-Key: smoke-capture-001" \
   -d '{"kind":"text","text":"smoke capture"}'

@@ -173,6 +173,10 @@ REQUIRED_COLUMNS: Final[dict[str, tuple[str, ...]]] = {
         "created_at",
         "updated_at",
     ),
+    "jobs": (
+        "agency_sandbox_policy",
+        "agency_egress_policy",
+    ),
     "action_private_payloads": (
         "payload_kind",
         "payload_digest",
@@ -218,9 +222,14 @@ REQUIRED_CONSTRAINTS: Final[dict[str, tuple[str, ...]]] = {
         "ck_background_task_provider_write_reconcile_shape",
     ),
     "provider_write_receipts": (
+        "ck_provider_write_receipt_provider",
         "ck_provider_write_receipt_capability",
         "ck_provider_write_receipt_status",
         "ck_provider_write_receipt_ambiguity_reason",
+    ),
+    "jobs": (
+        "ck_jobs_agency_sandbox_policy_object",
+        "ck_jobs_agency_egress_policy_object",
     ),
     "action_private_payloads": (
         "ck_action_private_payload_kind",
@@ -249,7 +258,11 @@ REQUIRED_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
         "ck_session_rotation_fields_paired": ("rotation_reason", "rotated_from_session_id"),
     },
     "ai_judgments": {
-        "ck_ai_judgment_type": ("'memory_extraction'", "'workspace_commitment_extraction'"),
+        "ck_ai_judgment_type": (
+            "'memory_extraction'",
+            "'workspace_commitment_extraction'",
+            "'tool_strategy'",
+        ),
         "ck_ai_judgment_status": ("'succeeded'", "'failed'"),
         "ck_ai_judgment_parse_status": ("'schema_invalid'",),
         "ck_ai_judgment_validation_status": ("'valid'", "'not_validated'"),
@@ -270,16 +283,22 @@ REQUIRED_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
         "ck_provider_evidence_block_index": ("block_index", ">=", "0"),
     },
     "provider_write_receipts": {
+        "ck_provider_write_receipt_provider": ("'google'", "'agency'"),
         "ck_provider_write_receipt_status": ("'executing'", "'ambiguous'"),
         "ck_provider_write_receipt_capability": (
             "'cap.email.draft'",
             "'cap.calendar.respond_to_event'",
             "'cap.drive.share'",
+            "'cap.agency.request_pr'",
         ),
         "ck_provider_write_receipt_ambiguity_reason": (
             "'ambiguous'",
             "ambiguity_reason IS NOT NULL",
         ),
+    },
+    "jobs": {
+        "ck_jobs_agency_sandbox_policy_object": ("jsonb_typeof", "agency_sandbox_policy"),
+        "ck_jobs_agency_egress_policy_object": ("jsonb_typeof", "agency_egress_policy"),
     },
     "action_private_payloads": {
         "ck_action_private_payload_kind": ("'google_provider_write_input'",),

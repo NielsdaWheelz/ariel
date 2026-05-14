@@ -37,6 +37,37 @@ class ActionProposalAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         del tools, history
+        if context_bundle.get("origin") == "tool_strategy":
+            strategy_input = json.loads(str(input_items[1]["content"]))
+            available_ids = {
+                capability_id
+                for family in strategy_input.get("available_capability_families", [])
+                if isinstance(family, dict)
+                for capability_id in family.get("capability_ids", [])
+                if isinstance(capability_id, str)
+            }
+            selected_capability_ids = [
+                proposal["capability_id"]
+                for proposal in self.proposals_by_message.get(user_message, [])
+                if proposal.get("capability_id") in available_ids
+            ]
+            return responses_message(
+                assistant_text=json.dumps(
+                    {
+                        "decision": "selected_tools" if selected_capability_ids else "no_tools",
+                        "selected_capability_ids": selected_capability_ids,
+                        "rationale": "test strategy",
+                        "unavailable_reason": None,
+                        "confidence": 1.0,
+                    },
+                    sort_keys=True,
+                ),
+                provider=self.provider,
+                model=self.model,
+                provider_response_id="resp_s4_pr01_strategy",
+                input_tokens=3,
+                output_tokens=2,
+            )
         if context_bundle.get("origin") == "tool_result_interpretation":
             interpreter_input = context_bundle.get("tool_result_interpreter_input")
             if not isinstance(interpreter_input, dict):
@@ -899,6 +930,24 @@ def test_s4_pr01_typed_auth_scope_failures_are_deterministic_and_recoverable(
         if expected_class == "token_expired":
             assert "retry" in rendered_message
             assert "reconnect" in rendered_message
+
+        if expected_class == "not_connected":
+            assert payload["turn"]["surface_action_lifecycle"] == []
+            assert all(
+                event["event_type"] != "evt.action.execution.failed"
+                for event in payload["turn"]["events"]
+            )
+            return
+        if (
+            expected_class == "consent_required"
+            and payload["turn"]["surface_action_lifecycle"] == []
+        ):
+            assert "reconnect" in rendered_message
+            assert all(
+                event["event_type"] != "evt.action.execution.started"
+                for event in payload["turn"]["events"]
+            )
+            return
 
         attempt = _surface_attempt(payload["turn"])
         assert attempt["policy"]["decision"] == "allow_inline"

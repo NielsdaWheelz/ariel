@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from ipaddress import ip_address
@@ -74,7 +74,7 @@ class CapabilityDefinition:
     contract_metadata: dict[str, Any]
     allowed_egress_destinations: tuple[str, ...]
     validate_input: Callable[[dict[str, Any]], tuple[dict[str, Any] | None, str | None]]
-    execute: Callable[[dict[str, Any]], dict[str, Any]]
+    execute: Callable[[dict[str, Any]], dict[str, Any]] | None
     declare_egress_intent: Callable[[dict[str, Any]], list[dict[str, Any]] | None] | None = None
 
 
@@ -95,30 +95,6 @@ def _validate_exact_text_input(
     if len(normalized) > max_length:
         return None, "schema_invalid"
     return {field_name: normalized}, None
-
-
-def _validate_read_echo_input(
-    raw_input: dict[str, Any],
-) -> tuple[dict[str, Any] | None, str | None]:
-    return _validate_exact_text_input(raw_input, field_name="text", max_length=4000)
-
-
-def _validate_read_private_input(
-    raw_input: dict[str, Any],
-) -> tuple[dict[str, Any] | None, str | None]:
-    return _validate_exact_text_input(raw_input, field_name="text", max_length=4000)
-
-
-def _validate_write_note_input(
-    raw_input: dict[str, Any],
-) -> tuple[dict[str, Any] | None, str | None]:
-    return _validate_exact_text_input(raw_input, field_name="note", max_length=500)
-
-
-def _validate_write_draft_input(
-    raw_input: dict[str, Any],
-) -> tuple[dict[str, Any] | None, str | None]:
-    return _validate_exact_text_input(raw_input, field_name="note", max_length=500)
 
 
 def _validate_search_web_input(
@@ -1108,24 +1084,6 @@ def _validate_weather_forecast_input(
     return {"location": location, "timeframe": timeframe}, None
 
 
-def _validate_external_notify_input(
-    raw_input: dict[str, Any],
-) -> tuple[dict[str, Any] | None, str | None]:
-    if set(raw_input.keys()) != {"destination", "message"}:
-        return None, "schema_invalid"
-    destination_raw = raw_input.get("destination")
-    message_raw = raw_input.get("message")
-    if not isinstance(destination_raw, str) or not isinstance(message_raw, str):
-        return None, "schema_invalid"
-    destination = destination_raw.strip()
-    message = message_raw.strip()
-    if not destination or not message:
-        return None, "schema_invalid"
-    if len(destination) > 500 or len(message) > 500:
-        return None, "schema_invalid"
-    return {"destination": destination, "message": message}, None
-
-
 _MEMORY_INSPECT_SECTIONS = {
     "all",
     "active_assertions",
@@ -1494,24 +1452,8 @@ def _validate_agency_request_pr_input(
     }, None
 
 
-def _execute_read_echo(input_payload: dict[str, Any]) -> dict[str, Any]:
-    return {"text": input_payload["text"]}
-
-
-def _execute_read_private(input_payload: dict[str, Any]) -> dict[str, Any]:
-    return {"text": input_payload["text"], "classification": "private"}
-
-
 def _execute_discord_no_response(input_payload: dict[str, Any]) -> dict[str, Any]:
     return {"reason": input_payload["reason"]}
-
-
-def _execute_write_note(input_payload: dict[str, Any]) -> dict[str, Any]:
-    return {"status": "recorded", "note": input_payload["note"]}
-
-
-def _execute_write_draft(input_payload: dict[str, Any]) -> dict[str, Any]:
-    return {"status": "drafted", "note": input_payload["note"]}
 
 
 def _execute_memory_runtime(input_payload: dict[str, Any]) -> dict[str, Any]:
@@ -2688,74 +2630,6 @@ def _maps_allowed_destinations() -> tuple[str, ...]:
     return ("maps.googleapis.com",)
 
 
-def _execute_google_calendar_list(_: dict[str, Any]) -> dict[str, Any]:
-    raise RuntimeError("google_runtime_not_bound")
-
-
-def _execute_google_calendar_propose_slots(_: dict[str, Any]) -> dict[str, Any]:
-    raise RuntimeError("google_runtime_not_bound")
-
-
-def _execute_google_email_search(_: dict[str, Any]) -> dict[str, Any]:
-    raise RuntimeError("google_runtime_not_bound")
-
-
-def _execute_google_email_read(_: dict[str, Any]) -> dict[str, Any]:
-    raise RuntimeError("google_runtime_not_bound")
-
-
-def _execute_google_calendar_create_event(_: dict[str, Any]) -> dict[str, Any]:
-    raise RuntimeError("google_runtime_not_bound")
-
-
-def _execute_google_calendar_update_event(_: dict[str, Any]) -> dict[str, Any]:
-    raise RuntimeError("google_runtime_not_bound")
-
-
-def _execute_google_calendar_respond_to_event(_: dict[str, Any]) -> dict[str, Any]:
-    raise RuntimeError("google_runtime_not_bound")
-
-
-def _execute_google_email_draft(_: dict[str, Any]) -> dict[str, Any]:
-    raise RuntimeError("google_runtime_not_bound")
-
-
-def _execute_google_email_send(_: dict[str, Any]) -> dict[str, Any]:
-    raise RuntimeError("google_runtime_not_bound")
-
-
-def _execute_google_email_archive(_: dict[str, Any]) -> dict[str, Any]:
-    raise RuntimeError("google_runtime_not_bound")
-
-
-def _execute_google_email_trash(_: dict[str, Any]) -> dict[str, Any]:
-    raise RuntimeError("google_runtime_not_bound")
-
-
-def _execute_google_email_labels_modify(_: dict[str, Any]) -> dict[str, Any]:
-    raise RuntimeError("google_runtime_not_bound")
-
-
-def _execute_google_email_undo(_: dict[str, Any]) -> dict[str, Any]:
-    raise RuntimeError("google_runtime_not_bound")
-
-
-def _execute_email_thread_watch_runtime(_: dict[str, Any]) -> dict[str, Any]:
-    raise RuntimeError("email_thread_watch_runtime_not_bound")
-
-
-def _execute_google_drive_search(_: dict[str, Any]) -> dict[str, Any]:
-    raise RuntimeError("google_runtime_not_bound")
-
-
-def _execute_google_drive_read(_: dict[str, Any]) -> dict[str, Any]:
-    raise RuntimeError("google_runtime_not_bound")
-
-
-def _execute_google_drive_share(_: dict[str, Any]) -> dict[str, Any]:
-    raise RuntimeError("google_runtime_not_bound")
-
-
 def _declare_google_calendar_list_egress_intent(
     input_payload: dict[str, Any],
 ) -> list[dict[str, Any]]:
@@ -3420,14 +3294,6 @@ def _execute_weather_forecast(input_payload: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-def _execute_external_notify(input_payload: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "status": "sent",
-        "destination": input_payload["destination"],
-        "message": input_payload["message"],
-    }
-
-
 def _execute_agency_runtime(_: dict[str, Any]) -> dict[str, Any]:
     raise RuntimeError("agency_runtime_not_bound")
 
@@ -3467,15 +3333,6 @@ def _execute_attachment_runtime(_: dict[str, Any]) -> dict[str, Any]:
     raise RuntimeError("attachment_runtime_not_bound")
 
 
-def _declare_external_notify_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
-    return [
-        {
-            "destination": input_payload["destination"],
-            "payload": {"message": input_payload["message"]},
-        }
-    ]
-
-
 _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
     "cap.calendar.list": CapabilityDefinition(
         capability_id="cap.calendar.list",
@@ -3490,7 +3347,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         },
         allowed_egress_destinations=_GOOGLE_ALLOWED_EGRESS_DESTINATIONS,
         validate_input=_validate_calendar_list_input,
-        execute=_execute_google_calendar_list,
+        execute=None,
         declare_egress_intent=_declare_google_calendar_list_egress_intent,
     ),
     "cap.calendar.propose_slots": CapabilityDefinition(
@@ -3507,7 +3364,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         },
         allowed_egress_destinations=_GOOGLE_ALLOWED_EGRESS_DESTINATIONS,
         validate_input=_validate_calendar_propose_slots_input,
-        execute=_execute_google_calendar_propose_slots,
+        execute=None,
         declare_egress_intent=_declare_google_calendar_propose_slots_egress_intent,
     ),
     "cap.email.search": CapabilityDefinition(
@@ -3523,7 +3380,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         },
         allowed_egress_destinations=_GOOGLE_GMAIL_ALLOWED_EGRESS_DESTINATIONS,
         validate_input=_validate_email_search_input,
-        execute=_execute_google_email_search,
+        execute=None,
         declare_egress_intent=_declare_google_email_search_egress_intent,
     ),
     "cap.email.read": CapabilityDefinition(
@@ -3539,7 +3396,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         },
         allowed_egress_destinations=_GOOGLE_GMAIL_ALLOWED_EGRESS_DESTINATIONS,
         validate_input=_validate_email_read_input,
-        execute=_execute_google_email_read,
+        execute=None,
         declare_egress_intent=_declare_google_email_read_egress_intent,
     ),
     "cap.drive.search": CapabilityDefinition(
@@ -3555,7 +3412,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         },
         allowed_egress_destinations=_GOOGLE_ALLOWED_EGRESS_DESTINATIONS,
         validate_input=_validate_drive_search_input,
-        execute=_execute_google_drive_search,
+        execute=None,
         declare_egress_intent=_declare_google_drive_search_egress_intent,
     ),
     "cap.drive.read": CapabilityDefinition(
@@ -3572,7 +3429,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         },
         allowed_egress_destinations=_GOOGLE_ALLOWED_EGRESS_DESTINATIONS,
         validate_input=_validate_drive_read_input,
-        execute=_execute_google_drive_read,
+        execute=None,
         declare_egress_intent=_declare_google_drive_read_egress_intent,
     ),
     "cap.maps.directions": CapabilityDefinition(
@@ -3622,7 +3479,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         },
         allowed_egress_destinations=_GOOGLE_ALLOWED_EGRESS_DESTINATIONS,
         validate_input=_validate_calendar_create_event_input,
-        execute=_execute_google_calendar_create_event,
+        execute=None,
         declare_egress_intent=_declare_google_calendar_create_event_egress_intent,
     ),
     "cap.calendar.update_event": CapabilityDefinition(
@@ -3638,7 +3495,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         },
         allowed_egress_destinations=_GOOGLE_ALLOWED_EGRESS_DESTINATIONS,
         validate_input=_validate_calendar_update_event_input,
-        execute=_execute_google_calendar_update_event,
+        execute=None,
         declare_egress_intent=_declare_google_calendar_update_event_egress_intent,
     ),
     "cap.calendar.respond_to_event": CapabilityDefinition(
@@ -3654,7 +3511,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         },
         allowed_egress_destinations=_GOOGLE_ALLOWED_EGRESS_DESTINATIONS,
         validate_input=_validate_calendar_respond_to_event_input,
-        execute=_execute_google_calendar_respond_to_event,
+        execute=None,
         declare_egress_intent=_declare_google_calendar_respond_to_event_egress_intent,
     ),
     "cap.email.draft": CapabilityDefinition(
@@ -3671,7 +3528,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         },
         allowed_egress_destinations=_GOOGLE_GMAIL_ALLOWED_EGRESS_DESTINATIONS,
         validate_input=_validate_email_draft_input,
-        execute=_execute_google_email_draft,
+        execute=None,
         declare_egress_intent=_declare_google_email_draft_egress_intent,
     ),
     "cap.email.send": CapabilityDefinition(
@@ -3687,7 +3544,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         },
         allowed_egress_destinations=_GOOGLE_GMAIL_ALLOWED_EGRESS_DESTINATIONS,
         validate_input=_validate_email_send_input,
-        execute=_execute_google_email_send,
+        execute=None,
         declare_egress_intent=_declare_google_email_send_egress_intent,
     ),
     "cap.email.archive": CapabilityDefinition(
@@ -3705,7 +3562,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         },
         allowed_egress_destinations=_GOOGLE_GMAIL_ALLOWED_EGRESS_DESTINATIONS,
         validate_input=_validate_email_message_batch_mutation_input,
-        execute=_execute_google_email_archive,
+        execute=None,
         declare_egress_intent=_declare_google_email_archive_egress_intent,
     ),
     "cap.email.trash": CapabilityDefinition(
@@ -3724,7 +3581,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         },
         allowed_egress_destinations=_GOOGLE_GMAIL_ALLOWED_EGRESS_DESTINATIONS,
         validate_input=_validate_email_message_batch_mutation_input,
-        execute=_execute_google_email_trash,
+        execute=None,
         declare_egress_intent=_declare_google_email_trash_egress_intent,
     ),
     "cap.email.labels.modify": CapabilityDefinition(
@@ -3742,7 +3599,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         },
         allowed_egress_destinations=_GOOGLE_GMAIL_ALLOWED_EGRESS_DESTINATIONS,
         validate_input=_validate_email_labels_modify_input,
-        execute=_execute_google_email_labels_modify,
+        execute=None,
         declare_egress_intent=_declare_google_email_labels_modify_egress_intent,
     ),
     "cap.email.undo": CapabilityDefinition(
@@ -3764,7 +3621,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         },
         allowed_egress_destinations=_GOOGLE_GMAIL_ALLOWED_EGRESS_DESTINATIONS,
         validate_input=_validate_email_undo_input,
-        execute=_execute_google_email_undo,
+        execute=None,
         declare_egress_intent=_declare_google_email_undo_egress_intent,
     ),
     "cap.email.thread_watch.create": CapabilityDefinition(
@@ -3782,7 +3639,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         },
         allowed_egress_destinations=_GOOGLE_GMAIL_ALLOWED_EGRESS_DESTINATIONS,
         validate_input=_validate_email_thread_watch_create_input,
-        execute=_execute_email_thread_watch_runtime,
+        execute=None,
         declare_egress_intent=_declare_google_email_thread_watch_create_egress_intent,
     ),
     "cap.email.thread_watch.cancel": CapabilityDefinition(
@@ -3798,7 +3655,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         },
         allowed_egress_destinations=(),
         validate_input=_validate_email_thread_watch_cancel_input,
-        execute=_execute_email_thread_watch_runtime,
+        execute=None,
     ),
     "cap.email.thread_watch.list": CapabilityDefinition(
         capability_id="cap.email.thread_watch.list",
@@ -3813,7 +3670,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         },
         allowed_egress_destinations=(),
         validate_input=_validate_email_thread_watch_list_input,
-        execute=_execute_email_thread_watch_runtime,
+        execute=None,
     ),
     "cap.drive.share": CapabilityDefinition(
         capability_id="cap.drive.share",
@@ -3828,7 +3685,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         },
         allowed_egress_destinations=_GOOGLE_ALLOWED_EGRESS_DESTINATIONS,
         validate_input=_validate_drive_share_input,
-        execute=_execute_google_drive_share,
+        execute=None,
         declare_egress_intent=_declare_google_drive_share_egress_intent,
     ),
     "cap.web.extract": CapabilityDefinition(
@@ -4187,77 +4044,6 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         allowed_egress_destinations=(),
         validate_input=_validate_discord_no_response_input,
         execute=_execute_discord_no_response,
-    ),
-    "cap.framework.read_echo": CapabilityDefinition(
-        capability_id="cap.framework.read_echo",
-        version="1.0",
-        impact_level="read",
-        policy_decision="allow_inline",
-        contract_metadata={
-            "input_schema": "text_v1",
-            "output_schema": "text_v1",
-            "idempotency": "deterministic_read",
-        },
-        allowed_egress_destinations=(),
-        validate_input=_validate_read_echo_input,
-        execute=_execute_read_echo,
-    ),
-    "cap.framework.read_private": CapabilityDefinition(
-        capability_id="cap.framework.read_private",
-        version="1.0",
-        impact_level="read",
-        policy_decision="deny",
-        contract_metadata={
-            "input_schema": "text_v1",
-            "output_schema": "private_text_v1",
-            "idempotency": "deterministic_read",
-        },
-        allowed_egress_destinations=(),
-        validate_input=_validate_read_private_input,
-        execute=_execute_read_private,
-    ),
-    "cap.framework.write_note": CapabilityDefinition(
-        capability_id="cap.framework.write_note",
-        version="1.0",
-        impact_level="write_reversible",
-        policy_decision="requires_approval",
-        contract_metadata={
-            "input_schema": "note_v1",
-            "output_schema": "write_receipt_v1",
-            "idempotency": "action_attempt_id",
-        },
-        allowed_egress_destinations=(),
-        validate_input=_validate_write_note_input,
-        execute=_execute_write_note,
-    ),
-    "cap.framework.write_draft": CapabilityDefinition(
-        capability_id="cap.framework.write_draft",
-        version="1.0",
-        impact_level="write_reversible",
-        policy_decision="allow_inline",
-        contract_metadata={
-            "input_schema": "note_v1",
-            "output_schema": "draft_receipt_v1",
-            "idempotency": "action_attempt_id",
-        },
-        allowed_egress_destinations=(),
-        validate_input=_validate_write_draft_input,
-        execute=_execute_write_draft,
-    ),
-    "cap.framework.external_notify": CapabilityDefinition(
-        capability_id="cap.framework.external_notify",
-        version="1.0",
-        impact_level="external_send",
-        policy_decision="requires_approval",
-        contract_metadata={
-            "input_schema": "external_notify_v1",
-            "output_schema": "external_notify_receipt_v1",
-            "idempotency": "action_attempt_id",
-        },
-        allowed_egress_destinations=("api.framework.local",),
-        validate_input=_validate_external_notify_input,
-        execute=_execute_external_notify,
-        declare_egress_intent=_declare_external_notify_egress_intent,
     ),
 }
 
@@ -4643,14 +4429,6 @@ _RESPONSE_TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     ),
     "memory_empty_v1": _object_schema({}),
     "discord_no_response_v1": _object_schema({"reason": {"type": "string", "maxLength": 500}}),
-    "text_v1": _object_schema({"text": {"type": "string", "maxLength": 4000}}),
-    "note_v1": _object_schema({"note": {"type": "string", "maxLength": 500}}),
-    "external_notify_v1": _object_schema(
-        {
-            "destination": {"type": "string", "maxLength": 500},
-            "message": {"type": "string", "maxLength": 500},
-        }
-    ),
 }
 
 _RESPONSE_TOOL_DESCRIPTIONS: dict[str, str] = {
@@ -4702,12 +4480,66 @@ _RESPONSE_TOOL_DESCRIPTIONS: dict[str, str] = {
     "cap.discord.no_response": (
         "Use when the right Discord behavior is to read the message and send no visible reply."
     ),
-    "cap.framework.read_echo": "Test-only read echo capability.",
-    "cap.framework.read_private": "Test-only denied private read capability.",
-    "cap.framework.write_note": "Test-only approval-gated note write capability.",
-    "cap.framework.write_draft": "Test-only inline draft write capability.",
-    "cap.framework.external_notify": "Test-only external notification capability.",
 }
+
+_ACTION_LABELS_BY_CAPABILITY_ID = {
+    "cap.agency.run": "Start coding job",
+    "cap.agency.request_pr": "Create or update pull request",
+    "cap.calendar.create_event": "Create calendar event",
+    "cap.calendar.update_event": "Update calendar event",
+    "cap.calendar.respond_to_event": "Respond to calendar event",
+    "cap.drive.share": "Share Drive file",
+    "cap.email.archive": "Archive email",
+    "cap.email.draft": "Draft email",
+    "cap.email.labels.modify": "Update email labels",
+    "cap.email.send": "Send email",
+    "cap.email.thread_watch.cancel": "Cancel email watch",
+    "cap.email.thread_watch.create": "Create email watch",
+    "cap.email.trash": "Move email to trash",
+    "cap.email.undo": "Undo email change",
+    "cap.memory.correct": "Correct memory",
+    "cap.memory.delete": "Delete memory",
+    "cap.memory.export": "Export memory",
+    "cap.memory.privacy_delete": "Privacy-delete memory",
+    "cap.memory.redact_evidence": "Redact memory evidence",
+    "cap.memory.consolidate": "Consolidate memory",
+    "cap.memory.resolve_conflict": "Resolve memory conflict",
+    "cap.memory.retract": "Retract memory",
+    "cap.memory.review": "Review memory candidate",
+    "cap.memory.set_never_remember": "Add memory rule",
+}
+
+
+def capability_action_label(capability_id: str) -> str:
+    label = _ACTION_LABELS_BY_CAPABILITY_ID.get(capability_id)
+    if label is not None:
+        return label
+    if capability_id.startswith("cap.agency."):
+        return "Agency action"
+    if capability_id.startswith("cap.calendar."):
+        return "Calendar action"
+    if capability_id.startswith("cap.drive."):
+        return "Drive action"
+    if capability_id.startswith("cap.email."):
+        return "Email action"
+    if capability_id.startswith("cap.memory."):
+        return "Memory action"
+    return "Action"
+
+
+_STRATEGY_FAMILIES_BY_PREFIX: tuple[tuple[str, str, str], ...] = (
+    ("cap.calendar.", "calendar", "Calendar reads, planning, and approved calendar writes."),
+    ("cap.email.", "email", "Gmail search, read, drafts, approved sends, and mail organization."),
+    ("cap.drive.", "drive", "Drive search, bounded reads, and approved sharing."),
+    ("cap.maps.", "maps", "Maps directions and place search."),
+    ("cap.web.", "web", "Bounded public URL extraction."),
+    ("cap.search.", "search", "Live web and news search."),
+    ("cap.weather.", "weather", "Weather lookup for explicit locations."),
+    ("cap.attachment.", "attachments", "Bounded reads from Discord attachments in the turn."),
+    ("cap.agency.", "agency", "Allowlisted coding daemon work."),
+    ("cap.memory.", "memory", "Memory inspection, proposal, review, correction, and export."),
+    ("cap.discord.", "discord", "Discord turn control actions such as no visible response."),
+)
 
 
 def response_tool_name_for_capability_id(capability_id: str) -> str:
@@ -4721,9 +4553,42 @@ def capability_id_for_response_tool_name(tool_name: str) -> str | None:
     return None
 
 
-def response_tool_definitions() -> list[dict[str, Any]]:
+def production_response_capability_ids() -> list[str]:
+    return list(_CAPABILITY_REGISTRY)
+
+
+def response_capability_strategy_families(
+    capability_ids: Sequence[str],
+) -> list[dict[str, Any]]:
+    available_ids = set(capability_ids)
+    families: list[dict[str, Any]] = []
+    for capability_prefix, family_id, description in _STRATEGY_FAMILIES_BY_PREFIX:
+        family_capability_ids = [
+            capability_id
+            for capability_id in _CAPABILITY_REGISTRY
+            if capability_id in available_ids and capability_id.startswith(capability_prefix)
+        ]
+        if not family_capability_ids:
+            continue
+        families.append(
+            {
+                "family": family_id,
+                "description": description,
+                "capability_ids": family_capability_ids,
+            }
+        )
+    return families
+
+
+def response_tool_definitions(
+    capability_ids: Sequence[str],
+) -> list[dict[str, Any]]:
     tools: list[dict[str, Any]] = []
-    for capability in _CAPABILITY_REGISTRY.values():
+    selected_capability_ids = list(capability_ids)
+    for capability_id in selected_capability_ids:
+        capability = get_capability(capability_id)
+        if capability is None:
+            raise RuntimeError(f"unknown Responses capability {capability_id}")
         input_schema_name = capability.contract_metadata.get("input_schema")
         parameters = (
             _RESPONSE_TOOL_INPUT_SCHEMAS.get(input_schema_name)

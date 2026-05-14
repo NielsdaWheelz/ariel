@@ -2,15 +2,19 @@ from __future__ import annotations
 
 from ipaddress import ip_address
 from pathlib import Path
+import re
 from typing import Any
 from urllib.parse import urlparse
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from ariel.google_connector import ConnectorTokenCipher
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MEMORY_EMBEDDING_DIMENSIONS = 1536
+_LOCAL_AUTH_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,}$")
 
 
 class AppSettings(BaseSettings):
@@ -25,8 +29,11 @@ class AppSettings(BaseSettings):
     )
 
     database_url: str = "postgresql+psycopg://localhost/ariel"
+    deployment_mode: str = "development"
     bind_host: str = "127.0.0.1"
     bind_port: int = 8000
+    local_auth_required: bool = False
+    local_auth_token: str | None = None
     model_name: str = "gpt-5.5"
     openai_api_key: str | None = None
     model_timeout_seconds: float = 30.0
@@ -95,6 +102,14 @@ class AppSettings(BaseSettings):
             pass
         raise ValueError("bind_host must be loopback-only (localhost, 127.0.0.1, or ::1)")
 
+    @field_validator("deployment_mode")
+    @classmethod
+    def _deployment_mode_must_be_supported(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"development", "production"}:
+            raise ValueError("deployment_mode must be one of: development, production")
+        return normalized
+
     @field_validator("openai_api_key", mode="before")
     @classmethod
     def _blank_openai_api_key_is_unset(cls, value: Any) -> Any:
@@ -108,6 +123,46 @@ class AppSettings(BaseSettings):
         if isinstance(value, str) and not value.strip():
             return None
         return value
+
+    @field_validator("local_auth_token", mode="before")
+    @classmethod
+    def _blank_local_auth_token_is_unset(cls, value: Any) -> Any:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("local_auth_token")
+    @classmethod
+    def _local_auth_token_must_be_strong(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not _LOCAL_AUTH_TOKEN_PATTERN.fullmatch(normalized):
+            raise ValueError("local_auth_token must be at least 32 URL-safe random characters")
+        return normalized
+
+    @model_validator(mode="after")
+    def _security_settings_must_match_deployment(self) -> AppSettings:
+        if self.local_auth_required and self.local_auth_token is None:
+            raise ValueError("local_auth_token is required when local_auth_required is true")
+        if self.deployment_mode == "production":
+            if not self.local_auth_required:
+                raise ValueError("local_auth_required must be true in production")
+            if self.connector_encryption_secret == "dev-local-connector-secret":
+                raise ValueError(
+                    "connector_encryption_secret must not use the dev default in production"
+                )
+            if self.connector_encryption_keys is None or not self.connector_encryption_keys.strip():
+                raise ValueError("connector_encryption_keys is required in production")
+            try:
+                ConnectorTokenCipher.from_config(
+                    active_key_version=self.connector_encryption_key_version,
+                    configured_keys=self.connector_encryption_keys,
+                    fallback_secret=self.connector_encryption_secret,
+                )
+            except RuntimeError as exc:
+                raise ValueError(str(exc)) from exc
+        return self
 
     @field_validator("model_reasoning_effort")
     @classmethod

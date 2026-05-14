@@ -12,10 +12,7 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from ariel.attention_ranking import build_work_follow_up_feature_packet
-from ariel.capability_registry import (
-    capability_id_for_response_tool_name,
-    get_capability,
-)
+from ariel.capability_registry import get_capability
 from ariel.config import AppSettings
 from ariel.executor import execute_capability, preflight_capability_execution
 from ariel.memory import (
@@ -1343,6 +1340,7 @@ def process_proactive_deliberation_due(
                 and 0.0 <= float(confidence) <= 1.0
                 and urgency in {"critical", "high", "normal", "low"}
                 and isinstance(rationale, str)
+                and not tool_refs
             )
             if decision_type in {"speak_now", "ask_user", "act_now", "speak_and_act"}:
                 valid = valid and bool(evidence_refs)
@@ -1369,7 +1367,7 @@ def process_proactive_deliberation_due(
                 user_visible_message=message.strip() if isinstance(message, str) else None,
                 rationale=rationale.strip() if isinstance(rationale, str) else "invalid decision",
                 evidence_refs=evidence_refs,
-                tool_refs=tool_refs,
+                tool_refs=[],
                 actions=actions,
                 follow_up=follow_up if isinstance(follow_up, dict) else None,
                 raw_model_output={
@@ -1550,39 +1548,14 @@ def _proactive_tool_call_outputs(
     for call in calls:
         call_id = call.get("call_id")
         name = call.get("name")
-        arguments = call.get("arguments")
         if not isinstance(call_id, str) or not isinstance(name, str):
             continue
-        capability_id = capability_id_for_response_tool_name(name)
-        capability = get_capability(capability_id) if capability_id is not None else None
-        payload: dict[str, Any]
-        if capability is None or capability.impact_level != "read":
-            payload = {"status": "failed", "error": "proactive_deliberation_tool_denied"}
-        else:
-            try:
-                raw_input = json.loads(arguments) if isinstance(arguments, str) else {}
-            except json.JSONDecodeError:
-                raw_input = {}
-            if not isinstance(raw_input, dict):
-                raw_input = {}
-            normalized_input, input_error = capability.validate_input(raw_input)
-            if normalized_input is None or input_error is not None:
-                payload = {"status": "failed", "error": input_error or "schema_invalid"}
-            else:
-                result = execute_capability(
-                    capability=capability,
-                    normalized_input=normalized_input,
-                )
-                payload = {
-                    "status": result.status,
-                    "output": result.output,
-                    "error": result.error,
-                }
+        payload = {"status": "failed", "error": "proactive_deliberation_tool_denied"}
         tool_outputs.append(
             {
                 "call_id": call_id,
                 "tool_name": name,
-                "capability_id": capability_id,
+                "capability_id": None,
                 "result": payload,
             }
         )
@@ -1822,8 +1795,6 @@ def _valid_remember_payload(payload: dict[str, Any] | None) -> bool:
     if payload is None:
         return False
     value = payload.get("value")
-    if value is None:
-        value = payload.get("text")
     return (
         _normalized_text(payload.get("subject_key")) is not None
         and _normalized_text(payload.get("predicate")) is not None
@@ -1845,10 +1816,7 @@ def _valid_remember_payload(payload: dict[str, Any] | None) -> bool:
 def _normalized_remember_payload(payload: dict[str, Any]) -> dict[str, Any]:
     subject_key = _normalized_text(payload.get("subject_key")) or "user:default"
     predicate = _normalized_text(payload.get("predicate")) or "note"
-    raw_value = payload.get("value")
-    if raw_value is None:
-        raw_value = payload.get("text")
-    value = _normalized_text(raw_value) or ""
+    value = _normalized_text(payload.get("value")) or ""
     assertion_type = str(payload.get("assertion_type") or "fact")
     if assertion_type not in {
         "fact",
@@ -1873,20 +1841,7 @@ def _action_target_system(action_type: str, action: dict[str, Any]) -> str:
     target_system = action.get("target_system")
     if isinstance(target_system, str) and target_system.strip():
         return target_system.strip()
-    if action_type == "send_discord_message":
-        return "discord"
     return action_type
-
-
-def _normalize_action_payload(action_type: str, payload: dict[str, Any]) -> dict[str, Any] | None:
-    if action_type != "send_discord_message":
-        return payload
-    message = _normalized_text(payload.get("message"), max_chars=4000)
-    if message is None:
-        message = _normalized_text(payload.get("text"), max_chars=4000)
-    if message is None:
-        return None
-    return {"message": message}
 
 
 def _risk_allowed_by_scope(scope: AutonomyScopeRecord, risk_tier: str) -> bool:
@@ -2085,10 +2040,6 @@ def _find_autonomy_scope(
     return None, denial_result, denial_reason, considered_scope_ids
 
 
-def _decision_has_discord_message_action(decision: ProactiveDecisionRecord) -> bool:
-    return any(action.get("action_type") == "send_discord_message" for action in decision.actions)
-
-
 def _taint_blocks_autonomous_write(latest_taint: Any) -> bool:
     return isinstance(latest_taint, dict) and (
         latest_taint.get("provenance_status") in {"tainted", "ambiguous"}
@@ -2134,24 +2085,28 @@ def _validate_and_apply_decision(
                 break
             action_type = action_type.strip()
             target = target.strip()
-            capability = None
             if action_type == "send_discord_message":
-                normalized_input = _normalize_action_payload(action_type, payload)
-                if normalized_input is None:
-                    validation_result = "invalid_decision"
-                    denial_reason = "discord message action missing message"
-                    break
-            else:
-                capability = get_capability(action_type)
-                if capability is None:
-                    validation_result = "invalid_decision"
-                    denial_reason = f"unknown capability {action_type}"
-                    break
-                normalized_input, input_error = capability.validate_input(payload)
-                if normalized_input is None or input_error is not None:
-                    validation_result = "invalid_decision"
-                    denial_reason = f"action input invalid for {action_type}"
-                    break
+                validation_result = "invalid_decision"
+                denial_reason = "proactive Discord messages must use speak_now or ask_user"
+                break
+            if action_type.startswith("cap.framework."):
+                validation_result = "invalid_decision"
+                denial_reason = "test-only capabilities are not valid proactive actions"
+                break
+            if action_type.startswith("cap.memory."):
+                validation_result = "invalid_decision"
+                denial_reason = "proactive memory updates must use decision=remember"
+                break
+            capability = get_capability(action_type)
+            if capability is None:
+                validation_result = "invalid_decision"
+                denial_reason = f"unknown capability {action_type}"
+                break
+            normalized_input, input_error = capability.validate_input(payload)
+            if normalized_input is None or input_error is not None:
+                validation_result = "invalid_decision"
+                denial_reason = f"action input invalid for {action_type}"
+                break
             if risk_tier == "blocked":
                 validation_result = "denied"
                 denial_reason = f"blocked risk tier for {action_type}"
@@ -2272,10 +2227,7 @@ def _validate_and_apply_decision(
         decision.status = "executed"
         return
 
-    should_create_turn = decision.decision_type in {"speak_now", "ask_user"} or (
-        decision.decision_type == "speak_and_act"
-        and not _decision_has_discord_message_action(decision)
-    )
+    should_create_turn = decision.decision_type in {"speak_now", "ask_user", "speak_and_act"}
     if should_create_turn:
         _create_proactive_turn(
             db=db,
@@ -2565,72 +2517,37 @@ def process_proactive_action_execution_due(
             execution.completed_at = None
             execution.error = None
             execution.updated_at = now
-            if plan.action_type == "send_discord_message":
-                decision = db.get(ProactiveDecisionRecord, plan.decision_id)
-                case = db.get(ProactiveCaseRecord, plan.case_id)
-                message = plan.payload.get("message")
-                if decision is None or case is None:
-                    raise RuntimeError("proactive action parent records missing")
-                if not isinstance(message, str) or not message.strip():
-                    execution.status = "failed"
-                    execution.error = "discord message action missing message"
-                    execution.completed_at = now
-                    plan.status = "failed"
-                else:
-                    decision.user_visible_message = message.strip()
-                    validation = (
-                        db.get(ProactivePolicyValidationRecord, plan.policy_validation_id)
-                        if plan.policy_validation_id is not None
-                        else None
-                    )
-                    if validation is None:
-                        raise RuntimeError("proactive action validation missing")
-                    _create_proactive_turn(
-                        db=db,
-                        case=case,
-                        decision=decision,
-                        validation=validation,
-                        now=now,
-                        new_id_fn=new_id_fn,
-                    )
-                    execution.status = "succeeded"
-                    execution.external_receipt = {"kind": "proactive_turn_delivery_queued"}
-                    execution.error = None
-                    execution.completed_at = now
-                    plan.status = "succeeded"
-                    plan.updated_at = now
+            capability = get_capability(plan.action_type)
+            if capability is None:
+                execution.status = "failed"
+                execution.error = "unknown_capability"
+                execution.completed_at = now
+                plan.status = "failed"
+                plan.updated_at = now
             else:
-                capability = get_capability(plan.action_type)
-                if capability is None:
+                normalized_input, input_error = capability.validate_input(plan.payload)
+                if normalized_input is None or input_error is not None:
                     execution.status = "failed"
-                    execution.error = "unknown_capability"
+                    execution.error = "schema_invalid"
                     execution.completed_at = now
                     plan.status = "failed"
                     plan.updated_at = now
                 else:
-                    normalized_input, input_error = capability.validate_input(plan.payload)
-                    if normalized_input is None or input_error is not None:
+                    preflight_error = preflight_capability_execution(
+                        capability=capability,
+                        normalized_input=normalized_input,
+                    )
+                    if preflight_error is not None:
                         execution.status = "failed"
-                        execution.error = "schema_invalid"
+                        execution.error = preflight_error
                         execution.completed_at = now
                         plan.status = "failed"
                         plan.updated_at = now
                     else:
-                        preflight_error = preflight_capability_execution(
-                            capability=capability,
-                            normalized_input=normalized_input,
-                        )
-                        if preflight_error is not None:
-                            execution.status = "failed"
-                            execution.error = preflight_error
-                            execution.completed_at = now
-                            plan.status = "failed"
-                            plan.updated_at = now
-                        else:
-                            capability_payload = normalized_input
-                            capability_action_type = plan.action_type
-                            plan.status = "executing"
-                            plan.updated_at = now
+                        capability_payload = normalized_input
+                        capability_action_type = plan.action_type
+                        plan.status = "executing"
+                        plan.updated_at = now
 
     if capability_payload is not None and capability_action_type is not None:
         capability = get_capability(capability_action_type)
@@ -2641,34 +2558,37 @@ def process_proactive_action_execution_due(
             result_status = "failed"
             result_output = None
             result_error = "unknown_capability"
-        elif google_runtime is not None and capability_action_type.startswith(
-            ("cap.calendar.", "cap.email.", "cap.drive.")
-        ):
-            with session_factory() as db:
-                with db.begin():
-                    access_token, granted_scopes, provider_account_id, access_failure = (
-                        google_runtime.prepare_capability_access(
-                            db=db,
-                            capability_id=capability_action_type,
-                            now_fn=now_fn,
-                            new_id_fn=new_id_fn,
-                        )
-                    )
-            if access_failure is not None:
-                google_result = access_failure
-            elif access_token is None:
-                google_result = google_runtime._typed_failure(failure_class="token_expired")
+        elif capability_action_type.startswith(("cap.calendar.", "cap.email.", "cap.drive.")):
+            if google_runtime is None:
+                result_status = "failed"
+                result_output = None
+                result_error = "google_runtime_not_bound"
             else:
-                google_result = google_runtime.execute_provider_capability(
-                    capability_id=capability_action_type,
-                    normalized_input=capability_payload,
-                    access_token=access_token,
-                    granted_scopes=granted_scopes,
-                    provider_account_id=provider_account_id,
-                )
-            result_status = google_result.status
-            result_output = google_result.output
-            result_error = google_result.error
+                with session_factory() as db:
+                    with db.begin():
+                        access_token, granted_scopes, provider_account_id, access_failure = (
+                            google_runtime.prepare_capability_access(
+                                db=db,
+                                capability_id=capability_action_type,
+                                now_fn=now_fn,
+                                new_id_fn=new_id_fn,
+                            )
+                        )
+                if access_failure is not None:
+                    google_result = access_failure
+                elif access_token is None:
+                    google_result = google_runtime._typed_failure(failure_class="token_expired")
+                else:
+                    google_result = google_runtime.execute_provider_capability(
+                        capability_id=capability_action_type,
+                        normalized_input=capability_payload,
+                        access_token=access_token,
+                        granted_scopes=granted_scopes,
+                        provider_account_id=provider_account_id,
+                    )
+                result_status = google_result.status
+                result_output = google_result.output
+                result_error = google_result.error
         else:
             result = execute_capability(
                 capability=capability,

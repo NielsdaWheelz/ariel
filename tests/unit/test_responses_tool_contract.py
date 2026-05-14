@@ -7,16 +7,21 @@ from typing import Any, cast
 
 import pytest
 from ariel.action_runtime import RuntimeProvenance, process_response_function_calls
-from ariel.app import ModelAdapterError, _call_tool_result_interpreter
+from ariel.app import ModelAdapterError, _call_tool_result_interpreter, _call_tool_strategy
 from ariel.capability_registry import (
     capability_id_for_response_tool_name,
     get_capability,
+    production_response_capability_ids,
     response_tool_definitions,
     response_tool_name_for_capability_id,
 )
 from ariel.executor import ExecutionResult
 from ariel.persistence import TurnRecord
 from sqlalchemy.orm import Session
+
+
+def _production_response_tool_definitions() -> list[dict[str, Any]]:
+    return response_tool_definitions(production_response_capability_ids())
 
 
 def test_response_tool_schemas_are_strict_objects() -> None:
@@ -33,14 +38,14 @@ def test_response_tool_schemas_are_strict_objects() -> None:
         if isinstance(items, dict):
             assert_strict_object_schema(items, f"{path}[]")
 
-    for tool in response_tool_definitions():
+    for tool in _production_response_tool_definitions():
         assert tool["type"] == "function"
         assert tool["strict"] is True
         assert_strict_object_schema(tool["parameters"], tool["name"])
 
 
 def test_response_tool_names_round_trip_without_dotted_names() -> None:
-    for tool in response_tool_definitions():
+    for tool in _production_response_tool_definitions():
         tool_name = tool["name"]
         capability_id = capability_id_for_response_tool_name(tool_name)
 
@@ -49,9 +54,236 @@ def test_response_tool_names_round_trip_without_dotted_names() -> None:
         assert response_tool_name_for_capability_id(capability_id) == tool_name
 
 
+def test_production_response_tools_exclude_framework_fixtures() -> None:
+    for tool in _production_response_tool_definitions():
+        capability_id = capability_id_for_response_tool_name(tool["name"])
+        assert capability_id is not None
+        assert not capability_id.startswith("cap.framework.")
+
+
+def test_framework_fixture_tools_cannot_be_exposed_explicitly() -> None:
+    assert get_capability("cap.framework.read_echo") is None
+    with pytest.raises(RuntimeError, match="unknown Responses capability"):
+        response_tool_definitions(["cap.framework.read_echo"])
+
+
+def test_tool_strategy_uses_no_tools_and_accepts_valid_selected_ids() -> None:
+    class StrategyAdapter:
+        provider = "provider.strategy-test"
+        model = "model.strategy-test"
+
+        def create_response(
+            self,
+            *,
+            input_items: list[dict[str, Any]],
+            tools: list[dict[str, Any]],
+            user_message: str,
+            history: list[dict[str, Any]],
+            context_bundle: dict[str, Any],
+        ) -> dict[str, Any]:
+            del user_message, history, context_bundle
+            assert tools == []
+            assert input_items[0]["role"] == "system"
+            strategy_input = json.loads(str(input_items[1]["content"]))
+            assert "eligible_tools" not in strategy_input
+            assert strategy_input["available_capability_families"] == [
+                {
+                    "family": "email",
+                    "description": "Gmail search, read, drafts, approved sends, and mail organization.",
+                    "capability_ids": ["cap.email.send"],
+                },
+                {
+                    "family": "memory",
+                    "description": ("Memory inspection, proposal, review, correction, and export."),
+                    "capability_ids": ["cap.memory.search"],
+                },
+            ]
+            assert strategy_input["runtime_facts"] == {"google": {"connected": False}}
+            assert strategy_input["bounded_context"] == {"case": "unit"}
+            return {
+                "provider": self.provider,
+                "model": self.model,
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": json.dumps(
+                                    {
+                                        "decision": "selected_tools",
+                                        "selected_capability_ids": [
+                                            "cap.memory.search",
+                                            "cap.email.send",
+                                        ],
+                                        "rationale": "Need search and send.",
+                                        "unavailable_reason": None,
+                                        "confidence": 0.8,
+                                    }
+                                ),
+                            }
+                        ],
+                    }
+                ],
+            }
+
+    selected, _, parsed = _call_tool_strategy(
+        model_adapter=StrategyAdapter(),  # type: ignore[arg-type]
+        user_message="Find the note and email it.",
+        context_bundle={"case": "unit"},
+        tool_surface_facts={"google": {"connected": False}},
+        eligible_capability_ids=["cap.memory.search", "cap.email.send"],
+    )
+
+    assert selected == ["cap.memory.search", "cap.email.send"]
+    assert parsed["rationale"] == "Need search and send."
+
+
+@pytest.mark.parametrize(
+    ("selected_capability_ids", "eligible_capability_ids", "expected_code", "expected_reason"),
+    [
+        (
+            ["cap.framework.read_echo"],
+            ["cap.memory.search"],
+            "E_AI_JUDGMENT_VALIDATION",
+            "ineligible capability",
+        ),
+        (
+            ["cap.memory.search", "cap.memory.search"],
+            ["cap.memory.search"],
+            "E_AI_JUDGMENT_VALIDATION",
+            "duplicate capability",
+        ),
+        (
+            [
+                "cap.memory.inspect",
+                "cap.memory.search",
+                "cap.memory.propose",
+                "cap.memory.review",
+                "cap.memory.correct",
+                "cap.memory.retract",
+                "cap.memory.delete",
+                "cap.memory.privacy_delete",
+                "cap.memory.redact_evidence",
+            ],
+            [
+                "cap.memory.inspect",
+                "cap.memory.search",
+                "cap.memory.propose",
+                "cap.memory.review",
+                "cap.memory.correct",
+                "cap.memory.retract",
+                "cap.memory.delete",
+                "cap.memory.privacy_delete",
+                "cap.memory.redact_evidence",
+            ],
+            "E_AI_JUDGMENT_SCHEMA",
+            "schema validation",
+        ),
+    ],
+)
+def test_tool_strategy_rejects_invalid_selected_ids(
+    selected_capability_ids: list[str],
+    eligible_capability_ids: list[str],
+    expected_code: str,
+    expected_reason: str,
+) -> None:
+    class StrategyAdapter:
+        provider = "provider.strategy-test"
+        model = "model.strategy-test"
+
+        def create_response(self, **kwargs: Any) -> dict[str, Any]:
+            del kwargs
+            return {
+                "provider": self.provider,
+                "model": self.model,
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": json.dumps(
+                                    {
+                                        "decision": "selected_tools",
+                                        "selected_capability_ids": selected_capability_ids,
+                                        "rationale": "bad selection",
+                                        "unavailable_reason": None,
+                                        "confidence": 0.8,
+                                    }
+                                ),
+                            }
+                        ],
+                    }
+                ],
+            }
+
+    with pytest.raises(ModelAdapterError) as exc_info:
+        _call_tool_strategy(
+            model_adapter=StrategyAdapter(),  # type: ignore[arg-type]
+            user_message="Find the note.",
+            context_bundle={},
+            tool_surface_facts={},
+            eligible_capability_ids=eligible_capability_ids,
+        )
+
+    assert exc_info.value.code == expected_code
+    assert expected_reason in exc_info.value.safe_reason
+    assert exc_info.value.validation_status == "invalid"
+
+
+def test_tool_strategy_rejects_schema_invalid_json_object() -> None:
+    class StrategyAdapter:
+        provider = "provider.strategy-test"
+        model = "model.strategy-test"
+
+        def create_response(
+            self,
+            *,
+            input_items: list[dict[str, Any]],
+            tools: list[dict[str, Any]],
+            user_message: str,
+            history: list[dict[str, Any]],
+            context_bundle: dict[str, Any],
+        ) -> dict[str, Any]:
+            del input_items, tools, user_message, history, context_bundle
+            return {
+                "provider": self.provider,
+                "model": self.model,
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": json.dumps(
+                                    {"selected_capability_ids": "cap.memory.search"}
+                                ),
+                            }
+                        ],
+                    }
+                ],
+            }
+
+    with pytest.raises(ModelAdapterError) as exc_info:
+        _call_tool_strategy(
+            model_adapter=StrategyAdapter(),  # type: ignore[arg-type]
+            user_message="Find the note.",
+            context_bundle={},
+            tool_surface_facts={},
+            eligible_capability_ids=["cap.memory.search"],
+        )
+
+    assert exc_info.value.code == "E_AI_JUDGMENT_SCHEMA"
+    assert exc_info.value.validation_status == "invalid"
+
+
 def test_attachment_read_response_tool_contract_is_strict() -> None:
     tool_name = response_tool_name_for_capability_id("cap.attachment.read")
-    tools_by_name = {tool["name"]: tool for tool in response_tool_definitions()}
+    tools_by_name = {tool["name"]: tool for tool in _production_response_tool_definitions()}
 
     assert capability_id_for_response_tool_name(tool_name) == "cap.attachment.read"
     assert tool_name in tools_by_name
@@ -88,7 +320,7 @@ def test_memory_response_tools_are_exposed_to_the_model() -> None:
         "cap.memory.consolidate",
         "cap.memory.export",
     }
-    tools_by_name = {tool["name"]: tool for tool in response_tool_definitions()}
+    tools_by_name = {tool["name"]: tool for tool in _production_response_tool_definitions()}
 
     assert {
         capability_id
@@ -299,17 +531,13 @@ def test_tool_result_interpreter_rejects_non_contract_output(
     assert exc_info.value.provider_response_id == "resp_interpreter_invalid_contract"
 
 
-def test_process_response_function_calls_returns_function_call_output_for_inline_capability() -> (
-    None
-):
+def test_process_response_function_calls_default_denies_without_turn_scope() -> None:
     fixed_now = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
-    added_records: list[Any] = []
     events: list[tuple[str, dict[str, Any]]] = []
-    id_counts: dict[str, int] = {}
 
     class Db:
         def add(self, record: Any) -> None:
-            added_records.append(record)
+            raise AssertionError(f"unscoped tool created a record: {record!r}")
 
         def flush(self) -> None:
             return None
@@ -317,9 +545,73 @@ def test_process_response_function_calls_returns_function_call_output_for_inline
         def get_bind(self) -> None:
             return None
 
-    def new_id(prefix: str) -> str:
-        id_counts[prefix] = id_counts.get(prefix, 0) + 1
-        return f"{prefix}_{id_counts[prefix]}"
+    turn = TurnRecord(
+        id="trn_1",
+        session_id="ses_1",
+        user_message="quiet",
+        assistant_message=None,
+        status="in_progress",
+        created_at=fixed_now,
+        updated_at=fixed_now,
+    )
+
+    result = process_response_function_calls(
+        db=cast(Session, Db()),
+        session_id="ses_1",
+        turn=turn,
+        assistant_message="done",
+        function_calls_raw=[
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": response_tool_name_for_capability_id("cap.discord.no_response"),
+                "arguments": json.dumps({"reason": "nothing useful to add"}),
+                "influenced_by_untrusted_content": False,
+            }
+        ],
+        approval_ttl_seconds=300,
+        approval_actor_id="usr_1",
+        add_event=lambda event_type, payload: events.append((event_type, payload)),
+        now_fn=lambda: fixed_now,
+        new_id_fn=lambda prefix: f"{prefix}_1",
+        runtime_provenance=RuntimeProvenance(status="clean"),
+    )
+
+    assert result.action_attempts == []
+    function_call_output = result.function_call_outputs[0]
+    assert function_call_output["type"] == "function_call_output"
+    assert function_call_output["call_id"] == "call_1"
+    assert json.loads(function_call_output["output"]) == {
+        "status": "denied",
+        "capability_id": "cap.discord.no_response",
+        "error": "tool_not_in_turn_scope",
+    }
+    assert events == [
+        (
+            "evt.action.call_denied",
+            {
+                "call_index": 1,
+                "call_id": "call_1",
+                "tool_name": "cap_discord_no_response",
+                "capability_id": "cap.discord.no_response",
+                "reason": "tool_not_in_turn_scope",
+            },
+        )
+    ]
+
+
+def test_process_response_function_calls_denies_unscoped_tools() -> None:
+    fixed_now = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
+
+    class Db:
+        def add(self, record: Any) -> None:
+            raise AssertionError(f"unscoped tool created a record: {record!r}")
+
+        def flush(self) -> None:
+            return None
+
+        def get_bind(self) -> None:
+            return None
 
     turn = TurnRecord(
         id="trn_1",
@@ -340,59 +632,24 @@ def test_process_response_function_calls_returns_function_call_output_for_inline
             {
                 "type": "function_call",
                 "call_id": "call_1",
-                "name": response_tool_name_for_capability_id("cap.framework.read_echo"),
-                "arguments": json.dumps({"text": " hello "}),
-                "influenced_by_untrusted_content": False,
+                "name": response_tool_name_for_capability_id("cap.discord.no_response"),
+                "arguments": json.dumps({"reason": "nothing useful to add"}),
             }
         ],
         approval_ttl_seconds=300,
         approval_actor_id="usr_1",
-        add_event=lambda event_type, payload: events.append((event_type, payload)),
+        add_event=lambda _event_type, _payload: None,
         now_fn=lambda: fixed_now,
-        new_id_fn=new_id,
-        runtime_provenance=RuntimeProvenance(status="clean"),
+        new_id_fn=lambda prefix: f"{prefix}_1",
+        allowed_capability_ids=[],
     )
 
-    assert len(result.function_call_outputs) == 1
-    function_call_output = result.function_call_outputs[0]
-    assert function_call_output["type"] == "function_call_output"
-    assert function_call_output["call_id"] == "call_1"
-    assert json.loads(function_call_output["output"]) == {
-        "status": "succeeded",
-        "capability_id": "cap.framework.read_echo",
-        "output": {"text": "hello"},
+    assert result.action_attempts == []
+    assert json.loads(result.function_call_outputs[0]["output"]) == {
+        "status": "denied",
+        "capability_id": "cap.discord.no_response",
+        "error": "tool_not_in_turn_scope",
     }
-    assert result.action_attempts[0].capability_id == "cap.framework.read_echo"
-    assert result.action_attempts[0].proposed_input == {"text": "hello"}
-    assert result.action_attempts[0].status == "succeeded"
-    tool_summary = json.loads(result.assistant_message)
-    assert tool_summary == {
-        "action_attempts": [
-            {
-                "action_attempt_id": "aat_1",
-                "approval_required": False,
-                "capability_id": "cap.framework.read_echo",
-                "has_execution_output": True,
-                "policy_decision": "allow_inline",
-                "status": "succeeded",
-            }
-        ],
-        "blocked_reasons": [],
-        "inline_result_count": 1,
-        "kind": "audited_tool_results",
-        "pending_approvals": [],
-        "requires_model_final_answer": True,
-        "retrieval": {
-            "capability_ids": [],
-            "errors": [],
-            "requested": False,
-            "source_count": 0,
-            "sources": [],
-        },
-    }
-    assert result.tool_result_interpreter_input is None
-    assert result.tool_result_interpreter_output is None
-    assert "response_function_call" not in events[0][1]
 
 
 def test_process_response_function_calls_treats_discord_no_response_as_silent() -> None:
@@ -444,6 +701,7 @@ def test_process_response_function_calls_treats_discord_no_response_as_silent() 
         now_fn=lambda: fixed_now,
         new_id_fn=new_id,
         runtime_provenance=RuntimeProvenance(status="clean"),
+        allowed_capability_ids=["cap.discord.no_response"],
     )
 
     assert result.silent_response is True
@@ -541,6 +799,7 @@ def test_process_response_function_calls_executes_attachment_read_runtime() -> N
         new_id_fn=new_id,
         runtime_provenance=RuntimeProvenance(status="clean"),
         attachment_runtime=cast(Any, AttachmentRuntime()),
+        allowed_capability_ids=["cap.attachment.read"],
     )
 
     assert result.action_attempts[0].capability_id == "cap.attachment.read"
@@ -588,29 +847,6 @@ def test_process_response_function_calls_executes_attachment_read_runtime() -> N
         (
             {"blocks": [{"kind": "text", "text": "x" * 7_000}]},
             "large",
-        ),
-        (
-            {
-                "results": [
-                    {
-                        "title": "report one",
-                        "source": "discord://channel/1/message/2/attachment/777",
-                        "snippet": "source one",
-                        "published_at": None,
-                    },
-                    {
-                        "title": "report two",
-                        "source": "discord://channel/1/message/2/attachment/888",
-                        "snippet": "source two",
-                        "published_at": None,
-                    },
-                ]
-            },
-            "multi_source",
-        ),
-        (
-            {"contradictions": [{"claim": "structured conflict signal"}]},
-            "contradictory",
         ),
         (
             {"modality": "image", "blocks": [{"kind": "ocr", "text": "visible text"}]},
@@ -693,6 +929,7 @@ def test_tool_outputs_requiring_interpretation_are_routed_without_raw_tool_outpu
         new_id_fn=new_id,
         runtime_provenance=RuntimeProvenance(status="clean"),
         attachment_runtime=cast(Any, AttachmentRuntime()),
+        allowed_capability_ids=["cap.attachment.read"],
     )
 
     tool_summary = json.loads(result.assistant_message)

@@ -57,10 +57,6 @@ UNCONFIGURED_AMBIENT_SOURCE_MIGRATION_ALLOWLIST = {
 }
 FALLBACK_TEST_NAME_ALLOWLIST = {
     (
-        "tests/integration/test_s2_pr01_acceptance.py::"
-        "test_s2_pr01_invalid_or_denied_proposals_are_blocked_with_explicit_reason_and_safe_fallback"
-    ): "approval proposal rail exposes a safe action denial, not AI-first replacement prose",
-    (
         "tests/integration/test_s4_pr01_acceptance.py::"
         "test_s4_pr01_attendee_slot_fallback_is_explicit_and_recoverable_without_freebusy_scope"
     ): "calendar free/busy scope recovery is connector behavior outside AI-first judgment fallback",

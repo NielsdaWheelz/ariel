@@ -10,6 +10,7 @@ from discord import app_commands
 from discord.ext import commands
 import httpx
 
+from .capability_registry import capability_action_label
 from .config import AppSettings
 
 
@@ -46,16 +47,31 @@ def format_discord_message(message: str) -> str:
     return f"{normalized[:1886].rstrip()}\n[truncated]"
 
 
+def _auth_headers(
+    ariel_auth_token: str | None,
+    headers: dict[str, str] | None = None,
+) -> dict[str, str] | None:
+    if not ariel_auth_token:
+        return headers
+    merged = dict(headers or {})
+    merged["Authorization"] = f"Bearer {ariel_auth_token}"
+    return merged
+
+
 def submit_discord_turn(
     *,
     ariel_base_url: str,
+    ariel_auth_token: str | None = None,
     prompt: str,
     discord_message_id: int,
     allowed_user_id: int | None = None,
     discord_context: dict[str, Any] | None = None,
 ) -> ArielDiscordReply:
     with httpx.Client(timeout=60.0) as client:
-        session_response = client.get(f"{ariel_base_url}/v1/sessions/active")
+        session_response = client.get(
+            f"{ariel_base_url}/v1/sessions/active",
+            headers=_auth_headers(ariel_auth_token),
+        )
         session_payload = _json_response_payload(session_response)
         if session_response.status_code >= 400 or session_payload.get("ok") is not True:
             raise ArielDiscordError(_safe_ariel_error_message(session_payload))
@@ -70,7 +86,10 @@ def submit_discord_turn(
             request_payload["discord"] = discord_context
         message_response = client.post(
             f"{ariel_base_url}/v1/sessions/{session_id}/message",
-            headers={"Idempotency-Key": f"discord-message-{discord_message_id}"},
+            headers=_auth_headers(
+                ariel_auth_token,
+                {"Idempotency-Key": f"discord-message-{discord_message_id}"},
+            ),
             json=request_payload,
         )
         message_payload = _json_response_payload(message_response)
@@ -87,6 +106,7 @@ def submit_discord_turn(
 def get_status(
     *,
     ariel_base_url: str,
+    ariel_auth_token: str | None = None,
 ) -> str:
     with httpx.Client(timeout=60.0) as client:
         health_response = client.get(f"{ariel_base_url}/v1/health")
@@ -94,17 +114,26 @@ def get_status(
         if health_response.status_code >= 400 or health_payload.get("ok") is not True:
             raise ArielDiscordError(_safe_ariel_error_message(health_payload))
 
-        session_response = client.get(f"{ariel_base_url}/v1/sessions/active")
+        session_response = client.get(
+            f"{ariel_base_url}/v1/sessions/active",
+            headers=_auth_headers(ariel_auth_token),
+        )
         session_payload = _json_response_payload(session_response)
         if session_response.status_code >= 400 or session_payload.get("ok") is not True:
             raise ArielDiscordError(_safe_ariel_error_message(session_payload))
 
-        jobs_response = client.get(f"{ariel_base_url}/v1/jobs?limit=5")
+        jobs_response = client.get(
+            f"{ariel_base_url}/v1/jobs?limit=5",
+            headers=_auth_headers(ariel_auth_token),
+        )
         jobs_payload = _json_response_payload(jobs_response)
         if jobs_response.status_code >= 400 or jobs_payload.get("ok") is not True:
             raise ArielDiscordError(_safe_ariel_error_message(jobs_payload))
 
-        notifications_response = client.get(f"{ariel_base_url}/v1/notifications?limit=5")
+        notifications_response = client.get(
+            f"{ariel_base_url}/v1/notifications?limit=5",
+            headers=_auth_headers(ariel_auth_token),
+        )
         notifications_payload = _json_response_payload(notifications_response)
         if notifications_response.status_code >= 400 or notifications_payload.get("ok") is not True:
             raise ArielDiscordError(_safe_ariel_error_message(notifications_payload))
@@ -125,9 +154,13 @@ def get_status(
 def list_jobs(
     *,
     ariel_base_url: str,
+    ariel_auth_token: str | None = None,
 ) -> str:
     with httpx.Client(timeout=60.0) as client:
-        response = client.get(f"{ariel_base_url}/v1/jobs?limit=10")
+        response = client.get(
+            f"{ariel_base_url}/v1/jobs?limit=10",
+            headers=_auth_headers(ariel_auth_token),
+        )
         payload = _json_response_payload(response)
         if response.status_code >= 400 or payload.get("ok") is not True:
             raise ArielDiscordError(_safe_ariel_error_message(payload))
@@ -140,13 +173,17 @@ def list_jobs(
 def record_capture(
     *,
     ariel_base_url: str,
+    ariel_auth_token: str | None = None,
     text: str,
     discord_interaction_id: int,
 ) -> str:
     with httpx.Client(timeout=60.0) as client:
         response = client.post(
             f"{ariel_base_url}/v1/captures/record",
-            headers={"Idempotency-Key": f"discord-capture-{discord_interaction_id}"},
+            headers=_auth_headers(
+                ariel_auth_token,
+                {"Idempotency-Key": f"discord-capture-{discord_interaction_id}"},
+            ),
             json={"kind": "text", "text": text},
         )
         payload = _json_response_payload(response)
@@ -165,6 +202,7 @@ def record_capture(
 def decide_approval(
     *,
     ariel_base_url: str,
+    ariel_auth_token: str | None = None,
     approval_ref: str,
     decision: str,
     reason: str | None = None,
@@ -173,7 +211,11 @@ def decide_approval(
     if reason:
         payload["reason"] = reason
     with httpx.Client(timeout=60.0) as client:
-        response = client.post(f"{ariel_base_url}/v1/approvals", json=payload)
+        response = client.post(
+            f"{ariel_base_url}/v1/approvals",
+            headers=_auth_headers(ariel_auth_token),
+            json=payload,
+        )
         response_payload = _json_response_payload(response)
         if response.status_code >= 400 or response_payload.get("ok") is not True:
             raise ArielDiscordError(_safe_ariel_error_message(response_payload))
@@ -183,15 +225,22 @@ def decide_approval(
 def refresh_job(
     *,
     ariel_base_url: str,
+    ariel_auth_token: str | None = None,
     job_id: str,
 ) -> str:
     with httpx.Client(timeout=60.0) as client:
-        job_response = client.get(f"{ariel_base_url}/v1/jobs/{job_id}")
+        job_response = client.get(
+            f"{ariel_base_url}/v1/jobs/{job_id}",
+            headers=_auth_headers(ariel_auth_token),
+        )
         job_payload = _json_response_payload(job_response)
         if job_response.status_code >= 400 or job_payload.get("ok") is not True:
             raise ArielDiscordError(_safe_ariel_error_message(job_payload))
 
-        events_response = client.get(f"{ariel_base_url}/v1/jobs/{job_id}/events")
+        events_response = client.get(
+            f"{ariel_base_url}/v1/jobs/{job_id}/events",
+            headers=_auth_headers(ariel_auth_token),
+        )
         events_payload = _json_response_payload(events_response)
         if events_response.status_code >= 400 or events_payload.get("ok") is not True:
             raise ArielDiscordError(_safe_ariel_error_message(events_payload))
@@ -202,10 +251,15 @@ def refresh_job(
 def ack_notification(
     *,
     ariel_base_url: str,
+    ariel_auth_token: str | None = None,
     notification_id: str,
 ) -> tuple[str, str | None]:
     with httpx.Client(timeout=60.0) as client:
-        response = client.post(f"{ariel_base_url}/v1/notifications/{notification_id}/ack", json={})
+        response = client.post(
+            f"{ariel_base_url}/v1/notifications/{notification_id}/ack",
+            headers=_auth_headers(ariel_auth_token),
+            json={},
+        )
         payload = _json_response_payload(response)
         if response.status_code >= 400 or payload.get("ok") is not True:
             raise ArielDiscordError(_safe_ariel_error_message(payload))
@@ -218,11 +272,13 @@ def ack_notification(
 def ack_proactive_case(
     *,
     ariel_base_url: str,
+    ariel_auth_token: str | None = None,
     case_id: str,
 ) -> str:
     with httpx.Client(timeout=60.0) as client:
         response = client.post(
             f"{ariel_base_url}/v1/proactive/cases/{case_id}/ack",
+            headers=_auth_headers(ariel_auth_token),
             json={},
         )
         payload = _json_response_payload(response)
@@ -234,11 +290,13 @@ def ack_proactive_case(
 def correct_proactive_case(
     *,
     ariel_base_url: str,
+    ariel_auth_token: str | None = None,
     case_id: str,
 ) -> str:
     with httpx.Client(timeout=60.0) as client:
         response = client.post(
             f"{ariel_base_url}/v1/proactive/cases/{case_id}/correct",
+            headers=_auth_headers(ariel_auth_token),
             json={"feedback_type": "correct"},
         )
         payload = _json_response_payload(response)
@@ -250,11 +308,13 @@ def correct_proactive_case(
 def stop_proactive_pattern(
     *,
     ariel_base_url: str,
+    ariel_auth_token: str | None = None,
     case_id: str,
 ) -> str:
     with httpx.Client(timeout=60.0) as client:
         response = client.post(
             f"{ariel_base_url}/v1/proactive/cases/{case_id}/stop-pattern",
+            headers=_auth_headers(ariel_auth_token),
             json={},
         )
         payload = _json_response_payload(response)
@@ -266,11 +326,13 @@ def stop_proactive_pattern(
 def more_aggressive_proactive_pattern(
     *,
     ariel_base_url: str,
+    ariel_auth_token: str | None = None,
     case_id: str,
 ) -> str:
     with httpx.Client(timeout=60.0) as client:
         response = client.post(
             f"{ariel_base_url}/v1/proactive/cases/{case_id}/more-aggressive",
+            headers=_auth_headers(ariel_auth_token),
             json={},
         )
         payload = _json_response_payload(response)
@@ -282,10 +344,14 @@ def more_aggressive_proactive_pattern(
 def inspect_proactive_case(
     *,
     ariel_base_url: str,
+    ariel_auth_token: str | None = None,
     case_id: str,
 ) -> str:
     with httpx.Client(timeout=60.0) as client:
-        response = client.get(f"{ariel_base_url}/v1/proactive/cases/{case_id}/inspect-why")
+        response = client.get(
+            f"{ariel_base_url}/v1/proactive/cases/{case_id}/inspect-why",
+            headers=_auth_headers(ariel_auth_token),
+        )
         payload = _json_response_payload(response)
         if response.status_code >= 400 or payload.get("ok") is not True:
             raise ArielDiscordError(_safe_ariel_error_message(payload))
@@ -295,11 +361,13 @@ def inspect_proactive_case(
 def undo_proactive_case(
     *,
     ariel_base_url: str,
+    ariel_auth_token: str | None = None,
     case_id: str,
 ) -> str:
     with httpx.Client(timeout=60.0) as client:
         response = client.post(
             f"{ariel_base_url}/v1/proactive/cases/{case_id}/undo",
+            headers=_auth_headers(ariel_auth_token),
             json={},
         )
         payload = _json_response_payload(response)
@@ -316,6 +384,7 @@ class ArielDiscordBot(commands.Bot):
         channel_id: int,
         user_id: int,
         ariel_base_url: str,
+        ariel_auth_token: str | None = None,
     ) -> None:
         intents = discord.Intents.none()
         intents.guilds = True
@@ -330,6 +399,7 @@ class ArielDiscordBot(commands.Bot):
         self.ariel_channel_id = channel_id
         self.ariel_user_id = user_id
         self.ariel_base_url = ariel_base_url
+        self.ariel_auth_token = ariel_auth_token
         self.tree.add_command(
             app_commands.Command(
                 name="status",
@@ -413,6 +483,7 @@ class ArielDiscordBot(commands.Bot):
             content = await asyncio.to_thread(
                 record_capture,
                 ariel_base_url=self.ariel_base_url,
+                ariel_auth_token=self.ariel_auth_token,
                 text=text,
                 discord_interaction_id=interaction.id,
             )
@@ -509,6 +580,7 @@ class ArielDiscordBot(commands.Bot):
             return await asyncio.to_thread(
                 submit_discord_turn,
                 ariel_base_url=self.ariel_base_url,
+                ariel_auth_token=self.ariel_auth_token,
                 prompt=prompt,
                 discord_message_id=discord_message_id,
                 allowed_user_id=self.ariel_user_id,
@@ -526,7 +598,11 @@ class ArielDiscordBot(commands.Bot):
         command: Any,
     ) -> str:
         try:
-            return await asyncio.to_thread(command, ariel_base_url=self.ariel_base_url)
+            return await asyncio.to_thread(
+                command,
+                ariel_base_url=self.ariel_base_url,
+                ariel_auth_token=self.ariel_auth_token,
+            )
         except ArielDiscordError as exc:
             return f"Ariel request failed: {exc}"
         except httpx.HTTPError:
@@ -552,6 +628,7 @@ class ArielDiscordBot(commands.Bot):
                 await _edit_with_approval_decision(
                     interaction=interaction,
                     ariel_base_url=self.ariel_base_url,
+                    ariel_auth_token=self.ariel_auth_token,
                     approval_ref=approval_ref,
                     decision=decision,
                 )
@@ -562,6 +639,7 @@ class ArielDiscordBot(commands.Bot):
                 await _edit_with_job_refresh(
                     interaction=interaction,
                     ariel_base_url=self.ariel_base_url,
+                    ariel_auth_token=self.ariel_auth_token,
                     job_id=job_id,
                     allowed_user_id=self.ariel_user_id,
                 )
@@ -572,6 +650,7 @@ class ArielDiscordBot(commands.Bot):
                 await _edit_with_notification_ack(
                     interaction=interaction,
                     ariel_base_url=self.ariel_base_url,
+                    ariel_auth_token=self.ariel_auth_token,
                     notification_id=notification_id,
                     allowed_user_id=self.ariel_user_id,
                 )
@@ -582,6 +661,7 @@ class ArielDiscordBot(commands.Bot):
                 await _edit_with_proactive_case_action(
                     interaction=interaction,
                     ariel_base_url=self.ariel_base_url,
+                    ariel_auth_token=self.ariel_auth_token,
                     case_id=case_id,
                     action=ack_proactive_case,
                 )
@@ -592,6 +672,7 @@ class ArielDiscordBot(commands.Bot):
                 await _edit_with_proactive_case_action(
                     interaction=interaction,
                     ariel_base_url=self.ariel_base_url,
+                    ariel_auth_token=self.ariel_auth_token,
                     case_id=case_id,
                     action=correct_proactive_case,
                 )
@@ -602,6 +683,7 @@ class ArielDiscordBot(commands.Bot):
                 await _edit_with_proactive_case_action(
                     interaction=interaction,
                     ariel_base_url=self.ariel_base_url,
+                    ariel_auth_token=self.ariel_auth_token,
                     case_id=case_id,
                     action=stop_proactive_pattern,
                 )
@@ -612,6 +694,7 @@ class ArielDiscordBot(commands.Bot):
                 await _edit_with_proactive_case_action(
                     interaction=interaction,
                     ariel_base_url=self.ariel_base_url,
+                    ariel_auth_token=self.ariel_auth_token,
                     case_id=case_id,
                     action=more_aggressive_proactive_pattern,
                 )
@@ -622,6 +705,7 @@ class ArielDiscordBot(commands.Bot):
                 await _edit_with_proactive_case_action(
                     interaction=interaction,
                     ariel_base_url=self.ariel_base_url,
+                    ariel_auth_token=self.ariel_auth_token,
                     case_id=case_id,
                     action=inspect_proactive_case,
                 )
@@ -632,6 +716,7 @@ class ArielDiscordBot(commands.Bot):
                 await _edit_with_proactive_case_action(
                     interaction=interaction,
                     ariel_base_url=self.ariel_base_url,
+                    ariel_auth_token=self.ariel_auth_token,
                     case_id=case_id,
                     action=undo_proactive_case,
                 )
@@ -649,12 +734,14 @@ def create_discord_bot(
     channel_id: int,
     user_id: int,
     ariel_base_url: str,
+    ariel_auth_token: str | None = None,
 ) -> ArielDiscordBot:
     return ArielDiscordBot(
         guild_id=guild_id,
         channel_id=channel_id,
         user_id=user_id,
         ariel_base_url=ariel_base_url,
+        ariel_auth_token=ariel_auth_token,
     )
 
 
@@ -683,6 +770,7 @@ def configured_discord_bot(settings: AppSettings) -> ArielDiscordBot:
         channel_id=discord_channel_id,
         user_id=discord_user_id,
         ariel_base_url=settings.discord_ariel_base_url,
+        ariel_auth_token=settings.local_auth_token if settings.local_auth_required else None,
     )
 
 
@@ -762,7 +850,7 @@ def _pending_approval_lines(payload: dict[str, Any]) -> list[str]:
         expires_at = pending.get("expires_at")
         suffix = f" expires_at={expires_at}" if isinstance(expires_at, str) else ""
         lines.append(
-            f"Approval pending ({pending['capability_id']}): {pending['approval_ref']}{suffix}. "
+            f"Approval pending ({pending['action_label']}): {pending['approval_ref']}{suffix}. "
             "Use the buttons below."
         )
     return lines
@@ -789,14 +877,14 @@ def _pending_approval_items(payload: dict[str, Any]) -> list[dict[str, str]]:
         if not isinstance(approval_ref, str) or not approval_ref:
             continue
         proposal = item.get("proposal")
-        capability_id = "action"
+        action_label = "Action"
         if isinstance(proposal, dict):
             capability_id_raw = proposal.get("capability_id")
             if isinstance(capability_id_raw, str):
-                capability_id = capability_id_raw
+                action_label = capability_action_label(capability_id_raw)
         pending: dict[str, str] = {
             "approval_ref": approval_ref,
-            "capability_id": capability_id,
+            "action_label": action_label,
         }
         expires_at = approval.get("expires_at")
         if isinstance(expires_at, str):
@@ -1078,6 +1166,7 @@ async def _edit_with_approval_decision(
     *,
     interaction: discord.Interaction,
     ariel_base_url: str,
+    ariel_auth_token: str | None,
     approval_ref: str,
     decision: str,
 ) -> None:
@@ -1085,6 +1174,7 @@ async def _edit_with_approval_decision(
         content = await asyncio.to_thread(
             decide_approval,
             ariel_base_url=ariel_base_url,
+            ariel_auth_token=ariel_auth_token,
             approval_ref=approval_ref,
             decision=decision,
         )
@@ -1103,6 +1193,7 @@ async def _edit_with_job_refresh(
     *,
     interaction: discord.Interaction,
     ariel_base_url: str,
+    ariel_auth_token: str | None,
     job_id: str,
     allowed_user_id: int | None,
 ) -> None:
@@ -1110,6 +1201,7 @@ async def _edit_with_job_refresh(
         content = await asyncio.to_thread(
             refresh_job,
             ariel_base_url=ariel_base_url,
+            ariel_auth_token=ariel_auth_token,
             job_id=job_id,
         )
     except ArielDiscordError as exc:
@@ -1131,6 +1223,7 @@ async def _edit_with_notification_ack(
     *,
     interaction: discord.Interaction,
     ariel_base_url: str,
+    ariel_auth_token: str | None,
     notification_id: str,
     allowed_user_id: int | None,
 ) -> None:
@@ -1138,6 +1231,7 @@ async def _edit_with_notification_ack(
         content, job_id = await asyncio.to_thread(
             ack_notification,
             ariel_base_url=ariel_base_url,
+            ariel_auth_token=ariel_auth_token,
             notification_id=notification_id,
         )
     except ArielDiscordError as exc:
@@ -1165,6 +1259,7 @@ async def _edit_with_proactive_case_action(
     *,
     interaction: discord.Interaction,
     ariel_base_url: str,
+    ariel_auth_token: str | None,
     case_id: str,
     action: Any,
 ) -> None:
@@ -1172,6 +1267,7 @@ async def _edit_with_proactive_case_action(
         content = await asyncio.to_thread(
             action,
             ariel_base_url=ariel_base_url,
+            ariel_auth_token=ariel_auth_token,
             case_id=case_id,
         )
     except ArielDiscordError as exc:

@@ -13,6 +13,10 @@ from ariel.executor import ExecutionResult
 from ariel.persistence import ActionAttemptRecord, JobEventRecord, JobRecord
 
 
+AGENCY_SANDBOX_POLICY_VERSION = "agency-sandbox-v1"
+AGENCY_EGRESS_POLICY_VERSION = "agency-egress-v1"
+
+
 class AgencyDaemonError(Exception):
     pass
 
@@ -58,12 +62,18 @@ class AgencyDaemonClient:
             params={"repo_id": repo_id, "order": "desc", "limit": "20"},
         )
 
-    def land_invocation(self, *, repo_id: str, invocation_ref: str) -> dict[str, Any]:
+    def land_invocation(
+        self,
+        *,
+        repo_id: str,
+        invocation_ref: str,
+        client_request_id: str,
+    ) -> dict[str, Any]:
         return self._action(
             "POST",
             f"/invocations/{invocation_ref}/land",
             params={"repo_id": repo_id},
-            json_payload={"apply": True},
+            json_payload={"apply": True, "client_request_id": client_request_id},
         )
 
     def worktree_pr_sync(
@@ -73,6 +83,7 @@ class AgencyDaemonClient:
         worktree_ref: str,
         allow_dirty: bool,
         force_with_lease: bool,
+        client_request_id: str,
     ) -> dict[str, Any]:
         return self._action(
             "POST",
@@ -81,6 +92,7 @@ class AgencyDaemonClient:
             json_payload={
                 "allow_dirty": allow_dirty,
                 "force_with_lease": force_with_lease,
+                "client_request_id": client_request_id,
             },
         )
 
@@ -197,18 +209,6 @@ class AgencyRuntime:
                     output=self._artifacts(input_payload=normalized_input, db=db),
                     error=None,
                 )
-            if capability_id == "cap.agency.request_pr":
-                prepared_request = self.prepare_request_pr(db=db, input_payload=normalized_input)
-                return ExecutionResult(
-                    status="succeeded",
-                    output=self.record_request_pr(
-                        db=db,
-                        prepared=prepared_request,
-                        result=self.request_pr(prepared=prepared_request),
-                        now_fn=now_fn,
-                    ),
-                    error=None,
-                )
         except AgencyDaemonError as exc:
             return ExecutionResult(status="failed", output=None, error=str(exc))
         return ExecutionResult(status="failed", output=None, error="unknown_agency_capability")
@@ -220,22 +220,51 @@ class AgencyRuntime:
         action_attempt_id: str,
     ) -> dict[str, Any]:
         repo_root = self._allowed_repo_root(input_payload["repo_root"])
+        base_branch = input_payload.get("base_branch") or self.default_base_branch
+        runner_args = input_payload.get("runner_args", [])
+        env = input_payload.get("env", {})
+        sandbox_policy = {
+            "version": AGENCY_SANDBOX_POLICY_VERSION,
+            "repo_root": repo_root,
+            "include_untracked": not bool(input_payload.get("no_include_untracked", False)),
+            "runner": input_payload.get("runner") or self.default_runner,
+            "mode": "headless",
+            "base_branch": base_branch,
+            "runner_args_count": len(runner_args) if isinstance(runner_args, list) else 0,
+            "env_keys": sorted(str(key) for key in env) if isinstance(env, dict) else [],
+            "env_values_redacted": True,
+            "client_request_id": action_attempt_id,
+        }
+        egress_policy = {
+            "version": AGENCY_EGRESS_POLICY_VERSION,
+            "allowed_destinations": ["agency.daemon.local"],
+            "declared_destination": "agency.daemon.local",
+            "capability_id": "cap.agency.run",
+            "client_request_id": action_attempt_id,
+        }
         response = self.client.task_start(
             {
                 "repo_root": repo_root,
                 "name": input_payload["name"],
-                "base_branch": input_payload.get("base_branch") or self.default_base_branch,
+                "base_branch": base_branch,
                 "mode": "headless",
                 "runner": input_payload.get("runner") or self.default_runner,
                 "prompt": input_payload["prompt"],
                 "invocation_name": input_payload["name"],
-                "runner_args": input_payload.get("runner_args", []),
-                "env": input_payload.get("env", {}),
+                "runner_args": runner_args,
+                "env": env,
                 "client_request_id": action_attempt_id,
                 "no_include_untracked": input_payload.get("no_include_untracked", False),
+                "sandbox_policy": sandbox_policy,
+                "egress_policy": egress_policy,
             }
         )
-        return {"repo_root": repo_root, "response": response}
+        return {
+            "repo_root": repo_root,
+            "response": response,
+            "sandbox_policy": sandbox_policy,
+            "egress_policy": egress_policy,
+        }
 
     def record_run_started(
         self,
@@ -254,6 +283,12 @@ class AgencyRuntime:
         if not isinstance(response_raw, dict):
             raise AgencyDaemonError("agency daemon returned invalid task start")
         response = response_raw
+        sandbox_policy = started.get("sandbox_policy")
+        egress_policy = started.get("egress_policy")
+        if not isinstance(sandbox_policy, dict):
+            sandbox_policy = {}
+        if not isinstance(egress_policy, dict):
+            egress_policy = {}
         task_id = self._required_text(response, "task_id")
         now = now_fn()
         job = db.scalar(
@@ -287,6 +322,8 @@ class AgencyRuntime:
                 agency_runner=self._optional_text(response, "runner"),
                 agency_request_id=self._optional_text(response, "request_id"),
                 agency_last_synced_at=now,
+                agency_sandbox_policy=sandbox_policy,
+                agency_egress_policy=egress_policy,
                 agency_pr_number=None,
                 agency_pr_url=None,
                 discord_thread_id=None,
@@ -297,6 +334,8 @@ class AgencyRuntime:
             db.flush()
         else:
             self._update_job_from_payload(job, response, now=now)
+            job.agency_sandbox_policy = sandbox_policy
+            job.agency_egress_policy = egress_policy
         self._record_job_event(
             db=db,
             job=job,
@@ -357,6 +396,7 @@ class AgencyRuntime:
         *,
         db: Session,
         input_payload: dict[str, Any],
+        action_attempt_id: str,
     ) -> dict[str, Any]:
         job = self._job_for_input(db=db, input_payload=input_payload)
         if job is None:
@@ -377,25 +417,52 @@ class AgencyRuntime:
             "worktree_id": worktree_id,
             "allow_dirty": bool(input_payload.get("allow_dirty")),
             "force_with_lease": bool(input_payload.get("force_with_lease")),
+            "client_request_id": action_attempt_id,
         }
 
     def request_pr(self, *, prepared: dict[str, Any]) -> dict[str, Any]:
         repo_id = self._required_text(prepared, "repo_id")
         invocation_id = self._required_text(prepared, "invocation_id")
         worktree_id = self._required_text(prepared, "worktree_id")
-        invocation = self.client.get_invocation(repo_id=repo_id, invocation_ref=invocation_id)
-        land_response = None
-        if invocation.get("landing_status") == "pending":
-            land_response = self.client.land_invocation(
-                repo_id=repo_id,
-                invocation_ref=invocation_id,
-            )
-        pr_response = self.client.worktree_pr_sync(
-            repo_id=repo_id,
-            worktree_ref=worktree_id,
-            allow_dirty=bool(prepared.get("allow_dirty")),
-            force_with_lease=bool(prepared.get("force_with_lease")),
+        client_request_id = self._required_text(prepared, "client_request_id")
+        land_client_request_id = (
+            prepared["land_client_request_id"]
+            if isinstance(prepared.get("land_client_request_id"), str)
+            and prepared["land_client_request_id"]
+            else client_request_id
         )
+        pr_sync_client_request_id = (
+            prepared["pr_sync_client_request_id"]
+            if isinstance(prepared.get("pr_sync_client_request_id"), str)
+            and prepared["pr_sync_client_request_id"]
+            else client_request_id
+        )
+        try:
+            invocation = self.client.get_invocation(repo_id=repo_id, invocation_ref=invocation_id)
+            land_response = None
+            if invocation.get("landing_status") == "pending":
+                land_response = self.client.land_invocation(
+                    repo_id=repo_id,
+                    invocation_ref=invocation_id,
+                    client_request_id=land_client_request_id,
+                )
+            pr_response = self.client.worktree_pr_sync(
+                repo_id=repo_id,
+                worktree_ref=worktree_id,
+                allow_dirty=bool(prepared.get("allow_dirty")),
+                force_with_lease=bool(prepared.get("force_with_lease")),
+                client_request_id=pr_sync_client_request_id,
+            )
+        except AgencyDaemonError:
+            raise
+        except Exception as exc:
+            raise AgencyDaemonError(str(exc) or "agency request_pr failed") from exc
+        if not (
+            isinstance(pr_response.get("pr_number"), int)
+            or isinstance(pr_response.get("pr_url"), str)
+            or isinstance(pr_response.get("request_id"), str)
+        ):
+            raise AgencyDaemonError("agency pull request identity missing")
         return {
             "job_id": prepared["job_id"],
             "land": land_response,

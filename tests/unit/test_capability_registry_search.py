@@ -89,7 +89,10 @@ def test_search_web_maps_provider_results_to_search_results_v1(
         ),
     )
 
-    output = registry.get_capability("cap.search.web").execute({"query": "example query"})  # type: ignore[union-attr]
+    capability = registry.get_capability("cap.search.web")
+    assert capability is not None
+    assert capability.execute is not None
+    output = capability.execute({"query": "example query"})
 
     assert output == {
         "query": "example query",
@@ -136,6 +139,7 @@ def test_search_news_uses_news_result_type_and_preserves_egress_preflight(
 
     capability = registry.get_capability("cap.search.news")
     assert capability is not None
+    assert capability.execute is not None
     assert capability.declare_egress_intent is not None
     output = capability.execute({"query": "news query"})
 
@@ -172,4 +176,7 @@ def test_search_provider_errors_map_to_existing_runtime_error_messages(
     )
 
     with pytest.raises(RuntimeError, match="search provider rate limited"):
-        registry.get_capability("cap.search.web").execute({"query": "example query"})  # type: ignore[union-attr]
+        capability = registry.get_capability("cap.search.web")
+        assert capability is not None
+        assert capability.execute is not None
+        capability.execute({"query": "example query"})

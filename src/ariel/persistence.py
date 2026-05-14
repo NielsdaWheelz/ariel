@@ -355,7 +355,7 @@ class AIJudgmentRecord(Base):
                 "judgment_type IN ('memory_curation', 'tool_result_interpretation', "
                 "'memory_extraction', 'continuity_compaction', 'feedback_learning', "
                 "'ambient_interpretation', 'proactive_deliberation', 'model_output', "
-                "'workspace_commitment_extraction')"
+                "'workspace_commitment_extraction', 'tool_strategy')"
             ),
             name="ck_ai_judgment_type",
         ),
@@ -3149,12 +3149,14 @@ class ProviderWriteReceiptRecord(Base):
     )
 
     __table_args__ = (
-        CheckConstraint("provider IN ('google')", name="ck_provider_write_receipt_provider"),
+        CheckConstraint(
+            "provider IN ('google', 'agency')", name="ck_provider_write_receipt_provider"
+        ),
         CheckConstraint(
             "capability_id IN ('cap.email.draft', 'cap.email.send', "
             "'cap.email.archive', 'cap.email.trash', 'cap.email.labels.modify', "
             "'cap.email.undo', 'cap.calendar.create_event', 'cap.calendar.update_event', "
-            "'cap.calendar.respond_to_event', 'cap.drive.share')",
+            "'cap.calendar.respond_to_event', 'cap.drive.share', 'cap.agency.request_pr')",
             name="ck_provider_write_receipt_capability",
         ),
         CheckConstraint(
@@ -3867,6 +3869,12 @@ class JobRecord(Base):
     agency_last_synced_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    agency_sandbox_policy: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict
+    )
+    agency_egress_policy: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict
+    )
     agency_pr_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     agency_pr_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     discord_thread_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -3887,6 +3895,14 @@ class JobRecord(Base):
                 "'failed', 'cancelled', 'timed_out')"
             ),
             name="ck_job_status",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(agency_sandbox_policy) = 'object'",
+            name="ck_jobs_agency_sandbox_policy_object",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(agency_egress_policy) = 'object'",
+            name="ck_jobs_agency_egress_policy_object",
         ),
     )
 
@@ -4098,6 +4114,8 @@ def serialize_job(job: JobRecord) -> dict[str, Any]:
                 if job.agency_last_synced_at is not None
                 else None
             ),
+            "sandbox_policy": redact_json_value(job.agency_sandbox_policy),
+            "egress_policy": redact_json_value(job.agency_egress_policy),
             "pr_number": job.agency_pr_number,
             "pr_url": redact_text(job.agency_pr_url) if job.agency_pr_url is not None else None,
         },

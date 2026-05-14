@@ -270,6 +270,9 @@ def execute_capability(
     capability: CapabilityDefinition,
     normalized_input: dict[str, Any],
 ) -> ExecutionResult:
+    if capability.execute is None:
+        return ExecutionResult(status="failed", output=None, error="provider_runtime_required")
+
     pre_guardrail_error = _pre_execution_guardrail_error(
         capability=capability,
         normalized_input=normalized_input,

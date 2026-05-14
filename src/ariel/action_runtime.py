@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 import hashlib
@@ -12,6 +12,7 @@ from fastapi.encoders import jsonable_encoder
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session, sessionmaker
 
+from ariel.agency_daemon import AgencyDaemonError
 from ariel.attachment_content import AttachmentContentRuntime
 from ariel.capability_registry import (
     AGENCY_CAPABILITY_IDS,
@@ -107,6 +108,7 @@ _EMAIL_TRANSIENT_PROVIDER_ERRORS = {
 _MAX_GMAIL_EVIDENCE_BLOCKS = 12
 _MAX_GMAIL_EVIDENCE_BLOCK_CHARS = 2000
 _GOOGLE_RECEIPT_CAPABILITY_IDS = GOOGLE_WRITE_CAPABILITY_IDS
+_AGENCY_RECEIPT_CAPABILITY_IDS = {"cap.agency.request_pr"}
 
 ModelDeclaredTaintStatus = Literal["missing", "true", "false", "malformed"]
 ProposalProvenanceStatus = Literal["clean", "tainted", "ambiguous"]
@@ -1020,15 +1022,6 @@ _MAX_SNIPPET_LENGTH = 320
 _MAX_DIRECT_TOOL_OUTPUT_JSON_CHARS = 6_000
 _MAX_INTERPRETER_OUTPUT_JSON_CHARS = 16_000
 _MODALITY_HEAVY_VALUES = {"audio", "document", "image", "video"}
-_CONTRADICTION_SIGNAL_KEYS = {
-    "conflict",
-    "conflicts",
-    "conflicting_results",
-    "conflicting_sources",
-    "contradiction",
-    "contradictions",
-    "inconsistent_results",
-}
 _MAPS_RETRIEVAL_CAPABILITY_IDS = {"cap.maps.directions", "cap.maps.search_places"}
 _WEB_EXTRACT_RETRIEVAL_CAPABILITY_IDS = {"cap.web.extract"}
 _GROUNDED_RETRIEVAL_CAPABILITIES = {
@@ -1093,43 +1086,6 @@ def _json_payload_size(value: Any) -> int:
         return len(str(value))
 
 
-def _structured_signal_present(value: Any) -> bool:
-    if value is True:
-        return True
-    if isinstance(value, str):
-        return bool(value.strip())
-    if isinstance(value, list | dict):
-        return bool(value)
-    return False
-
-
-def _has_contradiction_signal(value: Any) -> bool:
-    if isinstance(value, dict):
-        for key, nested_value in value.items():
-            if (
-                isinstance(key, str)
-                and key.strip().lower() in _CONTRADICTION_SIGNAL_KEYS
-                and _structured_signal_present(nested_value)
-            ):
-                return True
-            if _has_contradiction_signal(nested_value):
-                return True
-    if isinstance(value, list):
-        for nested_value in value:
-            if _has_contradiction_signal(nested_value):
-                return True
-    return False
-
-
-def _source_count(output_payload: Any) -> int:
-    if not isinstance(output_payload, dict):
-        return 0
-    raw_results = output_payload.get("results")
-    if not isinstance(raw_results, list):
-        return 0
-    return sum(1 for item in raw_results if isinstance(item, dict))
-
-
 def _has_modality_heavy_output(output_payload: Any) -> bool:
     if not isinstance(output_payload, dict):
         return False
@@ -1152,10 +1108,6 @@ def _tool_result_interpretation_reason_codes(output_payload: Any) -> list[str]:
     reason_codes: list[str] = []
     if _json_payload_size(output_payload) > _MAX_DIRECT_TOOL_OUTPUT_JSON_CHARS:
         reason_codes.append("large")
-    if _source_count(output_payload) > 1:
-        reason_codes.append("multi_source")
-    if _has_contradiction_signal(output_payload):
-        reason_codes.append("contradictory")
     if _has_modality_heavy_output(output_payload):
         reason_codes.append("modality_heavy")
     return reason_codes
@@ -2446,6 +2398,7 @@ def _provider_write_authority_payload(
 def _record_provider_write_receipt(
     *,
     db: Session,
+    provider: str = "google",
     action_attempt: ActionAttemptRecord,
     status: ProviderWriteReceiptStatus,
     normalized_input: dict[str, Any] | None,
@@ -2457,17 +2410,20 @@ def _record_provider_write_receipt(
     new_id_fn: Callable[[str], str],
 ) -> ProviderWriteReceiptRecord:
     resolved_provider_account_id = (
-        provider_account_id or _current_google_provider_account_id(db) or "google"
+        provider_account_id
+        or (_current_google_provider_account_id(db) if provider == "google" else None)
+        or provider
     )
     idempotency_key = _provider_write_idempotency_key(
         action_attempt=action_attempt,
+        provider=provider,
         provider_account_id=resolved_provider_account_id,
         normalized_input=normalized_input,
     )
     receipt = db.scalar(
         select(ProviderWriteReceiptRecord)
         .where(
-            ProviderWriteReceiptRecord.provider == "google",
+            ProviderWriteReceiptRecord.provider == provider,
             ProviderWriteReceiptRecord.provider_account_id == resolved_provider_account_id,
             ProviderWriteReceiptRecord.idempotency_key == idempotency_key,
         )
@@ -2478,27 +2434,40 @@ def _record_provider_write_receipt(
     if error is not None:
         raw_response_payload["error"] = error
     response_digest = _json_digest(raw_response_payload)
-    response_payload = _redact_google_provider_output(
-        capability_id=action_attempt.capability_id,
-        output_payload=raw_response_payload,
+    response_payload = (
+        _redact_google_provider_output(
+            capability_id=action_attempt.capability_id,
+            output_payload=raw_response_payload,
+        )
+        if provider == "google"
+        else dict(raw_response_payload)
     )
     if "undo_token" in response_payload:
         response_payload["undo_token"] = "[redacted]"
-    authority_payload, authority_error = _provider_write_authority_payload(
-        db=db,
-        action_attempt=action_attempt,
-        normalized_input=normalized_input,
-        provider_account_id=resolved_provider_account_id,
-    )
-    if authority_payload is not None:
-        response_payload["authority"] = authority_payload
-    elif authority_error is not None:
-        response_payload["authority_error"] = authority_error
+    if provider == "google":
+        authority_payload, authority_error = _provider_write_authority_payload(
+            db=db,
+            action_attempt=action_attempt,
+            normalized_input=normalized_input,
+            provider_account_id=resolved_provider_account_id,
+        )
+        if authority_payload is not None:
+            response_payload["authority"] = authority_payload
+        elif authority_error is not None:
+            response_payload["authority_error"] = authority_error
+    else:
+        approval_ref = _latest_approval_ref(db, action_attempt_id=action_attempt.id)
+        if approval_ref is not None:
+            response_payload["authority"] = {
+                "approval_ref": approval_ref,
+                "action_turn_id": action_attempt.turn_id,
+                "session_id": action_attempt.session_id,
+            }
     provider_object_ids = _provider_write_object_ids(
         normalized_input=normalized_input,
         response_payload=response_payload,
     )
-    if authority_payload is not None:
+    if provider == "google" and authority_payload is not None:
         for key in ("source_evidence_id", "commitment_id", "user_instruction_ref"):
             value = authority_payload.get(key)
             if isinstance(value, str):
@@ -2516,7 +2485,7 @@ def _record_provider_write_receipt(
     if receipt is None:
         receipt = ProviderWriteReceiptRecord(
             id=new_id_fn("pwr"),
-            provider="google",
+            provider=provider,
             provider_account_id=resolved_provider_account_id,
             action_attempt_id=action_attempt.id,
             capability_id=action_attempt.capability_id,
@@ -2557,6 +2526,7 @@ def _record_provider_write_receipt(
 def _provider_write_idempotency_key(
     *,
     action_attempt: ActionAttemptRecord,
+    provider: str = "google",
     provider_account_id: str,
     normalized_input: dict[str, Any] | None,
 ) -> str:
@@ -2565,11 +2535,11 @@ def _provider_write_idempotency_key(
     )
     if isinstance(client_key_raw, str) and client_key_raw.strip():
         raw = (
-            f"{action_attempt.capability_id}\x1fgoogle\x1f"
+            f"{action_attempt.capability_id}\x1f{provider}\x1f"
             f"{provider_account_id}\x1f{client_key_raw.strip()}"
         )
         return "provider-write:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
-    return f"provider-write:{action_attempt.id}:{action_attempt.payload_hash}"
+    return f"provider-write:{provider}:{action_attempt.id}:{action_attempt.payload_hash}"
 
 
 def _provider_write_object_ids(
@@ -2578,10 +2548,12 @@ def _provider_write_object_ids(
     response_payload: dict[str, Any],
 ) -> dict[str, Any]:
     provider_result = response_payload.get("provider_result")
+    agency_pr = response_payload.get("pr")
     sources = [
         normalized_input if isinstance(normalized_input, dict) else {},
         response_payload,
         provider_result if isinstance(provider_result, dict) else {},
+        agency_pr if isinstance(agency_pr, dict) else {},
     ]
     provider_object_ids: dict[str, Any] = {}
     for source in sources:
@@ -2605,6 +2577,13 @@ def _provider_write_object_ids(
             "provider_message_ref",
             "provider_draft_ref",
             "provider_event_ref",
+            "job_id",
+            "repo_id",
+            "invocation_id",
+            "worktree_id",
+            "pr_number",
+            "pr_url",
+            "request_id",
         ):
             value = source.get(key)
             if value is not None and key not in provider_object_ids:
@@ -2652,28 +2631,40 @@ def _provider_write_success_identity_error(
             if not isinstance(provider_object_ids.get(key), str):
                 return "provider_write_identity_missing"
         return None
+    if capability_id == "cap.agency.request_pr":
+        if not (
+            isinstance(provider_object_ids.get("pr_url"), str)
+            or isinstance(provider_object_ids.get("pr_number"), int)
+            or isinstance(provider_object_ids.get("request_id"), str)
+        ):
+            return "provider_write_identity_missing"
+        return None
     return None
 
 
 def _provider_write_receipt_for_attempt(
     *,
     db: Session,
+    provider: str = "google",
     action_attempt: ActionAttemptRecord,
     provider_account_id: str | None,
     normalized_input: dict[str, Any] | None,
 ) -> ProviderWriteReceiptRecord | None:
     resolved_provider_account_id = (
-        provider_account_id or _current_google_provider_account_id(db) or "google"
+        provider_account_id
+        or (_current_google_provider_account_id(db) if provider == "google" else None)
+        or provider
     )
     idempotency_key = _provider_write_idempotency_key(
         action_attempt=action_attempt,
+        provider=provider,
         provider_account_id=resolved_provider_account_id,
         normalized_input=normalized_input,
     )
     return db.scalar(
         select(ProviderWriteReceiptRecord)
         .where(
-            ProviderWriteReceiptRecord.provider == "google",
+            ProviderWriteReceiptRecord.provider == provider,
             ProviderWriteReceiptRecord.provider_account_id == resolved_provider_account_id,
             ProviderWriteReceiptRecord.idempotency_key == idempotency_key,
         )
@@ -2779,10 +2770,14 @@ def process_provider_write_reconcile_due(
     task_payload: dict[str, Any],
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
+    agency_runtime: Any | None = None,
 ) -> bool:
     receipt_id = task_payload.get("provider_write_receipt_id")
     if not isinstance(receipt_id, str) or not receipt_id:
         raise RuntimeError("provider_write_reconcile_due missing provider_write_receipt_id")
+
+    agency_prepared: dict[str, Any] | None = None
+    indeterminate_reason = "provider_reconcile_requires_provider_specific_probe"
 
     with session_factory() as db:
         with db.begin():
@@ -2805,28 +2800,213 @@ def process_provider_write_reconcile_due(
             if receipt.status != "ambiguous":
                 return False
 
-            now = now_fn()
-            response_payload = dict(receipt.response_payload)
-            response_payload["reconciliation"] = {
-                "status": "indeterminate",
-                "reason": "provider_reconcile_requires_provider_specific_probe",
-                "checked_at": to_rfc3339(now),
+            if (
+                agency_runtime is not None
+                and receipt.provider == "agency"
+                and receipt.capability_id == "cap.agency.request_pr"
+            ):
+                provider_object_ids = (
+                    receipt.provider_object_ids
+                    if isinstance(receipt.provider_object_ids, dict)
+                    else {}
+                )
+                response_payload = (
+                    receipt.response_payload if isinstance(receipt.response_payload, dict) else {}
+                )
+                proposed_input = (
+                    action_attempt.proposed_input
+                    if isinstance(action_attempt.proposed_input, dict)
+                    else {}
+                )
+
+                def text_value(key: str) -> str | None:
+                    for source in (provider_object_ids, response_payload, proposed_input):
+                        value = source.get(key)
+                        if isinstance(value, str) and value:
+                            return value
+                    return None
+
+                job_id = text_value("job_id")
+                repo_id = text_value("repo_id")
+                invocation_id = text_value("invocation_id")
+                worktree_id = text_value("worktree_id")
+                client_request_id = text_value("client_request_id") or receipt.id
+                if (
+                    job_id is not None
+                    and repo_id is not None
+                    and invocation_id is not None
+                    and worktree_id is not None
+                ):
+                    agency_prepared = {
+                        "job_id": job_id,
+                        "repo_id": repo_id,
+                        "invocation_id": invocation_id,
+                        "worktree_id": worktree_id,
+                        "allow_dirty": bool(proposed_input.get("allow_dirty")),
+                        "force_with_lease": bool(proposed_input.get("force_with_lease")),
+                        "client_request_id": client_request_id,
+                        "land_client_request_id": (
+                            text_value("land_client_request_id") or f"{client_request_id}:land"
+                        ),
+                        "pr_sync_client_request_id": (
+                            text_value("pr_sync_client_request_id")
+                            or f"{client_request_id}:pr-sync"
+                        ),
+                    }
+                else:
+                    indeterminate_reason = "agency_reconcile_identity_missing"
+
+            if agency_prepared is None:
+                now = now_fn()
+                response_payload = dict(receipt.response_payload)
+                response_payload["reconciliation"] = {
+                    "status": "indeterminate",
+                    "reason": indeterminate_reason,
+                    "checked_at": to_rfc3339(now),
+                }
+                receipt.response_payload = response_payload
+                receipt.response_digest = _json_digest(response_payload)
+                receipt.updated_at = now
+                _append_action_execution_event(
+                    db=db,
+                    action_attempt=action_attempt,
+                    event_type="evt.provider_write.reconcile_unavailable",
+                    payload_data={
+                        "action_attempt_id": action_attempt.id,
+                        "provider_write_receipt_id": receipt.id,
+                        "status": receipt.status,
+                        "reason": indeterminate_reason,
+                        "reconcile_task_enqueued": False,
+                    },
+                    now_fn=lambda: now,
+                    new_id_fn=new_id_fn,
+                )
+                return True
+
+    assert agency_runtime is not None
+    assert agency_prepared is not None
+    try:
+        agency_result = agency_runtime.request_pr(prepared=agency_prepared)
+    except AgencyDaemonError as exc:
+        indeterminate_reason = safe_failure_reason(
+            str(exc),
+            fallback="agency_reconcile_probe_failed",
+        )
+        with session_factory() as db:
+            with db.begin():
+                receipt = db.scalar(
+                    select(ProviderWriteReceiptRecord)
+                    .where(ProviderWriteReceiptRecord.id == receipt_id)
+                    .with_for_update()
+                    .limit(1)
+                )
+                if receipt is None:
+                    raise RuntimeError("provider_write_receipt_not_found")
+                action_attempt = db.scalar(
+                    select(ActionAttemptRecord)
+                    .where(ActionAttemptRecord.id == receipt.action_attempt_id)
+                    .with_for_update()
+                    .limit(1)
+                )
+                if action_attempt is None:
+                    raise RuntimeError("provider_write_action_attempt_not_found")
+                if receipt.status != "ambiguous":
+                    return False
+                now = now_fn()
+                response_payload = dict(receipt.response_payload)
+                response_payload["reconciliation"] = {
+                    "status": "indeterminate",
+                    "reason": indeterminate_reason,
+                    "checked_at": to_rfc3339(now),
+                }
+                receipt.response_payload = response_payload
+                receipt.response_digest = _json_digest(response_payload)
+                receipt.updated_at = now
+                _append_action_execution_event(
+                    db=db,
+                    action_attempt=action_attempt,
+                    event_type="evt.provider_write.reconcile_unavailable",
+                    payload_data={
+                        "action_attempt_id": action_attempt.id,
+                        "provider_write_receipt_id": receipt.id,
+                        "status": receipt.status,
+                        "reason": indeterminate_reason,
+                        "reconcile_task_enqueued": False,
+                    },
+                    now_fn=lambda: now,
+                    new_id_fn=new_id_fn,
+                )
+        raise
+
+    with session_factory() as db:
+        with db.begin():
+            receipt = db.scalar(
+                select(ProviderWriteReceiptRecord)
+                .where(ProviderWriteReceiptRecord.id == receipt_id)
+                .with_for_update()
+                .limit(1)
+            )
+            if receipt is None:
+                raise RuntimeError("provider_write_receipt_not_found")
+            action_attempt = db.scalar(
+                select(ActionAttemptRecord)
+                .where(ActionAttemptRecord.id == receipt.action_attempt_id)
+                .with_for_update()
+                .limit(1)
+            )
+            if action_attempt is None:
+                raise RuntimeError("provider_write_action_attempt_not_found")
+            if receipt.status != "ambiguous":
+                return False
+            normalized_input = (
+                action_attempt.proposed_input
+                if isinstance(action_attempt.proposed_input, dict)
+                else {}
+            )
+            agency_output = agency_runtime.record_request_pr(
+                db=db,
+                prepared=agency_prepared,
+                result=agency_result,
+                now_fn=now_fn,
+            )
+            agency_output = {
+                **agency_output,
+                "client_request_id": agency_prepared["client_request_id"],
+                "land_client_request_id": agency_prepared["land_client_request_id"],
+                "pr_sync_client_request_id": agency_prepared["pr_sync_client_request_id"],
             }
-            receipt.response_payload = response_payload
-            receipt.updated_at = now
+            receipt = _record_provider_write_receipt(
+                db=db,
+                provider="agency",
+                action_attempt=action_attempt,
+                status="succeeded",
+                normalized_input=normalized_input,
+                provider_account_id=agency_prepared["repo_id"],
+                output_payload=agency_output,
+                now_fn=now_fn,
+                new_id_fn=new_id_fn,
+            )
+            action_attempt.status = "succeeded"
+            action_attempt.execution_output = receipt.response_payload
+            action_attempt.execution_error = None
+            action_attempt.updated_at = now_fn()
             _append_action_execution_event(
                 db=db,
                 action_attempt=action_attempt,
-                event_type="evt.provider_write.reconcile_unavailable",
+                event_type="evt.action.execution.succeeded",
                 payload_data={
                     "action_attempt_id": action_attempt.id,
+                    "output": receipt.response_payload,
                     "provider_write_receipt_id": receipt.id,
-                    "status": receipt.status,
-                    "reason": "provider_reconcile_requires_provider_specific_probe",
-                    "reconcile_task_enqueued": False,
+                    "reconciled": True,
                 },
-                now_fn=lambda: now,
+                now_fn=now_fn,
                 new_id_fn=new_id_fn,
+            )
+            _update_memory_action_traces(
+                db=db,
+                action_attempt=action_attempt,
+                now_fn=now_fn,
             )
             return True
 
@@ -2849,6 +3029,7 @@ def process_response_function_calls(
     execute_google_reads_outside_transaction: bool = False,
     agency_runtime: Any | None = None,
     attachment_runtime: AttachmentContentRuntime | None = None,
+    allowed_capability_ids: Sequence[str] = (),
 ) -> FunctionCallProcessingResult:
     inline_results: list[dict[str, Any]] = []
     pending_approvals: list[dict[str, Any]] = []
@@ -2865,6 +3046,7 @@ def process_response_function_calls(
     call_ids_by_attempt_id: dict[str, str] = {}
     taint_by_attempt_id: dict[str, dict[str, Any]] = {}
     interpreter_reason_codes_by_attempt_id: dict[str, list[str]] = {}
+    allowed_capability_id_set = set(allowed_capability_ids)
 
     function_calls = function_calls_raw if isinstance(function_calls_raw, list) else []
     for function_call_index, function_call_raw in enumerate(function_calls, start=1):
@@ -2874,6 +3056,30 @@ def process_response_function_calls(
         tool_name_raw = function_call_payload.get("name")
         tool_name = tool_name_raw.strip() if isinstance(tool_name_raw, str) else ""
         capability_id = capability_id_for_response_tool_name(tool_name) or "invalid.capability"
+        if capability_id not in allowed_capability_id_set:
+            blocked_reasons.append(f"{capability_id}: tool_not_in_turn_scope")
+            add_event(
+                "evt.action.call_denied",
+                {
+                    "call_index": function_call_index,
+                    "call_id": call_id or None,
+                    "tool_name": tool_name,
+                    "capability_id": capability_id,
+                    "reason": "tool_not_in_turn_scope",
+                },
+            )
+            if call_id:
+                function_call_outputs.append(
+                    _response_function_call_output(
+                        call_id=call_id,
+                        payload={
+                            "status": "denied",
+                            "capability_id": capability_id,
+                            "error": "tool_not_in_turn_scope",
+                        },
+                    )
+                )
+            continue
         is_google_capability_call = capability_id in GOOGLE_CAPABILITY_IDS
         is_agency_capability_call = capability_id in AGENCY_CAPABILITY_IDS
         is_discord_capability_call = capability_id in DISCORD_CAPABILITY_IDS
@@ -3495,6 +3701,12 @@ def process_response_function_calls(
                     },
                 )
                 continue
+        elif is_google_capability_call:
+            execution_result = ExecutionResult(
+                status="failed",
+                output=None,
+                error="google_runtime_not_bound",
+            )
         elif is_agency_capability_call and agency_runtime is not None:
             _acquire_side_effect_execution_lock(
                 db=db,
@@ -3731,18 +3943,6 @@ def process_response_function_calls(
                 "error": action_attempt.execution_error,
             },
         )
-
-    if len(retrieval_sources) > 1:
-        for action_attempt in created_action_attempts:
-            if (
-                action_attempt.status == "succeeded"
-                and action_attempt.capability_id in _GROUNDED_RETRIEVAL_CAPABILITIES
-            ):
-                _append_reason_codes(
-                    interpreter_reason_codes_by_attempt_id,
-                    action_attempt_id=action_attempt.id,
-                    reason_codes=["multi_source"],
-                )
 
     tool_result_interpreter_input = _build_tool_result_interpreter_input(
         session_id=session_id,
@@ -4251,8 +4451,17 @@ def process_action_execution_task(
     email_provider_call: tuple[str, str, dict[str, Any], str, set[str], str] | None = None
     email_undo_prior_action_id: str | None = None
     email_lock_parts: tuple[str, ...] | None = None
-    agency_call: tuple[str, dict[str, Any], dict[str, Any]] | None = None
-    agency_result: tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]] | None = None
+    agency_call: tuple[str, dict[str, Any], dict[str, Any], str | None] | None = None
+    agency_result: (
+        tuple[
+            str,
+            dict[str, Any],
+            dict[str, Any],
+            dict[str, Any],
+            str | None,
+        ]
+        | None
+    ) = None
     local_call: tuple[CapabilityDefinition, dict[str, Any]] | None = None
     thread_watch_result: dict[str, Any] | None = None
     execution_result: ExecutionResult | GoogleCapabilityExecutionResult | None = None
@@ -4407,6 +4616,119 @@ def process_action_execution_task(
                             new_id_fn=new_id_fn,
                         )
                         return True
+                elif action_attempt.capability_id in _AGENCY_RECEIPT_CAPABILITY_IDS:
+                    receipt_id = (
+                        action_attempt.execution_output.get("provider_write_receipt_id")
+                        if isinstance(action_attempt.execution_output, dict)
+                        else None
+                    )
+                    existing_receipt = (
+                        db.get(ProviderWriteReceiptRecord, receipt_id)
+                        if isinstance(receipt_id, str) and receipt_id
+                        else None
+                    )
+                    if existing_receipt is None:
+                        existing_receipt = _provider_write_receipt_for_attempt(
+                            db=db,
+                            provider="agency",
+                            action_attempt=action_attempt,
+                            provider_account_id=dispatch_provider_account_id,
+                            normalized_input=dispatch_normalized_input,
+                        )
+                    if existing_receipt is not None and existing_receipt.request_digest != (
+                        action_attempt.payload_hash
+                    ):
+                        _fail_action_execution(
+                            db=db,
+                            action_attempt=action_attempt,
+                            error="idempotency_key_input_mismatch",
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        return True
+                    if existing_receipt is not None and existing_receipt.status == "succeeded":
+                        action_attempt.status = "succeeded"
+                        action_attempt.execution_output = existing_receipt.response_payload
+                        action_attempt.execution_error = None
+                        action_attempt.updated_at = now_fn()
+                        _append_action_execution_event(
+                            db=db,
+                            action_attempt=action_attempt,
+                            event_type="evt.action.execution.succeeded",
+                            payload_data={
+                                "action_attempt_id": action_attempt.id,
+                                "output": existing_receipt.response_payload,
+                                "replayed_provider_write_receipt_id": existing_receipt.id,
+                            },
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        _update_memory_action_traces(
+                            db=db,
+                            action_attempt=action_attempt,
+                            now_fn=now_fn,
+                        )
+                        return True
+                    if existing_receipt is not None and existing_receipt.status == "failed":
+                        existing_error = (
+                            existing_receipt.response_payload.get("error")
+                            if isinstance(existing_receipt.response_payload, dict)
+                            else None
+                        )
+                        _fail_action_execution(
+                            db=db,
+                            action_attempt=action_attempt,
+                            error=existing_error
+                            if isinstance(existing_error, str)
+                            else "provider_result_unknown",
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        return True
+                    receipt = existing_receipt
+                    if receipt is None:
+                        receipt = _record_provider_write_receipt(
+                            db=db,
+                            provider="agency",
+                            action_attempt=action_attempt,
+                            status="ambiguous",
+                            normalized_input=dispatch_normalized_input,
+                            provider_account_id=dispatch_provider_account_id,
+                            output_payload={"dispatch_state": "provider_call_started"},
+                            error="provider_result_unknown",
+                            ambiguity_reason="provider_result_unknown",
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                    elif receipt.status != "ambiguous":
+                        now = now_fn()
+                        response_payload = (
+                            dict(receipt.response_payload)
+                            if isinstance(receipt.response_payload, dict)
+                            else {}
+                        )
+                        response_payload["error"] = "provider_result_unknown"
+                        receipt.status = "ambiguous"
+                        receipt.ambiguity_reason = "provider_result_unknown"
+                        receipt.response_payload = response_payload
+                        receipt.response_digest = _json_digest(response_payload)
+                        receipt.updated_at = now
+                    _append_provider_write_reconcile_unavailable_event(
+                        db=db,
+                        action_attempt=action_attempt,
+                        receipt=receipt,
+                        reason="provider_result_unknown",
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
+                    _fail_action_execution(
+                        db=db,
+                        action_attempt=action_attempt,
+                        error="provider_result_unknown",
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
+                    return True
                 elif (
                     action_attempt.capability_id not in _EMAIL_MUTATION_CAPABILITY_IDS
                     and action_attempt.capability_id not in _EMAIL_THREAD_WATCH_CAPABILITY_IDS
@@ -5145,13 +5467,15 @@ def process_action_execution_task(
                 agency_context = {
                     "action_attempt_id": action_attempt.id,
                 }
+                agency_receipt_id: str | None = None
                 if action_attempt.capability_id == "cap.agency.request_pr":
                     try:
                         agency_context = agency_runtime.prepare_request_pr(
                             db=db,
                             input_payload=normalized_input,
+                            action_attempt_id=action_attempt.id,
                         )
-                    except Exception as exc:  # noqa: BLE001
+                    except AgencyDaemonError as exc:
                         _fail_action_execution(
                             db=db,
                             action_attempt=action_attempt,
@@ -5160,6 +5484,81 @@ def process_action_execution_task(
                             new_id_fn=new_id_fn,
                         )
                         return True
+                    existing_receipt = _provider_write_receipt_for_attempt(
+                        db=db,
+                        provider="agency",
+                        action_attempt=action_attempt,
+                        provider_account_id=str(agency_context["repo_id"]),
+                        normalized_input=normalized_input,
+                    )
+                    if existing_receipt is not None and existing_receipt.request_digest != (
+                        action_attempt.payload_hash
+                    ):
+                        _fail_action_execution(
+                            db=db,
+                            action_attempt=action_attempt,
+                            error="idempotency_key_input_mismatch",
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        return True
+                    if existing_receipt is not None and existing_receipt.status == "succeeded":
+                        action_attempt.status = "succeeded"
+                        action_attempt.execution_output = existing_receipt.response_payload
+                        action_attempt.execution_error = None
+                        action_attempt.updated_at = now_fn()
+                        _append_action_execution_event(
+                            db=db,
+                            action_attempt=action_attempt,
+                            event_type="evt.action.execution.succeeded",
+                            payload_data={
+                                "action_attempt_id": action_attempt.id,
+                                "output": existing_receipt.response_payload,
+                                "replayed_provider_write_receipt_id": existing_receipt.id,
+                            },
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        _update_memory_action_traces(
+                            db=db,
+                            action_attempt=action_attempt,
+                            now_fn=now_fn,
+                        )
+                        return True
+                    receipt = _record_provider_write_receipt(
+                        db=db,
+                        provider="agency",
+                        action_attempt=action_attempt,
+                        status="executing",
+                        normalized_input=normalized_input,
+                        provider_account_id=str(agency_context["repo_id"]),
+                        output_payload={
+                            "dispatch_state": "provider_call_started",
+                            "client_request_id": str(agency_context["client_request_id"]),
+                        },
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
+                    agency_receipt_id = receipt.id
+                    agency_context["client_request_id"] = receipt.id
+                    agency_context["land_client_request_id"] = f"{receipt.id}:land"
+                    agency_context["pr_sync_client_request_id"] = f"{receipt.id}:pr-sync"
+                    receipt.response_payload = {
+                        "dispatch_state": "provider_call_started",
+                        "job_id": agency_context["job_id"],
+                        "repo_id": agency_context["repo_id"],
+                        "invocation_id": agency_context["invocation_id"],
+                        "worktree_id": agency_context["worktree_id"],
+                        "client_request_id": receipt.id,
+                        "land_client_request_id": agency_context["land_client_request_id"],
+                        "pr_sync_client_request_id": agency_context["pr_sync_client_request_id"],
+                    }
+                    receipt.provider_object_ids = _provider_write_object_ids(
+                        normalized_input=normalized_input,
+                        response_payload=receipt.response_payload,
+                    )
+                    receipt.response_digest = _json_digest(receipt.response_payload)
+                    receipt.updated_at = now_fn()
                 elif action_attempt.capability_id != "cap.agency.run":
                     _fail_action_execution(
                         db=db,
@@ -5170,8 +5569,15 @@ def process_action_execution_task(
                     )
                     return True
                 action_attempt.execution_output = {"dispatch_state": "provider_call_started"}
+                if agency_receipt_id is not None:
+                    action_attempt.execution_output["provider_write_receipt_id"] = agency_receipt_id
                 action_attempt.updated_at = now_fn()
-                agency_call = (action_attempt.capability_id, normalized_input, agency_context)
+                agency_call = (
+                    action_attempt.capability_id,
+                    normalized_input,
+                    agency_context,
+                    agency_receipt_id,
+                )
             elif capability.impact_level == "external_send":
                 _fail_action_execution(
                     db=db,
@@ -5289,7 +5695,7 @@ def process_action_execution_task(
             provider_account_id=provider_account_id,
         )
     elif agency_call is not None:
-        capability_id, normalized_input, agency_context = agency_call
+        capability_id, normalized_input, agency_context, agency_receipt_id = agency_call
         assert agency_runtime is not None
         try:
             if capability_id == "cap.agency.run":
@@ -5306,11 +5712,17 @@ def process_action_execution_task(
                     error="unknown_agency_capability",
                 )
                 result = None
-        except Exception as exc:  # noqa: BLE001
+        except AgencyDaemonError as exc:
             execution_result = ExecutionResult(status="failed", output=None, error=str(exc))
         else:
             if result is not None:
-                agency_result = (capability_id, normalized_input, agency_context, result)
+                agency_result = (
+                    capability_id,
+                    normalized_input,
+                    agency_context,
+                    result,
+                    agency_receipt_id,
+                )
                 execution_result = ExecutionResult(status="succeeded", output={}, error=None)
     elif local_call is not None:
         capability, normalized_input = local_call
@@ -5340,7 +5752,9 @@ def process_action_execution_task(
             if action_attempt.status in {"succeeded", "failed", "rejected", "denied", "expired"}:
                 return False
             if agency_result is not None:
-                capability_id, normalized_input, agency_context, result = agency_result
+                capability_id, normalized_input, agency_context, result, agency_receipt_id = (
+                    agency_result
+                )
                 assert agency_runtime is not None
                 if capability_id == "cap.agency.run":
                     execution_result = ExecutionResult(
@@ -5358,16 +5772,48 @@ def process_action_execution_task(
                         error=None,
                     )
                 elif capability_id == "cap.agency.request_pr":
+                    agency_output = agency_runtime.record_request_pr(
+                        db=db,
+                        prepared=agency_context,
+                        result=result,
+                        now_fn=now_fn,
+                    )
+                    if agency_receipt_id is not None:
+                        agency_output = {
+                            **agency_output,
+                            "client_request_id": agency_receipt_id,
+                            "land_client_request_id": f"{agency_receipt_id}:land",
+                            "pr_sync_client_request_id": f"{agency_receipt_id}:pr-sync",
+                        }
                     execution_result = ExecutionResult(
                         status="succeeded",
-                        output=agency_runtime.record_request_pr(
-                            db=db,
-                            prepared=agency_context,
-                            result=result,
-                            now_fn=now_fn,
-                        ),
+                        output=agency_output,
                         error=None,
                     )
+                    receipt = _record_provider_write_receipt(
+                        db=db,
+                        provider="agency",
+                        action_attempt=action_attempt,
+                        status="succeeded",
+                        normalized_input=normalized_input,
+                        provider_account_id=str(agency_context["repo_id"]),
+                        output_payload=agency_output,
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
+                    if agency_receipt_id is not None and receipt.id != agency_receipt_id:
+                        _append_action_execution_event(
+                            db=db,
+                            action_attempt=action_attempt,
+                            event_type="evt.provider_write.receipt_reconciled",
+                            payload_data={
+                                "action_attempt_id": action_attempt.id,
+                                "expected_provider_write_receipt_id": agency_receipt_id,
+                                "provider_write_receipt_id": receipt.id,
+                            },
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
             if email_provider_call is not None:
                 email_action_id, capability_id, provider_input, _, _, provider_account_id = (
                     email_provider_call
@@ -5688,8 +6134,10 @@ def process_action_execution_task(
                     now_fn=now_fn,
                 )
             else:
+                provider_write_provider = "google"
                 provider_write_normalized_input = None
                 provider_write_provider_account_id = None
+                failure_agency_receipt_id: str | None = None
                 if email_provider_call is not None:
                     (
                         _,
@@ -5707,6 +6155,17 @@ def process_action_execution_task(
                         _,
                         provider_write_provider_account_id,
                     ) = provider_call
+                elif agency_call is not None:
+                    (
+                        agency_capability_id,
+                        agency_input,
+                        agency_context,
+                        failure_agency_receipt_id,
+                    ) = agency_call
+                    if agency_capability_id == "cap.agency.request_pr":
+                        provider_write_provider = "agency"
+                        provider_write_normalized_input = agency_input
+                        provider_write_provider_account_id = str(agency_context["repo_id"])
                 error = execution_result.error or "execution_output_missing"
                 if (
                     isinstance(execution_result, GoogleCapabilityExecutionResult)
@@ -5719,18 +6178,41 @@ def process_action_execution_task(
                             execution_result=execution_result,
                             now_fn=now_fn,
                         )
-                if action_attempt.capability_id in _GOOGLE_RECEIPT_CAPABILITY_IDS:
+                if action_attempt.capability_id in (
+                    _GOOGLE_RECEIPT_CAPABILITY_IDS | _AGENCY_RECEIPT_CAPABILITY_IDS
+                ):
                     failure_payload = provider_write_failure_payload
                     if failure_payload is None and isinstance(execution_result.output, dict):
                         failure_payload = execution_result.output
-                    receipt_status = provider_write_failure_status or (
-                        _provider_write_failure_receipt_status(
-                            error=error,
-                            output_payload=failure_payload,
+                    if (
+                        action_attempt.capability_id in _AGENCY_RECEIPT_CAPABILITY_IDS
+                        and failure_payload is None
+                        and failure_agency_receipt_id is not None
+                    ):
+                        existing_receipt = db.get(
+                            ProviderWriteReceiptRecord,
+                            failure_agency_receipt_id,
                         )
-                    )
+                        if existing_receipt is not None and isinstance(
+                            existing_receipt.response_payload,
+                            dict,
+                        ):
+                            failure_payload = {
+                                **existing_receipt.response_payload,
+                                "error": error,
+                            }
+                    if action_attempt.capability_id in _AGENCY_RECEIPT_CAPABILITY_IDS:
+                        receipt_status = provider_write_failure_status or "ambiguous"
+                    else:
+                        receipt_status = provider_write_failure_status or (
+                            _provider_write_failure_receipt_status(
+                                error=error,
+                                output_payload=failure_payload,
+                            )
+                        )
                     receipt = _record_provider_write_receipt(
                         db=db,
+                        provider=provider_write_provider,
                         action_attempt=action_attempt,
                         status=receipt_status,
                         normalized_input=provider_write_normalized_input,

@@ -9,6 +9,9 @@ from pydantic import ValidationError
 from ariel.app import create_app
 from ariel.config import AppSettings
 
+STRONG_LOCAL_AUTH_TOKEN = "test_local_auth_token_0123456789abcdef"
+CONNECTOR_KEYRING = '{"v1":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}'
+
 
 def _app_settings_without_env_files() -> AppSettings:
     return cast(Any, AppSettings)(_env_file=None)
@@ -97,6 +100,61 @@ def test_slice1_turn_budget_defaults_are_configured(monkeypatch: pytest.MonkeyPa
     assert settings.max_turn_wall_time_ms == 20000
     assert settings.approval_ttl_seconds == 900
     assert settings.approval_actor_id == "user.local"
+
+
+def test_security_defaults_are_development_only() -> None:
+    settings = AppSettings.model_validate({})
+    assert settings.deployment_mode == "development"
+    assert settings.local_auth_required is False
+    assert settings.connector_encryption_secret == "dev-local-connector-secret"
+
+
+def test_production_rejects_unauthenticated_local_api() -> None:
+    with pytest.raises(ValidationError):
+        AppSettings.model_validate(
+            {
+                "deployment_mode": "production",
+                "local_auth_required": False,
+                "local_auth_token": STRONG_LOCAL_AUTH_TOKEN,
+                "connector_encryption_secret": "prod-connector-secret",
+                "connector_encryption_keys": CONNECTOR_KEYRING,
+            }
+        )
+
+
+def test_production_rejects_dev_connector_encryption_secret() -> None:
+    with pytest.raises(ValidationError):
+        AppSettings.model_validate(
+            {
+                "deployment_mode": "production",
+                "local_auth_required": True,
+                "local_auth_token": STRONG_LOCAL_AUTH_TOKEN,
+                "connector_encryption_secret": "dev-local-connector-secret",
+                "connector_encryption_keys": CONNECTOR_KEYRING,
+            }
+        )
+
+
+def test_production_requires_connector_keyring() -> None:
+    with pytest.raises(ValidationError):
+        AppSettings.model_validate(
+            {
+                "deployment_mode": "production",
+                "local_auth_required": True,
+                "local_auth_token": STRONG_LOCAL_AUTH_TOKEN,
+                "connector_encryption_secret": "prod-connector-secret",
+            }
+        )
+
+
+def test_local_auth_rejects_weak_tokens() -> None:
+    with pytest.raises(ValidationError):
+        AppSettings.model_validate(
+            {
+                "local_auth_required": True,
+                "local_auth_token": "test-local-token",
+            }
+        )
 
 
 def test_turn_budget_env_overrides_are_loaded(monkeypatch: pytest.MonkeyPatch) -> None:

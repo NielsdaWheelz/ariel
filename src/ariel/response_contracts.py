@@ -48,6 +48,7 @@ SurfaceEventType = Literal[
     "evt.model.started",
     "evt.model.completed",
     "evt.model.failed",
+    "evt.action.call_denied",
     "evt.action.proposed",
     "evt.action.policy_decided",
     "evt.action.approval.requested",
@@ -59,6 +60,7 @@ SurfaceEventType = Literal[
     "evt.action.execution.failed",
     "evt.action.execution.retrying",
     "evt.provider_write.reconcile_unavailable",
+    "evt.provider_write.receipt_reconciled",
 ]
 
 
@@ -268,6 +270,16 @@ class SurfaceEventActionProposedPayloadContract(BaseModel):
     taint: SurfaceTaintPayloadContract
 
 
+class SurfaceEventActionCallDeniedPayloadContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    call_index: int
+    call_id: str | None = None
+    tool_name: str
+    capability_id: str
+    reason: str
+
+
 class SurfaceEventActionPolicyDecidedPayloadContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -352,6 +364,14 @@ class SurfaceEventProviderWriteReconcileUnavailablePayloadContract(BaseModel):
     reconcile_task_id: str | None = None
 
 
+class SurfaceEventProviderWriteReceiptReconciledPayloadContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action_attempt_id: str
+    expected_provider_write_receipt_id: str
+    provider_write_receipt_id: str
+
+
 class SurfaceEventMemoryAssertionPayloadContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -431,6 +451,7 @@ class SurfaceEventAIJudgmentPayloadContract(BaseModel):
         "proactive_deliberation",
         "model_output",
         "workspace_commitment_extraction",
+        "tool_strategy",
     ]
     parse_status: (
         Literal[
@@ -472,6 +493,8 @@ class SurfaceEventAIJudgmentPayloadContract(BaseModel):
     max_model_attempts: int | None = None
     last_tool_result_interpreter_judgment_id: str | None = None
     omitted_turn_count: int | None = None
+    eligible_capability_count: int | None = None
+    selected_capability_ids: list[str] | None = None
 
 
 class SurfaceEventEnvelopeContract(BaseModel):
@@ -1672,6 +1695,12 @@ def _project_surface_event_payload(
             SurfaceEventActionProposedPayloadContract,
             payload,
         )
+    if event_type == "evt.action.call_denied":
+        return _validate_contract(
+            "surface_event_payload.evt.action.call_denied",
+            SurfaceEventActionCallDeniedPayloadContract,
+            payload,
+        )
     if event_type == "evt.action.policy_decided":
         return _validate_contract(
             "surface_event_payload.evt.action.policy_decided",
@@ -1730,6 +1759,12 @@ def _project_surface_event_payload(
         return _validate_contract(
             "surface_event_payload.evt.provider_write.reconcile_unavailable",
             SurfaceEventProviderWriteReconcileUnavailablePayloadContract,
+            payload,
+        )
+    if event_type == "evt.provider_write.receipt_reconciled":
+        return _validate_contract(
+            "surface_event_payload.evt.provider_write.receipt_reconciled",
+            SurfaceEventProviderWriteReceiptReconciledPayloadContract,
             payload,
         )
     if event_type == "evt.memory.evidence_recorded":

@@ -1174,6 +1174,7 @@ def test_gmail_search_read_extraction_review_follow_up_notification_pipeline(
                 now_fn=_now,
                 new_id_fn=_new_id,
                 google_runtime=cast(GoogleConnectorRuntime, google_runtime),
+                allowed_capability_ids=["cap.email.search", "cap.email.read"],
             )
 
     assert [attempt.status for attempt in result.action_attempts] == ["succeeded", "succeeded"]
@@ -1377,6 +1378,7 @@ def test_gmail_read_persists_provider_evidence_and_grounded_artifact(
                 now_fn=_now,
                 new_id_fn=_new_id,
                 google_runtime=cast(GoogleConnectorRuntime, FakeGoogleRuntime()),
+                allowed_capability_ids=["cap.email.read"],
             )
 
     assert result.action_attempts[0].status == "succeeded"
@@ -1487,6 +1489,7 @@ def test_gmail_thread_read_persists_provider_evidence_and_grounded_artifact(
                 now_fn=_now,
                 new_id_fn=_new_id,
                 google_runtime=cast(GoogleConnectorRuntime, FakeThreadGoogleRuntime()),
+                allowed_capability_ids=["cap.email.read"],
             )
 
     assert result.action_attempts[0].status == "succeeded"
@@ -1546,6 +1549,7 @@ def test_calendar_read_persists_description_evidence_and_extraction_path(
                 now_fn=_now,
                 new_id_fn=_new_id,
                 google_runtime=cast(GoogleConnectorRuntime, google_runtime),
+                allowed_capability_ids=["cap.calendar.list"],
             )
 
     assert result.action_attempts[0].status == "succeeded"
@@ -1679,6 +1683,7 @@ def test_calendar_slot_options_persist_availability_evidence(
                 now_fn=_now,
                 new_id_fn=_new_id,
                 google_runtime=cast(GoogleConnectorRuntime, google_runtime),
+                allowed_capability_ids=["cap.calendar.propose_slots"],
             )
 
     assert result.action_attempts[0].status == "succeeded"
@@ -1960,6 +1965,7 @@ def test_inline_google_read_commits_action_attempt_before_provider_call(
             new_id_fn=_new_id,
             google_runtime=cast(GoogleConnectorRuntime, google_runtime),
             execute_google_reads_outside_transaction=True,
+            allowed_capability_ids=["cap.email.search"],
         )
         db.commit()
 
@@ -2986,6 +2992,7 @@ def test_prompt_injection_blocks_do_not_create_provider_writes(
                     ),
                 ),
                 google_runtime=cast(GoogleConnectorRuntime, google_runtime),
+                allowed_capability_ids=["cap.email.send", "cap.calendar.create_event"],
             )
 
     assert [attempt.capability_id for attempt in result.action_attempts] == [

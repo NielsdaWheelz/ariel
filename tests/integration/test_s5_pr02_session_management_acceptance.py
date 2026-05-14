@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import threading
 import time
 from collections.abc import Generator, Sequence
@@ -241,6 +242,38 @@ class SessionManagementProbeAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         del tools
+        if context_bundle.get("origin") == "tool_strategy":
+            strategy_input = json.loads(str(input_items[1]["content"]))
+            available_ids = {
+                capability_id
+                for family in strategy_input.get("available_capability_families", [])
+                if isinstance(family, dict)
+                for capability_id in family.get("capability_ids", [])
+                if isinstance(capability_id, str)
+            }
+            selected_capability_ids = [
+                proposal["capability_id"]
+                for proposal in self.proposals_by_message.get(user_message, [])
+                if proposal.get("capability_id") in available_ids
+            ]
+            return responses_message(
+                assistant_text=json.dumps(
+                    {
+                        "decision": "selected_tools" if selected_capability_ids else "no_tools",
+                        "selected_capability_ids": selected_capability_ids,
+                        "rationale": "test strategy",
+                        "unavailable_reason": None,
+                        "confidence": 1.0,
+                    },
+                    sort_keys=True,
+                ),
+                provider=self.provider,
+                model=self.model,
+                provider_response_id="resp_s5_pr02_strategy",
+                input_tokens=3,
+                output_tokens=2,
+            )
+
         with self._lock:
             self.history_lengths_by_message[user_message] = len(history)
             self.context_bundles.append(copy.deepcopy(context_bundle))
@@ -1086,11 +1119,14 @@ def test_s5_pr02_timeline_after_cursor_omits_turns_with_action_attempts_and_no_n
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _use_fake_embeddings(monkeypatch)
-    first_message = "propose an unavailable capability"
+    first_message = "search memory for cursor regression"
     adapter = SessionManagementProbeAdapter(
         proposals_by_message={
             first_message: [
-                {"capability_id": "cap.unavailable.demo", "input": {"subject": "cursor regression"}}
+                {
+                    "capability_id": "cap.memory.search",
+                    "input": {"query": "cursor regression", "limit": 1},
+                }
             ]
         }
     )

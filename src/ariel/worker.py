@@ -535,6 +535,7 @@ def process_one_task(
                 process_provider_write_reconcile_due(
                     session_factory=session_factory,
                     task_payload=task_payload,
+                    agency_runtime=_agency_runtime(resolved_settings),
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                 )

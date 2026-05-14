@@ -38,6 +38,37 @@ class ActionProposalAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         del tools, history
+        if context_bundle.get("origin") == "tool_strategy":
+            strategy_input = json.loads(str(input_items[1]["content"]))
+            available_ids = {
+                capability_id
+                for family in strategy_input.get("available_capability_families", [])
+                if isinstance(family, dict)
+                for capability_id in family.get("capability_ids", [])
+                if isinstance(capability_id, str)
+            }
+            selected_capability_ids = [
+                proposal["capability_id"]
+                for proposal in self.proposals_by_message.get(user_message, [])
+                if proposal.get("capability_id") in available_ids
+            ]
+            return responses_message(
+                assistant_text=json.dumps(
+                    {
+                        "decision": "selected_tools" if selected_capability_ids else "no_tools",
+                        "selected_capability_ids": selected_capability_ids,
+                        "rationale": "test strategy",
+                        "unavailable_reason": None,
+                        "confidence": 1.0,
+                    },
+                    sort_keys=True,
+                ),
+                provider=self.provider,
+                model=self.model,
+                provider_response_id="resp_s7_pr01_strategy",
+                input_tokens=3,
+                output_tokens=2,
+            )
         if context_bundle.get("origin") == "tool_result_interpretation":
             interpreter_input = context_bundle.get("tool_result_interpreter_input")
             if not isinstance(interpreter_input, dict):
@@ -113,6 +144,14 @@ def postgres_url() -> Generator[str, None, None]:
     with PostgresContainer("pgvector/pgvector:pg16") as postgres:
         url = postgres.get_connection_url()
         yield url.replace("psycopg2", "psycopg")
+
+
+@pytest.fixture(autouse=True)
+def _web_extract_provider_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(
+        "ARIEL_WEB_EXTRACT_PROVIDER_ENDPOINT",
+        "https://extract.provider.test/v1/extract",
+    )
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
@@ -202,10 +241,6 @@ def test_s7_pr01_web_extract_executes_inline_with_structured_output_citations_an
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv(
-        "ARIEL_WEB_EXTRACT_PROVIDER_ENDPOINT",
-        "https://extract.provider.test/v1/extract",
-    )
     outbound_calls: list[dict[str, Any]] = []
 
     def fake_post(
@@ -355,10 +390,13 @@ def test_s7_pr01_web_extract_egress_contract_failures_block_before_execute(
     execute_attempts = 0
 
     def mutate(capability: CapabilityDefinition) -> CapabilityDefinition:
+        assert capability.execute is not None
+        original_execute = capability.execute
+
         def counted_execute(input_payload: dict[str, Any]) -> dict[str, Any]:
             nonlocal execute_attempts
             execute_attempts += 1
-            return capability.execute(input_payload)
+            return original_execute(input_payload)
 
         if intent_case == "missing":
             return replace(capability, execute=counted_execute, declare_egress_intent=None)
@@ -401,10 +439,13 @@ def test_s7_pr01_non_allowlisted_egress_is_blocked_before_web_extract_execution(
     execute_attempts = 0
 
     def mutate(capability: CapabilityDefinition) -> CapabilityDefinition:
+        assert capability.execute is not None
+        original_execute = capability.execute
+
         def counted_execute(input_payload: dict[str, Any]) -> dict[str, Any]:
             nonlocal execute_attempts
             execute_attempts += 1
-            return capability.execute(input_payload)
+            return original_execute(input_payload)
 
         return replace(
             capability,
@@ -444,10 +485,6 @@ def test_s7_pr01_transient_provider_failure_retries_are_bounded_and_single_outco
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv(
-        "ARIEL_WEB_EXTRACT_PROVIDER_ENDPOINT",
-        "https://extract.provider.test/v1/extract",
-    )
     monkeypatch.setenv("ARIEL_WEB_EXTRACT_MAX_RETRIES", "2")
     call_count = 0
 
@@ -499,10 +536,6 @@ def test_s7_pr01_provider_retry_exhaustion_fails_once_with_typed_error(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv(
-        "ARIEL_WEB_EXTRACT_PROVIDER_ENDPOINT",
-        "https://extract.provider.test/v1/extract",
-    )
     monkeypatch.setenv("ARIEL_WEB_EXTRACT_MAX_RETRIES", "2")
     call_count = 0
 
@@ -642,11 +675,6 @@ def test_s7_pr01_public_ipv6_urls_remain_allowed_and_canonical(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv(
-        "ARIEL_WEB_EXTRACT_PROVIDER_ENDPOINT",
-        "https://extract.provider.test/v1/extract",
-    )
-
     outbound_urls: list[str] = []
 
     def fake_post(
@@ -750,7 +778,7 @@ def test_s7_pr01_large_pages_are_bounded_and_partial_disclosure_is_explicit(
         assert "narrow" in message or "focus" in message
 
 
-def test_s7_pr01_mixed_turn_with_web_extract_preserves_grounding_and_lifecycle_inspectability(
+def test_s7_pr01_web_extract_preserves_grounding_and_lifecycle_inspectability(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -773,7 +801,6 @@ def test_s7_pr01_mixed_turn_with_web_extract_preserves_grounding_and_lifecycle_i
                     "capability_id": "cap.web.extract",
                     "input": {"url": "https://example.com/research/article"},
                 },
-                {"capability_id": "cap.framework.read_echo", "input": {"text": "alpha"}},
             ]
         },
         assistant_text_by_message={
@@ -791,14 +818,9 @@ def test_s7_pr01_mixed_turn_with_web_extract_preserves_grounding_and_lifecycle_i
         assert len(payload["assistant"]["sources"]) == 1
 
         lifecycle = payload["turn"]["surface_action_lifecycle"]
-        assert len(lifecycle) == 2
+        assert len(lifecycle) == 1
         lifecycle_by_capability = {
             item["proposal"]["capability_id"]: item for item in lifecycle if isinstance(item, dict)
         }
         assert lifecycle_by_capability["cap.web.extract"]["execution"]["status"] == "succeeded"
-        assert (
-            lifecycle_by_capability["cap.framework.read_echo"]["execution"]["status"] == "succeeded"
-        )
-        assert lifecycle_by_capability["cap.framework.read_echo"]["execution"]["output"] == {
-            "text": "alpha"
-        }
+        assert "cap.framework.read_echo" not in lifecycle_by_capability

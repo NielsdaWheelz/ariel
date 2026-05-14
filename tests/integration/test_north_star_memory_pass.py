@@ -137,6 +137,24 @@ class MemoryContextProbeAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         del input_items, tools, history
+        if context_bundle.get("origin") == "tool_strategy":
+            return responses_message(
+                assistant_text=json.dumps(
+                    {
+                        "decision": "no_tools",
+                        "selected_capability_ids": [],
+                        "rationale": "memory context test needs no tools",
+                        "unavailable_reason": None,
+                        "confidence": 1.0,
+                    },
+                    sort_keys=True,
+                ),
+                provider=self.provider,
+                model=self.model,
+                provider_response_id="resp_north_star_memory_strategy",
+                input_tokens=2,
+                output_tokens=2,
+            )
         self.context_bundles.append(copy.deepcopy(context_bundle))
         return responses_message(
             assistant_text=f"assistant::{user_message}",

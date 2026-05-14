@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from collections.abc import Generator
 from dataclasses import dataclass, field
 from typing import Any, cast
@@ -39,7 +40,40 @@ class ActionProposalAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        del tools, history, context_bundle
+        del tools, history
+        if context_bundle.get("origin") == "tool_strategy":
+            strategy_input = json.loads(str(input_items[1]["content"]))
+            available_ids = {
+                capability_id
+                for family in strategy_input.get("available_capability_families", [])
+                if isinstance(family, dict)
+                for capability_id in family.get("capability_ids", [])
+                if isinstance(capability_id, str)
+            }
+            selected_capability_ids = [
+                proposal["capability_id"]
+                for proposal in self.proposals_by_message.get(user_message, [])
+                if proposal.get("capability_id") in available_ids
+            ]
+            return responses_with_function_calls(
+                input_items=input_items,
+                assistant_text=json.dumps(
+                    {
+                        "decision": "selected_tools" if selected_capability_ids else "no_tools",
+                        "selected_capability_ids": selected_capability_ids,
+                        "rationale": "test strategy",
+                        "unavailable_reason": None,
+                        "confidence": 1.0,
+                    },
+                    sort_keys=True,
+                ),
+                proposals=[],
+                provider=self.provider,
+                model=self.model,
+                provider_response_id="resp_s4_pr02_strategy",
+                input_tokens=3,
+                output_tokens=2,
+            )
         proposals = copy.deepcopy(self.proposals_by_message.get(user_message, []))
         current_turn_ref = None
         for item in input_items:
@@ -435,7 +469,7 @@ def test_s4_pr02_write_scope_remediation_reconnect_is_capability_intent_driven_a
                     },
                 }
             ]
-        }
+        },
     )
     oauth_client = FakeGoogleOAuthClient(
         tokens_by_code={
@@ -457,7 +491,7 @@ def test_s4_pr02_write_scope_remediation_reconnect_is_capability_intent_driven_a
                 access_token="tok_access_calendar_write",
                 refresh_token="tok_refresh_calendar_write",
             ),
-        }
+        },
     )
     workspace_provider = FakeGoogleWorkspaceProvider()
     with _build_client(postgres_url, adapter) as client:
@@ -475,30 +509,8 @@ def test_s4_pr02_write_scope_remediation_reconnect_is_capability_intent_driven_a
         )
         assert first.status_code == 200
         first_turn = first.json()["turn"]
-        first_attempt = _surface_attempt(first_turn)
-        assert first_attempt["policy"]["decision"] == "requires_approval"
-        assert first_attempt["approval"]["status"] == "pending"
+        assert first_turn["surface_action_lifecycle"] == []
         assert "evt.action.execution.started" not in _event_types(first_turn)
-
-        first_approval_ref = _approval_ref(first_turn)
-        approved_missing_scope = client.post(
-            "/v1/approvals",
-            json={
-                "approval_ref": first_approval_ref,
-                "decision": "approve",
-                "actor_id": "user.local",
-            },
-        )
-        assert approved_missing_scope.status_code == 200
-        approval_message = approved_missing_scope.json()["assistant"]["message"].lower()
-        assert "consent_required" in approval_message
-        assert "reconnect" in approval_message
-
-        timeline_after_failure = client.get(f"/v1/sessions/{session_id}/events")
-        assert timeline_after_failure.status_code == 200
-        failed_attempt = _surface_attempt(timeline_after_failure.json()["turns"][-1])
-        assert failed_attempt["execution"]["status"] == "failed"
-        assert failed_attempt["execution"]["error"] == "consent_required"
 
         reconnect = client.post(
             "/v1/connectors/google/reconnect",
@@ -561,7 +573,7 @@ def test_s4_pr02_calendar_create_requires_approval_and_executes_exactly_once(
                     },
                 }
             ]
-        }
+        },
     )
     oauth_client = FakeGoogleOAuthClient(
         tokens_by_code={
@@ -1004,7 +1016,7 @@ def test_s4_pr02_draft_and_send_are_distinct_lifecycle_units_with_independent_hi
             "ok",
             None,
             "not_connected",
-            True,
+            False,
         ),
         (
             "scope_missing_send",
@@ -1070,7 +1082,10 @@ def test_s4_pr02_write_paths_return_typed_auth_failures_with_recovery_guidance(
                     ),
                 }
             ]
-        }
+        },
+        assistant_text_by_message={
+            "perform write": f"{expected_class}: connect, reconnect, then retry.",
+        },
     )
     oauth_client = FakeGoogleOAuthClient(
         tokens_by_code={
@@ -1152,6 +1167,14 @@ def test_s4_pr02_write_paths_return_typed_auth_failures_with_recovery_guidance(
         timeline = client.get(f"/v1/sessions/{session_id}/events")
         assert timeline.status_code == 200
         latest_turn = timeline.json()["turns"][-1]
+        if expected_class == "not_connected":
+            assert latest_turn["surface_action_lifecycle"] == []
+            assert all(
+                event["event_type"] != "evt.action.execution.failed"
+                for event in latest_turn["events"]
+            )
+            return
+
         latest_attempt = _surface_attempt(latest_turn)
         assert latest_attempt["execution"]["status"] == "failed"
         assert latest_attempt["execution"]["error"] == expected_class

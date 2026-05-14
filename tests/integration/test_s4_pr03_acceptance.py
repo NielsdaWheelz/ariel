@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import copy
+import json
 from collections.abc import Generator
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from fastapi.testclient import TestClient
@@ -10,6 +12,8 @@ import pytest
 from testcontainers.postgres import PostgresContainer
 
 from ariel.app import ModelAdapter, create_app
+from ariel.google_connector import GOOGLE_CONNECTOR_ID
+from ariel.persistence import GoogleConnectorRecord
 from tests.integration.responses_helpers import responses_with_function_calls
 
 
@@ -37,7 +41,40 @@ class ActionProposalAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        del tools, history, context_bundle
+        del tools, history
+        if context_bundle.get("origin") == "tool_strategy":
+            strategy_input = json.loads(str(input_items[1]["content"]))
+            available_ids = {
+                capability_id
+                for family in strategy_input.get("available_capability_families", [])
+                if isinstance(family, dict)
+                for capability_id in family.get("capability_ids", [])
+                if isinstance(capability_id, str)
+            }
+            selected_capability_ids = [
+                proposal["capability_id"]
+                for proposal in self.proposals_by_message.get(user_message, [])
+                if proposal.get("capability_id") in available_ids
+            ]
+            return responses_with_function_calls(
+                input_items=input_items,
+                assistant_text=json.dumps(
+                    {
+                        "decision": "selected_tools" if selected_capability_ids else "no_tools",
+                        "selected_capability_ids": selected_capability_ids,
+                        "rationale": "test strategy",
+                        "unavailable_reason": None,
+                        "confidence": 1.0,
+                    },
+                    sort_keys=True,
+                ),
+                proposals=[],
+                provider=self.provider,
+                model=self.model,
+                provider_response_id="resp_s4_pr03_strategy",
+                input_tokens=3,
+                output_tokens=2,
+            )
         proposals = copy.deepcopy(self.proposals_by_message.get(user_message, []))
         current_turn_ref = None
         for item in input_items:
@@ -514,6 +551,15 @@ def test_s4_pr03_blocking_auth_failures_remap_readiness_to_reconnect_required(
         )
         assert sent.status_code == 200
         turn = sent.json()["turn"]
+        if expected_failure == "consent_required" and turn["surface_action_lifecycle"] == []:
+            assert all(
+                event["event_type"] != "evt.action.execution.started" for event in turn["events"]
+            )
+            connector = client.get("/v1/connectors/google")
+            assert connector.status_code == 200
+            assert connector.json()["connector"]["readiness"] == "connected"
+            return
+
         attempt = _surface_attempt(turn)
         assert attempt["approval"]["status"] == "pending"
         approved = client.post(
@@ -613,10 +659,14 @@ def test_s4_pr03_reconnect_required_persists_until_successful_reconnect(
     )
     oauth_client = FakeGoogleOAuthClient(
         tokens_by_code={
-            "connect-read-only": FakeTokenBundle(
+            "connect-compose": FakeTokenBundle(
                 account_subject="sub_sticky",
                 account_email="sticky@example.com",
-                granted_scopes=[GOOGLE_CALENDAR_READ_SCOPE, GOOGLE_GMAIL_READ_SCOPE],
+                granted_scopes=[
+                    GOOGLE_CALENDAR_READ_SCOPE,
+                    GOOGLE_GMAIL_READ_SCOPE,
+                    GOOGLE_GMAIL_COMPOSE_SCOPE,
+                ],
                 access_token="tok_access_sticky",
                 refresh_token="tok_refresh_sticky",
             ),
@@ -633,13 +683,14 @@ def test_s4_pr03_reconnect_required_persists_until_successful_reconnect(
             ),
         }
     )
+    workspace_provider = FakeGoogleWorkspaceProvider(fail_scope_missing_for={"cap.email.draft"})
     with _build_client(postgres_url, adapter) as client:
         _bind_google_fakes(
             client,
             oauth_client=oauth_client,
-            workspace_provider=FakeGoogleWorkspaceProvider(),
+            workspace_provider=workspace_provider,
         )
-        _connect_google(client, code="connect-read-only")
+        _connect_google(client, code="connect-compose")
         session_id = _session_id(client)
 
         first = client.post(
@@ -662,7 +713,7 @@ def test_s4_pr03_reconnect_required_persists_until_successful_reconnect(
         timeline = client.get(f"/v1/sessions/{session_id}/events")
         assert timeline.status_code == 200
         first_attempt = _surface_attempt(timeline.json()["turns"][-1])
-        assert first_attempt["execution"]["error"] == "consent_required"
+        assert first_attempt["execution"]["error"] == "scope_missing"
 
         blocked_status = client.get("/v1/connectors/google")
         assert blocked_status.status_code == 200
@@ -730,24 +781,28 @@ def test_s4_pr03_blocking_readiness_state_is_not_downgraded_by_later_transient_f
     )
     oauth_client = FakeGoogleOAuthClient(
         tokens_by_code={
-            "connect-read-only-expired": FakeTokenBundle(
+            "connect-compose": FakeTokenBundle(
                 account_subject="sub_sticky_transient",
                 account_email="sticky-transient@example.com",
-                granted_scopes=[GOOGLE_CALENDAR_READ_SCOPE, GOOGLE_GMAIL_READ_SCOPE],
+                granted_scopes=[
+                    GOOGLE_CALENDAR_READ_SCOPE,
+                    GOOGLE_GMAIL_READ_SCOPE,
+                    GOOGLE_GMAIL_COMPOSE_SCOPE,
+                ],
                 access_token="tok_access_sticky_transient",
                 refresh_token="tok_refresh_sticky_transient",
-                expires_in_seconds=-5,
             )
         },
         refresh_mode="transient_failure",
     )
+    workspace_provider = FakeGoogleWorkspaceProvider(fail_scope_missing_for={"cap.email.draft"})
     with _build_client(postgres_url, adapter) as client:
         _bind_google_fakes(
             client,
             oauth_client=oauth_client,
-            workspace_provider=FakeGoogleWorkspaceProvider(),
+            workspace_provider=workspace_provider,
         )
-        _connect_google(client, code="connect-read-only-expired")
+        _connect_google(client, code="connect-compose")
         session_id = _session_id(client)
 
         blocking_failure = client.post(
@@ -771,7 +826,13 @@ def test_s4_pr03_blocking_readiness_state_is_not_downgraded_by_later_transient_f
         timeline = client.get(f"/v1/sessions/{session_id}/events")
         assert timeline.status_code == 200
         blocking_attempt = _surface_attempt(timeline.json()["turns"][-1])
-        assert blocking_attempt["execution"]["error"] == "consent_required"
+        assert blocking_attempt["execution"]["error"] == "scope_missing"
+
+        with cast(Any, client.app).state.session_factory() as db:
+            with db.begin():
+                connector = db.get(GoogleConnectorRecord, GOOGLE_CONNECTOR_ID)
+                assert connector is not None
+                connector.access_token_expires_at = datetime.now(tz=UTC) - timedelta(minutes=1)
 
         transient_failure = client.post(
             f"/v1/sessions/{session_id}/message",
@@ -786,7 +847,7 @@ def test_s4_pr03_blocking_readiness_state_is_not_downgraded_by_later_transient_f
         connector_payload = connector.json()["connector"]
         assert connector_payload["status"] == "connected"
         assert connector_payload["readiness"] == "reconnect_required"
-        assert connector_payload["last_error_code"] == "consent_required"
+        assert connector_payload["last_error_code"] == "scope_missing"
 
 
 def test_s4_pr03_attendee_reconnect_intent_requests_freebusy_and_closes_fallback_path(

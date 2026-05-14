@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from typing import Any
+
 from ariel.capability_registry import (
     capability_id_for_response_tool_name,
     get_capability,
+    production_response_capability_ids,
     response_tool_definitions,
     response_tool_name_for_capability_id,
 )
@@ -28,8 +31,12 @@ FINAL_EMAIL_CAPABILITY_IDS = {
 BROAD_GMAIL_SCOPE = "https://mail.google.com/"
 
 
+def _production_response_tool_definitions() -> list[dict[str, Any]]:
+    return response_tool_definitions(production_response_capability_ids())
+
+
 def test_email_registry_contains_exact_final_decluttering_family() -> None:
-    tools = {tool["name"] for tool in response_tool_definitions()}
+    tools = {tool["name"] for tool in _production_response_tool_definitions()}
     email_capability_ids = {
         capability_id
         for tool_name in tools
@@ -99,7 +106,7 @@ def test_email_draft_requires_approval_like_other_write_surfaces() -> None:
 def test_email_response_tool_schemas_are_final_and_strict_where_possible() -> None:
     tools_by_capability_id = {
         capability_id: tool
-        for tool in response_tool_definitions()
+        for tool in _production_response_tool_definitions()
         if (capability_id := capability_id_for_response_tool_name(tool["name"])) is not None
     }
 

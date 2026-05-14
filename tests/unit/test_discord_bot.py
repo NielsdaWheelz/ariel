@@ -75,8 +75,11 @@ class FakeHttpClient:
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         return None
 
-    def get(self, url: str) -> httpx.Response:
-        self.calls.append({"method": "GET", "url": url})
+    def get(self, url: str, *, headers: dict[str, str] | None = None) -> httpx.Response:
+        call: dict[str, Any] = {"method": "GET", "url": url}
+        if headers is not None:
+            call["headers"] = headers
+        self.calls.append(call)
         return self.responses.pop(0)
 
     def post(
@@ -303,6 +306,7 @@ def _stub_discord_turn(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     def fake_submit_discord_turn(
         *,
         ariel_base_url: str,
+        ariel_auth_token: str | None = None,
         prompt: str,
         discord_message_id: int,
         allowed_user_id: int | None = None,
@@ -311,6 +315,7 @@ def _stub_discord_turn(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
         calls.append(
             {
                 "ariel_base_url": ariel_base_url,
+                "ariel_auth_token": ariel_auth_token,
                 "prompt": prompt,
                 "discord_message_id": discord_message_id,
                 "allowed_user_id": allowed_user_id,
@@ -341,6 +346,22 @@ def test_configured_discord_bot_requires_discord_settings() -> None:
     assert "ARIEL_DISCORD_CHANNEL_ID" in message
     assert "ARIEL_DISCORD_USER_ID" in message
     assert "ARIEL_DISCORD_APPLICATION_ID" not in message
+
+
+def test_configured_discord_bot_uses_local_auth_token_when_required() -> None:
+    bot = configured_discord_bot(
+        cast(Any, AppSettings)(
+            _env_file=None,
+            local_auth_required=True,
+            local_auth_token="local_token_0123456789abcdef012345",
+            discord_bot_token="discord-token",
+            discord_guild_id=123,
+            discord_channel_id=456,
+            discord_user_id=789,
+        )
+    )
+
+    assert bot.ariel_auth_token == "local_token_0123456789abcdef012345"
 
 
 def test_discord_bot_enables_message_intents() -> None:
@@ -403,6 +424,41 @@ def test_submit_discord_turn_posts_message_with_discord_message_idempotency(
             "json": {"message": "status please"},
         },
     ]
+
+
+def test_submit_discord_turn_sends_local_auth_and_idempotency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_clients: list[FakeHttpClient] = []
+
+    def fake_client(*, timeout: float) -> FakeHttpClient:
+        assert timeout == 60.0
+        client = FakeHttpClient(
+            responses=[
+                httpx.Response(200, json={"ok": True, "session": {"id": "ses_test"}}),
+                httpx.Response(200, json={"ok": True, "assistant": {"message": "hello"}}),
+            ]
+        )
+        fake_clients.append(client)
+        return client
+
+    monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
+
+    reply = submit_discord_turn(
+        ariel_base_url="http://127.0.0.1:8000",
+        ariel_auth_token="local_token_0123456789abcdef012345",
+        prompt="status please",
+        discord_message_id=123,
+    )
+
+    assert reply.content == "hello"
+    assert fake_clients[0].calls[0]["headers"] == {
+        "Authorization": "Bearer local_token_0123456789abcdef012345"
+    }
+    assert fake_clients[0].calls[1]["headers"] == {
+        "Authorization": "Bearer local_token_0123456789abcdef012345",
+        "Idempotency-Key": "discord-message-123",
+    }
 
 
 def test_submit_discord_turn_posts_discord_context_as_separate_field(
@@ -516,7 +572,7 @@ def test_submit_discord_turn_includes_pending_approval_affordance(
 
     message = reply.content
     assert "I need approval." in message
-    assert "Approval pending (cap.email.send): apr_123" in message
+    assert "Approval pending (Send email): apr_123" in message
     assert "Use the buttons below." in message
     assert "approve apr_123" not in message
     assert "deny apr_123" not in message
@@ -1087,8 +1143,13 @@ def test_capture_command_records_capture_without_message_endpoint(
 def test_slash_status_sends_ephemeral_deterministic_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fake_get_status(*, ariel_base_url: str) -> str:
+    def fake_get_status(
+        *,
+        ariel_base_url: str,
+        ariel_auth_token: str | None = None,
+    ) -> str:
         assert ariel_base_url == "http://127.0.0.1:8000"
+        assert ariel_auth_token is None
         return "Ariel status: ok"
 
     monkeypatch.setattr("ariel.discord_bot.get_status", fake_get_status)
@@ -1120,12 +1181,14 @@ def test_slash_capture_sends_ephemeral_deterministic_response(
     def fake_record_capture(
         *,
         ariel_base_url: str,
+        ariel_auth_token: str | None = None,
         text: str,
         discord_interaction_id: int,
     ) -> str:
         calls.append(
             {
                 "ariel_base_url": ariel_base_url,
+                "ariel_auth_token": ariel_auth_token,
                 "text": text,
                 "discord_interaction_id": discord_interaction_id,
             }
@@ -1141,6 +1204,7 @@ def test_slash_capture_sends_ephemeral_deterministic_response(
     assert calls == [
         {
             "ariel_base_url": "http://127.0.0.1:8000",
+            "ariel_auth_token": None,
             "text": "save this",
             "discord_interaction_id": 987,
         }
@@ -1229,6 +1293,7 @@ def test_on_interaction_handles_approval_custom_id(monkeypatch: pytest.MonkeyPat
     def fake_decide_approval(
         *,
         ariel_base_url: str,
+        ariel_auth_token: str | None = None,
         approval_ref: str,
         decision: str,
         reason: str | None = None,
@@ -1236,6 +1301,7 @@ def test_on_interaction_handles_approval_custom_id(monkeypatch: pytest.MonkeyPat
         calls.append(
             {
                 "ariel_base_url": ariel_base_url,
+                "ariel_auth_token": ariel_auth_token,
                 "approval_ref": approval_ref,
                 "decision": decision,
                 "reason": reason,
@@ -1252,6 +1318,7 @@ def test_on_interaction_handles_approval_custom_id(monkeypatch: pytest.MonkeyPat
     assert calls == [
         {
             "ariel_base_url": "http://127.0.0.1:8000",
+            "ariel_auth_token": None,
             "approval_ref": "apr_123",
             "decision": "approve",
             "reason": None,
@@ -1304,10 +1371,16 @@ def test_on_interaction_handles_proactive_case_custom_ids(
 ) -> None:
     calls: list[dict[str, Any]] = []
 
-    def fake_proactive_action(*, ariel_base_url: str, case_id: str) -> str:
+    def fake_proactive_action(
+        *,
+        ariel_base_url: str,
+        ariel_auth_token: str | None = None,
+        case_id: str,
+    ) -> str:
         calls.append(
             {
                 "ariel_base_url": ariel_base_url,
+                "ariel_auth_token": ariel_auth_token,
                 "case_id": case_id,
                 "function_name": function_name,
             }
@@ -1323,6 +1396,7 @@ def test_on_interaction_handles_proactive_case_custom_ids(
     assert calls == [
         {
             "ariel_base_url": "http://127.0.0.1:8000",
+            "ariel_auth_token": None,
             "case_id": "case_123",
             "function_name": function_name,
         }

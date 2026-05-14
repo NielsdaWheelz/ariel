@@ -36,6 +36,37 @@ class ActionProposalAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         del tools, history
+        if context_bundle.get("origin") == "tool_strategy":
+            strategy_input = json.loads(str(input_items[1]["content"]))
+            available_ids = {
+                capability_id
+                for family in strategy_input.get("available_capability_families", [])
+                if isinstance(family, dict)
+                for capability_id in family.get("capability_ids", [])
+                if isinstance(capability_id, str)
+            }
+            selected_capability_ids = [
+                proposal["capability_id"]
+                for proposal in self.proposals_by_message.get(user_message, [])
+                if proposal.get("capability_id") in available_ids
+            ]
+            return responses_message(
+                assistant_text=json.dumps(
+                    {
+                        "decision": "selected_tools" if selected_capability_ids else "no_tools",
+                        "selected_capability_ids": selected_capability_ids,
+                        "rationale": "test strategy",
+                        "unavailable_reason": None,
+                        "confidence": 1.0,
+                    },
+                    sort_keys=True,
+                ),
+                provider=self.provider,
+                model=self.model,
+                provider_response_id="resp_s3_pr02_strategy",
+                input_tokens=3,
+                output_tokens=2,
+            )
         if context_bundle.get("origin") == "tool_result_interpretation":
             interpreter_input = context_bundle.get("tool_result_interpreter_input")
             if not isinstance(interpreter_input, dict):
@@ -96,6 +127,12 @@ def postgres_url() -> Generator[str, None, None]:
     with PostgresContainer("pgvector/pgvector:pg16") as postgres:
         url = postgres.get_connection_url()
         yield url.replace("psycopg2", "psycopg")
+
+
+@pytest.fixture(autouse=True)
+def _provider_bindings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARIEL_SEARCH_NEWS_API_KEY", "fixture-news-key")
+    monkeypatch.setenv("ARIEL_WEATHER_PRODUCTION_API_KEY", "fixture-weather-key")
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
@@ -228,10 +265,13 @@ def test_s3_pr02_news_egress_fails_closed_before_execute(
     capability_execute_attempts = 0
 
     def mutate(capability: CapabilityDefinition) -> CapabilityDefinition:
+        assert capability.execute is not None
+        original_execute = capability.execute
+
         def counted_execute(input_payload: dict[str, Any]) -> dict[str, Any]:
             nonlocal capability_execute_attempts
             capability_execute_attempts += 1
-            return capability.execute(input_payload)
+            return original_execute(input_payload)
 
         return replace(
             capability,
@@ -561,10 +601,13 @@ def test_s3_pr02_weather_egress_fails_closed_before_execute(
     capability_execute_attempts = 0
 
     def mutate(capability: CapabilityDefinition) -> CapabilityDefinition:
+        assert capability.execute is not None
+        original_execute = capability.execute
+
         def counted_execute(input_payload: dict[str, Any]) -> dict[str, Any]:
             nonlocal capability_execute_attempts
             capability_execute_attempts += 1
-            return capability.execute(input_payload)
+            return original_execute(input_payload)
 
         return replace(
             capability,

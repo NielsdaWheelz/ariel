@@ -62,7 +62,7 @@ The strategy pass is an AI judgment with a strict output contract. It receives:
 
 - the user message
 - bounded context
-- available capability families
+- available capability families with the currently selectable IDs in each family
 - current surface metadata
 - connector and runtime availability
 - attachment and job presence
@@ -127,17 +127,16 @@ environment or a skill.
 
 ### Proactivity
 
-Proactive deliberation gets case-scoped tools, not all read tools.
+Proactive deliberation gets no model tools until a concrete source-scoped need
+earns one.
 
 Rules:
 
 - Read-only is necessary but not sufficient.
-- A job case may inspect that job's status and artifacts.
-- An attachment case may inspect the referenced attachment.
-- An email thread-watch case may inspect the relevant email/thread state.
-- A connector case may inspect only the connector-bound source that produced the
-  case.
-- Most proactive cases start with no tools.
+- Most proactive cases get no tools.
+- Any future proactive read tool must be source-scoped and justified by a current
+  case, not added speculatively.
+- Unadvertised proactive function calls are denied and audited.
 - Proactivity never receives shell-like authority.
 - Proactive writes must pass autonomy scope validation and action policy.
 
@@ -180,13 +179,11 @@ Proactive case:
 
 1. Ingest ambient observation.
 2. Build case and context snapshot.
-3. Select case-scoped read tools by hard source facts and optional strategy
-   judgment.
-4. Run deliberation model.
-5. Validate decision shape.
-6. Apply memory, notify, wait, observe, or propose action.
-7. Validate action against autonomy scope and policy.
-8. Queue side effects and feedback loops.
+3. Run deliberation model with no tools.
+4. Validate decision shape.
+5. Apply memory, notify, wait, observe, or propose action.
+6. Validate action against autonomy scope and policy.
+7. Queue side effects and feedback loops.
 
 Agency coding job:
 
@@ -200,112 +197,41 @@ Agency coding job:
 
 ### Module Structure
 
-The final codebase splits capability definition, presentation, and execution.
+The final codebase stays flat unless a split removes real complexity. See
+[codebase.md](codebase.md): no sub-packages unless unavoidable.
 
-Target modules:
+Current module ownership:
 
-- `src/ariel/capabilities/core.py`
-  - `CapabilityDefinition`
-  - impact levels
-  - policy metadata
-  - admission metadata
-  - common schema helpers
-  - registry construction primitives
+- `src/ariel/capability_registry.py`: capability contracts, schemas, and selected
+  response tool definitions.
+- `src/ariel/app.py`: FastAPI composition, local auth, and normal turn
+  orchestration.
+- `src/ariel/action_runtime.py`: proposal intake, policy, approval lifecycle,
+  execution orchestration, and side-effect receipts.
+- `src/ariel/agency_daemon.py`: Agency daemon client, sandbox policy persistence,
+  and PR request handling.
+- `src/ariel/proactivity.py`: ambient interpretation, no-tool deliberation,
+  action validation, and feedback learning.
+- `src/ariel/memory.py`: evidence lifecycle, AI curation, candidate memory, and
+  procedure promotion.
+- `src/ariel/discord_bot.py`: Discord presentation and deterministic operator
+  commands.
 
-- `src/ariel/capabilities/google.py`
-  - Google capability definitions
-  - Google validators
-  - Google schema names
-  - no runtime stubs that pretend to execute without a Google runtime
-
-- `src/ariel/capabilities/retrieval.py`
-  - web extract, search, news, maps, weather
-  - egress destination calculation
-  - bounded output contracts
-
-- `src/ariel/capabilities/attachments.py`
-  - attachment read tool definition and schema metadata
-
-- `src/ariel/capabilities/agency.py`
-  - Agency task, status, artifact, and PR capability definitions
-  - Agency admission rules
-  - sandbox policy metadata
-
-- `src/ariel/capabilities/discord.py`
-  - Discord no-response and notification-adjacent model-facing capabilities
-
-- `src/ariel/capabilities/test_fixtures.py`
-  - test-only framework capabilities
-  - never imported into production registry construction
-
-- `src/ariel/tool_surface.py`
-  - `ToolSurfaceContext`
-  - deterministic eligibility filtering
-  - strategy judgment contract
-  - selected tool definition builder
-  - exposure tests and counters
-
-- `src/ariel/action_runtime.py`
-  - proposal intake
-  - action attempt persistence
-  - policy calls
-  - approval lifecycle
-  - generic execution orchestration
-  - no provider-specific branching beyond runtime interface lookup
-
-- `src/ariel/action_executors.py`
-  - execution runtime protocol
-  - provider runtime dispatch
-  - read/write execution receipts
-
-- `src/ariel/agency_daemon.py`
-  - daemon client
-  - Agency runtime execution
-  - outbox/receipt handling
-  - sandbox policy persistence
-
-- `src/ariel/proactivity.py`
-  - ambient interpretation
-  - case deliberation
-  - case-scoped tool surface
-  - action validation
-  - feedback learning
-  - no duplicated action/memory contracts
-
-- `src/ariel/memory.py`
-  - evidence lifecycle
-  - candidate pool construction
-  - AI curation
-  - procedure promotion
-  - transport-order naming
-
-- `src/ariel/app.py`
-  - FastAPI composition and routes only
-  - turn execution orchestration moves out to a runtime module
-  - authority-bearing routes use shared local auth dependency
-
-- `src/ariel/discord_bot.py`
-  - Discord presentation only
-  - user-facing labels for actions
-  - no internal capability IDs in normal messages
-
-The package split is part of the hard cutover. Update [codebase.md](codebase.md)
-when the new package exists.
+Do not add `tool_surface.py`, capability sub-packages, executor wrappers, or test
+fixture registries until the existing modules have a concrete complexity problem
+that a split will reduce.
 
 ## Capability Rules
 
 Every capability must declare:
 
 - capability ID
-- owner module
 - impact level
 - policy decision
 - input schema
 - output schema
 - idempotency model
-- admission reason
 - why a skill or terminal workflow is insufficient
-- model exposure class: `runtime`, `proactive`, `internal`, or `test_only`
 - allowed surfaces
 - side effects
 - approval requirement
@@ -325,8 +251,7 @@ Production response tool generation excludes:
 - proactive-disallowed writes
 - Agency capabilities when no Agency repo root/runtime is configured
 
-Test fixtures do not live in the production registry. Tests import their fixture
-registry explicitly.
+Test-only capabilities must never be exported as model tools.
 
 ## Security Rules
 
@@ -354,12 +279,14 @@ Audit:
   level.
 - Side-effect records store request ID, actor, policy decision, input hash,
   contract hash, approval ref, external receipt, and reconciliation status.
-- Add tamper-evident event hashing for action attempts, approvals, job events,
-  connector events, and proactive policy validations.
+- Add hash chains only when the audit store crosses an untrusted persistence
+  boundary. Until then, keep side-effect events append-only and receipt-backed.
 
 Credentials:
 
-- Production startup fails if connector encryption uses dev defaults.
+- Production startup fails if local auth is disabled, the local auth token is weak,
+  connector encryption uses dev defaults, the connector keyring is absent, or the
+  active connector key version is missing from the keyring.
 - Credential-bearing routes and daemon runs never expose raw secrets to model
   context.
 
@@ -371,7 +298,16 @@ Attachments:
 ## Hard-Cutover Decisions
 
 - Delete broad `response_tool_definitions()` use from normal turns.
-- Delete production exposure of `cap.framework.*`.
+- Delete `cap.framework.*` from the production capability registry, not just from
+  model-tool exposure.
+- Require the no-tool strategy pass to emit a finite decision:
+  `no_tools`, `selected_tools`, or `unavailable_authority`.
+- Build capability eligibility from durable runtime facts: connected providers,
+  granted scopes, attachments present on the current turn, configured provider
+  backends, and Agency repo allowlists. Do not infer authority from compacted
+  model-owned context.
+- Default-deny answer-pass function calls outside the selected turn capability
+  set and emit `evt.action.call_denied`.
 - Delete Google execution stubs that only return `google_runtime_not_bound`.
 - Delete deterministic contradiction/source-count tool-result routing as semantic
   judgment. Keep only budget, taint, modality, and explicit AI-requested
@@ -386,239 +322,36 @@ Attachments:
   deterministic relevance semantics.
 - Do not keep feature flags that restore old broad-catalog behavior.
 
-## Implementation Plan
+## Implementation Checklist
 
-The sequence below is for engineering order only. It does not authorize merged
-legacy runtime behavior.
+The cutover stays in the existing flat modules. Do not create package splits or
+routing layers to make this checklist look tidy.
 
-### Phase 1: Lock The Contract
-
-Files:
-
-- `docs/north-star-cutover.md`
-- `docs/index.md`
-- `tests/unit/test_agent_tooling_policy.py`
-- `tests/unit/test_tool_surface_cutover.py`
-- `tests/integration/test_proactive_tool_surface_cutover.py`
-- `tests/integration/test_api_auth_cutover.py`
-- `tests/integration/test_agency_security_cutover.py`
-
-Work:
-
-- Add static policy tests for capability admission metadata.
-- Add tests that normal turns never receive the full registry.
-- Add tests that test-only tools are absent from production surfaces.
-- Add tests that proactive tool sets are case-scoped.
-- Add tests that authority-bearing routes reject unauthenticated calls.
-- Add tests that Agency task starts persist sandbox policy metadata.
-
-Acceptance:
-
-- The new tests fail on the current code for the intended reasons.
-- The tests encode final behavior, not transitional behavior.
-
-### Phase 2: Split Capability Definition From Presentation
-
-Files:
-
-- `src/ariel/capability_registry.py`
-- `src/ariel/capabilities/core.py`
-- `src/ariel/capabilities/google.py`
-- `src/ariel/capabilities/retrieval.py`
-- `src/ariel/capabilities/attachments.py`
-- `src/ariel/capabilities/agency.py`
-- `src/ariel/capabilities/discord.py`
-- `src/ariel/capabilities/test_fixtures.py`
-- `src/ariel/tool_surface.py`
-- `tests/unit/test_responses_tool_contract.py`
-- `tests/unit/test_email_decluttering_cutover.py`
-- `tests/unit/test_capability_registry_search.py`
-
-Work:
-
-- Move capability families into owner modules.
-- Add admission metadata.
-- Build an internal production registry without test fixtures.
-- Build an explicit test fixture registry for framework capabilities.
-- Replace `response_tool_definitions()` with selected-ID builders.
-- Add context-aware eligibility filters.
-
-Acceptance:
-
-- Production registry contains no framework capabilities.
-- Capability definitions cannot be model-exposed without admission metadata.
-- No code path can accidentally export every capability as a model tool.
-
-### Phase 3: Tool Strategy And Turn Runtime
-
-Files:
-
-- `src/ariel/app.py`
-- `src/ariel/tool_surface.py`
-- `src/ariel/action_runtime.py`
-- `src/ariel/response_contracts.py`
-- `tests/unit/test_responses_tool_contract.py`
-- `tests/integration/test_pr01_acceptance.py`
-- session and turn integration tests
-
-Work:
-
-- Move turn execution out of nested `create_app` scope.
-- Add audited tool strategy model call.
-- Pass only selected tools to the answer model.
-- Fail closed on invalid strategy output.
-- Preserve AI ownership of final response and tool-result interpretation.
-- Remove broad catalog calls from normal turns.
-
-Acceptance:
-
-- A no-tool conversational turn receives zero function tools.
-- A coding turn receives Agency tools only when Agency is configured and selected.
-- An attachment turn receives attachment read only when attachment refs exist.
-- Email/calendar/Drive tools appear only in selected, provider-bound contexts.
-- Invalid strategy output produces a typed auditable failure, not fallback tool
-  exposure.
-
-### Phase 4: Proactivity Cutover
-
-Files:
-
-- `src/ariel/proactivity.py`
-- `src/ariel/tool_surface.py`
-- `src/ariel/policy_engine.py`
-- `tests/integration/test_proactive_ambient_sources.py`
-- `tests/integration/test_proactive_runtime_completion.py`
-- `tests/integration/test_proactive_api_controls.py`
-
-Work:
-
-- Replace read-all tool loading with case-scoped selection.
-- Remove duplicate memory/action model contract shapes.
-- Route all proactive side effects through capabilities and policy.
-- Keep autonomy scope as the write boundary.
-- Add provider-aware read execution for proactive reads or exclude unbound reads.
-
-Acceptance:
-
-- Proactive deliberation never receives all read tools.
-- Proactive cases expose only source-relevant read tools.
-- Proactive writes cannot bypass capability policy.
-- Proactive memory updates use one contract.
-- Proactive Discord sends use one action path.
-
-### Phase 5: Agency As Coding Boundary
-
-Files:
-
-- `src/ariel/agency_daemon.py`
-- `src/ariel/action_runtime.py`
-- `src/ariel/persistence.py`
-- `src/ariel/worker.py`
-- `alembic/versions/*`
-- `tests/integration/test_agency_security_cutover.py`
-- worker/job integration tests
-
-Work:
-
-- Persist sandbox policy and egress policy metadata.
-- Redact and validate run environment values.
-- Add outbox/receipt state before PR land/sync side effects.
-- Reconcile PR side effects by idempotency key or daemon request ID.
-- Ensure job status/artifact reads are scoped to tracked jobs.
-
-Acceptance:
-
-- Agency task start cannot run without approval and configured repo allowlist.
-- Every Agency job has sandbox policy metadata.
-- PR land/sync is crash-recoverable and idempotent.
-- Agency artifacts are available through job-scoped reads only.
-
-### Phase 6: Local Auth And Audit
-
-Files:
-
-- `src/ariel/app.py`
-- `src/ariel/config.py`
-- `src/ariel/persistence.py`
-- `src/ariel/discord_bot.py`
-- `src/ariel/google_connector.py`
-- `tests/integration/test_api_auth_cutover.py`
-- `tests/integration/test_no_ai_ops_acceptance.py`
-
-Work:
-
-- Add a shared local auth dependency for authority-bearing routes.
-- Keep provider callbacks separately verified.
-- Add tamper-evident audit hashes for side-effect records.
-- Fail startup on production credential defaults.
-- Keep deterministic slash commands model-free.
-
-Acceptance:
-
-- Unauthenticated local approval, memory mutation, connector control, autonomy,
-  and proactive-control calls fail.
-- Authenticated test helpers and Discord controls pass.
-- Audit hash chains verify for action and job events.
-- Production config rejects dev connector encryption defaults.
-
-### Phase 7: Memory, Procedures, And Evals
-
-Files:
-
-- `src/ariel/memory.py`
-- `src/ariel/proactivity.py`
-- `docs/modules/memory.md`
-- `tests/integration/test_memory_eval_acceptance.py`
-- `tests/integration/test_north_star_memory_pass.py`
-
-Work:
-
-- Treat candidate order as transport order in names/docs.
-- Promote feedback-derived durable behavior into reviewed procedure candidates.
-- Keep autonomy requests separate from procedures.
-- Add memory eval cases promised by docs.
-- Add no-memory mode coverage.
-
-Acceptance:
-
-- Memory curation remains AI-owned.
-- Procedure promotion requires evidence and review state.
-- No-memory mode performs no extraction and no recall.
-- Evals cover vector-wrong, keyword-wrong, temporal, conflict, abstention,
-  correction, deletion, no-memory, proactive feedback, and procedure cases.
-
-### Phase 8: Product Presentation Cleanup
-
-Files:
-
-- `src/ariel/discord_bot.py`
-- `src/ariel/response_contracts.py`
-- `docs/production-runbook.md`
-- Discord unit tests
-
-Work:
-
-- Replace capability IDs in Discord copy with action labels.
-- Consolidate proactive inspection endpoints or document one inspection envelope.
-- Keep deterministic ops slash commands.
-- Update runbook smoke tests to north-star behavior.
-
-Acceptance:
-
-- Discord copy contains no internal capability IDs outside developer diagnostics.
-- Job, approval, memory, and capture commands remain deterministic.
-- Runbook smoke tests match new auth and tool-surface behavior.
+- Normal turns run an audited tool strategy judgment before the answer model.
+- Strategy calls receive no tools and must return strict JSON.
+- The answer model receives only selected, eligible tool definitions.
+- Runtime execution denies unselected function calls before action attempts exist.
+- Proactive deliberation receives no tools; unadvertised calls are denied and
+  audited.
+- Google capabilities execute only through the Google runtime, never local stubs.
+- Agency PR land/sync uses durable provider-write receipts and daemon
+  idempotency request IDs.
+- Local authority routes require bearer auth outside provider-owned callbacks.
+- Discord copy uses user-facing action labels.
+- Tests cover absence of broad model tool exposure, local auth, Agency policy
+  metadata, proactive tool denial, and strict tool strategy validation.
 
 ## Acceptance Criteria
 
 The cutover is complete only when all of these are true:
 
-- Normal turns cannot receive the full capability catalog.
+- Normal turns cannot receive the full capability catalog or per-tool strategy
+  descriptions.
 - Production model tool surfaces contain no test fixtures.
-- Every exposed tool has admission metadata and a current justification.
+- Every exposed tool has a current justification.
 - Tool strategy is AI-owned and audited.
 - Deterministic filtering is limited to hard eligibility rails.
-- Proactive tools are case-scoped.
+- Proactive deliberation has no model tools.
 - Coding work routes through Agency, not new granular repo tools.
 - Agency runs record sandbox and egress policy metadata.
 - Authority-bearing local API routes are authenticated.
@@ -635,7 +368,7 @@ The cutover is complete only when all of these are true:
 
 - Do not preserve the old broad registry-as-tool-surface behavior.
 - Do not add a compatibility mode for old tests.
-- Do not keep framework tools in production behind policy denial.
+- Do not expose framework tools through production model tool surfaces.
 - Do not add new structured tools for coding workflows that Agency can perform.
 - Do not build a generic MCP/API catalog for hypothetical future workflows.
 - Do not use deterministic keyword classifiers as product judgment.
@@ -672,14 +405,12 @@ This spec is based on the May 2026 code survey of:
 - `src/ariel/config.py`
 - current unit and integration tests
 
-The most important current-state defects are:
+The implemented cutover must stay guarded against regressions in these areas:
 
-- normal turns load every response tool
-- proactive deliberation loads every read tool
-- test-only framework capabilities are in the production tool catalog
-- Agency is the right terminal-first boundary but needs stronger sandbox and
-  side-effect receipts
-- authority-bearing local routes rely too heavily on loopback
-- action runtime and capability registry are monolithic
-- Discord copy leaks internal capability IDs
-- tests do not yet enforce tool minimalism or skills-before-tools
+- normal turns receiving the full response tool catalog
+- proactive deliberation receiving model tools
+- test-only framework capabilities leaking into production model tool surfaces
+- Agency PR requests losing receipt-derived idempotency IDs
+- authority-bearing local routes bypassing bearer auth
+- Discord copy exposing internal capability IDs
+- proactive memory or Discord output reintroducing duplicate action shapes

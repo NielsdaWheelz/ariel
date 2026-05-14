@@ -929,17 +929,30 @@ def test_autonomy_scope_enforces_target_recipient_and_payload_shape(
         _seed_scope(
             client,
             scope_id="scope_shape",
-            action_type="cap.framework.write_draft",
-            target_system="cap.framework.write_draft",
-            source_context={"allowed_targets": ["framework"]},
-            allowed_payload_shape={"required": {"title": "string"}, "allow_extra": False},
+            action_type="cap.email.draft",
+            target_system="gmail",
+            source_context={
+                "allowed_targets": ["shape-email"],
+                "allowed_recipients": ["ops@example.com"],
+            },
+            allowed_payload_shape={
+                "required": {
+                    "to": "list",
+                    "cc": "list",
+                    "bcc": "list",
+                    "subject": "string",
+                    "body": "string",
+                    "idempotency_key": "string",
+                    "commitment_id": "string",
+                },
+                "allow_extra": False,
+            },
         )
         _seed_case(client, case_id="case_bad_shape", undo_supported=False)
         bad_shape = {
-            "action_type": "cap.framework.write_draft",
-            "target": "framework",
-            "payload": {"note": "Draft the note."},
-            "risk_tier": "low",
+            **good_action,
+            "target": "shape-email",
+            "payload": {**good_action["payload"]},
         }
         _run_decision(
             client,
@@ -962,9 +975,7 @@ def test_autonomy_scope_enforces_target_recipient_and_payload_shape(
                 }
                 assert denials == {
                     "case_bad_recipient": "recipient is outside autonomy scope for cap.email.draft",
-                    "case_bad_shape": (
-                        "payload shape is outside autonomy scope for cap.framework.write_draft"
-                    ),
+                    "case_bad_shape": "payload shape is outside autonomy scope for cap.email.draft",
                     "case_bad_target": "target is outside autonomy scope for cap.email.draft",
                 }
 
@@ -1184,27 +1195,26 @@ def test_autonomy_scope_missing_target_or_recipient_scope_denies_writes(
         },
         "risk_tier": "low",
     }
-    framework_action = {
-        "action_type": "cap.framework.write_draft",
-        "target": "framework",
-        "payload": {"note": "Draft the note."},
-        "risk_tier": "low",
-    }
     with _build_client(postgres_url, DecisionAdapter(_decision_payload())) as client:
         _seed_scope(
             client,
             scope_id="scope_no_target",
-            action_type="cap.framework.write_draft",
-            target_system="cap.framework.write_draft",
-            source_context={},
-            allowed_payload_shape={"required": {"note": "string"}, "allow_extra": False},
+            action_type="cap.email.draft",
+            target_system="gmail",
+            source_context={"allowed_recipients": ["ops@example.com"]},
+            allowed_payload_shape=email_shape,
         )
         _seed_case(client, case_id="case_no_target", undo_supported=False)
         _run_decision(
             client,
             case_id="case_no_target",
-            adapter=DecisionAdapter(_decision_payload(actions=[framework_action])),
+            adapter=DecisionAdapter(_decision_payload(actions=[email_action])),
         )
+        with _session_factory(client)() as db:
+            with db.begin():
+                scope = db.get(AutonomyScopeRecord, "scope_no_target")
+                assert scope is not None
+                scope.status = "revoked"
 
         _seed_scope(
             client,
@@ -1235,27 +1245,51 @@ def test_autonomy_scope_missing_target_or_recipient_scope_denies_writes(
 
     assert denials == {
         "case_no_recipient": "recipient is outside autonomy scope for cap.email.draft",
-        "case_no_target": "target is outside autonomy scope for cap.framework.write_draft",
+        "case_no_target": "target is outside autonomy scope for cap.email.draft",
     }
 
 
 def test_tainted_context_cannot_execute_low_risk_autonomous_write(
     postgres_url: str,
 ) -> None:
+    email_shape = {
+        "required": {
+            "to": "list",
+            "cc": "list",
+            "bcc": "list",
+            "subject": "string",
+            "body": "string",
+            "idempotency_key": "string",
+            "user_instruction_ref": "string",
+        },
+        "allow_extra": False,
+    }
     action = {
-        "action_type": "cap.framework.write_draft",
-        "target": "framework",
-        "payload": {"note": "Draft from tainted content."},
+        "action_type": "cap.email.draft",
+        "target": "team-email",
+        "target_system": "gmail",
+        "payload": {
+            "to": ["ops@example.com"],
+            "cc": [],
+            "bcc": [],
+            "subject": "Status",
+            "body": "Draft from tainted content.",
+            "idempotency_key": "tainted-email-draft",
+            "user_instruction_ref": "turn:tainted-email",
+        },
         "risk_tier": "low",
     }
     with _build_client(postgres_url, DecisionAdapter(_decision_payload())) as client:
         _seed_scope(
             client,
             scope_id="scope_tainted",
-            action_type="cap.framework.write_draft",
-            target_system="cap.framework.write_draft",
-            source_context={"allowed_targets": ["framework"]},
-            allowed_payload_shape={"required": {"note": "string"}, "allow_extra": False},
+            action_type="cap.email.draft",
+            target_system="gmail",
+            source_context={
+                "allowed_targets": ["team-email"],
+                "allowed_recipients": ["ops@example.com"],
+            },
+            allowed_payload_shape=email_shape,
         )
         _seed_case(
             client,
@@ -1293,28 +1327,17 @@ def test_tainted_context_cannot_execute_low_risk_autonomous_write(
                 assert plan_count == 0
 
 
-def test_proactive_write_uses_capability_preflight_before_action_plan(
+def test_proactive_write_rejects_unknown_capability_before_action_plan(
     postgres_url: str,
 ) -> None:
     action = {
-        "action_type": "cap.framework.external_notify",
-        "target": "framework-notify",
-        "target_system": "framework",
+        "action_type": "cap.external.notify",
+        "target": "external-notify",
+        "target_system": "external",
         "payload": {"destination": "evil.example", "message": "Notify outside scope."},
         "risk_tier": "low",
     }
     with _build_client(postgres_url, DecisionAdapter(_decision_payload())) as client:
-        _seed_scope(
-            client,
-            scope_id="scope_external",
-            action_type="cap.framework.external_notify",
-            target_system="framework",
-            source_context={"allowed_targets": ["framework-notify"]},
-            allowed_payload_shape={
-                "required": {"destination": "string", "message": "string"},
-                "allow_extra": False,
-            },
-        )
         _seed_case(client, case_id="case_egress", undo_supported=False)
         _run_decision(
             client,
@@ -1339,6 +1362,6 @@ def test_proactive_write_uses_capability_preflight_before_action_plan(
                         "SELECT COUNT(*) FROM proactive_action_plans WHERE case_id = 'case_egress'"
                     )
                 ).scalar_one()
-                assert validation["result"] == "denied"
-                assert validation["denial_reason"] == "egress_destination_denied:evil.example"
+                assert validation["result"] == "invalid_decision"
+                assert validation["denial_reason"] == "unknown capability cap.external.notify"
                 assert plan_count == 0

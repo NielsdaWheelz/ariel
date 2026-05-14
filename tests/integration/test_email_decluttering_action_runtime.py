@@ -409,6 +409,7 @@ def test_memory_inspect_capability_executes_inline(
                 ),
                 now_fn=lambda: NOW,
                 new_id_fn=lambda prefix: f"{prefix}_memory",
+                allowed_capability_ids=["cap.memory.inspect"],
             )
 
     assert result.action_attempts[0].capability_id == "cap.memory.inspect"
@@ -1008,6 +1009,7 @@ def test_email_thread_watch_list_is_scoped_to_current_google_account(
                 now_fn=lambda: NOW,
                 new_id_fn=lambda prefix: f"{prefix}_watch_list",
                 runtime_provenance=RuntimeProvenance(status="clean"),
+                allowed_capability_ids=["cap.email.thread_watch.list"],
             )
 
     assert len(result.function_call_outputs) == 1

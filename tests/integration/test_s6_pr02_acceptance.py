@@ -37,6 +37,37 @@ class ActionProposalAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         del tools, history
+        if context_bundle.get("origin") == "tool_strategy":
+            strategy_input = json.loads(str(input_items[1]["content"]))
+            available_ids = {
+                capability_id
+                for family in strategy_input.get("available_capability_families", [])
+                if isinstance(family, dict)
+                for capability_id in family.get("capability_ids", [])
+                if isinstance(capability_id, str)
+            }
+            selected_capability_ids = [
+                proposal["capability_id"]
+                for proposal in self.proposals_by_message.get(user_message, [])
+                if proposal.get("capability_id") in available_ids
+            ]
+            return responses_message(
+                assistant_text=json.dumps(
+                    {
+                        "decision": "selected_tools" if selected_capability_ids else "no_tools",
+                        "selected_capability_ids": selected_capability_ids,
+                        "rationale": "test strategy",
+                        "unavailable_reason": None,
+                        "confidence": 1.0,
+                    },
+                    sort_keys=True,
+                ),
+                provider=self.provider,
+                model=self.model,
+                provider_response_id="resp_s6_pr02_strategy",
+                input_tokens=3,
+                output_tokens=2,
+            )
         if context_bundle.get("origin") == "tool_result_interpretation":
             interpreter_input = context_bundle.get("tool_result_interpreter_input")
             if not isinstance(interpreter_input, dict):
@@ -187,6 +218,11 @@ def _set_valid_maps_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
         fallback_secret="dev-local-connector-secret",
     )
     monkeypatch.setenv("ARIEL_MAPS_PROVIDER_API_KEY_ENC", cipher.encrypt("maps-test-key"))
+
+
+@pytest.fixture(autouse=True)
+def _maps_provider_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_valid_maps_credentials(monkeypatch)
 
 
 def test_s6_pr02_maps_directions_execute_inline_with_citations_and_auditable_lifecycle(
@@ -441,6 +477,15 @@ def test_s6_pr02_maps_credentials_failures_are_typed_and_recoverable(
         )
         assert sent.status_code == 200
         payload = sent.json()
+        if credential_mode == "missing":
+            assert payload["turn"]["surface_action_lifecycle"] == []
+            assert "provider_credentials_missing" in payload["assistant"]["message"].lower()
+            assert all(
+                event["event_type"] != "evt.action.execution.started"
+                for event in payload["turn"]["events"]
+            )
+            return
+
         attempt = _surface_attempt(payload["turn"])
         assert attempt["execution"]["status"] == "failed"
         assert attempt["execution"]["error"] == expected_error
@@ -554,10 +599,13 @@ def test_s6_pr02_maps_egress_preflight_remains_fail_closed_before_execution(
     execute_attempts = 0
 
     def mutate(capability: CapabilityDefinition) -> CapabilityDefinition:
+        assert capability.execute is not None
+        original_execute = capability.execute
+
         def counted_execute(input_payload: dict[str, Any]) -> dict[str, Any]:
             nonlocal execute_attempts
             execute_attempts += 1
-            return capability.execute(input_payload)
+            return original_execute(input_payload)
 
         return replace(
             capability,
@@ -661,6 +709,8 @@ def test_s6_pr02_maps_outputs_remain_normalized_for_mixed_retrieval_turns(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("ARIEL_SEARCH_WEB_API_KEY", "fixture-search-key")
+
     def mutate_maps(capability: CapabilityDefinition) -> CapabilityDefinition:
         def execute(input_payload: dict[str, Any]) -> dict[str, Any]:
             return {

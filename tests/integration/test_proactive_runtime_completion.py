@@ -14,6 +14,7 @@ from testcontainers.postgres import PostgresContainer
 from ariel.app import create_app
 from ariel.config import AppSettings
 from ariel.executor import ExecutionResult
+from ariel.google_connector import GoogleCapabilityExecutionResult
 from ariel.memory import AIJudgmentFailure
 from ariel.persistence import (
     AIJudgmentRecord,
@@ -88,24 +89,69 @@ class ToolCallingProactiveAdapter:
                 "provider_response_id": "resp_proactive_tool_denied",
                 "output": [
                     {
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "type": "output_text",
-                                "text": json.dumps(
-                                    _decision_payload(
-                                        decision="speak_now",
-                                        user_visible_message="Leave now from the case evidence.",
-                                        tool_refs=[],
-                                    )
-                                ),
-                            }
-                        ],
+                        "type": "function_call",
+                        "call_id": "call_proactive_memory_search",
+                        "name": "cap_memory_search",
+                        "arguments": json.dumps({"query": "case evidence"}),
                     }
                 ],
             }
-        raise AssertionError("case-scoped proactive test should not reach a tool round")
+        assert tools == []
+        tool_output = next(
+            item for item in input_items if item.get("type") == "function_call_output"
+        )
+        assert json.loads(tool_output["output"]) == {
+            "status": "failed",
+            "error": "proactive_deliberation_tool_denied",
+        }
+        return {
+            "provider": "provider.proactive-test",
+            "model": "model.proactive-test",
+            "provider_response_id": "resp_proactive_after_tool_denial",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": json.dumps(
+                                _decision_payload(
+                                    decision="speak_now",
+                                    user_visible_message="Leave now from the case evidence.",
+                                    tool_refs=[],
+                                )
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+
+
+@dataclass
+class ProactiveGoogleRuntime:
+    results: list[ExecutionResult]
+
+    def prepare_capability_access(self, **_: Any) -> tuple[str, set[str], str, None]:
+        return "token", set(), "acct_google", None
+
+    def _typed_failure(self, *, failure_class: str) -> GoogleCapabilityExecutionResult:
+        return GoogleCapabilityExecutionResult(
+            status="failed",
+            output=None,
+            auth_failure=None,
+            error=failure_class,
+        )
+
+    def execute_provider_capability(self, **_: Any) -> GoogleCapabilityExecutionResult:
+        result = self.results.pop(0)
+        return GoogleCapabilityExecutionResult(
+            status=result.status,
+            output=result.output,
+            auth_failure=None,
+            error=result.error,
+        )
 
 
 _id_counter = 0
@@ -182,6 +228,25 @@ def _seed_scope(
     allowed_payload: dict[str, Any] | None = None,
     now: datetime,
 ) -> None:
+    source_context = {"allowed_targets": ["framework"]}
+    allowed_payload_shape = {"required": {"note": "string"}, "allow_extra": False}
+    if action_type == "cap.email.draft":
+        source_context = {
+            "allowed_targets": ["team-email"],
+            "allowed_recipients": ["ops@example.com"],
+        }
+        allowed_payload_shape = {
+            "required": {
+                "to": "list",
+                "cc": "list",
+                "bcc": "list",
+                "subject": "string",
+                "body": "string",
+                "idempotency_key": "string",
+                "user_instruction_ref": "string",
+            },
+            "allow_extra": False,
+        }
     with _session_factory(client)() as db:
         with db.begin():
             scope = AutonomyScopeRecord(
@@ -199,17 +264,9 @@ def _seed_scope(
                 updated_at=now,
             )
             for field_name, value in {
-                "source_context": {
-                    "allowed_targets": ["owner-discord"]
-                    if action_type == "send_discord_message"
-                    else ["framework"]
-                },
+                "source_context": source_context,
                 "allowed_target_systems": [target_system],
-                "allowed_payload_shape": (
-                    {"required": {"message": "string"}, "allow_extra": False}
-                    if action_type == "send_discord_message"
-                    else {"required": {"note": "string"}, "allow_extra": False}
-                ),
+                "allowed_payload_shape": allowed_payload_shape,
                 "revocation_rule": "manual",
                 "audit_visibility": "private",
                 "version": 1,
@@ -217,6 +274,18 @@ def _seed_scope(
                 if hasattr(scope, field_name):
                     setattr(scope, field_name, value)
             db.add(scope)
+
+
+def _email_draft_payload(idempotency_key: str, body: str) -> dict[str, Any]:
+    return {
+        "to": ["ops@example.com"],
+        "cc": [],
+        "bcc": [],
+        "subject": "Status",
+        "body": body,
+        "idempotency_key": idempotency_key,
+        "user_instruction_ref": f"turn:{idempotency_key}",
+    }
 
 
 def _run_deliberation(
@@ -334,11 +403,18 @@ def test_proactive_memory_curation_failure_is_case_audited_before_deliberation(
             assert db.scalar(select(func.count()).select_from(ProactiveActionPlanRecord)) == 0
 
 
-def test_deliberation_does_not_expose_generic_read_tools(
+def test_deliberation_denies_unadvertised_function_calls(
     postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     now = datetime(2026, 5, 7, 12, 2, tzinfo=UTC)
     adapter = ToolCallingProactiveAdapter()
+
+    def fail_execute_capability(**_: Any) -> ExecutionResult:
+        raise AssertionError("unadvertised proactive tool call executed a capability")
+
+    monkeypatch.setattr("ariel.proactivity.execute_capability", fail_execute_capability)
+
     with _build_client(postgres_url, adapter) as client:
         case_id = _seed_case(client, now=now)
         _run_deliberation(client, case_id=case_id, adapter=adapter, now=now)
@@ -349,10 +425,20 @@ def test_deliberation_does_not_expose_generic_read_tools(
                 decision = db.scalar(select(ProactiveDecisionRecord).limit(1))
                 turn = db.scalar(select(ProactiveTurnRecord).limit(1))
 
-                assert adapter.calls == 1
+                assert adapter.calls == 2
                 assert snapshot is not None
-                assert snapshot.context["tool_outputs"] == []
-                assert not any(
+                assert snapshot.context["tool_outputs"] == [
+                    {
+                        "call_id": "call_proactive_memory_search",
+                        "tool_name": "cap_memory_search",
+                        "capability_id": None,
+                        "result": {
+                            "status": "failed",
+                            "error": "proactive_deliberation_tool_denied",
+                        },
+                    }
+                ]
+                assert any(
                     item.get("type") == "function_call_output" for item in snapshot.model_input
                 )
                 assert decision is not None
@@ -428,96 +514,76 @@ def test_remember_creates_reviewable_memory_candidate_and_ask_user_sets_asked(
                 assert turn.message == "Should I keep watching this approval?"
 
 
-def test_act_now_send_discord_requires_scope_and_marks_acted_after_receipt(
+@pytest.mark.parametrize(
+    ("action_type", "target_system", "expected_reason"),
+    [
+        (
+            "send_discord_message",
+            "discord",
+            "proactive Discord messages must use speak_now or ask_user",
+        ),
+        (
+            "cap.memory.propose",
+            "memory",
+            "proactive memory updates must use decision=remember",
+        ),
+    ],
+)
+def test_act_now_duplicate_action_shapes_are_invalid(
     postgres_url: str,
+    action_type: str,
+    target_system: str,
+    expected_reason: str,
 ) -> None:
     now = datetime(2026, 5, 7, 12, 10, tzinfo=UTC)
     action = {
-        "action_type": "send_discord_message",
-        "target": "owner-discord",
-        "target_system": "discord",
-        "payload": {"text": "Approval needs attention now."},
+        "action_type": action_type,
+        "target": "framework",
+        "target_system": target_system,
+        "payload": {"note": "Duplicate action shape regression."},
         "risk_tier": "low",
     }
-    denied = ProactiveAdapter(json.dumps(_decision_payload(decision="act_now", actions=[action])))
-    authorized = ProactiveAdapter(
-        json.dumps(_decision_payload(decision="act_now", actions=[action]))
-    )
+    adapter = ProactiveAdapter(json.dumps(_decision_payload(decision="act_now", actions=[action])))
 
-    with _build_client(postgres_url, denied) as client:
-        denied_case_id = _seed_case(client, now=now)
-        _run_deliberation(client, case_id=denied_case_id, adapter=denied, now=now)
-        validation = _latest_validation(client)
-        assert validation.result == "needs_user_authority"
-
-    with _build_client(postgres_url, authorized) as client:
-        _seed_scope(
-            client,
-            action_type="send_discord_message",
-            target_system="discord",
-            now=now,
-        )
+    with _build_client(postgres_url, adapter) as client:
         case_id = _seed_case(client, now=now)
-        _run_deliberation(client, case_id=case_id, adapter=authorized, now=now)
+        _run_deliberation(client, case_id=case_id, adapter=adapter, now=now)
+        validation = _latest_validation(client)
+        assert validation.result == "invalid_decision"
+        assert validation.denial_reason == expected_reason
 
         with _session_factory(client)() as db:
             with db.begin():
                 case = db.get(ProactiveCaseRecord, case_id)
                 plan = db.scalar(select(ProactiveActionPlanRecord).limit(1))
-                validation = db.scalar(select(ProactivePolicyValidationRecord).limit(1))
                 assert case is not None
-                assert case.status == "open"
-                assert plan is not None
-                assert plan.payload == {"message": "Approval needs attention now."}
-                assert validation is not None
-                assert validation.action_plan_hash is not None
-
-        process_proactive_action_execution_due(
-            session_factory=_session_factory(client),
-            task_payload={"action_plan_id": plan.id},
-            now_fn=lambda: now,
-            new_id_fn=_new_id,
-        )
-
-        with _session_factory(client)() as db:
-            with db.begin():
-                case = db.get(ProactiveCaseRecord, case_id)
-                turn = db.scalar(select(ProactiveTurnRecord).limit(1))
-                execution = db.scalar(select(ProactiveActionExecutionRecord).limit(1))
-                assert case is not None
-                assert case.status == "acted"
-                assert turn is not None
-                assert turn.message == "Approval needs attention now."
-                assert execution is not None
-                assert execution.status == "succeeded"
+                assert case.status == "failed"
+                assert plan is None
 
 
 def test_failed_action_execution_is_replayable_with_same_execution_record(
     postgres_url: str,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     now = datetime(2026, 5, 7, 12, 15, tzinfo=UTC)
     action = {
-        "action_type": "cap.framework.write_draft",
-        "target": "framework",
-        "payload": {"note": "Draft the note."},
+        "action_type": "cap.email.draft",
+        "target": "team-email",
+        "target_system": "gmail",
+        "payload": _email_draft_payload("proactive-replay-draft", "Draft the note."),
         "risk_tier": "low",
     }
     adapter = ProactiveAdapter(json.dumps(_decision_payload(decision="act_now", actions=[action])))
-    results = [
-        ExecutionResult(status="failed", output=None, error="temporary_failure"),
-        ExecutionResult(status="succeeded", output={"status": "drafted"}, error=None),
-    ]
-
-    def fake_execute_capability(**_: Any) -> ExecutionResult:
-        return results.pop(0)
-
-    monkeypatch.setattr("ariel.proactivity.execute_capability", fake_execute_capability)
+    google_runtime = ProactiveGoogleRuntime(
+        [
+            ExecutionResult(status="failed", output=None, error="temporary_failure"),
+            ExecutionResult(status="succeeded", output={"status": "drafted"}, error=None),
+        ]
+    )
     with _build_client(postgres_url, adapter) as client:
         _seed_scope(
             client,
-            action_type="cap.framework.write_draft",
-            target_system="cap.framework.write_draft",
+            action_type="cap.email.draft",
+            target_system="gmail",
             now=now,
         )
         case_id = _seed_case(client, now=now)
@@ -531,12 +597,14 @@ def test_failed_action_execution_is_replayable_with_same_execution_record(
         process_proactive_action_execution_due(
             session_factory=_session_factory(client),
             task_payload={"action_plan_id": plan_id},
+            google_runtime=google_runtime,
             now_fn=lambda: now,
             new_id_fn=_new_id,
         )
         process_proactive_action_execution_due(
             session_factory=_session_factory(client),
             task_payload={"action_plan_id": plan_id},
+            google_runtime=google_runtime,
             now_fn=lambda: now,
             new_id_fn=_new_id,
         )
@@ -558,13 +626,13 @@ def test_failed_action_execution_is_replayable_with_same_execution_record(
 
 def test_speak_and_act_authorizes_turn_then_marks_acted_after_action_receipt(
     postgres_url: str,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     now = datetime(2026, 5, 7, 12, 18, tzinfo=UTC)
     action = {
-        "action_type": "cap.framework.write_draft",
-        "target": "framework",
-        "payload": {"note": "Draft the proactive note."},
+        "action_type": "cap.email.draft",
+        "target": "team-email",
+        "target_system": "gmail",
+        "payload": _email_draft_payload("proactive-speak-and-act", "Draft the proactive note."),
         "risk_tier": "low",
     }
     adapter = ProactiveAdapter(
@@ -577,15 +645,14 @@ def test_speak_and_act_authorizes_turn_then_marks_acted_after_action_receipt(
         )
     )
 
-    def fake_execute_capability(**_: Any) -> ExecutionResult:
-        return ExecutionResult(status="succeeded", output={"status": "drafted"}, error=None)
-
-    monkeypatch.setattr("ariel.proactivity.execute_capability", fake_execute_capability)
+    google_runtime = ProactiveGoogleRuntime(
+        [ExecutionResult(status="succeeded", output={"status": "drafted"}, error=None)]
+    )
     with _build_client(postgres_url, adapter) as client:
         _seed_scope(
             client,
-            action_type="cap.framework.write_draft",
-            target_system="cap.framework.write_draft",
+            action_type="cap.email.draft",
+            target_system="gmail",
             now=now,
         )
         case_id = _seed_case(client, now=now)
@@ -609,6 +676,7 @@ def test_speak_and_act_authorizes_turn_then_marks_acted_after_action_receipt(
         process_proactive_action_execution_due(
             session_factory=_session_factory(client),
             task_payload={"action_plan_id": plan_id},
+            google_runtime=google_runtime,
             now_fn=lambda: now,
             new_id_fn=_new_id,
         )
@@ -626,9 +694,10 @@ def test_speak_and_act_authorizes_turn_then_marks_acted_after_action_receipt(
 def test_speak_and_act_denies_non_low_risk_from_tainted_context(postgres_url: str) -> None:
     now = datetime(2026, 5, 7, 12, 20, tzinfo=UTC)
     action = {
-        "action_type": "cap.framework.write_draft",
-        "target": "framework",
-        "payload": {"note": "Draft from tainted text."},
+        "action_type": "cap.email.draft",
+        "target": "team-email",
+        "target_system": "gmail",
+        "payload": _email_draft_payload("proactive-tainted-medium", "Draft from tainted text."),
         "risk_tier": "medium",
     }
     adapter = ProactiveAdapter(
@@ -643,8 +712,8 @@ def test_speak_and_act_denies_non_low_risk_from_tainted_context(postgres_url: st
     with _build_client(postgres_url, adapter) as client:
         _seed_scope(
             client,
-            action_type="cap.framework.write_draft",
-            target_system="cap.framework.write_draft",
+            action_type="cap.email.draft",
+            target_system="gmail",
             max_impact="medium",
             now=now,
         )

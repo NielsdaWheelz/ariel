@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from collections.abc import Generator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -119,6 +120,25 @@ class MemoryProbeAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         del input_items, tools, history
+        if context_bundle.get("origin") == "tool_strategy":
+            return responses_message(
+                assistant_text=json.dumps(
+                    {
+                        "decision": "no_tools",
+                        "selected_capability_ids": [],
+                        "rationale": "memory turn does not need runtime tools",
+                        "unavailable_reason": None,
+                        "confidence": 1.0,
+                    },
+                    sort_keys=True,
+                ),
+                provider=self.provider,
+                model=self.model,
+                provider_response_id="resp_s5_pr01_strategy",
+                input_tokens=3,
+                output_tokens=2,
+            )
+
         snapshot = copy.deepcopy(context_bundle)
         self.context_bundles.append(snapshot)
 

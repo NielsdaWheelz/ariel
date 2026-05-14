@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager, nullcontext
 import hmac
 import hashlib
 import json
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -41,7 +42,12 @@ from ariel.action_runtime import (
 )
 from ariel.agency_daemon import AgencyDaemonClient, AgencyRuntime
 from ariel.attachment_content import AttachmentContentRuntime
-from ariel.capability_registry import response_tool_definitions
+from ariel.capability_registry import (
+    get_capability,
+    production_response_capability_ids,
+    response_capability_strategy_families,
+    response_tool_definitions,
+)
 from ariel.config import AppSettings
 from ariel.db import missing_required_tables, reset_schema_for_tests
 from ariel.google_connector import (
@@ -359,6 +365,35 @@ class NormalizedCaptureEnvelope:
 class NormalizedSharedContent:
     text: str | None
     urls: list[str]
+
+
+class ToolStrategyDecisionContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: Literal["no_tools", "selected_tools", "unavailable_authority"]
+    selected_capability_ids: list[str] = Field(default_factory=list, max_length=8)
+    rationale: str = Field(min_length=1, max_length=2000)
+    unavailable_reason: str | None = Field(default=None, max_length=2000)
+    confidence: float = Field(ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def _decision_matches_fields(self) -> ToolStrategyDecisionContract:
+        if self.decision == "selected_tools":
+            if not self.selected_capability_ids:
+                raise ValueError("selected_tools requires selected_capability_ids")
+            if self.unavailable_reason is not None:
+                raise ValueError("selected_tools must not include unavailable_reason")
+        elif self.decision == "no_tools":
+            if self.selected_capability_ids:
+                raise ValueError("no_tools must not include selected_capability_ids")
+            if self.unavailable_reason is not None:
+                raise ValueError("no_tools must not include unavailable_reason")
+        elif self.decision == "unavailable_authority":
+            if self.selected_capability_ids:
+                raise ValueError("unavailable_authority must not include selected_capability_ids")
+            if not isinstance(self.unavailable_reason, str) or not self.unavailable_reason.strip():
+                raise ValueError("unavailable_authority requires unavailable_reason")
+        return self
 
 
 class DiscordAttachmentRequest(BaseModel):
@@ -1213,6 +1248,19 @@ def _build_responses_input_items(
                 "content": "turn-id context for write authority:\n" + "\n".join(turn_ref_lines),
             }
         )
+
+    tool_strategy = context_bundle.get("tool_strategy")
+    if isinstance(tool_strategy, dict) and tool_strategy.get("decision") == "unavailable_authority":
+        unavailable_reason = tool_strategy.get("unavailable_reason")
+        if isinstance(unavailable_reason, str) and unavailable_reason.strip():
+            input_items.append(
+                {
+                    "role": "system",
+                    "content": (
+                        f"tool authority unavailable for this turn: {unavailable_reason.strip()}"
+                    ),
+                }
+            )
 
     memory_context = context_bundle.get("memory_context")
     if isinstance(memory_context, dict):
@@ -3153,6 +3201,319 @@ def _context_bundle_audit_metadata(context_bundle: dict[str, Any]) -> dict[str, 
     }
 
 
+def _tool_surface_facts(
+    *,
+    db: Session,
+    context_bundle: dict[str, Any],
+    agency_configured: bool,
+) -> dict[str, Any]:
+    connector = db.scalar(
+        select(GoogleConnectorRecord)
+        .where(GoogleConnectorRecord.id == GOOGLE_CONNECTOR_ID)
+        .limit(1)
+    )
+    granted_scopes = (
+        [scope for scope in connector.granted_scopes if isinstance(scope, str)]
+        if connector is not None and isinstance(connector.granted_scopes, list)
+        else []
+    )
+    provider_account_id = (
+        connector.account_subject.strip()
+        if connector is not None and isinstance(connector.account_subject, str)
+        else ""
+    )
+    discord_context = context_bundle.get("discord_context")
+    attachment_count = (
+        len(discord_context["attachments"])
+        if (
+            isinstance(discord_context, dict)
+            and isinstance(discord_context.get("attachments"), list)
+        )
+        else 0
+    )
+    weather_mode = os.getenv("ARIEL_WEATHER_PROVIDER_MODE", "production").strip().lower()
+    search_web_bound = bool(os.getenv("ARIEL_SEARCH_WEB_API_KEY", "").strip())
+    web_extract_bound = bool(
+        os.getenv("ARIEL_WEB_EXTRACT_PROVIDER_ENDPOINT", "").strip()
+        or os.getenv("ARIEL_WEB_EXTRACT_API_KEY", "").strip()
+        or search_web_bound
+    )
+    return {
+        "google": {
+            "connected": connector is not None
+            and connector.status == "connected"
+            and bool(provider_account_id),
+            "provider_account_id": provider_account_id or None,
+            "granted_scopes": sorted(set(granted_scopes)),
+        },
+        "discord": {
+            "available": isinstance(discord_context, dict),
+            "attachment_count": attachment_count,
+        },
+        "runtime_bindings": {
+            "agency": agency_configured,
+            "web_extract": web_extract_bound,
+            "search_web": search_web_bound,
+            "search_news": bool(os.getenv("ARIEL_SEARCH_NEWS_API_KEY", "").strip())
+            or search_web_bound,
+            "maps": bool(os.getenv("ARIEL_MAPS_PROVIDER_API_KEY_ENC", "").strip()),
+            "weather": weather_mode == "dev_fallback"
+            or bool(os.getenv("ARIEL_WEATHER_PRODUCTION_API_KEY", "").strip()),
+        },
+    }
+
+
+def _eligible_response_capability_ids(
+    *,
+    tool_surface_facts: dict[str, Any],
+) -> list[str]:
+    google_facts = tool_surface_facts.get("google")
+    google_connected = isinstance(google_facts, dict) and google_facts.get("connected") is True
+    granted_scopes_raw = (
+        google_facts.get("granted_scopes") if isinstance(google_facts, dict) else []
+    )
+    granted_scopes = (
+        {scope for scope in granted_scopes_raw if isinstance(scope, str)}
+        if isinstance(granted_scopes_raw, list)
+        else set()
+    )
+    discord_facts = tool_surface_facts.get("discord")
+    has_attachment_refs = (
+        isinstance(discord_facts, dict)
+        and isinstance(discord_facts.get("attachment_count"), int)
+        and discord_facts["attachment_count"] > 0
+    )
+    has_discord_context = isinstance(discord_facts, dict) and discord_facts.get("available") is True
+    runtime_bindings = tool_surface_facts.get("runtime_bindings")
+    bindings = runtime_bindings if isinstance(runtime_bindings, dict) else {}
+
+    capability_ids: list[str] = []
+    for capability_id in production_response_capability_ids():
+        capability = get_capability(capability_id)
+        raw_required_scopes = (
+            capability.contract_metadata.get("required_scopes") if capability is not None else None
+        )
+        required_google_scopes = (
+            {scope for scope in raw_required_scopes if isinstance(scope, str)}
+            if isinstance(raw_required_scopes, list)
+            else set()
+        )
+        if required_google_scopes:
+            if google_connected and required_google_scopes.issubset(granted_scopes):
+                capability_ids.append(capability_id)
+            continue
+        if capability_id in {"cap.email.thread_watch.cancel", "cap.email.thread_watch.list"}:
+            if google_connected:
+                capability_ids.append(capability_id)
+            continue
+        if capability_id.startswith("cap.agency."):
+            if bindings.get("agency") is True:
+                capability_ids.append(capability_id)
+            continue
+        if capability_id == "cap.attachment.read":
+            if has_attachment_refs:
+                capability_ids.append(capability_id)
+            continue
+        if capability_id == "cap.discord.no_response":
+            if has_discord_context:
+                capability_ids.append(capability_id)
+            continue
+        if capability_id == "cap.web.extract":
+            if bindings.get("web_extract") is True:
+                capability_ids.append(capability_id)
+            continue
+        if capability_id == "cap.search.web":
+            if bindings.get("search_web") is True:
+                capability_ids.append(capability_id)
+            continue
+        if capability_id == "cap.search.news":
+            if bindings.get("search_news") is True:
+                capability_ids.append(capability_id)
+            continue
+        if capability_id.startswith("cap.maps."):
+            if bindings.get("maps") is True:
+                capability_ids.append(capability_id)
+            continue
+        if capability_id == "cap.weather.forecast":
+            if bindings.get("weather") is True:
+                capability_ids.append(capability_id)
+            continue
+        capability_ids.append(capability_id)
+    return capability_ids
+
+
+def _call_tool_strategy(
+    *,
+    model_adapter: ModelAdapter,
+    user_message: str,
+    context_bundle: dict[str, Any],
+    tool_surface_facts: dict[str, Any],
+    eligible_capability_ids: list[str],
+) -> tuple[list[str], dict[str, Any], dict[str, Any]]:
+    eligible = set(eligible_capability_ids)
+    available_capability_families = response_capability_strategy_families(eligible_capability_ids)
+    response = model_adapter.create_response(
+        input_items=[
+            {
+                "role": "system",
+                "content": (
+                    "Select the smallest Ariel tool set for the next assistant turn. "
+                    "Return JSON only with keys decision, selected_capability_ids, rationale, "
+                    "unavailable_reason, and confidence. decision must be one of no_tools, "
+                    "selected_tools, or unavailable_authority. Select no_tools when the answer "
+                    "can be written without tools. Select selected_tools only for capability IDs "
+                    "present in available_capability_families. Select unavailable_authority when "
+                    "the user asks for work that needs a provider or scope absent from runtime_facts. "
+                    "Select at most 8 capability IDs. Do not answer the user."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "user_message": user_message,
+                        "available_capability_families": available_capability_families,
+                        "runtime_facts": redact_json_value(tool_surface_facts),
+                        "bounded_context": redact_json_value(context_bundle),
+                        "hard_policy_exclusions": [
+                            "capability ids absent from available_capability_families",
+                            "cap.framework.*",
+                        ],
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            },
+        ],
+        tools=[],
+        user_message=user_message,
+        history=[],
+        context_bundle={"origin": "tool_strategy", "tool_surface_facts": tool_surface_facts},
+    )
+    output_items = response.get("output")
+    if not isinstance(output_items, list):
+        raise ModelAdapterError(
+            safe_reason="tool strategy response missing Responses output items",
+            status_code=502,
+            code="E_AI_JUDGMENT_SCHEMA",
+            message="AI tool strategy failed",
+            retryable=False,
+            provider=response.get("provider")
+            if isinstance(response.get("provider"), str)
+            else None,
+            model=response.get("model")
+            if isinstance(response.get("model"), str)
+            else model_adapter.model,
+            usage=response.get("usage") if isinstance(response.get("usage"), dict) else None,
+            provider_response_id=response.get("provider_response_id")
+            if isinstance(response.get("provider_response_id"), str)
+            else None,
+            parse_status="schema_invalid",
+            validation_status="invalid",
+            raw_output_shape={"output_type": type(output_items).__name__, "output_count": None},
+        )
+    text = _extract_responses_assistant_text(output_items)
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ModelAdapterError(
+            safe_reason="tool strategy response was not valid JSON",
+            status_code=502,
+            code="E_AI_JUDGMENT_INVALID_JSON",
+            message="AI tool strategy failed",
+            retryable=False,
+            provider=response.get("provider")
+            if isinstance(response.get("provider"), str)
+            else None,
+            model=response.get("model")
+            if isinstance(response.get("model"), str)
+            else model_adapter.model,
+            usage=response.get("usage") if isinstance(response.get("usage"), dict) else None,
+            provider_response_id=response.get("provider_response_id")
+            if isinstance(response.get("provider_response_id"), str)
+            else None,
+            parse_status="invalid_json",
+            validation_status="not_validated",
+            raw_output_shape={"output_type": "list", "output_count": len(output_items)},
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise ModelAdapterError(
+            safe_reason="tool strategy response JSON was not an object",
+            status_code=502,
+            code="E_AI_JUDGMENT_SCHEMA",
+            message="AI tool strategy failed",
+            retryable=False,
+            provider=response.get("provider")
+            if isinstance(response.get("provider"), str)
+            else None,
+            model=response.get("model")
+            if isinstance(response.get("model"), str)
+            else model_adapter.model,
+            usage=response.get("usage") if isinstance(response.get("usage"), dict) else None,
+            provider_response_id=response.get("provider_response_id")
+            if isinstance(response.get("provider_response_id"), str)
+            else None,
+            parse_status="parsed",
+            validation_status="invalid",
+            raw_output_shape={"output_type": "list", "output_count": len(output_items)},
+        )
+
+    try:
+        decision = ToolStrategyDecisionContract.model_validate(parsed)
+    except ValidationError as exc:
+        raise ModelAdapterError(
+            safe_reason="tool strategy response failed schema validation",
+            status_code=502,
+            code="E_AI_JUDGMENT_SCHEMA",
+            message="AI tool strategy failed",
+            retryable=False,
+            provider=response.get("provider")
+            if isinstance(response.get("provider"), str)
+            else None,
+            model=response.get("model")
+            if isinstance(response.get("model"), str)
+            else model_adapter.model,
+            usage=response.get("usage") if isinstance(response.get("usage"), dict) else None,
+            provider_response_id=response.get("provider_response_id")
+            if isinstance(response.get("provider_response_id"), str)
+            else None,
+            parse_status="parsed",
+            validation_status="invalid",
+            raw_output_shape={"output_type": "list", "output_count": len(output_items)},
+        ) from exc
+
+    def raise_strategy_validation(safe_reason: str) -> None:
+        raise ModelAdapterError(
+            safe_reason=safe_reason,
+            status_code=502,
+            code="E_AI_JUDGMENT_VALIDATION",
+            message="AI tool strategy failed",
+            retryable=False,
+            provider=response.get("provider")
+            if isinstance(response.get("provider"), str)
+            else None,
+            model=response.get("model")
+            if isinstance(response.get("model"), str)
+            else model_adapter.model,
+            usage=response.get("usage") if isinstance(response.get("usage"), dict) else None,
+            provider_response_id=response.get("provider_response_id")
+            if isinstance(response.get("provider_response_id"), str)
+            else None,
+            parse_status="parsed",
+            validation_status="invalid",
+            raw_output_shape={"output_type": "list", "output_count": len(output_items)},
+        )
+
+    selected: list[str] = []
+    for item in decision.selected_capability_ids:
+        if item not in eligible:
+            raise_strategy_validation("tool strategy selected an ineligible capability")
+        if item in selected:
+            raise_strategy_validation("tool strategy selected a duplicate capability")
+        selected.append(item)
+    return selected, response, decision.model_dump(mode="json")
+
+
 def _runtime_provenance_for_turn(
     *,
     db: Session,
@@ -3292,6 +3653,8 @@ def create_app(
     app.state.context_compaction_adapter = compaction_adapter
     app.state.bind_host = settings.bind_host
     app.state.bind_port = settings.bind_port
+    app.state.local_auth_required = settings.local_auth_required
+    app.state.local_auth_token = settings.local_auth_token
     app.state.max_recent_turns = settings.max_recent_turns
     app.state.max_recalled_assertions = settings.max_recalled_assertions
     app.state.max_context_tokens = settings.max_context_tokens
@@ -3366,6 +3729,44 @@ def create_app(
                 retryable=False,
             )
         )
+
+    @app.middleware("http")
+    async def _local_auth_middleware(request: Request, call_next: Any) -> Any:
+        if not app.state.local_auth_required:
+            return await call_next(request)
+        if (request.method, request.url.path) in {
+            ("GET", "/v1/health"),
+            ("GET", "/v1/connectors/google/callback"),
+            ("POST", "/v1/providers/google/events"),
+            ("POST", "/v1/agency/events"),
+        }:
+            return await call_next(request)
+        expected_token = app.state.local_auth_token
+        authorization = request.headers.get("authorization")
+        if not isinstance(expected_token, str) or not isinstance(authorization, str):
+            return _error_response(
+                ApiError(
+                    status_code=401,
+                    code="E_LOCAL_AUTH_TOKEN_INVALID",
+                    message="local API auth token is required",
+                    details={},
+                    retryable=False,
+                )
+            )
+        if not authorization.startswith("Bearer ") or not hmac.compare_digest(
+            authorization.removeprefix("Bearer "),
+            expected_token,
+        ):
+            return _error_response(
+                ApiError(
+                    status_code=401,
+                    code="E_LOCAL_AUTH_TOKEN_INVALID",
+                    message="local API auth token is invalid",
+                    details={},
+                    retryable=False,
+                )
+            )
+        return await call_next(request)
 
     @app.get("/", response_model=None)
     def root() -> dict[str, Any]:
@@ -5192,6 +5593,12 @@ def create_app(
             "turn_id": turn.id,
             "user_instruction_ref": f"turn:{turn.id}",
         }
+        agency_configured = bool(str(app.state.agency_allowed_repo_roots).strip())
+        tool_surface_facts = _tool_surface_facts(
+            db=db,
+            context_bundle=context_bundle,
+            agency_configured=agency_configured,
+        )
         context_metadata = _context_bundle_audit_metadata(context_bundle)
         if (
             memory_recall_event_payload["selected_memory_count"]
@@ -5253,7 +5660,8 @@ def create_app(
         model_failure_reason: str | None = None
         assistant_response: dict[str, Any] | None = None
         responses_input_items: list[dict[str, Any]] = []
-        responses_tools = response_tool_definitions()
+        responses_tools: list[dict[str, Any]] = []
+        selected_capability_ids: list[str] = []
         last_tool_result_interpreter_judgment_id: str | None = None
 
         def record_model_output_budget_failure(
@@ -5641,13 +6049,134 @@ def create_app(
                         else 0,
                     },
                 )
-            if model_failure is None:
-                context_bundle = compacted_context_bundle
-                context_metadata = _context_bundle_audit_metadata(context_bundle)
-                context_tokens = _estimate_context_tokens(
-                    context_bundle=context_bundle,
-                    user_message=user_message,
+        if model_failure is None and isinstance(compacted_context_bundle, dict):
+            context_bundle = compacted_context_bundle
+        context_metadata = _context_bundle_audit_metadata(context_bundle)
+        if model_failure is None:
+            try:
+                eligible_capability_ids = _eligible_response_capability_ids(
+                    tool_surface_facts=tool_surface_facts,
                 )
+                selected_capability_ids, strategy_response, strategy_output = _call_tool_strategy(
+                    model_adapter=app.state.model_adapter,
+                    user_message=user_message,
+                    context_bundle=context_bundle,
+                    tool_surface_facts=tool_surface_facts,
+                    eligible_capability_ids=eligible_capability_ids,
+                )
+                context_bundle["tool_strategy"] = {
+                    "decision": strategy_output.get("decision"),
+                    "selected_capability_ids": selected_capability_ids,
+                    "unavailable_reason": strategy_output.get("unavailable_reason"),
+                }
+                responses_tools = response_tool_definitions(selected_capability_ids)
+                add_ai_judgment(
+                    judgment_type="tool_strategy",
+                    source_type="turn",
+                    source_id=turn.id,
+                    status="succeeded",
+                    model=strategy_response.get("model")
+                    if isinstance(strategy_response.get("model"), str)
+                    else app.state.model_adapter.model,
+                    prompt_version="tool-strategy-v1",
+                    provider_response_id=strategy_response.get("provider_response_id")
+                    if isinstance(strategy_response.get("provider_response_id"), str)
+                    else None,
+                    input_summary="turn tool strategy",
+                    input_refs={
+                        "tool_surface_facts": redact_json_value(tool_surface_facts),
+                        "eligible_capability_ids": eligible_capability_ids,
+                        "selected_capability_ids": selected_capability_ids,
+                    },
+                    selected=[
+                        {"capability_id": capability_id}
+                        for capability_id in selected_capability_ids
+                    ],
+                    omitted=[
+                        {"capability_id": capability_id}
+                        for capability_id in eligible_capability_ids
+                        if capability_id not in selected_capability_ids
+                    ],
+                    output=strategy_output,
+                    rationale=strategy_output.get("rationale")
+                    if isinstance(strategy_output.get("rationale"), str)
+                    else None,
+                    confidence=strategy_output.get("confidence")
+                    if isinstance(strategy_output.get("confidence"), (float, int))
+                    else None,
+                    parse_status="parsed",
+                    validation_status="valid",
+                )
+                add_event(
+                    "evt.ai_judgment.completed",
+                    {
+                        "judgment_type": "tool_strategy",
+                        "eligible_capability_count": len(eligible_capability_ids),
+                        "selected_capability_ids": selected_capability_ids,
+                    },
+                )
+            except ModelAdapterError as exc:
+                failure_reason = safe_failure_reason(
+                    exc.safe_reason,
+                    fallback=f"unexpected {exc.__class__.__name__}",
+                )
+                judgment_failure_code = exc.code
+                if not judgment_failure_code.startswith("E_AI_JUDGMENT_"):
+                    judgment_failure_code = (
+                        "E_AI_JUDGMENT_CREDENTIALS"
+                        if "CREDENTIAL" in judgment_failure_code
+                        else "E_AI_JUDGMENT_REQUIRED"
+                    )
+                add_ai_judgment(
+                    judgment_type="tool_strategy",
+                    source_type="turn",
+                    source_id=turn.id,
+                    status="failed",
+                    model=exc.model or app.state.model_adapter.model,
+                    prompt_version="tool-strategy-v1",
+                    provider_response_id=exc.provider_response_id
+                    if isinstance(exc.provider_response_id, str)
+                    else None,
+                    input_summary="turn tool strategy",
+                    input_refs={"session_id": effective_session_id, "turn_id": turn.id},
+                    output={
+                        "provider": exc.provider or app.state.model_adapter.provider,
+                        "usage": exc.usage or {},
+                        "response_output_shape": exc.raw_output_shape or {},
+                    },
+                    parse_status=exc.parse_status or "missing_output",
+                    validation_status=exc.validation_status or "not_validated",
+                    failure_code=judgment_failure_code,
+                    failure_reason=failure_reason,
+                )
+                add_event(
+                    "evt.ai_judgment.failed",
+                    {
+                        "judgment_type": "tool_strategy",
+                        "failure_code": judgment_failure_code,
+                        "failure_reason": failure_reason,
+                        "parse_status": exc.parse_status,
+                        "validation_status": exc.validation_status,
+                        "provider_response_id": exc.provider_response_id,
+                    },
+                )
+                model_failure = ApiError(
+                    status_code=exc.status_code,
+                    code=exc.code,
+                    message=exc.message,
+                    details={
+                        "session_id": effective_session_id,
+                        "turn_id": turn.id,
+                        "judgment_type": "tool_strategy",
+                        "prompt_version": "tool-strategy-v1",
+                    },
+                    retryable=exc.retryable,
+                )
+                model_failure_reason = failure_reason
+        context_tokens = _estimate_context_tokens(
+            context_bundle=context_bundle,
+            user_message=user_message,
+        )
         if model_failure is not None:
             pass
         elif context_tokens > app.state.max_context_tokens:
@@ -5799,6 +6328,7 @@ def create_app(
                             now_fn=_utcnow,
                             new_id_fn=_new_id,
                             runtime_provenance=runtime_provenance,
+                            allowed_capability_ids=selected_capability_ids,
                             google_runtime=_google_runtime(),
                             execute_google_reads_outside_transaction=(
                                 execute_google_reads_outside_transaction

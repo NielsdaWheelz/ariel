@@ -4,6 +4,7 @@ import copy
 import json
 from collections.abc import Generator
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from fastapi.testclient import TestClient
@@ -13,6 +14,8 @@ from testcontainers.postgres import PostgresContainer
 
 import ariel.capability_registry as capability_registry_module
 from ariel.app import ModelAdapter, ModelAdapterError, create_app
+from ariel.google_connector import GOOGLE_CONNECTOR_ID
+from ariel.persistence import GoogleConnectorRecord
 from tests.integration.responses_helpers import responses_message, responses_with_function_calls
 
 
@@ -37,6 +40,41 @@ class SharedContentAdapter:
         self.seen_user_messages.append(user_message)
         if self.failure is not None:
             raise self.failure
+        if context_bundle.get("origin") == "tool_strategy":
+            strategy_input = json.loads(str(input_items[1]["content"]))
+            available_ids = {
+                capability_id
+                for family in strategy_input.get("available_capability_families", [])
+                if isinstance(family, dict)
+                for capability_id in family.get("capability_ids", [])
+                if isinstance(capability_id, str)
+            }
+            selected_capability_ids = [
+                proposal["capability_id"]
+                for proposal in (
+                    self.proposals_for_shared_content
+                    if "capture_kind: shared_content" in user_message
+                    else []
+                )
+                if proposal.get("capability_id") in available_ids
+            ]
+            return responses_message(
+                assistant_text=json.dumps(
+                    {
+                        "decision": "selected_tools" if selected_capability_ids else "no_tools",
+                        "selected_capability_ids": selected_capability_ids,
+                        "rationale": "test strategy",
+                        "unavailable_reason": None,
+                        "confidence": 1.0,
+                    },
+                    sort_keys=True,
+                ),
+                provider=self.provider,
+                model=self.model,
+                provider_response_id="resp_s8_pr02_strategy",
+                input_tokens=3,
+                output_tokens=2,
+            )
         if context_bundle.get("origin") == "tool_result_interpretation":
             interpreter_input = context_bundle.get("tool_result_interpreter_input")
             if not isinstance(interpreter_input, dict):
@@ -307,16 +345,40 @@ def test_s8_pr02_shared_content_origin_taint_denies_external_side_effect_even_wh
     adapter = SharedContentAdapter(
         proposals_for_shared_content=[
             {
-                "capability_id": "cap.framework.external_notify",
+                "capability_id": "cap.email.send",
                 "input": {
-                    "destination": "https://api.framework.local/notify",
-                    "message": "ship now",
+                    "to": ["ops@example.com"],
+                    "subject": "ship now",
+                    "body": "ship now",
+                    "idempotency_key": "shared-content-email-taint-1",
+                    "user_instruction_ref": "turn:current",
                 },
                 "influenced_by_untrusted_content": False,
             }
         ]
     )
     with _build_client(postgres_url, adapter) as client:
+        now = datetime.now(tz=UTC)
+        with cast(Any, client.app).state.session_factory() as db:
+            db.merge(
+                GoogleConnectorRecord(
+                    id=GOOGLE_CONNECTOR_ID,
+                    provider="google",
+                    status="connected",
+                    account_subject="sub_s8_pr02",
+                    account_email="s8-pr02@example.com",
+                    granted_scopes=["https://www.googleapis.com/auth/gmail.send"],
+                    access_token_enc="unused",
+                    refresh_token_enc="unused",
+                    access_token_expires_at=now + timedelta(hours=1),
+                    token_obtained_at=now,
+                    encryption_key_version="v1",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            db.commit()
+
         response = client.post(
             "/v1/captures",
             json={
