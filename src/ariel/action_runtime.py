@@ -26,6 +26,7 @@ from ariel.capability_registry import (
     get_capability,
     payload_hash,
 )
+from ariel.config import AppSettings
 from ariel.executor import (
     ExecutionResult,
     append_turn_event,
@@ -45,19 +46,28 @@ from ariel.google_connector import (
 )
 from ariel.memory import (
     approve_candidate,
+    build_memory_context,
     consolidate_memory,
     correct_assertion,
     delete_assertion,
+    edit_candidate,
     export_memory,
+    import_memory_candidates,
     list_memory,
+    mark_assertion_stale,
+    merge_candidates,
     privacy_delete_assertion,
     propose_memory_candidate,
     redact_evidence,
     reject_candidate,
     resolve_conflict,
     retract_assertion,
+    retry_projection_job,
+    run_memory_eval,
     search_memory,
     set_never_remember_rule,
+    set_assertion_priority,
+    set_memory_scope_binding,
 )
 from ariel.persistence import (
     ActionAttemptRecord,
@@ -109,6 +119,16 @@ _MAX_GMAIL_EVIDENCE_BLOCKS = 12
 _MAX_GMAIL_EVIDENCE_BLOCK_CHARS = 2000
 _GOOGLE_RECEIPT_CAPABILITY_IDS = GOOGLE_WRITE_CAPABILITY_IDS
 _AGENCY_RECEIPT_CAPABILITY_IDS = {"cap.agency.request_pr"}
+
+
+class MemoryCapabilityExecutionError(Exception):
+    pass
+
+
+def _require_memory_events(events: list[dict[str, Any]], error: str) -> None:
+    if not events:
+        raise MemoryCapabilityExecutionError(error)
+
 
 ModelDeclaredTaintStatus = Literal["missing", "true", "false", "malformed"]
 ProposalProvenanceStatus = Literal["clean", "tainted", "ambiguous"]
@@ -736,11 +756,33 @@ def _bounded_memory_payload(
         "evidence",
         "procedures",
         "action_traces",
+        "topics",
+        "context_blocks",
+        "deletions",
+        "scope_bindings",
+        "retention_policies",
+        "sensitivity_labels",
+        "export_artifacts",
+        "eval_runs",
     )
     for key in list_keys:
         value = payload.get(key)
         if not isinstance(value, list):
             payload[key] = []
+            continue
+        if section == "hot_index" and key == "context_blocks":
+            payload[key] = [
+                item
+                for item in value
+                if isinstance(item, dict) and item.get("block_type") == "hot_index"
+            ][:limit]
+            continue
+        if section == "topics" and key == "context_blocks":
+            payload[key] = [
+                item
+                for item in value
+                if isinstance(item, dict) and item.get("block_type") == "topic"
+            ][:limit]
             continue
         payload[key] = value[:limit] if section in {"all", key} else []
     return payload
@@ -754,6 +796,8 @@ def _execute_memory_capability(
     action_attempt: ActionAttemptRecord,
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
+    settings: AppSettings | None = None,
+    memory_import_cutover_enabled: bool = False,
 ) -> dict[str, Any]:
     actor_id = _memory_actor_id(db=db, action_attempt=action_attempt)
     if capability_id == "cap.memory.inspect":
@@ -771,17 +815,108 @@ def _execute_memory_capability(
             query=str(normalized_input["query"]),
             limit=int(normalized_input["limit"]),
             current_session_id=action_attempt.session_id,
+            scope_key=normalized_input.get("scope_key"),
+            actor_id=actor_id,
+            settings=settings,
         )
         return {"status": "searched", "schema_version": "memory.sota.v1", "results": results}
+    if capability_id == "cap.memory.recall_diagnostics":
+        memory_context, recall_event = build_memory_context(
+            db,
+            user_message=str(normalized_input["query"]),
+            max_recalled_assertions=int(normalized_input["limit"]),
+            current_session_id=action_attempt.session_id,
+            scope_key=normalized_input.get("scope_key"),
+            actor_id=actor_id,
+            settings=settings,
+        )
+        return {
+            "status": "diagnosed",
+            "schema_version": memory_context.get("schema_version", "memory.sota.v1"),
+            "recall_diagnostics": recall_event,
+            "memory_context": {
+                "hot_index": memory_context.get("hot_index", []),
+                "topic_index": memory_context.get("topic_index", []),
+                "semantic_assertions": memory_context.get("semantic_assertions", []),
+                "project_state": memory_context.get("project_state", []),
+                "procedural_memory": memory_context.get("procedural_memory", []),
+                "action_traces": memory_context.get("action_traces", []),
+                "conflicts": memory_context.get("conflicts", []),
+            },
+            "memory_policy": memory_context.get("memory_policy"),
+            "projection_health": memory_context.get("projection_health", {}),
+        }
+    if capability_id == "cap.memory.topics":
+        return {
+            "status": "listed",
+            "memory": _bounded_memory_payload(
+                db,
+                section="topics",
+                limit=int(normalized_input["limit"]),
+            ),
+        }
+    if capability_id == "cap.memory.hot_index":
+        return {
+            "status": "listed",
+            "memory": _bounded_memory_payload(
+                db,
+                section="hot_index",
+                limit=int(normalized_input["limit"]),
+            ),
+        }
+    if capability_id == "cap.memory.context_blocks":
+        limit = int(normalized_input["limit"])
+        payload = _bounded_memory_payload(
+            db,
+            section="context_blocks",
+            limit=100,
+        )
+        block_type = str(normalized_input["block_type"])
+        topic_id = normalized_input.get("topic_id")
+        if block_type != "all":
+            payload["context_blocks"] = [
+                item
+                for item in payload["context_blocks"]
+                if isinstance(item, dict) and item.get("block_type") == block_type
+            ]
+        else:
+            payload["context_blocks"] = payload["context_blocks"]
+        if isinstance(topic_id, str):
+            payload["context_blocks"] = [
+                item
+                for item in payload["context_blocks"]
+                if isinstance(item, dict) and item.get("topic_id") == topic_id
+            ]
+        payload["context_blocks"] = payload["context_blocks"][:limit]
+        return {"status": "listed", "memory": payload}
     if capability_id == "cap.memory.export":
         artifact = export_memory(
             db,
-            scope_key="global",
+            scope_key=str(normalized_input["scope_key"]),
             actor_id=actor_id,
             now_fn=now_fn,
             new_id_fn=new_id_fn,
+            source_session_id=action_attempt.session_id,
         )
         return {"status": "exported", "format": "json", "export": artifact}
+    if capability_id == "cap.memory.deletions":
+        return {
+            "status": "listed",
+            "memory": _bounded_memory_payload(
+                db,
+                section="deletions",
+                limit=int(normalized_input["limit"]),
+            ),
+        }
+    if capability_id == "cap.memory.scope_bindings":
+        return {
+            "status": "listed",
+            "memory": _bounded_memory_payload(
+                db,
+                section="scope_bindings",
+                limit=int(normalized_input["limit"]),
+            ),
+        }
     if capability_id == "cap.memory.propose":
         events = propose_memory_candidate(
             db,
@@ -827,8 +962,38 @@ def _execute_memory_capability(
                 new_id_fn=new_id_fn,
             )
             status = "rejected"
+        _require_memory_events(events, "memory_candidate_review_not_applicable")
         return {
-            "status": status if events else "not_found",
+            "status": status,
+            "events": events,
+            "memory": _bounded_memory_payload(db, section="all", limit=20),
+        }
+    if capability_id == "cap.memory.edit_candidate":
+        events = edit_candidate(
+            db,
+            assertion_id=str(normalized_input["assertion_id"]),
+            value=str(normalized_input["value"]),
+            actor_id=actor_id,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        _require_memory_events(events, "memory_candidate_edit_not_applicable")
+        return {
+            "status": "edited",
+            "events": events,
+            "memory": _bounded_memory_payload(db, section="all", limit=20),
+        }
+    if capability_id == "cap.memory.merge_candidates":
+        events = merge_candidates(
+            db,
+            assertion_ids=normalized_input["assertion_ids"],
+            actor_id=actor_id,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        _require_memory_events(events, "memory_candidates_merge_not_applicable")
+        return {
+            "status": "merged",
             "events": events,
             "memory": _bounded_memory_payload(db, section="all", limit=20),
         }
@@ -842,8 +1007,9 @@ def _execute_memory_capability(
             now_fn=now_fn,
             new_id_fn=new_id_fn,
         )
+        _require_memory_events(events, "memory_assertion_correct_not_applicable")
         return {
-            "status": "corrected" if events else "not_found",
+            "status": "corrected",
             "events": events,
             "memory": _bounded_memory_payload(db, section="all", limit=20),
         }
@@ -855,8 +1021,9 @@ def _execute_memory_capability(
             now_fn=now_fn,
             new_id_fn=new_id_fn,
         )
+        _require_memory_events(events, "memory_assertion_retract_not_applicable")
         return {
-            "status": "retracted" if events else "not_found",
+            "status": "retracted",
             "events": events,
             "memory": _bounded_memory_payload(db, section="all", limit=20),
         }
@@ -868,8 +1035,9 @@ def _execute_memory_capability(
             now_fn=now_fn,
             new_id_fn=new_id_fn,
         )
+        _require_memory_events(events, "memory_assertion_delete_not_applicable")
         return {
-            "status": "deleted" if events else "not_found",
+            "status": "deleted",
             "events": events,
             "memory": _bounded_memory_payload(db, section="all", limit=20),
         }
@@ -882,8 +1050,9 @@ def _execute_memory_capability(
             now_fn=now_fn,
             new_id_fn=new_id_fn,
         )
+        _require_memory_events(events, "memory_assertion_privacy_delete_not_applicable")
         return {
-            "status": "privacy_deleted" if events else "not_found",
+            "status": "privacy_deleted",
             "events": events,
             "memory": _bounded_memory_payload(db, section="all", limit=20),
         }
@@ -896,25 +1065,46 @@ def _execute_memory_capability(
             now_fn=now_fn,
             new_id_fn=new_id_fn,
         )
+        _require_memory_events(events, "memory_evidence_redact_not_applicable")
         return {
-            "status": "redacted" if events else "not_found",
+            "status": "redacted",
             "events": events,
             "memory": _bounded_memory_payload(db, section="all", limit=20),
         }
     if capability_id == "cap.memory.set_never_remember":
         rule = set_never_remember_rule(
             db,
-            scope_key="global",
+            scope_key=str(normalized_input["scope_key"]),
             pattern=str(normalized_input["rule"]),
             actor_id=actor_id,
             reason="never-remember rule requested",
             now_fn=now_fn,
             new_id_fn=new_id_fn,
         )
+        if rule is None:
+            raise MemoryCapabilityExecutionError("memory_never_remember_rule_invalid")
         return {
-            "status": "recorded" if rule is not None else "invalid",
+            "status": "recorded",
             "rule": rule,
             "memory": _bounded_memory_payload(db, section="all", limit=20),
+        }
+    if capability_id == "cap.memory.set_scope_mode":
+        binding = set_memory_scope_binding(
+            db,
+            scope_type=str(normalized_input["scope_type"]),
+            scope_key=str(normalized_input["scope_key"]),
+            memory_mode=str(normalized_input["memory_mode"]),
+            actor_id=actor_id,
+            reason=normalized_input.get("reason"),
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        if binding is None:
+            raise MemoryCapabilityExecutionError("memory_scope_mode_invalid")
+        return {
+            "status": "recorded",
+            "scope_binding": binding,
+            "memory": _bounded_memory_payload(db, section="scope_bindings", limit=20),
         }
     if capability_id == "cap.memory.resolve_conflict":
         events = resolve_conflict(
@@ -925,20 +1115,110 @@ def _execute_memory_capability(
             now_fn=now_fn,
             new_id_fn=new_id_fn,
         )
+        _require_memory_events(events, "memory_conflict_resolve_not_applicable")
         return {
-            "status": "resolved" if events else "not_found",
+            "status": "resolved",
+            "events": events,
+            "memory": _bounded_memory_payload(db, section="all", limit=20),
+        }
+    if capability_id == "cap.memory.prioritize":
+        updated = set_assertion_priority(
+            db,
+            assertion_id=str(normalized_input["assertion_id"]),
+            priority="pinned",
+            actor_id=actor_id,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        if updated is None:
+            raise MemoryCapabilityExecutionError("memory_assertion_priority_not_applicable")
+        return {
+            "status": "prioritized",
+            "assertion": updated,
+            "memory": _bounded_memory_payload(db, section="all", limit=20),
+        }
+    if capability_id == "cap.memory.deprioritize":
+        updated = set_assertion_priority(
+            db,
+            assertion_id=str(normalized_input["assertion_id"]),
+            priority="deprioritized",
+            actor_id=actor_id,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        if updated is None:
+            raise MemoryCapabilityExecutionError("memory_assertion_priority_not_applicable")
+        return {
+            "status": "deprioritized",
+            "assertion": updated,
+            "memory": _bounded_memory_payload(db, section="all", limit=20),
+        }
+    if capability_id == "cap.memory.mark_stale":
+        events = mark_assertion_stale(
+            db,
+            assertion_id=str(normalized_input["assertion_id"]),
+            actor_id=actor_id,
+            reason=normalized_input.get("reason"),
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        _require_memory_events(events, "memory_assertion_mark_stale_not_applicable")
+        return {
+            "status": "stale",
             "events": events,
             "memory": _bounded_memory_payload(db, section="all", limit=20),
         }
     if capability_id == "cap.memory.consolidate":
         result = consolidate_memory(
             db,
-            scope_key="global",
+            scope_key=str(normalized_input["scope_key"]),
             actor_id=actor_id,
             now_fn=now_fn,
             new_id_fn=new_id_fn,
+            source_session_id=action_attempt.session_id,
         )
         return {"status": "consolidated", "consolidation": result}
+    if capability_id == "cap.memory.import":
+        if not memory_import_cutover_enabled:
+            raise MemoryCapabilityExecutionError("memory_import_disabled")
+        imported_ids = import_memory_candidates(
+            db,
+            source_session_id=action_attempt.session_id,
+            actor_id=actor_id,
+            candidates=normalized_input["candidates"],
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+            cutover_enabled=memory_import_cutover_enabled,
+        )
+        return {
+            "status": "imported",
+            "imported_candidate_ids": imported_ids,
+            "memory": _bounded_memory_payload(db, section="candidates", limit=20),
+        }
+    if capability_id == "cap.memory.eval":
+        result = run_memory_eval(
+            db,
+            eval_name=str(normalized_input["eval_name"]),
+            cases=normalized_input["cases"],
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+            settings=settings,
+            current_session_id=action_attempt.session_id,
+        )
+        return {"status": "evaluated", "eval": result}
+    if capability_id == "cap.memory.retry_projection_job":
+        retried_job = retry_projection_job(
+            db,
+            job_id=str(normalized_input["job_id"]),
+            now_fn=now_fn,
+        )
+        if retried_job is None:
+            raise MemoryCapabilityExecutionError("memory_projection_job_not_found")
+        return {
+            "status": "queued",
+            "projection_job": retried_job,
+            "memory": _bounded_memory_payload(db, section="all", limit=20),
+        }
     raise RuntimeError("unknown_memory_capability")
 
 
@@ -3030,6 +3310,8 @@ def process_response_function_calls(
     agency_runtime: Any | None = None,
     attachment_runtime: AttachmentContentRuntime | None = None,
     allowed_capability_ids: Sequence[str] = (),
+    settings: AppSettings | None = None,
+    memory_import_cutover_enabled: bool = False,
 ) -> FunctionCallProcessingResult:
     inline_results: list[dict[str, Any]] = []
     pending_approvals: list[dict[str, Any]] = []
@@ -3746,6 +4028,8 @@ def process_response_function_calls(
                     action_attempt=action_attempt,
                     now_fn=now_fn,
                     new_id_fn=new_id_fn,
+                    settings=settings,
+                    memory_import_cutover_enabled=memory_import_cutover_enabled,
                 )
             except Exception as exc:  # noqa: BLE001
                 execution_result = ExecutionResult(
@@ -4446,6 +4730,8 @@ def process_action_execution_task(
     agency_runtime: Any | None,
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
+    settings: AppSettings | None = None,
+    memory_import_cutover_enabled: bool = False,
 ) -> bool:
     provider_call: tuple[str, dict[str, Any], str, set[str], str | None] | None = None
     email_provider_call: tuple[str, str, dict[str, Any], str, set[str], str] | None = None
@@ -4812,6 +5098,8 @@ def process_action_execution_task(
                         action_attempt=action_attempt,
                         now_fn=now_fn,
                         new_id_fn=new_id_fn,
+                        settings=settings,
+                        memory_import_cutover_enabled=memory_import_cutover_enabled,
                     )
                 except Exception as exc:  # noqa: BLE001
                     _fail_action_execution(

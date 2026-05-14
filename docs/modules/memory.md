@@ -844,33 +844,11 @@ behavior.
 - `src/ariel/persistence.py`
   - ORM models for canonical memory, review, conflict, salience, versions,
     scopes, retention, topics, projections, and eval history when persisted.
-- `src/ariel/memory_models.py`
-  - Pydantic models and owned types for memory values, evidence, candidates,
-    recall bundles, topics, projections, reviews, conflicts, deletion, and evals.
-- `src/ariel/memory_lifecycle.py`
-  - Candidate creation, activation, correction, merge, supersession, staleness,
-    retraction, deletion, privacy deletion, review, and conflict operations.
-- `src/ariel/memory_policy.py`
-  - Trust, sensitivity, no-memory, auto-approval, review routing, retention, and
-    never-remember rules.
-- `src/ariel/memory_extraction.py`
-  - AI extraction contracts for assertions, episodes, relationships,
-    procedures, project state, action traces, and negative memory.
-- `src/ariel/memory_projection.py`
-  - Projection rebuild jobs for embeddings, full-text, entity indexes, graph
-    caches, temporal indexes, symbol maps, hot index blocks, topic blocks, and
-    export artifacts.
-- `src/ariel/memory_retrieval.py`
-  - Candidate retrieval service with hybrid retrieval and deterministic rails.
-- `src/ariel/memory_curation.py`
-  - AI memory curation contract and validation.
-- `src/ariel/memory_consolidation.py`
-  - Audited consolidation flow for merges, supersessions, topic rebuilds, hot
-    index rebuilds, staleness detection, and procedure proposals.
-- `src/ariel/memory_export.py`
-  - Export/import artifacts and cross-agent memory pack projections.
-- `src/ariel/memory_eval.py`
-  - Local long-memory eval runner, fixtures, scoring, and result serialization.
+- `src/ariel/memory.py`
+  - Canonical memory lifecycle, policy rails, extraction contracts, retrieval,
+    projection rebuilds, consolidation, import/export, evals, and serialization.
+  - Keeps control flow local and explicit until a split clearly reduces concrete
+    complexity.
 - `src/ariel/response_contracts.py`
   - New memory API, recall diagnostics, AI operation, and event contracts.
 - `src/ariel/worker.py`
@@ -889,8 +867,8 @@ behavior.
   - Adds settings only for real implementation needs, such as budgets,
     consolidation cadence, eval toggles, and export paths.
 
-`src/ariel/memory.py` can remain as a thin facade during implementation only if
-it does not keep legacy logic. The final state must keep module ownership clear.
+Do not add memory submodules, facade layers, adapters, or registries unless the
+existing flat modules have a concrete complexity problem that the split reduces.
 
 ### Migration Files
 
@@ -903,25 +881,12 @@ it does not keep legacy logic. The final state must keep module ownership clear.
 
 ### Test Files
 
-- `tests/unit/test_memory_models.py`
-- `tests/unit/test_memory_policy.py`
-- `tests/unit/test_memory_lifecycle.py`
-- `tests/unit/test_memory_extraction.py`
-- `tests/unit/test_memory_projection.py`
-- `tests/unit/test_memory_retrieval.py`
-- `tests/unit/test_memory_curation.py`
-- `tests/unit/test_memory_consolidation.py`
-- `tests/unit/test_memory_conflicts.py`
-- `tests/unit/test_memory_context_bundle.py`
-- `tests/integration/test_memory_cutover_acceptance.py`
-- `tests/integration/test_memory_project_state.py`
-- `tests/integration/test_memory_review_api.py`
-- `tests/integration/test_memory_projection_jobs.py`
-- `tests/integration/test_memory_temporal_graph.py`
-- `tests/integration/test_memory_privacy_deletion.py`
-- `tests/integration/test_memory_proactive_integration.py`
-- `tests/integration/test_memory_discord_operations.py`
-- `tests/integration/test_memory_eval_acceptance.py`
+- `tests/integration/test_north_star_memory_pass.py`
+- `tests/integration/test_worker_memory_jobs.py`
+- `tests/unit/test_responses_tool_contract.py`
+- `tests/unit/test_discord_bot.py`
+- Existing slice acceptance tests continue covering session, capture,
+  proactive, auth, and transport regressions that memory depends on.
 
 ## Acceptance Criteria
 
@@ -1028,7 +993,8 @@ it does not keep legacy logic. The final state must keep module ownership clear.
 ### API And AI Operations
 
 - Users can list, search, inspect, correct, delete, privacy-delete, redact,
-  export, prioritize, deprioritize, and consolidate memory.
+  export, prioritize, deprioritize, consolidate memory, and set scoped memory
+  mode.
 - Users can inspect pending candidates before approval when review is required.
 - Users can inspect conflicts and resolution history.
 - Users can inspect evidence, memory versions, projection health, and recall

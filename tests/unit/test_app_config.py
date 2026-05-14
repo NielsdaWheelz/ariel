@@ -182,6 +182,26 @@ def test_turn_budget_env_overrides_are_loaded(monkeypatch: pytest.MonkeyPatch) -
     assert settings.approval_actor_id == "user.integration"
 
 
+def test_memory_runtime_settings_load_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARIEL_MEMORY_EMBEDDING_PROVIDER", "local")
+    monkeypatch.setenv("ARIEL_MEMORY_EMBEDDING_MODEL", "fixture-embedding")
+    monkeypatch.setenv("ARIEL_MEMORY_EMBEDDING_DIMENSIONS", "1536")
+    monkeypatch.setenv("ARIEL_MEMORY_IMPORT_CUTOVER_ENABLED", "true")
+
+    settings = AppSettings()
+    assert settings.memory_embedding_provider == "local"
+    assert settings.memory_embedding_model == "fixture-embedding"
+    assert settings.memory_embedding_dimensions == 1536
+    assert settings.memory_import_cutover_enabled is True
+
+
+def test_memory_embedding_dimensions_must_match_schema(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARIEL_MEMORY_EMBEDDING_DIMENSIONS", "3072")
+
+    with pytest.raises(ValidationError):
+        AppSettings()
+
+
 @pytest.mark.parametrize(
     ("env_name", "env_value"),
     [

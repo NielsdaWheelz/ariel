@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 
 class ResponseContractViolation(Exception):
@@ -876,6 +876,8 @@ class SurfaceMemoryContextBlockContract(BaseModel):
     source_action_trace_ids: list[str]
     source_procedure_ids: list[str]
     source_project_state_snapshot_ids: list[str]
+    source_memory_versions: dict[str, Any]
+    source_projection_versions: dict[str, Any]
     projection_version: str
     created_at: str
     updated_at: str
@@ -891,6 +893,7 @@ class SurfaceMemoryDeletionContract(BaseModel):
     actor_id: str
     reason: str | None
     redaction_posture: str
+    projection_invalidation: dict[str, Any]
     created_at: str
 
 
@@ -945,8 +948,11 @@ class SurfaceMemoryExportArtifactContract(BaseModel):
     scope_key: str
     export_format: str
     status: str
+    projection_version: str
     redaction_posture: str
     source_counts: Any
+    source_memory_versions: dict[str, Any]
+    source_projection_versions: dict[str, Any]
     created_at: str
     updated_at: str
 
@@ -973,15 +979,15 @@ class SurfaceMemoryResponseContract(BaseModel):
     project_state: list[SurfaceProjectStateContract]
     evidence: list[SurfaceMemoryEvidenceContract]
     procedures: list[SurfaceMemoryProcedureContract]
-    action_traces: list[SurfaceMemoryActionTraceContract] = []
-    topics: list[SurfaceMemoryTopicContract] = []
-    context_blocks: list[SurfaceMemoryContextBlockContract] = []
-    deletions: list[SurfaceMemoryDeletionContract] = []
-    scope_bindings: list[SurfaceMemoryScopeBindingContract] = []
-    retention_policies: list[SurfaceMemoryRetentionPolicyContract] = []
-    sensitivity_labels: list[SurfaceMemorySensitivityLabelContract] = []
-    export_artifacts: list[SurfaceMemoryExportArtifactContract] = []
-    eval_runs: list[SurfaceMemoryEvalRunContract] = []
+    action_traces: list[SurfaceMemoryActionTraceContract] = Field(default_factory=list)
+    topics: list[SurfaceMemoryTopicContract] = Field(default_factory=list)
+    context_blocks: list[SurfaceMemoryContextBlockContract] = Field(default_factory=list)
+    deletions: list[SurfaceMemoryDeletionContract] = Field(default_factory=list)
+    scope_bindings: list[SurfaceMemoryScopeBindingContract] = Field(default_factory=list)
+    retention_policies: list[SurfaceMemoryRetentionPolicyContract] = Field(default_factory=list)
+    sensitivity_labels: list[SurfaceMemorySensitivityLabelContract] = Field(default_factory=list)
+    export_artifacts: list[SurfaceMemoryExportArtifactContract] = Field(default_factory=list)
+    eval_runs: list[SurfaceMemoryEvalRunContract] = Field(default_factory=list)
     projection_health: SurfaceMemoryProjectionHealthContract
 
 
@@ -990,6 +996,12 @@ class SurfaceMemorySearchResultContract(BaseModel):
 
     id: str
     kind: str
+    rationale: str | None = None
+    value: Any = None
+    evidence_refs: Any = None
+    retrieval_features: Any = None
+    conflict_status: Any = None
+    projection_version: str | None = None
 
 
 class SurfaceMemorySearchResponseContract(BaseModel):

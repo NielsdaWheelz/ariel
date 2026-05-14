@@ -1745,12 +1745,19 @@ class MemoryProjectionJobRecord(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     projection_kind: Mapped[str] = mapped_column(String(32), nullable=False)
     target_table: Mapped[str] = mapped_column(String(64), nullable=False)
-    target_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    target_id: Mapped[str] = mapped_column(Text, nullable=False, index=True)
     lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False)
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     max_retries: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    claimed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    attempt_token: Mapped[str | None] = mapped_column(String(32), nullable=True)
     run_after: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    last_heartbeat: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )
@@ -1785,6 +1792,7 @@ class MemoryEmbeddingProjectionRecord(Base):
         index=True,
     )
     projection_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_memory_version: Mapped[int] = mapped_column(Integer, nullable=False)
     embedding_provider: Mapped[str] = mapped_column(String(32), nullable=False)
     embedding_model: Mapped[str] = mapped_column(String(128), nullable=False)
     embedding_dimensions: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -1804,6 +1812,10 @@ class MemoryEmbeddingProjectionRecord(Base):
         CheckConstraint(
             f"embedding_dimensions = {MEMORY_EMBEDDING_DIMENSIONS}",
             name="ck_memory_embedding_projection_dimensions",
+        ),
+        CheckConstraint(
+            "source_memory_version > 0",
+            name="ck_memory_embedding_projection_source_memory_version",
         ),
         Index(
             "ix_memory_embedding_projection_unique",
@@ -1825,6 +1837,7 @@ class MemoryTemporalProjectionRecord(Base):
     valid_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     projection_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_memory_version: Mapped[int] = mapped_column(Integer, nullable=False)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
@@ -1846,6 +1859,10 @@ class MemoryTemporalProjectionRecord(Base):
         CheckConstraint(
             "(valid_to IS NULL) OR (valid_from IS NULL) OR (valid_from < valid_to)",
             name="ck_memory_temporal_projection_valid_interval",
+        ),
+        CheckConstraint(
+            "source_memory_version > 0",
+            name="ck_memory_temporal_projection_source_memory_version",
         ),
         Index(
             "ix_memory_temporal_projections_unique",
@@ -1869,6 +1886,7 @@ class MemorySymbolProjectionRecord(Base):
     path: Mapped[str] = mapped_column(Text, nullable=False)
     language: Mapped[str | None] = mapped_column(String(64), nullable=True)
     projection_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_memory_version: Mapped[int] = mapped_column(Integer, nullable=False)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
@@ -1882,6 +1900,10 @@ class MemorySymbolProjectionRecord(Base):
             "canonical_table IN ('memory_assertions', 'memory_episodes', "
             "'memory_action_traces', 'memory_procedures', 'project_state_snapshots')",
             name="ck_memory_symbol_projection_canonical_table",
+        ),
+        CheckConstraint(
+            "source_memory_version > 0",
+            name="ck_memory_symbol_projection_source_memory_version",
         ),
         Index(
             "ix_memory_symbol_projections_unique",
@@ -1903,6 +1925,7 @@ class MemoryKeywordProjectionRecord(Base):
     canonical_table: Mapped[str] = mapped_column(String(64), nullable=False)
     canonical_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     projection_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_memory_version: Mapped[int] = mapped_column(Integer, nullable=False)
     search_text: Mapped[str] = mapped_column(Text, nullable=False)
     weighted_terms: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(
@@ -1917,6 +1940,10 @@ class MemoryKeywordProjectionRecord(Base):
             "canonical_table IN ('memory_assertions', 'memory_evidence', "
             "'memory_episodes', 'memory_reasoning_traces', 'memory_procedures')",
             name="ck_memory_keyword_projection_canonical_table",
+        ),
+        CheckConstraint(
+            "source_memory_version > 0",
+            name="ck_memory_keyword_projection_source_memory_version",
         ),
         Index(
             "ix_memory_keyword_projection_unique",
@@ -1941,6 +1968,7 @@ class MemoryEntityProjectionRecord(Base):
         index=True,
     )
     projection_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_memory_version: Mapped[int] = mapped_column(Integer, nullable=False)
     mention_text: Mapped[str] = mapped_column(Text, nullable=False)
     features: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(
@@ -1956,6 +1984,10 @@ class MemoryEntityProjectionRecord(Base):
             "'memory_relationships', 'memory_episodes', 'memory_reasoning_traces', "
             "'memory_procedures', 'project_state_snapshots')",
             name="ck_memory_entity_projection_canonical_table",
+        ),
+        CheckConstraint(
+            "source_memory_version > 0",
+            name="ck_memory_entity_projection_source_memory_version",
         ),
         Index(
             "ix_memory_entity_projection_unique",
@@ -1985,6 +2017,8 @@ class MemoryGraphProjectionRecord(Base):
         index=True,
     )
     projection_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_memory_versions: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    source_projection_versions: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     relationship_path: Mapped[list[dict[str, Any]]] = mapped_column(
         JSONB,
         nullable=False,
@@ -2002,6 +2036,14 @@ class MemoryGraphProjectionRecord(Base):
     __table_args__ = (
         CheckConstraint("distance >= 0", name="ck_memory_graph_projection_distance"),
         CheckConstraint("score >= 0.0", name="ck_memory_graph_projection_score"),
+        CheckConstraint(
+            "jsonb_typeof(source_memory_versions) = 'object'",
+            name="ck_memory_graph_projection_source_memory_versions_object",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(source_projection_versions) = 'object'",
+            name="ck_memory_graph_projection_source_projection_versions_object",
+        ),
         Index(
             "ix_memory_graph_projection_unique",
             "source_entity_id",
@@ -2036,9 +2078,8 @@ class MemoryContextBlockRecord(Base):
         nullable=False,
         default=list,
     )
-    source_memory_versions: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, default=dict
-    )
+    source_memory_versions: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    source_projection_versions: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     projection_version: Mapped[str] = mapped_column(String(32), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
@@ -2061,6 +2102,14 @@ class MemoryContextBlockRecord(Base):
             "(block_type = 'topic' AND topic_id IS NOT NULL) OR "
             "(block_type != 'topic' AND topic_id IS NULL)",
             name="ck_memory_context_block_topic_binding",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(source_memory_versions) = 'object'",
+            name="ck_memory_context_block_source_memory_versions_object",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(source_projection_versions) = 'object'",
+            name="ck_memory_context_block_source_projection_versions_object",
         ),
         Index(
             "ix_memory_context_blocks_unique",
@@ -2166,9 +2215,12 @@ class MemoryExportArtifactRecord(Base):
     scope_key: Mapped[str] = mapped_column(Text, nullable=False, index=True)
     export_format: Mapped[str] = mapped_column(String(32), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
+    projection_version: Mapped[str] = mapped_column(String(32), nullable=False)
     redaction_posture: Mapped[str] = mapped_column(String(32), nullable=False)
     content: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     source_counts: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    source_memory_versions: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    source_projection_versions: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     actor_id: Mapped[str] = mapped_column(String(128), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
@@ -2189,6 +2241,14 @@ class MemoryExportArtifactRecord(Base):
         CheckConstraint(
             "redaction_posture IN ('none', 'redacted', 'privacy_deleted')",
             name="ck_memory_export_artifact_redaction_posture",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(source_memory_versions) = 'object'",
+            name="ck_memory_export_artifact_source_memory_versions_object",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(source_projection_versions) = 'object'",
+            name="ck_memory_export_artifact_source_projection_versions_object",
         ),
     )
 

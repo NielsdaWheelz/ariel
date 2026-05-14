@@ -45,6 +45,7 @@ class AppSettings(BaseSettings):
     memory_embedding_provider: str = "openai"
     memory_embedding_model: str = "text-embedding-3-small"
     memory_embedding_dimensions: int = MEMORY_EMBEDDING_DIMENSIONS
+    memory_import_cutover_enabled: bool = False
     auto_rotate_max_turns: int = 120
     auto_rotate_max_age_seconds: int = 172800
     auto_rotate_context_pressure_tokens: int = 5400

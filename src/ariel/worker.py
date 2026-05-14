@@ -7,7 +7,7 @@ from typing import Any
 
 import httpx
 import ulid
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from .action_runtime import (
@@ -29,6 +29,7 @@ from .persistence import (
     EmailThreadWatchRecord,
     JobEventRecord,
     JobRecord,
+    MemoryProjectionJobRecord,
     NotificationDeliveryRecord,
     NotificationRecord,
     SessionRecord,
@@ -36,7 +37,12 @@ from .persistence import (
     WorkFollowUpLoopRecord,
     to_rfc3339,
 )
-from .memory import process_memory_extract_turn, process_memory_projection_job
+from .memory import (
+    consolidate_memory,
+    export_memory,
+    process_memory_extract_turn,
+    process_memory_projection_job,
+)
 from .proactivity import (
     mark_proactive_turn_delivered,
     process_proactive_action_execution_due,
@@ -63,6 +69,16 @@ PROACTIVE_RECOVERABLE_TASK_TYPES = (
     "proactive_feedback_learning_due",
     "proactive_action_execution_due",
 )
+
+MEMORY_CONSOLIDATION_PROJECTION_KINDS = (
+    "context_block",
+    "project_state",
+    "hot_index",
+    "topic_block",
+)
+
+MEMORY_MAINTENANCE_PROJECTION_KINDS = MEMORY_CONSOLIDATION_PROJECTION_KINDS + ("export",)
+SUPPORTED_MEMORY_PROJECTION_KINDS = ("embedding",) + MEMORY_MAINTENANCE_PROJECTION_KINDS
 
 
 class UnsupportedTaskType(RuntimeError):
@@ -262,6 +278,38 @@ def reap_stale_tasks(db: Session, *, now: datetime, heartbeat_timeout_seconds: i
     return len(stale_tasks) + len(recoverable_failed_tasks)
 
 
+def reap_stale_memory_projection_jobs(
+    db: Session,
+    *,
+    now: datetime,
+    heartbeat_timeout_seconds: int,
+) -> int:
+    stale_before = now - timedelta(seconds=heartbeat_timeout_seconds)
+    stale_jobs = db.scalars(
+        select(MemoryProjectionJobRecord)
+        .where(
+            MemoryProjectionJobRecord.lifecycle_state == "running",
+            func.coalesce(
+                MemoryProjectionJobRecord.last_heartbeat,
+                MemoryProjectionJobRecord.updated_at,
+            )
+            < stale_before,
+        )
+        .with_for_update(skip_locked=True)
+    ).all()
+    for job in stale_jobs:
+        job.lifecycle_state = "pending" if job.attempts < job.max_retries else "dead_letter"
+        job.error = "heartbeat timeout"
+        job.claimed_by = None
+        job.attempt_token = None
+        job.last_heartbeat = None
+        job.run_after = now
+        job.updated_at = now
+    if stale_jobs:
+        db.flush()
+    return len(stale_jobs)
+
+
 def enqueue_due_worker_owned_ambient_task(
     db: Session,
     *,
@@ -375,6 +423,151 @@ def enqueue_due_work_follow_up_evaluation_tasks(
     return enqueued
 
 
+def process_memory_maintenance_job(
+    *,
+    session_factory: sessionmaker[Session],
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+    worker_id: str = "memory-worker",
+) -> bool:
+    with session_factory() as db:
+        with db.begin():
+            now = now_fn()
+            job = db.scalar(
+                select(MemoryProjectionJobRecord)
+                .where(
+                    MemoryProjectionJobRecord.projection_kind.in_(
+                        MEMORY_MAINTENANCE_PROJECTION_KINDS
+                    ),
+                    MemoryProjectionJobRecord.lifecycle_state == "pending",
+                    MemoryProjectionJobRecord.run_after <= now,
+                )
+                .order_by(
+                    MemoryProjectionJobRecord.run_after.asc(),
+                    MemoryProjectionJobRecord.created_at.asc(),
+                    MemoryProjectionJobRecord.id.asc(),
+                )
+                .limit(1)
+                .with_for_update(skip_locked=True)
+            )
+            if job is None:
+                return False
+            job.lifecycle_state = "running"
+            job.attempts += 1
+            job.claimed_by = worker_id
+            job.attempt_token = new_id_fn("mpa")
+            job.last_heartbeat = now
+            job.updated_at = now
+            job_id = job.id
+            attempt_token = str(job.attempt_token)
+            projection_kind = job.projection_kind
+            scope_key = job.target_id.strip()
+            if job.target_table != "memory_scopes":
+                job.lifecycle_state = "dead_letter"
+                job.error = (
+                    f"memory maintenance job target table must be memory_scopes: {job.target_table}"
+                )
+                job.claimed_by = None
+                job.attempt_token = None
+                job.last_heartbeat = None
+                job.run_after = now
+                job.updated_at = now
+                return True
+            if not scope_key:
+                job.lifecycle_state = "dead_letter"
+                job.error = "memory maintenance job missing target scope"
+                job.claimed_by = None
+                job.attempt_token = None
+                job.last_heartbeat = None
+                job.run_after = now
+                job.updated_at = now
+                return True
+
+    try:
+        with session_factory() as db:
+            with db.begin():
+                job = db.scalar(
+                    select(MemoryProjectionJobRecord)
+                    .where(
+                        MemoryProjectionJobRecord.id == job_id,
+                        MemoryProjectionJobRecord.lifecycle_state == "running",
+                        MemoryProjectionJobRecord.attempt_token == attempt_token,
+                    )
+                    .with_for_update()
+                )
+                if job is None:
+                    return True
+                if projection_kind in MEMORY_CONSOLIDATION_PROJECTION_KINDS:
+                    consolidate_memory(
+                        db,
+                        scope_key=scope_key,
+                        actor_id=f"memory-worker:{job_id}",
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
+                elif projection_kind == "export":
+                    export_memory(
+                        db,
+                        scope_key=scope_key,
+                        actor_id=f"memory-worker:{job_id}",
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
+                else:
+                    raise RuntimeError(f"unsupported memory maintenance job: {projection_kind}")
+                now = now_fn()
+                job.lifecycle_state = "completed"
+                job.error = None
+                job.claimed_by = None
+                job.attempt_token = None
+                job.last_heartbeat = None
+                job.updated_at = now
+    except Exception as exc:
+        _mark_memory_projection_job_failed(
+            session_factory=session_factory,
+            job_id=job_id,
+            attempt_token=attempt_token,
+            error=safe_failure_reason(str(exc), fallback=f"unexpected {exc.__class__.__name__}"),
+            now_fn=now_fn,
+        )
+    return True
+
+
+def process_unsupported_memory_projection_job(
+    *,
+    session_factory: sessionmaker[Session],
+    now_fn: Callable[[], datetime],
+) -> bool:
+    with session_factory() as db:
+        with db.begin():
+            now = now_fn()
+            job = db.scalar(
+                select(MemoryProjectionJobRecord)
+                .where(
+                    MemoryProjectionJobRecord.projection_kind.not_in(
+                        SUPPORTED_MEMORY_PROJECTION_KINDS
+                    ),
+                    MemoryProjectionJobRecord.lifecycle_state == "pending",
+                    MemoryProjectionJobRecord.run_after <= now,
+                )
+                .order_by(
+                    MemoryProjectionJobRecord.run_after.asc(),
+                    MemoryProjectionJobRecord.created_at.asc(),
+                    MemoryProjectionJobRecord.id.asc(),
+                )
+                .limit(1)
+                .with_for_update(skip_locked=True)
+            )
+            if job is None:
+                return False
+            job.lifecycle_state = "dead_letter"
+            job.attempts += 1
+            job.error = f"unsupported memory projection job: {job.projection_kind}"
+            job.run_after = now
+            job.updated_at = now
+    return True
+
+
 def _google_runtime(settings: AppSettings) -> GoogleConnectorRuntime:
     return GoogleConnectorRuntime(
         oauth_client=DefaultGoogleOAuthClient(
@@ -423,6 +616,11 @@ def process_one_task(
                 now=now,
                 heartbeat_timeout_seconds=resolved_settings.worker_heartbeat_timeout_seconds,
             )
+            reap_stale_memory_projection_jobs(
+                db,
+                now=now,
+                heartbeat_timeout_seconds=resolved_settings.worker_heartbeat_timeout_seconds,
+            )
 
     if process_due_email_thread_watches(
         session_factory=session_factory,
@@ -446,6 +644,21 @@ def process_one_task(
         settings=resolved_settings,
         now_fn=_utcnow,
         new_id_fn=_new_id,
+        worker_id=resolved_worker_id,
+    ):
+        return True
+
+    if process_memory_maintenance_job(
+        session_factory=session_factory,
+        now_fn=_utcnow,
+        new_id_fn=_new_id,
+        worker_id=resolved_worker_id,
+    ):
+        return True
+
+    if process_unsupported_memory_projection_job(
+        session_factory=session_factory,
+        now_fn=_utcnow,
     ):
         return True
 
@@ -456,14 +669,19 @@ def process_one_task(
                 return False
             task_id = task.id
             task_type = task.task_type
-            task_payload = dict(task.payload)
+            task_shape_error: str | None = None
+            if isinstance(task.payload, dict):
+                task_payload = dict(task.payload)
+            else:
+                task_payload = {}
+                task_shape_error = f"{task_type} task payload invalid"
             if task_type == "work_follow_up_evaluate_due":
                 if (
                     task.work_follow_up_loop_id is None
                     or task.work_follow_up_loop_version is None
                     or task.work_follow_up_scheduled_for is None
                 ):
-                    task_payload = {"shape_error": "work_follow_up_evaluate_due task shape invalid"}
+                    task_shape_error = "work_follow_up_evaluate_due task shape invalid"
                 else:
                     scheduled_for = to_rfc3339(task.work_follow_up_scheduled_for)
                     idempotency_key = _work_follow_up_task_idempotency_key(
@@ -472,9 +690,7 @@ def process_one_task(
                         scheduled_for=scheduled_for,
                     )
                     if task.idempotency_key != idempotency_key:
-                        task_payload = {
-                            "shape_error": ("work_follow_up_evaluate_due task idempotency mismatch")
-                        }
+                        task_shape_error = "work_follow_up_evaluate_due task idempotency mismatch"
                     else:
                         task_payload = {
                             "loop_id": task.work_follow_up_loop_id,
@@ -484,19 +700,13 @@ def process_one_task(
                         }
             if task_type == "provider_write_reconcile_due":
                 if task.provider_write_receipt_id is None:
-                    task_payload = {
-                        "shape_error": "provider_write_reconcile_due task shape invalid"
-                    }
+                    task_shape_error = "provider_write_reconcile_due task shape invalid"
                 else:
                     expected_idempotency_key = (
                         f"provider_write_reconcile:{task.provider_write_receipt_id}"
                     )
                     if task.idempotency_key != expected_idempotency_key:
-                        task_payload = {
-                            "shape_error": (
-                                "provider_write_reconcile_due task idempotency mismatch"
-                            )
-                        }
+                        task_shape_error = "provider_write_reconcile_due task idempotency mismatch"
                     else:
                         task_payload = {
                             "provider_write_receipt_id": task.provider_write_receipt_id,
@@ -504,6 +714,8 @@ def process_one_task(
                         }
 
     try:
+        if task_shape_error is not None:
+            raise RuntimeError(task_shape_error)
         match task_type:
             case "agency_event_received":
                 _process_agency_event_received(
@@ -527,6 +739,8 @@ def process_one_task(
                     agency_runtime=_agency_runtime(resolved_settings),
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
+                    settings=resolved_settings,
+                    memory_import_cutover_enabled=resolved_settings.memory_import_cutover_enabled,
                 )
             case "provider_write_reconcile_due":
                 shape_error = _payload_text(task_payload, "shape_error")
@@ -731,6 +945,41 @@ def _mark_task_failed(
                 else now
             )
             task.updated_at = now
+
+
+def _mark_memory_projection_job_failed(
+    *,
+    session_factory: sessionmaker[Session],
+    job_id: str,
+    attempt_token: str,
+    error: str,
+    now_fn: Callable[[], datetime],
+) -> None:
+    with session_factory() as db:
+        with db.begin():
+            job = db.scalar(
+                select(MemoryProjectionJobRecord)
+                .where(
+                    MemoryProjectionJobRecord.id == job_id,
+                    MemoryProjectionJobRecord.lifecycle_state == "running",
+                    MemoryProjectionJobRecord.attempt_token == attempt_token,
+                )
+                .with_for_update()
+            )
+            if job is None:
+                return
+            now = now_fn()
+            job.lifecycle_state = "pending" if job.attempts < job.max_retries else "dead_letter"
+            job.error = error
+            job.claimed_by = None
+            job.attempt_token = None
+            job.last_heartbeat = None
+            job.run_after = (
+                now + timedelta(seconds=min(300, 2 ** max(job.attempts - 1, 0)))
+                if job.lifecycle_state == "pending"
+                else now
+            )
+            job.updated_at = now
 
 
 def _payload_text(payload: dict[str, Any], key: str) -> str | None:

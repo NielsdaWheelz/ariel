@@ -70,9 +70,12 @@ from ariel.memory import (
     correct_assertion,
     create_relationship,
     delete_assertion,
+    edit_candidate,
     export_memory,
     import_memory_candidates,
     list_memory,
+    mark_assertion_stale,
+    merge_candidates,
     privacy_delete_assertion,
     propose_memory_candidate,
     record_rotation_context_block,
@@ -85,6 +88,7 @@ from ariel.memory import (
     run_memory_eval,
     search_memory,
     set_assertion_priority,
+    set_memory_scope_binding,
     set_never_remember_rule,
     validate_continuity_compaction_payload,
 )
@@ -106,7 +110,10 @@ from ariel.persistence import (
     JobRecord,
     MemoryAssertionRecord,
     MemoryActionTraceRecord,
-    MemoryScopeBindingRecord,
+    MemoryContextBlockRecord,
+    MemoryEvidenceRecord,
+    MemoryConflictSetRecord,
+    MemoryVersionRecord,
     NotificationRecord,
     ProactiveFeedbackRecord,
     ProactiveActionExecutionRecord,
@@ -466,6 +473,23 @@ class SessionMemoryModeRequest(BaseModel):
     memory_mode: Literal["normal", "temporary", "no_memory"]
 
 
+class MemoryScopeModeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope_type: Literal["user", "project", "repo", "session", "thread", "proactive_case"]
+    scope_key: str = Field(min_length=1, max_length=200)
+    memory_mode: Literal["normal", "temporary", "no_memory"]
+    reason: str | None = Field(default=None, max_length=500)
+
+    @field_validator("scope_key")
+    @classmethod
+    def _scope_key_must_not_be_blank(cls, value: str) -> str:
+        normalized = " ".join(value.strip().split())
+        if not normalized:
+            raise ValueError("scope key must not be blank")
+        return normalized
+
+
 class WorkCommitmentSnoozeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -539,6 +563,20 @@ class MemoryRejectRequest(BaseModel):
     reason: str | None = Field(default=None, max_length=500)
 
 
+class MemoryMergeCandidatesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    assertion_ids: list[str] = Field(min_length=2, max_length=20)
+
+    @field_validator("assertion_ids")
+    @classmethod
+    def _assertion_ids_must_not_be_blank(cls, value: list[str]) -> list[str]:
+        normalized = [" ".join(item.strip().split()) for item in value]
+        if any(not item for item in normalized):
+            raise ValueError("assertion ids must not be blank")
+        return normalized
+
+
 class MemoryReasonRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -573,11 +611,54 @@ class MemoryImportRequest(BaseModel):
     candidates: list[MemoryCandidateRequest] = Field(default_factory=list, max_length=50)
 
 
+class MemoryEvalCaseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    case_id: str | None = Field(default=None, min_length=1, max_length=64)
+    query: str = Field(min_length=1, max_length=1000)
+    expected: str | None = Field(default=None, max_length=1000)
+    expected_memory_ids: list[str] = Field(default_factory=list, max_length=50)
+    forbidden_memory_ids: list[str] = Field(default_factory=list, max_length=50)
+    expected_kinds: list[str] = Field(default_factory=list, max_length=20)
+    forbidden_texts: list[str] = Field(default_factory=list, max_length=20)
+    expect_policy_blocked: bool = False
+    notes: str | None = Field(default=None, max_length=500)
+
+    @field_validator(
+        "query",
+        "case_id",
+        "expected",
+        "notes",
+        mode="after",
+    )
+    @classmethod
+    def _optional_eval_text_must_not_be_blank(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = " ".join(value.strip().split())
+        if not normalized:
+            raise ValueError("memory eval text fields must not be blank")
+        return normalized
+
+    @field_validator(
+        "expected_memory_ids",
+        "forbidden_memory_ids",
+        "expected_kinds",
+        "forbidden_texts",
+    )
+    @classmethod
+    def _eval_lists_must_not_contain_blank_text(cls, value: list[str]) -> list[str]:
+        normalized = [" ".join(item.strip().split()) for item in value]
+        if any(not item for item in normalized):
+            raise ValueError("memory eval list entries must not be blank")
+        return normalized
+
+
 class MemoryEvalRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     eval_name: str = Field(default="memory eval", min_length=1, max_length=200)
-    cases: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
+    cases: list[MemoryEvalCaseRequest] = Field(default_factory=list, max_length=100)
 
 
 class MemoryConflictResolutionRequest(BaseModel):
@@ -4052,40 +4133,16 @@ def create_app(
                 now = _utcnow()
                 session.memory_mode = payload.memory_mode
                 session.updated_at = now
-                binding = db.scalar(
-                    select(MemoryScopeBindingRecord)
-                    .where(
-                        MemoryScopeBindingRecord.scope_type == "session",
-                        MemoryScopeBindingRecord.scope_key == session.id,
-                        MemoryScopeBindingRecord.actor_id == str(app.state.approval_actor_id),
-                    )
-                    .limit(1)
+                set_memory_scope_binding(
+                    db,
+                    scope_type="session",
+                    scope_key=session.id,
+                    memory_mode=payload.memory_mode,
+                    actor_id=str(app.state.approval_actor_id),
+                    reason="session memory mode updated",
+                    now_fn=lambda: now,
+                    new_id_fn=_new_id,
                 )
-                if binding is None:
-                    db.add(
-                        MemoryScopeBindingRecord(
-                            id=_new_id("msb"),
-                            scope_type="session",
-                            scope_key=session.id,
-                            actor_id=str(app.state.approval_actor_id),
-                            memory_mode=payload.memory_mode,
-                            extraction_enabled=payload.memory_mode == "normal",
-                            recall_enabled=payload.memory_mode == "normal",
-                            reason="session memory mode updated",
-                            expires_at=None,
-                            metadata_json={"source": "session_memory_mode_endpoint"},
-                            created_at=now,
-                            updated_at=now,
-                        )
-                    )
-                else:
-                    binding.memory_mode = payload.memory_mode
-                    binding.extraction_enabled = payload.memory_mode == "normal"
-                    binding.recall_enabled = payload.memory_mode == "normal"
-                    binding.reason = "session memory mode updated"
-                    binding.expires_at = None
-                    binding.metadata_json = {"source": "session_memory_mode_endpoint"}
-                    binding.updated_at = now
                 return {"ok": True, "session": serialize_session(session)}
 
     @app.post("/v1/sessions/rotate", response_model=None)
@@ -4175,7 +4232,11 @@ def create_app(
                     raise _response_contract_error(exc) from exc
 
     @app.get("/v1/memory/search", response_model=None)
-    def get_memory_search(q: str, limit: int = 20) -> JSONResponse | dict[str, Any]:
+    def get_memory_search(
+        q: str,
+        limit: int = 20,
+        scope_key: str | None = None,
+    ) -> JSONResponse | dict[str, Any]:
         _ensure_schema_ready()
         bounded_limit = max(1, min(limit, 100))
         with session_factory() as db:
@@ -4187,6 +4248,8 @@ def create_app(
                     limit=bounded_limit,
                     settings=settings,
                     current_session_id=active_session.id,
+                    scope_key=scope_key,
+                    actor_id=str(app.state.approval_actor_id),
                 )
                 try:
                     return build_surface_memory_search_response(
@@ -4195,6 +4258,34 @@ def create_app(
                     )
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/memory/recall-diagnostics", response_model=None)
+    def get_memory_recall_diagnostics(
+        q: str,
+        limit: int = 20,
+        scope_key: str | None = None,
+    ) -> dict[str, Any]:
+        _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 100))
+        with session_factory() as db:
+            with db.begin():
+                active_session = _get_or_create_active_session(db)
+                memory_context, recall_event = build_memory_context(
+                    db,
+                    user_message=q,
+                    max_recalled_assertions=bounded_limit,
+                    settings=settings,
+                    current_session_id=active_session.id,
+                    scope_key=scope_key,
+                    actor_id=str(app.state.approval_actor_id),
+                )
+                return {
+                    "ok": True,
+                    "schema_version": memory_context.get("schema_version"),
+                    "recall_diagnostics": recall_event,
+                    "memory_policy": memory_context.get("memory_policy"),
+                    "projection_health": memory_context.get("projection_health"),
+                }
 
     @app.post("/v1/memory/candidates", response_model=None)
     def post_memory_candidate(payload: MemoryCandidateRequest) -> JSONResponse | dict[str, Any]:
@@ -4247,11 +4338,242 @@ def create_app(
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
 
+    @app.get("/v1/memory/assertions/{assertion_id}", response_model=None)
+    def get_memory_assertion(assertion_id: str) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                payload = list_memory(db)
+                for key in ("active_assertions", "candidates"):
+                    for assertion in payload[key]:
+                        if assertion["id"] == assertion_id:
+                            return {
+                                "ok": True,
+                                "schema_version": payload["schema_version"],
+                                "assertion": assertion,
+                            }
+                raise ApiError(
+                    status_code=404,
+                    code="E_MEMORY_ASSERTION_NOT_FOUND",
+                    message="memory assertion was not found",
+                    details={"assertion_id": assertion_id},
+                    retryable=False,
+                )
+
+    @app.get("/v1/memory/evidence/{evidence_id}", response_model=None)
+    def get_memory_evidence(evidence_id: str) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                evidence = db.get(MemoryEvidenceRecord, evidence_id)
+                if evidence is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_MEMORY_EVIDENCE_NOT_FOUND",
+                        message="memory evidence was not found",
+                        details={"evidence_id": evidence_id},
+                        retryable=False,
+                    )
+                return {
+                    "ok": True,
+                    "schema_version": MEMORY_CONTEXT_SCHEMA_VERSION,
+                    "evidence": {
+                        "id": evidence.id,
+                        "source_turn_id": evidence.source_turn_id,
+                        "source_session_id": evidence.source_session_id,
+                        "content_class": evidence.content_class,
+                        "trust_boundary": evidence.trust_boundary,
+                        "state": evidence.lifecycle_state,
+                        "snippet": evidence.evidence_snippet or redact_text(evidence.source_text),
+                        "redaction_posture": evidence.redaction_posture,
+                        "metadata": evidence.metadata_json,
+                        "created_at": to_rfc3339(evidence.created_at),
+                        "updated_at": to_rfc3339(evidence.updated_at),
+                    },
+                }
+
+    @app.get("/v1/memory/versions/{canonical_table}/{canonical_id}", response_model=None)
+    def get_memory_versions(canonical_table: str, canonical_id: str) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                versions = db.scalars(
+                    select(MemoryVersionRecord)
+                    .where(
+                        MemoryVersionRecord.canonical_table == canonical_table,
+                        MemoryVersionRecord.canonical_id == canonical_id,
+                    )
+                    .order_by(MemoryVersionRecord.version.asc())
+                ).all()
+                if not versions:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_MEMORY_VERSION_NOT_FOUND",
+                        message="memory versions were not found",
+                        details={"canonical_table": canonical_table, "canonical_id": canonical_id},
+                        retryable=False,
+                    )
+                return {
+                    "ok": True,
+                    "schema_version": MEMORY_CONTEXT_SCHEMA_VERSION,
+                    "versions": [
+                        {
+                            "id": version.id,
+                            "canonical_table": version.canonical_table,
+                            "canonical_id": version.canonical_id,
+                            "version": version.version,
+                            "change_type": version.change_type,
+                            "actor_id": version.actor_id,
+                            "reason": version.reason,
+                            "prior_state": version.prior_state,
+                            "new_state": version.new_state,
+                            "redaction_posture": version.redaction_posture,
+                            "projection_invalidation": version.projection_invalidation,
+                            "created_at": to_rfc3339(version.created_at),
+                        }
+                        for version in versions
+                    ],
+                }
+
+    @app.get("/v1/memory/projection-health", response_model=None)
+    def get_memory_projection_health() -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                payload = list_memory(db)
+                return {
+                    "ok": True,
+                    "schema_version": payload["schema_version"],
+                    "projection_health": payload["projection_health"],
+                }
+
+    @app.get("/v1/memory/consolidations/{context_block_id}", response_model=None)
+    def get_memory_consolidation(context_block_id: str) -> dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                block = db.get(MemoryContextBlockRecord, context_block_id)
+                if block is None or block.block_type != "hot_index":
+                    raise ApiError(
+                        status_code=404,
+                        code="E_MEMORY_CONSOLIDATION_NOT_FOUND",
+                        message="memory consolidation result was not found",
+                        details={"context_block_id": context_block_id},
+                        retryable=False,
+                    )
+                return {
+                    "ok": True,
+                    "schema_version": MEMORY_CONTEXT_SCHEMA_VERSION,
+                    "consolidation": {
+                        "context_block_id": block.id,
+                        "scope_key": block.scope_key,
+                        "state": block.lifecycle_state,
+                        "content": json.loads(block.content),
+                        "source_assertion_ids": block.source_assertion_ids,
+                        "source_memory_versions": block.source_memory_versions,
+                        "source_projection_versions": block.source_projection_versions,
+                        "projection_version": block.projection_version,
+                        "updated_at": to_rfc3339(block.updated_at),
+                    },
+                }
+
+    @app.post("/v1/memory/candidates/{assertion_id}/edit", response_model=None)
+    def post_memory_candidate_edit(
+        assertion_id: str,
+        payload: MemoryCorrectionRequest,
+    ) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                assertion = db.get(MemoryAssertionRecord, assertion_id)
+                if assertion is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_MEMORY_ASSERTION_NOT_FOUND",
+                        message="memory candidate was not found",
+                        details={"assertion_id": assertion_id},
+                        retryable=False,
+                    )
+                events = edit_candidate(
+                    db,
+                    assertion_id=assertion_id,
+                    value=payload.value,
+                    actor_id=str(app.state.approval_actor_id),
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+                if not events:
+                    raise ApiError(
+                        status_code=409,
+                        code="E_MEMORY_OPERATION_NOT_APPLICABLE",
+                        message="memory candidate cannot be edited",
+                        details={"assertion_id": assertion_id, "state": assertion.lifecycle_state},
+                        retryable=False,
+                    )
+                memory_payload = list_memory(db)
+                try:
+                    return build_surface_memory_response(**memory_payload)
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.post("/v1/memory/candidates/merge", response_model=None)
+    def post_memory_candidates_merge(
+        payload: MemoryMergeCandidatesRequest,
+    ) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                missing_id = next(
+                    (
+                        assertion_id
+                        for assertion_id in payload.assertion_ids
+                        if db.get(MemoryAssertionRecord, assertion_id) is None
+                    ),
+                    None,
+                )
+                if missing_id is not None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_MEMORY_ASSERTION_NOT_FOUND",
+                        message="memory candidate was not found",
+                        details={"assertion_id": missing_id},
+                        retryable=False,
+                    )
+                events = merge_candidates(
+                    db,
+                    assertion_ids=payload.assertion_ids,
+                    actor_id=str(app.state.approval_actor_id),
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+                if not events:
+                    raise ApiError(
+                        status_code=409,
+                        code="E_MEMORY_OPERATION_NOT_APPLICABLE",
+                        message="memory candidates cannot be merged",
+                        details={"assertion_ids": payload.assertion_ids},
+                        retryable=False,
+                    )
+                memory_payload = list_memory(db)
+                try:
+                    return build_surface_memory_response(**memory_payload)
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
     @app.post("/v1/memory/candidates/{assertion_id}/approve", response_model=None)
     def post_memory_candidate_approve(assertion_id: str) -> JSONResponse | dict[str, Any]:
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
+                assertion = db.get(MemoryAssertionRecord, assertion_id)
+                if assertion is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_MEMORY_ASSERTION_NOT_FOUND",
+                        message="memory candidate was not found",
+                        details={"assertion_id": assertion_id},
+                        retryable=False,
+                    )
                 events = approve_candidate(
                     db,
                     assertion_id=assertion_id,
@@ -4264,7 +4586,7 @@ def create_app(
                         status_code=409,
                         code="E_MEMORY_OPERATION_NOT_APPLICABLE",
                         message="memory candidate cannot be approved directly",
-                        details={"assertion_id": assertion_id},
+                        details={"assertion_id": assertion_id, "state": assertion.lifecycle_state},
                         retryable=False,
                     )
                 payload = list_memory(db)
@@ -4281,6 +4603,15 @@ def create_app(
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
+                assertion = db.get(MemoryAssertionRecord, assertion_id)
+                if assertion is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_MEMORY_ASSERTION_NOT_FOUND",
+                        message="memory candidate was not found",
+                        details={"assertion_id": assertion_id},
+                        retryable=False,
+                    )
                 events = reject_candidate(
                     db,
                     assertion_id=assertion_id,
@@ -4291,10 +4622,10 @@ def create_app(
                 )
                 if not events:
                     raise ApiError(
-                        status_code=404,
-                        code="E_MEMORY_ASSERTION_NOT_FOUND",
-                        message="memory candidate was not found",
-                        details={"assertion_id": assertion_id},
+                        status_code=409,
+                        code="E_MEMORY_OPERATION_NOT_APPLICABLE",
+                        message="memory candidate cannot be rejected",
+                        details={"assertion_id": assertion_id, "state": assertion.lifecycle_state},
                         retryable=False,
                     )
                 memory_payload = list_memory(db)
@@ -4312,6 +4643,15 @@ def create_app(
         with session_factory() as db:
             with db.begin():
                 active_session = _get_or_create_active_session(db)
+                assertion = db.get(MemoryAssertionRecord, assertion_id)
+                if assertion is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_MEMORY_ASSERTION_NOT_FOUND",
+                        message="memory assertion was not found",
+                        details={"assertion_id": assertion_id},
+                        retryable=False,
+                    )
                 events = correct_assertion(
                     db,
                     assertion_id=assertion_id,
@@ -4323,10 +4663,10 @@ def create_app(
                 )
                 if not events:
                     raise ApiError(
-                        status_code=404,
-                        code="E_MEMORY_ASSERTION_NOT_FOUND",
-                        message="memory assertion was not found",
-                        details={"assertion_id": assertion_id},
+                        status_code=409,
+                        code="E_MEMORY_OPERATION_NOT_APPLICABLE",
+                        message="memory assertion cannot be corrected",
+                        details={"assertion_id": assertion_id, "state": assertion.lifecycle_state},
                         retryable=False,
                     )
                 memory_payload = list_memory(db)
@@ -4340,6 +4680,15 @@ def create_app(
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
+                assertion = db.get(MemoryAssertionRecord, assertion_id)
+                if assertion is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_MEMORY_ASSERTION_NOT_FOUND",
+                        message="memory assertion was not found",
+                        details={"assertion_id": assertion_id},
+                        retryable=False,
+                    )
                 events = retract_assertion(
                     db,
                     assertion_id=assertion_id,
@@ -4349,10 +4698,10 @@ def create_app(
                 )
                 if not events:
                     raise ApiError(
-                        status_code=404,
-                        code="E_MEMORY_ASSERTION_NOT_FOUND",
-                        message="memory assertion was not found",
-                        details={"assertion_id": assertion_id},
+                        status_code=409,
+                        code="E_MEMORY_OPERATION_NOT_APPLICABLE",
+                        message="memory assertion cannot be retracted",
+                        details={"assertion_id": assertion_id, "state": assertion.lifecycle_state},
                         retryable=False,
                     )
                 payload = list_memory(db)
@@ -4366,6 +4715,15 @@ def create_app(
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
+                assertion = db.get(MemoryAssertionRecord, assertion_id)
+                if assertion is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_MEMORY_ASSERTION_NOT_FOUND",
+                        message="memory assertion was not found",
+                        details={"assertion_id": assertion_id},
+                        retryable=False,
+                    )
                 events = delete_assertion(
                     db,
                     assertion_id=assertion_id,
@@ -4375,10 +4733,10 @@ def create_app(
                 )
                 if not events:
                     raise ApiError(
-                        status_code=404,
-                        code="E_MEMORY_ASSERTION_NOT_FOUND",
-                        message="memory assertion was not found",
-                        details={"assertion_id": assertion_id},
+                        status_code=409,
+                        code="E_MEMORY_OPERATION_NOT_APPLICABLE",
+                        message="memory assertion cannot be deleted",
+                        details={"assertion_id": assertion_id, "state": assertion.lifecycle_state},
                         retryable=False,
                     )
                 payload = list_memory(db)
@@ -4395,6 +4753,15 @@ def create_app(
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
+                assertion = db.get(MemoryAssertionRecord, assertion_id)
+                if assertion is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_MEMORY_ASSERTION_NOT_FOUND",
+                        message="memory assertion was not found",
+                        details={"assertion_id": assertion_id},
+                        retryable=False,
+                    )
                 events = privacy_delete_assertion(
                     db,
                     assertion_id=assertion_id,
@@ -4405,10 +4772,10 @@ def create_app(
                 )
                 if not events:
                     raise ApiError(
-                        status_code=404,
-                        code="E_MEMORY_ASSERTION_NOT_FOUND",
-                        message="memory assertion was not found",
-                        details={"assertion_id": assertion_id},
+                        status_code=409,
+                        code="E_MEMORY_OPERATION_NOT_APPLICABLE",
+                        message="memory assertion cannot be privacy-deleted",
+                        details={"assertion_id": assertion_id, "state": assertion.lifecycle_state},
                         retryable=False,
                     )
                 memory_payload = list_memory(db)
@@ -4425,6 +4792,15 @@ def create_app(
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
+                evidence = db.get(MemoryEvidenceRecord, evidence_id)
+                if evidence is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_MEMORY_EVIDENCE_NOT_FOUND",
+                        message="memory evidence was not found",
+                        details={"evidence_id": evidence_id},
+                        retryable=False,
+                    )
                 events = redact_evidence(
                     db,
                     evidence_id=evidence_id,
@@ -4435,10 +4811,10 @@ def create_app(
                 )
                 if not events:
                     raise ApiError(
-                        status_code=404,
-                        code="E_MEMORY_EVIDENCE_NOT_FOUND",
-                        message="memory evidence was not found",
-                        details={"evidence_id": evidence_id},
+                        status_code=409,
+                        code="E_MEMORY_OPERATION_NOT_APPLICABLE",
+                        message="memory evidence cannot be redacted",
+                        details={"evidence_id": evidence_id, "state": evidence.lifecycle_state},
                         retryable=False,
                     )
                 memory_payload = list_memory(db)
@@ -4482,19 +4858,29 @@ def create_app(
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
+                assertion = db.get(MemoryAssertionRecord, assertion_id)
+                if assertion is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_MEMORY_ASSERTION_NOT_FOUND",
+                        message="memory assertion was not found",
+                        details={"assertion_id": assertion_id},
+                        retryable=False,
+                    )
                 updated = set_assertion_priority(
                     db,
                     assertion_id=assertion_id,
                     priority="pinned",
+                    actor_id=str(app.state.approval_actor_id),
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                 )
                 if updated is None:
                     raise ApiError(
-                        status_code=404,
-                        code="E_MEMORY_ASSERTION_NOT_FOUND",
-                        message="active memory assertion was not found",
-                        details={"assertion_id": assertion_id},
+                        status_code=409,
+                        code="E_MEMORY_OPERATION_NOT_APPLICABLE",
+                        message="memory assertion cannot be prioritized",
+                        details={"assertion_id": assertion_id, "state": assertion.lifecycle_state},
                         retryable=False,
                     )
                 payload = list_memory(db)
@@ -4508,24 +4894,73 @@ def create_app(
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
+                assertion = db.get(MemoryAssertionRecord, assertion_id)
+                if assertion is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_MEMORY_ASSERTION_NOT_FOUND",
+                        message="memory assertion was not found",
+                        details={"assertion_id": assertion_id},
+                        retryable=False,
+                    )
                 updated = set_assertion_priority(
                     db,
                     assertion_id=assertion_id,
                     priority="deprioritized",
+                    actor_id=str(app.state.approval_actor_id),
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                 )
                 if updated is None:
                     raise ApiError(
-                        status_code=404,
-                        code="E_MEMORY_ASSERTION_NOT_FOUND",
-                        message="active memory assertion was not found",
-                        details={"assertion_id": assertion_id},
+                        status_code=409,
+                        code="E_MEMORY_OPERATION_NOT_APPLICABLE",
+                        message="memory assertion cannot be deprioritized",
+                        details={"assertion_id": assertion_id, "state": assertion.lifecycle_state},
                         retryable=False,
                     )
                 payload = list_memory(db)
                 try:
                     return build_surface_memory_response(**payload)
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.post("/v1/memory/assertions/{assertion_id}/mark-stale", response_model=None)
+    def post_memory_assertion_mark_stale(
+        assertion_id: str,
+        payload: MemoryReasonRequest | None = None,
+    ) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                assertion = db.get(MemoryAssertionRecord, assertion_id)
+                if assertion is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_MEMORY_ASSERTION_NOT_FOUND",
+                        message="memory assertion was not found",
+                        details={"assertion_id": assertion_id},
+                        retryable=False,
+                    )
+                events = mark_assertion_stale(
+                    db,
+                    assertion_id=assertion_id,
+                    actor_id=str(app.state.approval_actor_id),
+                    reason=payload.reason if payload is not None else None,
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+                if not events:
+                    raise ApiError(
+                        status_code=409,
+                        code="E_MEMORY_OPERATION_NOT_APPLICABLE",
+                        message="memory assertion cannot be marked stale",
+                        details={"assertion_id": assertion_id, "state": assertion.lifecycle_state},
+                        retryable=False,
+                    )
+                memory_payload = list_memory(db)
+                try:
+                    return build_surface_memory_response(**memory_payload)
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
 
@@ -4536,6 +4971,14 @@ def create_app(
             with db.begin():
                 payload = list_memory(db)
                 conflict = [item for item in payload["conflicts"] if item["id"] == conflict_set_id]
+                if not conflict:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_MEMORY_CONFLICT_NOT_FOUND",
+                        message="memory conflict was not found",
+                        details={"conflict_set_id": conflict_set_id},
+                        retryable=False,
+                    )
                 try:
                     return build_surface_memory_response(
                         schema_version=payload["schema_version"],
@@ -4558,6 +5001,24 @@ def create_app(
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
+                conflict = db.get(MemoryConflictSetRecord, conflict_set_id)
+                assertion = db.get(MemoryAssertionRecord, payload.assertion_id)
+                if conflict is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_MEMORY_CONFLICT_NOT_FOUND",
+                        message="memory conflict was not found",
+                        details={"conflict_set_id": conflict_set_id},
+                        retryable=False,
+                    )
+                if assertion is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_MEMORY_ASSERTION_NOT_FOUND",
+                        message="memory assertion was not found",
+                        details={"assertion_id": payload.assertion_id},
+                        retryable=False,
+                    )
                 events = resolve_conflict(
                     db,
                     conflict_set_id=conflict_set_id,
@@ -4717,17 +5178,60 @@ def create_app(
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
 
+    @app.put("/v1/memory/scope-bindings", response_model=None)
+    def put_memory_scope_binding(
+        payload: MemoryScopeModeRequest,
+    ) -> JSONResponse | dict[str, Any]:
+        _ensure_schema_ready()
+        with session_factory() as db:
+            with db.begin():
+                binding = set_memory_scope_binding(
+                    db,
+                    scope_type=payload.scope_type,
+                    scope_key=payload.scope_key,
+                    memory_mode=payload.memory_mode,
+                    actor_id=str(app.state.approval_actor_id),
+                    reason=payload.reason,
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+                if binding is None:
+                    raise ApiError(
+                        status_code=422,
+                        code="E_MEMORY_SCOPE_MODE_INVALID",
+                        message="memory scope mode is invalid",
+                        details={},
+                        retryable=False,
+                    )
+                memory_payload = list_memory(db)
+                try:
+                    return build_surface_memory_response(
+                        schema_version=memory_payload["schema_version"],
+                        active_assertions=[],
+                        candidates=[],
+                        conflicts=[],
+                        project_state=[],
+                        evidence=[],
+                        procedures=[],
+                        scope_bindings=memory_payload["scope_bindings"],
+                        projection_health=memory_payload["projection_health"],
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
     @app.post("/v1/memory/consolidate", response_model=None)
     def post_memory_consolidate(payload: MemoryExportRequest) -> JSONResponse | dict[str, Any]:
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
+                active_session = _get_or_create_active_session(db)
                 consolidate_memory(
                     db,
                     scope_key=payload.scope_key,
                     actor_id=str(app.state.approval_actor_id),
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
+                    source_session_id=active_session.id,
                 )
                 memory_payload = list_memory(db)
                 try:
@@ -4740,12 +5244,14 @@ def create_app(
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
+                active_session = _get_or_create_active_session(db)
                 export_memory(
                     db,
                     scope_key=payload.scope_key,
                     actor_id=str(app.state.approval_actor_id),
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
+                    source_session_id=active_session.id,
                 )
                 memory_payload = list_memory(db)
                 try:
@@ -4756,6 +5262,14 @@ def create_app(
     @app.post("/v1/memory/import", response_model=None)
     def post_memory_import(payload: MemoryImportRequest) -> JSONResponse | dict[str, Any]:
         _ensure_schema_ready()
+        if not settings.memory_import_cutover_enabled:
+            raise ApiError(
+                status_code=403,
+                code="E_MEMORY_IMPORT_DISABLED",
+                message="memory import is available only during explicit cutover mode",
+                details={"setting": "ARIEL_MEMORY_IMPORT_CUTOVER_ENABLED"},
+                retryable=False,
+            )
         with session_factory() as db:
             with db.begin():
                 active_session = _get_or_create_active_session(db)
@@ -4766,6 +5280,7 @@ def create_app(
                     candidates=[candidate.model_dump() for candidate in payload.candidates],
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
+                    cutover_enabled=settings.memory_import_cutover_enabled,
                 )
                 memory_payload = list_memory(db)
                 try:
@@ -4778,12 +5293,15 @@ def create_app(
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
+                active_session = _get_or_create_active_session(db)
                 run_memory_eval(
                     db,
                     eval_name=payload.eval_name,
-                    cases=payload.cases,
+                    cases=[case.model_dump() for case in payload.cases],
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
+                    settings=settings,
+                    current_session_id=active_session.id,
                 )
                 memory_payload = list_memory(db)
                 try:
@@ -5372,6 +5890,11 @@ def create_app(
                 max_recalled_assertions=int(app.state.max_recalled_assertions),
                 settings=settings,
                 current_session_id=effective_session_id,
+                thread_id=str(discord_context["thread_id"])
+                if isinstance(discord_context, dict)
+                and discord_context.get("thread_id") is not None
+                else None,
+                actor_id=str(app.state.approval_actor_id),
             )
         except AIJudgmentFailure as exc:
             safe_reason = safe_failure_reason(
@@ -6335,6 +6858,8 @@ def create_app(
                             ),
                             agency_runtime=_agency_runtime(),
                             attachment_runtime=app.state.attachment_runtime,
+                            settings=settings,
+                            memory_import_cutover_enabled=settings.memory_import_cutover_enabled,
                         )
                         created_action_attempts.extend(function_processing.action_attempts)
                         assistant_sources = (
@@ -6723,65 +7248,66 @@ def create_app(
                     payload_data = memory_event.get("payload")
                     if isinstance(event_type, str) and isinstance(payload_data, dict):
                         add_event(event_type, payload_data)
-                now_memory_trace = _utcnow()
-                for action_attempt in created_action_attempts:
-                    outcome = "unknown"
-                    if action_attempt.status == "succeeded":
-                        outcome = "succeeded"
-                    elif action_attempt.status == "failed":
-                        outcome = "failed"
-                    elif (
-                        action_attempt.status in {"rejected", "denied", "expired"}
-                        or action_attempt.policy_decision == "deny"
-                    ):
-                        outcome = "denied"
-                    db.add(
-                        MemoryActionTraceRecord(
-                            id=_new_id("mat"),
-                            scope_key=f"session:{effective_session_id}",
-                            trace_type=(
-                                "execution"
-                                if action_attempt.status in {"executing", "succeeded", "failed"}
-                                else "policy_decision"
-                            ),
-                            action_attempt_id=action_attempt.id,
-                            source_turn_id=turn.id,
-                            primary_evidence_id=user_evidence_id,
-                            capability_id=action_attempt.capability_id,
-                            summary=(
-                                f"{action_attempt.capability_id} {outcome} "
-                                f"for proposal {action_attempt.proposal_index}"
-                            ),
-                            outcome=outcome,
-                            result_refs={
-                                "impact_level": action_attempt.impact_level,
-                                "policy_decision": action_attempt.policy_decision,
-                                "approval_required": action_attempt.approval_required,
-                                "execution_error": action_attempt.execution_error,
-                            },
-                            lifecycle_state="active",
-                            created_at=now_memory_trace,
-                            updated_at=now_memory_trace,
+                if user_evidence_id is not None:
+                    now_memory_trace = _utcnow()
+                    for action_attempt in created_action_attempts:
+                        outcome = "unknown"
+                        if action_attempt.status == "succeeded":
+                            outcome = "succeeded"
+                        elif action_attempt.status == "failed":
+                            outcome = "failed"
+                        elif (
+                            action_attempt.status in {"rejected", "denied", "expired"}
+                            or action_attempt.policy_decision == "deny"
+                        ):
+                            outcome = "denied"
+                        db.add(
+                            MemoryActionTraceRecord(
+                                id=_new_id("mat"),
+                                scope_key=f"session:{effective_session_id}",
+                                trace_type=(
+                                    "execution"
+                                    if action_attempt.status in {"executing", "succeeded", "failed"}
+                                    else "policy_decision"
+                                ),
+                                action_attempt_id=action_attempt.id,
+                                source_turn_id=turn.id,
+                                primary_evidence_id=user_evidence_id,
+                                capability_id=action_attempt.capability_id,
+                                summary=(
+                                    f"{action_attempt.capability_id} {outcome} "
+                                    f"for proposal {action_attempt.proposal_index}"
+                                ),
+                                outcome=outcome,
+                                result_refs={
+                                    "impact_level": action_attempt.impact_level,
+                                    "policy_decision": action_attempt.policy_decision,
+                                    "approval_required": action_attempt.approval_required,
+                                    "execution_error": action_attempt.execution_error,
+                                },
+                                lifecycle_state="active",
+                                created_at=now_memory_trace,
+                                updated_at=now_memory_trace,
+                            )
                         )
+                    task = enqueue_background_task(
+                        db,
+                        task_type="memory_extract_turn",
+                        payload={
+                            "session_id": effective_session_id,
+                            "turn_id": turn.id,
+                            "evidence_id": user_evidence_id,
+                        },
+                        now=_utcnow(),
                     )
-                task = enqueue_background_task(
-                    db,
-                    task_type="memory_extract_turn",
-                    payload={
-                        "session_id": effective_session_id,
-                        "turn_id": turn.id,
-                        "evidence_id": user_evidence_id,
-                    },
-                    now=_utcnow(),
-                )
-                add_event(
-                    "evt.memory.extraction_queued",
-                    {
-                        "task_id": task.id,
-                        "turn_id": turn.id,
-                        "evidence_id": user_evidence_id,
-                    },
-                )
+                    add_event(
+                        "evt.memory.extraction_queued",
+                        {
+                            "task_id": task.id,
+                            "turn_id": turn.id,
+                            "evidence_id": user_evidence_id,
+                        },
+                    )
 
             turn.status = "completed"
             turn.updated_at = _utcnow()
@@ -7493,6 +8019,7 @@ def create_app(
                 agency_runtime=_agency_runtime(),
                 now_fn=_utcnow,
                 new_id_fn=_new_id,
+                memory_import_cutover_enabled=settings.memory_import_cutover_enabled,
             )
             with session_factory() as db:
                 with db.begin():

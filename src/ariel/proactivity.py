@@ -1024,6 +1024,8 @@ def process_proactive_deliberation_due(
                     max_recalled_assertions=settings.max_recalled_assertions,
                     settings=settings,
                     current_session_id=active_session.id if active_session is not None else None,
+                    proactive_case_id=case.id,
+                    actor_id="system",
                 )
             except AIJudgmentFailure as exc:
                 safe_reason = safe_failure_reason(

@@ -37,12 +37,16 @@ from ariel.persistence import (
     MemoryConflictSetRecord,
     MemoryDeletionRecord,
     MemoryEmbeddingProjectionRecord,
+    MemoryExportArtifactRecord,
+    MemoryGraphProjectionRecord,
     MemoryEvidenceRecord,
     MemoryKeywordProjectionRecord,
     MemoryProcedureRecord,
     MemoryRetentionPolicyRecord,
     MemoryReviewRecord,
     MemoryScopeBindingRecord,
+    MemoryTopicRecord,
+    MemoryVersionRecord,
     ProjectStateSnapshotRecord,
     ProactiveCaseEventRecord,
     SessionRecord,
@@ -65,8 +69,8 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}_nsm_{next(_id_counter)}"
 
 
-def _settings() -> AppSettings:
-    return cast(AppSettings, cast(Any, AppSettings)(_env_file=None))
+def _settings(**overrides: Any) -> AppSettings:
+    return cast(AppSettings, cast(Any, AppSettings)(_env_file=None, **overrides))
 
 
 def _session_factory(client: TestClient) -> Any:
@@ -203,9 +207,18 @@ def _fake_memory_curation(
         }
         for candidate in candidates[:max_selected]
     ]
+    selected_ids = {item["id"] for item in selected}
     return {
         "selected_memories": selected,
-        "omitted_memories": [],
+        "omitted_memories": [
+            {
+                "id": candidate["id"],
+                "kind": candidate.get("kind", "semantic_assertion"),
+                "rationale": "fixture omitted by selection budget",
+            }
+            for candidate in candidates
+            if candidate["id"] not in selected_ids
+        ],
         "rationale": "fixture curation",
         "uncertainty": "",
         "confidence": 0.9,
@@ -467,6 +480,13 @@ def test_session_no_memory_disables_search_endpoint_and_proactive_remember(
         assert search.status_code == 200
         assert search.json()["results"] == []
 
+        diagnostics = client.get(
+            "/v1/memory/recall-diagnostics",
+            params={"q": "phoenix", "limit": 10, "scope_key": "project:phoenix"},
+        )
+        assert diagnostics.status_code == 200
+        assert diagnostics.json()["recall_diagnostics"]["selected_memory_ids"] == []
+
         case_id = _seed_proactive_case(client, now=now)
         before_assertion_count = 0
         with _session_factory(client)() as db:
@@ -500,6 +520,88 @@ def test_session_no_memory_disables_search_endpoint_and_proactive_remember(
             if resolved_event is not None:
                 assert resolved_event.payload.get("memory_candidate_assertion_id") is None
                 assert resolved_event.payload.get("memory_events") == []
+
+
+def test_extracted_candidate_links_original_turn_evidence(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        session_id = _session_id(client)
+        response = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "remember phoenix ships tomorrow"},
+        )
+        assert response.status_code == 200
+
+        with _session_factory(client)() as db:
+            evidence_id = db.scalar(
+                select(MemoryEvidenceRecord.id)
+                .where(
+                    MemoryEvidenceRecord.source_session_id == session_id,
+                    MemoryEvidenceRecord.content_class == "user_message",
+                )
+                .order_by(MemoryEvidenceRecord.created_at.desc())
+                .limit(1)
+            )
+            assert evidence_id is not None
+
+        class ExtractionResponse:
+            status_code = 200
+
+            def json(self) -> dict[str, Any]:
+                return {
+                    "id": "resp_extract_memory",
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": json.dumps(
+                                        {
+                                            "candidates": [
+                                                {
+                                                    "subject_key": "project:phoenix",
+                                                    "predicate": "project.deadline",
+                                                    "assertion_type": "project_state",
+                                                    "value": "phoenix ships tomorrow",
+                                                    "confidence": 0.9,
+                                                    "is_multi_valued": False,
+                                                }
+                                            ]
+                                        }
+                                    ),
+                                }
+                            ],
+                        }
+                    ],
+                }
+
+        monkeypatch.setattr(memory.httpx, "post", lambda *args, **kwargs: ExtractionResponse())
+        process_memory_extract_turn(
+            session_factory=_session_factory(client),
+            task_payload={"session_id": session_id, "evidence_id": evidence_id},
+            settings=_settings(openai_api_key="test-key"),
+            now_fn=lambda: datetime.now(tz=UTC),
+            new_id_fn=_new_id,
+        )
+
+        with _session_factory(client)() as db:
+            assertion_id = db.scalar(
+                select(MemoryAssertionRecord.id).where(
+                    MemoryAssertionRecord.subject_key == "project:phoenix"
+                )
+            )
+            assert assertion_id is not None
+            linked_evidence_ids = db.scalars(
+                select(MemoryAssertionEvidenceRecord.evidence_id).where(
+                    MemoryAssertionEvidenceRecord.assertion_id == assertion_id
+                )
+            ).all()
+            assert linked_evidence_ids == [evidence_id]
+            assert db.scalar(select(func.count()).select_from(MemoryEvidenceRecord)) == 2
 
 
 def test_conflicted_candidates_require_conflict_resolution_and_reject_losers(
@@ -541,6 +643,34 @@ def test_conflicted_candidates_require_conflict_resolution_and_reject_losers(
             assert loser is not None
             assert winner.lifecycle_state == "active"
             assert loser.lifecycle_state == "rejected"
+
+
+def test_rejected_conflict_member_cannot_be_reactivated_by_resolution(
+    postgres_url: str,
+) -> None:
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        first = _candidate(client, value="phoenix ships tomorrow")
+        assert client.post(f"/v1/memory/candidates/{first['id']}/approve").status_code == 200
+        second = _candidate(client, value="phoenix ships next week")
+        assert client.post(f"/v1/memory/candidates/{second['id']}/approve").status_code == 409
+        conflict_id = client.get("/v1/memory").json()["conflicts"][0]["id"]
+
+        reject = client.post(f"/v1/memory/candidates/{second['id']}/reject")
+        assert reject.status_code == 200
+        revived = client.post(
+            f"/v1/memory/conflicts/{conflict_id}/resolve",
+            json={"assertion_id": second["id"]},
+        )
+        assert revived.status_code == 409
+        assert revived.json()["error"]["code"] == "E_MEMORY_CONFLICT_NOT_APPLICABLE"
+        with _session_factory(client)() as db:
+            rejected = db.get(MemoryAssertionRecord, second["id"])
+            active = db.get(MemoryAssertionRecord, first["id"])
+            assert rejected is not None
+            assert active is not None
+            assert rejected.lifecycle_state == "rejected"
+            assert active.lifecycle_state == "active"
 
 
 def test_memory_context_exposes_hot_index_and_topic_projection_fields_if_implemented(
@@ -662,6 +792,365 @@ def test_delete_memory_assertion_removes_active_memory_and_projection_rows(
         assert memory_context["topic_index"] == []
 
 
+def test_delete_memory_assertion_invalidates_graph_and_export_artifacts(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_fake_memory_models(monkeypatch)
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        first = _candidate(client)
+        second = _candidate(
+            client,
+            subject_key="project:atlas",
+            predicate="project.deadline",
+            value="atlas ships next week",
+            evidence_text="The user said Atlas ships next week.",
+        )
+        assert client.post(f"/v1/memory/candidates/{first['id']}/approve").status_code == 200
+        assert client.post(f"/v1/memory/candidates/{second['id']}/approve").status_code == 200
+
+        with _session_factory(client)() as db:
+            first_assertion = db.get(MemoryAssertionRecord, first["id"])
+            second_assertion = db.get(MemoryAssertionRecord, second["id"])
+            assert first_assertion is not None
+            assert second_assertion is not None
+            evidence_id = db.scalar(
+                select(MemoryAssertionEvidenceRecord.evidence_id)
+                .where(MemoryAssertionEvidenceRecord.assertion_id == first["id"])
+                .limit(1)
+            )
+            assert evidence_id is not None
+            first_entity_id = first_assertion.subject_entity_id
+            second_entity_id = second_assertion.subject_entity_id
+        relationship = client.post(
+            "/v1/memory/relationships",
+            json={
+                "source_entity_id": first_entity_id,
+                "target_entity_id": second_entity_id,
+                "relationship_type": "related_project",
+                "evidence_id": evidence_id,
+                "scope_key": "global",
+                "confidence": 0.9,
+            },
+        )
+        assert relationship.status_code == 200
+
+        export = client.post("/v1/memory/export", json={"scope_key": "global"})
+        assert export.status_code == 200
+
+        with _session_factory(client)() as db:
+            assert db.scalar(select(func.count()).select_from(MemoryGraphProjectionRecord)) == 1
+            assert db.scalar(select(func.count()).select_from(MemoryExportArtifactRecord)) == 1
+
+        delete = client.delete(f"/v1/memory/assertions/{first['id']}")
+        assert delete.status_code == 200
+        deletion = delete.json()["deletions"][0]
+        assert deletion["projection_invalidation"]["deleted_rows"]["memory_graph_projections"]
+        assert deletion["projection_invalidation"]["invalidated_exports"]
+
+        with _session_factory(client)() as db:
+            assert db.scalar(select(func.count()).select_from(MemoryGraphProjectionRecord)) == 0
+            artifact = db.scalar(select(MemoryExportArtifactRecord).limit(1))
+            assert artifact is not None
+            assert artifact.status == "failed"
+
+
+def test_unrelated_recall_has_no_semantic_recency_candidate(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_fake_memory_models(monkeypatch)
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        session_id = _session_id(client)
+        candidate = _candidate(
+            client,
+            subject_key="user:default",
+            predicate="notebook.preference",
+            assertion_type="preference",
+            value="Use matte notebooks.",
+            evidence_text="The user said to use matte notebooks.",
+        )
+        assert client.post(f"/v1/memory/candidates/{candidate['id']}/approve").status_code == 200
+
+        with _session_factory(client)() as db:
+            memory_context, _event_payload = memory.build_memory_context(
+                db,
+                user_message="zebra migration window",
+                max_recalled_assertions=8,
+                settings=_settings(),
+                current_session_id=session_id,
+            )
+
+        semantic_candidates = [
+            item
+            for item in memory_context["recall_window"]["candidate_memories"]
+            if item["kind"] == "semantic_assertion"
+        ]
+        assert semantic_candidates == []
+        assert client.get("/v1/memory/search", params={"q": "zebra"}).json()["results"] == []
+
+
+def test_recall_diagnostics_endpoint_exposes_curation_and_policy(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_fake_memory_models(monkeypatch)
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        candidate = _candidate(client)
+        assert client.post(f"/v1/memory/candidates/{candidate['id']}/approve").status_code == 200
+
+        response = client.get("/v1/memory/recall-diagnostics", params={"q": "phoenix"})
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["ok"] is True
+        assert candidate["id"] in payload["recall_diagnostics"]["candidate_memory_ids"]
+        assert candidate["id"] in payload["recall_diagnostics"]["selected_memory_ids"]
+        assert payload["projection_health"]["selected_memory_count"] >= 1
+
+
+def test_project_scope_binding_blocks_project_recall_and_search(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_fake_memory_models(monkeypatch)
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        session_id = _session_id(client)
+        candidate = _candidate(client)
+        assert client.post(f"/v1/memory/candidates/{candidate['id']}/approve").status_code == 200
+        actor_id = str(cast(Any, client.app).state.approval_actor_id)
+        scope_response = client.put(
+            "/v1/memory/scope-bindings",
+            json={
+                "scope_type": "project",
+                "scope_key": "project:phoenix",
+                "memory_mode": "no_memory",
+                "reason": "project memory disabled",
+            },
+        )
+        assert scope_response.status_code == 200
+        assert scope_response.json()["scope_bindings"][0]["memory_mode"] == "no_memory"
+        with _session_factory(client)() as db:
+            with db.begin():
+                memory_context, _event_payload = memory.build_memory_context(
+                    db,
+                    user_message="what is phoenix deadline?",
+                    max_recalled_assertions=8,
+                    settings=_settings(),
+                    current_session_id=session_id,
+                    scope_key="project:phoenix",
+                    actor_id=actor_id,
+                )
+                proactive_context, _proactive_payload = memory.build_memory_context(
+                    db,
+                    user_message="what is phoenix deadline?",
+                    max_recalled_assertions=8,
+                    settings=_settings(),
+                    current_session_id=session_id,
+                    scope_key="project:phoenix",
+                    actor_id="system",
+                )
+        assert memory_context["semantic_assertions"] == []
+        assert memory_context["memory_policy"]["binding_scope_type"] == "project"
+        assert proactive_context["semantic_assertions"] == []
+        assert proactive_context["memory_policy"]["binding_scope_type"] == "project"
+
+        search = client.get(
+            "/v1/memory/search",
+            params={"q": "phoenix", "limit": 10, "scope_key": "project:phoenix"},
+        )
+        assert search.status_code == 200
+        assert search.json()["results"] == []
+
+        diagnostics = client.get(
+            "/v1/memory/recall-diagnostics",
+            params={"q": "phoenix", "limit": 10, "scope_key": "project:phoenix"},
+        )
+        assert diagnostics.status_code == 200
+        assert diagnostics.json()["recall_diagnostics"]["selected_memory_ids"] == []
+
+
+def test_consolidation_respects_no_memory_mode(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_fake_memory_models(monkeypatch)
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        session_id = _session_id(client)
+        assert (
+            client.put(
+                f"/v1/sessions/{session_id}/memory-mode", json={"memory_mode": "no_memory"}
+            ).status_code
+            == 200
+        )
+
+        response = client.post("/v1/memory/consolidate", json={"scope_key": "global"})
+        assert response.status_code == 200
+        assert response.json()["context_blocks"] == []
+        with _session_factory(client)() as db:
+            with db.begin():
+                result = memory.consolidate_memory(
+                    db,
+                    scope_key="global",
+                    actor_id="system",
+                    source_session_id=session_id,
+                    now_fn=lambda: datetime.now(tz=UTC),
+                    new_id_fn=_new_id,
+                )
+        assert result["status"] == "skipped"
+        assert result["memory_policy"]["memory_mode"] == "no_memory"
+
+
+def test_import_is_cutover_only(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_fake_memory_models(monkeypatch)
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        response = client.post(
+            "/v1/memory/import",
+            json={
+                "candidates": [
+                    {
+                        "subject_key": "user:default",
+                        "predicate": "notebook.preference",
+                        "assertion_type": "preference",
+                        "value": "Use matte notebooks.",
+                        "evidence_text": "The user said to use matte notebooks.",
+                        "confidence": 0.9,
+                        "scope_key": "global",
+                        "is_multi_valued": False,
+                    }
+                ]
+            },
+        )
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "E_MEMORY_IMPORT_DISABLED"
+
+
+def test_eval_runs_recall_cases_and_records_metrics(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_fake_memory_models(monkeypatch)
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        candidate = _candidate(client)
+        assert client.post(f"/v1/memory/candidates/{candidate['id']}/approve").status_code == 200
+
+        response = client.post(
+            "/v1/memory/evals",
+            json={
+                "eval_name": "phoenix recall",
+                "cases": [
+                    {
+                        "query": "what is phoenix deadline?",
+                        "expected_memory_ids": [candidate["id"]],
+                        "expected_kinds": ["semantic_assertion"],
+                    }
+                ],
+            },
+        )
+        assert response.status_code == 200
+        eval_run = response.json()["eval_runs"][0]
+        assert eval_run["status"] == "completed"
+        assert eval_run["metrics"]["passed_cases"] == 1
+        assert eval_run["metrics"]["failed_cases"] == 0
+
+
+def test_memory_public_api_inspects_versions_mutations_and_typed_errors(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_fake_memory_models(monkeypatch)
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        first = _candidate(client, value="phoenix ships tomorrow")
+        second = _candidate(
+            client,
+            subject_key="project:phoenix",
+            predicate="project.codename",
+            value="phoenix codename is ember",
+        )
+        edit = client.post(
+            f"/v1/memory/candidates/{first['id']}/edit",
+            json={"value": "phoenix ships Friday"},
+        )
+        assert edit.status_code == 200
+        merge = client.post(
+            "/v1/memory/candidates/merge",
+            json={"assertion_ids": [first["id"], second["id"]]},
+        )
+        assert merge.status_code == 200
+
+        assertion = client.get(f"/v1/memory/assertions/{first['id']}")
+        assert assertion.status_code == 200
+        assert (
+            assertion.json()["assertion"]["value"]
+            == "phoenix ships Friday; phoenix codename is ember"
+        )
+        evidence_id = assertion.json()["assertion"]["evidence_refs"][0]["evidence_id"]
+        evidence = client.get(f"/v1/memory/evidence/{evidence_id}")
+        assert evidence.status_code == 200
+        assert evidence.json()["evidence"]["id"] == evidence_id
+        versions = client.get(f"/v1/memory/versions/memory_assertions/{first['id']}")
+        assert versions.status_code == 200
+        assert [item["change_type"] for item in versions.json()["versions"]] == [
+            "created",
+            "updated",
+            "updated",
+        ]
+
+        assert client.post(f"/v1/memory/candidates/{first['id']}/approve").status_code == 200
+        consolidate = client.post("/v1/memory/consolidate", json={"scope_key": "global"})
+        assert consolidate.status_code == 200
+        hot_index_id = next(
+            block["id"]
+            for block in consolidate.json()["context_blocks"]
+            if block["block_type"] == "hot_index"
+        )
+        consolidation = client.get(f"/v1/memory/consolidations/{hot_index_id}")
+        assert consolidation.status_code == 200
+        assert consolidation.json()["consolidation"]["context_block_id"] == hot_index_id
+        health = client.get("/v1/memory/projection-health")
+        assert health.status_code == 200
+        assert health.json()["projection_health"]["projection_version"] == MEMORY_PROJECTION_VERSION
+
+        stale = client.post(
+            f"/v1/memory/assertions/{first['id']}/mark-stale",
+            json={"reason": "deadline passed"},
+        )
+        assert stale.status_code == 200
+        assert stale.json()["active_assertions"] == []
+
+        missing_conflict = client.get("/v1/memory/conflicts/mcf_missing")
+        assert missing_conflict.status_code == 404
+        assert missing_conflict.json()["error"]["code"] == "E_MEMORY_CONFLICT_NOT_FOUND"
+        approve_stale = client.post(f"/v1/memory/candidates/{first['id']}/approve")
+        assert approve_stale.status_code == 409
+        assert approve_stale.json()["error"]["code"] == "E_MEMORY_OPERATION_NOT_APPLICABLE"
+        correct_stale = client.post(
+            f"/v1/memory/assertions/{first['id']}/correct",
+            json={"value": "phoenix ships later"},
+        )
+        assert correct_stale.status_code == 409
+        assert correct_stale.json()["error"]["code"] == "E_MEMORY_OPERATION_NOT_APPLICABLE"
+        prioritize_stale = client.post(f"/v1/memory/assertions/{first['id']}/prioritize")
+        assert prioritize_stale.status_code == 409
+        assert prioritize_stale.json()["error"]["code"] == "E_MEMORY_OPERATION_NOT_APPLICABLE"
+        approve_missing = client.post("/v1/memory/candidates/mas_missing/approve")
+        assert approve_missing.status_code == 404
+        assert approve_missing.json()["error"]["code"] == "E_MEMORY_ASSERTION_NOT_FOUND"
+        redact_missing = client.post("/v1/memory/evidence/mev_missing/redact")
+        assert redact_missing.status_code == 404
+        assert redact_missing.json()["error"]["code"] == "E_MEMORY_EVIDENCE_NOT_FOUND"
+
+
 def test_delete_procedure_assertion_removes_procedural_recall(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -778,7 +1267,7 @@ def test_memory_privacy_delete_redact_and_never_remember_actions(
             client,
             action_attempt_id="act_never_remember_memory",
             capability_id="cap.memory.set_never_remember",
-            proposed_input={"rule": "do not remember launch secrets"},
+            proposed_input={"scope_key": "global", "rule": "do not remember launch secrets"},
         )
         never_output = _run_memory_action(client, "act_never_remember_memory")
         assert never_output["status"] == "recorded"
@@ -841,6 +1330,62 @@ def test_memory_privacy_delete_redact_and_never_remember_actions(
                 .limit(1)
             )
             assert policy is not None
+
+
+def test_privacy_delete_scrubs_projection_content_and_scoped_export_filters_evidence(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_fake_memory_models(monkeypatch)
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        secret = _candidate(
+            client,
+            value="phoenix launch secret is code violet",
+            evidence_text="The Phoenix launch secret is code violet.",
+        )
+        unrelated = _candidate(
+            client,
+            subject_key="project:orion",
+            predicate="project.secret",
+            value="orion secret is code orange",
+            evidence_text="The Orion secret is code orange.",
+        )
+        assert client.post(f"/v1/memory/candidates/{secret['id']}/approve").status_code == 200
+        assert client.post(f"/v1/memory/candidates/{unrelated['id']}/approve").status_code == 200
+
+        scoped_export = client.post("/v1/memory/export", json={"scope_key": "project:phoenix"})
+        assert scoped_export.status_code == 200
+        with _session_factory(client)() as db:
+            export_artifact = db.scalar(
+                select(MemoryExportArtifactRecord)
+                .where(MemoryExportArtifactRecord.scope_key == "project:phoenix")
+                .limit(1)
+            )
+            assert export_artifact is not None
+            assert "code violet" in json.dumps(export_artifact.content)
+            assert "code orange" not in json.dumps(export_artifact.content)
+
+        assert (
+            client.post(f"/v1/memory/assertions/{secret['id']}/privacy-delete").status_code == 200
+        )
+        with _session_factory(client)() as db:
+            serialized_tables: list[str] = []
+            for table in (
+                MemoryProcedureRecord,
+                ProjectStateSnapshotRecord,
+                MemoryContextBlockRecord,
+                MemoryExportArtifactRecord,
+                MemoryTopicRecord,
+                MemoryVersionRecord,
+            ):
+                rows = db.scalars(select(table)).all()
+                serialized_tables.extend(json.dumps(row.__dict__, default=str) for row in rows)
+            assert "code violet" not in "\n".join(serialized_tables)
+            artifact = db.scalar(select(MemoryExportArtifactRecord).limit(1))
+            assert artifact is not None
+            assert artifact.content == {}
+            assert artifact.redaction_posture == "privacy_deleted"
 
 
 def test_no_memory_and_temporary_modes_disable_recall_and_extraction(

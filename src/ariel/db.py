@@ -184,6 +184,133 @@ REQUIRED_COLUMNS: Final[dict[str, tuple[str, ...]]] = {
         "encryption_key_version",
     ),
     "work_commitments": ("dedupe_digest",),
+    "memory_evidence": (
+        "source_turn_id",
+        "source_session_id",
+        "actor_id",
+        "content_class",
+        "trust_boundary",
+        "lifecycle_state",
+        "redaction_posture",
+    ),
+    "memory_assertions": (
+        "subject_entity_id",
+        "subject_key",
+        "predicate",
+        "scope_key",
+        "object_value",
+        "assertion_type",
+        "is_multi_valued",
+        "lifecycle_state",
+        "confidence",
+        "superseded_by_assertion_id",
+    ),
+    "memory_versions": (
+        "canonical_table",
+        "canonical_id",
+        "version",
+        "change_type",
+        "redaction_posture",
+        "projection_invalidation",
+    ),
+    "memory_deletions": (
+        "target_table",
+        "target_id",
+        "deletion_type",
+        "redaction_posture",
+        "projection_invalidation",
+    ),
+    "memory_projection_jobs": (
+        "projection_kind",
+        "target_table",
+        "target_id",
+        "lifecycle_state",
+        "attempts",
+        "max_retries",
+        "claimed_by",
+        "attempt_token",
+        "last_heartbeat",
+        "run_after",
+    ),
+    "memory_embedding_projections": (
+        "assertion_id",
+        "projection_version",
+        "source_memory_version",
+        "embedding_provider",
+        "embedding_model",
+        "embedding_dimensions",
+        "search_text",
+    ),
+    "memory_keyword_projections": (
+        "canonical_table",
+        "canonical_id",
+        "projection_version",
+        "source_memory_version",
+        "search_text",
+        "weighted_terms",
+    ),
+    "memory_entity_projections": (
+        "canonical_table",
+        "canonical_id",
+        "entity_id",
+        "projection_version",
+        "source_memory_version",
+        "mention_text",
+        "features",
+    ),
+    "memory_graph_projections": (
+        "source_entity_id",
+        "target_entity_id",
+        "projection_version",
+        "source_memory_versions",
+        "source_projection_versions",
+        "relationship_path",
+        "distance",
+        "score",
+    ),
+    "memory_temporal_projections": (
+        "canonical_table",
+        "canonical_id",
+        "temporal_kind",
+        "projection_version",
+        "source_memory_version",
+        "metadata_json",
+    ),
+    "memory_symbol_projections": (
+        "canonical_table",
+        "canonical_id",
+        "repo_key",
+        "symbol",
+        "path",
+        "projection_version",
+        "source_memory_version",
+        "metadata_json",
+    ),
+    "memory_context_blocks": (
+        "block_type",
+        "scope_key",
+        "topic_id",
+        "lifecycle_state",
+        "source_assertion_ids",
+        "source_episode_ids",
+        "source_trace_ids",
+        "source_action_trace_ids",
+        "source_procedure_ids",
+        "source_project_state_snapshot_ids",
+        "source_memory_versions",
+        "source_projection_versions",
+        "projection_version",
+    ),
+    "memory_export_artifacts": (
+        "scope_key",
+        "export_format",
+        "status",
+        "projection_version",
+        "redaction_posture",
+        "source_counts",
+        "source_memory_versions",
+        "source_projection_versions",
+    ),
 }
 
 REQUIRED_CONSTRAINTS: Final[dict[str, tuple[str, ...]]] = {
@@ -247,6 +374,134 @@ REQUIRED_CONSTRAINTS: Final[dict[str, tuple[str, ...]]] = {
         "ck_work_follow_up_loop_version",
     ),
     "work_follow_up_events": ("ck_work_follow_up_event_type",),
+    "memory_evidence": (
+        "ck_memory_evidence_content_class",
+        "ck_memory_evidence_trust_boundary",
+        "ck_memory_evidence_lifecycle_state",
+        "ck_memory_evidence_redaction_posture",
+    ),
+    "memory_entities": ("ck_memory_entity_type",),
+    "memory_relationships": (
+        "ck_memory_relationship_lifecycle_state",
+        "ck_memory_relationship_confidence_range",
+        "ck_memory_relationship_valid_interval",
+    ),
+    "memory_assertions": (
+        "ck_memory_assertion_type",
+        "ck_memory_assertion_lifecycle_state",
+        "ck_memory_assertion_confidence_range",
+        "ck_memory_assertion_valid_interval",
+        "ck_memory_assertion_superseded_link",
+    ),
+    "memory_episodes": (
+        "ck_memory_episode_type",
+        "ck_memory_episode_lifecycle_state",
+        "ck_memory_episode_valid_interval",
+    ),
+    "memory_reasoning_traces": (
+        "ck_memory_reasoning_trace_type",
+        "ck_memory_reasoning_trace_outcome",
+        "ck_memory_reasoning_trace_lifecycle_state",
+    ),
+    "memory_action_traces": (
+        "ck_memory_action_trace_type",
+        "ck_memory_action_trace_outcome",
+        "ck_memory_action_trace_lifecycle_state",
+    ),
+    "memory_procedures": (
+        "ck_memory_procedure_lifecycle_state",
+        "ck_memory_procedure_review_state",
+        "ck_memory_procedure_valid_interval",
+    ),
+    "memory_reviews": ("ck_memory_review_decision",),
+    "memory_conflict_sets": ("ck_memory_conflict_set_lifecycle_state",),
+    "memory_salience": (
+        "ck_memory_salience_user_priority",
+        "ck_memory_salience_score_non_negative",
+    ),
+    "memory_scope_bindings": (
+        "ck_memory_scope_binding_scope_type",
+        "ck_memory_scope_binding_memory_mode",
+    ),
+    "memory_retention_policies": (
+        "ck_memory_retention_policy_kind",
+        "ck_memory_retention_policy_lifecycle_state",
+        "ck_memory_retention_policy_days_positive",
+    ),
+    "memory_sensitivity_labels": (
+        "ck_memory_sensitivity_label_canonical_table",
+        "ck_memory_sensitivity_label",
+        "ck_memory_sensitivity_label_lifecycle_state",
+    ),
+    "memory_versions": (
+        "ck_memory_version_canonical_table",
+        "ck_memory_version_positive",
+        "ck_memory_version_change_type",
+        "ck_memory_version_redaction_posture",
+    ),
+    "memory_deletions": (
+        "ck_memory_deletion_target_table",
+        "ck_memory_deletion_type",
+        "ck_memory_deletion_redaction_posture",
+    ),
+    "memory_projection_jobs": (
+        "ck_memory_projection_job_kind",
+        "ck_memory_projection_job_lifecycle_state",
+        "ck_memory_projection_job_attempts",
+        "ck_memory_projection_job_max_retries",
+    ),
+    "memory_embedding_projections": (
+        "ck_memory_embedding_projection_dimensions",
+        "ck_memory_embedding_projection_source_memory_version",
+    ),
+    "memory_keyword_projections": (
+        "ck_memory_keyword_projection_canonical_table",
+        "ck_memory_keyword_projection_source_memory_version",
+    ),
+    "memory_entity_projections": (
+        "ck_memory_entity_projection_canonical_table",
+        "ck_memory_entity_projection_source_memory_version",
+    ),
+    "memory_graph_projections": (
+        "ck_memory_graph_projection_distance",
+        "ck_memory_graph_projection_score",
+        "ck_memory_graph_projection_source_memory_versions_object",
+        "ck_memory_graph_projection_source_projection_versions_object",
+    ),
+    "memory_temporal_projections": (
+        "ck_memory_temporal_projection_canonical_table",
+        "ck_memory_temporal_projection_kind",
+        "ck_memory_temporal_projection_valid_interval",
+        "ck_memory_temporal_projection_source_memory_version",
+    ),
+    "memory_symbol_projections": (
+        "ck_memory_symbol_projection_canonical_table",
+        "ck_memory_symbol_projection_source_memory_version",
+    ),
+    "memory_context_blocks": (
+        "ck_memory_context_block_type",
+        "ck_memory_context_block_lifecycle_state",
+        "ck_memory_context_block_topic_binding",
+        "ck_memory_context_block_source_memory_versions_object",
+        "ck_memory_context_block_source_projection_versions_object",
+    ),
+    "memory_topics": (
+        "ck_memory_topic_family",
+        "ck_memory_topic_lifecycle_state",
+    ),
+    "memory_topic_members": (
+        "ck_memory_topic_member_canonical_table",
+        "ck_memory_topic_member_kind",
+        "ck_memory_topic_member_rank_nonnegative",
+    ),
+    "memory_export_artifacts": (
+        "ck_memory_export_artifact_format",
+        "ck_memory_export_artifact_status",
+        "ck_memory_export_artifact_redaction_posture",
+        "ck_memory_export_artifact_source_memory_versions_object",
+        "ck_memory_export_artifact_source_projection_versions_object",
+    ),
+    "memory_eval_runs": ("ck_memory_eval_run_status",),
 }
 
 REQUIRED_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
@@ -337,6 +592,204 @@ REQUIRED_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
     },
     "work_follow_up_events": {
         "ck_work_follow_up_event_type": ("'notified'", "'stale_noop'", "'suppressed'"),
+    },
+    "memory_evidence": {
+        "ck_memory_evidence_content_class": ("'user_message'", "'tool_output'", "'rotation'"),
+        "ck_memory_evidence_trust_boundary": ("'trusted_user'", "'untrusted_tool'"),
+        "ck_memory_evidence_lifecycle_state": ("'available'", "'privacy_deleted'"),
+        "ck_memory_evidence_redaction_posture": ("'none'", "'privacy_deleted'"),
+    },
+    "memory_entities": {
+        "ck_memory_entity_type": ("'user'", "'repo'", "'assertion_subject'"),
+    },
+    "memory_relationships": {
+        "ck_memory_relationship_lifecycle_state": ("'active'", "'deleted'"),
+        "ck_memory_relationship_confidence_range": ("confidence", "0.0", "1.0"),
+        "ck_memory_relationship_valid_interval": ("valid_from", "valid_to"),
+    },
+    "memory_assertions": {
+        "ck_memory_assertion_type": ("'fact'", "'procedure'", "'project_state'"),
+        "ck_memory_assertion_lifecycle_state": ("'active'", "'conflicted'", "'privacy_deleted'"),
+        "ck_memory_assertion_confidence_range": ("confidence", "0.0", "1.0"),
+        "ck_memory_assertion_valid_interval": ("valid_from", "valid_to"),
+        "ck_memory_assertion_superseded_link": (
+            "superseded",
+            "superseded_by_assertion_id IS NOT NULL",
+        ),
+    },
+    "memory_episodes": {
+        "ck_memory_episode_type": ("'task_event'", "'action_outcome'"),
+        "ck_memory_episode_lifecycle_state": ("'active'", "'deleted'"),
+        "ck_memory_episode_valid_interval": ("valid_from", "valid_to"),
+    },
+    "memory_reasoning_traces": {
+        "ck_memory_reasoning_trace_type": ("'action_path'", "'user_correction'"),
+        "ck_memory_reasoning_trace_outcome": ("'succeeded'", "'corrected'"),
+        "ck_memory_reasoning_trace_lifecycle_state": ("'active'", "'deleted'"),
+    },
+    "memory_action_traces": {
+        "ck_memory_action_trace_type": ("'proposal'", "'execution'", "'outcome'"),
+        "ck_memory_action_trace_outcome": ("'succeeded'", "'undone'"),
+        "ck_memory_action_trace_lifecycle_state": ("'active'", "'privacy_deleted'"),
+    },
+    "memory_procedures": {
+        "ck_memory_procedure_lifecycle_state": ("'active'", "'rejected'", "'deleted'"),
+        "ck_memory_procedure_review_state": ("'approved'", "'needs_user_review'"),
+        "ck_memory_procedure_valid_interval": ("valid_from", "valid_to"),
+    },
+    "memory_reviews": {
+        "ck_memory_review_decision": ("'approved'", "'needs_user_review'", "'merged'"),
+    },
+    "memory_conflict_sets": {
+        "ck_memory_conflict_set_lifecycle_state": ("'open'", "'resolved'"),
+    },
+    "memory_salience": {
+        "ck_memory_salience_user_priority": ("'pinned'", "'deprioritized'"),
+        "ck_memory_salience_score_non_negative": ("score", ">=", "0.0"),
+    },
+    "memory_scope_bindings": {
+        "ck_memory_scope_binding_scope_type": ("'session'", "'proactive_case'"),
+        "ck_memory_scope_binding_memory_mode": ("'normal'", "'temporary'", "'no_memory'"),
+    },
+    "memory_retention_policies": {
+        "ck_memory_retention_policy_kind": ("'never_remember'", "'review_after'"),
+        "ck_memory_retention_policy_lifecycle_state": ("'active'", "'deleted'"),
+        "ck_memory_retention_policy_days_positive": ("retention_days", ">", "0"),
+    },
+    "memory_sensitivity_labels": {
+        "ck_memory_sensitivity_label_canonical_table": ("'memory_evidence'", "'memory_procedures'"),
+        "ck_memory_sensitivity_label": ("'secret'", "'source_confidential'"),
+        "ck_memory_sensitivity_label_lifecycle_state": ("'active'", "'deleted'"),
+    },
+    "memory_versions": {
+        "ck_memory_version_canonical_table": (
+            "'memory_assertions'",
+            "'memory_export_artifacts'",
+        ),
+        "ck_memory_version_positive": ("version", ">", "0"),
+        "ck_memory_version_change_type": ("'deleted'", "'privacy_deleted'", "'exported'"),
+        "ck_memory_version_redaction_posture": ("'none'", "'privacy_deleted'"),
+    },
+    "memory_deletions": {
+        "ck_memory_deletion_target_table": ("'memory_evidence'", "'memory_assertions'"),
+        "ck_memory_deletion_type": ("'delete'", "'privacy_delete'", "'retract'"),
+        "ck_memory_deletion_redaction_posture": ("'none'", "'privacy_deleted'"),
+    },
+    "memory_projection_jobs": {
+        "ck_memory_projection_job_kind": ("'embedding'", "'topic_block'", "'export'"),
+        "ck_memory_projection_job_lifecycle_state": ("'pending'", "'dead_letter'"),
+        "ck_memory_projection_job_attempts": ("attempts", ">=", "0"),
+        "ck_memory_projection_job_max_retries": ("max_retries", ">=", "0"),
+    },
+    "memory_embedding_projections": {
+        "ck_memory_embedding_projection_dimensions": ("embedding_dimensions", "1536"),
+        "ck_memory_embedding_projection_source_memory_version": (
+            "source_memory_version",
+            ">",
+            "0",
+        ),
+    },
+    "memory_keyword_projections": {
+        "ck_memory_keyword_projection_canonical_table": (
+            "'memory_assertions'",
+            "'memory_evidence'",
+        ),
+        "ck_memory_keyword_projection_source_memory_version": (
+            "source_memory_version",
+            ">",
+            "0",
+        ),
+    },
+    "memory_entity_projections": {
+        "ck_memory_entity_projection_canonical_table": (
+            "'memory_assertions'",
+            "'project_state_snapshots'",
+        ),
+        "ck_memory_entity_projection_source_memory_version": (
+            "source_memory_version",
+            ">",
+            "0",
+        ),
+    },
+    "memory_graph_projections": {
+        "ck_memory_graph_projection_distance": ("distance", ">=", "0"),
+        "ck_memory_graph_projection_score": ("score", ">=", "0.0"),
+        "ck_memory_graph_projection_source_memory_versions_object": (
+            "jsonb_typeof",
+            "source_memory_versions",
+            "object",
+        ),
+        "ck_memory_graph_projection_source_projection_versions_object": (
+            "jsonb_typeof",
+            "source_projection_versions",
+            "object",
+        ),
+    },
+    "memory_temporal_projections": {
+        "ck_memory_temporal_projection_canonical_table": (
+            "'memory_assertions'",
+            "'project_state_snapshots'",
+        ),
+        "ck_memory_temporal_projection_kind": ("'validity'", "'retention'"),
+        "ck_memory_temporal_projection_valid_interval": ("valid_from", "valid_to"),
+        "ck_memory_temporal_projection_source_memory_version": (
+            "source_memory_version",
+            ">",
+            "0",
+        ),
+    },
+    "memory_symbol_projections": {
+        "ck_memory_symbol_projection_canonical_table": (
+            "'memory_assertions'",
+            "'project_state_snapshots'",
+        ),
+        "ck_memory_symbol_projection_source_memory_version": (
+            "source_memory_version",
+            ">",
+            "0",
+        ),
+    },
+    "memory_context_blocks": {
+        "ck_memory_context_block_type": ("'hot_index'", "'topic'", "'project_state'"),
+        "ck_memory_context_block_lifecycle_state": ("'active'", "'deleted'"),
+        "ck_memory_context_block_topic_binding": ("topic_id IS NOT NULL", "topic_id IS NULL"),
+        "ck_memory_context_block_source_memory_versions_object": (
+            "jsonb_typeof",
+            "source_memory_versions",
+            "object",
+        ),
+        "ck_memory_context_block_source_projection_versions_object": (
+            "jsonb_typeof",
+            "source_projection_versions",
+            "object",
+        ),
+    },
+    "memory_topics": {
+        "ck_memory_topic_family": ("'user-profile'", "'repo-conventions'", "'open-risks'"),
+        "ck_memory_topic_lifecycle_state": ("'active'", "'deleted'"),
+    },
+    "memory_topic_members": {
+        "ck_memory_topic_member_canonical_table": ("'memory_assertions'", "'memory_procedures'"),
+        "ck_memory_topic_member_kind": ("'source'", "'summary'"),
+        "ck_memory_topic_member_rank_nonnegative": ("rank", ">=", "0"),
+    },
+    "memory_export_artifacts": {
+        "ck_memory_export_artifact_format": ("'json'",),
+        "ck_memory_export_artifact_status": ("'created'", "'failed'"),
+        "ck_memory_export_artifact_redaction_posture": ("'redacted'", "'privacy_deleted'"),
+        "ck_memory_export_artifact_source_memory_versions_object": (
+            "jsonb_typeof",
+            "source_memory_versions",
+            "object",
+        ),
+        "ck_memory_export_artifact_source_projection_versions_object": (
+            "jsonb_typeof",
+            "source_projection_versions",
+            "object",
+        ),
+    },
+    "memory_eval_runs": {
+        "ck_memory_eval_run_status": ("'completed'", "'failed'"),
     },
 }
 

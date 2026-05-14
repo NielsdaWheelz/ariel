@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from ariel import action_runtime
 from ariel.action_runtime import RuntimeProvenance, process_response_function_calls
 from ariel.app import ModelAdapterError, _call_tool_result_interpreter, _call_tool_strategy
 from ariel.capability_registry import (
@@ -94,7 +95,10 @@ def test_tool_strategy_uses_no_tools_and_accepts_valid_selected_ids() -> None:
                 },
                 {
                     "family": "memory",
-                    "description": ("Memory inspection, proposal, review, correction, and export."),
+                    "description": (
+                        "Memory inspection, recall diagnostics, policy, mutation, "
+                        "consolidation, and export."
+                    ),
                     "capability_ids": ["cap.memory.search"],
                 },
             ]
@@ -308,15 +312,22 @@ def test_memory_response_tools_are_exposed_to_the_model() -> None:
     expected_capability_ids = {
         "cap.memory.inspect",
         "cap.memory.search",
+        "cap.memory.recall_diagnostics",
         "cap.memory.propose",
         "cap.memory.review",
+        "cap.memory.edit_candidate",
+        "cap.memory.merge_candidates",
         "cap.memory.correct",
         "cap.memory.retract",
         "cap.memory.delete",
         "cap.memory.privacy_delete",
         "cap.memory.redact_evidence",
         "cap.memory.set_never_remember",
+        "cap.memory.set_scope_mode",
         "cap.memory.resolve_conflict",
+        "cap.memory.prioritize",
+        "cap.memory.deprioritize",
+        "cap.memory.mark_stale",
         "cap.memory.consolidate",
         "cap.memory.export",
     }
@@ -336,16 +347,452 @@ def test_memory_response_tools_are_exposed_to_the_model() -> None:
 
     inspect_capability = get_capability("cap.memory.inspect")
     search_capability = get_capability("cap.memory.search")
-    export_capability = get_capability("cap.memory.export")
-    review_capability = get_capability("cap.memory.review")
     assert inspect_capability is not None
     assert search_capability is not None
-    assert export_capability is not None
-    assert review_capability is not None
     assert inspect_capability.policy_decision == "allow_inline"
     assert search_capability.policy_decision == "allow_inline"
-    assert export_capability.policy_decision == "allow_inline"
-    assert review_capability.policy_decision == "requires_approval"
+    for capability_id in expected_capability_ids:
+        capability = get_capability(capability_id)
+        assert capability is not None
+        if capability.impact_level != "read":
+            assert capability.policy_decision == "requires_approval"
+
+
+def test_memory_import_response_tool_is_not_model_visible() -> None:
+    default_tool_names = {tool["name"] for tool in _production_response_tool_definitions()}
+    import_tool_name = response_tool_name_for_capability_id("cap.memory.import")
+
+    assert import_tool_name not in default_tool_names
+    import_capability = get_capability("cap.memory.import")
+    assert import_capability is not None
+    assert import_capability.policy_decision == "requires_approval"
+
+
+def test_missing_memory_surface_tools_have_explicit_contracts() -> None:
+    tools_by_name = {tool["name"]: tool for tool in _production_response_tool_definitions()}
+
+    inspect_tool = tools_by_name[response_tool_name_for_capability_id("cap.memory.inspect")]
+    inspect_capability = get_capability("cap.memory.inspect")
+    assert inspect_capability is not None
+    for section in inspect_tool["parameters"]["properties"]["section"]["enum"]:
+        assert inspect_capability.validate_input({"section": section, "limit": 1})[1] is None
+
+    recall_tool = tools_by_name[
+        response_tool_name_for_capability_id("cap.memory.recall_diagnostics")
+    ]
+    assert recall_tool["parameters"]["properties"] == {
+        "query": {"type": "string", "minLength": 1, "maxLength": 1000},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+        "scope_key": {"type": ["string", "null"], "minLength": 1, "maxLength": 200},
+    }
+
+    context_tool = response_tool_definitions(["cap.memory.context_blocks"])[0]
+    assert context_tool["parameters"]["properties"]["block_type"]["enum"] == [
+        "all",
+        "hot_index",
+        "topic",
+        "pinned_core",
+        "project_state",
+        "procedure",
+        "episodic",
+        "reasoning",
+    ]
+    assert context_tool["parameters"]["properties"]["limit"] == {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100,
+    }
+    assert context_tool["parameters"]["properties"]["topic_id"] == {
+        "type": ["string", "null"],
+        "minLength": 1,
+        "maxLength": 32,
+    }
+
+    scope_mode_tool = tools_by_name[
+        response_tool_name_for_capability_id("cap.memory.set_scope_mode")
+    ]
+    assert scope_mode_tool["parameters"]["properties"] == {
+        "scope_type": {
+            "type": "string",
+            "enum": ["user", "project", "repo", "session", "thread", "proactive_case"],
+        },
+        "scope_key": {"type": "string", "minLength": 1, "maxLength": 200},
+        "memory_mode": {"type": "string", "enum": ["normal", "temporary", "no_memory"]},
+        "reason": {"type": ["string", "null"], "maxLength": 500},
+    }
+
+    import_tool = response_tool_definitions(["cap.memory.import"])[0]
+    candidate_schema = import_tool["parameters"]["properties"]["candidates"]["items"]
+    assert set(candidate_schema["properties"]) == {
+        "subject_key",
+        "predicate",
+        "assertion_type",
+        "value",
+        "evidence_text",
+        "confidence",
+        "scope_key",
+        "is_multi_valued",
+        "valid_from",
+        "valid_to",
+    }
+
+    eval_tool = response_tool_definitions(["cap.memory.eval"])[0]
+    assert set(eval_tool["parameters"]["properties"]["cases"]["items"]["properties"]) == {
+        "case_id",
+        "query",
+        "expected",
+        "expected_memory_ids",
+        "forbidden_memory_ids",
+        "expected_kinds",
+        "forbidden_texts",
+        "expect_policy_blocked",
+        "notes",
+    }
+
+    retry_tool = response_tool_definitions(["cap.memory.retry_projection_job"])[0]
+    assert retry_tool["parameters"]["properties"] == {
+        "job_id": {"type": "string", "minLength": 1, "maxLength": 32}
+    }
+
+
+def test_memory_runtime_handles_projection_read_surfaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixed_now = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
+    calls: list[tuple[str, int]] = []
+
+    def bounded_memory_payload(_: Any, *, section: str, limit: int) -> dict[str, Any]:
+        calls.append((section, limit))
+        return {
+            "schema_version": "memory.sota.v1",
+            "topics": [{"id": "mt_1"}] if section == "topics" else [],
+            "context_blocks": [{"id": "mcb_1", "block_type": section, "topic_id": "mtp_1"}],
+            "deletions": [{"id": "md_1"}] if section == "deletions" else [],
+            "scope_bindings": [{"id": "msb_1"}] if section == "scope_bindings" else [],
+            "projection_health": {"failed_jobs": 0},
+        }
+
+    monkeypatch.setattr(action_runtime, "_memory_actor_id", lambda **_: "assistant")
+    monkeypatch.setattr(action_runtime, "_bounded_memory_payload", bounded_memory_payload)
+
+    class Attempt:
+        session_id = "ses_1"
+
+    for capability_id, normalized_input, expected_section in [
+        ("cap.memory.topics", {"limit": 7}, "topics"),
+        ("cap.memory.hot_index", {"limit": 8}, "hot_index"),
+        ("cap.memory.deletions", {"limit": 9}, "deletions"),
+        ("cap.memory.scope_bindings", {"limit": 10}, "scope_bindings"),
+    ]:
+        output = action_runtime._execute_memory_capability(
+            db=cast(Session, object()),
+            capability_id=capability_id,
+            normalized_input=normalized_input,
+            action_attempt=cast(Any, Attempt()),
+            now_fn=lambda: fixed_now,
+            new_id_fn=lambda prefix: f"{prefix}_1",
+        )
+        assert output["status"] == "listed"
+        assert output["memory"]["schema_version"] == "memory.sota.v1"
+        assert calls[-1] == (expected_section, normalized_input["limit"])
+
+    output = action_runtime._execute_memory_capability(
+        db=cast(Session, object()),
+        capability_id="cap.memory.context_blocks",
+        normalized_input={"block_type": "topic", "limit": 11, "topic_id": "mtp_1"},
+        action_attempt=cast(Any, Attempt()),
+        now_fn=lambda: fixed_now,
+        new_id_fn=lambda prefix: f"{prefix}_1",
+    )
+    assert output["status"] == "listed"
+    assert calls[-1] == ("context_blocks", 100)
+
+
+def test_memory_runtime_handles_diagnostics_import_eval_and_projection_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixed_now = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
+    observed: dict[str, Any] = {}
+
+    class Attempt:
+        session_id = "ses_1"
+
+    def build_context(
+        db: Any,
+        *,
+        user_message: str,
+        max_recalled_assertions: int,
+        current_session_id: str | None,
+        scope_key: str | None,
+        actor_id: str | None,
+        settings: Any | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        del settings
+        observed["diagnostics"] = (
+            db,
+            user_message,
+            max_recalled_assertions,
+            current_session_id,
+            scope_key,
+            actor_id,
+        )
+        return (
+            {
+                "schema_version": "memory.sota.v1",
+                "hot_index": [{"id": "mcb_hot"}],
+                "topic_index": [],
+                "semantic_assertions": [],
+                "project_state": [],
+                "procedural_memory": [],
+                "action_traces": [],
+                "conflicts": [],
+                "memory_policy": {"reason": "normal"},
+                "projection_health": {"failed_jobs": 1},
+            },
+            {"selected_memory_ids": ["mem_1"], "omitted_memories": []},
+        )
+
+    monkeypatch.setattr(action_runtime, "_memory_actor_id", lambda **_: "assistant")
+    monkeypatch.setattr(action_runtime, "build_memory_context", build_context)
+
+    def import_candidates(*_args: Any, **kwargs: Any) -> list[str]:
+        observed["import"] = kwargs
+        return ["mem_candidate_1"]
+
+    def run_eval(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        observed["eval"] = kwargs
+        return {"id": "mer_1"}
+
+    def retry_job(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        observed["retry"] = kwargs
+        return {"id": "mpj_1", "state": "pending"}
+
+    monkeypatch.setattr(action_runtime, "import_memory_candidates", import_candidates)
+    monkeypatch.setattr(action_runtime, "run_memory_eval", run_eval)
+    monkeypatch.setattr(action_runtime, "retry_projection_job", retry_job)
+    monkeypatch.setattr(
+        action_runtime,
+        "_bounded_memory_payload",
+        lambda *_args, **_kwargs: {"schema_version": "memory.sota.v1"},
+    )
+
+    diagnostics = action_runtime._execute_memory_capability(
+        db=cast(Session, object()),
+        capability_id="cap.memory.recall_diagnostics",
+        normalized_input={"query": "phoenix", "limit": 5, "scope_key": "project:phoenix"},
+        action_attempt=cast(Any, Attempt()),
+        now_fn=lambda: fixed_now,
+        new_id_fn=lambda prefix: f"{prefix}_1",
+    )
+    assert diagnostics["status"] == "diagnosed"
+    assert diagnostics["recall_diagnostics"]["selected_memory_ids"] == ["mem_1"]
+    assert observed["diagnostics"][1:] == ("phoenix", 5, "ses_1", "project:phoenix", "assistant")
+
+    candidate = {
+        "subject_key": "project:phoenix",
+        "predicate": "preference",
+        "assertion_type": "preference",
+        "value": "Use matte notebooks.",
+        "evidence_text": "The user said to remember matte notebooks.",
+        "confidence": 0.9,
+        "scope_key": "global",
+        "is_multi_valued": False,
+        "valid_from": None,
+        "valid_to": None,
+    }
+    imported = action_runtime._execute_memory_capability(
+        db=cast(Session, object()),
+        capability_id="cap.memory.import",
+        normalized_input={"candidates": [candidate]},
+        action_attempt=cast(Any, Attempt()),
+        now_fn=lambda: fixed_now,
+        new_id_fn=lambda prefix: f"{prefix}_1",
+        memory_import_cutover_enabled=True,
+    )
+    assert imported["status"] == "imported"
+    assert observed["import"]["source_session_id"] == "ses_1"
+    assert observed["import"]["candidates"] == [candidate]
+
+    evaluated = action_runtime._execute_memory_capability(
+        db=cast(Session, object()),
+        capability_id="cap.memory.eval",
+        normalized_input={
+            "eval_name": "memory smoke",
+            "cases": [
+                {
+                    "case_id": "case_1",
+                    "query": "phoenix",
+                    "expected": "remember phoenix",
+                    "expected_memory_ids": ["mem_1"],
+                    "forbidden_memory_ids": ["mem_2"],
+                    "expected_kinds": ["semantic_assertion"],
+                    "forbidden_texts": ["forbidden"],
+                    "expect_policy_blocked": False,
+                    "notes": None,
+                }
+            ],
+        },
+        action_attempt=cast(Any, Attempt()),
+        now_fn=lambda: fixed_now,
+        new_id_fn=lambda prefix: f"{prefix}_1",
+    )
+    assert evaluated == {"status": "evaluated", "eval": {"id": "mer_1"}}
+    assert observed["eval"]["eval_name"] == "memory smoke"
+
+    retried = action_runtime._execute_memory_capability(
+        db=cast(Session, object()),
+        capability_id="cap.memory.retry_projection_job",
+        normalized_input={"job_id": "mpj_1"},
+        action_attempt=cast(Any, Attempt()),
+        now_fn=lambda: fixed_now,
+        new_id_fn=lambda prefix: f"{prefix}_1",
+    )
+    assert retried["status"] == "queued"
+    assert observed["retry"]["job_id"] == "mpj_1"
+
+
+def test_memory_runtime_passes_scoped_mutation_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixed_now = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
+    observed: dict[str, Any] = {}
+
+    class Attempt:
+        session_id = "ses_1"
+
+    monkeypatch.setattr(action_runtime, "_memory_actor_id", lambda **_: "assistant")
+    monkeypatch.setattr(
+        action_runtime,
+        "_bounded_memory_payload",
+        lambda *_args, **_kwargs: {"schema_version": "memory.sota.v1"},
+    )
+
+    def export(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        observed["export"] = kwargs
+        return {"id": "mea_1"}
+
+    def consolidate(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        observed["consolidate"] = kwargs
+        return {"scope_key": kwargs["scope_key"]}
+
+    def never_remember(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        observed["never_remember"] = kwargs
+        return {"scope_key": kwargs["scope_key"], "pattern": kwargs["pattern"]}
+
+    def scope_mode(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        observed["scope_mode"] = kwargs
+        return {"scope_key": kwargs["scope_key"], "memory_mode": kwargs["memory_mode"]}
+
+    monkeypatch.setattr(action_runtime, "export_memory", export)
+    monkeypatch.setattr(action_runtime, "consolidate_memory", consolidate)
+    monkeypatch.setattr(action_runtime, "set_never_remember_rule", never_remember)
+    monkeypatch.setattr(action_runtime, "set_memory_scope_binding", scope_mode)
+
+    for capability_id, normalized_input, observed_key in [
+        ("cap.memory.export", {"scope_key": "project:phoenix"}, "export"),
+        ("cap.memory.consolidate", {"scope_key": "project:phoenix"}, "consolidate"),
+        (
+            "cap.memory.set_never_remember",
+            {"scope_key": "project:phoenix", "rule": "do not store launch codes"},
+            "never_remember",
+        ),
+        (
+            "cap.memory.set_scope_mode",
+            {
+                "scope_type": "project",
+                "scope_key": "project:phoenix",
+                "memory_mode": "no_memory",
+                "reason": "user request",
+            },
+            "scope_mode",
+        ),
+    ]:
+        output = action_runtime._execute_memory_capability(
+            db=cast(Session, object()),
+            capability_id=capability_id,
+            normalized_input=normalized_input,
+            action_attempt=cast(Any, Attempt()),
+            now_fn=lambda: fixed_now,
+            new_id_fn=lambda prefix: f"{prefix}_1",
+        )
+        assert output["status"] in {"exported", "consolidated", "recorded"}
+        assert observed[observed_key]["scope_key"] == "project:phoenix"
+
+
+def test_memory_runtime_handles_candidate_and_priority_mutations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixed_now = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
+    observed: dict[str, Any] = {}
+
+    class Attempt:
+        session_id = "ses_1"
+
+    monkeypatch.setattr(action_runtime, "_memory_actor_id", lambda **_: "assistant")
+    monkeypatch.setattr(
+        action_runtime,
+        "_bounded_memory_payload",
+        lambda *_args, **_kwargs: {"schema_version": "memory.sota.v1"},
+    )
+
+    def edit(*_args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        observed["edit"] = kwargs
+        return [{"event_type": "evt.memory.candidate_edited", "payload": {}}]
+
+    def merge(*_args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        observed["merge"] = kwargs
+        return [{"event_type": "evt.memory.candidates_merged", "payload": {}}]
+
+    def priority(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        observed[str(kwargs["priority"])] = kwargs
+        return {"id": kwargs["assertion_id"], "priority": kwargs["priority"]}
+
+    def stale(*_args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        observed["stale"] = kwargs
+        return [{"event_type": "evt.memory.assertion_marked_stale", "payload": {}}]
+
+    monkeypatch.setattr(action_runtime, "edit_candidate", edit)
+    monkeypatch.setattr(action_runtime, "merge_candidates", merge)
+    monkeypatch.setattr(action_runtime, "set_assertion_priority", priority)
+    monkeypatch.setattr(action_runtime, "mark_assertion_stale", stale)
+
+    cases: list[tuple[str, dict[str, Any], str]] = [
+        (
+            "cap.memory.edit_candidate",
+            {"assertion_id": "mas_1", "value": "new"},
+            "edited",
+        ),
+        (
+            "cap.memory.merge_candidates",
+            {"assertion_ids": ["mas_1", "mas_2"]},
+            "merged",
+        ),
+        ("cap.memory.prioritize", {"assertion_id": "mas_1"}, "prioritized"),
+        ("cap.memory.deprioritize", {"assertion_id": "mas_1"}, "deprioritized"),
+        (
+            "cap.memory.mark_stale",
+            {"assertion_id": "mas_1", "reason": "old"},
+            "stale",
+        ),
+    ]
+    for capability_id, normalized_input, expected_status in cases:
+        output = action_runtime._execute_memory_capability(
+            db=cast(Session, object()),
+            capability_id=capability_id,
+            normalized_input=normalized_input,
+            action_attempt=cast(Any, Attempt()),
+            now_fn=lambda: fixed_now,
+            new_id_fn=lambda prefix: f"{prefix}_1",
+        )
+        assert output["status"] == expected_status
+
+    assert observed["edit"]["actor_id"] == "assistant"
+    assert observed["merge"]["assertion_ids"] == ["mas_1", "mas_2"]
+    assert observed["pinned"]["assertion_id"] == "mas_1"
+    assert observed["pinned"]["actor_id"] == "assistant"
+    assert observed["deprioritized"]["assertion_id"] == "mas_1"
+    assert observed["deprioritized"]["actor_id"] == "assistant"
+    assert observed["stale"]["reason"] == "old"
 
 
 def test_action_runtime_has_no_deterministic_tool_result_synthesizer() -> None:

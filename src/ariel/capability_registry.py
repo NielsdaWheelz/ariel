@@ -51,15 +51,52 @@ ATTACHMENT_CAPABILITY_IDS = {"cap.attachment.read"}
 MEMORY_CAPABILITY_IDS = {
     "cap.memory.inspect",
     "cap.memory.search",
+    "cap.memory.recall_diagnostics",
+    "cap.memory.topics",
+    "cap.memory.hot_index",
+    "cap.memory.context_blocks",
     "cap.memory.propose",
     "cap.memory.review",
+    "cap.memory.edit_candidate",
+    "cap.memory.merge_candidates",
+    "cap.memory.correct",
+    "cap.memory.retract",
+    "cap.memory.delete",
+    "cap.memory.privacy_delete",
+    "cap.memory.deletions",
+    "cap.memory.redact_evidence",
+    "cap.memory.set_never_remember",
+    "cap.memory.set_scope_mode",
+    "cap.memory.resolve_conflict",
+    "cap.memory.prioritize",
+    "cap.memory.deprioritize",
+    "cap.memory.mark_stale",
+    "cap.memory.scope_bindings",
+    "cap.memory.consolidate",
+    "cap.memory.export",
+    "cap.memory.import",
+    "cap.memory.eval",
+    "cap.memory.retry_projection_job",
+}
+_MODEL_VISIBLE_MEMORY_CAPABILITY_IDS = {
+    "cap.memory.inspect",
+    "cap.memory.search",
+    "cap.memory.recall_diagnostics",
+    "cap.memory.propose",
+    "cap.memory.review",
+    "cap.memory.edit_candidate",
+    "cap.memory.merge_candidates",
     "cap.memory.correct",
     "cap.memory.retract",
     "cap.memory.delete",
     "cap.memory.privacy_delete",
     "cap.memory.redact_evidence",
     "cap.memory.set_never_remember",
+    "cap.memory.set_scope_mode",
     "cap.memory.resolve_conflict",
+    "cap.memory.prioritize",
+    "cap.memory.deprioritize",
+    "cap.memory.mark_stale",
     "cap.memory.consolidate",
     "cap.memory.export",
 }
@@ -1084,7 +1121,7 @@ def _validate_weather_forecast_input(
     return {"location": location, "timeframe": timeframe}, None
 
 
-_MEMORY_INSPECT_SECTIONS = {
+_MEMORY_INSPECT_SECTIONS = (
     "all",
     "active_assertions",
     "candidates",
@@ -1093,7 +1130,26 @@ _MEMORY_INSPECT_SECTIONS = {
     "evidence",
     "procedures",
     "action_traces",
-}
+    "topics",
+    "context_blocks",
+    "hot_index",
+    "deletions",
+    "scope_bindings",
+    "retention_policies",
+    "sensitivity_labels",
+    "export_artifacts",
+    "eval_runs",
+)
+_MEMORY_CONTEXT_BLOCK_TYPES = (
+    "all",
+    "hot_index",
+    "topic",
+    "pinned_core",
+    "project_state",
+    "procedure",
+    "episodic",
+    "reasoning",
+)
 _MEMORY_ASSERTION_TYPES = {
     "fact",
     "profile",
@@ -1138,13 +1194,55 @@ def _validate_memory_inspect_input(
 def _validate_memory_search_input(
     raw_input: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
-    if set(raw_input.keys()) != {"query", "limit"}:
+    if set(raw_input.keys()) != {"query", "limit", "scope_key"}:
         return None, "schema_invalid"
     query = _normalize_optional_text(raw_input.get("query"), max_length=1000)
     limit = _normalize_bounded_int(raw_input.get("limit"), minimum=1, maximum=100)
+    scope_key = _normalize_optional_text(raw_input.get("scope_key"), max_length=200)
+    if raw_input.get("scope_key") is None:
+        scope_key = None
+    elif scope_key is None:
+        return None, "schema_invalid"
     if query is None or limit is None:
         return None, "schema_invalid"
-    return {"query": query, "limit": limit}, None
+    return {"query": query, "limit": limit, "scope_key": scope_key}, None
+
+
+def _validate_memory_recall_diagnostics_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    return _validate_memory_search_input(raw_input)
+
+
+def _validate_memory_limit_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {"limit"}:
+        return None, "schema_invalid"
+    limit = _normalize_bounded_int(raw_input.get("limit"), minimum=1, maximum=100)
+    if limit is None:
+        return None, "schema_invalid"
+    return {"limit": limit}, None
+
+
+def _validate_memory_context_blocks_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {"block_type", "limit", "topic_id"}:
+        return None, "schema_invalid"
+    block_type_raw = raw_input.get("block_type")
+    if not isinstance(block_type_raw, str):
+        return None, "schema_invalid"
+    block_type = block_type_raw.strip().lower()
+    limit = _normalize_bounded_int(raw_input.get("limit"), minimum=1, maximum=100)
+    topic_id, topic_id_valid = _normalize_nullable_memory_text(
+        raw_input.get("topic_id"), max_length=32
+    )
+    if block_type not in _MEMORY_CONTEXT_BLOCK_TYPES or limit is None:
+        return None, "schema_invalid"
+    if not topic_id_valid or (block_type == "topic" and topic_id is None):
+        return None, "schema_invalid"
+    return {"block_type": block_type, "limit": limit, "topic_id": topic_id}, None
 
 
 def _validate_memory_propose_input(
@@ -1274,12 +1372,77 @@ def _validate_memory_redact_evidence_input(
 def _validate_memory_set_never_remember_input(
     raw_input: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
-    if set(raw_input.keys()) != {"rule"}:
+    if set(raw_input.keys()) != {"scope_key", "rule"}:
         return None, "schema_invalid"
+    scope_key = _normalize_optional_text(raw_input.get("scope_key"), max_length=200)
     rule = _normalize_optional_text(raw_input.get("rule"), max_length=700)
-    if rule is None:
+    if scope_key is None or rule is None:
         return None, "schema_invalid"
-    return {"rule": rule}, None
+    return {"scope_key": scope_key, "rule": rule}, None
+
+
+def _validate_memory_set_scope_mode_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {"scope_type", "scope_key", "memory_mode", "reason"}:
+        return None, "schema_invalid"
+    scope_type = _normalize_optional_text(raw_input.get("scope_type"), max_length=32)
+    scope_key = _normalize_optional_text(raw_input.get("scope_key"), max_length=200)
+    memory_mode = _normalize_optional_text(raw_input.get("memory_mode"), max_length=32)
+    reason, reason_valid = _normalize_nullable_memory_text(raw_input.get("reason"), max_length=500)
+    if (
+        scope_type not in {"user", "project", "repo", "session", "thread", "proactive_case"}
+        or scope_key is None
+        or memory_mode not in {"normal", "temporary", "no_memory"}
+        or not reason_valid
+    ):
+        return None, "schema_invalid"
+    return {
+        "scope_type": scope_type,
+        "scope_key": scope_key,
+        "memory_mode": memory_mode,
+        "reason": reason,
+    }, None
+
+
+def _validate_memory_scope_key_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {"scope_key"}:
+        return None, "schema_invalid"
+    scope_key = _normalize_optional_text(raw_input.get("scope_key"), max_length=200)
+    if scope_key is None:
+        return None, "schema_invalid"
+    return {"scope_key": scope_key}, None
+
+
+def _validate_memory_merge_candidates_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {"assertion_ids"}:
+        return None, "schema_invalid"
+    raw_ids = raw_input.get("assertion_ids")
+    if not isinstance(raw_ids, list) or len(raw_ids) < 2 or len(raw_ids) > 20:
+        return None, "schema_invalid"
+    assertion_ids: list[str] = []
+    for raw_id in raw_ids:
+        assertion_id = _normalize_optional_text(raw_id, max_length=32)
+        if assertion_id is None:
+            return None, "schema_invalid"
+        assertion_ids.append(assertion_id)
+    return {"assertion_ids": assertion_ids}, None
+
+
+def _validate_memory_mark_stale_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {"assertion_id", "reason"}:
+        return None, "schema_invalid"
+    assertion_id = _normalize_optional_text(raw_input.get("assertion_id"), max_length=32)
+    reason, reason_valid = _normalize_nullable_memory_text(raw_input.get("reason"), max_length=500)
+    if assertion_id is None or not reason_valid:
+        return None, "schema_invalid"
+    return {"assertion_id": assertion_id, "reason": reason}, None
 
 
 def _validate_memory_resolve_conflict_input(
@@ -1294,12 +1457,152 @@ def _validate_memory_resolve_conflict_input(
     return {"conflict_set_id": conflict_set_id, "assertion_id": assertion_id}, None
 
 
+def _validate_memory_import_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {"candidates"}:
+        return None, "schema_invalid"
+    raw_candidates = raw_input.get("candidates")
+    if not isinstance(raw_candidates, list) or len(raw_candidates) > 50:
+        return None, "schema_invalid"
+    candidates: list[dict[str, Any]] = []
+    for raw_candidate in raw_candidates:
+        if not isinstance(raw_candidate, dict):
+            return None, "schema_invalid"
+        candidate, error = _validate_memory_propose_input(raw_candidate)
+        if error is not None or candidate is None:
+            return None, "schema_invalid"
+        candidates.append(candidate)
+    return {"candidates": candidates}, None
+
+
+def _validate_memory_eval_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {"eval_name", "cases"}:
+        return None, "schema_invalid"
+    eval_name = _normalize_optional_text(raw_input.get("eval_name"), max_length=200)
+    raw_cases = raw_input.get("cases")
+    if eval_name is None or not isinstance(raw_cases, list) or len(raw_cases) > 100:
+        return None, "schema_invalid"
+    allowed_case_keys = {
+        "case_id",
+        "query",
+        "expected",
+        "expected_memory_ids",
+        "forbidden_memory_ids",
+        "expected_kinds",
+        "forbidden_texts",
+        "expect_policy_blocked",
+        "notes",
+    }
+    cases: list[dict[str, Any]] = []
+    for raw_case in raw_cases:
+        if (
+            not isinstance(raw_case, dict)
+            or set(raw_case.keys()) != allowed_case_keys
+            or "query" not in raw_case
+        ):
+            return None, "schema_invalid"
+        query = _normalize_optional_text(raw_case.get("query"), max_length=1000)
+        if query is None:
+            return None, "schema_invalid"
+        case_id, case_id_valid = _normalize_nullable_memory_text(
+            raw_case.get("case_id"), max_length=100
+        )
+        expected, expected_valid = _normalize_nullable_memory_text(
+            raw_case.get("expected"), max_length=2000
+        )
+        notes, notes_valid = _normalize_nullable_memory_text(raw_case.get("notes"), max_length=2000)
+        expected_memory_ids = _normalize_memory_string_list(
+            raw_case.get("expected_memory_ids", []),
+            max_items=100,
+            max_length=64,
+        )
+        forbidden_memory_ids = _normalize_memory_string_list(
+            raw_case.get("forbidden_memory_ids", []),
+            max_items=100,
+            max_length=64,
+        )
+        expected_kinds = _normalize_memory_string_list(
+            raw_case.get("expected_kinds", []),
+            max_items=20,
+            max_length=64,
+        )
+        forbidden_texts = _normalize_memory_string_list(
+            raw_case.get("forbidden_texts", []),
+            max_items=50,
+            max_length=500,
+        )
+        expect_policy_blocked = raw_case.get("expect_policy_blocked", False)
+        if (
+            not case_id_valid
+            or not expected_valid
+            or not notes_valid
+            or expected_memory_ids is None
+            or forbidden_memory_ids is None
+            or expected_kinds is None
+            or forbidden_texts is None
+            or not isinstance(expect_policy_blocked, bool)
+        ):
+            return None, "schema_invalid"
+        cases.append(
+            {
+                "case_id": case_id,
+                "query": query,
+                "expected": expected,
+                "expected_memory_ids": expected_memory_ids,
+                "forbidden_memory_ids": forbidden_memory_ids,
+                "expected_kinds": expected_kinds,
+                "forbidden_texts": forbidden_texts,
+                "expect_policy_blocked": expect_policy_blocked,
+                "notes": notes,
+            }
+        )
+    return {"eval_name": eval_name, "cases": cases}, None
+
+
+def _validate_memory_retry_projection_job_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {"job_id"}:
+        return None, "schema_invalid"
+    job_id = _normalize_optional_text(raw_input.get("job_id"), max_length=32)
+    if job_id is None:
+        return None, "schema_invalid"
+    return {"job_id": job_id}, None
+
+
 def _validate_empty_memory_input(
     raw_input: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
     if raw_input:
         return None, "schema_invalid"
     return {}, None
+
+
+def _normalize_nullable_memory_text(value: Any, *, max_length: int) -> tuple[str | None, bool]:
+    if value is None:
+        return None, True
+    normalized = _normalize_optional_text(value, max_length=max_length)
+    return normalized, normalized is not None
+
+
+def _normalize_memory_string_list(
+    value: Any,
+    *,
+    max_items: int,
+    max_length: int,
+) -> list[str] | None:
+    if not isinstance(value, list) or len(value) > max_items:
+        return None
+    normalized_items: list[str] = []
+    for item in value:
+        normalized = _normalize_optional_text(item, max_length=max_length)
+        if normalized is None:
+            return None
+        normalized_items.append(normalized)
+    return normalized_items
 
 
 def _normalize_optional_text(value: Any, *, max_length: int) -> str | None:
@@ -3863,11 +4166,71 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         validate_input=_validate_memory_search_input,
         execute=_execute_memory_runtime,
     ),
+    "cap.memory.recall_diagnostics": CapabilityDefinition(
+        capability_id="cap.memory.recall_diagnostics",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "memory_recall_diagnostics_v1",
+            "output_schema": "memory_recall_diagnostics_v1",
+            "idempotency": "deterministic_read",
+            "execution_mode": "memory_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_recall_diagnostics_input,
+        execute=_execute_memory_runtime,
+    ),
+    "cap.memory.topics": CapabilityDefinition(
+        capability_id="cap.memory.topics",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "memory_limit_v1",
+            "output_schema": "memory_projection_v1",
+            "idempotency": "deterministic_read",
+            "execution_mode": "memory_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_limit_input,
+        execute=_execute_memory_runtime,
+    ),
+    "cap.memory.hot_index": CapabilityDefinition(
+        capability_id="cap.memory.hot_index",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "memory_limit_v1",
+            "output_schema": "memory_projection_v1",
+            "idempotency": "deterministic_read",
+            "execution_mode": "memory_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_limit_input,
+        execute=_execute_memory_runtime,
+    ),
+    "cap.memory.context_blocks": CapabilityDefinition(
+        capability_id="cap.memory.context_blocks",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "memory_context_blocks_v1",
+            "output_schema": "memory_projection_v1",
+            "idempotency": "deterministic_read",
+            "execution_mode": "memory_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_context_blocks_input,
+        execute=_execute_memory_runtime,
+    ),
     "cap.memory.propose": CapabilityDefinition(
         capability_id="cap.memory.propose",
         version="1.0",
         impact_level="write_reversible",
-        policy_decision="allow_inline",
+        policy_decision="requires_approval",
         contract_metadata={
             "input_schema": "memory_propose_v1",
             "output_schema": "memory_mutation_result_v1",
@@ -3877,6 +4240,36 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         },
         allowed_egress_destinations=(),
         validate_input=_validate_memory_propose_input,
+        execute=_execute_memory_runtime,
+    ),
+    "cap.memory.edit_candidate": CapabilityDefinition(
+        capability_id="cap.memory.edit_candidate",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="requires_approval",
+        contract_metadata={
+            "input_schema": "memory_correct_v1",
+            "output_schema": "memory_mutation_result_v1",
+            "idempotency": "action_attempt_id",
+            "execution_mode": "memory_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_correct_input,
+        execute=_execute_memory_runtime,
+    ),
+    "cap.memory.merge_candidates": CapabilityDefinition(
+        capability_id="cap.memory.merge_candidates",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="requires_approval",
+        contract_metadata={
+            "input_schema": "memory_merge_candidates_v1",
+            "output_schema": "memory_mutation_result_v1",
+            "idempotency": "action_attempt_id",
+            "execution_mode": "memory_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_merge_candidates_input,
         execute=_execute_memory_runtime,
     ),
     "cap.memory.review": CapabilityDefinition(
@@ -3955,6 +4348,21 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         validate_input=_validate_memory_assertion_id_input,
         execute=_execute_memory_runtime,
     ),
+    "cap.memory.deletions": CapabilityDefinition(
+        capability_id="cap.memory.deletions",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "memory_limit_v1",
+            "output_schema": "memory_projection_v1",
+            "idempotency": "deterministic_read",
+            "execution_mode": "memory_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_limit_input,
+        execute=_execute_memory_runtime,
+    ),
     "cap.memory.redact_evidence": CapabilityDefinition(
         capability_id="cap.memory.redact_evidence",
         version="1.0",
@@ -3986,6 +4394,21 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         validate_input=_validate_memory_set_never_remember_input,
         execute=_execute_memory_runtime,
     ),
+    "cap.memory.set_scope_mode": CapabilityDefinition(
+        capability_id="cap.memory.set_scope_mode",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="requires_approval",
+        contract_metadata={
+            "input_schema": "memory_set_scope_mode_v1",
+            "output_schema": "memory_mutation_result_v1",
+            "idempotency": "action_attempt_id",
+            "execution_mode": "memory_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_set_scope_mode_input,
+        execute=_execute_memory_runtime,
+    ),
     "cap.memory.resolve_conflict": CapabilityDefinition(
         capability_id="cap.memory.resolve_conflict",
         version="1.0",
@@ -4001,34 +4424,140 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         validate_input=_validate_memory_resolve_conflict_input,
         execute=_execute_memory_runtime,
     ),
+    "cap.memory.prioritize": CapabilityDefinition(
+        capability_id="cap.memory.prioritize",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="requires_approval",
+        contract_metadata={
+            "input_schema": "memory_assertion_id_v1",
+            "output_schema": "memory_mutation_result_v1",
+            "idempotency": "action_attempt_id",
+            "execution_mode": "memory_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_assertion_id_input,
+        execute=_execute_memory_runtime,
+    ),
+    "cap.memory.deprioritize": CapabilityDefinition(
+        capability_id="cap.memory.deprioritize",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="requires_approval",
+        contract_metadata={
+            "input_schema": "memory_assertion_id_v1",
+            "output_schema": "memory_mutation_result_v1",
+            "idempotency": "action_attempt_id",
+            "execution_mode": "memory_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_assertion_id_input,
+        execute=_execute_memory_runtime,
+    ),
+    "cap.memory.mark_stale": CapabilityDefinition(
+        capability_id="cap.memory.mark_stale",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="requires_approval",
+        contract_metadata={
+            "input_schema": "memory_mark_stale_v1",
+            "output_schema": "memory_mutation_result_v1",
+            "idempotency": "action_attempt_id",
+            "execution_mode": "memory_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_mark_stale_input,
+        execute=_execute_memory_runtime,
+    ),
+    "cap.memory.scope_bindings": CapabilityDefinition(
+        capability_id="cap.memory.scope_bindings",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "memory_limit_v1",
+            "output_schema": "memory_projection_v1",
+            "idempotency": "deterministic_read",
+            "execution_mode": "memory_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_limit_input,
+        execute=_execute_memory_runtime,
+    ),
     "cap.memory.consolidate": CapabilityDefinition(
         capability_id="cap.memory.consolidate",
         version="1.0",
         impact_level="write_reversible",
         policy_decision="requires_approval",
         contract_metadata={
-            "input_schema": "memory_empty_v1",
+            "input_schema": "memory_scope_key_v1",
             "output_schema": "memory_consolidation_result_v1",
             "idempotency": "action_attempt_id",
             "execution_mode": "memory_runtime_only",
         },
         allowed_egress_destinations=(),
-        validate_input=_validate_empty_memory_input,
+        validate_input=_validate_memory_scope_key_input,
         execute=_execute_memory_runtime,
     ),
     "cap.memory.export": CapabilityDefinition(
         capability_id="cap.memory.export",
         version="1.0",
-        impact_level="read",
-        policy_decision="allow_inline",
+        impact_level="write_reversible",
+        policy_decision="requires_approval",
         contract_metadata={
-            "input_schema": "memory_empty_v1",
+            "input_schema": "memory_scope_key_v1",
             "output_schema": "memory_export_v1",
-            "idempotency": "deterministic_read",
+            "idempotency": "action_attempt_id",
             "execution_mode": "memory_runtime_only",
         },
         allowed_egress_destinations=(),
-        validate_input=_validate_empty_memory_input,
+        validate_input=_validate_memory_scope_key_input,
+        execute=_execute_memory_runtime,
+    ),
+    "cap.memory.import": CapabilityDefinition(
+        capability_id="cap.memory.import",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="requires_approval",
+        contract_metadata={
+            "input_schema": "memory_import_v1",
+            "output_schema": "memory_mutation_result_v1",
+            "idempotency": "action_attempt_id",
+            "execution_mode": "memory_runtime_only",
+            "mutation": "candidate_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_import_input,
+        execute=_execute_memory_runtime,
+    ),
+    "cap.memory.eval": CapabilityDefinition(
+        capability_id="cap.memory.eval",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="requires_approval",
+        contract_metadata={
+            "input_schema": "memory_eval_v1",
+            "output_schema": "memory_eval_result_v1",
+            "idempotency": "action_attempt_id",
+            "execution_mode": "memory_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_eval_input,
+        execute=_execute_memory_runtime,
+    ),
+    "cap.memory.retry_projection_job": CapabilityDefinition(
+        capability_id="cap.memory.retry_projection_job",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="requires_approval",
+        contract_metadata={
+            "input_schema": "memory_retry_projection_job_v1",
+            "output_schema": "memory_projection_job_retry_v1",
+            "idempotency": "action_attempt_id",
+            "execution_mode": "memory_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_retry_projection_job_input,
         execute=_execute_memory_runtime,
     ),
     "cap.discord.no_response": CapabilityDefinition(
@@ -4100,6 +4629,64 @@ _IDEMPOTENCY_KEY_SCHEMA = {"type": "string", "minLength": 1, "maxLength": 128}
 _MEMORY_ASSERTION_ID_SCHEMA = {"type": "string", "minLength": 1, "maxLength": 32}
 _MEMORY_EVIDENCE_ID_SCHEMA = {"type": "string", "minLength": 1, "maxLength": 32}
 _MEMORY_LIMIT_SCHEMA = {"type": "integer", "minimum": 1, "maximum": 100}
+_MEMORY_CANDIDATE_SCHEMA = _object_schema(
+    {
+        "subject_key": {"type": "string", "minLength": 1, "maxLength": 200},
+        "predicate": {"type": "string", "minLength": 1, "maxLength": 200},
+        "assertion_type": {
+            "type": "string",
+            "enum": [
+                "fact",
+                "profile",
+                "preference",
+                "commitment",
+                "decision",
+                "project_state",
+                "procedure",
+                "domain_concept",
+            ],
+        },
+        "value": {"type": "string", "minLength": 1, "maxLength": 700},
+        "evidence_text": {"type": "string", "minLength": 1, "maxLength": 12000},
+        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+        "scope_key": {"type": "string", "minLength": 1, "maxLength": 200},
+        "is_multi_valued": {"type": "boolean"},
+        "valid_from": _NULLABLE_STRING,
+        "valid_to": _NULLABLE_STRING,
+    }
+)
+_MEMORY_STRING_ID_LIST_SCHEMA = {
+    "type": "array",
+    "items": {"type": "string", "minLength": 1, "maxLength": 64},
+    "maxItems": 100,
+}
+_MEMORY_ASSERTION_ID_MERGE_LIST_SCHEMA = {
+    "type": "array",
+    "items": _MEMORY_ASSERTION_ID_SCHEMA,
+    "minItems": 2,
+    "maxItems": 20,
+}
+_MEMORY_EVAL_CASE_SCHEMA = _object_schema(
+    {
+        "case_id": {"type": ["string", "null"], "maxLength": 100},
+        "query": {"type": "string", "minLength": 1, "maxLength": 1000},
+        "expected": {"type": ["string", "null"], "maxLength": 2000},
+        "expected_memory_ids": _MEMORY_STRING_ID_LIST_SCHEMA,
+        "forbidden_memory_ids": _MEMORY_STRING_ID_LIST_SCHEMA,
+        "expected_kinds": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1, "maxLength": 64},
+            "maxItems": 20,
+        },
+        "forbidden_texts": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1, "maxLength": 500},
+            "maxItems": 50,
+        },
+        "expect_policy_blocked": {"type": "boolean"},
+        "notes": {"type": ["string", "null"], "maxLength": 2000},
+    }
+)
 
 _RESPONSE_TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     "calendar_window_v1": _object_schema(
@@ -4352,16 +4939,7 @@ _RESPONSE_TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
         {
             "section": {
                 "type": "string",
-                "enum": [
-                    "all",
-                    "active_assertions",
-                    "candidates",
-                    "conflicts",
-                    "project_state",
-                    "evidence",
-                    "procedures",
-                    "action_traces",
-                ],
+                "enum": list(_MEMORY_INSPECT_SECTIONS),
             },
             "limit": _MEMORY_LIMIT_SCHEMA,
         }
@@ -4370,34 +4948,37 @@ _RESPONSE_TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
         {
             "query": {"type": "string", "minLength": 1, "maxLength": 1000},
             "limit": _MEMORY_LIMIT_SCHEMA,
+            "scope_key": {"type": ["string", "null"], "minLength": 1, "maxLength": 200},
         }
     ),
-    "memory_propose_v1": _object_schema(
+    "memory_recall_diagnostics_v1": _object_schema(
         {
-            "subject_key": {"type": "string", "minLength": 1, "maxLength": 200},
-            "predicate": {"type": "string", "minLength": 1, "maxLength": 200},
-            "assertion_type": {
+            "query": {"type": "string", "minLength": 1, "maxLength": 1000},
+            "limit": _MEMORY_LIMIT_SCHEMA,
+            "scope_key": {"type": ["string", "null"], "minLength": 1, "maxLength": 200},
+        }
+    ),
+    "memory_limit_v1": _object_schema({"limit": _MEMORY_LIMIT_SCHEMA}),
+    "memory_context_blocks_v1": _object_schema(
+        {
+            "block_type": {
                 "type": "string",
                 "enum": [
-                    "fact",
-                    "profile",
-                    "preference",
-                    "commitment",
-                    "decision",
+                    "all",
+                    "hot_index",
+                    "topic",
+                    "pinned_core",
                     "project_state",
                     "procedure",
-                    "domain_concept",
+                    "episodic",
+                    "reasoning",
                 ],
             },
-            "value": {"type": "string", "minLength": 1, "maxLength": 700},
-            "evidence_text": {"type": "string", "minLength": 1, "maxLength": 12000},
-            "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-            "scope_key": {"type": "string", "minLength": 1, "maxLength": 200},
-            "is_multi_valued": {"type": "boolean"},
-            "valid_from": _NULLABLE_STRING,
-            "valid_to": _NULLABLE_STRING,
+            "limit": _MEMORY_LIMIT_SCHEMA,
+            "topic_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 32},
         }
     ),
+    "memory_propose_v1": _MEMORY_CANDIDATE_SCHEMA,
     "memory_review_v1": _object_schema(
         {
             "assertion_id": _MEMORY_ASSERTION_ID_SCHEMA,
@@ -4411,7 +4992,16 @@ _RESPONSE_TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "value": {"type": "string", "minLength": 1, "maxLength": 500},
         }
     ),
+    "memory_merge_candidates_v1": _object_schema(
+        {"assertion_ids": _MEMORY_ASSERTION_ID_MERGE_LIST_SCHEMA}
+    ),
     "memory_assertion_id_v1": _object_schema({"assertion_id": _MEMORY_ASSERTION_ID_SCHEMA}),
+    "memory_mark_stale_v1": _object_schema(
+        {
+            "assertion_id": _MEMORY_ASSERTION_ID_SCHEMA,
+            "reason": {"type": ["string", "null"], "maxLength": 500},
+        }
+    ),
     "memory_redact_evidence_v1": _object_schema(
         {
             "evidence_id": _MEMORY_EVIDENCE_ID_SCHEMA,
@@ -4419,13 +5009,52 @@ _RESPONSE_TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
         }
     ),
     "memory_set_never_remember_v1": _object_schema(
-        {"rule": {"type": "string", "minLength": 1, "maxLength": 700}}
+        {
+            "scope_key": {"type": "string", "minLength": 1, "maxLength": 200},
+            "rule": {"type": "string", "minLength": 1, "maxLength": 700},
+        }
+    ),
+    "memory_set_scope_mode_v1": _object_schema(
+        {
+            "scope_type": {
+                "type": "string",
+                "enum": ["user", "project", "repo", "session", "thread", "proactive_case"],
+            },
+            "scope_key": {"type": "string", "minLength": 1, "maxLength": 200},
+            "memory_mode": {"type": "string", "enum": ["normal", "temporary", "no_memory"]},
+            "reason": {"type": ["string", "null"], "maxLength": 500},
+        }
+    ),
+    "memory_scope_key_v1": _object_schema(
+        {"scope_key": {"type": "string", "minLength": 1, "maxLength": 200}}
     ),
     "memory_resolve_conflict_v1": _object_schema(
         {
             "conflict_set_id": {"type": "string", "minLength": 1, "maxLength": 32},
             "assertion_id": _MEMORY_ASSERTION_ID_SCHEMA,
         }
+    ),
+    "memory_import_v1": _object_schema(
+        {
+            "candidates": {
+                "type": "array",
+                "items": _MEMORY_CANDIDATE_SCHEMA,
+                "maxItems": 50,
+            }
+        }
+    ),
+    "memory_eval_v1": _object_schema(
+        {
+            "eval_name": {"type": "string", "minLength": 1, "maxLength": 200},
+            "cases": {
+                "type": "array",
+                "items": _MEMORY_EVAL_CASE_SCHEMA,
+                "maxItems": 100,
+            },
+        }
+    ),
+    "memory_retry_projection_job_v1": _object_schema(
+        {"job_id": {"type": "string", "minLength": 1, "maxLength": 32}}
     ),
     "memory_empty_v1": _object_schema({}),
     "discord_no_response_v1": _object_schema({"reason": {"type": "string", "maxLength": 500}}),
@@ -4466,17 +5095,34 @@ _RESPONSE_TOOL_DESCRIPTIONS: dict[str, str] = {
     "cap.agency.request_pr": "Land Agency work and create or update a pull request after approval.",
     "cap.memory.inspect": "Inspect stored memory, candidates, conflicts, evidence, and traces.",
     "cap.memory.search": "Search stored memory by query.",
+    "cap.memory.recall_diagnostics": (
+        "Inspect AI memory recall candidates, selections, omissions, policy, and projection health."
+    ),
+    "cap.memory.topics": "Inspect active memory topics and their topic context blocks.",
+    "cap.memory.hot_index": "Inspect active hot-index context blocks.",
+    "cap.memory.context_blocks": "Inspect active memory context blocks by block type.",
     "cap.memory.propose": "Propose a reviewable memory candidate from explicit evidence.",
     "cap.memory.review": "Approve or reject a reviewable memory candidate.",
+    "cap.memory.edit_candidate": "Edit a reviewable memory candidate after approval.",
+    "cap.memory.merge_candidates": "Merge duplicate reviewable memory candidates after approval.",
     "cap.memory.correct": "Correct an existing memory assertion.",
     "cap.memory.retract": "Retract an existing memory assertion.",
     "cap.memory.delete": "Delete an existing memory assertion.",
     "cap.memory.privacy_delete": "Privacy-delete an assertion and linked evidence after approval.",
+    "cap.memory.deletions": "Inspect memory deletion, retraction, redaction, and privacy-delete audit.",
     "cap.memory.redact_evidence": "Redact stored memory evidence after approval.",
     "cap.memory.set_never_remember": "Record a durable never-remember preference after approval.",
+    "cap.memory.set_scope_mode": "Set memory mode for a user, project, repo, session, thread, or proactive scope.",
     "cap.memory.resolve_conflict": "Resolve an open memory conflict by choosing an assertion.",
+    "cap.memory.prioritize": "Pin an active memory assertion after approval.",
+    "cap.memory.deprioritize": "Deprioritize an active memory assertion after approval.",
+    "cap.memory.mark_stale": "Mark an active memory assertion stale after approval.",
+    "cap.memory.scope_bindings": "Inspect memory mode and scope binding policy records.",
     "cap.memory.consolidate": "Queue memory projection consolidation work after approval.",
     "cap.memory.export": "Export a redacted JSON snapshot of stored memory.",
+    "cap.memory.import": "Import reviewable cutover memory candidates from explicit evidence.",
+    "cap.memory.eval": "Run a bounded local memory eval and record aggregate diagnostics.",
+    "cap.memory.retry_projection_job": "Retry a failed or stalled memory projection job.",
     "cap.discord.no_response": (
         "Use when the right Discord behavior is to read the message and send no visible reply."
     ),
@@ -4498,15 +5144,25 @@ _ACTION_LABELS_BY_CAPABILITY_ID = {
     "cap.email.trash": "Move email to trash",
     "cap.email.undo": "Undo email change",
     "cap.memory.correct": "Correct memory",
+    "cap.memory.deprioritize": "Deprioritize memory",
     "cap.memory.delete": "Delete memory",
+    "cap.memory.edit_candidate": "Edit memory candidate",
+    "cap.memory.import": "Import memory candidates",
+    "cap.memory.eval": "Run memory eval",
     "cap.memory.export": "Export memory",
+    "cap.memory.mark_stale": "Mark memory stale",
+    "cap.memory.merge_candidates": "Merge memory candidates",
     "cap.memory.privacy_delete": "Privacy-delete memory",
+    "cap.memory.prioritize": "Prioritize memory",
+    "cap.memory.propose": "Propose memory candidate",
     "cap.memory.redact_evidence": "Redact memory evidence",
     "cap.memory.consolidate": "Consolidate memory",
     "cap.memory.resolve_conflict": "Resolve memory conflict",
+    "cap.memory.retry_projection_job": "Retry memory projection job",
     "cap.memory.retract": "Retract memory",
     "cap.memory.review": "Review memory candidate",
     "cap.memory.set_never_remember": "Add memory rule",
+    "cap.memory.set_scope_mode": "Set memory scope mode",
 }
 
 
@@ -4537,7 +5193,11 @@ _STRATEGY_FAMILIES_BY_PREFIX: tuple[tuple[str, str, str], ...] = (
     ("cap.weather.", "weather", "Weather lookup for explicit locations."),
     ("cap.attachment.", "attachments", "Bounded reads from Discord attachments in the turn."),
     ("cap.agency.", "agency", "Allowlisted coding daemon work."),
-    ("cap.memory.", "memory", "Memory inspection, proposal, review, correction, and export."),
+    (
+        "cap.memory.",
+        "memory",
+        "Memory inspection, recall diagnostics, policy, mutation, consolidation, and export.",
+    ),
     ("cap.discord.", "discord", "Discord turn control actions such as no visible response."),
 )
 
@@ -4554,7 +5214,12 @@ def capability_id_for_response_tool_name(tool_name: str) -> str | None:
 
 
 def production_response_capability_ids() -> list[str]:
-    return list(_CAPABILITY_REGISTRY)
+    return [
+        capability_id
+        for capability_id in _CAPABILITY_REGISTRY
+        if not capability_id.startswith("cap.memory.")
+        or capability_id in _MODEL_VISIBLE_MEMORY_CAPABILITY_IDS
+    ]
 
 
 def response_capability_strategy_families(

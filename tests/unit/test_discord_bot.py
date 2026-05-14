@@ -380,8 +380,19 @@ def test_discord_bot_registers_only_deterministic_ops_slash_commands() -> None:
 
     assert bot.tree.get_command("status") is not None
     assert bot.tree.get_command("jobs") is not None
-    assert bot.tree.get_command("memory") is None
     assert bot.tree.get_command("capture") is not None
+
+    removed_memory_commands = (
+        "memory",
+        "memory-inbox",
+        "memory-recall",
+        "memory-conflicts",
+        "memory-consolidate",
+        "memory-export",
+        "memory-no",
+    )
+    for command_name in removed_memory_commands:
+        assert bot.tree.get_command(command_name) is None
 
 
 def test_format_discord_message_truncates_to_safe_size() -> None:

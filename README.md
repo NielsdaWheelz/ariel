@@ -433,6 +433,13 @@ google connector runtime config:
 use 16/24/32-byte keys (base64url encoded). keep previous key versions configured during rotation windows.
 production startup fails without a keyring, with a missing active key version, or with the dev fallback secret.
 
+memory runtime config:
+
+- `ARIEL_MEMORY_EMBEDDING_PROVIDER` (default `openai`)
+- `ARIEL_MEMORY_EMBEDDING_MODEL` (default `text-embedding-3-small`)
+- `ARIEL_MEMORY_EMBEDDING_DIMENSIONS` (default `1536`; must match schema)
+- `ARIEL_MEMORY_IMPORT_CUTOVER_ENABLED` (default `false`; enables one-time cutover import only)
+
 search capability runtime config:
 
 Search execution delegates to `web-search-tool`'s Brave provider. Ariel still owns capability
