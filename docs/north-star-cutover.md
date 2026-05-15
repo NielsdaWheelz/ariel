@@ -24,7 +24,8 @@ tools exist only for authority, safety, audit, credentials, trust boundaries, or
 domain side effects.
 
 The model must not receive the full capability registry. The registry is an
-internal authority catalog. The model sees a small, task-scoped working set.
+internal authority catalog. The `run` prompt/runtime exposes only eligible
+internal callable authority for the current turn.
 
 ## Target Behavior
 
@@ -56,39 +57,24 @@ is not an authentication boundary.
 
 ### Agent Behavior
 
-For ordinary turns, Ariel runs a tool strategy pass before the answer pass.
+For ordinary turns, Ariel calls the answer model with exactly one direct tool:
+`run`.
 
-The strategy pass is an AI judgment with a strict output contract. It receives:
-
-- the user message
-- bounded context
-- available capability families with the currently selectable IDs in each family
-- current surface metadata
-- connector and runtime availability
-- attachment and job presence
-- hard policy exclusions
-
-It returns either:
-
-- no tools
-- a small list of selected capability IDs
-- an auditable reason that the task cannot proceed without unavailable authority
-
-The answer pass receives only the selected tool definitions. It cannot call
-anything else.
+The model does not receive selected capability IDs as Responses tools. It writes
+a small run source that emits user-visible output, runs terminal commands, or
+calls internal Ariel operations. Internal capability calls still pass through
+policy, approval, idempotency, audit, and receipts before execution.
 
 Deterministic code may filter eligibility by hard facts: connector availability,
 attachment presence, policy, runtime binding, source surface, proactive case
 type, trust boundary, and environment configuration. Deterministic code must not
-perform semantic intent classification to choose tools.
+perform semantic intent classification to choose tools or direct work.
 
 ### Coding Work
 
-Coding work routes through Agency.
-
-The terminal belongs inside a sandboxed Agency/Codex execution environment. Ariel
-does not grow separate GitHub, filesystem, test, linter, build, or shell tools
-when Agency can do the work.
+Durable coding work routes through Agency. Bounded in-turn inspection and
+verification may use `terminal.*`; implementation jobs, PR ownership, and
+long-running repository work route through `agency.*`.
 
 Ariel's direct responsibilities for coding work are:
 
@@ -166,11 +152,11 @@ Normal user turn:
 
 1. Ingest Discord/API message.
 2. Build bounded context and eligibility facts.
-3. Run tool strategy AI judgment.
-4. Filter selected IDs through deterministic eligibility rails.
-5. Build strict Responses tool definitions for selected IDs only.
-6. Run answer model.
-7. Process tool calls through policy, approval, execution, audit, and result
+3. Build the single strict `run` Responses tool.
+4. Run answer model.
+5. Validate exactly one `run` call and feed back protocol failures.
+6. Execute the run source through internal host operations.
+7. Process internal capability calls through policy, approval, execution, audit, and result
    interpretation.
 8. Produce final Discord/API response.
 9. Extract memory/procedural candidates as separate audited AI judgments.
@@ -188,7 +174,8 @@ Proactive case:
 Agency coding job:
 
 1. User asks for repo/coding work.
-2. Strategy selects Agency task start, or answer asks for missing approval/context.
+2. The answer model calls `run`; the internal callable starts an Agency task or
+   asks for missing approval/context.
 3. Policy requires approval for task start.
 4. Agency daemon starts sandboxed work.
 5. Worker syncs status, artifacts, timeline, verification, and sandbox receipts.
@@ -202,8 +189,8 @@ The final codebase stays flat unless a split removes real complexity. See
 
 Current module ownership:
 
-- `src/ariel/capability_registry.py`: capability contracts, schemas, and selected
-  response tool definitions.
+- `src/ariel/capability_registry.py`: internal capability contracts, schemas, and
+  callable metadata.
 - `src/ariel/app.py`: FastAPI composition, local auth, and normal turn
   orchestration.
 - `src/ariel/action_runtime.py`: proposal intake, policy, approval lifecycle,
@@ -239,9 +226,9 @@ Every capability must declare:
 - audit fields
 - common failure modes
 
-Capabilities are not model tools by default.
+Capabilities are internal callables, not normal-turn model tools.
 
-Production response tool generation excludes:
+Normal answer turns expose only `run`. Internal callable eligibility excludes:
 
 - `test_only`
 - `internal`
@@ -251,7 +238,7 @@ Production response tool generation excludes:
 - proactive-disallowed writes
 - Agency capabilities when no Agency repo root/runtime is configured
 
-Test-only capabilities must never be exported as model tools.
+Test-only capabilities must never be callable from `run`.
 
 ## Security Rules
 
@@ -300,13 +287,12 @@ Attachments:
 - Delete broad `response_tool_definitions()` use from normal turns.
 - Delete `cap.framework.*` from the production capability registry, not just from
   model-tool exposure.
-- Require the no-tool strategy pass to emit a finite decision:
-  `no_tools`, `selected_tools`, or `unavailable_authority`.
+- Require exactly one direct `run` call from the answer model.
 - Build capability eligibility from durable runtime facts: connected providers,
   granted scopes, attachments present on the current turn, configured provider
   backends, and Agency repo allowlists. Do not infer authority from compacted
   model-owned context.
-- Default-deny answer-pass function calls outside the selected turn capability
+- Default-deny internal run calls outside the eligible turn capability
   set and emit `evt.action.call_denied`.
 - Delete Google execution stubs that only return `google_runtime_not_bound`.
 - Delete deterministic contradiction/source-count tool-result routing as semantic
@@ -327,10 +313,10 @@ Attachments:
 The cutover stays in the existing flat modules. Do not create package splits or
 routing layers to make this checklist look tidy.
 
-- Normal turns run an audited tool strategy judgment before the answer model.
-- Strategy calls receive no tools and must return strict JSON.
-- The answer model receives only selected, eligible tool definitions.
-- Runtime execution denies unselected function calls before action attempts exist.
+- Normal turns expose exactly one direct model tool, `run`.
+- The answer model must call `run` exactly once.
+- Plain assistant text is protocol feedback only, not user-visible output.
+- Runtime execution denies unadvertised internal function calls before action attempts exist.
 - Proactive deliberation receives no tools; unadvertised calls are denied and
   audited.
 - Google capabilities execute only through the Google runtime, never local stubs.
@@ -339,7 +325,7 @@ routing layers to make this checklist look tidy.
 - Local authority routes require bearer auth outside provider-owned callbacks.
 - Discord copy uses user-facing action labels.
 - Tests cover absence of broad model tool exposure, local auth, Agency policy
-  metadata, proactive tool denial, and strict tool strategy validation.
+  metadata, proactive tool denial, and strict run protocol validation.
 
 ## Acceptance Criteria
 
@@ -347,9 +333,11 @@ The cutover is complete only when all of these are true:
 
 - Normal turns cannot receive the full capability catalog or per-tool strategy
   descriptions.
-- Production model tool surfaces contain no test fixtures.
-- Every exposed tool has a current justification.
-- Tool strategy is AI-owned and audited.
+- The normal-turn model tool surface contains no test fixtures.
+- Every internal callable has a current justification.
+- Normal turns expose exactly one direct model tool, `run`.
+- The selected-tool strategy pass is absent from normal turns.
+- User-visible output goes through `agent.emit_message`.
 - Deterministic filtering is limited to hard eligibility rails.
 - Proactive deliberation has no model tools.
 - Coding work routes through Agency, not new granular repo tools.
@@ -378,8 +366,8 @@ The cutover is complete only when all of these are true:
 
 ## Key Risks
 
-- Tool selection can become hidden deterministic intent routing. Mitigation:
-  strategy is AI-owned; deterministic code filters only hard eligibility facts.
+- The single run tool can become a shell escape. Mitigation: typed host calls,
+  terminal policy, output bounds, approvals, and durable action attempts.
 - Agency can become too broad. Mitigation: sandbox, egress, approval, transcript,
   and outbox receipts are required before terminal-first is safe.
 - Tests can preserve legacy shape accidentally. Mitigation: write failing

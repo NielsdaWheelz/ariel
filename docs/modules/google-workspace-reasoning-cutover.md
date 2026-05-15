@@ -901,7 +901,7 @@ The model does not receive:
 - arbitrary Gmail headers outside the normalized contract
 - all old email in a thread when bounded evidence selection is enough
 - ranking internals
-- capability ids outside the selected tool surface
+- internal callable names outside the current `run` authority
 
 Extraction prompts must require:
 

@@ -1,15 +1,12 @@
 from __future__ import annotations
 
-from collections.abc import Generator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import json
 from typing import Any, cast
 
 from fastapi.testclient import TestClient
-import pytest
 from sqlalchemy import text
-from testcontainers.postgres import PostgresContainer
 
 from ariel.app import ModelAdapter, create_app
 from ariel.config import AppSettings
@@ -226,12 +223,6 @@ class DecisionAdapter:
             input_tokens=1,
             output_tokens=1,
         )
-
-
-@pytest.fixture(scope="session")
-def postgres_url() -> Generator[str, None, None]:
-    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
-        yield postgres.get_connection_url().replace("psycopg2", "psycopg")
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:

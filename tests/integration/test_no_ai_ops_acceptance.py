@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Generator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from fastapi.testclient import TestClient
-import pytest
 from sqlalchemy import text
-from testcontainers.postgres import PostgresContainer
 
 from ariel.app import ModelAdapter, create_app
 from ariel.persistence import JobRecord
@@ -41,13 +38,6 @@ class CaptureStorageRow:
     effective_session_id: str | None
     status_code: int
     normalized_turn_input: str | None
-
-
-@pytest.fixture(scope="session")
-def postgres_url() -> Generator[str, None, None]:
-    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
-        url = postgres.get_connection_url()
-        yield url.replace("psycopg2", "psycopg")
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:

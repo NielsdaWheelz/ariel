@@ -1,19 +1,19 @@
 from __future__ import annotations
 
 import copy
-import json
-from collections.abc import Generator
 from dataclasses import dataclass, field
 from typing import Any, cast
 
 from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import select
-from testcontainers.postgres import PostgresContainer
 
 from ariel.app import ModelAdapter, create_app
 from ariel.persistence import ProviderWriteReceiptRecord
-from tests.integration.responses_helpers import responses_with_function_calls
+from tests.integration.responses_helpers import (
+    process_queued_action_execution,
+    responses_with_run_calls,
+)
 
 
 GOOGLE_CALENDAR_READ_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
@@ -30,7 +30,7 @@ GOOGLE_CALENDAR_WRITE_SCOPE = "https://www.googleapis.com/auth/calendar.events"
 class ActionProposalAdapter:
     provider: str = "provider.s6-pr01"
     model: str = "model.s6-pr01-v1"
-    proposals_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    run_calls_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     assistant_text_by_message: dict[str, str] = field(default_factory=dict)
 
     def create_response(
@@ -43,40 +43,7 @@ class ActionProposalAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         del tools, history
-        if context_bundle.get("origin") == "tool_strategy":
-            strategy_input = json.loads(str(input_items[1]["content"]))
-            available_ids = {
-                capability_id
-                for family in strategy_input.get("available_capability_families", [])
-                if isinstance(family, dict)
-                for capability_id in family.get("capability_ids", [])
-                if isinstance(capability_id, str)
-            }
-            selected_capability_ids = [
-                proposal["capability_id"]
-                for proposal in self.proposals_by_message.get(user_message, [])
-                if proposal.get("capability_id") in available_ids
-            ]
-            return responses_with_function_calls(
-                input_items=input_items,
-                assistant_text=json.dumps(
-                    {
-                        "decision": "selected_tools" if selected_capability_ids else "no_tools",
-                        "selected_capability_ids": selected_capability_ids,
-                        "rationale": "test strategy",
-                        "unavailable_reason": None,
-                        "confidence": 1.0,
-                    },
-                    sort_keys=True,
-                ),
-                proposals=[],
-                provider=self.provider,
-                model=self.model,
-                provider_response_id="resp_s6_pr01_strategy",
-                input_tokens=3,
-                output_tokens=2,
-            )
-        proposals = copy.deepcopy(self.proposals_by_message.get(user_message, []))
+        run_calls = copy.deepcopy(self.run_calls_by_message.get(user_message, []))
         current_turn_ref = None
         for item in input_items:
             content = item.get("content")
@@ -85,8 +52,8 @@ class ActionProposalAdapter:
             for line in content.splitlines():
                 if line.startswith("- current user instruction: "):
                     current_turn_ref = line.removeprefix("- current user instruction: ").strip()
-        for proposal in proposals:
-            input_payload = proposal.get("input")
+        for run_call in run_calls:
+            input_payload = run_call.get("input")
             if (
                 current_turn_ref is not None
                 and isinstance(input_payload, dict)
@@ -97,10 +64,16 @@ class ActionProposalAdapter:
             user_message,
             f"assistant::{user_message}",
         )
-        return responses_with_function_calls(
-            input_items=input_items,
+        if any(
+            isinstance(item, dict) and item.get("type") == "function_call_output"
+            for item in input_items
+        ):
+            run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
+        if not run_calls:
+            run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
+        return responses_with_run_calls(
             assistant_text=assistant_text,
-            proposals=proposals,
+            calls=run_calls,
             provider=self.provider,
             model=self.model,
             provider_response_id="resp_s6_pr01_123",
@@ -493,13 +466,6 @@ class FakeGoogleWorkspaceProvider:
         }
 
 
-@pytest.fixture(scope="session")
-def postgres_url() -> Generator[str, None, None]:
-    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
-        url = postgres.get_connection_url()
-        yield url.replace("psycopg2", "psycopg")
-
-
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
     app = create_app(
         database_url=postgres_url,
@@ -564,13 +530,9 @@ def test_s6_pr01_drive_search_and_read_execute_inline_with_retrieval_citations(
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
-        proposals_by_message={
-            "find launch plan": [
-                {"capability_id": "cap.drive.search", "input": {"query": "launch plan"}}
-            ],
-            "read launch plan": [
-                {"capability_id": "cap.drive.read", "input": {"file_id": "drv_plan"}}
-            ],
+        run_calls_by_message={
+            "find launch plan": [{"name": "drive.search", "input": {"query": "launch plan"}}],
+            "read launch plan": [{"name": "drive.read", "input": {"file_id": "drv_plan"}}],
         },
         assistant_text_by_message={
             "find launch plan": "I found the Q3 launch plan. [1]",
@@ -656,9 +618,7 @@ def test_s6_pr01_drive_read_typed_outcomes_are_explicit_and_recoverable(
     expected_hint: str,
 ) -> None:
     adapter = ActionProposalAdapter(
-        proposals_by_message={
-            message: [{"capability_id": "cap.drive.read", "input": {"file_id": file_id}}]
-        },
+        run_calls_by_message={message: [{"name": "drive.read", "input": {"file_id": file_id}}]},
         assistant_text_by_message={
             message: f"The Drive read outcome is {expected_status}; {expected_hint}.",
         },
@@ -772,10 +732,10 @@ def test_s6_pr01_drive_share_is_approval_gated_exact_payload_and_exactly_once(
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
-        proposals_by_message={
+        run_calls_by_message={
             "share launch plan": [
                 {
-                    "capability_id": "cap.drive.share",
+                    "name": "drive.share",
                     "input": {
                         "file_id": "drv_plan",
                         "grantee_email": "partner@example.com",
@@ -829,6 +789,7 @@ def test_s6_pr01_drive_share_is_approval_gated_exact_payload_and_exactly_once(
             json={"approval_ref": approval_ref, "decision": "approve", "actor_id": "user.local"},
         )
         assert approved.status_code == 200
+        assert process_queued_action_execution(client, approved.json()) is True
 
         replay = client.post(
             "/v1/approvals",
@@ -908,13 +869,11 @@ def test_s6_pr01_drive_auth_scope_failures_are_typed_and_recoverable(
 ) -> None:
     del case_name
     adapter = ActionProposalAdapter(
-        proposals_by_message={
-            "read strategy doc": [
-                {"capability_id": "cap.drive.read", "input": {"file_id": "drv_auth"}}
-            ]
+        run_calls_by_message={
+            "read planning doc": [{"name": "drive.read", "input": {"file_id": "drv_auth"}}]
         },
         assistant_text_by_message={
-            "read strategy doc": f"{expected_class}: connect, reconnect, then retry.",
+            "read planning doc": f"{expected_class}: connect, reconnect, then retry.",
         },
     )
     oauth_client = FakeGoogleOAuthClient(
@@ -966,7 +925,7 @@ def test_s6_pr01_drive_auth_scope_failures_are_typed_and_recoverable(
         session_id = _session_id(client)
 
         sent = client.post(
-            f"/v1/sessions/{session_id}/message", json={"message": "read strategy doc"}
+            f"/v1/sessions/{session_id}/message", json={"message": "read planning doc"}
         )
         assert sent.status_code == 200
         payload = sent.json()
@@ -1017,10 +976,8 @@ def test_s6_pr01_drive_provider_failures_are_typed_and_recoverable(
     expected_hint: str,
 ) -> None:
     adapter = ActionProposalAdapter(
-        proposals_by_message={
-            "find risk register": [
-                {"capability_id": "cap.drive.search", "input": {"query": "risk register"}}
-            ]
+        run_calls_by_message={
+            "find risk register": [{"name": "drive.search", "input": {"query": "risk register"}}]
         },
         assistant_text_by_message={
             "find risk register": f"{expected_class}: {expected_hint}.",

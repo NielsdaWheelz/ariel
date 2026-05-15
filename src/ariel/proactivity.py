@@ -1601,7 +1601,7 @@ def _call_direct_json_model(
     response_json_schema: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if model_adapter is not None:
-        return model_adapter.create_response(
+        adapter_response: object = model_adapter.create_response(
             input_items=model_input,
             tools=[],
             user_message="",
@@ -1612,6 +1612,14 @@ def _call_direct_json_model(
                 "response_json_schema": response_json_schema,
             },
         )
+        if not isinstance(adapter_response, dict):
+            raise RuntimeError("model adapter returned a non-object response")
+        response_payload: dict[str, Any] = {}
+        for key, value in adapter_response.items():
+            if not isinstance(key, str):
+                raise RuntimeError("model adapter returned a non-object response")
+            response_payload[key] = value
+        return response_payload
     if settings.openai_api_key is None:
         raise RuntimeError("model credentials are not configured")
     response = httpx.post(
@@ -3708,15 +3716,15 @@ def process_work_follow_up_evaluate_due(
             return False
         if not block_ids:
             return True
-        matched_block_count = db.scalar(
-            select(text("count(*)"))
-            .select_from(ProviderEvidenceBlockRecord)
-            .where(
-                ProviderEvidenceBlockRecord.evidence_id == source_evidence.id,
-                ProviderEvidenceBlockRecord.id.in_(block_ids),
-            )
+        matched_block_ids = set(
+            db.scalars(
+                select(ProviderEvidenceBlockRecord.id).where(
+                    ProviderEvidenceBlockRecord.evidence_id == source_evidence.id,
+                    ProviderEvidenceBlockRecord.id.in_(block_ids),
+                )
+            ).all()
         )
-        return matched_block_count == len(set(block_ids))
+        return matched_block_ids == set(block_ids)
 
     def record_failed_judgment(
         *,

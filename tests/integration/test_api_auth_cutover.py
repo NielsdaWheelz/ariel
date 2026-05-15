@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Generator
 from dataclasses import dataclass
 import hashlib
 import hmac
@@ -10,7 +9,6 @@ from typing import Any
 
 from fastapi.testclient import TestClient
 import pytest
-from testcontainers.postgres import PostgresContainer
 
 from ariel.app import create_app
 
@@ -33,12 +31,6 @@ class NoModelAdapter:
     ) -> dict[str, Any]:
         del input_items, tools, user_message, history, context_bundle
         raise AssertionError("API auth tests must not call the model")
-
-
-@pytest.fixture(scope="session")
-def postgres_url() -> Generator[str, None, None]:
-    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
-        yield postgres.get_connection_url().replace("psycopg2", "psycopg")
 
 
 def test_local_auth_guards_authority_routes(

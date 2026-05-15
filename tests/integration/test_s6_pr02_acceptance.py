@@ -2,20 +2,19 @@ from __future__ import annotations
 
 import copy
 import json
-from collections.abc import Callable, Generator
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
 from fastapi.testclient import TestClient
 import httpx
 import pytest
-from testcontainers.postgres import PostgresContainer
 
 import ariel.action_runtime as action_runtime_module
 import ariel.capability_registry as capability_registry_module
 import ariel.policy_engine as policy_engine_module
 from ariel.app import ModelAdapter, create_app
-from tests.integration.responses_helpers import responses_message, responses_with_function_calls
+from tests.integration.responses_helpers import responses_message, responses_with_run_calls
 from ariel.capability_registry import CapabilityDefinition
 from ariel.google_connector import ConnectorTokenCipher
 
@@ -24,7 +23,7 @@ from ariel.google_connector import ConnectorTokenCipher
 class ActionProposalAdapter:
     provider: str = "provider.s6-pr02"
     model: str = "model.s6-pr02-v1"
-    proposals_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    run_calls_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     assistant_text_by_message: dict[str, str] = field(default_factory=dict)
 
     def create_response(
@@ -37,37 +36,6 @@ class ActionProposalAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         del tools, history
-        if context_bundle.get("origin") == "tool_strategy":
-            strategy_input = json.loads(str(input_items[1]["content"]))
-            available_ids = {
-                capability_id
-                for family in strategy_input.get("available_capability_families", [])
-                if isinstance(family, dict)
-                for capability_id in family.get("capability_ids", [])
-                if isinstance(capability_id, str)
-            }
-            selected_capability_ids = [
-                proposal["capability_id"]
-                for proposal in self.proposals_by_message.get(user_message, [])
-                if proposal.get("capability_id") in available_ids
-            ]
-            return responses_message(
-                assistant_text=json.dumps(
-                    {
-                        "decision": "selected_tools" if selected_capability_ids else "no_tools",
-                        "selected_capability_ids": selected_capability_ids,
-                        "rationale": "test strategy",
-                        "unavailable_reason": None,
-                        "confidence": 1.0,
-                    },
-                    sort_keys=True,
-                ),
-                provider=self.provider,
-                model=self.model,
-                provider_response_id="resp_s6_pr02_strategy",
-                input_tokens=3,
-                output_tokens=2,
-            )
         if context_bundle.get("origin") == "tool_result_interpretation":
             interpreter_input = context_bundle.get("tool_result_interpreter_input")
             if not isinstance(interpreter_input, dict):
@@ -101,7 +69,7 @@ class ActionProposalAdapter:
                 input_tokens=41,
                 output_tokens=26,
             )
-        proposals = self.proposals_by_message.get(user_message, [])
+        run_calls = copy.deepcopy(self.run_calls_by_message.get(user_message, []))
         assistant_text = self.assistant_text_by_message.get(
             user_message,
             {
@@ -113,10 +81,16 @@ class ActionProposalAdapter:
                 "mixed retrieval": "Route and construction updates are available [1][2].",
             }.get(user_message, f"assistant::{user_message}"),
         )
-        return responses_with_function_calls(
-            input_items=input_items,
+        if any(
+            isinstance(item, dict) and item.get("type") == "function_call_output"
+            for item in input_items
+        ):
+            run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
+        if not run_calls:
+            run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
+        return responses_with_run_calls(
             assistant_text=assistant_text,
-            proposals=copy.deepcopy(proposals),
+            calls=run_calls,
             provider=self.provider,
             model=self.model,
             provider_response_id="resp_s6_pr02_123",
@@ -136,13 +110,6 @@ class _FakeHTTPResponse:
         if self.json_raises:
             raise ValueError("invalid json")
         return self.payload
-
-
-@pytest.fixture(scope="session")
-def postgres_url() -> Generator[str, None, None]:
-    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
-        url = postgres.get_connection_url()
-        yield url.replace("psycopg2", "psycopg")
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
@@ -218,6 +185,7 @@ def _set_valid_maps_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
         fallback_secret="dev-local-connector-secret",
     )
     monkeypatch.setenv("ARIEL_MAPS_PROVIDER_API_KEY_ENC", cipher.encrypt("maps-test-key"))
+    monkeypatch.setenv("ARIEL_MAPS_PROVIDER_ENDPOINT", "https://maps.example.test")
 
 
 @pytest.fixture(autouse=True)
@@ -250,10 +218,10 @@ def test_s6_pr02_maps_directions_execute_inline_with_citations_and_auditable_lif
 
     _patch_capability_lookup(monkeypatch, capability_id="cap.maps.directions", mutate=mutate)
     adapter = ActionProposalAdapter(
-        proposals_by_message={
+        run_calls_by_message={
             "route to airport": [
                 {
-                    "capability_id": "cap.maps.directions",
+                    "name": "maps.directions",
                     "input": {
                         "origin": "Pike Place Market, Seattle, WA",
                         "destination": "SEA Airport, Seattle, WA",
@@ -322,10 +290,10 @@ def test_s6_pr02_maps_search_places_execute_inline_with_disambiguating_metadata_
 
     _patch_capability_lookup(monkeypatch, capability_id="cap.maps.search_places", mutate=mutate)
     adapter = ActionProposalAdapter(
-        proposals_by_message={
+        run_calls_by_message={
             "find nearby coffee": [
                 {
-                    "capability_id": "cap.maps.search_places",
+                    "name": "maps.search_places",
                     "input": {
                         "query": "coffee",
                         "location_context": "Downtown Seattle, WA",
@@ -378,9 +346,9 @@ def test_s6_pr02_maps_directions_missing_required_route_fields_asks_explicit_cla
     expected_hint: str,
 ) -> None:
     adapter = ActionProposalAdapter(
-        proposals_by_message={
+        run_calls_by_message={
             "missing route field": [
-                {"capability_id": "cap.maps.directions", "input": input_payload},
+                {"name": "maps.directions", "input": input_payload},
             ]
         },
         assistant_text_by_message={
@@ -409,9 +377,9 @@ def test_s6_pr02_maps_search_places_missing_location_context_asks_explicit_clari
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
-        proposals_by_message={
+        run_calls_by_message={
             "missing places location": [
-                {"capability_id": "cap.maps.search_places", "input": {"query": "coffee"}},
+                {"name": "maps.search_places", "input": {"query": "coffee"}},
             ]
         }
     )
@@ -453,10 +421,10 @@ def test_s6_pr02_maps_credentials_failures_are_typed_and_recoverable(
         monkeypatch.setenv("ARIEL_MAPS_PROVIDER_API_KEY_ENC", "aeadv1:v1:bad_nonce:bad_payload")
 
     adapter = ActionProposalAdapter(
-        proposals_by_message={
+        run_calls_by_message={
             "maps credentials failure": [
                 {
-                    "capability_id": "cap.maps.directions",
+                    "name": "maps.directions",
                     "input": {
                         "origin": "Pike Place Market, Seattle, WA",
                         "destination": "SEA Airport, Seattle, WA",
@@ -562,10 +530,10 @@ def test_s6_pr02_maps_provider_failures_are_typed_and_recoverable(
     monkeypatch.setattr(capability_registry_module.httpx, "get", fake_get)
 
     adapter = ActionProposalAdapter(
-        proposals_by_message={
+        run_calls_by_message={
             "maps runtime failure": [
                 {
-                    "capability_id": "cap.maps.search_places",
+                    "name": "maps.search_places",
                     "input": {
                         "query": "coffee",
                         "location_context": "Downtown Seattle, WA",
@@ -620,10 +588,10 @@ def test_s6_pr02_maps_egress_preflight_remains_fail_closed_before_execution(
 
     _patch_capability_lookup(monkeypatch, capability_id="cap.maps.directions", mutate=mutate)
     adapter = ActionProposalAdapter(
-        proposals_by_message={
+        run_calls_by_message={
             "maps egress deny": [
                 {
-                    "capability_id": "cap.maps.directions",
+                    "name": "maps.directions",
                     "input": {
                         "origin": "Pike Place Market, Seattle, WA",
                         "destination": "SEA Airport, Seattle, WA",
@@ -674,10 +642,10 @@ def test_s6_pr02_maps_retrieval_isolation_from_google_connector_readiness(
 
     _patch_capability_lookup(monkeypatch, capability_id="cap.maps.directions", mutate=mutate)
     adapter = ActionProposalAdapter(
-        proposals_by_message={
+        run_calls_by_message={
             "maps while google disconnected": [
                 {
-                    "capability_id": "cap.maps.directions",
+                    "name": "maps.directions",
                     "input": {
                         "origin": "Pike Place Market, Seattle, WA",
                         "destination": "SEA Airport, Seattle, WA",
@@ -750,10 +718,10 @@ def test_s6_pr02_maps_outputs_remain_normalized_for_mixed_retrieval_turns(
     _patch_capability_lookup(monkeypatch, capability_id="cap.maps.directions", mutate=mutate_maps)
     _patch_capability_lookup(monkeypatch, capability_id="cap.search.web", mutate=mutate_web)
     adapter = ActionProposalAdapter(
-        proposals_by_message={
+        run_calls_by_message={
             "mixed retrieval": [
                 {
-                    "capability_id": "cap.maps.directions",
+                    "name": "maps.directions",
                     "input": {
                         "origin": "Pike Place Market, Seattle, WA",
                         "destination": "SEA Airport, Seattle, WA",
@@ -761,7 +729,7 @@ def test_s6_pr02_maps_outputs_remain_normalized_for_mixed_retrieval_turns(
                     },
                 },
                 {
-                    "capability_id": "cap.search.web",
+                    "name": "search.web",
                     "input": {"query": "airport construction updates"},
                 },
             ]

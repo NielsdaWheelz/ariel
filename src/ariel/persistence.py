@@ -179,7 +179,7 @@ class TurnIdempotencyRecord(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     session_id: Mapped[str] = mapped_column(
         String(32),
-        ForeignKey("sessions.id", ondelete="CASCADE"),
+        ForeignKey("sessions.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
@@ -187,7 +187,7 @@ class TurnIdempotencyRecord(Base):
     request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     turn_id: Mapped[str] = mapped_column(
         String(32),
-        ForeignKey("turns.id", ondelete="CASCADE"),
+        ForeignKey("turns.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
@@ -300,7 +300,7 @@ class EventRecord(Base):
     )
     turn_id: Mapped[str] = mapped_column(
         String(32),
-        ForeignKey("turns.id", ondelete="CASCADE"),
+        ForeignKey("turns.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
@@ -355,7 +355,7 @@ class AIJudgmentRecord(Base):
                 "judgment_type IN ('memory_curation', 'tool_result_interpretation', "
                 "'memory_extraction', 'continuity_compaction', 'feedback_learning', "
                 "'ambient_interpretation', 'proactive_deliberation', 'model_output', "
-                "'workspace_commitment_extraction', 'tool_strategy')"
+                "'workspace_commitment_extraction')"
             ),
             name="ck_ai_judgment_type",
         ),
@@ -443,6 +443,98 @@ class ActionAttemptRecord(Base):
             name="ck_action_attempt_policy_decision",
         ),
         Index("ix_turn_proposal_index_unique", "turn_id", "proposal_index", unique=True),
+    )
+
+
+class TerminalCommandRecord(Base):
+    __tablename__ = "terminal_commands"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    command_id: Mapped[str] = mapped_column(String(96), nullable=False)
+    session_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("sessions.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    turn_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("turns.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    action_attempt_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("action_attempts.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    cwd: Mapped[str] = mapped_column(Text, nullable=False)
+    command: Mapped[str] = mapped_column(Text, nullable=False)
+    purpose: Mapped[str] = mapped_column(Text, nullable=False)
+    policy_decision: Mapped[str] = mapped_column(String(32), nullable=False)
+    policy_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    process_group_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    process_start_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    terminal_dir: Mapped[str] = mapped_column(Text, nullable=False)
+    stdout_path: Mapped[str] = mapped_column(Text, nullable=False)
+    stderr_path: Mapped[str] = mapped_column(Text, nullable=False)
+    exit_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    stdout_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    stderr_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    output_limit_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=12000)
+    exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN ('foreground', 'background')",
+            name="ck_terminal_command_kind",
+        ),
+        CheckConstraint(
+            "status IN ('running', 'completed', 'failed', 'timeout', 'cancelled', 'denied', "
+            "'unknown')",
+            name="ck_terminal_command_status",
+        ),
+        CheckConstraint(
+            "policy_decision IN ('allow_inline', 'requires_approval', 'deny')",
+            name="ck_terminal_command_policy_decision",
+        ),
+        CheckConstraint("stdout_bytes >= 0", name="ck_terminal_command_stdout_bytes_nonnegative"),
+        CheckConstraint("stderr_bytes >= 0", name="ck_terminal_command_stderr_bytes_nonnegative"),
+        CheckConstraint(
+            "output_limit_bytes > 0",
+            name="ck_terminal_command_output_limit_bytes_positive",
+        ),
+        CheckConstraint(
+            "duration_ms IS NULL OR duration_ms >= 0",
+            name="ck_terminal_command_duration_ms_nonnegative",
+        ),
+        CheckConstraint(
+            (
+                "(status = 'running' AND completed_at IS NULL AND exit_code IS NULL) OR "
+                "(status = 'unknown' AND completed_at IS NOT NULL) OR "
+                "(status IN ('completed', 'failed', 'timeout', 'cancelled', 'denied') "
+                "AND completed_at IS NOT NULL AND exit_code IS NOT NULL)"
+            ),
+            name="ck_terminal_command_status_fields",
+        ),
+        Index(
+            "ix_terminal_commands_session_command_unique",
+            "session_id",
+            "command_id",
+            unique=True,
+        ),
     )
 
 

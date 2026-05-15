@@ -252,6 +252,10 @@ def test_discord_settings_default_to_disabled(monkeypatch: pytest.MonkeyPatch) -
     assert settings.agency_event_max_skew_seconds == 300
     assert settings.worker_poll_seconds == 1.0
     assert settings.worker_heartbeat_timeout_seconds == 300
+    assert settings.terminal_output_limit_bytes == 12000
+    assert settings.terminal_run_timeout_seconds == 30.0
+    assert settings.terminal_background_timeout_seconds == 3600
+    assert settings.terminal_timeout_kill_after_seconds == 5.0
 
 
 def test_discord_settings_load_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -265,6 +269,10 @@ def test_discord_settings_load_from_env(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setenv("ARIEL_AGENCY_EVENT_MAX_SKEW_SECONDS", "120")
     monkeypatch.setenv("ARIEL_WORKER_POLL_SECONDS", "0.25")
     monkeypatch.setenv("ARIEL_WORKER_HEARTBEAT_TIMEOUT_SECONDS", "45")
+    monkeypatch.setenv("ARIEL_TERMINAL_OUTPUT_LIMIT_BYTES", "4096")
+    monkeypatch.setenv("ARIEL_TERMINAL_RUN_TIMEOUT_SECONDS", "2.5")
+    monkeypatch.setenv("ARIEL_TERMINAL_BACKGROUND_TIMEOUT_SECONDS", "120")
+    monkeypatch.setenv("ARIEL_TERMINAL_TIMEOUT_KILL_AFTER_SECONDS", "0.5")
 
     settings = _app_settings_without_env_files()
     assert settings.discord_bot_token == "discord-token"
@@ -277,6 +285,116 @@ def test_discord_settings_load_from_env(monkeypatch: pytest.MonkeyPatch) -> None
     assert settings.agency_event_max_skew_seconds == 120
     assert settings.worker_poll_seconds == 0.25
     assert settings.worker_heartbeat_timeout_seconds == 45
+    assert settings.terminal_output_limit_bytes == 4096
+    assert settings.terminal_run_timeout_seconds == 2.5
+    assert settings.terminal_background_timeout_seconds == 120
+    assert settings.terminal_timeout_kill_after_seconds == 0.5
+
+
+def test_provider_runtime_settings_default_to_production_values() -> None:
+    settings = _app_settings_without_env_files()
+
+    assert settings.terminal_dir == "~/.cache/ariel/terminal"
+    assert settings.search_brave_base_url == "https://api.search.brave.com/res/v1"
+    assert settings.search_web_timeout_seconds == 8.0
+    assert settings.search_web_api_key is None
+    assert settings.search_news_timeout_seconds == 8.0
+    assert settings.search_news_api_key is None
+    assert settings.web_extract_provider_endpoint is None
+    assert settings.web_extract_timeout_seconds == 10.0
+    assert settings.web_extract_max_retries == 2
+    assert settings.web_extract_api_key is None
+    assert settings.maps_provider_endpoint is None
+    assert settings.maps_provider_timeout_seconds == 8.0
+    assert settings.maps_provider_api_key_enc is None
+    assert settings.weather_provider_mode == "production"
+    assert settings.weather_production_endpoint == "https://api.tomorrow.io/v4/weather/forecast"
+    assert settings.weather_production_timeout_seconds == 8.0
+    assert settings.weather_production_api_key is None
+    assert settings.weather_dev_endpoint == "https://wttr.in"
+    assert settings.weather_dev_timeout_seconds == 8.0
+    assert settings.weather_default_location is None
+
+
+def test_provider_runtime_settings_load_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARIEL_TERMINAL_DIR", "/tmp/ariel-terminal")
+    monkeypatch.setenv("ARIEL_SEARCH_BRAVE_BASE_URL", "https://search.example.test/res/v1")
+    monkeypatch.setenv("ARIEL_SEARCH_WEB_TIMEOUT_SECONDS", "3.5")
+    monkeypatch.setenv("ARIEL_SEARCH_WEB_API_KEY", "search-key")
+    monkeypatch.setenv("ARIEL_SEARCH_NEWS_TIMEOUT_SECONDS", "4.5")
+    monkeypatch.setenv("ARIEL_SEARCH_NEWS_API_KEY", "news-key")
+    monkeypatch.setenv("ARIEL_WEB_EXTRACT_PROVIDER_ENDPOINT", "https://extract.example.test")
+    monkeypatch.setenv("ARIEL_WEB_EXTRACT_TIMEOUT_SECONDS", "5.5")
+    monkeypatch.setenv("ARIEL_WEB_EXTRACT_MAX_RETRIES", "4")
+    monkeypatch.setenv("ARIEL_WEB_EXTRACT_API_KEY", "extract-key")
+    monkeypatch.setenv("ARIEL_MAPS_PROVIDER_ENDPOINT", "https://maps.example.test")
+    monkeypatch.setenv("ARIEL_MAPS_PROVIDER_TIMEOUT_SECONDS", "6.5")
+    monkeypatch.setenv("ARIEL_MAPS_PROVIDER_API_KEY_ENC", "encrypted-maps-key")
+    monkeypatch.setenv("ARIEL_WEATHER_PROVIDER_MODE", "dev_fallback")
+    monkeypatch.setenv("ARIEL_WEATHER_PRODUCTION_ENDPOINT", "https://weather.example.test")
+    monkeypatch.setenv("ARIEL_WEATHER_PRODUCTION_TIMEOUT_SECONDS", "7.5")
+    monkeypatch.setenv("ARIEL_WEATHER_PRODUCTION_API_KEY", "weather-key")
+    monkeypatch.setenv("ARIEL_WEATHER_DEV_ENDPOINT", "https://wttr.example.test")
+    monkeypatch.setenv("ARIEL_WEATHER_DEV_TIMEOUT_SECONDS", "8.5")
+    monkeypatch.setenv("ARIEL_WEATHER_DEFAULT_LOCATION", "Austin, TX")
+
+    settings = _app_settings_without_env_files()
+
+    assert settings.terminal_dir == "/tmp/ariel-terminal"
+    assert settings.search_brave_base_url == "https://search.example.test/res/v1"
+    assert settings.search_web_timeout_seconds == 3.5
+    assert settings.search_web_api_key == "search-key"
+    assert settings.search_news_timeout_seconds == 4.5
+    assert settings.search_news_api_key == "news-key"
+    assert settings.web_extract_provider_endpoint == "https://extract.example.test"
+    assert settings.web_extract_timeout_seconds == 5.5
+    assert settings.web_extract_max_retries == 4
+    assert settings.web_extract_api_key == "extract-key"
+    assert settings.maps_provider_endpoint == "https://maps.example.test"
+    assert settings.maps_provider_timeout_seconds == 6.5
+    assert settings.maps_provider_api_key_enc == "encrypted-maps-key"
+    assert settings.weather_provider_mode == "dev_fallback"
+    assert settings.weather_production_endpoint == "https://weather.example.test"
+    assert settings.weather_production_timeout_seconds == 7.5
+    assert settings.weather_production_api_key == "weather-key"
+    assert settings.weather_dev_endpoint == "https://wttr.example.test"
+    assert settings.weather_dev_timeout_seconds == 8.5
+    assert settings.weather_default_location == "Austin, TX"
+
+
+@pytest.mark.parametrize(
+    "env_name",
+    [
+        "ARIEL_SEARCH_WEB_TIMEOUT_SECONDS",
+        "ARIEL_SEARCH_NEWS_TIMEOUT_SECONDS",
+        "ARIEL_WEB_EXTRACT_TIMEOUT_SECONDS",
+        "ARIEL_MAPS_PROVIDER_TIMEOUT_SECONDS",
+        "ARIEL_WEATHER_PRODUCTION_TIMEOUT_SECONDS",
+        "ARIEL_WEATHER_DEV_TIMEOUT_SECONDS",
+    ],
+)
+def test_provider_timeout_settings_reject_non_positive_values(
+    monkeypatch: pytest.MonkeyPatch,
+    env_name: str,
+) -> None:
+    monkeypatch.setenv(env_name, "0")
+
+    with pytest.raises(ValidationError):
+        _app_settings_without_env_files()
+
+
+@pytest.mark.parametrize(
+    "env_value",
+    ["-1", "6"],
+)
+def test_web_extract_max_retries_rejects_out_of_range_values(
+    monkeypatch: pytest.MonkeyPatch,
+    env_value: str,
+) -> None:
+    monkeypatch.setenv("ARIEL_WEB_EXTRACT_MAX_RETRIES", env_value)
+
+    with pytest.raises(ValidationError):
+        _app_settings_without_env_files()
 
 
 @pytest.mark.parametrize(
@@ -309,7 +427,11 @@ def test_discord_base_url_must_be_http_url(monkeypatch: pytest.MonkeyPatch) -> N
     [
         "ARIEL_DISCORD_NOTIFICATION_TIMEOUT_SECONDS",
         "ARIEL_WORKER_POLL_SECONDS",
+        "ARIEL_TERMINAL_RUN_TIMEOUT_SECONDS",
+        "ARIEL_TERMINAL_TIMEOUT_KILL_AFTER_SECONDS",
         "ARIEL_AGENCY_EVENT_MAX_SKEW_SECONDS",
+        "ARIEL_TERMINAL_OUTPUT_LIMIT_BYTES",
+        "ARIEL_TERMINAL_BACKGROUND_TIMEOUT_SECONDS",
         "ARIEL_WORKER_HEARTBEAT_TIMEOUT_SECONDS",
     ],
 )

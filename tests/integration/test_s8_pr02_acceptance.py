@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import copy
 import json
-from collections.abc import Generator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
@@ -10,13 +9,12 @@ from typing import Any, cast
 from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import text
-from testcontainers.postgres import PostgresContainer
 
 import ariel.capability_registry as capability_registry_module
 from ariel.app import ModelAdapter, ModelAdapterError, create_app
 from ariel.google_connector import GOOGLE_CONNECTOR_ID
 from ariel.persistence import GoogleConnectorRecord
-from tests.integration.responses_helpers import responses_message, responses_with_function_calls
+from tests.integration.responses_helpers import responses_message, responses_with_run_calls
 
 
 @dataclass
@@ -24,7 +22,7 @@ class SharedContentAdapter:
     provider: str = "provider.s8-pr02"
     model: str = "model.s8-pr02-v1"
     seen_user_messages: list[str] = field(default_factory=list)
-    proposals_for_shared_content: list[dict[str, Any]] = field(default_factory=list)
+    run_calls_for_shared_content: list[dict[str, Any]] = field(default_factory=list)
     failure: ModelAdapterError | None = None
 
     def create_response(
@@ -40,41 +38,6 @@ class SharedContentAdapter:
         self.seen_user_messages.append(user_message)
         if self.failure is not None:
             raise self.failure
-        if context_bundle.get("origin") == "tool_strategy":
-            strategy_input = json.loads(str(input_items[1]["content"]))
-            available_ids = {
-                capability_id
-                for family in strategy_input.get("available_capability_families", [])
-                if isinstance(family, dict)
-                for capability_id in family.get("capability_ids", [])
-                if isinstance(capability_id, str)
-            }
-            selected_capability_ids = [
-                proposal["capability_id"]
-                for proposal in (
-                    self.proposals_for_shared_content
-                    if "capture_kind: shared_content" in user_message
-                    else []
-                )
-                if proposal.get("capability_id") in available_ids
-            ]
-            return responses_message(
-                assistant_text=json.dumps(
-                    {
-                        "decision": "selected_tools" if selected_capability_ids else "no_tools",
-                        "selected_capability_ids": selected_capability_ids,
-                        "rationale": "test strategy",
-                        "unavailable_reason": None,
-                        "confidence": 1.0,
-                    },
-                    sort_keys=True,
-                ),
-                provider=self.provider,
-                model=self.model,
-                provider_response_id="resp_s8_pr02_strategy",
-                input_tokens=3,
-                output_tokens=2,
-            )
         if context_bundle.get("origin") == "tool_result_interpretation":
             interpreter_input = context_bundle.get("tool_result_interpreter_input")
             if not isinstance(interpreter_input, dict):
@@ -108,18 +71,24 @@ class SharedContentAdapter:
                 input_tokens=34,
                 output_tokens=21,
             )
-        function_calls = (
-            copy.deepcopy(self.proposals_for_shared_content)
+        run_calls = (
+            copy.deepcopy(self.run_calls_for_shared_content)
             if "capture_kind: shared_content" in user_message
             else []
         )
         assistant_text = f"assistant::{user_message}"
         if "capture_kind: shared_content" in user_message:
             assistant_text = "The shared source supports the summary [1]."
-        return responses_with_function_calls(
-            input_items=input_items,
+        if any(
+            isinstance(item, dict) and item.get("type") == "function_call_output"
+            for item in input_items
+        ):
+            run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
+        if not run_calls:
+            run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
+        return responses_with_run_calls(
             assistant_text=assistant_text,
-            proposals=function_calls,
+            calls=run_calls,
             provider=self.provider,
             model=self.model,
             provider_response_id="resp_s8_pr02_123",
@@ -139,13 +108,6 @@ class _FakeHTTPResponse:
         if self.json_raises:
             raise ValueError("invalid json")
         return self.payload
-
-
-@pytest.fixture(scope="session")
-def postgres_url() -> Generator[str, None, None]:
-    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
-        url = postgres.get_connection_url()
-        yield url.replace("psycopg2", "psycopg")
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
@@ -343,9 +305,9 @@ def test_s8_pr02_shared_content_origin_taint_denies_external_side_effect_even_wh
     postgres_url: str,
 ) -> None:
     adapter = SharedContentAdapter(
-        proposals_for_shared_content=[
+        run_calls_for_shared_content=[
             {
-                "capability_id": "cap.email.send",
+                "name": "email.send",
                 "input": {
                     "to": ["ops@example.com"],
                     "subject": "ship now",
@@ -353,7 +315,6 @@ def test_s8_pr02_shared_content_origin_taint_denies_external_side_effect_even_wh
                     "idempotency_key": "shared-content-email-taint-1",
                     "user_instruction_ref": "turn:current",
                 },
-                "influenced_by_untrusted_content": False,
             }
         ]
     )
@@ -584,9 +545,9 @@ def test_s8_pr02_shared_content_capture_preserves_retrieval_citations_and_artifa
     monkeypatch.setattr(capability_registry_module.httpx, "post", fake_post)
 
     adapter = SharedContentAdapter(
-        proposals_for_shared_content=[
+        run_calls_for_shared_content=[
             {
-                "capability_id": "cap.web.extract",
+                "name": "web.extract",
                 "input": {"url": "https://example.com/research/article"},
             }
         ]

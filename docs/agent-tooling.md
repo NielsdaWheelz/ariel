@@ -28,12 +28,15 @@ For coding work, the default agent surface is:
 - command output, logs, and test feedback
 - subagents for bounded parallel judgment work when explicitly useful
 
-All other model-callable capabilities must justify their existence against that
-default.
+All other internal callable capabilities must justify their existence against
+that default. Normal Ariel answer turns expose only the single `run` tool.
 
 ## Definitions
 
-A tool is any model-callable capability outside plain text generation.
+A tool is any model-callable capability outside plain text generation. For
+normal Ariel answer turns, the only model-callable tool is `run`; provider,
+memory, attachment, web, Agency, and terminal operations are internal callable
+operations behind `run`.
 
 Tools include shell execution, file editing, browser or computer use, MCP
 methods, hosted search, GitHub APIs, image generation, subagents, plugins,
@@ -119,7 +122,7 @@ large REST or MCP catalog directly to the model when a small task-specific
 surface can do the job.
 
 For large catalogs, use routing, search, allowlists, or task-scoped loading so
-the model sees only the relevant working set.
+the `run` prompt/runtime exposes only eligible internal callable authority.
 
 ## Security Rails
 
@@ -183,16 +186,16 @@ The current state of the art is not "more tools." It is:
 
 The target stack is:
 
-`user goal -> planner -> small working tool set -> skills -> sandboxed
-shell/browser/computer/MCP tools -> durable state -> verification loop -> memory
-update`
+`user goal -> planner -> run -> skills/internal callables -> sandboxed
+shell/browser/computer/MCP operations -> durable state -> verification loop ->
+memory update`
 
 For Ariel, this means:
 
 - terminal-first for coding and repo work
 - skills for repeated procedural knowledge
-- structured tools for privileged domain actions
-- tool search or task-scoped loading for any large catalog
+- internal structured callables for privileged domain actions
+- task-scoped internal callable eligibility for any large catalog
 - durable workflow rails for long-running work
 - verification loops before claims of completion
 - policy, taint, approval, and audit at every side-effect boundary

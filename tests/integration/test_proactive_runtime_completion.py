@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Generator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
@@ -9,7 +8,6 @@ from typing import Any, cast
 from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import func, select
-from testcontainers.postgres import PostgresContainer
 
 from ariel.app import create_app
 from ariel.config import AppSettings
@@ -155,12 +153,6 @@ class ProactiveGoogleRuntime:
 
 
 _id_counter = 0
-
-
-@pytest.fixture(scope="session")
-def postgres_url() -> Generator[str, None, None]:
-    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
-        yield postgres.get_connection_url().replace("psycopg2", "psycopg")
 
 
 def _new_id(prefix: str) -> str:

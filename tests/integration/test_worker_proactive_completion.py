@@ -1,16 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import Generator
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 import pytest
-from sqlalchemy import create_engine, select, text
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session, sessionmaker
-from testcontainers.postgres import PostgresContainer
 
 from ariel.config import AppSettings
-from ariel.db import reset_schema_for_tests
 from ariel.persistence import (
     ActionAttemptRecord,
     BackgroundTaskRecord,
@@ -20,23 +17,6 @@ from ariel.persistence import (
     TurnRecord,
 )
 from ariel.worker import enqueue_background_task, process_one_task
-
-
-@pytest.fixture(scope="session")
-def postgres_url() -> Generator[str, None, None]:
-    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
-        url = postgres.get_connection_url()
-        yield url.replace("psycopg2", "psycopg")
-
-
-@pytest.fixture
-def session_factory(postgres_url: str) -> Generator[sessionmaker[Session], None, None]:
-    engine = create_engine(postgres_url, future=True, pool_pre_ping=True)
-    reset_schema_for_tests(engine, postgres_url)
-    try:
-        yield sessionmaker(bind=engine, future=True, expire_on_commit=False)
-    finally:
-        engine.dispose()
 
 
 def test_worker_marks_due_email_thread_watches_without_ambient_bridge(

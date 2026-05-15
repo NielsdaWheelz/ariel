@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager, nullcontext
 import hmac
 import hashlib
 import json
-import os
+from pathlib import Path
 import re
 import time
 from dataclasses import dataclass
@@ -34,8 +34,6 @@ from sqlalchemy.orm import Session, sessionmaker
 from ariel.action_runtime import (
     ActionRuntimeError,
     RuntimeProvenance,
-    approval_execution_failure_message,
-    process_action_execution_task,
     process_response_function_calls,
     reconcile_expired_approvals_for_session,
     resolve_approval_decision,
@@ -43,10 +41,11 @@ from ariel.action_runtime import (
 from ariel.agency_daemon import AgencyDaemonClient, AgencyRuntime
 from ariel.attachment_content import AttachmentContentRuntime
 from ariel.capability_registry import (
+    MEMORY_CAPABILITY_IDS,
+    TERMINAL_CAPABILITY_IDS,
     get_capability,
-    production_response_capability_ids,
-    response_capability_strategy_families,
-    response_tool_definitions,
+    internal_callable_capability_ids,
+    run_callable_name_for_capability_id,
 )
 from ariel.config import AppSettings
 from ariel.db import missing_required_tables, reset_schema_for_tests
@@ -211,6 +210,7 @@ from ariel.response_contracts import (
     build_surface_workspace_item_event_list_response,
     build_surface_workspace_item_list_response,
 )
+from ariel.run_runtime import parse_run_function_call, run_tool_definitions, unpack_run_source
 from ariel.weather_state import get_weather_default_location_state, set_weather_default_location
 from ariel.worker import enqueue_background_task
 from ariel.workspace_reasoning import CommitmentState, validate_lifecycle_transition
@@ -347,8 +347,8 @@ _POLICY_SYSTEM_INSTRUCTIONS = (
         "commitment_id, or user_instruction_ref. Use user_instruction_ref=turn:<turn_id> "
         "only for an explicit user instruction shown in the turn-id context."
     ),
-    "If the right Discord behavior is to listen without a visible reply, call cap.discord.no_response.",
-    "Discord attachments are metadata until cap.attachment.read is called; attachment_ref is not content.",
+    "If the right Discord behavior is to listen without a visible reply, call agent.pause_until_input.",
+    "Discord attachments are metadata until attachment.read is called; attachment_ref is not content.",
 )
 
 _CAPTURE_ALLOWED_KINDS = {"text", "url", "shared_content"}
@@ -372,35 +372,6 @@ class NormalizedCaptureEnvelope:
 class NormalizedSharedContent:
     text: str | None
     urls: list[str]
-
-
-class ToolStrategyDecisionContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    decision: Literal["no_tools", "selected_tools", "unavailable_authority"]
-    selected_capability_ids: list[str] = Field(default_factory=list, max_length=8)
-    rationale: str = Field(min_length=1, max_length=2000)
-    unavailable_reason: str | None = Field(default=None, max_length=2000)
-    confidence: float = Field(ge=0.0, le=1.0)
-
-    @model_validator(mode="after")
-    def _decision_matches_fields(self) -> ToolStrategyDecisionContract:
-        if self.decision == "selected_tools":
-            if not self.selected_capability_ids:
-                raise ValueError("selected_tools requires selected_capability_ids")
-            if self.unavailable_reason is not None:
-                raise ValueError("selected_tools must not include unavailable_reason")
-        elif self.decision == "no_tools":
-            if self.selected_capability_ids:
-                raise ValueError("no_tools must not include selected_capability_ids")
-            if self.unavailable_reason is not None:
-                raise ValueError("no_tools must not include unavailable_reason")
-        elif self.decision == "unavailable_authority":
-            if self.selected_capability_ids:
-                raise ValueError("unavailable_authority must not include selected_capability_ids")
-            if not isinstance(self.unavailable_reason, str) or not self.unavailable_reason.strip():
-                raise ValueError("unavailable_authority requires unavailable_reason")
-        return self
 
 
 class DiscordAttachmentRequest(BaseModel):
@@ -1283,6 +1254,36 @@ def _build_responses_input_items(
     if discord_context_text is not None:
         input_items.append({"role": "system", "content": discord_context_text})
 
+    eligible_callables = context_bundle.get("eligible_internal_callables")
+    if isinstance(eligible_callables, list):
+        callable_lines = [
+            f"- {callable_name}"
+            for callable_name in eligible_callables
+            if isinstance(callable_name, str) and callable_name
+        ]
+        if callable_lines:
+            input_items.append(
+                {
+                    "role": "system",
+                    "content": "eligible run callables for this turn:\n"
+                    + "\n".join(callable_lines),
+                }
+            )
+
+    tool_surface_facts = context_bundle.get("tool_surface_facts")
+    if isinstance(tool_surface_facts, dict):
+        input_items.append(
+            {
+                "role": "system",
+                "content": "runtime facts:\n"
+                + json.dumps(
+                    jsonable_encoder(tool_surface_facts),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            }
+        )
+
     discord_channel_recent_turns = context_bundle.get("discord_channel_recent_turns")
     if isinstance(discord_channel_recent_turns, list) and discord_channel_recent_turns:
         channel_lines: list[str] = []
@@ -1329,19 +1330,6 @@ def _build_responses_input_items(
                 "content": "turn-id context for write authority:\n" + "\n".join(turn_ref_lines),
             }
         )
-
-    tool_strategy = context_bundle.get("tool_strategy")
-    if isinstance(tool_strategy, dict) and tool_strategy.get("decision") == "unavailable_authority":
-        unavailable_reason = tool_strategy.get("unavailable_reason")
-        if isinstance(unavailable_reason, str) and unavailable_reason.strip():
-            input_items.append(
-                {
-                    "role": "system",
-                    "content": (
-                        f"tool authority unavailable for this turn: {unavailable_reason.strip()}"
-                    ),
-                }
-            )
 
     memory_context = context_bundle.get("memory_context")
     if isinstance(memory_context, dict):
@@ -3287,6 +3275,7 @@ def _tool_surface_facts(
     db: Session,
     context_bundle: dict[str, Any],
     agency_configured: bool,
+    settings: AppSettings,
 ) -> dict[str, Any]:
     connector = db.scalar(
         select(GoogleConnectorRecord)
@@ -3312,11 +3301,10 @@ def _tool_surface_facts(
         )
         else 0
     )
-    weather_mode = os.getenv("ARIEL_WEATHER_PROVIDER_MODE", "production").strip().lower()
-    search_web_bound = bool(os.getenv("ARIEL_SEARCH_WEB_API_KEY", "").strip())
-    web_extract_bound = bool(
-        os.getenv("ARIEL_WEB_EXTRACT_PROVIDER_ENDPOINT", "").strip()
-        or os.getenv("ARIEL_WEB_EXTRACT_API_KEY", "").strip()
+    search_web_bound = settings.search_web_api_key is not None
+    web_extract_bound = (
+        settings.web_extract_provider_endpoint is not None
+        or settings.web_extract_api_key is not None
         or search_web_bound
     )
     return {
@@ -3335,16 +3323,16 @@ def _tool_surface_facts(
             "agency": agency_configured,
             "web_extract": web_extract_bound,
             "search_web": search_web_bound,
-            "search_news": bool(os.getenv("ARIEL_SEARCH_NEWS_API_KEY", "").strip())
-            or search_web_bound,
-            "maps": bool(os.getenv("ARIEL_MAPS_PROVIDER_API_KEY_ENC", "").strip()),
-            "weather": weather_mode == "dev_fallback"
-            or bool(os.getenv("ARIEL_WEATHER_PRODUCTION_API_KEY", "").strip()),
+            "search_news": settings.search_news_api_key is not None or search_web_bound,
+            "maps": settings.maps_provider_api_key_enc is not None
+            and settings.maps_provider_endpoint is not None,
+            "weather": settings.weather_provider_mode == "dev_fallback"
+            or settings.weather_production_api_key is not None,
         },
     }
 
 
-def _eligible_response_capability_ids(
+def _eligible_internal_callable_capability_ids(
     *,
     tool_surface_facts: dict[str, Any],
 ) -> list[str]:
@@ -3364,12 +3352,11 @@ def _eligible_response_capability_ids(
         and isinstance(discord_facts.get("attachment_count"), int)
         and discord_facts["attachment_count"] > 0
     )
-    has_discord_context = isinstance(discord_facts, dict) and discord_facts.get("available") is True
     runtime_bindings = tool_surface_facts.get("runtime_bindings")
     bindings = runtime_bindings if isinstance(runtime_bindings, dict) else {}
 
     capability_ids: list[str] = []
-    for capability_id in production_response_capability_ids():
+    for capability_id in internal_callable_capability_ids():
         capability = get_capability(capability_id)
         raw_required_scopes = (
             capability.contract_metadata.get("required_scopes") if capability is not None else None
@@ -3395,8 +3382,11 @@ def _eligible_response_capability_ids(
             if has_attachment_refs:
                 capability_ids.append(capability_id)
             continue
-        if capability_id == "cap.discord.no_response":
-            if has_discord_context:
+        if capability_id in TERMINAL_CAPABILITY_IDS:
+            capability_ids.append(capability_id)
+            continue
+        if capability_id in MEMORY_CAPABILITY_IDS:
+            if capability_id != "cap.memory.eval":
                 capability_ids.append(capability_id)
             continue
         if capability_id == "cap.web.extract":
@@ -3419,180 +3409,7 @@ def _eligible_response_capability_ids(
             if bindings.get("weather") is True:
                 capability_ids.append(capability_id)
             continue
-        capability_ids.append(capability_id)
     return capability_ids
-
-
-def _call_tool_strategy(
-    *,
-    model_adapter: ModelAdapter,
-    user_message: str,
-    context_bundle: dict[str, Any],
-    tool_surface_facts: dict[str, Any],
-    eligible_capability_ids: list[str],
-) -> tuple[list[str], dict[str, Any], dict[str, Any]]:
-    eligible = set(eligible_capability_ids)
-    available_capability_families = response_capability_strategy_families(eligible_capability_ids)
-    response = model_adapter.create_response(
-        input_items=[
-            {
-                "role": "system",
-                "content": (
-                    "Select the smallest Ariel tool set for the next assistant turn. "
-                    "Return JSON only with keys decision, selected_capability_ids, rationale, "
-                    "unavailable_reason, and confidence. decision must be one of no_tools, "
-                    "selected_tools, or unavailable_authority. Select no_tools when the answer "
-                    "can be written without tools. Select selected_tools only for capability IDs "
-                    "present in available_capability_families. Select unavailable_authority when "
-                    "the user asks for work that needs a provider or scope absent from runtime_facts. "
-                    "Select at most 8 capability IDs. Do not answer the user."
-                ),
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "user_message": user_message,
-                        "available_capability_families": available_capability_families,
-                        "runtime_facts": redact_json_value(tool_surface_facts),
-                        "bounded_context": redact_json_value(context_bundle),
-                        "hard_policy_exclusions": [
-                            "capability ids absent from available_capability_families",
-                            "cap.framework.*",
-                        ],
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-            },
-        ],
-        tools=[],
-        user_message=user_message,
-        history=[],
-        context_bundle={"origin": "tool_strategy", "tool_surface_facts": tool_surface_facts},
-    )
-    output_items = response.get("output")
-    if not isinstance(output_items, list):
-        raise ModelAdapterError(
-            safe_reason="tool strategy response missing Responses output items",
-            status_code=502,
-            code="E_AI_JUDGMENT_SCHEMA",
-            message="AI tool strategy failed",
-            retryable=False,
-            provider=response.get("provider")
-            if isinstance(response.get("provider"), str)
-            else None,
-            model=response.get("model")
-            if isinstance(response.get("model"), str)
-            else model_adapter.model,
-            usage=response.get("usage") if isinstance(response.get("usage"), dict) else None,
-            provider_response_id=response.get("provider_response_id")
-            if isinstance(response.get("provider_response_id"), str)
-            else None,
-            parse_status="schema_invalid",
-            validation_status="invalid",
-            raw_output_shape={"output_type": type(output_items).__name__, "output_count": None},
-        )
-    text = _extract_responses_assistant_text(output_items)
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise ModelAdapterError(
-            safe_reason="tool strategy response was not valid JSON",
-            status_code=502,
-            code="E_AI_JUDGMENT_INVALID_JSON",
-            message="AI tool strategy failed",
-            retryable=False,
-            provider=response.get("provider")
-            if isinstance(response.get("provider"), str)
-            else None,
-            model=response.get("model")
-            if isinstance(response.get("model"), str)
-            else model_adapter.model,
-            usage=response.get("usage") if isinstance(response.get("usage"), dict) else None,
-            provider_response_id=response.get("provider_response_id")
-            if isinstance(response.get("provider_response_id"), str)
-            else None,
-            parse_status="invalid_json",
-            validation_status="not_validated",
-            raw_output_shape={"output_type": "list", "output_count": len(output_items)},
-        ) from exc
-    if not isinstance(parsed, dict):
-        raise ModelAdapterError(
-            safe_reason="tool strategy response JSON was not an object",
-            status_code=502,
-            code="E_AI_JUDGMENT_SCHEMA",
-            message="AI tool strategy failed",
-            retryable=False,
-            provider=response.get("provider")
-            if isinstance(response.get("provider"), str)
-            else None,
-            model=response.get("model")
-            if isinstance(response.get("model"), str)
-            else model_adapter.model,
-            usage=response.get("usage") if isinstance(response.get("usage"), dict) else None,
-            provider_response_id=response.get("provider_response_id")
-            if isinstance(response.get("provider_response_id"), str)
-            else None,
-            parse_status="parsed",
-            validation_status="invalid",
-            raw_output_shape={"output_type": "list", "output_count": len(output_items)},
-        )
-
-    try:
-        decision = ToolStrategyDecisionContract.model_validate(parsed)
-    except ValidationError as exc:
-        raise ModelAdapterError(
-            safe_reason="tool strategy response failed schema validation",
-            status_code=502,
-            code="E_AI_JUDGMENT_SCHEMA",
-            message="AI tool strategy failed",
-            retryable=False,
-            provider=response.get("provider")
-            if isinstance(response.get("provider"), str)
-            else None,
-            model=response.get("model")
-            if isinstance(response.get("model"), str)
-            else model_adapter.model,
-            usage=response.get("usage") if isinstance(response.get("usage"), dict) else None,
-            provider_response_id=response.get("provider_response_id")
-            if isinstance(response.get("provider_response_id"), str)
-            else None,
-            parse_status="parsed",
-            validation_status="invalid",
-            raw_output_shape={"output_type": "list", "output_count": len(output_items)},
-        ) from exc
-
-    def raise_strategy_validation(safe_reason: str) -> None:
-        raise ModelAdapterError(
-            safe_reason=safe_reason,
-            status_code=502,
-            code="E_AI_JUDGMENT_VALIDATION",
-            message="AI tool strategy failed",
-            retryable=False,
-            provider=response.get("provider")
-            if isinstance(response.get("provider"), str)
-            else None,
-            model=response.get("model")
-            if isinstance(response.get("model"), str)
-            else model_adapter.model,
-            usage=response.get("usage") if isinstance(response.get("usage"), dict) else None,
-            provider_response_id=response.get("provider_response_id")
-            if isinstance(response.get("provider_response_id"), str)
-            else None,
-            parse_status="parsed",
-            validation_status="invalid",
-            raw_output_shape={"output_type": "list", "output_count": len(output_items)},
-        )
-
-    selected: list[str] = []
-    for item in decision.selected_capability_ids:
-        if item not in eligible:
-            raise_strategy_validation("tool strategy selected an ineligible capability")
-        if item in selected:
-            raise_strategy_validation("tool strategy selected a duplicate capability")
-        selected.append(item)
-    return selected, response, decision.model_dump(mode="json")
 
 
 def _runtime_provenance_for_turn(
@@ -4162,7 +3979,7 @@ def create_app(
                 except AIJudgmentFailure as exc:
                     return _error_response(
                         ApiError(
-                            status_code=502 if exc.retryable else 422,
+                            status_code=503 if exc.retryable else 422,
                             code=exc.code,
                             message="AI session continuity failed",
                             details={
@@ -5753,7 +5570,7 @@ def create_app(
                 active_session.updated_at = now_failed_rotation
                 db.flush()
                 failure = ApiError(
-                    status_code=502 if exc.retryable else 422,
+                    status_code=503 if exc.retryable else 422,
                     code=exc.code,
                     message="AI session continuity failed",
                     details={
@@ -6096,6 +5913,17 @@ def create_app(
             parse_status=memory_curation_parse_status,
             validation_status="valid",
         )
+        add_event(
+            "evt.ai_judgment.completed",
+            {
+                "judgment_type": "memory_curation",
+                "prompt_version": MEMORY_CURATION_PROMPT_VERSION,
+                "source_id": turn.id,
+                "parse_status": memory_curation_parse_status,
+                "validation_status": "valid",
+                "provider_response_id": memory_curation_provider_response_id,
+            },
+        )
         open_commitments_and_jobs = _open_commitments_and_jobs_context(
             db=db,
             now=_utcnow(),
@@ -6116,11 +5944,15 @@ def create_app(
             "turn_id": turn.id,
             "user_instruction_ref": f"turn:{turn.id}",
         }
-        agency_configured = bool(str(app.state.agency_allowed_repo_roots).strip())
+        agency_configured = (
+            bool(str(app.state.agency_allowed_repo_roots).strip())
+            and Path(settings.agency_socket_path).exists()
+        )
         tool_surface_facts = _tool_surface_facts(
             db=db,
             context_bundle=context_bundle,
             agency_configured=agency_configured,
+            settings=settings,
         )
         context_metadata = _context_bundle_audit_metadata(context_bundle)
         if (
@@ -6184,7 +6016,7 @@ def create_app(
         assistant_response: dict[str, Any] | None = None
         responses_input_items: list[dict[str, Any]] = []
         responses_tools: list[dict[str, Any]] = []
-        selected_capability_ids: list[str] = []
+        allowed_capability_ids: list[str] = []
         last_tool_result_interpreter_judgment_id: str | None = None
 
         def record_model_output_budget_failure(
@@ -6321,7 +6153,7 @@ def create_app(
                 },
             )
             model_failure = ApiError(
-                status_code=exc.status_code,
+                status_code=503 if exc.retryable else exc.status_code,
                 code=compaction_failure_code,
                 message="AI continuity compaction failed",
                 details={
@@ -6576,126 +6408,17 @@ def create_app(
             context_bundle = compacted_context_bundle
         context_metadata = _context_bundle_audit_metadata(context_bundle)
         if model_failure is None:
-            try:
-                eligible_capability_ids = _eligible_response_capability_ids(
-                    tool_surface_facts=tool_surface_facts,
-                )
-                selected_capability_ids, strategy_response, strategy_output = _call_tool_strategy(
-                    model_adapter=app.state.model_adapter,
-                    user_message=user_message,
-                    context_bundle=context_bundle,
-                    tool_surface_facts=tool_surface_facts,
-                    eligible_capability_ids=eligible_capability_ids,
-                )
-                context_bundle["tool_strategy"] = {
-                    "decision": strategy_output.get("decision"),
-                    "selected_capability_ids": selected_capability_ids,
-                    "unavailable_reason": strategy_output.get("unavailable_reason"),
-                }
-                responses_tools = response_tool_definitions(selected_capability_ids)
-                add_ai_judgment(
-                    judgment_type="tool_strategy",
-                    source_type="turn",
-                    source_id=turn.id,
-                    status="succeeded",
-                    model=strategy_response.get("model")
-                    if isinstance(strategy_response.get("model"), str)
-                    else app.state.model_adapter.model,
-                    prompt_version="tool-strategy-v1",
-                    provider_response_id=strategy_response.get("provider_response_id")
-                    if isinstance(strategy_response.get("provider_response_id"), str)
-                    else None,
-                    input_summary="turn tool strategy",
-                    input_refs={
-                        "tool_surface_facts": redact_json_value(tool_surface_facts),
-                        "eligible_capability_ids": eligible_capability_ids,
-                        "selected_capability_ids": selected_capability_ids,
-                    },
-                    selected=[
-                        {"capability_id": capability_id}
-                        for capability_id in selected_capability_ids
-                    ],
-                    omitted=[
-                        {"capability_id": capability_id}
-                        for capability_id in eligible_capability_ids
-                        if capability_id not in selected_capability_ids
-                    ],
-                    output=strategy_output,
-                    rationale=strategy_output.get("rationale")
-                    if isinstance(strategy_output.get("rationale"), str)
-                    else None,
-                    confidence=strategy_output.get("confidence")
-                    if isinstance(strategy_output.get("confidence"), (float, int))
-                    else None,
-                    parse_status="parsed",
-                    validation_status="valid",
-                )
-                add_event(
-                    "evt.ai_judgment.completed",
-                    {
-                        "judgment_type": "tool_strategy",
-                        "eligible_capability_count": len(eligible_capability_ids),
-                        "selected_capability_ids": selected_capability_ids,
-                    },
-                )
-            except ModelAdapterError as exc:
-                failure_reason = safe_failure_reason(
-                    exc.safe_reason,
-                    fallback=f"unexpected {exc.__class__.__name__}",
-                )
-                judgment_failure_code = exc.code
-                if not judgment_failure_code.startswith("E_AI_JUDGMENT_"):
-                    judgment_failure_code = (
-                        "E_AI_JUDGMENT_CREDENTIALS"
-                        if "CREDENTIAL" in judgment_failure_code
-                        else "E_AI_JUDGMENT_REQUIRED"
-                    )
-                add_ai_judgment(
-                    judgment_type="tool_strategy",
-                    source_type="turn",
-                    source_id=turn.id,
-                    status="failed",
-                    model=exc.model or app.state.model_adapter.model,
-                    prompt_version="tool-strategy-v1",
-                    provider_response_id=exc.provider_response_id
-                    if isinstance(exc.provider_response_id, str)
-                    else None,
-                    input_summary="turn tool strategy",
-                    input_refs={"session_id": effective_session_id, "turn_id": turn.id},
-                    output={
-                        "provider": exc.provider or app.state.model_adapter.provider,
-                        "usage": exc.usage or {},
-                        "response_output_shape": exc.raw_output_shape or {},
-                    },
-                    parse_status=exc.parse_status or "missing_output",
-                    validation_status=exc.validation_status or "not_validated",
-                    failure_code=judgment_failure_code,
-                    failure_reason=failure_reason,
-                )
-                add_event(
-                    "evt.ai_judgment.failed",
-                    {
-                        "judgment_type": "tool_strategy",
-                        "failure_code": judgment_failure_code,
-                        "failure_reason": failure_reason,
-                        "parse_status": exc.parse_status,
-                        "validation_status": exc.validation_status,
-                        "provider_response_id": exc.provider_response_id,
-                    },
-                )
-                model_failure = ApiError(
-                    status_code=exc.status_code,
-                    code=exc.code,
-                    message=exc.message,
-                    details={
-                        "session_id": effective_session_id,
-                        "turn_id": turn.id,
-                        "judgment_type": "tool_strategy",
-                        "prompt_version": "tool-strategy-v1",
-                    },
-                    retryable=exc.retryable,
-                )
-                model_failure_reason = failure_reason
+            allowed_capability_ids = _eligible_internal_callable_capability_ids(
+                tool_surface_facts=tool_surface_facts,
+            )
+            context_bundle["tool_surface_facts"] = tool_surface_facts
+            eligible_internal_callables: list[str] = []
+            for capability_id in allowed_capability_ids:
+                callable_name = run_callable_name_for_capability_id(capability_id)
+                if callable_name is not None:
+                    eligible_internal_callables.append(callable_name)
+            context_bundle["eligible_internal_callables"] = sorted(eligible_internal_callables)
+            responses_tools = run_tool_definitions()
         context_tokens = _estimate_context_tokens(
             context_bundle=context_bundle,
             user_message=user_message,
@@ -6736,7 +6459,7 @@ def create_app(
                 },
             )
             model_failure = ApiError(
-                status_code=502,
+                status_code=503,
                 code="E_AI_JUDGMENT_REQUIRED",
                 message="AI continuity compaction failed",
                 details={
@@ -6837,21 +6560,238 @@ def create_app(
                         )
                     assistant_text = _extract_responses_assistant_text(output_items)
                     function_calls = _extract_responses_function_calls(output_items)
-                    if function_calls:
+                    run_source, run_protocol_error = parse_run_function_call(function_calls)
+                    if run_protocol_error is not None or run_source is None:
+                        provider_response_id = candidate_response.get("provider_response_id")
+                        add_ai_judgment(
+                            judgment_type="model_output",
+                            source_type="turn",
+                            source_id=turn.id,
+                            status="failed",
+                            model=candidate_response.get("model")
+                            if isinstance(candidate_response.get("model"), str)
+                            else app.state.model_adapter.model,
+                            prompt_version="model-output-v1",
+                            provider_response_id=provider_response_id
+                            if isinstance(provider_response_id, str)
+                            else None,
+                            input_summary="run protocol validation for model response",
+                            input_refs={
+                                "session_id": effective_session_id,
+                                "turn_id": turn.id,
+                                "attempt": attempt,
+                                "response_output": jsonable_encoder(output_items),
+                            },
+                            parse_status="parsed",
+                            validation_status="invalid",
+                            failure_code="E_AI_JUDGMENT_VALIDATION",
+                            failure_reason=run_protocol_error
+                            or "model failed the run tool protocol",
+                        )
+                        for output_item in output_items:
+                            if (
+                                isinstance(output_item, dict)
+                                and output_item.get("type") == "function_call"
+                            ):
+                                responses_input_items.append(jsonable_encoder(output_item))
+                        for function_call in function_calls:
+                            call_id = function_call.get("call_id")
+                            if not isinstance(call_id, str) or not call_id:
+                                continue
+                            responses_input_items.append(
+                                {
+                                    "type": "function_call_output",
+                                    "call_id": call_id,
+                                    "output": json.dumps(
+                                        {
+                                            "status": "failed",
+                                            "error": run_protocol_error
+                                            or "model failed the run tool protocol",
+                                        },
+                                        sort_keys=True,
+                                    ),
+                                }
+                            )
+                        responses_input_items.append(
+                            {
+                                "role": "system",
+                                "content": (
+                                    "model protocol failure: the user did not see that response. "
+                                    "Call exactly one tool named run with JSON arguments "
+                                    '{"source":"..."} and emit user-visible text inside '
+                                    "the run source with agent.emit_message."
+                                ),
+                            }
+                        )
+                        add_event(
+                            "evt.model.protocol_failed",
+                            {
+                                "reason": run_protocol_error,
+                                "attempt": attempt,
+                                "provider_response_id": candidate_response.get(
+                                    "provider_response_id"
+                                ),
+                            },
+                        )
+                        if attempt >= app.state.max_model_attempts:
+                            model_failure = record_model_output_budget_failure(
+                                attempt=attempt,
+                                provider_response_id=candidate_response.get("provider_response_id")
+                                if isinstance(candidate_response.get("provider_response_id"), str)
+                                else None,
+                                failure_reason=run_protocol_error
+                                or "model failed the run tool protocol",
+                            )
+                            model_failure_reason = "AI model failed the run tool protocol"
+                            break
+                        continue
+
+                    run_effects = unpack_run_source(run_source)
+                    run_call_id = function_calls[0].get("call_id")
+                    run_call_id = run_call_id if isinstance(run_call_id, str) else ""
+                    if run_effects.errors:
+                        provider_response_id = candidate_response.get("provider_response_id")
+                        add_ai_judgment(
+                            judgment_type="model_output",
+                            source_type="turn",
+                            source_id=turn.id,
+                            status="failed",
+                            model=candidate_response.get("model")
+                            if isinstance(candidate_response.get("model"), str)
+                            else app.state.model_adapter.model,
+                            prompt_version="model-output-v1",
+                            provider_response_id=provider_response_id
+                            if isinstance(provider_response_id, str)
+                            else None,
+                            input_summary="run source validation for model response",
+                            input_refs={
+                                "session_id": effective_session_id,
+                                "turn_id": turn.id,
+                                "attempt": attempt,
+                                "source": run_source,
+                            },
+                            parse_status="parsed",
+                            validation_status="invalid",
+                            failure_code="E_AI_JUDGMENT_VALIDATION",
+                            failure_reason=json.dumps(run_effects.errors, sort_keys=True),
+                        )
+                        for output_item in output_items:
+                            if (
+                                isinstance(output_item, dict)
+                                and output_item.get("type") == "function_call"
+                            ):
+                                responses_input_items.append(jsonable_encoder(output_item))
+                        if run_call_id:
+                            responses_input_items.append(
+                                {
+                                    "type": "function_call_output",
+                                    "call_id": run_call_id,
+                                    "output": json.dumps(
+                                        {"status": "failed", "errors": run_effects.errors},
+                                        sort_keys=True,
+                                    ),
+                                }
+                            )
+                        responses_input_items.append(
+                            {
+                                "role": "system",
+                                "content": (
+                                    "run source failed validation: "
+                                    + json.dumps(run_effects.errors, sort_keys=True)
+                                    + ". The user did not see any plain assistant text. "
+                                    "Retry with a JSON source shaped as "
+                                    '{"calls":[{"name":"agent.emit_message",'
+                                    '"input":{"text":"..."}}]}.'
+                                ),
+                            }
+                        )
+                        add_event(
+                            "evt.run.validation_failed",
+                            {
+                                "errors": run_effects.errors,
+                                "attempt": attempt,
+                                "provider_response_id": candidate_response.get(
+                                    "provider_response_id"
+                                ),
+                            },
+                        )
+                        if attempt >= app.state.max_model_attempts:
+                            model_failure = record_model_output_budget_failure(
+                                attempt=attempt,
+                                provider_response_id=candidate_response.get("provider_response_id")
+                                if isinstance(candidate_response.get("provider_response_id"), str)
+                                else None,
+                                failure_reason="run source failed validation",
+                            )
+                            model_failure_reason = "AI model produced invalid run source"
+                            break
+                        continue
+
+                    provider_response_id = candidate_response.get("provider_response_id")
+                    add_ai_judgment(
+                        judgment_type="model_output",
+                        source_type="turn",
+                        source_id=turn.id,
+                        status="succeeded",
+                        model=candidate_response.get("model")
+                        if isinstance(candidate_response.get("model"), str)
+                        else app.state.model_adapter.model,
+                        prompt_version="model-output-v1",
+                        provider_response_id=provider_response_id
+                        if isinstance(provider_response_id, str)
+                        else None,
+                        input_summary="validated run source for model response",
+                        input_refs={
+                            "session_id": effective_session_id,
+                            "turn_id": turn.id,
+                            "attempt": attempt,
+                            "source": run_source,
+                            "response_output": jsonable_encoder(output_items),
+                        },
+                        output={
+                            "emitted_message": bool(run_effects.emitted_message),
+                            "paused": run_effects.paused,
+                            "emitted_value_count": len(run_effects.emitted_values),
+                            "internal_call_count": len(run_effects.function_calls),
+                        },
+                        parse_status="parsed",
+                        validation_status="valid",
+                    )
+
+                    for index, emitted_value in enumerate(run_effects.emitted_values, start=1):
+                        encoded_value = json.dumps(
+                            jsonable_encoder(emitted_value),
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                        add_event(
+                            "evt.agent.value_emitted",
+                            {
+                                "index": index,
+                                "value_digest": hashlib.sha256(encoded_value).hexdigest(),
+                                "value_bytes": len(encoded_value),
+                                "attempt": attempt,
+                                "provider_response_id": candidate_response.get(
+                                    "provider_response_id"
+                                ),
+                            },
+                        )
+
+                    if run_effects.function_calls:
                         function_processing = process_response_function_calls(
                             db=db,
                             session_factory=session_factory,
                             session_id=effective_session_id,
                             turn=turn,
-                            assistant_message=assistant_text,
-                            function_calls_raw=function_calls,
+                            assistant_message=run_effects.emitted_message or assistant_text,
+                            function_calls_raw=run_effects.function_calls,
                             approval_ttl_seconds=int(app.state.approval_ttl_seconds),
                             approval_actor_id=str(app.state.approval_actor_id),
                             add_event=add_event,
                             now_fn=_utcnow,
                             new_id_fn=_new_id,
                             runtime_provenance=runtime_provenance,
-                            allowed_capability_ids=selected_capability_ids,
+                            allowed_capability_ids=allowed_capability_ids,
                             google_runtime=_google_runtime(),
                             execute_google_reads_outside_transaction=(
                                 execute_google_reads_outside_transaction
@@ -6876,12 +6816,41 @@ def create_app(
                                 "assistant_silent": True,
                             }
                             break
+
+                        if any(
+                            action_attempt.status == "awaiting_approval"
+                            for action_attempt in function_processing.action_attempts
+                        ):
+                            approval_message = (
+                                run_effects.emitted_message
+                                or "approval required. review the pending action."
+                            )
+                            response_tokens = _response_tokens_from_model_payload(
+                                candidate_response,
+                                assistant_text=approval_message,
+                            )
+                            if response_tokens > app.state.max_response_tokens:
+                                bounded_failure = build_turn_limit_failure(
+                                    budget="response_tokens",
+                                    unit="tokens",
+                                    measured=response_tokens,
+                                    limit=app.state.max_response_tokens,
+                                )
+                                break
+                            assistant_response = {
+                                **candidate_response,
+                                "assistant_text": approval_message,
+                                "assistant_silent": False,
+                            }
+                            break
                         tool_result_interpreter_output: dict[str, Any] | None = None
                         if function_processing.tool_result_interpreter_input is not None:
                             try:
                                 interpreted = _call_tool_result_interpreter(
                                     model_adapter=app.state.model_adapter,
-                                    interpreter_input=function_processing.tool_result_interpreter_input,
+                                    interpreter_input=(
+                                        function_processing.tool_result_interpreter_input
+                                    ),
                                 )
                             except ModelAdapterError as exc:
                                 failure_reason = safe_failure_reason(
@@ -7011,15 +6980,57 @@ def create_app(
                                             "response_output_shape"
                                         )
                                         or {},
-                                        "reason_codes": function_processing.tool_result_interpreter_input[
-                                            "reason_codes"
-                                        ],
+                                        "reason_codes": (
+                                            function_processing.tool_result_interpreter_input[
+                                                "reason_codes"
+                                            ]
+                                        ),
                                     },
                                 )
                         for output_item in output_items:
-                            if isinstance(output_item, dict):
+                            if (
+                                isinstance(output_item, dict)
+                                and output_item.get("type") == "function_call"
+                            ):
                                 responses_input_items.append(jsonable_encoder(output_item))
-                        responses_input_items.extend(function_processing.function_call_outputs)
+                        if run_call_id:
+                            decoded_call_outputs = []
+                            for call_output in function_processing.function_call_outputs:
+                                if not isinstance(call_output, dict):
+                                    continue
+                                raw_output = call_output.get("output")
+                                if not isinstance(raw_output, str):
+                                    continue
+                                try:
+                                    decoded_output = json.loads(raw_output)
+                                except ValueError:
+                                    decoded_output = {"raw_output": raw_output}
+                                decoded_call_outputs.append(
+                                    {
+                                        "call_id": call_output.get("call_id"),
+                                        "output": decoded_output,
+                                    }
+                                )
+                            responses_input_items.append(
+                                {
+                                    "type": "function_call_output",
+                                    "call_id": run_call_id,
+                                    "output": json.dumps(
+                                        {
+                                            "status": "completed",
+                                            "action_attempt_count": len(
+                                                function_processing.action_attempts
+                                            ),
+                                            "message_emitted": False,
+                                            "emitted_values": jsonable_encoder(
+                                                run_effects.emitted_values
+                                            ),
+                                            "internal_call_outputs": decoded_call_outputs,
+                                        },
+                                        sort_keys=True,
+                                    ),
+                                }
+                            )
                         responses_input_items.append(
                             {
                                 "role": "system",
@@ -7060,53 +7071,108 @@ def create_app(
                             model_failure_reason = "AI model output exhausted its attempt budget"
                             break
                         continue
-                    if not assistant_text:
-                        provider_response_id = candidate_response.get("provider_response_id")
-                        raise ModelAdapterError(
-                            safe_reason="model response missing assistant_text",
-                            status_code=502,
-                            code="E_MODEL_OUTPUT_REQUIRED",
-                            message="model response failed output contract",
-                            retryable=False,
-                            provider=candidate_response.get("provider")
-                            if isinstance(candidate_response.get("provider"), str)
-                            else app.state.model_adapter.provider,
-                            model=candidate_response.get("model")
-                            if isinstance(candidate_response.get("model"), str)
-                            else app.state.model_adapter.model,
-                            usage=candidate_response.get("usage")
-                            if isinstance(candidate_response.get("usage"), dict)
-                            else None,
-                            provider_response_id=provider_response_id
-                            if isinstance(provider_response_id, str)
-                            else None,
-                            parse_status="missing_output",
-                            validation_status="not_validated",
-                            raw_output_shape={
-                                "output_type": "list",
-                                "output_count": len(output_items),
-                                "text_present": False,
-                            },
+                    if run_effects.emitted_values and not run_effects.emitted_message:
+                        for output_item in output_items:
+                            if (
+                                isinstance(output_item, dict)
+                                and output_item.get("type") == "function_call"
+                            ):
+                                responses_input_items.append(jsonable_encoder(output_item))
+                        if run_call_id:
+                            responses_input_items.append(
+                                {
+                                    "type": "function_call_output",
+                                    "call_id": run_call_id,
+                                    "output": json.dumps(
+                                        {
+                                            "status": "completed",
+                                            "emitted_values": jsonable_encoder(
+                                                run_effects.emitted_values
+                                            ),
+                                        },
+                                        sort_keys=True,
+                                    ),
+                                }
+                            )
+                        responses_input_items.append(
+                            {
+                                "role": "system",
+                                "content": (
+                                    "agent emitted internal values. They are not visible to "
+                                    "the user. Continue with exactly one run call."
+                                ),
+                            }
                         )
-                    response_tokens = _response_tokens_from_model_payload(
-                        candidate_response,
-                        assistant_text=assistant_text,
-                    )
-                    if response_tokens > app.state.max_response_tokens:
-                        bounded_failure = build_turn_limit_failure(
-                            budget="response_tokens",
-                            unit="tokens",
-                            measured=response_tokens,
-                            limit=app.state.max_response_tokens,
+                        if attempt >= app.state.max_model_attempts:
+                            model_failure = record_model_output_budget_failure(
+                                attempt=attempt,
+                                provider_response_id=candidate_response.get("provider_response_id")
+                                if isinstance(candidate_response.get("provider_response_id"), str)
+                                else None,
+                                failure_reason=(
+                                    "model emitted internal values but exhausted its attempt budget"
+                                ),
+                            )
+                            model_failure_reason = "AI model output exhausted its attempt budget"
+                            break
+                        continue
+                    if run_effects.emitted_message:
+                        response_tokens = _response_tokens_from_model_payload(
+                            candidate_response,
+                            assistant_text=run_effects.emitted_message,
                         )
-                        break
+                        if response_tokens > app.state.max_response_tokens:
+                            bounded_failure = build_turn_limit_failure(
+                                budget="response_tokens",
+                                unit="tokens",
+                                measured=response_tokens,
+                                limit=app.state.max_response_tokens,
+                            )
+                            break
 
-                    assistant_response = {
-                        **candidate_response,
-                        "assistant_text": assistant_text,
-                        "assistant_silent": False,
-                    }
-                    break
+                        assistant_response = {
+                            **candidate_response,
+                            "assistant_text": run_effects.emitted_message,
+                            "assistant_silent": False,
+                        }
+                        break
+                    if run_effects.paused:
+                        assistant_response = {
+                            **candidate_response,
+                            "assistant_text": "",
+                            "assistant_silent": True,
+                        }
+                        break
+                    responses_input_items.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "run completed without user-visible output. Plain assistant text "
+                                "is audit-only and was not shown. Continue with exactly one run "
+                                "call that emits output through agent.emit_message or pauses with "
+                                "agent.pause_until_input."
+                            ),
+                        }
+                    )
+                    add_event(
+                        "evt.model.protocol_failed",
+                        {
+                            "reason": "run_completed_without_visible_output",
+                            "attempt": attempt,
+                            "provider_response_id": candidate_response.get("provider_response_id"),
+                        },
+                    )
+                    if attempt >= app.state.max_model_attempts:
+                        model_failure = record_model_output_budget_failure(
+                            attempt=attempt,
+                            provider_response_id=candidate_response.get("provider_response_id")
+                            if isinstance(candidate_response.get("provider_response_id"), str)
+                            else None,
+                            failure_reason="run completed without visible output",
+                        )
+                        model_failure_reason = "AI model produced no visible run output"
+                        break
+                    continue
                 except Exception as exc:
                     duration_ms = int((time.perf_counter() - model_started_at) * 1000)
                     fallback_reason = f"unexpected {exc.__class__.__name__}"
@@ -7230,6 +7296,25 @@ def create_app(
             )
         else:
             assert assistant_response is not None
+            current_turn_id = db.scalar(
+                select(TurnRecord.id)
+                .where(TurnRecord.session_id == effective_session_id)
+                .order_by(TurnRecord.created_at.desc(), TurnRecord.id.desc())
+                .limit(1)
+            )
+            if current_turn_id != turn.id:
+                add_event(
+                    "evt.agent.output_not_applied",
+                    {
+                        "reason": "stale_turn",
+                        "current_turn_id": current_turn_id,
+                    },
+                )
+                assistant_response = {
+                    **assistant_response,
+                    "assistant_text": "",
+                    "assistant_silent": True,
+                }
             assistant_message = assistant_response["assistant_text"]
             turn.assistant_message = assistant_message
             if active_session.memory_mode == "normal":
@@ -8011,39 +8096,6 @@ def create_app(
                     )
 
         assert decision_result is not None
-        if payload.decision == "approve" and decision_result.action_attempt.status == "executing":
-            process_action_execution_task(
-                session_factory=session_factory,
-                action_attempt_id=decision_result.action_attempt.id,
-                google_runtime=_google_runtime(),
-                agency_runtime=_agency_runtime(),
-                now_fn=_utcnow,
-                new_id_fn=_new_id,
-                memory_import_cutover_enabled=settings.memory_import_cutover_enabled,
-            )
-            with session_factory() as db:
-                with db.begin():
-                    refreshed_approval = db.scalar(
-                        select(ApprovalRequestRecord)
-                        .where(ApprovalRequestRecord.id == decision_result.approval.id)
-                        .limit(1)
-                    )
-                    refreshed_attempt = db.scalar(
-                        select(ActionAttemptRecord)
-                        .where(ActionAttemptRecord.id == decision_result.action_attempt.id)
-                        .limit(1)
-                    )
-                    if refreshed_approval is not None:
-                        decision_result.approval = refreshed_approval
-                    if refreshed_attempt is not None:
-                        decision_result.action_attempt = refreshed_attempt
-            if decision_result.action_attempt.status == "succeeded":
-                decision_result.assistant_message = "approved action executed successfully."
-            elif decision_result.action_attempt.status == "failed":
-                decision_result.assistant_message = approval_execution_failure_message(
-                    decision_result.action_attempt.execution_error or "execution_failed"
-                )
-
         with session_factory() as db:
             with db.begin():
                 approval_record = db.scalar(
@@ -8073,6 +8125,8 @@ def create_app(
                     return build_surface_approval_response(
                         approval=raw_approval,
                         assistant_message=decision_result.assistant_message,
+                        action_attempt_id=decision_result.action_attempt.id,
+                        execution_task_id=decision_result.execution_task_id,
                     )
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc

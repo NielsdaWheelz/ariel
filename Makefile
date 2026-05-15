@@ -4,21 +4,17 @@ PYTHON := $(shell for v in .venv/bin/python python3.13 python3.12 python3; do \
     echo $$v; break; \
   fi; \
 done)
+UV := $(shell if command -v uv >/dev/null 2>&1; then command -v uv; elif [ -x "$$HOME/.local/bin/uv" ]; then echo "$$HOME/.local/bin/uv"; fi)
 
 UVICORN_CMD := .venv/bin/uvicorn ariel.app:create_app --factory --host 127.0.0.1 --port 8000
 
-.PHONY: help bootstrap setup env-init check-venv db-up db-stop db-down db-destroy db-status db-logs db-config db-upgrade tailscale-serve run run-worker run-discord dev lint format-check typecheck test verify e2e
+.PHONY: help bootstrap setup env-init check-venv check-uv db-up db-stop db-down db-destroy db-status db-logs db-config db-upgrade tailscale-serve run run-worker run-discord dev lint format-check typecheck test verify e2e
 
 bootstrap:
 	bash scripts/bootstrap.sh
 
-setup:
-ifndef PYTHON
-	$(error No Python >= 3.$(MIN_PY) found. Install Python 3.$(MIN_PY)+ and ensure it is on PATH.)
-endif
-	$(PYTHON) -m venv .venv
-	.venv/bin/pip install --upgrade pip
-	.venv/bin/pip install -e ".[dev]"
+setup: check-uv
+	$(UV) sync --locked --extra dev
 
 help:
 	@printf "%s\n" \
@@ -52,6 +48,12 @@ env-init:
 check-venv:
 	@if [ ! -x ".venv/bin/python" ]; then \
 	  echo "missing .venv. run 'make setup' first."; \
+	  exit 1; \
+	fi
+
+check-uv:
+	@if [ -z "$(UV)" ]; then \
+	  echo "missing uv. install uv from https://docs.astral.sh/uv/getting-started/installation/"; \
 	  exit 1; \
 	fi
 

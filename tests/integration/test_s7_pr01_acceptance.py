@@ -2,19 +2,18 @@ from __future__ import annotations
 
 import copy
 import json
-from collections.abc import Callable, Generator
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any, cast
 
 from fastapi.testclient import TestClient
 import pytest
-from testcontainers.postgres import PostgresContainer
 
 import ariel.action_runtime as action_runtime_module
 import ariel.capability_registry as capability_registry_module
 import ariel.policy_engine as policy_engine_module
 from ariel.app import ModelAdapter, create_app
-from tests.integration.responses_helpers import responses_message, responses_with_function_calls
+from tests.integration.responses_helpers import responses_message, responses_with_run_calls
 from ariel.capability_registry import (
     CapabilityDefinition,
     get_capability as registry_get_capability,
@@ -22,10 +21,10 @@ from ariel.capability_registry import (
 
 
 @dataclass
-class ActionProposalAdapter:
+class ActionRunAdapter:
     provider: str = "provider.s7-pr01"
     model: str = "model.s7-pr01-v1"
-    proposals_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    run_calls_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     assistant_text_by_message: dict[str, str] = field(default_factory=dict)
 
     def create_response(
@@ -38,37 +37,6 @@ class ActionProposalAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         del tools, history
-        if context_bundle.get("origin") == "tool_strategy":
-            strategy_input = json.loads(str(input_items[1]["content"]))
-            available_ids = {
-                capability_id
-                for family in strategy_input.get("available_capability_families", [])
-                if isinstance(family, dict)
-                for capability_id in family.get("capability_ids", [])
-                if isinstance(capability_id, str)
-            }
-            selected_capability_ids = [
-                proposal["capability_id"]
-                for proposal in self.proposals_by_message.get(user_message, [])
-                if proposal.get("capability_id") in available_ids
-            ]
-            return responses_message(
-                assistant_text=json.dumps(
-                    {
-                        "decision": "selected_tools" if selected_capability_ids else "no_tools",
-                        "selected_capability_ids": selected_capability_ids,
-                        "rationale": "test strategy",
-                        "unavailable_reason": None,
-                        "confidence": 1.0,
-                    },
-                    sort_keys=True,
-                ),
-                provider=self.provider,
-                model=self.model,
-                provider_response_id="resp_s7_pr01_strategy",
-                input_tokens=3,
-                output_tokens=2,
-            )
         if context_bundle.get("origin") == "tool_result_interpretation":
             interpreter_input = context_bundle.get("tool_result_interpreter_input")
             if not isinstance(interpreter_input, dict):
@@ -102,7 +70,6 @@ class ActionProposalAdapter:
                 input_tokens=47,
                 output_tokens=31,
             )
-        proposals = self.proposals_by_message.get(user_message, [])
         assistant_text = self.assistant_text_by_message.get(
             user_message,
             {
@@ -114,10 +81,17 @@ class ActionProposalAdapter:
                 "large extraction": "Partial extraction only; narrow or focus the request [1].",
             }.get(user_message, f"assistant::{user_message}"),
         )
-        return responses_with_function_calls(
-            input_items=input_items,
+        run_calls = self.run_calls_by_message.get(user_message, [])
+        if any(
+            isinstance(item, dict) and item.get("type") == "function_call_output"
+            for item in input_items
+        ):
+            run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
+        if not run_calls:
+            run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
+        return responses_with_run_calls(
             assistant_text=assistant_text,
-            proposals=copy.deepcopy(proposals),
+            calls=copy.deepcopy(run_calls),
             provider=self.provider,
             model=self.model,
             provider_response_id="resp_s7_pr01_123",
@@ -137,13 +111,6 @@ class _FakeHTTPResponse:
         if self.json_raises:
             raise ValueError("invalid json")
         return self.payload
-
-
-@pytest.fixture(scope="session")
-def postgres_url() -> Generator[str, None, None]:
-    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
-        url = postgres.get_connection_url()
-        yield url.replace("psycopg2", "psycopg")
 
 
 @pytest.fixture(autouse=True)
@@ -272,11 +239,11 @@ def test_s7_pr01_web_extract_executes_inline_with_structured_output_citations_an
 
     monkeypatch.setattr(capability_registry_module.httpx, "post", fake_post)
 
-    adapter = ActionProposalAdapter(
-        proposals_by_message={
+    adapter = ActionRunAdapter(
+        run_calls_by_message={
             "extract url": [
                 {
-                    "capability_id": "cap.web.extract",
+                    "name": "web.extract",
                     "input": {
                         "url": "https://example.com/research/article?utm_source=rss#section-2"
                     },
@@ -350,10 +317,8 @@ def test_s7_pr01_url_safety_preflight_fails_closed_before_provider_dispatch(
         raise AssertionError(msg)
 
     monkeypatch.setattr(capability_registry_module.httpx, "post", fake_post)
-    adapter = ActionProposalAdapter(
-        proposals_by_message={
-            "unsafe url": [{"capability_id": "cap.web.extract", "input": {"url": input_url}}]
-        },
+    adapter = ActionRunAdapter(
+        run_calls_by_message={"unsafe url": [{"name": "web.extract", "input": {"url": input_url}}]},
         assistant_text_by_message={
             "unsafe url": f"{expected_error}: provide a {expected_hint} URL."
         },
@@ -409,11 +374,11 @@ def test_s7_pr01_web_extract_egress_contract_failures_block_before_execute(
         return replace(capability, execute=counted_execute, declare_egress_intent=lambda _: [])
 
     _patch_capability_lookup(monkeypatch, capability_id="cap.web.extract", mutate=mutate)
-    adapter = ActionProposalAdapter(
-        proposals_by_message={
+    adapter = ActionRunAdapter(
+        run_calls_by_message={
             "intent failure": [
                 {
-                    "capability_id": "cap.web.extract",
+                    "name": "web.extract",
                     "input": {"url": "https://example.com/research/article"},
                 }
             ]
@@ -459,11 +424,11 @@ def test_s7_pr01_non_allowlisted_egress_is_blocked_before_web_extract_execution(
         )
 
     _patch_capability_lookup(monkeypatch, capability_id="cap.web.extract", mutate=mutate)
-    adapter = ActionProposalAdapter(
-        proposals_by_message={
+    adapter = ActionRunAdapter(
+        run_calls_by_message={
             "egress deny": [
                 {
-                    "capability_id": "cap.web.extract",
+                    "name": "web.extract",
                     "input": {"url": "https://example.com/research/article"},
                 }
             ]
@@ -504,11 +469,11 @@ def test_s7_pr01_transient_provider_failure_retries_are_bounded_and_single_outco
         )
 
     monkeypatch.setattr(capability_registry_module.httpx, "post", fake_post)
-    adapter = ActionProposalAdapter(
-        proposals_by_message={
+    adapter = ActionRunAdapter(
+        run_calls_by_message={
             "retry extraction": [
                 {
-                    "capability_id": "cap.web.extract",
+                    "name": "web.extract",
                     "input": {"url": "https://example.com/research/article"},
                 }
             ]
@@ -546,11 +511,11 @@ def test_s7_pr01_provider_retry_exhaustion_fails_once_with_typed_error(
         return _FakeHTTPResponse(status_code=503, payload={"error": "temporary outage"})
 
     monkeypatch.setattr(capability_registry_module.httpx, "post", fake_post)
-    adapter = ActionProposalAdapter(
-        proposals_by_message={
+    adapter = ActionRunAdapter(
+        run_calls_by_message={
             "retry exhaustion": [
                 {
-                    "capability_id": "cap.web.extract",
+                    "name": "web.extract",
                     "input": {"url": "https://example.com/research/article"},
                 }
             ]
@@ -604,11 +569,11 @@ def test_s7_pr01_typed_url_extraction_failures_are_actionable_and_auditable(
         return _FakeHTTPResponse(status_code=502, payload={"error": "upstream"})
 
     monkeypatch.setattr(capability_registry_module.httpx, "post", fake_post)
-    adapter = ActionProposalAdapter(
-        proposals_by_message={
+    adapter = ActionRunAdapter(
+        run_calls_by_message={
             "failing extraction": [
                 {
-                    "capability_id": "cap.web.extract",
+                    "name": "web.extract",
                     "input": {"url": "https://example.com/research/article"},
                 }
             ]
@@ -647,11 +612,11 @@ def test_s7_pr01_provider_malformed_final_url_is_fail_closed(
         )
 
     monkeypatch.setattr(capability_registry_module.httpx, "post", fake_post)
-    adapter = ActionProposalAdapter(
-        proposals_by_message={
+    adapter = ActionRunAdapter(
+        run_calls_by_message={
             "malformed final url": [
                 {
-                    "capability_id": "cap.web.extract",
+                    "name": "web.extract",
                     "input": {"url": "https://example.com/research/article"},
                 }
             ]
@@ -696,11 +661,11 @@ def test_s7_pr01_public_ipv6_urls_remain_allowed_and_canonical(
         )
 
     monkeypatch.setattr(capability_registry_module.httpx, "post", fake_post)
-    adapter = ActionProposalAdapter(
-        proposals_by_message={
+    adapter = ActionRunAdapter(
+        run_calls_by_message={
             "ipv6 extraction": [
                 {
-                    "capability_id": "cap.web.extract",
+                    "name": "web.extract",
                     "input": {"url": "https://[2606:4700:4700::1111]/research/article#frag"},
                 }
             ]
@@ -747,11 +712,11 @@ def test_s7_pr01_large_pages_are_bounded_and_partial_disclosure_is_explicit(
         )
 
     monkeypatch.setattr(capability_registry_module.httpx, "post", fake_post)
-    adapter = ActionProposalAdapter(
-        proposals_by_message={
+    adapter = ActionRunAdapter(
+        run_calls_by_message={
             "large extraction": [
                 {
-                    "capability_id": "cap.web.extract",
+                    "name": "web.extract",
                     "input": {"url": "https://example.com/research/large-page"},
                 }
             ]
@@ -794,11 +759,11 @@ def test_s7_pr01_web_extract_preserves_grounding_and_lifecycle_inspectability(
         )
 
     monkeypatch.setattr(capability_registry_module.httpx, "post", fake_post)
-    adapter = ActionProposalAdapter(
-        proposals_by_message={
+    adapter = ActionRunAdapter(
+        run_calls_by_message={
             "mixed turn": [
                 {
-                    "capability_id": "cap.web.extract",
+                    "name": "web.extract",
                     "input": {"url": "https://example.com/research/article"},
                 },
             ]

@@ -124,7 +124,7 @@ ARIEL_DISCORD_NOTIFICATION_TIMEOUT_SECONDS=10.0
 messages are the Discord AI surface; `/ariel` and `/ask` are gone. `/status`, `/jobs`,
 and `/capture` are deterministic operational commands only. They expose
 rails, state, and operator controls; they do not decide user intent, memory relevance,
-tool strategy, or response content. Do not use `ARIEL_DISCORD_CHANNEL_ID` as a
+run-source choice, or response content. Do not use `ARIEL_DISCORD_CHANNEL_ID` as a
 one-channel-only chat gate; it is the default notification and thread parent when a
 message-specific Discord target is unavailable.
 
@@ -148,6 +148,16 @@ ARIEL_WORKER_HEARTBEAT_TIMEOUT_SECONDS=300
 ARIEL_PROACTIVE_AMBIENT_INTERVAL_SECONDS=60
 ARIEL_PROACTIVE_WORKER_MAX_ATTEMPTS=5
 ARIEL_PROACTIVE_DELIBERATION_TOOL_ROUNDS=2
+```
+
+Required terminal settings:
+
+```sh
+ARIEL_TERMINAL_DIR=/var/lib/ariel/terminal
+ARIEL_TERMINAL_OUTPUT_LIMIT_BYTES=12000
+ARIEL_TERMINAL_RUN_TIMEOUT_SECONDS=30.0
+ARIEL_TERMINAL_BACKGROUND_TIMEOUT_SECONDS=3600
+ARIEL_TERMINAL_TIMEOUT_KILL_AFTER_SECONDS=5.0
 ```
 
 Required provider callback settings when Google provider ingress is enabled:
@@ -181,6 +191,9 @@ ARIEL_SEARCH_WEB_API_KEY=<brave-api-key>
 ARIEL_SEARCH_NEWS_API_KEY=<optional-news-api-key>
 ARIEL_WEB_EXTRACT_API_KEY=<optional-extract-api-key>
 ARIEL_MAPS_PROVIDER_API_KEY_ENC=<encrypted-maps-key>
+ARIEL_MAPS_PROVIDER_ENDPOINT=<custom-maps-provider-base-url>
+ARIEL_WEATHER_PROVIDER_MODE=production
+ARIEL_WEATHER_PRODUCTION_API_KEY=<weather-api-key>
 ```
 
 Do not set `ARIEL_MODEL_PROVIDER` or `ARIEL_MODEL_API_BASE_URL`.
@@ -234,7 +247,8 @@ systemctl reload caddy
 ## Deployment
 
 1. Pull the intended Ariel revision into `/opt/ariel`.
-2. Install dependencies with `uv`.
+2. Install locked runtime and verification dependencies with `make setup`
+   (`uv sync --locked --extra dev`).
 3. Run verification before replacing services. `make verify` includes the required pytest
    eval suite for Responses routing, policy, Agency, Discord, worker recovery, and memory:
 
@@ -247,7 +261,7 @@ make verify
 6. Confirm health checks.
 7. Send one ambient owner DM smoke message and one ambient owner home-guild smoke
    message.
-8. Start one approval-required `cap.agency.run` smoke task in an allowed repo.
+8. Start one approval-required `agency.run` smoke task in an allowed repo.
 
 ## Health Checks
 
@@ -311,16 +325,16 @@ Expected state:
 Functional health:
 
 - Ambient Discord owner DM and home-guild messages receive concise responses unless
-  the model chooses `cap.discord.no_response`.
-- A `cap.discord.no_response` turn records the audited tool output and sends no visible
-  assistant text.
+  the `run` program pauses with `agent.pause_until_input`.
+- A pause turn records the audited model output and sends no visible assistant
+  text.
 - Messages with attachments preserve bounded attachment references in context; raw
   Discord download URLs are not model-visible, and content extraction happens only
-  through `cap.attachment.read` with provenance and typed failures.
-- Responses function calls create action attempts with audit events.
+  through the `attachment.read` callable with provenance and typed failures.
+- Internal `run` capability calls create action attempts with audit events.
 - Approval-required actions render Discord buttons.
 - Duplicate approval clicks do not duplicate side effects.
-- `cap.agency.status` can read the smoke Agency job.
+- `agency.status` can read the smoke Agency job.
 
 ## Rollback
 
@@ -398,9 +412,9 @@ Proactive worker:
 - Responses API is the only production model path.
 - No legacy provider, Chat Completions, compatibility flag, or fallback provider is
   configured.
-- Every model tool call goes through capability validation, policy, egress checks, audit
-  logging, and the approval path when required.
-- Agency work starts through `cap.agency.*` and the local daemon socket.
+- Every internal capability call goes through validation, policy, egress checks,
+  audit logging, and the approval path when required.
+- Agency work starts through the `agency.*` run callables and the local daemon socket.
 - `ARIEL_AGENCY_ALLOWED_REPO_ROOTS` contains only approved absolute repo roots.
 - Postgres survives process restarts with conversations, jobs, approvals, memory, and
   Agency identifiers intact.

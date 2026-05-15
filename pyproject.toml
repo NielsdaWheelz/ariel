@@ -24,7 +24,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-web-search-tool = { path = "../web-search-tool", editable = true }
+web-search-tool = { git = "https://github.com/NielsdaWheelz/web-search-tool.git", rev = "20adb934cdfb6e7a3a9bbffa990e5553541cba2c" }
 
 [project.optional-dependencies]
 dev = [

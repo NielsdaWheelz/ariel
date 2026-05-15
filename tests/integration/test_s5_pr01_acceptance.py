@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import copy
-import json
-from collections.abc import Generator, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from itertools import count
@@ -11,7 +10,6 @@ from typing import Any, cast
 from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import func, select
-from testcontainers.postgres import PostgresContainer
 
 from ariel.app import ModelAdapter, create_app
 from ariel.config import AppSettings
@@ -25,7 +23,7 @@ from ariel.persistence import (
     MemoryKeywordProjectionRecord,
     MemorySalienceRecord,
 )
-from tests.integration.responses_helpers import responses_message
+from tests.integration.responses_helpers import responses_run_message
 
 
 _projection_id_counter = count(1)
@@ -120,25 +118,6 @@ class MemoryProbeAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         del input_items, tools, history
-        if context_bundle.get("origin") == "tool_strategy":
-            return responses_message(
-                assistant_text=json.dumps(
-                    {
-                        "decision": "no_tools",
-                        "selected_capability_ids": [],
-                        "rationale": "memory turn does not need runtime tools",
-                        "unavailable_reason": None,
-                        "confidence": 1.0,
-                    },
-                    sort_keys=True,
-                ),
-                provider=self.provider,
-                model=self.model,
-                provider_response_id="resp_s5_pr01_strategy",
-                input_tokens=3,
-                output_tokens=2,
-            )
-
         snapshot = copy.deepcopy(context_bundle)
         self.context_bundles.append(snapshot)
 
@@ -163,7 +142,7 @@ class MemoryProbeAdapter:
         assistant_text = (
             "recalled::" + " | ".join(fragments) if fragments else f"assistant::{user_message}"
         )
-        return responses_message(
+        return responses_run_message(
             assistant_text=assistant_text,
             provider=self.provider,
             model=self.model,
@@ -171,12 +150,6 @@ class MemoryProbeAdapter:
             input_tokens=19,
             output_tokens=14,
         )
-
-
-@pytest.fixture(scope="session")
-def postgres_url() -> Generator[str, None, None]:
-    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
-        yield postgres.get_connection_url().replace("psycopg2", "psycopg")
 
 
 def _build_client(

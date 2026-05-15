@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import copy
-import json
 import threading
-import time
-from collections.abc import Generator, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from itertools import count
@@ -13,13 +11,12 @@ from typing import Any, cast
 from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import select, text
-from testcontainers.postgres import PostgresContainer
 
 from ariel.app import ModelAdapter, _session_turn_lock_id, create_app
 from ariel.config import AppSettings
 import ariel.memory as memory
 from ariel.memory import MEMORY_PROJECTION_VERSION, process_memory_projection_job
-from tests.integration.responses_helpers import responses_message, responses_with_function_calls
+from tests.integration.responses_helpers import responses_run_message, responses_with_run_calls
 from ariel.persistence import AIJudgmentRecord, SessionRecord
 
 
@@ -229,7 +226,7 @@ class SessionManagementProbeAdapter:
     context_bundles: list[dict[str, Any]] = field(default_factory=list)
     history_lengths_by_message: dict[str, int] = field(default_factory=dict)
     message_delays_seconds: dict[str, float] = field(default_factory=dict)
-    proposals_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    run_calls_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def create_response(
@@ -241,60 +238,33 @@ class SessionManagementProbeAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        del tools
-        if context_bundle.get("origin") == "tool_strategy":
-            strategy_input = json.loads(str(input_items[1]["content"]))
-            available_ids = {
-                capability_id
-                for family in strategy_input.get("available_capability_families", [])
-                if isinstance(family, dict)
-                for capability_id in family.get("capability_ids", [])
-                if isinstance(capability_id, str)
-            }
-            selected_capability_ids = [
-                proposal["capability_id"]
-                for proposal in self.proposals_by_message.get(user_message, [])
-                if proposal.get("capability_id") in available_ids
-            ]
-            return responses_message(
-                assistant_text=json.dumps(
-                    {
-                        "decision": "selected_tools" if selected_capability_ids else "no_tools",
-                        "selected_capability_ids": selected_capability_ids,
-                        "rationale": "test strategy",
-                        "unavailable_reason": None,
-                        "confidence": 1.0,
-                    },
-                    sort_keys=True,
-                ),
-                provider=self.provider,
-                model=self.model,
-                provider_response_id="resp_s5_pr02_strategy",
-                input_tokens=3,
-                output_tokens=2,
-            )
-
+        assert [tool.get("name") for tool in tools] == ["run"]
         with self._lock:
-            self.history_lengths_by_message[user_message] = len(history)
             self.context_bundles.append(copy.deepcopy(context_bundle))
-
-        delay_seconds = float(self.message_delays_seconds.get(user_message, 0.0))
-        if delay_seconds > 0:
-            time.sleep(delay_seconds)
-
-        proposals = self.proposals_by_message.get(user_message)
-        if isinstance(proposals, list):
-            return responses_with_function_calls(
-                input_items=input_items,
+            self.history_lengths_by_message[user_message] = len(history)
+        run_calls = self.run_calls_by_message.get(user_message)
+        if isinstance(run_calls, list):
+            if any(
+                isinstance(item, dict) and item.get("type") == "function_call_output"
+                for item in input_items
+            ):
+                run_calls = [
+                    {"name": "agent.emit_message", "input": {"text": f"assistant::{user_message}"}}
+                ]
+            if not run_calls:
+                run_calls = [
+                    {"name": "agent.emit_message", "input": {"text": f"assistant::{user_message}"}}
+                ]
+            return responses_with_run_calls(
                 assistant_text=f"assistant::{user_message}",
-                proposals=copy.deepcopy(proposals),
+                calls=copy.deepcopy(run_calls),
                 provider=self.provider,
                 model=self.model,
                 provider_response_id="resp_s5_pr02_123",
                 input_tokens=17,
                 output_tokens=12,
             )
-        return responses_message(
+        return responses_run_message(
             assistant_text=f"assistant::{user_message}",
             provider=self.provider,
             model=self.model,
@@ -430,13 +400,6 @@ class ValidAICompactionAdapter:
             "compacted_by": "ai_context_compaction",
         }
         return compacted
-
-
-@pytest.fixture(scope="session")
-def postgres_url() -> Generator[str, None, None]:
-    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
-        url = postgres.get_connection_url()
-        yield url.replace("psycopg2", "psycopg")
 
 
 def _build_client(
@@ -938,7 +901,7 @@ def test_s5_pr02_over_budget_compaction_noop_is_ai_judgment_failure_not_budget_s
         assert compaction_adapter.calls
         assert compaction_adapter.calls[-1]["estimated_context_tokens"] > 1
         assert response.headers["content-type"].startswith("application/json")
-        assert response.status_code == 502
+        assert response.status_code == 503
         error = response.json()["error"]
         assert error["code"].startswith("E_AI_JUDGMENT_")
         assert error["details"]["judgment_type"] == "continuity_compaction"
@@ -1121,10 +1084,10 @@ def test_s5_pr02_timeline_after_cursor_omits_turns_with_action_attempts_and_no_n
     _use_fake_embeddings(monkeypatch)
     first_message = "search memory for cursor regression"
     adapter = SessionManagementProbeAdapter(
-        proposals_by_message={
+        run_calls_by_message={
             first_message: [
                 {
-                    "capability_id": "cap.memory.search",
+                    "name": "memory.search",
                     "input": {"query": "cursor regression", "limit": 1},
                 }
             ]

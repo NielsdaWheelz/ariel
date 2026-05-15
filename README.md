@@ -12,7 +12,7 @@ discord-primary Ariel runtime with:
 
 ## quickstart
 
-first-time setup (checks prerequisites, creates venv, starts db, runs migrations, configures tailscale):
+first-time setup (checks prerequisites, creates venv, starts db, runs migrations):
 
 ```bash
 make bootstrap
@@ -59,10 +59,10 @@ ambient messages are the Discord AI surface. the bot handles:
 
 guild chat is not limited to one configured channel. attachments are passed as
 bounded references without raw Discord download URLs; content reads flow through
-`cap.attachment.read` with typed failures, provenance, and citation artifacts.
+`attachment.read` with typed failures, provenance, and citation artifacts.
 links still flow through normal URL extraction/search capabilities.
-when the model calls `cap.discord.no_response`, Ariel records the audited tool output and
-sends no visible assistant text.
+when the model calls `agent.pause_until_input` inside `run`, Ariel records the
+audited pause and sends no visible assistant text.
 
 `/ariel` and `/ask` are gone. `/status`, `/jobs`, and `/capture` are
 deterministic operational commands only and do not route free-form prompts to the model.
@@ -197,7 +197,7 @@ slice-2 pr-08 hardens outbound side effects with fail-closed egress preflight:
 slice-3 pr-01 introduces the first externally grounded factual retrieval path with citation and provenance
 contracts:
 
-- factual retrieval executes through `cap.search.web` (`read`) under capability policy, not model-vendor
+- factual retrieval executes through `search.web` (`read`) under capability policy, not model-vendor
   native search shortcuts.
 - grounded message responses now include:
   - inline citation markers in `assistant.message` (for example `[1]`, `[2]`)
@@ -210,7 +210,7 @@ contracts:
 
 slice-3 pr-03 hardens grounding safety for conflicting evidence and mixed proposal sets:
 
-- when any retrieval capability executes (`cap.search.web`, `cap.search.news`, `cap.weather.forecast`, `cap.web.extract`),
+- when any retrieval callable executes (`search.web`, `search.news`, `weather.forecast`, `web.extract`),
   `assistant.message` stays grounded narrative with inline citations and synchronized `assistant.sources[]`,
   even if non-retrieval proposals run in the same turn.
 - mixed-turn non-retrieval outcomes remain auditable through structured surfaces
@@ -230,11 +230,11 @@ slice-4 pr-01 adds google oauth connector lifecycle and allowlisted read capabil
   - `POST /v1/connectors/google/reconnect`
   - `GET /v1/connectors/google/callback`
   - `DELETE /v1/connectors/google`
-- allowlisted read capabilities:
-  - `cap.calendar.list`
-  - `cap.calendar.propose_slots`
-  - `cap.email.search`
-  - `cap.email.read`
+- allowlisted read callables:
+  - `calendar.list`
+  - `calendar.propose_slots`
+  - `email.search`
+  - `email.read`
 - typed recoverable auth/scope failures:
   - `not_connected`, `consent_required`, `scope_missing`, `token_expired`, `access_revoked`
 
@@ -243,10 +243,10 @@ slice-4 pr-01 adds google oauth connector lifecycle and allowlisted read capabil
 slice-4 pr-02 extends google workspace write safety with least-privilege scope remediation and
 approval-safe execution boundaries:
 
-- new write capabilities:
-  - `cap.calendar.create_event` (`write_reversible`, approval required)
-  - `cap.email.draft` (`write_reversible`, allowlisted inline, draft-only by construction)
-  - `cap.email.send` (`external_send`, approval required)
+- new write callables:
+  - `calendar.create_event` (`write_reversible`, approval required)
+  - `email.draft` (`write_reversible`, approval required, draft-only by construction)
+  - `email.send` (`external_send`, approval required)
 - reconnect is capability-intent driven:
   - `POST /v1/connectors/google/reconnect?capability_intent=<capability_id>`
   - runtime requests only scopes needed for the attempted write intent while preserving already-granted scopes.
@@ -307,11 +307,11 @@ slice-5 adds canonical durable memory, explicit + threshold rotation, and harden
 slice-6 pr-01 adds drive capabilities and capability-scoped reconnect intent under existing policy and
 approval boundaries:
 
-- allowlisted read capabilities:
-  - `cap.drive.search` (metadata-oriented file discovery)
-  - `cap.drive.read` (bounded content retrieval with typed read outcomes)
-- approval-gated external-send capability:
-  - `cap.drive.share` (`requires_approval`, exact approved payload, exactly-once execution)
+- allowlisted read callables:
+  - `drive.search` (metadata-oriented file discovery)
+  - `drive.read` (bounded content retrieval with typed read outcomes)
+- approval-gated external-send callable:
+  - `drive.share` (`requires_approval`, exact approved payload, exactly-once execution)
 - reconnect intent remains least-privilege by capability:
   - `POST /v1/connectors/google/reconnect?capability_intent=cap.drive.search`
   - `POST /v1/connectors/google/reconnect?capability_intent=cap.drive.read`
@@ -333,9 +333,9 @@ approval boundaries:
 
 slice-6 pr-02 adds maps retrieval capabilities under explicit read-only policy and fail-closed egress:
 
-- allowlisted read capabilities (no approval path):
-  - `cap.maps.directions`
-  - `cap.maps.search_places`
+- allowlisted read callables (no approval path):
+  - `maps.directions`
+  - `maps.search_places`
 - maps execution uses server-managed provider credentials only (no google oauth reconnect/consent loop).
 - maps capability contracts remain strict and retrieval-native (citation-ready `results[]` + `retrieved_at`).
 - required-field clarification behavior is deterministic and explicit:
@@ -352,13 +352,13 @@ slice-6 pr-02 adds maps retrieval capabilities under explicit read-only policy a
 - maps retrieval remains isolated from google connector readiness/consent state.
 - maps outputs stay grounded with inline citations and `assistant.sources[]` in single- and mixed-retrieval turns.
 
-## slice-7 pr-01 url extraction vertical (cap.web.extract)
+## slice-7 pr-01 url extraction vertical (`web.extract`)
 
 slice-7 pr-01 adds url extraction retrieval under strict safety preflight, fail-closed egress, and
 grounded provenance contracts:
 
 - allowlisted read capability:
-  - `cap.web.extract` (`read`, `allow_inline`)
+  - `web.extract` (`read`, `allow_inline`)
 - url safety preflight is strict and fail-closed before extraction:
   - invalid url -> `url_invalid`
   - non-http(s) scheme -> `url_scheme_unsupported`
@@ -378,7 +378,7 @@ grounded provenance contracts:
     `provider_upstream_failure`, `provider_request_rejected`, `provider_invalid_payload`,
     `provider_unreachable`
 - large/complex pages remain bounded with explicit partial disclosure (no silent degradation).
-- mixed turns containing `cap.web.extract` plus non-retrieval proposals keep retrieval-grounded
+- mixed turns containing `web.extract` plus non-retrieval proposals keep retrieval-grounded
   assistant messaging while preserving structured lifecycle inspectability for all proposals.
 
 ## slice-8 quick capture surface (`post /v1/captures`)
@@ -464,7 +464,7 @@ weather capability runtime config:
 maps capability runtime config:
 
 - `ARIEL_MAPS_PROVIDER_API_KEY_ENC` (required; encrypted maps provider api key)
-- `ARIEL_MAPS_PROVIDER_ENDPOINT` (optional; defaults to `https://maps.googleapis.com/maps/api`)
+- `ARIEL_MAPS_PROVIDER_ENDPOINT` (required with maps credentials; custom maps provider/proxy base URL)
 - `ARIEL_MAPS_PROVIDER_TIMEOUT_SECONDS` (optional; defaults to `8.0`)
 
 maps encrypted key handling uses the existing connector cipher/keyring settings:

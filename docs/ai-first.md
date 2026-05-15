@@ -67,7 +67,7 @@ Subagents are used for:
 
 - memory relevance and recall curation
 - memory extraction and "worth remembering" decisions
-- tool strategy and source selection
+- run-source choice and evidence source selection
 - tool-result interpretation
 - final answer synthesis from evidence
 - ambient event interpretation
@@ -110,12 +110,14 @@ transport order, not the final relevance decision.
 
 ## Tool Use
 
-Tool execution is a rail; tool strategy and result interpretation are AI-owned.
+Tool execution is a rail; run-source choice and result interpretation are
+AI-owned.
 
-Deterministic code validates tool calls, executes authorized tools, captures
-outputs, labels taint, records artifacts, and returns typed failures. AI decides
-which tools to call, whether more evidence is needed, how outputs affect the
-answer, and whether uncertainty should be surfaced.
+Deterministic code validates the `run` protocol, executes authorized internal
+callables, captures outputs, labels taint, records artifacts, and returns typed
+failures. AI decides which internal callables to invoke, whether more evidence
+is needed, how outputs affect the answer, and whether uncertainty should be
+surfaced.
 
 Deterministic code must not author final answers from tool output except typed
 failure envelopes that stop the turn.

@@ -6,7 +6,6 @@ from typing import Any, cast
 
 import pytest
 from fastapi.testclient import TestClient
-from testcontainers.postgres import PostgresContainer
 
 from ariel.app import create_app
 from ariel.persistence import (
@@ -39,13 +38,6 @@ class NoopModelAdapter:
             "provider_response_id": "resp_unused",
             "usage": {"input_tokens": 0, "output_tokens": 0},
         }
-
-
-@pytest.fixture(scope="session")
-def postgres_url() -> Generator[str, None, None]:
-    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
-        url = postgres.get_connection_url()
-        yield url.replace("psycopg2", "psycopg")
 
 
 @pytest.fixture

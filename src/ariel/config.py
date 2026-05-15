@@ -84,6 +84,30 @@ class AppSettings(BaseSettings):
     agency_timeout_seconds: float = 30.0
     agency_event_secret: str | None = None
     agency_event_max_skew_seconds: int = 300
+    terminal_dir: str = "~/.cache/ariel/terminal"
+    terminal_output_limit_bytes: int = 12000
+    terminal_run_timeout_seconds: float = 30.0
+    terminal_background_timeout_seconds: int = 3600
+    terminal_timeout_kill_after_seconds: float = 5.0
+    search_brave_base_url: str = "https://api.search.brave.com/res/v1"
+    search_web_timeout_seconds: float = 8.0
+    search_web_api_key: str | None = None
+    search_news_timeout_seconds: float = 8.0
+    search_news_api_key: str | None = None
+    web_extract_provider_endpoint: str | None = None
+    web_extract_timeout_seconds: float = 10.0
+    web_extract_max_retries: int = 2
+    web_extract_api_key: str | None = None
+    maps_provider_api_key_enc: str | None = None
+    maps_provider_endpoint: str | None = None
+    maps_provider_timeout_seconds: float = 8.0
+    weather_provider_mode: str = "production"
+    weather_production_endpoint: str = "https://api.tomorrow.io/v4/weather/forecast"
+    weather_production_timeout_seconds: float = 8.0
+    weather_production_api_key: str | None = None
+    weather_dev_endpoint: str = "https://wttr.in"
+    weather_dev_timeout_seconds: float = 8.0
+    weather_default_location: str | None = None
     worker_poll_seconds: float = 1.0
     worker_heartbeat_timeout_seconds: int = 300
     proactive_ambient_interval_seconds: int = 60
@@ -117,6 +141,51 @@ class AppSettings(BaseSettings):
         if isinstance(value, str) and not value.strip():
             return None
         return value
+
+    @field_validator(
+        "search_web_api_key",
+        "search_news_api_key",
+        "web_extract_provider_endpoint",
+        "web_extract_api_key",
+        "maps_provider_api_key_enc",
+        "maps_provider_endpoint",
+        "weather_production_api_key",
+        "weather_default_location",
+        mode="before",
+    )
+    @classmethod
+    def _blank_optional_strings_are_unset(cls, value: Any) -> Any:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("weather_provider_mode")
+    @classmethod
+    def _weather_provider_mode_must_be_supported(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"production", "dev_fallback"}:
+            raise ValueError("weather_provider_mode must be production or dev_fallback")
+        return normalized
+
+    @field_validator(
+        "search_brave_base_url",
+        "weather_production_endpoint",
+        "weather_dev_endpoint",
+    )
+    @classmethod
+    def _provider_endpoint_settings_must_be_nonblank(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("provider endpoint settings must be nonblank")
+        return normalized
+
+    @field_validator("terminal_dir")
+    @classmethod
+    def _terminal_dir_must_be_nonblank(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("terminal_dir must be nonblank")
+        return normalized
 
     @field_validator("google_provider_event_token", mode="before")
     @classmethod
@@ -374,6 +443,14 @@ class AppSettings(BaseSettings):
         "attachment_fetch_timeout_seconds",
         "attachment_openai_timeout_seconds",
         "agency_timeout_seconds",
+        "terminal_run_timeout_seconds",
+        "terminal_timeout_kill_after_seconds",
+        "search_web_timeout_seconds",
+        "search_news_timeout_seconds",
+        "web_extract_timeout_seconds",
+        "maps_provider_timeout_seconds",
+        "weather_production_timeout_seconds",
+        "weather_dev_timeout_seconds",
         "worker_poll_seconds",
     )
     @classmethod
@@ -386,6 +463,8 @@ class AppSettings(BaseSettings):
         "attachment_max_bytes",
         "attachment_handle_ttl_seconds",
         "agency_event_max_skew_seconds",
+        "terminal_output_limit_bytes",
+        "terminal_background_timeout_seconds",
         "worker_heartbeat_timeout_seconds",
         "proactive_ambient_interval_seconds",
         "proactive_worker_max_attempts",
@@ -395,6 +474,13 @@ class AppSettings(BaseSettings):
     def _positive_int_settings_must_be_positive(cls, value: int) -> int:
         if value < 1:
             raise ValueError("agency, attachment, worker, and proactive settings must be >= 1")
+        return value
+
+    @field_validator("web_extract_max_retries")
+    @classmethod
+    def _web_extract_max_retries_must_be_bounded(cls, value: int) -> int:
+        if value < 0 or value > 5:
+            raise ValueError("web_extract_max_retries must be between 0 and 5")
         return value
 
     @field_validator(

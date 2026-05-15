@@ -8,24 +8,24 @@ from typing import Any, cast
 import pytest
 from ariel import action_runtime
 from ariel.action_runtime import RuntimeProvenance, process_response_function_calls
-from ariel.app import ModelAdapterError, _call_tool_result_interpreter, _call_tool_strategy
+from ariel.app import (
+    ModelAdapterError,
+    _POLICY_SYSTEM_INSTRUCTIONS,
+    _call_tool_result_interpreter,
+    _eligible_internal_callable_capability_ids,
+)
 from ariel.capability_registry import (
-    capability_id_for_response_tool_name,
-    get_capability,
-    production_response_capability_ids,
-    response_tool_definitions,
-    response_tool_name_for_capability_id,
+    capability_id_for_run_callable,
+    internal_callable_capability_ids,
+    run_callable_name_for_capability_id,
 )
 from ariel.executor import ExecutionResult
 from ariel.persistence import TurnRecord
+from ariel.run_runtime import parse_run_function_call, run_tool_definitions, unpack_run_source
 from sqlalchemy.orm import Session
 
 
-def _production_response_tool_definitions() -> list[dict[str, Any]]:
-    return response_tool_definitions(production_response_capability_ids())
-
-
-def test_response_tool_schemas_are_strict_objects() -> None:
+def test_normal_response_tool_surface_is_single_strict_run_tool() -> None:
     def assert_strict_object_schema(schema: dict[str, Any], path: str) -> None:
         if schema.get("type") == "object" or "properties" in schema:
             assert schema.get("additionalProperties") is False, path
@@ -39,420 +39,185 @@ def test_response_tool_schemas_are_strict_objects() -> None:
         if isinstance(items, dict):
             assert_strict_object_schema(items, f"{path}[]")
 
-    for tool in _production_response_tool_definitions():
-        assert tool["type"] == "function"
-        assert tool["strict"] is True
-        assert_strict_object_schema(tool["parameters"], tool["name"])
+    tools = run_tool_definitions()
+    assert [tool["name"] for tool in tools] == ["run"]
+    assert tools[0]["type"] == "function"
+    assert tools[0]["strict"] is True
+    assert_strict_object_schema(tools[0]["parameters"], "run")
 
 
-def test_response_tool_names_round_trip_without_dotted_names() -> None:
-    for tool in _production_response_tool_definitions():
-        tool_name = tool["name"]
-        capability_id = capability_id_for_response_tool_name(tool_name)
+def test_model_facing_policy_instructions_use_run_callable_names() -> None:
+    instructions = "\n".join(_POLICY_SYSTEM_INSTRUCTIONS)
 
-        assert "." not in tool_name
-        assert capability_id is not None
-        assert response_tool_name_for_capability_id(capability_id) == tool_name
+    assert "cap." not in instructions
+    assert "agent.pause_until_input" in instructions
+    assert "attachment.read" in instructions
 
 
-def test_production_response_tools_exclude_framework_fixtures() -> None:
-    for tool in _production_response_tool_definitions():
-        capability_id = capability_id_for_response_tool_name(tool["name"])
-        assert capability_id is not None
-        assert not capability_id.startswith("cap.framework.")
-
-
-def test_framework_fixture_tools_cannot_be_exposed_explicitly() -> None:
-    assert get_capability("cap.framework.read_echo") is None
-    with pytest.raises(RuntimeError, match="unknown Responses capability"):
-        response_tool_definitions(["cap.framework.read_echo"])
-
-
-def test_tool_strategy_uses_no_tools_and_accepts_valid_selected_ids() -> None:
-    class StrategyAdapter:
-        provider = "provider.strategy-test"
-        model = "model.strategy-test"
-
-        def create_response(
-            self,
-            *,
-            input_items: list[dict[str, Any]],
-            tools: list[dict[str, Any]],
-            user_message: str,
-            history: list[dict[str, Any]],
-            context_bundle: dict[str, Any],
-        ) -> dict[str, Any]:
-            del user_message, history, context_bundle
-            assert tools == []
-            assert input_items[0]["role"] == "system"
-            strategy_input = json.loads(str(input_items[1]["content"]))
-            assert "eligible_tools" not in strategy_input
-            assert strategy_input["available_capability_families"] == [
-                {
-                    "family": "email",
-                    "description": "Gmail search, read, drafts, approved sends, and mail organization.",
-                    "capability_ids": ["cap.email.send"],
-                },
-                {
-                    "family": "memory",
-                    "description": (
-                        "Memory inspection, recall diagnostics, policy, mutation, "
-                        "consolidation, and export."
-                    ),
-                    "capability_ids": ["cap.memory.search"],
-                },
-            ]
-            assert strategy_input["runtime_facts"] == {"google": {"connected": False}}
-            assert strategy_input["bounded_context"] == {"case": "unit"}
-            return {
-                "provider": self.provider,
-                "model": self.model,
-                "output": [
-                    {
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "type": "output_text",
-                                "text": json.dumps(
-                                    {
-                                        "decision": "selected_tools",
-                                        "selected_capability_ids": [
-                                            "cap.memory.search",
-                                            "cap.email.send",
-                                        ],
-                                        "rationale": "Need search and send.",
-                                        "unavailable_reason": None,
-                                        "confidence": 0.8,
-                                    }
-                                ),
-                            }
-                        ],
-                    }
-                ],
-            }
-
-    selected, _, parsed = _call_tool_strategy(
-        model_adapter=StrategyAdapter(),  # type: ignore[arg-type]
-        user_message="Find the note and email it.",
-        context_bundle={"case": "unit"},
-        tool_surface_facts={"google": {"connected": False}},
-        eligible_capability_ids=["cap.memory.search", "cap.email.send"],
+def test_run_protocol_requires_exactly_one_run_call() -> None:
+    assert parse_run_function_call([]) == (
+        None,
+        "run_protocol_requires_exactly_one_tool_call",
+    )
+    assert parse_run_function_call(
+        [{"name": "run", "arguments": "{}"}, {"name": "run", "arguments": "{}"}]
+    ) == (None, "run_protocol_requires_exactly_one_tool_call")
+    assert parse_run_function_call([{"name": "cap_memory_search", "arguments": "{}"}]) == (
+        None,
+        "run_protocol_requires_run_tool",
     )
 
-    assert selected == ["cap.memory.search", "cap.email.send"]
-    assert parsed["rationale"] == "Need search and send."
+
+def test_run_callable_aliases_are_unique_and_deliberate() -> None:
+    aliases: dict[str, str] = {}
+    internal_only = {"cap.memory.eval"}
+    for capability_id in internal_callable_capability_ids():
+        alias = run_callable_name_for_capability_id(capability_id)
+        if capability_id in internal_only:
+            assert alias is None
+            continue
+        assert alias is not None, capability_id
+        assert not alias.startswith("cap.")
+        assert alias not in aliases, alias
+        aliases[alias] = capability_id
+        assert capability_id_for_run_callable(alias) == capability_id
+
+    assert capability_id_for_run_callable("discord.no_response") is None
+    assert capability_id_for_run_callable("memory.eval") is None
 
 
-@pytest.mark.parametrize(
-    ("selected_capability_ids", "eligible_capability_ids", "expected_code", "expected_reason"),
-    [
-        (
-            ["cap.framework.read_echo"],
-            ["cap.memory.search"],
-            "E_AI_JUDGMENT_VALIDATION",
-            "ineligible capability",
-        ),
-        (
-            ["cap.memory.search", "cap.memory.search"],
-            ["cap.memory.search"],
-            "E_AI_JUDGMENT_VALIDATION",
-            "duplicate capability",
-        ),
-        (
-            [
-                "cap.memory.inspect",
-                "cap.memory.search",
-                "cap.memory.propose",
-                "cap.memory.review",
-                "cap.memory.correct",
-                "cap.memory.retract",
-                "cap.memory.delete",
-                "cap.memory.privacy_delete",
-                "cap.memory.redact_evidence",
-            ],
-            [
-                "cap.memory.inspect",
-                "cap.memory.search",
-                "cap.memory.propose",
-                "cap.memory.review",
-                "cap.memory.correct",
-                "cap.memory.retract",
-                "cap.memory.delete",
-                "cap.memory.privacy_delete",
-                "cap.memory.redact_evidence",
-            ],
-            "E_AI_JUDGMENT_SCHEMA",
-            "schema validation",
-        ),
-    ],
-)
-def test_tool_strategy_rejects_invalid_selected_ids(
-    selected_capability_ids: list[str],
-    eligible_capability_ids: list[str],
-    expected_code: str,
-    expected_reason: str,
-) -> None:
-    class StrategyAdapter:
-        provider = "provider.strategy-test"
-        model = "model.strategy-test"
-
-        def create_response(self, **kwargs: Any) -> dict[str, Any]:
-            del kwargs
-            return {
-                "provider": self.provider,
-                "model": self.model,
-                "output": [
-                    {
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "type": "output_text",
-                                "text": json.dumps(
-                                    {
-                                        "decision": "selected_tools",
-                                        "selected_capability_ids": selected_capability_ids,
-                                        "rationale": "bad selection",
-                                        "unavailable_reason": None,
-                                        "confidence": 0.8,
-                                    }
-                                ),
-                            }
-                        ],
-                    }
-                ],
+def test_internal_callable_eligibility_is_default_deny() -> None:
+    capability_ids = set(
+        _eligible_internal_callable_capability_ids(
+            tool_surface_facts={
+                "discord": {"available": True, "attachment_count": 0},
+                "runtime_bindings": {},
             }
-
-    with pytest.raises(ModelAdapterError) as exc_info:
-        _call_tool_strategy(
-            model_adapter=StrategyAdapter(),  # type: ignore[arg-type]
-            user_message="Find the note.",
-            context_bundle={},
-            tool_surface_facts={},
-            eligible_capability_ids=eligible_capability_ids,
         )
+    )
 
-    assert exc_info.value.code == expected_code
-    assert expected_reason in exc_info.value.safe_reason
-    assert exc_info.value.validation_status == "invalid"
+    assert "cap.terminal.run" in capability_ids
+    assert "cap.terminal.cancel" in capability_ids
+    assert "cap.memory.search" in capability_ids
+    assert "cap.memory.deprioritize" in capability_ids
+    assert "cap.memory.eval" not in capability_ids
+    assert "cap.attachment.read" not in capability_ids
+    assert "cap.agency.run" not in capability_ids
+    assert "cap.search.web" not in capability_ids
+    assert "cap.maps.directions" not in capability_ids
+    assert "cap.weather.forecast" not in capability_ids
 
 
-def test_tool_strategy_rejects_schema_invalid_json_object() -> None:
-    class StrategyAdapter:
-        provider = "provider.strategy-test"
-        model = "model.strategy-test"
+def test_run_source_rejects_user_output_mixed_with_internal_calls() -> None:
+    source = json.dumps(
+        {
+            "calls": [
+                {"name": "agent.emit_message", "input": {"text": "Done."}},
+                {
+                    "name": "terminal.run",
+                    "input": {"cwd": "/tmp", "command": "pwd", "purpose": "inspect cwd"},
+                },
+                {
+                    "name": "memory.search",
+                    "input": {"query": "project phoenix", "limit": 3, "scope_key": None},
+                },
+            ]
+        }
+    )
 
-        def create_response(
-            self,
-            *,
-            input_items: list[dict[str, Any]],
-            tools: list[dict[str, Any]],
-            user_message: str,
-            history: list[dict[str, Any]],
-            context_bundle: dict[str, Any],
-        ) -> dict[str, Any]:
-            del input_items, tools, user_message, history, context_bundle
-            return {
-                "provider": self.provider,
-                "model": self.model,
-                "output": [
-                    {
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "type": "output_text",
-                                "text": json.dumps(
-                                    {"selected_capability_ids": "cap.memory.search"}
-                                ),
-                            }
-                        ],
-                    }
-                ],
+    effects = unpack_run_source(source)
+
+    assert effects.errors == ["agent_emit_message_must_not_share_run_with_internal_calls"]
+    assert effects.emitted_message == ""
+    assert effects.paused is False
+    assert effects.function_calls == []
+
+
+def test_run_source_rejects_user_output_mixed_with_emit_value() -> None:
+    effects = unpack_run_source(
+        json.dumps(
+            {
+                "calls": [
+                    {"name": "agent.emit_message", "input": {"text": "Done."}},
+                    {"name": "agent.emit_value", "input": {"value": {"answer": 42}}},
+                ]
             }
-
-    with pytest.raises(ModelAdapterError) as exc_info:
-        _call_tool_strategy(
-            model_adapter=StrategyAdapter(),  # type: ignore[arg-type]
-            user_message="Find the note.",
-            context_bundle={},
-            tool_surface_facts={},
-            eligible_capability_ids=["cap.memory.search"],
         )
+    )
 
-    assert exc_info.value.code == "E_AI_JUDGMENT_SCHEMA"
-    assert exc_info.value.validation_status == "invalid"
-
-
-def test_attachment_read_response_tool_contract_is_strict() -> None:
-    tool_name = response_tool_name_for_capability_id("cap.attachment.read")
-    tools_by_name = {tool["name"]: tool for tool in _production_response_tool_definitions()}
-
-    assert capability_id_for_response_tool_name(tool_name) == "cap.attachment.read"
-    assert tool_name in tools_by_name
-
-    tool = tools_by_name[tool_name]
-    assert tool["strict"] is True
-    assert tool["parameters"] == {
-        "type": "object",
-        "properties": {
-            "attachment_ref": {"type": "string", "maxLength": 256},
-            "intent": {
-                "type": "string",
-                "enum": ["summarize", "ocr", "transcribe", "extract_text", "answer"],
-            },
-        },
-        "required": ["attachment_ref", "intent"],
-        "additionalProperties": False,
-    }
+    assert effects.errors == ["agent_emit_message_must_not_share_run_with_emit_value"]
+    assert effects.emitted_message == ""
+    assert effects.emitted_values == []
 
 
-def test_memory_response_tools_are_exposed_to_the_model() -> None:
-    expected_capability_ids = {
-        "cap.memory.inspect",
-        "cap.memory.search",
-        "cap.memory.recall_diagnostics",
-        "cap.memory.propose",
-        "cap.memory.review",
-        "cap.memory.edit_candidate",
-        "cap.memory.merge_candidates",
-        "cap.memory.correct",
-        "cap.memory.retract",
-        "cap.memory.delete",
-        "cap.memory.privacy_delete",
-        "cap.memory.redact_evidence",
-        "cap.memory.set_never_remember",
-        "cap.memory.set_scope_mode",
-        "cap.memory.resolve_conflict",
-        "cap.memory.prioritize",
-        "cap.memory.deprioritize",
-        "cap.memory.mark_stale",
-        "cap.memory.consolidate",
-        "cap.memory.export",
-    }
-    tools_by_name = {tool["name"]: tool for tool in _production_response_tool_definitions()}
+def test_run_source_rejects_capability_ids_as_call_names() -> None:
+    effects = unpack_run_source(
+        json.dumps({"calls": [{"name": "cap.memory.search", "input": {"query": "x"}}]})
+    )
 
-    assert {
-        capability_id
-        for name in tools_by_name
-        if (capability_id := capability_id_for_response_tool_name(name)) is not None
-        and capability_id.startswith("cap.memory.")
-    } == expected_capability_ids
-    for capability_id in expected_capability_ids:
-        capability = get_capability(capability_id)
-        assert capability is not None
-        assert response_tool_name_for_capability_id(capability_id) in tools_by_name
-        assert capability.allowed_egress_destinations == ()
-
-    inspect_capability = get_capability("cap.memory.inspect")
-    search_capability = get_capability("cap.memory.search")
-    assert inspect_capability is not None
-    assert search_capability is not None
-    assert inspect_capability.policy_decision == "allow_inline"
-    assert search_capability.policy_decision == "allow_inline"
-    for capability_id in expected_capability_ids:
-        capability = get_capability(capability_id)
-        assert capability is not None
-        if capability.impact_level != "read":
-            assert capability.policy_decision == "requires_approval"
-
-
-def test_memory_import_response_tool_is_not_model_visible() -> None:
-    default_tool_names = {tool["name"] for tool in _production_response_tool_definitions()}
-    import_tool_name = response_tool_name_for_capability_id("cap.memory.import")
-
-    assert import_tool_name not in default_tool_names
-    import_capability = get_capability("cap.memory.import")
-    assert import_capability is not None
-    assert import_capability.policy_decision == "requires_approval"
-
-
-def test_missing_memory_surface_tools_have_explicit_contracts() -> None:
-    tools_by_name = {tool["name"]: tool for tool in _production_response_tool_definitions()}
-
-    inspect_tool = tools_by_name[response_tool_name_for_capability_id("cap.memory.inspect")]
-    inspect_capability = get_capability("cap.memory.inspect")
-    assert inspect_capability is not None
-    for section in inspect_tool["parameters"]["properties"]["section"]["enum"]:
-        assert inspect_capability.validate_input({"section": section, "limit": 1})[1] is None
-
-    recall_tool = tools_by_name[
-        response_tool_name_for_capability_id("cap.memory.recall_diagnostics")
+    assert effects.errors == [
+        "cap.memory.search: capability_ids_are_not_run_callables",
+        "run_source_no_effect",
     ]
-    assert recall_tool["parameters"]["properties"] == {
-        "query": {"type": "string", "minLength": 1, "maxLength": 1000},
-        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-        "scope_key": {"type": ["string", "null"], "minLength": 1, "maxLength": 200},
-    }
 
-    context_tool = response_tool_definitions(["cap.memory.context_blocks"])[0]
-    assert context_tool["parameters"]["properties"]["block_type"]["enum"] == [
-        "all",
-        "hot_index",
-        "topic",
-        "pinned_core",
-        "project_state",
-        "procedure",
-        "episodic",
-        "reasoning",
+
+def test_run_source_supports_emit_value_and_terminal_background_calls() -> None:
+    source = json.dumps(
+        {
+            "calls": [
+                {"name": "agent.emit_value", "input": {"value": {"answer": 42}}},
+                {
+                    "name": "terminal.run_background",
+                    "input": {"cwd": "/tmp", "command": "sleep 1", "purpose": "demo"},
+                },
+                {"name": "terminal.status", "input": {"command_id": "a" * 32}},
+                {
+                    "name": "terminal.read_output",
+                    "input": {
+                        "command_id": "a" * 32,
+                        "stream": "stdout",
+                        "offset": 0,
+                        "limit": 100,
+                    },
+                },
+            ]
+        }
+    )
+
+    effects = unpack_run_source(source)
+
+    assert effects.errors == []
+    assert effects.emitted_values == [{"answer": 42}]
+    assert [call["capability_id"] for call in effects.function_calls] == [
+        "cap.terminal.run_background",
+        "cap.terminal.status",
+        "cap.terminal.read_output",
     ]
-    assert context_tool["parameters"]["properties"]["limit"] == {
-        "type": "integer",
-        "minimum": 1,
-        "maximum": 100,
-    }
-    assert context_tool["parameters"]["properties"]["topic_id"] == {
-        "type": ["string", "null"],
-        "minLength": 1,
-        "maxLength": 32,
-    }
 
-    scope_mode_tool = tools_by_name[
-        response_tool_name_for_capability_id("cap.memory.set_scope_mode")
-    ]
-    assert scope_mode_tool["parameters"]["properties"] == {
-        "scope_type": {
-            "type": "string",
-            "enum": ["user", "project", "repo", "session", "thread", "proactive_case"],
-        },
-        "scope_key": {"type": "string", "minLength": 1, "maxLength": 200},
-        "memory_mode": {"type": "string", "enum": ["normal", "temporary", "no_memory"]},
-        "reason": {"type": ["string", "null"], "maxLength": 500},
-    }
 
-    import_tool = response_tool_definitions(["cap.memory.import"])[0]
-    candidate_schema = import_tool["parameters"]["properties"]["candidates"]["items"]
-    assert set(candidate_schema["properties"]) == {
-        "subject_key",
-        "predicate",
-        "assertion_type",
-        "value",
-        "evidence_text",
-        "confidence",
-        "scope_key",
-        "is_multi_valued",
-        "valid_from",
-        "valid_to",
-    }
+def test_run_source_rejects_malformed_emit_value() -> None:
+    effects = unpack_run_source(
+        json.dumps({"calls": [{"name": "agent.emit_value", "input": {"text": "nope"}}]})
+    )
 
-    eval_tool = response_tool_definitions(["cap.memory.eval"])[0]
-    assert set(eval_tool["parameters"]["properties"]["cases"]["items"]["properties"]) == {
-        "case_id",
-        "query",
-        "expected",
-        "expected_memory_ids",
-        "forbidden_memory_ids",
-        "expected_kinds",
-        "forbidden_texts",
-        "expect_policy_blocked",
-        "notes",
-    }
+    assert "agent_emit_value_schema_invalid" in effects.errors
 
-    retry_tool = response_tool_definitions(["cap.memory.retry_projection_job"])[0]
-    assert retry_tool["parameters"]["properties"] == {
-        "job_id": {"type": "string", "minLength": 1, "maxLength": 32}
-    }
+
+def test_run_source_enforces_source_and_call_budgets() -> None:
+    assert parse_run_function_call(
+        [{"name": "run", "arguments": json.dumps({"source": "x" * 20001})}]
+    ) == (None, "run_source_too_large")
+    effects = unpack_run_source(
+        json.dumps(
+            {
+                "calls": [
+                    {"name": "agent.emit_value", "input": {"value": index}} for index in range(21)
+                ]
+            }
+        )
+    )
+
+    assert effects.errors == ["run_source_too_many_calls"]
 
 
 def test_memory_runtime_handles_projection_read_surfaces(
@@ -1009,10 +774,9 @@ def test_process_response_function_calls_default_denies_without_turn_scope() -> 
         assistant_message="done",
         function_calls_raw=[
             {
-                "type": "function_call",
                 "call_id": "call_1",
-                "name": response_tool_name_for_capability_id("cap.discord.no_response"),
-                "arguments": json.dumps({"reason": "nothing useful to add"}),
+                "capability_id": "cap.legacy.no_response",
+                "input": {"reason": "nothing useful to add"},
                 "influenced_by_untrusted_content": False,
             }
         ],
@@ -1030,7 +794,7 @@ def test_process_response_function_calls_default_denies_without_turn_scope() -> 
     assert function_call_output["call_id"] == "call_1"
     assert json.loads(function_call_output["output"]) == {
         "status": "denied",
-        "capability_id": "cap.discord.no_response",
+        "capability_id": "cap.legacy.no_response",
         "error": "tool_not_in_turn_scope",
     }
     assert events == [
@@ -1039,8 +803,8 @@ def test_process_response_function_calls_default_denies_without_turn_scope() -> 
             {
                 "call_index": 1,
                 "call_id": "call_1",
-                "tool_name": "cap_discord_no_response",
-                "capability_id": "cap.discord.no_response",
+                "tool_name": "cap.legacy.no_response",
+                "capability_id": "cap.legacy.no_response",
                 "reason": "tool_not_in_turn_scope",
             },
         )
@@ -1077,10 +841,9 @@ def test_process_response_function_calls_denies_unscoped_tools() -> None:
         assistant_message="done",
         function_calls_raw=[
             {
-                "type": "function_call",
                 "call_id": "call_1",
-                "name": response_tool_name_for_capability_id("cap.discord.no_response"),
-                "arguments": json.dumps({"reason": "nothing useful to add"}),
+                "capability_id": "cap.legacy.no_response",
+                "input": {"reason": "nothing useful to add"},
             }
         ],
         approval_ttl_seconds=300,
@@ -1094,72 +857,9 @@ def test_process_response_function_calls_denies_unscoped_tools() -> None:
     assert result.action_attempts == []
     assert json.loads(result.function_call_outputs[0]["output"]) == {
         "status": "denied",
-        "capability_id": "cap.discord.no_response",
+        "capability_id": "cap.legacy.no_response",
         "error": "tool_not_in_turn_scope",
     }
-
-
-def test_process_response_function_calls_treats_discord_no_response_as_silent() -> None:
-    fixed_now = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
-    events: list[tuple[str, dict[str, Any]]] = []
-    id_counts: dict[str, int] = {}
-
-    class Db:
-        def add(self, record: Any) -> None:
-            return None
-
-        def flush(self) -> None:
-            return None
-
-        def get_bind(self) -> None:
-            return None
-
-    def new_id(prefix: str) -> str:
-        id_counts[prefix] = id_counts.get(prefix, 0) + 1
-        return f"{prefix}_{id_counts[prefix]}"
-
-    turn = TurnRecord(
-        id="trn_1",
-        session_id="ses_1",
-        user_message="quiet",
-        assistant_message=None,
-        status="in_progress",
-        created_at=fixed_now,
-        updated_at=fixed_now,
-    )
-
-    result = process_response_function_calls(
-        db=cast(Session, Db()),
-        session_id="ses_1",
-        turn=turn,
-        assistant_message="",
-        function_calls_raw=[
-            {
-                "type": "function_call",
-                "call_id": "call_1",
-                "name": response_tool_name_for_capability_id("cap.discord.no_response"),
-                "arguments": json.dumps({"reason": "nothing useful to add"}),
-                "influenced_by_untrusted_content": False,
-            }
-        ],
-        approval_ttl_seconds=300,
-        approval_actor_id="usr_1",
-        add_event=lambda event_type, payload: events.append((event_type, payload)),
-        now_fn=lambda: fixed_now,
-        new_id_fn=new_id,
-        runtime_provenance=RuntimeProvenance(status="clean"),
-        allowed_capability_ids=["cap.discord.no_response"],
-    )
-
-    assert result.silent_response is True
-    assert result.assistant_message == ""
-    assert json.loads(result.function_call_outputs[0]["output"]) == {
-        "status": "succeeded",
-        "capability_id": "cap.discord.no_response",
-        "output": {"reason": "nothing useful to add"},
-    }
-    assert result.action_attempts[0].capability_id == "cap.discord.no_response"
-    assert result.action_attempts[0].status == "succeeded"
 
 
 def test_process_response_function_calls_executes_attachment_read_runtime() -> None:
@@ -1232,10 +932,9 @@ def test_process_response_function_calls_executes_attachment_read_runtime() -> N
         assistant_message="",
         function_calls_raw=[
             {
-                "type": "function_call",
                 "call_id": "call_1",
-                "name": response_tool_name_for_capability_id("cap.attachment.read"),
-                "arguments": json.dumps({"attachment_ref": "discord:777", "intent": "summarize"}),
+                "capability_id": "cap.attachment.read",
+                "input": {"attachment_ref": "discord:777", "intent": "summarize"},
                 "influenced_by_untrusted_content": False,
             }
         ],
@@ -1362,10 +1061,9 @@ def test_tool_outputs_requiring_interpretation_are_routed_without_raw_tool_outpu
         assistant_message="",
         function_calls_raw=[
             {
-                "type": "function_call",
                 "call_id": "call_1",
-                "name": response_tool_name_for_capability_id("cap.attachment.read"),
-                "arguments": json.dumps({"attachment_ref": "discord:777", "intent": "summarize"}),
+                "capability_id": "cap.attachment.read",
+                "input": {"attachment_ref": "discord:777", "intent": "summarize"},
                 "influenced_by_untrusted_content": False,
             }
         ],

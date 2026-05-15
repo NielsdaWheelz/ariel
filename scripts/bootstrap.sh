@@ -6,6 +6,7 @@ ok()    { printf '\033[1;32m    ✓ %s\033[0m\n' "$1"; }
 fail()  { printf '\033[1;31m    ✗ %s\033[0m\n' "$1"; }
 
 errors=0
+uv_cmd=""
 
 # ── 1. Check prerequisites ─────────────────────────────────────────────
 info "Checking prerequisites"
@@ -15,6 +16,18 @@ if python3 -c "import sys; assert sys.version_info >= (3,12)" 2>/dev/null; then
   ok "python3 $(python3 --version 2>&1 | awk '{print $2}')"
 else
   fail "Python 3.12+ required. Install from https://www.python.org/downloads/"
+  errors=$((errors + 1))
+fi
+
+# UV
+if command -v uv >/dev/null 2>&1; then
+  uv_cmd=$(command -v uv)
+  ok "uv"
+elif [ -x "$HOME/.local/bin/uv" ]; then
+  uv_cmd="$HOME/.local/bin/uv"
+  ok "uv"
+else
+  fail "uv required. Install from https://docs.astral.sh/uv/getting-started/installation/"
   errors=$((errors + 1))
 fi
 
@@ -33,7 +46,7 @@ fi
 
 # ── 2. Create venv & install deps ──────────────────────────────────────
 info "Setting up Python environment"
-make setup
+PATH="$(dirname "$uv_cmd"):$PATH" make setup
 
 # ── 3. Create .env.local ───────────────────────────────────────────────
 info "Initializing environment config"
@@ -41,9 +54,9 @@ make env-init
 
 # ── 4. Check API key ───────────────────────────────────────────────────
 info "Checking API key"
-api_key=$(grep -E '^ARIEL_MODEL_API_KEY=' .env.local 2>/dev/null | cut -d= -f2-)
+api_key=$(grep -E '^ARIEL_OPENAI_API_KEY=' .env.local 2>/dev/null | cut -d= -f2-)
 if [ -z "$api_key" ] || [ "$api_key" = "your_real_key" ]; then
-  fail "ARIEL_MODEL_API_KEY is still the placeholder value."
+  fail "ARIEL_OPENAI_API_KEY is still the placeholder value."
   printf '\n  Edit \033[1m.env.local\033[0m and set your real API key, then re-run:\n'
   printf '    make bootstrap\n\n'
   exit 1

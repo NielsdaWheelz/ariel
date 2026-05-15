@@ -33,7 +33,9 @@ This directory is the canonical home for repository documentation.
 - [agent-tooling.md](agent-tooling.md): terminal-first agent tooling, skills,
   structured tools, security rails, and SOTA direction
 - [north-star-cutover.md](north-star-cutover.md): hard cutover spec for the
-  terminal-first, task-scoped-tool, Agency-centered product architecture
+  terminal-first, single-`run`, Agency-centered product architecture
+- [single-run-tool-cutover.md](single-run-tool-cutover.md): hard cutover from
+  selected model tools to one direct `run` tool with internal callable operations
 - [simplicity.md](simplicity.md): fewer code paths, no speculative surface
 - [function-parameters.md](function-parameters.md): parameter conventions
 - [control-flow.md](control-flow.md): exhaustive branching and race-safety

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 from alembic import command
 from alembic.config import Config
@@ -20,6 +20,7 @@ REQUIRED_TABLES: Final[tuple[str, ...]] = (
     "events",
     "ai_judgments",
     "action_attempts",
+    "terminal_commands",
     "action_private_payloads",
     "approval_requests",
     "artifacts",
@@ -182,6 +183,36 @@ REQUIRED_COLUMNS: Final[dict[str, tuple[str, ...]]] = {
         "payload_digest",
         "payload_enc",
         "encryption_key_version",
+    ),
+    "terminal_commands": (
+        "command_id",
+        "session_id",
+        "turn_id",
+        "action_attempt_id",
+        "kind",
+        "status",
+        "cwd",
+        "command",
+        "purpose",
+        "policy_decision",
+        "policy_reason",
+        "pid",
+        "process_group_id",
+        "process_start_token",
+        "terminal_dir",
+        "stdout_path",
+        "stderr_path",
+        "exit_path",
+        "stdout_bytes",
+        "stderr_bytes",
+        "output_limit_bytes",
+        "exit_code",
+        "started_at",
+        "completed_at",
+        "duration_ms",
+        "error",
+        "created_at",
+        "updated_at",
     ),
     "work_commitments": ("dedupe_digest",),
     "memory_evidence": (
@@ -362,6 +393,16 @@ REQUIRED_CONSTRAINTS: Final[dict[str, tuple[str, ...]]] = {
         "ck_action_private_payload_kind",
         "ck_action_private_payload_digest",
     ),
+    "terminal_commands": (
+        "ck_terminal_command_kind",
+        "ck_terminal_command_status",
+        "ck_terminal_command_policy_decision",
+        "ck_terminal_command_stdout_bytes_nonnegative",
+        "ck_terminal_command_stderr_bytes_nonnegative",
+        "ck_terminal_command_output_limit_bytes_positive",
+        "ck_terminal_command_duration_ms_nonnegative",
+        "ck_terminal_command_status_fields",
+    ),
     "work_commitments": (
         "ck_work_commitment_lifecycle_state",
         "ck_work_commitment_review_state",
@@ -516,7 +557,6 @@ REQUIRED_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
         "ck_ai_judgment_type": (
             "'memory_extraction'",
             "'workspace_commitment_extraction'",
-            "'tool_strategy'",
         ),
         "ck_ai_judgment_status": ("'succeeded'", "'failed'"),
         "ck_ai_judgment_parse_status": ("'schema_invalid'",),
@@ -793,6 +833,27 @@ REQUIRED_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
     },
 }
 
+FORBIDDEN_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
+    "ai_judgments": {
+        "ck_ai_judgment_type": ("'tool_strategy'",),
+    },
+}
+
+REQUIRED_FOREIGN_KEYS: Final[dict[str, dict[str, tuple[str, str]]]] = {
+    "action_attempts": {
+        "turn_id": ("turns", "RESTRICT"),
+    },
+    "terminal_commands": {
+        "session_id": ("sessions", "RESTRICT"),
+        "turn_id": ("turns", "RESTRICT"),
+        "action_attempt_id": ("action_attempts", "RESTRICT"),
+    },
+    "turn_idempotency_keys": {
+        "session_id": ("sessions", "RESTRICT"),
+        "turn_id": ("turns", "RESTRICT"),
+    },
+}
+
 REQUIRED_INDEXES: Final[dict[str, tuple[str, ...]]] = {
     "sessions": (
         "ix_single_active_session",
@@ -829,6 +890,7 @@ REQUIRED_INDEXES: Final[dict[str, tuple[str, ...]]] = {
         "ix_provider_write_receipts_provider_timestamp",
     ),
     "action_private_payloads": ("ix_action_private_payloads_action_attempt_id",),
+    "terminal_commands": ("ix_terminal_commands_session_command_unique",),
 }
 
 REQUIRED_UNIQUE_INDEXES: Final[dict[str, tuple[str, ...]]] = {
@@ -853,6 +915,7 @@ REQUIRED_UNIQUE_INDEXES: Final[dict[str, tuple[str, ...]]] = {
         "ix_provider_write_receipts_attempt_idempotency_unique",
     ),
     "action_private_payloads": ("ix_action_private_payloads_action_attempt_id",),
+    "terminal_commands": ("ix_terminal_commands_session_command_unique",),
 }
 
 REQUIRED_INDEX_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
@@ -951,6 +1014,9 @@ REQUIRED_INDEX_COLUMNS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
     "action_private_payloads": {
         "ix_action_private_payloads_action_attempt_id": ("action_attempt_id",),
     },
+    "terminal_commands": {
+        "ix_terminal_commands_session_command_unique": ("session_id", "command_id"),
+    },
 }
 
 
@@ -1021,6 +1087,39 @@ def missing_required_tables(engine: Engine) -> list[str]:
                 if fragment not in sql_text:
                     missing.append(f"missing_constraint_fragment:{table_name}.{constraint_name}")
                     break
+            for fragment in FORBIDDEN_CHECK_SQL_FRAGMENTS.get(table_name, {}).get(
+                constraint_name,
+                (),
+            ):
+                if fragment in sql_text:
+                    missing.append(f"forbidden_constraint_fragment:{table_name}.{constraint_name}")
+                    break
+
+    for table_name, foreign_keys in REQUIRED_FOREIGN_KEYS.items():
+        existing_foreign_keys: dict[str, dict[str, Any]] = {}
+        for reflected_foreign_key in inspector.get_foreign_keys(table_name):
+            constrained_columns = reflected_foreign_key.get("constrained_columns")
+            if not isinstance(constrained_columns, list) or len(constrained_columns) != 1:
+                continue
+            column_name = constrained_columns[0]
+            if isinstance(column_name, str):
+                existing_foreign_keys[column_name] = dict(reflected_foreign_key)
+        for column_name, expected in foreign_keys.items():
+            expected_table, expected_ondelete = expected
+            existing_foreign_key = existing_foreign_keys.get(column_name)
+            if existing_foreign_key is None:
+                missing.append(f"missing_foreign_key:{table_name}.{column_name}")
+                continue
+            if existing_foreign_key.get("referred_table") != expected_table:
+                missing.append(f"wrong_foreign_key_table:{table_name}.{column_name}")
+            options = existing_foreign_key.get("options")
+            actual_ondelete = (
+                str(options.get("ondelete")).upper()
+                if isinstance(options, dict) and options.get("ondelete") is not None
+                else ""
+            )
+            if actual_ondelete != expected_ondelete:
+                missing.append(f"wrong_foreign_key_ondelete:{table_name}.{column_name}")
 
     for table_name, index_names in REQUIRED_INDEXES.items():
         existing_indexes = {

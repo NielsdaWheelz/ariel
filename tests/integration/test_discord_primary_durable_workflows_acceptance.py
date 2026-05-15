@@ -4,7 +4,6 @@ import hashlib
 import hmac
 import json
 import time
-from collections.abc import Generator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
@@ -12,10 +11,9 @@ from typing import Any, cast
 from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import text
-from testcontainers.postgres import PostgresContainer
 
 from ariel.app import ModelAdapter, create_app
-from tests.integration.responses_helpers import responses_message
+from tests.integration.responses_helpers import responses_message, responses_run_message
 from ariel.config import AppSettings
 from ariel.persistence import JobRecord
 from ariel.worker import (
@@ -52,7 +50,7 @@ class DurableWorkflowAdapter:
                 input_tokens=8,
                 output_tokens=5,
             )
-        return responses_message(
+        return responses_run_message(
             assistant_text=f"assistant::{user_message}",
             provider=self.provider,
             model=self.model,
@@ -194,7 +192,7 @@ class ProactiveDecisionAdapter:
                 input_tokens=32,
                 output_tokens=24,
             )
-        return responses_message(
+        return responses_run_message(
             assistant_text=f"assistant::{user_message}",
             provider=self.provider,
             model=self.model,
@@ -216,13 +214,6 @@ class FrozenClock:
 
     def __call__(self) -> float:
         return float(self.timestamp)
-
-
-@pytest.fixture(scope="session")
-def postgres_url() -> Generator[str, None, None]:
-    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
-        url = postgres.get_connection_url()
-        yield url.replace("psycopg2", "psycopg")
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:

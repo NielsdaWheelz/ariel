@@ -1,20 +1,20 @@
 from __future__ import annotations
 
 import copy
-import json
-from collections.abc import Generator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from fastapi.testclient import TestClient
 import pytest
-from testcontainers.postgres import PostgresContainer
 
 from ariel.app import ModelAdapter, create_app
 from ariel.google_connector import GOOGLE_CONNECTOR_ID
 from ariel.persistence import GoogleConnectorRecord
-from tests.integration.responses_helpers import responses_with_function_calls
+from tests.integration.responses_helpers import (
+    process_queued_action_execution,
+    responses_with_run_calls,
+)
 
 
 GOOGLE_CALENDAR_READ_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
@@ -29,7 +29,7 @@ GOOGLE_GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 class ActionProposalAdapter:
     provider: str = "provider.s4-pr03"
     model: str = "model.s4-pr03-v1"
-    proposals_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    run_calls_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     assistant_text_by_message: dict[str, str] = field(default_factory=dict)
 
     def create_response(
@@ -42,40 +42,7 @@ class ActionProposalAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         del tools, history
-        if context_bundle.get("origin") == "tool_strategy":
-            strategy_input = json.loads(str(input_items[1]["content"]))
-            available_ids = {
-                capability_id
-                for family in strategy_input.get("available_capability_families", [])
-                if isinstance(family, dict)
-                for capability_id in family.get("capability_ids", [])
-                if isinstance(capability_id, str)
-            }
-            selected_capability_ids = [
-                proposal["capability_id"]
-                for proposal in self.proposals_by_message.get(user_message, [])
-                if proposal.get("capability_id") in available_ids
-            ]
-            return responses_with_function_calls(
-                input_items=input_items,
-                assistant_text=json.dumps(
-                    {
-                        "decision": "selected_tools" if selected_capability_ids else "no_tools",
-                        "selected_capability_ids": selected_capability_ids,
-                        "rationale": "test strategy",
-                        "unavailable_reason": None,
-                        "confidence": 1.0,
-                    },
-                    sort_keys=True,
-                ),
-                proposals=[],
-                provider=self.provider,
-                model=self.model,
-                provider_response_id="resp_s4_pr03_strategy",
-                input_tokens=3,
-                output_tokens=2,
-            )
-        proposals = copy.deepcopy(self.proposals_by_message.get(user_message, []))
+        run_calls = copy.deepcopy(self.run_calls_by_message.get(user_message, []))
         current_turn_ref = None
         for item in input_items:
             content = item.get("content")
@@ -84,8 +51,8 @@ class ActionProposalAdapter:
             for line in content.splitlines():
                 if line.startswith("- current user instruction: "):
                     current_turn_ref = line.removeprefix("- current user instruction: ").strip()
-        for proposal in proposals:
-            input_payload = proposal.get("input")
+        for run_call in run_calls:
+            input_payload = run_call.get("input")
             if (
                 current_turn_ref is not None
                 and isinstance(input_payload, dict)
@@ -96,10 +63,16 @@ class ActionProposalAdapter:
             user_message,
             f"assistant::{user_message}",
         )
-        return responses_with_function_calls(
-            input_items=input_items,
+        if any(
+            isinstance(item, dict) and item.get("type") == "function_call_output"
+            for item in input_items
+        ):
+            run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
+        if not run_calls:
+            run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
+        return responses_with_run_calls(
             assistant_text=assistant_text,
-            proposals=proposals,
+            calls=run_calls,
             provider=self.provider,
             model=self.model,
             provider_response_id="resp_s4_pr03_123",
@@ -403,13 +376,6 @@ class FakeGoogleWorkspaceProvider:
         }
 
 
-@pytest.fixture(scope="session")
-def postgres_url() -> Generator[str, None, None]:
-    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
-        url = postgres.get_connection_url()
-        yield url.replace("psycopg2", "psycopg")
-
-
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
     app = create_app(
         database_url=postgres_url,
@@ -484,10 +450,10 @@ def test_s4_pr03_blocking_auth_failures_remap_readiness_to_reconnect_required(
 ) -> None:
     del case_name
     adapter = ActionProposalAdapter(
-        proposals_by_message={
+        run_calls_by_message={
             "draft follow-up": [
                 {
-                    "capability_id": "cap.email.draft",
+                    "name": "email.draft",
                     "input": {
                         "to": ["ops@example.com"],
                         "subject": "status",
@@ -571,6 +537,7 @@ def test_s4_pr03_blocking_auth_failures_remap_readiness_to_reconnect_required(
             },
         )
         assert approved.status_code == 200
+        assert process_queued_action_execution(client, approved.json()) is True
 
         timeline = client.get(f"/v1/sessions/{session_id}/events")
         assert timeline.status_code == 200
@@ -589,8 +556,8 @@ def test_s4_pr03_transient_auth_failures_do_not_remap_connected_readiness(
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
-        proposals_by_message={
-            "search inbox": [{"capability_id": "cap.email.search", "input": {"query": "invoice"}}]
+        run_calls_by_message={
+            "search inbox": [{"name": "email.search", "input": {"query": "invoice"}}]
         }
     )
     oauth_client = FakeGoogleOAuthClient(
@@ -633,10 +600,10 @@ def test_s4_pr03_reconnect_required_persists_until_successful_reconnect(
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
-        proposals_by_message={
+        run_calls_by_message={
             "draft follow-up": [
                 {
-                    "capability_id": "cap.email.draft",
+                    "name": "email.draft",
                     "input": {
                         "to": ["ops@example.com"],
                         "subject": "status",
@@ -648,7 +615,7 @@ def test_s4_pr03_reconnect_required_persists_until_successful_reconnect(
             ],
             "show schedule": [
                 {
-                    "capability_id": "cap.calendar.list",
+                    "name": "calendar.list",
                     "input": {
                         "window_start": "2026-03-04T00:00:00Z",
                         "window_end": "2026-03-05T00:00:00Z",
@@ -709,6 +676,7 @@ def test_s4_pr03_reconnect_required_persists_until_successful_reconnect(
             },
         )
         assert first_approved.status_code == 200
+        assert process_queued_action_execution(client, first_approved.json()) is True
 
         timeline = client.get(f"/v1/sessions/{session_id}/events")
         assert timeline.status_code == 200
@@ -755,10 +723,10 @@ def test_s4_pr03_blocking_readiness_state_is_not_downgraded_by_later_transient_f
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
-        proposals_by_message={
+        run_calls_by_message={
             "draft follow-up": [
                 {
-                    "capability_id": "cap.email.draft",
+                    "name": "email.draft",
                     "input": {
                         "to": ["ops@example.com"],
                         "subject": "status",
@@ -770,7 +738,7 @@ def test_s4_pr03_blocking_readiness_state_is_not_downgraded_by_later_transient_f
             ],
             "show schedule": [
                 {
-                    "capability_id": "cap.calendar.list",
+                    "name": "calendar.list",
                     "input": {
                         "window_start": "2026-03-04T00:00:00Z",
                         "window_end": "2026-03-05T00:00:00Z",
@@ -822,6 +790,7 @@ def test_s4_pr03_blocking_readiness_state_is_not_downgraded_by_later_transient_f
             },
         )
         assert blocking_approved.status_code == 200
+        assert process_queued_action_execution(client, blocking_approved.json()) is True
 
         timeline = client.get(f"/v1/sessions/{session_id}/events")
         assert timeline.status_code == 200
@@ -854,10 +823,10 @@ def test_s4_pr03_attendee_reconnect_intent_requests_freebusy_and_closes_fallback
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
-        proposals_by_message={
+        run_calls_by_message={
             "plan team sync": [
                 {
-                    "capability_id": "cap.calendar.propose_slots",
+                    "name": "calendar.propose_slots",
                     "input": {
                         "window_start": "2026-03-04T00:00:00Z",
                         "window_end": "2026-03-05T00:00:00Z",

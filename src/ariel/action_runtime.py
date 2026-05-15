@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
+from pathlib import Path
 import secrets
 from typing import Any, Literal
 
@@ -21,7 +22,6 @@ from ariel.capability_registry import (
     DISCORD_CAPABILITY_IDS,
     MEMORY_CAPABILITY_IDS,
     canonical_action_payload,
-    capability_id_for_response_tool_name,
     capability_contract_hash,
     get_capability,
     payload_hash,
@@ -83,6 +83,7 @@ from ariel.persistence import (
     ProviderEvidenceBlockRecord,
     ProviderEvidenceRecord,
     ProviderWriteReceiptRecord,
+    TerminalCommandRecord,
     TurnRecord,
     WorkCommitmentRecord,
     to_rfc3339,
@@ -170,6 +171,7 @@ class ApprovalDecisionResult:
     approval: ApprovalRequestRecord
     action_attempt: ActionAttemptRecord
     assistant_message: str
+    execution_task_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -619,9 +621,10 @@ def _fail_action_execution(
     error: str,
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
+    output: dict[str, Any] | None = None,
 ) -> None:
     action_attempt.status = "failed"
-    action_attempt.execution_output = None
+    action_attempt.execution_output = output
     action_attempt.execution_error = error
     action_attempt.updated_at = now_fn()
     approval = db.scalar(
@@ -636,6 +639,7 @@ def _fail_action_execution(
         payload_data={
             "action_attempt_id": action_attempt.id,
             "error": error,
+            "output": output,
             "approval_ref": approval.id if approval is not None else None,
         },
         now_fn=now_fn,
@@ -1808,6 +1812,147 @@ def _persist_retrieval_artifacts(
             }
         )
     return assistant_sources
+
+
+def _parse_terminal_started_at(value: Any, *, fallback: datetime) -> datetime:
+    if not isinstance(value, str) or not value.strip():
+        return fallback
+    try:
+        return datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return fallback
+
+
+def _terminal_record_status(*, capability_id: str, output_payload: dict[str, Any]) -> str:
+    status = output_payload.get("status")
+    exit_code = output_payload.get("exit_code")
+    if status == "already_completed":
+        return "cancelled" if exit_code == 130 else "completed"
+    if status in {"running", "completed", "timeout", "cancelled", "denied", "unknown"}:
+        return str(status)
+    if capability_id == "cap.terminal.cancel" and exit_code == 130:
+        return "cancelled"
+    return "completed" if exit_code is not None else "unknown"
+
+
+def _upsert_terminal_command_record(
+    *,
+    db: Session,
+    session_id: str,
+    turn_id: str,
+    action_attempt: ActionAttemptRecord,
+    capability_id: str,
+    output_payload: dict[str, Any],
+    terminal_dir: str,
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> TerminalCommandRecord | None:
+    command_id = output_payload.get("command_id")
+    if not isinstance(command_id, str) or not command_id.strip():
+        return None
+
+    record = db.scalar(
+        select(TerminalCommandRecord)
+        .where(
+            TerminalCommandRecord.session_id == session_id,
+            TerminalCommandRecord.command_id == command_id,
+        )
+        .limit(1)
+    )
+    if record is None:
+        if capability_id not in {"cap.terminal.run", "cap.terminal.run_background"}:
+            return None
+        cwd = output_payload.get("cwd")
+        command = output_payload.get("command")
+        purpose = output_payload.get("purpose")
+        stdout_ref = output_payload.get("stdout_ref")
+        stderr_ref = output_payload.get("stderr_ref")
+        if (
+            not isinstance(cwd, str)
+            or not isinstance(command, str)
+            or not isinstance(purpose, str)
+            or not isinstance(stdout_ref, str)
+            or not isinstance(stderr_ref, str)
+        ):
+            return None
+        now = now_fn()
+        record = TerminalCommandRecord(
+            id=new_id_fn("tcmd"),
+            command_id=command_id,
+            session_id=session_id,
+            turn_id=turn_id,
+            action_attempt_id=action_attempt.id,
+            kind="foreground" if capability_id == "cap.terminal.run" else "background",
+            status="unknown",
+            cwd=cwd,
+            command=command,
+            purpose=purpose,
+            policy_decision=action_attempt.policy_decision,
+            policy_reason=action_attempt.policy_reason,
+            pid=None,
+            process_group_id=None,
+            process_start_token=None,
+            terminal_dir=terminal_dir,
+            stdout_path=stdout_ref,
+            stderr_path=stderr_ref,
+            exit_path=(
+                output_payload["exit_code_ref"]
+                if isinstance(output_payload.get("exit_code_ref"), str)
+                else None
+            ),
+            stdout_bytes=0,
+            stderr_bytes=0,
+            output_limit_bytes=(
+                output_payload["output_limit_bytes"]
+                if isinstance(output_payload.get("output_limit_bytes"), int)
+                and output_payload["output_limit_bytes"] > 0
+                else AppSettings().terminal_output_limit_bytes
+            ),
+            exit_code=None,
+            started_at=_parse_terminal_started_at(output_payload.get("started_at"), fallback=now),
+            completed_at=None,
+            duration_ms=None,
+            error=None,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(record)
+
+    status = _terminal_record_status(capability_id=capability_id, output_payload=output_payload)
+    record.status = status
+    if isinstance(output_payload.get("pid"), int):
+        record.pid = int(output_payload["pid"])
+    if isinstance(output_payload.get("process_group_id"), int):
+        record.process_group_id = int(output_payload["process_group_id"])
+    if isinstance(output_payload.get("process_start_token"), str):
+        record.process_start_token = output_payload["process_start_token"]
+    if isinstance(output_payload.get("stdout_ref"), str):
+        record.stdout_path = output_payload["stdout_ref"]
+    if isinstance(output_payload.get("stderr_ref"), str):
+        record.stderr_path = output_payload["stderr_ref"]
+    if isinstance(output_payload.get("exit_code_ref"), str):
+        record.exit_path = output_payload["exit_code_ref"]
+    if isinstance(output_payload.get("exit_code"), int):
+        record.exit_code = int(output_payload["exit_code"])
+    if isinstance(output_payload.get("duration_ms"), int):
+        record.duration_ms = int(output_payload["duration_ms"])
+    if isinstance(output_payload.get("stdout"), str):
+        record.stdout_bytes = len(output_payload["stdout"].encode("utf-8"))
+    if isinstance(output_payload.get("stderr"), str):
+        record.stderr_bytes = len(output_payload["stderr"].encode("utf-8"))
+    if (
+        isinstance(output_payload.get("output_limit_bytes"), int)
+        and output_payload["output_limit_bytes"] > 0
+    ):
+        record.output_limit_bytes = int(output_payload["output_limit_bytes"])
+    if status in {"completed", "failed", "timeout", "cancelled", "denied", "unknown"}:
+        if record.completed_at is None:
+            record.completed_at = now_fn()
+    if status in {"denied", "unknown"}:
+        record.error = status
+    record.updated_at = now_fn()
+    db.flush()
+    return record
 
 
 def _persist_google_provider_evidence(
@@ -3335,9 +3480,17 @@ def process_response_function_calls(
         function_call_payload = function_call_raw if isinstance(function_call_raw, dict) else {}
         call_id_raw = function_call_payload.get("call_id")
         call_id = call_id_raw.strip() if isinstance(call_id_raw, str) else ""
-        tool_name_raw = function_call_payload.get("name")
-        tool_name = tool_name_raw.strip() if isinstance(tool_name_raw, str) else ""
-        capability_id = capability_id_for_response_tool_name(tool_name) or "invalid.capability"
+        tool_name_raw = function_call_payload.get("tool_name")
+        capability_id_raw = function_call_payload.get("capability_id")
+        if isinstance(capability_id_raw, str):
+            capability_id = capability_id_raw.strip()
+        else:
+            capability_id = "invalid.capability"
+        tool_name = (
+            tool_name_raw.strip()
+            if isinstance(tool_name_raw, str) and tool_name_raw.strip()
+            else capability_id
+        )
         if capability_id not in allowed_capability_id_set:
             blocked_reasons.append(f"{capability_id}: tool_not_in_turn_scope")
             add_event(
@@ -3372,11 +3525,7 @@ def process_response_function_calls(
         if is_retrieval_call:
             retrieval_requested = True
             retrieval_capability_ids.add(capability_id)
-        raw_arguments = function_call_payload.get("arguments")
-        try:
-            decoded_arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else {}
-        except ValueError:
-            decoded_arguments = {}
+        decoded_arguments = function_call_payload.get("input")
         input_payload = (
             jsonable_encoder(decoded_arguments) if isinstance(decoded_arguments, dict) else {}
         )
@@ -3848,7 +3997,7 @@ def process_response_function_calls(
             )
             continue
 
-        if evaluation.capability.impact_level != "read":
+        if evaluation.capability.impact_level != "read" and capability_id != "cap.terminal.cancel":
             task = _enqueue_action_execution_task(
                 db=db,
                 action_attempt=action_attempt,
@@ -3980,6 +4129,7 @@ def process_response_function_calls(
                     {
                         "action_attempt_id": action_attempt.id,
                         "error": error_reason,
+                        "output": action_attempt.execution_output,
                     },
                 )
                 continue
@@ -4046,14 +4196,36 @@ def process_response_function_calls(
                     output=memory_output,
                     error=None,
                 )
+        elif capability_id.startswith("cap.terminal."):
+            normalized_for_execution = evaluation.normalized_input
+            normalized_for_execution = {
+                **evaluation.normalized_input,
+                "_action_attempt_id": action_attempt.id,
+                "_session_id": action_attempt.session_id,
+                "_terminal_dir": (settings or AppSettings()).terminal_dir,
+            }
+            if not execute_google_reads_outside_transaction or session_factory is None:
+                execution_result = ExecutionResult(
+                    status="failed",
+                    output=None,
+                    error="terminal_execution_requires_committed_turn",
+                )
+            else:
+                db.flush()
+                db.commit()
+                execution_result = execute_capability(
+                    capability=evaluation.capability,
+                    normalized_input=normalized_for_execution,
+                )
         else:
             _acquire_side_effect_execution_lock(
                 db=db,
                 impact_level=evaluation.capability.impact_level,
             )
+            normalized_for_execution = evaluation.normalized_input
             execution_result = execute_capability(
                 capability=evaluation.capability,
-                normalized_input=evaluation.normalized_input,
+                normalized_input=normalized_for_execution,
             )
         if execution_result.status == "succeeded" and execution_result.output is not None:
             if is_google_capability_call and isinstance(execution_result.output, dict):
@@ -4125,6 +4297,24 @@ def process_response_function_calls(
             action_attempt.execution_error = None
             action_attempt.status = "succeeded"
             action_attempt.updated_at = now_fn()
+            terminal_record = None
+            if capability_id in {
+                "cap.terminal.run",
+                "cap.terminal.run_background",
+                "cap.terminal.status",
+                "cap.terminal.cancel",
+            }:
+                terminal_record = _upsert_terminal_command_record(
+                    db=db,
+                    session_id=session_id,
+                    turn_id=turn.id,
+                    action_attempt=action_attempt,
+                    capability_id=capability_id,
+                    output_payload=execution_result.output,
+                    terminal_dir=str(Path((settings or AppSettings()).terminal_dir).expanduser()),
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
             _append_reason_codes(
                 interpreter_reason_codes_by_attempt_id,
                 action_attempt_id=action_attempt.id,
@@ -4198,10 +4388,23 @@ def process_response_function_calls(
                     "output": execution_result.output,
                 },
             )
+            if terminal_record is not None:
+                add_event(
+                    "evt.terminal.command.recorded",
+                    {
+                        "action_attempt_id": action_attempt.id,
+                        "terminal_command_record_id": terminal_record.id,
+                        "command_id": terminal_record.command_id,
+                        "status": terminal_record.status,
+                        "exit_code": terminal_record.exit_code,
+                    },
+                )
             continue
 
         action_attempt.execution_output = None
         action_attempt.execution_error = execution_result.error or "execution_output_missing"
+        if capability_id.startswith("cap.terminal.") and isinstance(execution_result.output, dict):
+            action_attempt.execution_output = execution_result.output
         action_attempt.status = "failed"
         action_attempt.updated_at = now_fn()
         blocked_reasons.append(
@@ -4225,6 +4428,7 @@ def process_response_function_calls(
             {
                 "action_attempt_id": action_attempt.id,
                 "error": action_attempt.execution_error,
+                "output": action_attempt.execution_output,
             },
         )
 
@@ -4611,6 +4815,49 @@ def resolve_approval_decision(
             retryable=False,
         )
 
+    revalidation_provenance_status: Literal["clean", "tainted"] = "clean"
+    revalidation_untrusted = False
+    if action_attempt.policy_reason == "taint_escalated_requires_approval":
+        revalidation_provenance_status = "tainted"
+        revalidation_untrusted = True
+
+    policy = evaluate_proposal(
+        capability_id=action_attempt.capability_id,
+        input_payload=full_input_payload,
+        pending_approval_exists=False,
+        influenced_by_untrusted_content=revalidation_untrusted,
+        provenance_status=revalidation_provenance_status,
+    )
+    if policy.decision != "requires_approval":
+        approval.status = "expired"
+        approval.decision_reason = f"policy_revalidation_{policy.decision}"
+        approval.decided_at = now
+        approval.updated_at = now
+        action_attempt.status = "failed"
+        action_attempt.execution_error = "approval policy revalidation failed"
+        action_attempt.policy_reason = policy.reason
+        action_attempt.updated_at = now
+        add_approval_event(
+            "evt.action.execution.failed",
+            {
+                "action_attempt_id": action_attempt.id,
+                "approval_ref": approval.id,
+                "error": "approval policy revalidation failed",
+            },
+        )
+        db.flush()
+        raise ActionRuntimeError(
+            status_code=409,
+            code="E_APPROVAL_POLICY_CHANGED",
+            message="approval policy changed before execution",
+            details={
+                "approval_ref": approval.id,
+                "policy_decision": policy.decision,
+                "policy_reason": policy.reason,
+            },
+            retryable=False,
+        )
+
     approval.status = "approved"
     approval.decision_reason = reason or "approved_by_actor"
     approval.decided_at = now
@@ -4627,6 +4874,7 @@ def resolve_approval_decision(
         },
     )
 
+    execution_task_id = None
     capability = get_capability(action_attempt.capability_id)
     if capability is None:
         action_attempt.status = "failed"
@@ -4705,6 +4953,7 @@ def resolve_approval_decision(
                             "task_id": task.id,
                         },
                     )
+                    execution_task_id = task.id
 
     db.flush()
     if action_attempt.status == "executing":
@@ -4719,6 +4968,7 @@ def resolve_approval_decision(
         approval=approval,
         action_attempt=action_attempt,
         assistant_message=assistant_message,
+        execution_task_id=execution_task_id if action_attempt.status == "executing" else None,
     )
 
 
@@ -4748,7 +4998,7 @@ def process_action_execution_task(
         ]
         | None
     ) = None
-    local_call: tuple[CapabilityDefinition, dict[str, Any]] | None = None
+    local_call: tuple[CapabilityDefinition, dict[str, Any], str, str] | None = None
     thread_watch_result: dict[str, Any] | None = None
     execution_result: ExecutionResult | GoogleCapabilityExecutionResult | None = None
     retryable_provider_error: str | None = None
@@ -5876,7 +6126,17 @@ def process_action_execution_task(
                 )
                 return True
             else:
-                local_call = (capability, normalized_input)
+                if action_attempt.impact_level != "read":
+                    _acquire_side_effect_execution_lock(
+                        db=db,
+                        impact_level=action_attempt.impact_level,
+                    )
+                local_call = (
+                    capability,
+                    normalized_input,
+                    action_attempt.id,
+                    action_attempt.session_id,
+                )
 
     if email_provider_call is not None:
         (
@@ -6013,7 +6273,14 @@ def process_action_execution_task(
                 )
                 execution_result = ExecutionResult(status="succeeded", output={}, error=None)
     elif local_call is not None:
-        capability, normalized_input = local_call
+        capability, normalized_input, action_attempt_id, session_id = local_call
+        if capability.capability_id.startswith("cap.terminal."):
+            normalized_input = {
+                **normalized_input,
+                "_action_attempt_id": action_attempt_id,
+                "_session_id": session_id,
+                "_terminal_dir": (settings or AppSettings()).terminal_dir,
+            }
         execution_result = execute_capability(
             capability=capability,
             normalized_input=normalized_input,
@@ -6389,6 +6656,26 @@ def process_action_execution_task(
                 action_attempt.execution_output = public_output
                 action_attempt.execution_error = None
                 action_attempt.updated_at = now_fn()
+                terminal_record = None
+                if action_attempt.capability_id in {
+                    "cap.terminal.run",
+                    "cap.terminal.run_background",
+                    "cap.terminal.status",
+                    "cap.terminal.cancel",
+                } and isinstance(public_output, dict):
+                    terminal_record = _upsert_terminal_command_record(
+                        db=db,
+                        session_id=action_attempt.session_id,
+                        turn_id=action_attempt.turn_id,
+                        action_attempt=action_attempt,
+                        capability_id=action_attempt.capability_id,
+                        output_payload=public_output,
+                        terminal_dir=str(
+                            Path((settings or AppSettings()).terminal_dir).expanduser()
+                        ),
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
                 if action_attempt.capability_id in _GOOGLE_RECEIPT_CAPABILITY_IDS and isinstance(
                     execution_result.output, dict
                 ):
@@ -6416,6 +6703,21 @@ def process_action_execution_task(
                     now_fn=now_fn,
                     new_id_fn=new_id_fn,
                 )
+                if terminal_record is not None:
+                    _append_action_execution_event(
+                        db=db,
+                        action_attempt=action_attempt,
+                        event_type="evt.terminal.command.recorded",
+                        payload_data={
+                            "action_attempt_id": action_attempt.id,
+                            "terminal_command_record_id": terminal_record.id,
+                            "command_id": terminal_record.command_id,
+                            "status": terminal_record.status,
+                            "exit_code": terminal_record.exit_code,
+                        },
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
                 _update_memory_action_traces(
                     db=db,
                     action_attempt=action_attempt,
@@ -6526,6 +6828,10 @@ def process_action_execution_task(
                     error=error,
                     now_fn=now_fn,
                     new_id_fn=new_id_fn,
+                    output=execution_result.output
+                    if action_attempt.capability_id.startswith("cap.terminal.")
+                    and isinstance(execution_result.output, dict)
+                    else None,
                 )
     if retryable_provider_error is not None:
         raise RuntimeError(retryable_provider_error)

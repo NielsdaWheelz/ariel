@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
-from collections.abc import Generator, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from itertools import count
@@ -11,7 +11,6 @@ from typing import Any, cast
 from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import func, select
-from testcontainers.postgres import PostgresContainer
 
 from ariel.action_runtime import process_action_execution_task
 from ariel.app import ModelAdapter, create_app
@@ -53,16 +52,10 @@ from ariel.persistence import (
     TurnRecord,
 )
 from ariel.proactivity import process_proactive_deliberation_due, upsert_proactive_observation
-from tests.integration.responses_helpers import responses_message
+from tests.integration.responses_helpers import responses_run_message
 
 
 _id_counter = count(1)
-
-
-@pytest.fixture(scope="session")
-def postgres_url() -> Generator[str, None, None]:
-    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
-        yield postgres.get_connection_url().replace("psycopg2", "psycopg")
 
 
 def _new_id(prefix: str) -> str:
@@ -141,26 +134,8 @@ class MemoryContextProbeAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         del input_items, tools, history
-        if context_bundle.get("origin") == "tool_strategy":
-            return responses_message(
-                assistant_text=json.dumps(
-                    {
-                        "decision": "no_tools",
-                        "selected_capability_ids": [],
-                        "rationale": "memory context test needs no tools",
-                        "unavailable_reason": None,
-                        "confidence": 1.0,
-                    },
-                    sort_keys=True,
-                ),
-                provider=self.provider,
-                model=self.model,
-                provider_response_id="resp_north_star_memory_strategy",
-                input_tokens=2,
-                output_tokens=2,
-            )
         self.context_bundles.append(copy.deepcopy(context_bundle))
-        return responses_message(
+        return responses_run_message(
             assistant_text=f"assistant::{user_message}",
             provider=self.provider,
             model=self.model,

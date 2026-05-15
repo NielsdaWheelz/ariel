@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from ipaddress import ip_address
@@ -12,6 +12,14 @@ from typing import Any, Literal, Protocol
 from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
 import httpx
+from .config import AppSettings
+from .terminal_runtime import (
+    execute_terminal_cancel,
+    execute_terminal_read_output,
+    execute_terminal_run,
+    execute_terminal_run_background,
+    execute_terminal_status,
+)
 from web_search_tool.brave import BraveSearchProvider
 from web_search_tool.types import (
     WebSearchError,
@@ -46,8 +54,15 @@ AGENCY_CAPABILITY_IDS = {
     "cap.agency.artifacts",
     "cap.agency.request_pr",
 }
-DISCORD_CAPABILITY_IDS = {"cap.discord.no_response"}
+DISCORD_CAPABILITY_IDS: set[str] = set()
 ATTACHMENT_CAPABILITY_IDS = {"cap.attachment.read"}
+TERMINAL_CAPABILITY_IDS = {
+    "cap.terminal.run",
+    "cap.terminal.run_background",
+    "cap.terminal.status",
+    "cap.terminal.read_output",
+    "cap.terminal.cancel",
+}
 MEMORY_CAPABILITY_IDS = {
     "cap.memory.inspect",
     "cap.memory.search",
@@ -77,28 +92,6 @@ MEMORY_CAPABILITY_IDS = {
     "cap.memory.import",
     "cap.memory.eval",
     "cap.memory.retry_projection_job",
-}
-_MODEL_VISIBLE_MEMORY_CAPABILITY_IDS = {
-    "cap.memory.inspect",
-    "cap.memory.search",
-    "cap.memory.recall_diagnostics",
-    "cap.memory.propose",
-    "cap.memory.review",
-    "cap.memory.edit_candidate",
-    "cap.memory.merge_candidates",
-    "cap.memory.correct",
-    "cap.memory.retract",
-    "cap.memory.delete",
-    "cap.memory.privacy_delete",
-    "cap.memory.redact_evidence",
-    "cap.memory.set_never_remember",
-    "cap.memory.set_scope_mode",
-    "cap.memory.resolve_conflict",
-    "cap.memory.prioritize",
-    "cap.memory.deprioritize",
-    "cap.memory.mark_stale",
-    "cap.memory.consolidate",
-    "cap.memory.export",
 }
 
 
@@ -140,10 +133,91 @@ def _validate_search_web_input(
     return _validate_exact_text_input(raw_input, field_name="query", max_length=1000)
 
 
-def _validate_discord_no_response_input(
+def _validate_terminal_run_input(
     raw_input: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
-    return _validate_exact_text_input(raw_input, field_name="reason", max_length=500)
+    if set(raw_input.keys()) != {"cwd", "command", "purpose"}:
+        return None, "schema_invalid"
+    cwd = raw_input.get("cwd")
+    command = raw_input.get("command")
+    purpose = raw_input.get("purpose")
+    if not isinstance(cwd, str) or not isinstance(command, str) or not isinstance(purpose, str):
+        return None, "schema_invalid"
+    normalized_cwd = cwd.strip()
+    normalized_command = command.strip()
+    normalized_purpose = purpose.strip()
+    if (
+        not normalized_cwd
+        or not normalized_command
+        or not normalized_purpose
+        or "\x00" in normalized_cwd
+        or "\x00" in normalized_command
+        or "\x00" in normalized_purpose
+        or len(normalized_cwd) > 4096
+        or len(normalized_command) > 8000
+        or len(normalized_purpose) > 1000
+    ):
+        return None, "schema_invalid"
+    if not os.path.isdir(normalized_cwd):
+        return None, "schema_invalid"
+    return {
+        "cwd": normalized_cwd,
+        "command": normalized_command,
+        "purpose": normalized_purpose,
+    }, None
+
+
+def _validate_terminal_command_id_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {"command_id"}:
+        return None, "schema_invalid"
+    command_id = raw_input.get("command_id")
+    if not isinstance(command_id, str):
+        return None, "schema_invalid"
+    normalized = command_id.strip()
+    command_id_parts = normalized.split(".")
+    if (
+        not normalized
+        or len(normalized) > 80
+        or not command_id_parts
+        or any(
+            not part or not all(ch.isalnum() or ch == "_" for ch in part)
+            for part in command_id_parts
+        )
+    ):
+        return None, "schema_invalid"
+    return {"command_id": normalized}, None
+
+
+def _validate_terminal_read_output_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {"command_id", "stream", "offset", "limit"}:
+        return None, "schema_invalid"
+    command_id = raw_input.get("command_id")
+    stream = raw_input.get("stream")
+    offset = raw_input.get("offset")
+    limit = raw_input.get("limit")
+    if not isinstance(command_id, str) or stream not in {"stdout", "stderr"}:
+        return None, "schema_invalid"
+    if not isinstance(offset, int) or not isinstance(limit, int):
+        return None, "schema_invalid"
+    normalized = command_id.strip()
+    command_id_parts = normalized.split(".")
+    if (
+        not normalized
+        or len(normalized) > 80
+        or not command_id_parts
+        or any(
+            not part or not all(ch.isalnum() or ch == "_" for ch in part)
+            for part in command_id_parts
+        )
+    ):
+        return None, "schema_invalid"
+    if offset < 0 or limit < 1 or limit > AppSettings().terminal_output_limit_bytes:
+        return None, "schema_invalid"
+    return {"command_id": normalized, "stream": stream, "offset": offset, "limit": limit}, None
 
 
 def _validate_attachment_read_input(
@@ -1755,10 +1829,6 @@ def _validate_agency_request_pr_input(
     }, None
 
 
-def _execute_discord_no_response(input_payload: dict[str, Any]) -> dict[str, Any]:
-    return {"reason": input_payload["reason"]}
-
-
 def _execute_memory_runtime(input_payload: dict[str, Any]) -> dict[str, Any]:
     del input_payload
     raise RuntimeError("memory_runtime_not_bound")
@@ -1766,10 +1836,7 @@ def _execute_memory_runtime(input_payload: dict[str, Any]) -> dict[str, Any]:
 
 def _search_brave_base_url() -> str:
     default_base_url = "https://api.search.brave.com/res/v1"
-    configured_base_url = os.getenv("ARIEL_SEARCH_BRAVE_BASE_URL")
-    if configured_base_url is None:
-        return default_base_url
-    normalized = configured_base_url.strip().rstrip("/")
+    normalized = AppSettings().search_brave_base_url.strip().rstrip("/")
     if not normalized:
         return default_base_url
     parsed = urlparse(normalized)
@@ -1785,27 +1852,11 @@ def _search_web_endpoint() -> str:
 
 
 def _search_web_timeout_seconds() -> float:
-    configured_timeout = os.getenv("ARIEL_SEARCH_WEB_TIMEOUT_SECONDS")
-    if configured_timeout is None:
-        return 8.0
-    normalized = configured_timeout.strip()
-    if not normalized:
-        return 8.0
-    try:
-        parsed = float(normalized)
-    except ValueError:
-        return 8.0
-    if parsed <= 0:
-        return 8.0
-    return parsed
+    return AppSettings().search_web_timeout_seconds
 
 
 def _search_web_api_key() -> str | None:
-    configured_api_key = os.getenv("ARIEL_SEARCH_WEB_API_KEY")
-    if configured_api_key is None:
-        return None
-    normalized = configured_api_key.strip()
-    return normalized or None
+    return AppSettings().search_web_api_key
 
 
 def _endpoint_host(endpoint: str) -> str | None:
@@ -1948,27 +1999,12 @@ def _search_news_endpoint() -> str:
 
 
 def _search_news_timeout_seconds() -> float:
-    configured_timeout = os.getenv("ARIEL_SEARCH_NEWS_TIMEOUT_SECONDS")
-    if configured_timeout is None:
-        return 8.0
-    normalized = configured_timeout.strip()
-    if not normalized:
-        return 8.0
-    try:
-        parsed = float(normalized)
-    except ValueError:
-        return 8.0
-    if parsed <= 0:
-        return 8.0
-    return parsed
+    return AppSettings().search_news_timeout_seconds
 
 
 def _search_news_api_key() -> str | None:
-    configured_api_key = os.getenv("ARIEL_SEARCH_NEWS_API_KEY")
-    if configured_api_key is None:
-        return _search_web_api_key()
-    normalized = configured_api_key.strip()
-    return normalized or _search_web_api_key()
+    settings = AppSettings()
+    return settings.search_news_api_key or settings.search_web_api_key
 
 
 def _execute_search_news(input_payload: dict[str, Any]) -> dict[str, Any]:
@@ -2038,7 +2074,7 @@ _WEB_EXTRACT_MAX_TOTAL_CHARS = 4000
 
 def _web_extract_provider_endpoint() -> str:
     default_endpoint = "https://api.search.brave.com/res/v1/web/extract"
-    configured_endpoint = os.getenv("ARIEL_WEB_EXTRACT_PROVIDER_ENDPOINT")
+    configured_endpoint = AppSettings().web_extract_provider_endpoint
     if configured_endpoint is None:
         return default_endpoint
     normalized = configured_endpoint.strip()
@@ -2053,43 +2089,16 @@ def _web_extract_provider_endpoint() -> str:
 
 
 def _web_extract_timeout_seconds() -> float:
-    configured_timeout = os.getenv("ARIEL_WEB_EXTRACT_TIMEOUT_SECONDS")
-    if configured_timeout is None:
-        return 10.0
-    normalized = configured_timeout.strip()
-    if not normalized:
-        return 10.0
-    try:
-        parsed = float(normalized)
-    except ValueError:
-        return 10.0
-    if parsed <= 0:
-        return 10.0
-    return parsed
+    return AppSettings().web_extract_timeout_seconds
 
 
 def _web_extract_max_retries() -> int:
-    configured_retries = os.getenv("ARIEL_WEB_EXTRACT_MAX_RETRIES")
-    if configured_retries is None:
-        return 2
-    normalized = configured_retries.strip()
-    if not normalized:
-        return 2
-    try:
-        parsed = int(normalized)
-    except ValueError:
-        return 2
-    if parsed < 0:
-        return 2
-    return min(parsed, 5)
+    return AppSettings().web_extract_max_retries
 
 
 def _web_extract_api_key() -> str | None:
-    configured_api_key = os.getenv("ARIEL_WEB_EXTRACT_API_KEY")
-    if configured_api_key is None:
-        return _search_web_api_key()
-    normalized = configured_api_key.strip()
-    return normalized or _search_web_api_key()
+    settings = AppSettings()
+    return settings.web_extract_api_key or settings.search_web_api_key
 
 
 def _is_unsafe_web_extract_host(host: str) -> bool:
@@ -2485,18 +2494,15 @@ def _web_extract_allowed_destinations() -> tuple[str, ...]:
 
 
 def _maps_provider_endpoint() -> str:
-    default_endpoint = "https://maps.googleapis.com/maps/api"
-    configured_endpoint = os.getenv("ARIEL_MAPS_PROVIDER_ENDPOINT")
+    configured_endpoint = AppSettings().maps_provider_endpoint
     if configured_endpoint is None:
-        return default_endpoint
+        raise RuntimeError("provider_endpoint_missing")
     normalized = configured_endpoint.strip()
-    if not normalized:
-        return default_endpoint
     parsed = urlparse(normalized)
     if parsed.scheme:
         return normalized
     if "://" in normalized:
-        return default_endpoint
+        raise RuntimeError("provider_endpoint_invalid")
     return f"https://{normalized.lstrip('/')}"
 
 
@@ -2509,56 +2515,28 @@ def _maps_search_places_endpoint() -> str:
 
 
 def _maps_provider_timeout_seconds() -> float:
-    configured_timeout = os.getenv("ARIEL_MAPS_PROVIDER_TIMEOUT_SECONDS")
-    if configured_timeout is None:
-        return 8.0
-    normalized = configured_timeout.strip()
-    if not normalized:
-        return 8.0
-    try:
-        parsed = float(normalized)
-    except ValueError:
-        return 8.0
-    if parsed <= 0:
-        return 8.0
-    return parsed
+    return AppSettings().maps_provider_timeout_seconds
 
 
 def _maps_provider_api_key_encrypted() -> str | None:
-    configured = os.getenv("ARIEL_MAPS_PROVIDER_API_KEY_ENC")
-    if configured is None:
-        return None
-    normalized = configured.strip()
-    return normalized or None
+    return AppSettings().maps_provider_api_key_enc
 
 
 def _maps_connector_encryption_secret() -> str:
-    configured = os.getenv("ARIEL_CONNECTOR_ENCRYPTION_SECRET")
-    if configured is None:
-        return "dev-local-connector-secret"
-    normalized = configured.strip()
-    return normalized or "dev-local-connector-secret"
+    return AppSettings().connector_encryption_secret
 
 
 def _maps_connector_encryption_key_version() -> str:
-    configured = os.getenv("ARIEL_CONNECTOR_ENCRYPTION_KEY_VERSION")
-    if configured is None:
-        return "v1"
-    normalized = configured.strip()
-    return normalized or "v1"
+    return AppSettings().connector_encryption_key_version
 
 
 def _maps_connector_encryption_keys() -> str | None:
-    configured = os.getenv("ARIEL_CONNECTOR_ENCRYPTION_KEYS")
-    if configured is None:
-        return None
-    normalized = configured.strip()
-    return normalized or None
+    return AppSettings().connector_encryption_keys
 
 
 def _maps_provider_api_key() -> str:
     # Import lazily to avoid pulling connector runtime dependencies into registry import-time.
-    from ariel.google_connector import ConnectorTokenCipher
+    from .google_connector import ConnectorTokenCipher
 
     encrypted_api_key = _maps_provider_api_key_encrypted()
     if encrypted_api_key is None:
@@ -2925,12 +2903,14 @@ def _declare_maps_search_places_egress_intent(
 
 
 def _maps_allowed_destinations() -> tuple[str, ...]:
-    directions_host = _endpoint_host(_maps_directions_endpoint())
-    places_host = _endpoint_host(_maps_search_places_endpoint())
+    try:
+        endpoint = _maps_provider_endpoint()
+    except RuntimeError:
+        return ()
+    directions_host = _endpoint_host(f"{endpoint.rstrip('/')}/directions")
+    places_host = _endpoint_host(f"{endpoint.rstrip('/')}/search_places")
     hosts = {host for host in (directions_host, places_host) if host is not None}
-    if hosts:
-        return tuple(sorted(hosts))
-    return ("maps.googleapis.com",)
+    return tuple(sorted(hosts))
 
 
 def _declare_google_calendar_list_egress_intent(
@@ -3251,21 +3231,12 @@ class _WeatherProviderAdapter(Protocol):
 
 
 def _weather_provider_mode() -> str:
-    configured_mode = os.getenv("ARIEL_WEATHER_PROVIDER_MODE")
-    if configured_mode is None:
-        return "production"
-    normalized = configured_mode.strip().lower()
-    if normalized in {"dev", "dev_fallback", "fallback"}:
-        return "dev_fallback"
-    return "production"
+    return AppSettings().weather_provider_mode
 
 
 def _weather_production_endpoint() -> str:
     default_endpoint = "https://api.tomorrow.io/v4/weather/forecast"
-    configured = os.getenv("ARIEL_WEATHER_PRODUCTION_ENDPOINT")
-    if configured is None:
-        return default_endpoint
-    normalized = configured.strip()
+    normalized = AppSettings().weather_production_endpoint.strip()
     if not normalized:
         return default_endpoint
     parsed = urlparse(normalized)
@@ -3278,10 +3249,7 @@ def _weather_production_endpoint() -> str:
 
 def _weather_dev_fallback_endpoint() -> str:
     default_endpoint = "https://wttr.in"
-    configured = os.getenv("ARIEL_WEATHER_DEV_ENDPOINT")
-    if configured is None:
-        return default_endpoint
-    normalized = configured.strip()
+    normalized = AppSettings().weather_dev_endpoint.strip()
     if not normalized:
         return default_endpoint
     parsed = urlparse(normalized)
@@ -3292,40 +3260,20 @@ def _weather_dev_fallback_endpoint() -> str:
     return f"https://{normalized.lstrip('/')}"
 
 
-def _weather_timeout_seconds(*, env_key: str, default: float) -> float:
-    configured_timeout = os.getenv(env_key)
-    if configured_timeout is None:
-        return default
-    normalized = configured_timeout.strip()
-    if not normalized:
-        return default
-    try:
-        parsed = float(normalized)
-    except ValueError:
-        return default
-    if parsed <= 0:
-        return default
-    return parsed
-
-
 def _weather_production_timeout_seconds() -> float:
-    return _weather_timeout_seconds(env_key="ARIEL_WEATHER_PRODUCTION_TIMEOUT_SECONDS", default=8.0)
+    return AppSettings().weather_production_timeout_seconds
 
 
 def _weather_dev_timeout_seconds() -> float:
-    return _weather_timeout_seconds(env_key="ARIEL_WEATHER_DEV_TIMEOUT_SECONDS", default=8.0)
+    return AppSettings().weather_dev_timeout_seconds
 
 
 def _weather_production_api_key() -> str | None:
-    configured_api_key = os.getenv("ARIEL_WEATHER_PRODUCTION_API_KEY")
-    if configured_api_key is None:
-        return None
-    normalized = configured_api_key.strip()
-    return normalized or None
+    return AppSettings().weather_production_api_key
 
 
 def _weather_timesteps_for_timeframe(timeframe: str) -> str:
-    if timeframe == "tomorrow":
+    if timeframe in {"today", "tomorrow"}:
         return "1d"
     return "1h"
 
@@ -3418,35 +3366,60 @@ class _TomorrowIoWeatherAdapter:
             raise RuntimeError("weather provider returned invalid payload")
 
         timelines = payload.get("timelines")
-        hourly_first: dict[str, Any] | None = None
+        intervals: list[dict[str, Any]] = []
         if isinstance(timelines, dict):
-            hourly_payload = timelines.get("hourly")
-            if (
-                isinstance(hourly_payload, list)
-                and hourly_payload
-                and isinstance(hourly_payload[0], dict)
-            ):
-                hourly_first = hourly_payload[0]
-        values = hourly_first.get("values") if isinstance(hourly_first, dict) else None
-        if not isinstance(values, dict):
-            values = {}
+            if timeframe in {"today", "tomorrow"}:
+                daily_payload = timelines.get("daily")
+                daily_index = 1 if timeframe == "tomorrow" else 0
+                if isinstance(daily_payload, list) and len(daily_payload) > daily_index:
+                    daily_item = daily_payload[daily_index]
+                    if isinstance(daily_item, dict):
+                        intervals.append(daily_item)
+            else:
+                hourly_payload = timelines.get("hourly")
+                limit = 24 if timeframe == "next_24h" else 1
+                if isinstance(hourly_payload, list):
+                    intervals.extend(
+                        item for item in hourly_payload[:limit] if isinstance(item, dict)
+                    )
+        value_sets: list[dict[str, Any]] = []
+        for item in intervals:
+            values = item.get("values")
+            if isinstance(values, dict):
+                value_sets.append(values)
+        first_values = value_sets[0] if value_sets else {}
 
         summary_parts: list[str] = []
-        temperature = values.get("temperature")
-        if isinstance(temperature, (int, float)):
-            summary_parts.append(f"temperature {temperature}C")
-        weather_code = values.get("weatherCode")
+        temperatures: list[float] = []
+        temperature_mins: list[float] = []
+        temperature_maxes: list[float] = []
+        wind_speeds: list[float] = []
+        for values in value_sets:
+            temperature = values.get("temperature")
+            if isinstance(temperature, (int, float)):
+                temperatures.append(float(temperature))
+            temperature_min = values.get("temperatureMin")
+            if isinstance(temperature_min, (int, float)):
+                temperature_mins.append(float(temperature_min))
+            temperature_max = values.get("temperatureMax")
+            if isinstance(temperature_max, (int, float)):
+                temperature_maxes.append(float(temperature_max))
+            wind_speed = values.get("windSpeed")
+            if isinstance(wind_speed, (int, float)):
+                wind_speeds.append(float(wind_speed))
+        if len(temperatures) > 1:
+            summary_parts.append(f"temperature {min(temperatures)}-{max(temperatures)}C")
+        elif temperatures:
+            summary_parts.append(f"temperature {temperatures[0]}C")
+        elif temperature_mins and temperature_maxes:
+            summary_parts.append(f"temperature {min(temperature_mins)}-{max(temperature_maxes)}C")
+        weather_code = first_values.get("weatherCode")
         if isinstance(weather_code, (int, float, str)):
             summary_parts.append(f"code {weather_code}")
-        wind_speed = values.get("windSpeed")
-        if isinstance(wind_speed, (int, float)):
-            summary_parts.append(f"wind {wind_speed} m/s")
+        if wind_speeds:
+            summary_parts.append(f"wind {max(wind_speeds)} m/s")
         summary = ", ".join(summary_parts) or "forecast data available"
-        forecast_timestamp = (
-            hourly_first.get("time")
-            if isinstance(hourly_first, dict)
-            else payload.get("updatedTime")
-        )
+        forecast_timestamp = intervals[0].get("time") if intervals else payload.get("updatedTime")
         return _build_weather_output(
             provider_id=self.provider_id,
             source=self.endpoint,
@@ -3637,6 +3610,76 @@ def _execute_attachment_runtime(_: dict[str, Any]) -> dict[str, Any]:
 
 
 _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
+    "cap.terminal.run": CapabilityDefinition(
+        capability_id="cap.terminal.run",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "terminal_run_v1",
+            "output_schema": "terminal_run_result_v1",
+            "idempotency": "command_observation",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_terminal_run_input,
+        execute=execute_terminal_run,
+    ),
+    "cap.terminal.run_background": CapabilityDefinition(
+        capability_id="cap.terminal.run_background",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "terminal_run_v1",
+            "output_schema": "terminal_background_result_v1",
+            "idempotency": "command_observation",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_terminal_run_input,
+        execute=execute_terminal_run_background,
+    ),
+    "cap.terminal.status": CapabilityDefinition(
+        capability_id="cap.terminal.status",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "terminal_command_id_v1",
+            "output_schema": "terminal_status_v1",
+            "idempotency": "deterministic_read",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_terminal_command_id_input,
+        execute=execute_terminal_status,
+    ),
+    "cap.terminal.read_output": CapabilityDefinition(
+        capability_id="cap.terminal.read_output",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "terminal_read_output_v1",
+            "output_schema": "terminal_output_chunk_v1",
+            "idempotency": "deterministic_read",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_terminal_read_output_input,
+        execute=execute_terminal_read_output,
+    ),
+    "cap.terminal.cancel": CapabilityDefinition(
+        capability_id="cap.terminal.cancel",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "terminal_command_id_v1",
+            "output_schema": "terminal_cancel_result_v1",
+            "idempotency": "idempotent_command_control",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_terminal_command_id_input,
+        execute=execute_terminal_cancel,
+    ),
     "cap.calendar.list": CapabilityDefinition(
         capability_id="cap.calendar.list",
         version="2.0",
@@ -3747,7 +3790,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
             "credentials_mode": "server_managed_encrypted",
             "location_inference": "explicit_only",
         },
-        allowed_egress_destinations=_maps_allowed_destinations(),
+        allowed_egress_destinations=("maps.googleapis.com",),
         validate_input=_validate_maps_directions_input,
         execute=_execute_maps_directions,
         declare_egress_intent=_declare_maps_directions_egress_intent,
@@ -3764,7 +3807,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
             "credentials_mode": "server_managed_encrypted",
             "location_inference": "explicit_only",
         },
-        allowed_egress_destinations=_maps_allowed_destinations(),
+        allowed_egress_destinations=("maps.googleapis.com",),
         validate_input=_validate_maps_search_places_input,
         execute=_execute_maps_search_places,
         declare_egress_intent=_declare_maps_search_places_egress_intent,
@@ -4004,7 +4047,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
             "bounded_output": "structured_blocks_with_partial_disclosure",
             "safety_preflight": "strict_fail_closed",
         },
-        allowed_egress_destinations=_web_extract_allowed_destinations(),
+        allowed_egress_destinations=("api.search.brave.com",),
         validate_input=_validate_web_extract_input,
         execute=_execute_web_extract,
         declare_egress_intent=_declare_web_extract_egress_intent,
@@ -4019,7 +4062,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
             "output_schema": "search_results_v1",
             "idempotency": "deterministic_read",
         },
-        allowed_egress_destinations=_search_web_allowed_destinations(),
+        allowed_egress_destinations=("api.search.brave.com",),
         validate_input=_validate_search_web_input,
         execute=_execute_search_web,
         declare_egress_intent=_declare_search_web_egress_intent,
@@ -4034,7 +4077,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
             "output_schema": "search_results_v1",
             "idempotency": "deterministic_read",
         },
-        allowed_egress_destinations=_search_news_allowed_destinations(),
+        allowed_egress_destinations=("api.search.brave.com",),
         validate_input=_validate_search_news_input,
         execute=_execute_search_news,
         declare_egress_intent=_declare_search_news_egress_intent,
@@ -4053,7 +4096,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
                 "fallback": "dev_fallback",
             },
         },
-        allowed_egress_destinations=_weather_allowed_destinations(),
+        allowed_egress_destinations=("api.tomorrow.io",),
         validate_input=_validate_weather_forecast_input,
         execute=_execute_weather_forecast,
         declare_egress_intent=_declare_weather_forecast_egress_intent,
@@ -4560,20 +4603,6 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         validate_input=_validate_memory_retry_projection_job_input,
         execute=_execute_memory_runtime,
     ),
-    "cap.discord.no_response": CapabilityDefinition(
-        capability_id="cap.discord.no_response",
-        version="1.0",
-        impact_level="read",
-        policy_decision="allow_inline",
-        contract_metadata={
-            "input_schema": "discord_no_response_v1",
-            "output_schema": "discord_no_response_receipt_v1",
-            "idempotency": "deterministic_read",
-        },
-        allowed_egress_destinations=(),
-        validate_input=_validate_discord_no_response_input,
-        execute=_execute_discord_no_response,
-    ),
 }
 
 
@@ -4593,540 +4622,6 @@ def get_capability(capability_id: str) -> CapabilityDefinition | None:
         return replace(capability, allowed_egress_destinations=_web_extract_allowed_destinations())
     return capability
 
-
-def _object_schema(properties: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "type": "object",
-        "properties": properties,
-        "required": list(properties.keys()),
-        "additionalProperties": False,
-    }
-
-
-_NULLABLE_STRING = {"type": ["string", "null"]}
-_STRING_LIST = {
-    "type": "array",
-    "items": {"type": "string"},
-    "maxItems": 20,
-}
-_EMAIL_RECIPIENT_LIST = {
-    "type": "array",
-    "items": {"type": "string", "minLength": 1, "maxLength": 320},
-    "maxItems": 20,
-}
-_EMAIL_MESSAGE_ID_LIST = {
-    "type": "array",
-    "items": {"type": "string", "minLength": 1, "maxLength": 256},
-    "minItems": 1,
-    "maxItems": 1000,
-}
-_EMAIL_LABEL_LIST = {
-    "type": "array",
-    "items": {"type": "string", "minLength": 1, "maxLength": 225},
-    "maxItems": 100,
-}
-_IDEMPOTENCY_KEY_SCHEMA = {"type": "string", "minLength": 1, "maxLength": 128}
-_MEMORY_ASSERTION_ID_SCHEMA = {"type": "string", "minLength": 1, "maxLength": 32}
-_MEMORY_EVIDENCE_ID_SCHEMA = {"type": "string", "minLength": 1, "maxLength": 32}
-_MEMORY_LIMIT_SCHEMA = {"type": "integer", "minimum": 1, "maximum": 100}
-_MEMORY_CANDIDATE_SCHEMA = _object_schema(
-    {
-        "subject_key": {"type": "string", "minLength": 1, "maxLength": 200},
-        "predicate": {"type": "string", "minLength": 1, "maxLength": 200},
-        "assertion_type": {
-            "type": "string",
-            "enum": [
-                "fact",
-                "profile",
-                "preference",
-                "commitment",
-                "decision",
-                "project_state",
-                "procedure",
-                "domain_concept",
-            ],
-        },
-        "value": {"type": "string", "minLength": 1, "maxLength": 700},
-        "evidence_text": {"type": "string", "minLength": 1, "maxLength": 12000},
-        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-        "scope_key": {"type": "string", "minLength": 1, "maxLength": 200},
-        "is_multi_valued": {"type": "boolean"},
-        "valid_from": _NULLABLE_STRING,
-        "valid_to": _NULLABLE_STRING,
-    }
-)
-_MEMORY_STRING_ID_LIST_SCHEMA = {
-    "type": "array",
-    "items": {"type": "string", "minLength": 1, "maxLength": 64},
-    "maxItems": 100,
-}
-_MEMORY_ASSERTION_ID_MERGE_LIST_SCHEMA = {
-    "type": "array",
-    "items": _MEMORY_ASSERTION_ID_SCHEMA,
-    "minItems": 2,
-    "maxItems": 20,
-}
-_MEMORY_EVAL_CASE_SCHEMA = _object_schema(
-    {
-        "case_id": {"type": ["string", "null"], "maxLength": 100},
-        "query": {"type": "string", "minLength": 1, "maxLength": 1000},
-        "expected": {"type": ["string", "null"], "maxLength": 2000},
-        "expected_memory_ids": _MEMORY_STRING_ID_LIST_SCHEMA,
-        "forbidden_memory_ids": _MEMORY_STRING_ID_LIST_SCHEMA,
-        "expected_kinds": {
-            "type": "array",
-            "items": {"type": "string", "minLength": 1, "maxLength": 64},
-            "maxItems": 20,
-        },
-        "forbidden_texts": {
-            "type": "array",
-            "items": {"type": "string", "minLength": 1, "maxLength": 500},
-            "maxItems": 50,
-        },
-        "expect_policy_blocked": {"type": "boolean"},
-        "notes": {"type": ["string", "null"], "maxLength": 2000},
-    }
-)
-
-_RESPONSE_TOOL_INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
-    "calendar_window_v1": _object_schema(
-        {
-            "window_start": {"type": "string", "description": "RFC3339 start timestamp."},
-            "window_end": {"type": "string", "description": "RFC3339 end timestamp."},
-        }
-    ),
-    "calendar_slot_planning_v1": _object_schema(
-        {
-            "window_start": {"type": "string"},
-            "window_end": {"type": "string"},
-            "duration_minutes": {"type": "integer", "minimum": 5, "maximum": 480},
-            "attendees": _STRING_LIST,
-            "timezone": {"type": "string", "minLength": 1, "maxLength": 64},
-            "source_evidence_ids": _STRING_LIST,
-            "quoted_content_caveat": {"type": "boolean"},
-            "participants": _STRING_LIST,
-            "proposed_windows": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {"start": {"type": "string"}, "end": {"type": "string"}},
-                    "required": ["start", "end"],
-                    "additionalProperties": False,
-                },
-                "maxItems": 20,
-            },
-            "timezone_evidence": _object_schema(
-                {
-                    "source": _NULLABLE_STRING,
-                    "rationale": _NULLABLE_STRING,
-                    "confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
-                }
-            ),
-            "constraints": _object_schema(
-                {
-                    "hard": _STRING_LIST,
-                    "soft": _STRING_LIST,
-                    "attendee_notes": _STRING_LIST,
-                }
-            ),
-        }
-    ),
-    "email_search_v1": _object_schema(
-        {"query": {"type": "string", "minLength": 1, "maxLength": 1000}}
-    ),
-    "email_read_v1": {
-        "type": "object",
-        "properties": {
-            "message_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 256},
-            "thread_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 256},
-            "mode": {"type": "string", "enum": ["message", "thread", "thread_context"]},
-        },
-        "required": ["message_id", "thread_id", "mode"],
-        "additionalProperties": False,
-    },
-    "drive_search_query_v1": _object_schema({"query": {"type": "string", "maxLength": 1000}}),
-    "drive_read_v1": _object_schema({"file_id": {"type": "string", "maxLength": 256}}),
-    "maps_directions_query_v1": _object_schema(
-        {
-            "origin": _NULLABLE_STRING,
-            "destination": _NULLABLE_STRING,
-            "travel_mode": {
-                "type": "string",
-                "enum": ["driving", "walking", "bicycling", "transit"],
-            },
-        }
-    ),
-    "maps_search_places_query_v1": _object_schema(
-        {
-            "query": {"type": "string", "maxLength": 200},
-            "location_context": _NULLABLE_STRING,
-            "radius_meters": {"type": "integer", "minimum": 100, "maximum": 50000},
-        }
-    ),
-    "calendar_create_event_v1": _object_schema(
-        {
-            "calendar_id": _NULLABLE_STRING,
-            "title": {"type": "string", "maxLength": 200},
-            "start_time": {"type": "string"},
-            "end_time": {"type": "string"},
-            "description": _NULLABLE_STRING,
-            "location": _NULLABLE_STRING,
-            "attendees": _STRING_LIST,
-            "idempotency_key": _IDEMPOTENCY_KEY_SCHEMA,
-            "source_evidence_id": _NULLABLE_STRING,
-            "commitment_id": _NULLABLE_STRING,
-            "user_instruction_ref": _NULLABLE_STRING,
-        }
-    ),
-    "calendar_update_event_v1": _object_schema(
-        {
-            "calendar_id": _NULLABLE_STRING,
-            "event_id": {"type": "string", "minLength": 1, "maxLength": 512},
-            "title": _NULLABLE_STRING,
-            "start_time": _NULLABLE_STRING,
-            "end_time": _NULLABLE_STRING,
-            "description": _NULLABLE_STRING,
-            "location": _NULLABLE_STRING,
-            "attendees": {"type": ["array", "null"], "items": {"type": "string"}},
-            "idempotency_key": _IDEMPOTENCY_KEY_SCHEMA,
-            "source_evidence_id": _NULLABLE_STRING,
-            "commitment_id": _NULLABLE_STRING,
-            "user_instruction_ref": _NULLABLE_STRING,
-        }
-    ),
-    "calendar_respond_to_event_v1": _object_schema(
-        {
-            "calendar_id": _NULLABLE_STRING,
-            "event_id": {"type": "string", "minLength": 1, "maxLength": 512},
-            "attendee_email": {"type": "string", "minLength": 3, "maxLength": 320},
-            "response_status": {
-                "type": "string",
-                "enum": ["accepted", "declined", "tentative", "needsAction"],
-            },
-            "idempotency_key": _IDEMPOTENCY_KEY_SCHEMA,
-            "source_evidence_id": _NULLABLE_STRING,
-            "commitment_id": _NULLABLE_STRING,
-            "user_instruction_ref": _NULLABLE_STRING,
-        }
-    ),
-    "email_compose_v1": _object_schema(
-        {
-            "to": _EMAIL_RECIPIENT_LIST,
-            "cc": _EMAIL_RECIPIENT_LIST,
-            "bcc": _EMAIL_RECIPIENT_LIST,
-            "subject": {"type": "string", "minLength": 1, "maxLength": 998},
-            "body": {"type": "string", "minLength": 1, "maxLength": 20000},
-            "idempotency_key": _IDEMPOTENCY_KEY_SCHEMA,
-            "source_evidence_id": _NULLABLE_STRING,
-            "commitment_id": _NULLABLE_STRING,
-            "user_instruction_ref": _NULLABLE_STRING,
-        }
-    ),
-    "email_message_batch_mutation_v1": _object_schema(
-        {
-            "message_ids": _EMAIL_MESSAGE_ID_LIST,
-            "idempotency_key": _IDEMPOTENCY_KEY_SCHEMA,
-            "source_evidence_id": _NULLABLE_STRING,
-            "commitment_id": _NULLABLE_STRING,
-            "user_instruction_ref": _NULLABLE_STRING,
-        }
-    ),
-    "email_labels_modify_v1": _object_schema(
-        {
-            "message_ids": _EMAIL_MESSAGE_ID_LIST,
-            "add_labels": _EMAIL_LABEL_LIST,
-            "remove_labels": _EMAIL_LABEL_LIST,
-            "idempotency_key": _IDEMPOTENCY_KEY_SCHEMA,
-            "source_evidence_id": _NULLABLE_STRING,
-            "commitment_id": _NULLABLE_STRING,
-            "user_instruction_ref": _NULLABLE_STRING,
-        }
-    ),
-    "email_undo_v1": _object_schema(
-        {
-            "undo_token": {"type": "string", "minLength": 1, "maxLength": 512},
-            "idempotency_key": _IDEMPOTENCY_KEY_SCHEMA,
-            "source_evidence_id": _NULLABLE_STRING,
-            "commitment_id": _NULLABLE_STRING,
-            "user_instruction_ref": _NULLABLE_STRING,
-        }
-    ),
-    "email_thread_watch_create_v1": _object_schema(
-        {
-            "provider_thread_id": {"type": "string", "minLength": 1, "maxLength": 256},
-            "anchor_message_id": {"type": "string", "minLength": 1, "maxLength": 256},
-            "condition": {"type": "string", "enum": list(_EMAIL_THREAD_WATCH_CONDITIONS)},
-            "deadline": {"type": "string"},
-            "note": {"type": "string", "minLength": 1, "maxLength": 2000},
-            "idempotency_key": _IDEMPOTENCY_KEY_SCHEMA,
-        }
-    ),
-    "email_thread_watch_cancel_v1": _object_schema(
-        {
-            "watch_id": {"type": "string", "minLength": 1, "maxLength": 128},
-            "idempotency_key": _IDEMPOTENCY_KEY_SCHEMA,
-        }
-    ),
-    "email_thread_watch_list_v1": _object_schema({}),
-    "drive_share_v1": _object_schema(
-        {
-            "file_id": {"type": "string", "maxLength": 256},
-            "grantee_email": {"type": "string", "maxLength": 320},
-            "role": {"type": "string", "enum": ["reader", "commenter", "writer"]},
-            "idempotency_key": _IDEMPOTENCY_KEY_SCHEMA,
-            "source_evidence_id": _NULLABLE_STRING,
-            "commitment_id": _NULLABLE_STRING,
-            "user_instruction_ref": _NULLABLE_STRING,
-        }
-    ),
-    "url_extract_v1": _object_schema({"url": {"type": "string", "maxLength": 2048}}),
-    "attachment_read_v1": _object_schema(
-        {
-            "attachment_ref": {"type": "string", "maxLength": 256},
-            "intent": {
-                "type": "string",
-                "enum": ["summarize", "ocr", "transcribe", "extract_text", "answer"],
-            },
-        }
-    ),
-    "search_query_v1": _object_schema({"query": {"type": "string", "maxLength": 1000}}),
-    "weather_forecast_query_v1": _object_schema(
-        {
-            "location": _NULLABLE_STRING,
-            "timeframe": {"type": "string", "enum": ["now", "today", "tomorrow", "next_24h"]},
-        }
-    ),
-    "agency_run_v1": _object_schema(
-        {
-            "repo_root": {"type": "string", "maxLength": 4096},
-            "name": {"type": "string", "maxLength": 120},
-            "prompt": {"type": "string", "maxLength": 262144},
-            "base_branch": _NULLABLE_STRING,
-            "runner": _NULLABLE_STRING,
-            "runner_args": _STRING_LIST,
-            "env": {
-                "type": "array",
-                "items": _object_schema(
-                    {
-                        "name": {"type": "string", "maxLength": 80},
-                        "value": {"type": "string", "maxLength": 2000},
-                    }
-                ),
-                "maxItems": 20,
-            },
-            "no_include_untracked": {"type": "boolean"},
-        }
-    ),
-    "agency_job_lookup_v1": _object_schema(
-        {
-            "job_id": _NULLABLE_STRING,
-            "repo_id": _NULLABLE_STRING,
-            "task_id": _NULLABLE_STRING,
-        }
-    ),
-    "agency_request_pr_v1": _object_schema(
-        {
-            "job_id": _NULLABLE_STRING,
-            "repo_id": _NULLABLE_STRING,
-            "task_id": _NULLABLE_STRING,
-            "invocation_id": _NULLABLE_STRING,
-            "worktree_id": _NULLABLE_STRING,
-            "allow_dirty": {"type": "boolean"},
-            "force_with_lease": {"type": "boolean"},
-        }
-    ),
-    "memory_inspect_v1": _object_schema(
-        {
-            "section": {
-                "type": "string",
-                "enum": list(_MEMORY_INSPECT_SECTIONS),
-            },
-            "limit": _MEMORY_LIMIT_SCHEMA,
-        }
-    ),
-    "memory_search_v1": _object_schema(
-        {
-            "query": {"type": "string", "minLength": 1, "maxLength": 1000},
-            "limit": _MEMORY_LIMIT_SCHEMA,
-            "scope_key": {"type": ["string", "null"], "minLength": 1, "maxLength": 200},
-        }
-    ),
-    "memory_recall_diagnostics_v1": _object_schema(
-        {
-            "query": {"type": "string", "minLength": 1, "maxLength": 1000},
-            "limit": _MEMORY_LIMIT_SCHEMA,
-            "scope_key": {"type": ["string", "null"], "minLength": 1, "maxLength": 200},
-        }
-    ),
-    "memory_limit_v1": _object_schema({"limit": _MEMORY_LIMIT_SCHEMA}),
-    "memory_context_blocks_v1": _object_schema(
-        {
-            "block_type": {
-                "type": "string",
-                "enum": [
-                    "all",
-                    "hot_index",
-                    "topic",
-                    "pinned_core",
-                    "project_state",
-                    "procedure",
-                    "episodic",
-                    "reasoning",
-                ],
-            },
-            "limit": _MEMORY_LIMIT_SCHEMA,
-            "topic_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 32},
-        }
-    ),
-    "memory_propose_v1": _MEMORY_CANDIDATE_SCHEMA,
-    "memory_review_v1": _object_schema(
-        {
-            "assertion_id": _MEMORY_ASSERTION_ID_SCHEMA,
-            "decision": {"type": "string", "enum": ["approve", "reject"]},
-            "reason": _NULLABLE_STRING,
-        }
-    ),
-    "memory_correct_v1": _object_schema(
-        {
-            "assertion_id": _MEMORY_ASSERTION_ID_SCHEMA,
-            "value": {"type": "string", "minLength": 1, "maxLength": 500},
-        }
-    ),
-    "memory_merge_candidates_v1": _object_schema(
-        {"assertion_ids": _MEMORY_ASSERTION_ID_MERGE_LIST_SCHEMA}
-    ),
-    "memory_assertion_id_v1": _object_schema({"assertion_id": _MEMORY_ASSERTION_ID_SCHEMA}),
-    "memory_mark_stale_v1": _object_schema(
-        {
-            "assertion_id": _MEMORY_ASSERTION_ID_SCHEMA,
-            "reason": {"type": ["string", "null"], "maxLength": 500},
-        }
-    ),
-    "memory_redact_evidence_v1": _object_schema(
-        {
-            "evidence_id": _MEMORY_EVIDENCE_ID_SCHEMA,
-            "reason": _NULLABLE_STRING,
-        }
-    ),
-    "memory_set_never_remember_v1": _object_schema(
-        {
-            "scope_key": {"type": "string", "minLength": 1, "maxLength": 200},
-            "rule": {"type": "string", "minLength": 1, "maxLength": 700},
-        }
-    ),
-    "memory_set_scope_mode_v1": _object_schema(
-        {
-            "scope_type": {
-                "type": "string",
-                "enum": ["user", "project", "repo", "session", "thread", "proactive_case"],
-            },
-            "scope_key": {"type": "string", "minLength": 1, "maxLength": 200},
-            "memory_mode": {"type": "string", "enum": ["normal", "temporary", "no_memory"]},
-            "reason": {"type": ["string", "null"], "maxLength": 500},
-        }
-    ),
-    "memory_scope_key_v1": _object_schema(
-        {"scope_key": {"type": "string", "minLength": 1, "maxLength": 200}}
-    ),
-    "memory_resolve_conflict_v1": _object_schema(
-        {
-            "conflict_set_id": {"type": "string", "minLength": 1, "maxLength": 32},
-            "assertion_id": _MEMORY_ASSERTION_ID_SCHEMA,
-        }
-    ),
-    "memory_import_v1": _object_schema(
-        {
-            "candidates": {
-                "type": "array",
-                "items": _MEMORY_CANDIDATE_SCHEMA,
-                "maxItems": 50,
-            }
-        }
-    ),
-    "memory_eval_v1": _object_schema(
-        {
-            "eval_name": {"type": "string", "minLength": 1, "maxLength": 200},
-            "cases": {
-                "type": "array",
-                "items": _MEMORY_EVAL_CASE_SCHEMA,
-                "maxItems": 100,
-            },
-        }
-    ),
-    "memory_retry_projection_job_v1": _object_schema(
-        {"job_id": {"type": "string", "minLength": 1, "maxLength": 32}}
-    ),
-    "memory_empty_v1": _object_schema({}),
-    "discord_no_response_v1": _object_schema({"reason": {"type": "string", "maxLength": 500}}),
-}
-
-_RESPONSE_TOOL_DESCRIPTIONS: dict[str, str] = {
-    "cap.calendar.list": "Read typed calendar event evidence for an explicit time window.",
-    "cap.calendar.propose_slots": "Find candidate meeting slots in an explicit time window.",
-    "cap.email.search": "Search the owner's email and return structured message refs.",
-    "cap.email.read": "Read bounded Gmail message or thread evidence by provider id.",
-    "cap.drive.search": "Search the owner's Drive metadata.",
-    "cap.drive.read": "Read a bounded Drive file excerpt.",
-    "cap.maps.directions": "Fetch directions for an explicit origin and destination.",
-    "cap.maps.search_places": "Search places with explicit location context.",
-    "cap.calendar.create_event": "Create a calendar event after approval.",
-    "cap.calendar.update_event": "Update a calendar event after approval.",
-    "cap.calendar.respond_to_event": "RSVP to a calendar event after approval.",
-    "cap.email.draft": "Create an email draft.",
-    "cap.email.send": "Send an email after approval.",
-    "cap.email.archive": "Archive email messages by provider message id after approval.",
-    "cap.email.trash": "Move email messages to Trash after approval.",
-    "cap.email.labels.modify": "Add or remove email labels after approval.",
-    "cap.email.undo": "Undo one prior mutable email action by undo token.",
-    "cap.email.thread_watch.create": "Create a deadline-bound email thread watch.",
-    "cap.email.thread_watch.cancel": "Cancel an email thread watch by watch id.",
-    "cap.email.thread_watch.list": "List active email thread watches.",
-    "cap.drive.share": "Share a Drive file after approval.",
-    "cap.web.extract": "Extract bounded text and provenance from a public URL.",
-    "cap.attachment.read": (
-        "Read bounded content from a Discord attachment by attachment_ref for a specific intent."
-    ),
-    "cap.search.web": "Search the live web for grounded evidence.",
-    "cap.search.news": "Search recent news for grounded evidence.",
-    "cap.weather.forecast": "Fetch weather for an explicit or stored location.",
-    "cap.agency.run": "Start an Agency daemon task against an allowlisted repository.",
-    "cap.agency.status": "Read status for a tracked Agency job or task.",
-    "cap.agency.artifacts": "Read diff and timeline artifacts for a tracked Agency job.",
-    "cap.agency.request_pr": "Land Agency work and create or update a pull request after approval.",
-    "cap.memory.inspect": "Inspect stored memory, candidates, conflicts, evidence, and traces.",
-    "cap.memory.search": "Search stored memory by query.",
-    "cap.memory.recall_diagnostics": (
-        "Inspect AI memory recall candidates, selections, omissions, policy, and projection health."
-    ),
-    "cap.memory.topics": "Inspect active memory topics and their topic context blocks.",
-    "cap.memory.hot_index": "Inspect active hot-index context blocks.",
-    "cap.memory.context_blocks": "Inspect active memory context blocks by block type.",
-    "cap.memory.propose": "Propose a reviewable memory candidate from explicit evidence.",
-    "cap.memory.review": "Approve or reject a reviewable memory candidate.",
-    "cap.memory.edit_candidate": "Edit a reviewable memory candidate after approval.",
-    "cap.memory.merge_candidates": "Merge duplicate reviewable memory candidates after approval.",
-    "cap.memory.correct": "Correct an existing memory assertion.",
-    "cap.memory.retract": "Retract an existing memory assertion.",
-    "cap.memory.delete": "Delete an existing memory assertion.",
-    "cap.memory.privacy_delete": "Privacy-delete an assertion and linked evidence after approval.",
-    "cap.memory.deletions": "Inspect memory deletion, retraction, redaction, and privacy-delete audit.",
-    "cap.memory.redact_evidence": "Redact stored memory evidence after approval.",
-    "cap.memory.set_never_remember": "Record a durable never-remember preference after approval.",
-    "cap.memory.set_scope_mode": "Set memory mode for a user, project, repo, session, thread, or proactive scope.",
-    "cap.memory.resolve_conflict": "Resolve an open memory conflict by choosing an assertion.",
-    "cap.memory.prioritize": "Pin an active memory assertion after approval.",
-    "cap.memory.deprioritize": "Deprioritize an active memory assertion after approval.",
-    "cap.memory.mark_stale": "Mark an active memory assertion stale after approval.",
-    "cap.memory.scope_bindings": "Inspect memory mode and scope binding policy records.",
-    "cap.memory.consolidate": "Queue memory projection consolidation work after approval.",
-    "cap.memory.export": "Export a redacted JSON snapshot of stored memory.",
-    "cap.memory.import": "Import reviewable cutover memory candidates from explicit evidence.",
-    "cap.memory.eval": "Run a bounded local memory eval and record aggregate diagnostics.",
-    "cap.memory.retry_projection_job": "Retry a failed or stalled memory projection job.",
-    "cap.discord.no_response": (
-        "Use when the right Discord behavior is to read the message and send no visible reply."
-    ),
-}
 
 _ACTION_LABELS_BY_CAPABILITY_ID = {
     "cap.agency.run": "Start coding job",
@@ -5183,95 +4678,85 @@ def capability_action_label(capability_id: str) -> str:
     return "Action"
 
 
-_STRATEGY_FAMILIES_BY_PREFIX: tuple[tuple[str, str, str], ...] = (
-    ("cap.calendar.", "calendar", "Calendar reads, planning, and approved calendar writes."),
-    ("cap.email.", "email", "Gmail search, read, drafts, approved sends, and mail organization."),
-    ("cap.drive.", "drive", "Drive search, bounded reads, and approved sharing."),
-    ("cap.maps.", "maps", "Maps directions and place search."),
-    ("cap.web.", "web", "Bounded public URL extraction."),
-    ("cap.search.", "search", "Live web and news search."),
-    ("cap.weather.", "weather", "Weather lookup for explicit locations."),
-    ("cap.attachment.", "attachments", "Bounded reads from Discord attachments in the turn."),
-    ("cap.agency.", "agency", "Allowlisted coding daemon work."),
-    (
-        "cap.memory.",
-        "memory",
-        "Memory inspection, recall diagnostics, policy, mutation, consolidation, and export.",
-    ),
-    ("cap.discord.", "discord", "Discord turn control actions such as no visible response."),
-)
+def internal_callable_capability_ids() -> list[str]:
+    return list(_CAPABILITY_REGISTRY)
 
 
-def response_tool_name_for_capability_id(capability_id: str) -> str:
-    return capability_id.replace(".", "_")
+_RUN_CALLABLE_ALIASES = {
+    "agency.artifacts": "cap.agency.artifacts",
+    "agency.request_pr": "cap.agency.request_pr",
+    "agency.run": "cap.agency.run",
+    "agency.status": "cap.agency.status",
+    "attachment.read": "cap.attachment.read",
+    "calendar.create_event": "cap.calendar.create_event",
+    "calendar.list": "cap.calendar.list",
+    "calendar.propose_slots": "cap.calendar.propose_slots",
+    "calendar.respond_to_event": "cap.calendar.respond_to_event",
+    "calendar.update_event": "cap.calendar.update_event",
+    "drive.read": "cap.drive.read",
+    "drive.search": "cap.drive.search",
+    "drive.share": "cap.drive.share",
+    "email.archive": "cap.email.archive",
+    "email.draft": "cap.email.draft",
+    "email.labels.modify": "cap.email.labels.modify",
+    "email.read": "cap.email.read",
+    "email.search": "cap.email.search",
+    "email.send": "cap.email.send",
+    "email.thread_watch.cancel": "cap.email.thread_watch.cancel",
+    "email.thread_watch.create": "cap.email.thread_watch.create",
+    "email.thread_watch.list": "cap.email.thread_watch.list",
+    "email.trash": "cap.email.trash",
+    "email.undo": "cap.email.undo",
+    "maps.directions": "cap.maps.directions",
+    "maps.search_places": "cap.maps.search_places",
+    "memory.consolidate": "cap.memory.consolidate",
+    "memory.context_blocks": "cap.memory.context_blocks",
+    "memory.correct": "cap.memory.correct",
+    "memory.delete": "cap.memory.delete",
+    "memory.deletions": "cap.memory.deletions",
+    "memory.deprioritize": "cap.memory.deprioritize",
+    "memory.edit_candidate": "cap.memory.edit_candidate",
+    "memory.export": "cap.memory.export",
+    "memory.hot_index": "cap.memory.hot_index",
+    "memory.import": "cap.memory.import",
+    "memory.inspect": "cap.memory.inspect",
+    "memory.mark_stale": "cap.memory.mark_stale",
+    "memory.merge_candidates": "cap.memory.merge_candidates",
+    "memory.prioritize": "cap.memory.prioritize",
+    "memory.privacy_delete": "cap.memory.privacy_delete",
+    "memory.propose": "cap.memory.propose",
+    "memory.recall_diagnostics": "cap.memory.recall_diagnostics",
+    "memory.redact_evidence": "cap.memory.redact_evidence",
+    "memory.resolve_conflict": "cap.memory.resolve_conflict",
+    "memory.retract": "cap.memory.retract",
+    "memory.retry_projection_job": "cap.memory.retry_projection_job",
+    "memory.review": "cap.memory.review",
+    "memory.scope_bindings": "cap.memory.scope_bindings",
+    "memory.search": "cap.memory.search",
+    "memory.set_never_remember": "cap.memory.set_never_remember",
+    "memory.set_scope_mode": "cap.memory.set_scope_mode",
+    "memory.topics": "cap.memory.topics",
+    "search.news": "cap.search.news",
+    "search.web": "cap.search.web",
+    "terminal.cancel": "cap.terminal.cancel",
+    "terminal.read_output": "cap.terminal.read_output",
+    "terminal.run": "cap.terminal.run",
+    "terminal.run_background": "cap.terminal.run_background",
+    "terminal.status": "cap.terminal.status",
+    "weather.forecast": "cap.weather.forecast",
+    "web.extract": "cap.web.extract",
+}
 
 
-def capability_id_for_response_tool_name(tool_name: str) -> str | None:
-    for capability_id in _CAPABILITY_REGISTRY:
-        if response_tool_name_for_capability_id(capability_id) == tool_name:
-            return capability_id
+def capability_id_for_run_callable(name: str) -> str | None:
+    return _RUN_CALLABLE_ALIASES.get(name)
+
+
+def run_callable_name_for_capability_id(capability_id: str) -> str | None:
+    for name, mapped_capability_id in _RUN_CALLABLE_ALIASES.items():
+        if mapped_capability_id == capability_id:
+            return name
     return None
-
-
-def production_response_capability_ids() -> list[str]:
-    return [
-        capability_id
-        for capability_id in _CAPABILITY_REGISTRY
-        if not capability_id.startswith("cap.memory.")
-        or capability_id in _MODEL_VISIBLE_MEMORY_CAPABILITY_IDS
-    ]
-
-
-def response_capability_strategy_families(
-    capability_ids: Sequence[str],
-) -> list[dict[str, Any]]:
-    available_ids = set(capability_ids)
-    families: list[dict[str, Any]] = []
-    for capability_prefix, family_id, description in _STRATEGY_FAMILIES_BY_PREFIX:
-        family_capability_ids = [
-            capability_id
-            for capability_id in _CAPABILITY_REGISTRY
-            if capability_id in available_ids and capability_id.startswith(capability_prefix)
-        ]
-        if not family_capability_ids:
-            continue
-        families.append(
-            {
-                "family": family_id,
-                "description": description,
-                "capability_ids": family_capability_ids,
-            }
-        )
-    return families
-
-
-def response_tool_definitions(
-    capability_ids: Sequence[str],
-) -> list[dict[str, Any]]:
-    tools: list[dict[str, Any]] = []
-    selected_capability_ids = list(capability_ids)
-    for capability_id in selected_capability_ids:
-        capability = get_capability(capability_id)
-        if capability is None:
-            raise RuntimeError(f"unknown Responses capability {capability_id}")
-        input_schema_name = capability.contract_metadata.get("input_schema")
-        parameters = (
-            _RESPONSE_TOOL_INPUT_SCHEMAS.get(input_schema_name)
-            if isinstance(input_schema_name, str)
-            else None
-        )
-        if parameters is None:
-            raise RuntimeError(f"missing Responses schema for {capability.capability_id}")
-        tools.append(
-            {
-                "type": "function",
-                "name": response_tool_name_for_capability_id(capability.capability_id),
-                "description": _RESPONSE_TOOL_DESCRIPTIONS[capability.capability_id],
-                "parameters": json.loads(json.dumps(parameters)),
-                "strict": True,
-            }
-        )
-    return tools
 
 
 def capability_contract_hash(capability: CapabilityDefinition) -> str:

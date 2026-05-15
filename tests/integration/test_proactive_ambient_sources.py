@@ -1,19 +1,16 @@
 from __future__ import annotations
 
-from collections.abc import Generator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 import json
 from typing import Any, cast
 
 import pytest
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
-from testcontainers.postgres import PostgresContainer
 
 from ariel.config import AppSettings
-from ariel.db import reset_schema_for_tests
 from ariel.persistence import (
     ActionAttemptRecord,
     AIJudgmentRecord,
@@ -141,21 +138,6 @@ class InvalidAmbientInterpreterAdapter:
                 }
             ],
         }
-
-
-@pytest.fixture(scope="session")
-def postgres_url() -> Generator[str, None, None]:
-    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
-        url = postgres.get_connection_url()
-        yield url.replace("psycopg2", "psycopg")
-
-
-@pytest.fixture
-def session_factory(postgres_url: str) -> Generator[sessionmaker[Session], None, None]:
-    engine = create_engine(postgres_url, future=True, pool_pre_ping=True)
-    reset_schema_for_tests(engine, postgres_url)
-    yield sessionmaker(bind=engine, future=True, expire_on_commit=False)
-    engine.dispose()
 
 
 def _settings() -> AppSettings:

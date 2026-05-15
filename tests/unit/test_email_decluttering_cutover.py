@@ -1,19 +1,14 @@
 from __future__ import annotations
 
-from typing import Any
-
 from ariel.capability_registry import (
-    capability_id_for_response_tool_name,
     get_capability,
-    production_response_capability_ids,
-    response_tool_definitions,
-    response_tool_name_for_capability_id,
 )
 from ariel.google_connector import (
     GOOGLE_CAPABILITY_SCOPES,
     GOOGLE_GMAIL_MODIFY_SCOPE,
     GOOGLE_GMAIL_READ_SCOPE,
 )
+from ariel.run_runtime import run_tool_definitions
 
 FINAL_EMAIL_CAPABILITY_IDS = {
     "cap.email.search",
@@ -31,25 +26,10 @@ FINAL_EMAIL_CAPABILITY_IDS = {
 BROAD_GMAIL_SCOPE = "https://mail.google.com/"
 
 
-def _production_response_tool_definitions() -> list[dict[str, Any]]:
-    return response_tool_definitions(production_response_capability_ids())
-
-
-def test_email_registry_contains_exact_final_decluttering_family() -> None:
-    tools = {tool["name"] for tool in _production_response_tool_definitions()}
-    email_capability_ids = {
-        capability_id
-        for tool_name in tools
-        if (capability_id := capability_id_for_response_tool_name(tool_name)) is not None
-        and capability_id.startswith("cap.email.")
-    }
-
-    expected_tool_names = {
-        response_tool_name_for_capability_id(capability_id)
-        for capability_id in FINAL_EMAIL_CAPABILITY_IDS
-    }
-    assert email_capability_ids == FINAL_EMAIL_CAPABILITY_IDS
-    assert {tool for tool in tools if tool.startswith("cap_email_")} == expected_tool_names
+def test_email_registry_contains_final_decluttering_family_but_model_gets_only_run() -> None:
+    assert [tool["name"] for tool in run_tool_definitions()] == ["run"]
+    for capability_id in FINAL_EMAIL_CAPABILITY_IDS:
+        assert get_capability(capability_id) is not None
 
 
 def test_email_mutations_require_idempotency_and_narrow_gmail_modify_scope() -> None:
@@ -103,71 +83,43 @@ def test_email_draft_requires_approval_like_other_write_surfaces() -> None:
     assert draft.policy_decision == "requires_approval"
 
 
-def test_email_response_tool_schemas_are_final_and_strict_where_possible() -> None:
-    tools_by_capability_id = {
-        capability_id: tool
-        for tool in _production_response_tool_definitions()
-        if (capability_id := capability_id_for_response_tool_name(tool["name"])) is not None
+def test_email_capability_input_contracts_remain_final() -> None:
+    archive = get_capability("cap.email.archive")
+    trash = get_capability("cap.email.trash")
+    draft = get_capability("cap.email.draft")
+    send = get_capability("cap.email.send")
+    labels = get_capability("cap.email.labels.modify")
+    assert archive is not None
+    assert trash is not None
+    assert draft is not None
+    assert send is not None
+    assert labels is not None
+    archive_input = {
+        "message_ids": ["m1"],
+        "idempotency_key": "archive-1",
+        "user_instruction_ref": "turn:turn_1",
     }
-
-    assert tools_by_capability_id["cap.email.archive"]["parameters"] == {
-        "type": "object",
-        "properties": {
-            "message_ids": {
-                "type": "array",
-                "items": {"type": "string", "minLength": 1, "maxLength": 256},
-                "minItems": 1,
-                "maxItems": 1000,
-            },
-            "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 128},
-            "source_evidence_id": {"type": ["string", "null"]},
-            "commitment_id": {"type": ["string", "null"]},
-            "user_instruction_ref": {"type": ["string", "null"]},
-        },
-        "required": [
-            "message_ids",
-            "idempotency_key",
-            "source_evidence_id",
-            "commitment_id",
-            "user_instruction_ref",
-        ],
-        "additionalProperties": False,
+    draft_input = {
+        "to": ["person@example.com"],
+        "cc": [],
+        "bcc": [],
+        "subject": "Hello",
+        "body": "Body",
+        "idempotency_key": "draft-1",
+        "user_instruction_ref": "turn:turn_1",
     }
-    assert (
-        tools_by_capability_id["cap.email.trash"]["parameters"]
-        == tools_by_capability_id["cap.email.archive"]["parameters"]
-    )
-    assert tools_by_capability_id["cap.email.draft"]["parameters"]["properties"]["to"] == {
-        "type": "array",
-        "items": {"type": "string", "minLength": 1, "maxLength": 320},
-        "maxItems": 20,
+    labels_input = {
+        "message_ids": ["m1"],
+        "add_labels": ["Receipts"],
+        "remove_labels": [],
+        "idempotency_key": "label-1",
+        "user_instruction_ref": "turn:turn_1",
     }
-    assert (
-        tools_by_capability_id["cap.email.send"]["parameters"]
-        == tools_by_capability_id["cap.email.draft"]["parameters"]
-    )
-    assert tools_by_capability_id["cap.email.labels.modify"]["parameters"]["properties"] == {
-        "message_ids": {
-            "type": "array",
-            "items": {"type": "string", "minLength": 1, "maxLength": 256},
-            "minItems": 1,
-            "maxItems": 1000,
-        },
-        "add_labels": {
-            "type": "array",
-            "items": {"type": "string", "minLength": 1, "maxLength": 225},
-            "maxItems": 100,
-        },
-        "remove_labels": {
-            "type": "array",
-            "items": {"type": "string", "minLength": 1, "maxLength": 225},
-            "maxItems": 100,
-        },
-        "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 128},
-        "source_evidence_id": {"type": ["string", "null"]},
-        "commitment_id": {"type": ["string", "null"]},
-        "user_instruction_ref": {"type": ["string", "null"]},
-    }
+    assert archive.validate_input(archive_input)[1] is None
+    assert trash.validate_input(archive_input)[1] is None
+    assert draft.validate_input(draft_input)[1] is None
+    assert send.validate_input(draft_input)[1] is None
+    assert labels.validate_input(labels_input)[1] is None
 
 
 def test_email_label_modify_contract_is_single_primary_shape() -> None:

@@ -370,7 +370,7 @@ memory.
 4. Episodic and reasoning layer
 
    Episodes capture what happened, when, where it came from, and what outcome it
-   produced. Reasoning/action traces capture selected tool paths, failures, user
+   produced. Reasoning/action traces capture run callable paths, failures, user
    corrections, successful patterns, action receipts, and diagnostic decisions.
 
 5. Review and conflict control plane

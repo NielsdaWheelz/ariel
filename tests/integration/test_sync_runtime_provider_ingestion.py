@@ -1,17 +1,14 @@
 from __future__ import annotations
 
-from collections.abc import Generator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
-from testcontainers.postgres import PostgresContainer
 
 from ariel.config import AppSettings
-from ariel.db import reset_schema_for_tests
 from ariel.persistence import (
     ActionAttemptRecord,
     BackgroundTaskRecord,
@@ -283,27 +280,12 @@ class FakeFullBodyGmailProvider:
         }
 
 
-@pytest.fixture(scope="session")
-def postgres_url() -> Generator[str, None, None]:
-    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
-        url = postgres.get_connection_url()
-        yield url.replace("psycopg2", "psycopg")
-
-
-@pytest.fixture
-def db_sessions(postgres_url: str) -> Generator[sessionmaker[Session], None, None]:
-    engine = create_engine(postgres_url, future=True, pool_pre_ping=True)
-    reset_schema_for_tests(engine, postgres_url)
-    yield sessionmaker(bind=engine, future=True, expire_on_commit=False)
-    engine.dispose()
-
-
 def _settings() -> AppSettings:
     return cast(AppSettings, cast(Any, AppSettings)(_env_file=None))
 
 
 def test_gmail_sync_bootstraps_empty_cursor_from_profile(
-    db_sessions: sessionmaker[Session],
+    session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     providers: list[FakeGmailBootstrapProvider] = []
@@ -323,14 +305,14 @@ def test_gmail_sync_bootstraps_empty_cursor_from_profile(
     new_id = IdFactory()
 
     process_provider_sync_due(
-        session_factory=db_sessions,
+        session_factory=session_factory,
         task_payload={"provider": "google", "resource_type": "gmail", "resource_id": "primary"},
         settings=_settings(),
         now_fn=lambda: now,
         new_id_fn=new_id,
     )
 
-    with db_sessions() as db:
+    with session_factory() as db:
         with db.begin():
             cursor = db.scalar(select(SyncCursorRecord).limit(1))
             run = db.scalar(select(SyncRunRecord).limit(1))
@@ -350,7 +332,7 @@ def test_gmail_sync_bootstraps_empty_cursor_from_profile(
 
 
 def test_gmail_sync_follows_history_pages_and_dedupes_replayed_events(
-    db_sessions: sessionmaker[Session],
+    session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     providers: list[FakePagedGmailProvider] = []
@@ -368,7 +350,7 @@ def test_gmail_sync_follows_history_pages_and_dedupes_replayed_events(
     monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
     now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
     new_id = IdFactory()
-    with db_sessions() as db:
+    with session_factory() as db:
         with db.begin():
             db.add(
                 SyncCursorRecord(
@@ -389,7 +371,7 @@ def test_gmail_sync_follows_history_pages_and_dedupes_replayed_events(
 
     for _ in range(2):
         process_provider_sync_due(
-            session_factory=db_sessions,
+            session_factory=session_factory,
             task_payload={
                 "provider": "google",
                 "resource_type": "gmail",
@@ -399,13 +381,13 @@ def test_gmail_sync_follows_history_pages_and_dedupes_replayed_events(
             now_fn=lambda: now,
             new_id_fn=new_id,
         )
-        with db_sessions() as db:
+        with session_factory() as db:
             with db.begin():
                 cursor = db.scalar(select(SyncCursorRecord).limit(1))
                 assert cursor is not None
                 cursor.cursor_value = "hist-1"
 
-    with db_sessions() as db:
+    with session_factory() as db:
         with db.begin():
             runs = db.scalars(select(SyncRunRecord).order_by(SyncRunRecord.id.asc())).all()
             tasks = db.scalars(
@@ -445,7 +427,7 @@ def test_gmail_sync_follows_history_pages_and_dedupes_replayed_events(
 
 
 def test_gmail_sync_hydrates_added_messages_into_body_evidence(
-    db_sessions: sessionmaker[Session],
+    session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     providers: list[FakeFullBodyGmailProvider] = []
@@ -463,7 +445,7 @@ def test_gmail_sync_hydrates_added_messages_into_body_evidence(
     monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
     now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
     new_id = IdFactory()
-    with db_sessions() as db:
+    with session_factory() as db:
         with db.begin():
             db.add(
                 SyncCursorRecord(
@@ -483,14 +465,14 @@ def test_gmail_sync_hydrates_added_messages_into_body_evidence(
             )
 
     process_provider_sync_due(
-        session_factory=db_sessions,
+        session_factory=session_factory,
         task_payload={"provider": "google", "resource_type": "gmail", "resource_id": "primary"},
         settings=_settings(),
         now_fn=lambda: now,
         new_id_fn=new_id,
     )
 
-    with db_sessions() as db:
+    with session_factory() as db:
         with db.begin():
             run = db.scalar(select(SyncRunRecord).limit(1))
             provider_object = db.scalar(select(GoogleProviderObjectRecord).limit(1))
@@ -538,7 +520,7 @@ def test_gmail_sync_hydrates_added_messages_into_body_evidence(
 
 
 def test_gmail_sync_invalid_cursor_fails_closed_without_provider_call(
-    db_sessions: sessionmaker[Session],
+    session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakeGoogleConnectorRuntime:
@@ -548,7 +530,7 @@ def test_gmail_sync_invalid_cursor_fails_closed_without_provider_call(
     monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
     now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
     new_id = IdFactory()
-    with db_sessions() as db:
+    with session_factory() as db:
         with db.begin():
             db.add(
                 SyncCursorRecord(
@@ -568,14 +550,14 @@ def test_gmail_sync_invalid_cursor_fails_closed_without_provider_call(
             )
 
     process_provider_sync_due(
-        session_factory=db_sessions,
+        session_factory=session_factory,
         task_payload={"provider": "google", "resource_type": "gmail", "resource_id": "primary"},
         settings=_settings(),
         now_fn=lambda: now,
         new_id_fn=new_id,
     )
 
-    with db_sessions() as db:
+    with session_factory() as db:
         with db.begin():
             cursor = db.scalar(select(SyncCursorRecord).limit(1))
             run = db.scalar(select(SyncRunRecord).limit(1))
@@ -590,7 +572,7 @@ def test_gmail_sync_invalid_cursor_fails_closed_without_provider_call(
 
 
 def test_gmail_sync_completes_thread_watch_on_reply(
-    db_sessions: sessionmaker[Session],
+    session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     providers: list[FakePagedGmailProvider] = []
@@ -608,7 +590,7 @@ def test_gmail_sync_completes_thread_watch_on_reply(
     monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
     now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
     new_id = IdFactory()
-    with db_sessions() as db:
+    with session_factory() as db:
         with db.begin():
             db.add(
                 SyncCursorRecord(
@@ -737,14 +719,14 @@ def test_gmail_sync_completes_thread_watch_on_reply(
             )
 
     process_provider_sync_due(
-        session_factory=db_sessions,
+        session_factory=session_factory,
         task_payload={"provider": "google", "resource_type": "gmail", "resource_id": "primary"},
         settings=_settings(),
         now_fn=lambda: now,
         new_id_fn=new_id,
     )
 
-    with db_sessions() as db:
+    with session_factory() as db:
         with db.begin():
             watch = db.get(EmailThreadWatchRecord, "etw_reply")
             assert watch is not None
@@ -780,7 +762,7 @@ def test_gmail_sync_completes_thread_watch_on_reply(
 
 
 def test_gmail_sync_uses_message_time_for_thread_watch_deadline(
-    db_sessions: sessionmaker[Session],
+    session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     reply_at = datetime(2026, 5, 8, 11, 0, tzinfo=UTC)
@@ -836,7 +818,7 @@ def test_gmail_sync_uses_message_time_for_thread_watch_deadline(
     monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
     now = datetime(2026, 5, 8, 13, 0, tzinfo=UTC)
     new_id = IdFactory()
-    with db_sessions() as db:
+    with session_factory() as db:
         with db.begin():
             db.add(
                 SyncCursorRecord(
@@ -922,14 +904,14 @@ def test_gmail_sync_uses_message_time_for_thread_watch_deadline(
             )
 
     process_provider_sync_due(
-        session_factory=db_sessions,
+        session_factory=session_factory,
         task_payload={"provider": "google", "resource_type": "gmail", "resource_id": "primary"},
         settings=_settings(),
         now_fn=lambda: now,
         new_id_fn=new_id,
     )
 
-    with db_sessions() as db:
+    with session_factory() as db:
         with db.begin():
             watch = db.get(EmailThreadWatchRecord, "etw_delayed")
             assert watch is not None
@@ -940,7 +922,7 @@ def test_gmail_sync_uses_message_time_for_thread_watch_deadline(
 
 
 def test_gmail_sync_does_not_complete_any_reply_watch_after_deadline(
-    db_sessions: sessionmaker[Session],
+    session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     reply_at = datetime(2026, 5, 8, 13, 0, tzinfo=UTC)
@@ -996,7 +978,7 @@ def test_gmail_sync_does_not_complete_any_reply_watch_after_deadline(
     monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
     now = datetime(2026, 5, 8, 14, 0, tzinfo=UTC)
     new_id = IdFactory()
-    with db_sessions() as db:
+    with session_factory() as db:
         with db.begin():
             db.add(
                 SyncCursorRecord(
@@ -1082,14 +1064,14 @@ def test_gmail_sync_does_not_complete_any_reply_watch_after_deadline(
             )
 
     process_provider_sync_due(
-        session_factory=db_sessions,
+        session_factory=session_factory,
         task_payload={"provider": "google", "resource_type": "gmail", "resource_id": "primary"},
         settings=_settings(),
         now_fn=lambda: now,
         new_id_fn=new_id,
     )
 
-    with db_sessions() as db:
+    with session_factory() as db:
         with db.begin():
             watch = db.get(EmailThreadWatchRecord, "etw_late")
             assert watch is not None

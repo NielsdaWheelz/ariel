@@ -2,17 +2,15 @@ from __future__ import annotations
 
 import copy
 import json
-from collections.abc import Generator
 from dataclasses import dataclass, field
 from typing import Any, cast
 
 from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import text
-from testcontainers.postgres import PostgresContainer
 
 from ariel.app import ModelAdapter, create_app
-from tests.integration.responses_helpers import responses_message, responses_with_function_calls
+from tests.integration.responses_helpers import responses_message, responses_with_run_calls
 
 
 GOOGLE_CALENDAR_READ_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
@@ -24,7 +22,7 @@ GOOGLE_GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 class ActionProposalAdapter:
     provider: str = "provider.s4-pr01"
     model: str = "model.s4-pr01-v1"
-    proposals_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    run_calls_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     assistant_text_by_message: dict[str, str] = field(default_factory=dict)
 
     def create_response(
@@ -37,37 +35,6 @@ class ActionProposalAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         del tools, history
-        if context_bundle.get("origin") == "tool_strategy":
-            strategy_input = json.loads(str(input_items[1]["content"]))
-            available_ids = {
-                capability_id
-                for family in strategy_input.get("available_capability_families", [])
-                if isinstance(family, dict)
-                for capability_id in family.get("capability_ids", [])
-                if isinstance(capability_id, str)
-            }
-            selected_capability_ids = [
-                proposal["capability_id"]
-                for proposal in self.proposals_by_message.get(user_message, [])
-                if proposal.get("capability_id") in available_ids
-            ]
-            return responses_message(
-                assistant_text=json.dumps(
-                    {
-                        "decision": "selected_tools" if selected_capability_ids else "no_tools",
-                        "selected_capability_ids": selected_capability_ids,
-                        "rationale": "test strategy",
-                        "unavailable_reason": None,
-                        "confidence": 1.0,
-                    },
-                    sort_keys=True,
-                ),
-                provider=self.provider,
-                model=self.model,
-                provider_response_id="resp_s4_pr01_strategy",
-                input_tokens=3,
-                output_tokens=2,
-            )
         if context_bundle.get("origin") == "tool_result_interpretation":
             interpreter_input = context_bundle.get("tool_result_interpreter_input")
             if not isinstance(interpreter_input, dict):
@@ -101,7 +68,7 @@ class ActionProposalAdapter:
                 input_tokens=31,
                 output_tokens=20,
             )
-        proposals = self.proposals_by_message.get(user_message, [])
+        run_calls = copy.deepcopy(self.run_calls_by_message.get(user_message, []))
         assistant_text = self.assistant_text_by_message.get(
             user_message,
             {
@@ -112,10 +79,16 @@ class ActionProposalAdapter:
                 "plan team sync": "attendee availability is limited to user-calendar-only; reconnect to include attendee calendars.",
             }.get(user_message, f"assistant::{user_message}"),
         )
-        return responses_with_function_calls(
-            input_items=input_items,
+        if any(
+            isinstance(item, dict) and item.get("type") == "function_call_output"
+            for item in input_items
+        ):
+            run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
+        if not run_calls:
+            run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
+        return responses_with_run_calls(
             assistant_text=assistant_text,
-            proposals=copy.deepcopy(proposals),
+            calls=run_calls,
             provider=self.provider,
             model=self.model,
             provider_response_id="resp_s4_pr01_123",
@@ -478,13 +451,6 @@ class FakeGoogleWorkspaceProvider:
         }
 
 
-@pytest.fixture(scope="session")
-def postgres_url() -> Generator[str, None, None]:
-    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
-        url = postgres.get_connection_url()
-        yield url.replace("psycopg2", "psycopg")
-
-
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
     app = create_app(
         database_url=postgres_url,
@@ -706,10 +672,10 @@ def test_s4_pr01_calendar_and_email_read_caps_execute_allowlisted_without_approv
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
-        proposals_by_message={
+        run_calls_by_message={
             "show schedule": [
                 {
-                    "capability_id": "cap.calendar.list",
+                    "name": "calendar.list",
                     "input": {
                         "window_start": "2026-03-04T00:00:00Z",
                         "window_end": "2026-03-05T00:00:00Z",
@@ -718,7 +684,7 @@ def test_s4_pr01_calendar_and_email_read_caps_execute_allowlisted_without_approv
             ],
             "propose slots": [
                 {
-                    "capability_id": "cap.calendar.propose_slots",
+                    "name": "calendar.propose_slots",
                     "input": {
                         "window_start": "2026-03-04T00:00:00Z",
                         "window_end": "2026-03-05T00:00:00Z",
@@ -738,12 +704,8 @@ def test_s4_pr01_calendar_and_email_read_caps_execute_allowlisted_without_approv
                     },
                 }
             ],
-            "search inbox": [
-                {"capability_id": "cap.email.search", "input": {"query": "invoice #44"}}
-            ],
-            "open inbox item": [
-                {"capability_id": "cap.email.read", "input": {"message_id": "msg-1"}}
-            ],
+            "search inbox": [{"name": "email.search", "input": {"query": "invoice #44"}}],
+            "open inbox item": [{"name": "email.read", "input": {"message_id": "msg-1"}}],
         }
     )
     oauth_client = FakeGoogleOAuthClient(
@@ -793,10 +755,10 @@ def test_s4_pr01_attendee_slot_fallback_is_explicit_and_recoverable_without_free
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
-        proposals_by_message={
+        run_calls_by_message={
             "plan team sync": [
                 {
-                    "capability_id": "cap.calendar.propose_slots",
+                    "name": "calendar.propose_slots",
                     "input": {
                         "window_start": "2026-03-04T00:00:00Z",
                         "window_end": "2026-03-05T00:00:00Z",
@@ -871,10 +833,8 @@ def test_s4_pr01_typed_auth_scope_failures_are_deterministic_and_recoverable(
 ) -> None:
     del case_name
     adapter = ActionProposalAdapter(
-        proposals_by_message={
-            "read emails": [
-                {"capability_id": "cap.email.search", "input": {"query": "latest invoice"}}
-            ]
+        run_calls_by_message={
+            "read emails": [{"name": "email.search", "input": {"query": "latest invoice"}}]
         },
         assistant_text_by_message={"read emails": f"{expected_class} connect reconnect retry"},
     )

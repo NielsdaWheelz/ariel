@@ -29,7 +29,9 @@ This document covers the tech stack, repository-wide code organization, imports,
 - Keep `.env.example` in sync with every added, removed, or renamed environment variable.
 - Every environment variable read by source code must appear in `.env.example`.
 - Each variable in `.env.example` must state whether it is required or optional, and its default if it has one.
-- All env vars use the `ARIEL_` prefix and are validated via pydantic-settings in `config.py`.
+- Application runtime env vars use the `ARIEL_` prefix and are validated via
+  pydantic-settings in `config.py`. Local Docker dev database helper vars also use
+  `ARIEL_`, are documented in `.env.example`, and are parsed only by `dev_db.py`.
 
 ## Imports
 

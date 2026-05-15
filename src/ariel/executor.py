@@ -27,6 +27,11 @@ _UNSAFE_INPUT_PATTERNS: tuple[tuple[str, str], ...] = (
     ("shell_dangerous", "rm -rf"),
 )
 
+_UNSAFE_TERMINAL_INPUT_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("shell_pipe_to_interpreter", "| sh"),
+    ("shell_pipe_to_interpreter", "| bash"),
+)
+
 _UNSAFE_OUTPUT_PATTERNS: tuple[tuple[str, str], ...] = (
     ("script_tag", "<script"),
     ("javascript_uri", "javascript:"),
@@ -65,7 +70,14 @@ def _pre_execution_guardrail_error(
     capability: CapabilityDefinition,
     normalized_input: dict[str, Any],
 ) -> str | None:
-    if capability.impact_level == "read":
+    if capability.impact_level == "read" and not capability.capability_id.startswith(
+        "cap.terminal."
+    ):
+        return None
+    if capability.capability_id.startswith("cap.terminal."):
+        violation = _detect_pattern(normalized_input, _UNSAFE_TERMINAL_INPUT_PATTERNS)
+        if violation is not None:
+            return f"guardrail_pre_input_blocked:{violation}"
         return None
     violation = _detect_pattern(normalized_input, _UNSAFE_INPUT_PATTERNS)
     if violation is None:

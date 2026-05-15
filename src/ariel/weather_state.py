@@ -2,17 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-import os
 from typing import Callable, Literal
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from ariel.persistence import WeatherDefaultLocationRecord
+from .config import AppSettings
+from .persistence import WeatherDefaultLocationRecord
 
 _WEATHER_DEFAULT_LOCATION_ROW_ID = "weather_default_location"
-_WEATHER_DEFAULT_LOCATION_ENV = "ARIEL_WEATHER_DEFAULT_LOCATION"
 _MAX_LOCATION_LENGTH = 200
 
 WeatherDefaultLocationSource = Literal["unset", "bootstrap", "user"]
@@ -104,7 +103,7 @@ def get_weather_default_location_state(
     if not bootstrap_if_unset:
         return WeatherDefaultLocationState(location=None, source="unset", updated_at=None)
 
-    bootstrap_location = _normalize_location(os.getenv(_WEATHER_DEFAULT_LOCATION_ENV))
+    bootstrap_location = _normalize_location(AppSettings().weather_default_location)
     if bootstrap_location is None:
         return WeatherDefaultLocationState(location=None, source="unset", updated_at=None)
 

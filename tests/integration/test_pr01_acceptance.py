@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Generator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import json
@@ -10,10 +9,13 @@ from typing import Any, cast
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
-from testcontainers.postgres import PostgresContainer
 
 from ariel.app import ModelAdapter, ModelAdapterError, create_app
-from tests.integration.responses_helpers import responses_message, responses_with_function_calls
+from tests.integration.responses_helpers import (
+    responses_message,
+    responses_run_message,
+    responses_with_run_calls,
+)
 from ariel.db import run_migrations
 from ariel.google_connector import GOOGLE_CONNECTOR_ID
 from ariel.persistence import GoogleConnectorRecord, WorkCommitmentRecord, WorkFollowUpLoopRecord
@@ -43,7 +45,7 @@ class DeterministicModelAdapter:
         del tools, history, context_bundle
         if self.fail:
             raise RuntimeError("simulated provider failure")
-        return responses_message(
+        return responses_run_message(
             assistant_text=f"assistant::{user_message}",
             provider=self.provider,
             model=self.model,
@@ -54,7 +56,7 @@ class DeterministicModelAdapter:
 
 
 @dataclass
-class DiscordNoResponseAdapter:
+class NoVisibleResponseAdapter:
     provider: str = "provider.discord"
     model: str = "model.discord-v1"
     input_items: list[list[dict[str, Any]]] = field(default_factory=list)
@@ -72,19 +74,13 @@ class DiscordNoResponseAdapter:
         del tools, history, user_message
         self.input_items.append(input_items)
         self.context_bundles.append(context_bundle)
-        return responses_with_function_calls(
-            input_items=input_items,
+        calls = [{"name": "agent.pause_until_input", "input": {}}]
+        return responses_with_run_calls(
             assistant_text="",
-            proposals=[
-                {
-                    "capability_id": "cap.discord.no_response",
-                    "input": {"reason": "nothing useful to add"},
-                    "influenced_by_untrusted_content": False,
-                }
-            ],
+            calls=calls,
             provider=self.provider,
             model=self.model,
-            provider_response_id="resp_discord_no_response_123",
+            provider_response_id="resp_no_visible_response_123",
             input_tokens=13,
             output_tokens=2,
         )
@@ -109,7 +105,7 @@ class CapturingAttachmentAdapter:
         del tools, history
         self.input_items.append(input_items)
         self.context_bundles.append(context_bundle)
-        return responses_message(
+        return responses_run_message(
             assistant_text=f"ack::{user_message}",
             provider=self.provider,
             model=self.model,
@@ -173,7 +169,7 @@ class AttachmentReadAdapter:
             isinstance(item, dict) and item.get("type") == "function_call_output"
             for item in input_items
         ):
-            return responses_message(
+            return responses_run_message(
                 assistant_text="attachment content: quarterly revenue increased [1]",
                 provider=self.provider,
                 model=self.model,
@@ -182,14 +178,12 @@ class AttachmentReadAdapter:
                 output_tokens=5,
             )
         self.input_items.append(input_items)
-        return responses_with_function_calls(
-            input_items=input_items,
+        return responses_with_run_calls(
             assistant_text="",
-            proposals=[
+            calls=[
                 {
-                    "capability_id": "cap.attachment.read",
+                    "name": "attachment.read",
                     "input": {"attachment_ref": "discord:131415", "intent": "summarize"},
-                    "influenced_by_untrusted_content": False,
                 }
             ],
             provider=self.provider,
@@ -236,7 +230,7 @@ class ContextWindowDecisionAdapter:
         else:
             assistant_text = f"direct::{user_message}"
 
-        return responses_message(
+        return responses_run_message(
             assistant_text=assistant_text,
             provider=self.provider,
             model=self.model,
@@ -284,7 +278,7 @@ class MutatingContextAdapter:
             recent_window["included_turn_count"] = 999
             recent_window["included_turn_ids"] = ["mutated"]
 
-        return responses_message(
+        return responses_run_message(
             assistant_text="mutating-adapter-response",
             provider=self.provider,
             model=self.model,
@@ -294,97 +288,10 @@ class MutatingContextAdapter:
         )
 
 
-def _strategy_response(
-    *,
-    provider: str,
-    model: str,
-    selected_capability_ids: list[str] | None = None,
-) -> dict[str, Any]:
-    return responses_message(
-        assistant_text=json.dumps(
-            {
-                "decision": "selected_tools" if selected_capability_ids else "no_tools",
-                "selected_capability_ids": selected_capability_ids or [],
-                "rationale": "test strategy",
-                "unavailable_reason": None,
-                "confidence": 1.0,
-            },
-            sort_keys=True,
-        ),
-        provider=provider,
-        model=model,
-        provider_response_id="resp_tool_strategy_123",
-        input_tokens=3,
-        output_tokens=2,
-    )
-
-
-@dataclass
-class StrategyAwareTestAdapter:
-    inner: ModelAdapter
-    selected_capability_ids: list[str]
-    provider: str = ""
-    model: str = ""
-
-    def __post_init__(self) -> None:
-        self.provider = str(getattr(self.inner, "provider", "provider.test"))
-        self.model = str(getattr(self.inner, "model", "model.test"))
-
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if context_bundle.get("origin") == "tool_strategy":
-            del input_items, tools, user_message, history
-            return _strategy_response(
-                provider=self.provider,
-                model=self.model,
-                selected_capability_ids=self.selected_capability_ids,
-            )
-        return self.inner.create_response(
-            input_items=input_items,
-            tools=tools,
-            user_message=user_message,
-            history=history,
-            context_bundle=context_bundle,
-        )
-
-
-def _wrap_strategy_adapter(adapter: ModelAdapter) -> StrategyAwareTestAdapter:
-    selected_capability_ids: list[str] = []
-    if isinstance(adapter, DiscordNoResponseAdapter):
-        selected_capability_ids = ["cap.discord.no_response"]
-    elif isinstance(adapter, AttachmentReadAdapter):
-        selected_capability_ids = ["cap.attachment.read"]
-    return StrategyAwareTestAdapter(
-        inner=adapter,
-        selected_capability_ids=selected_capability_ids,
-    )
-
-
-@pytest.fixture(scope="session")
-def postgres_url() -> Generator[str, None, None]:
-    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
-        url = postgres.get_connection_url()
-        yield url.replace("psycopg2", "psycopg")
-
-
-@pytest.fixture
-def fresh_postgres_url() -> Generator[str, None, None]:
-    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
-        url = postgres.get_connection_url()
-        yield url.replace("psycopg2", "psycopg")
-
-
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
     app = create_app(
         database_url=postgres_url,
-        model_adapter=_wrap_strategy_adapter(adapter),
+        model_adapter=adapter,
         reset_database=True,
     )
     return TestClient(app)
@@ -409,10 +316,10 @@ def test_user_can_send_message_and_receive_model_backed_response(postgres_url: s
         assert body["turn"]["status"] == "completed"
 
 
-def test_discord_no_response_tool_completes_turn_without_visible_reply(
+def test_no_visible_response_operation_completes_turn_without_visible_reply(
     postgres_url: str,
 ) -> None:
-    adapter = DiscordNoResponseAdapter()
+    adapter = NoVisibleResponseAdapter()
     with _build_client(postgres_url, adapter) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
 
@@ -456,9 +363,7 @@ def test_discord_no_response_tool_completes_turn_without_visible_reply(
         assert body["assistant"]["message"] == ""
         assert body["assistant"]["silent"] is True
         assert body["turn"]["assistant_message"] == ""
-        lifecycle = body["turn"]["surface_action_lifecycle"]
-        assert lifecycle[0]["proposal"]["capability_id"] == "cap.discord.no_response"
-        assert lifecycle[0]["execution"]["status"] == "succeeded"
+        assert body["turn"]["surface_action_lifecycle"] == []
         turn_started = [
             event for event in body["turn"]["events"] if event["event_type"] == "evt.turn.started"
         ][0]
@@ -950,7 +855,7 @@ def test_invalid_tool_result_interpreter_output_preserves_failure_provenance(
 def test_discord_turn_context_includes_bounded_same_channel_history(
     postgres_url: str,
 ) -> None:
-    adapter = DiscordNoResponseAdapter()
+    adapter = NoVisibleResponseAdapter()
     with _build_client(postgres_url, adapter) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
 
@@ -1469,11 +1374,11 @@ def test_create_session_endpoint_reuses_single_active_session(postgres_url: str)
         assert active.json()["session"]["id"] == first_id
 
 
-def test_schema_not_ready_returns_503_until_migrated(fresh_postgres_url: str) -> None:
+def test_schema_not_ready_returns_503_until_migrated(unmigrated_postgres_url: str) -> None:
     adapter = DeterministicModelAdapter()
 
     app_without_migration = create_app(
-        database_url=fresh_postgres_url,
+        database_url=unmigrated_postgres_url,
         model_adapter=adapter,
         reset_database=False,
     )
@@ -1491,9 +1396,9 @@ def test_schema_not_ready_returns_503_until_migrated(fresh_postgres_url: str) ->
         assert active_body["ok"] is False
         assert active_body["error"]["code"] == "E_SCHEMA_NOT_READY"
 
-    run_migrations(fresh_postgres_url)
+    run_migrations(unmigrated_postgres_url)
     app_with_migration = create_app(
-        database_url=fresh_postgres_url,
+        database_url=unmigrated_postgres_url,
         model_adapter=adapter,
         reset_database=False,
     )
@@ -1762,11 +1667,13 @@ def test_default_runtime_model_requires_server_secret_credentials(
         event_types = [event["event_type"] for event in events]
         assert event_types == [
             "evt.turn.started",
-            "evt.ai_judgment.failed",
+            "evt.ai_judgment.completed",
+            "evt.model.started",
+            "evt.model.failed",
             "evt.turn.failed",
         ]
         failure_payload = next(
-            event["payload"] for event in events if event["event_type"] == "evt.ai_judgment.failed"
+            event["payload"] for event in events if event["event_type"] == "evt.model.failed"
         )
         assert "credential" in failure_payload["failure_reason"].lower()
         assert "sk-" not in failure_payload["failure_reason"]
@@ -1833,7 +1740,7 @@ def test_restart_preserves_history_and_appends_to_same_active_session(postgres_u
 
     restarted_app = create_app(
         database_url=postgres_url,
-        model_adapter=_wrap_strategy_adapter(adapter),
+        model_adapter=adapter,
         reset_database=False,
     )
     with TestClient(restarted_app) as second_client:
@@ -1878,7 +1785,7 @@ class LongResponseAdapter:
     ) -> dict[str, Any]:
         del tools, user_message, history, context_bundle
         assistant_text = " ".join(["long"] * self.response_token_count)
-        return responses_message(
+        return responses_run_message(
             assistant_text=assistant_text,
             provider=self.provider,
             model=self.model,
@@ -1904,7 +1811,7 @@ class UsageDrivenResponseAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         del tools, user_message, history, context_bundle
-        return responses_message(
+        return responses_run_message(
             assistant_text="ok",
             provider=self.provider,
             model=self.model,

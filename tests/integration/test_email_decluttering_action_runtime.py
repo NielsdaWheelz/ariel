@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Generator
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import hashlib
@@ -8,9 +8,8 @@ import json
 from typing import Any, Literal
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
-from testcontainers.postgres import PostgresContainer
 
 from ariel.action_runtime import (
     RuntimeProvenance,
@@ -22,9 +21,7 @@ from ariel.capability_registry import (
     capability_contract_hash,
     get_capability,
     payload_hash,
-    response_tool_name_for_capability_id,
 )
-from ariel.db import reset_schema_for_tests
 from ariel.google_connector import (
     GOOGLE_CONNECTOR_ID,
     GOOGLE_GMAIL_MODIFY_SCOPE,
@@ -60,22 +57,6 @@ def _email_idempotency_key(
 ) -> str:
     raw = f"{capability_id}\x1fgoogle\x1f{provider_account_id}\x1f{client_key}"
     return "email:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-@pytest.fixture(scope="session")
-def postgres_url() -> Generator[str, None, None]:
-    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
-        yield postgres.get_connection_url().replace("psycopg2", "psycopg")
-
-
-@pytest.fixture
-def session_factory(postgres_url: str) -> Generator[sessionmaker[Session], None, None]:
-    engine = create_engine(postgres_url, future=True, pool_pre_ping=True)
-    reset_schema_for_tests(engine, postgres_url)
-    try:
-        yield sessionmaker(bind=engine, future=True, expire_on_commit=False)
-    finally:
-        engine.dispose()
 
 
 @dataclass
@@ -398,8 +379,8 @@ def test_memory_inspect_capability_executes_inline(
                 function_calls_raw=[
                     {
                         "call_id": "call_memory_inspect",
-                        "name": response_tool_name_for_capability_id("cap.memory.inspect"),
-                        "arguments": json.dumps({"section": "all", "limit": 10}),
+                        "capability_id": "cap.memory.inspect",
+                        "input": {"section": "all", "limit": 10},
                     }
                 ],
                 approval_ttl_seconds=300,
@@ -996,10 +977,9 @@ def test_email_thread_watch_list_is_scoped_to_current_google_account(
                 assistant_message="list watches",
                 function_calls_raw=[
                     {
-                        "type": "function_call",
                         "call_id": "call_watch_list",
-                        "name": response_tool_name_for_capability_id("cap.email.thread_watch.list"),
-                        "arguments": json.dumps({}),
+                        "capability_id": "cap.email.thread_watch.list",
+                        "input": {},
                         "influenced_by_untrusted_content": False,
                     }
                 ],

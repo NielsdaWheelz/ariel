@@ -48,6 +48,10 @@ SurfaceEventType = Literal[
     "evt.model.started",
     "evt.model.completed",
     "evt.model.failed",
+    "evt.model.protocol_failed",
+    "evt.run.validation_failed",
+    "evt.agent.value_emitted",
+    "evt.agent.output_not_applied",
     "evt.action.call_denied",
     "evt.action.proposed",
     "evt.action.policy_decided",
@@ -59,6 +63,7 @@ SurfaceEventType = Literal[
     "evt.action.execution.succeeded",
     "evt.action.execution.failed",
     "evt.action.execution.retrying",
+    "evt.terminal.command.recorded",
     "evt.provider_write.reconcile_unavailable",
     "evt.provider_write.receipt_reconciled",
 ]
@@ -261,6 +266,39 @@ class SurfaceEventModelFailedPayloadContract(BaseModel):
     response_output_shape: dict[str, Any] | None = None
 
 
+class SurfaceEventModelProtocolFailedPayloadContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str
+    attempt: int
+    provider_response_id: str | None = None
+
+
+class SurfaceEventRunValidationFailedPayloadContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    errors: list[str]
+    attempt: int
+    provider_response_id: str | None = None
+
+
+class SurfaceEventAgentValueEmittedPayloadContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    index: int
+    value_digest: str
+    value_bytes: int
+    attempt: int
+    provider_response_id: str | None = None
+
+
+class SurfaceEventAgentOutputNotAppliedPayloadContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str
+    current_turn_id: str | None = None
+
+
 class SurfaceEventActionProposedPayloadContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -336,6 +374,9 @@ class SurfaceEventActionExecutionSucceededPayloadContract(BaseModel):
 
     action_attempt_id: str
     output: Any
+    provider_write_receipt_id: str | None = None
+    replayed_provider_write_receipt_id: str | None = None
+    reconciled: bool | None = None
 
 
 class SurfaceEventActionExecutionFailedPayloadContract(BaseModel):
@@ -344,6 +385,7 @@ class SurfaceEventActionExecutionFailedPayloadContract(BaseModel):
     action_attempt_id: str
     error: str
     approval_ref: str | None = None
+    output: Any = None
 
 
 class SurfaceEventActionExecutionRetryingPayloadContract(BaseModel):
@@ -351,6 +393,16 @@ class SurfaceEventActionExecutionRetryingPayloadContract(BaseModel):
 
     action_attempt_id: str
     error: str
+
+
+class SurfaceEventTerminalCommandRecordedPayloadContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action_attempt_id: str
+    terminal_command_record_id: str
+    command_id: str
+    status: str
+    exit_code: int | None = None
 
 
 class SurfaceEventProviderWriteReconcileUnavailablePayloadContract(BaseModel):
@@ -451,7 +503,6 @@ class SurfaceEventAIJudgmentPayloadContract(BaseModel):
         "proactive_deliberation",
         "model_output",
         "workspace_commitment_extraction",
-        "tool_strategy",
     ]
     parse_status: (
         Literal[
@@ -494,7 +545,6 @@ class SurfaceEventAIJudgmentPayloadContract(BaseModel):
     last_tool_result_interpreter_judgment_id: str | None = None
     omitted_turn_count: int | None = None
     eligible_capability_count: int | None = None
-    selected_capability_ids: list[str] | None = None
 
 
 class SurfaceEventEnvelopeContract(BaseModel):
@@ -711,6 +761,8 @@ class SurfaceApprovalResponseContract(BaseModel):
     ok: bool
     approval: SurfaceApprovalContract
     assistant: SurfaceAssistantContract
+    action_attempt_id: str | None = None
+    execution_task_id: str | None = None
 
 
 class SurfaceArtifactContract(BaseModel):
@@ -1701,6 +1753,30 @@ def _project_surface_event_payload(
             SurfaceEventModelFailedPayloadContract,
             payload,
         )
+    if event_type == "evt.model.protocol_failed":
+        return _validate_contract(
+            "surface_event_payload.evt.model.protocol_failed",
+            SurfaceEventModelProtocolFailedPayloadContract,
+            payload,
+        )
+    if event_type == "evt.run.validation_failed":
+        return _validate_contract(
+            "surface_event_payload.evt.run.validation_failed",
+            SurfaceEventRunValidationFailedPayloadContract,
+            payload,
+        )
+    if event_type == "evt.agent.value_emitted":
+        return _validate_contract(
+            "surface_event_payload.evt.agent.value_emitted",
+            SurfaceEventAgentValueEmittedPayloadContract,
+            payload,
+        )
+    if event_type == "evt.agent.output_not_applied":
+        return _validate_contract(
+            "surface_event_payload.evt.agent.output_not_applied",
+            SurfaceEventAgentOutputNotAppliedPayloadContract,
+            payload,
+        )
     if event_type == "evt.action.proposed":
         return _validate_contract(
             "surface_event_payload.evt.action.proposed",
@@ -1765,6 +1841,12 @@ def _project_surface_event_payload(
         return _validate_contract(
             "surface_event_payload.evt.action.execution.retrying",
             SurfaceEventActionExecutionRetryingPayloadContract,
+            payload,
+        )
+    if event_type == "evt.terminal.command.recorded":
+        return _validate_contract(
+            "surface_event_payload.evt.terminal.command.recorded",
+            SurfaceEventTerminalCommandRecordedPayloadContract,
             payload,
         )
     if event_type == "evt.provider_write.reconcile_unavailable":
@@ -2034,6 +2116,8 @@ def build_surface_approval_response(
     *,
     approval: Any,
     assistant_message: Any,
+    action_attempt_id: Any = None,
+    execution_task_id: Any = None,
 ) -> dict[str, Any]:
     approval_payload = approval if isinstance(approval, dict) else {}
     return _validate_contract(
@@ -2049,6 +2133,8 @@ def build_surface_approval_response(
                 "decided_at": approval_payload.get("decided_at"),
             },
             "assistant": {"message": assistant_message, "sources": []},
+            "action_attempt_id": action_attempt_id,
+            "execution_task_id": execution_task_id,
         },
     )
 

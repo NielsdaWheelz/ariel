@@ -2,18 +2,17 @@ from __future__ import annotations
 
 import copy
 import json
-from collections.abc import Callable, Generator
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
 from fastapi.testclient import TestClient
 import pytest
-from testcontainers.postgres import PostgresContainer
 
 import ariel.action_runtime as action_runtime_module
 import ariel.policy_engine as policy_engine_module
 from ariel.app import ModelAdapter, create_app
-from tests.integration.responses_helpers import responses_message, responses_with_function_calls
+from tests.integration.responses_helpers import responses_message, responses_with_run_calls
 from ariel.capability_registry import (
     CapabilityDefinition,
     get_capability as registry_get_capability,
@@ -21,10 +20,10 @@ from ariel.capability_registry import (
 
 
 @dataclass
-class ActionProposalAdapter:
+class ActionRunAdapter:
     provider: str = "provider.s3-pr02"
     model: str = "model.s3-pr02-v1"
-    proposals_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    run_calls_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
     def create_response(
         self,
@@ -36,37 +35,6 @@ class ActionProposalAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         del tools, history
-        if context_bundle.get("origin") == "tool_strategy":
-            strategy_input = json.loads(str(input_items[1]["content"]))
-            available_ids = {
-                capability_id
-                for family in strategy_input.get("available_capability_families", [])
-                if isinstance(family, dict)
-                for capability_id in family.get("capability_ids", [])
-                if isinstance(capability_id, str)
-            }
-            selected_capability_ids = [
-                proposal["capability_id"]
-                for proposal in self.proposals_by_message.get(user_message, [])
-                if proposal.get("capability_id") in available_ids
-            ]
-            return responses_message(
-                assistant_text=json.dumps(
-                    {
-                        "decision": "selected_tools" if selected_capability_ids else "no_tools",
-                        "selected_capability_ids": selected_capability_ids,
-                        "rationale": "test strategy",
-                        "unavailable_reason": None,
-                        "confidence": 1.0,
-                    },
-                    sort_keys=True,
-                ),
-                provider=self.provider,
-                model=self.model,
-                provider_response_id="resp_s3_pr02_strategy",
-                input_tokens=3,
-                output_tokens=2,
-            )
         if context_bundle.get("origin") == "tool_result_interpretation":
             interpreter_input = context_bundle.get("tool_result_interpreter_input")
             if not isinstance(interpreter_input, dict):
@@ -109,24 +77,23 @@ class ActionProposalAdapter:
             "weather timeout": "uncertain because the weather provider timed out; retry later.",
             "weather egress deny": "blocked: egress_destination_denied",
         }.get(user_message, f"assistant::{user_message}")
-        proposals = self.proposals_by_message.get(user_message, [])
-        return responses_with_function_calls(
-            input_items=input_items,
+        run_calls = self.run_calls_by_message.get(user_message, [])
+        if any(
+            isinstance(item, dict) and item.get("type") == "function_call_output"
+            for item in input_items
+        ):
+            run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
+        if not run_calls:
+            run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
+        return responses_with_run_calls(
             assistant_text=assistant_text,
-            proposals=copy.deepcopy(proposals),
+            calls=copy.deepcopy(run_calls),
             provider=self.provider,
             model=self.model,
             provider_response_id="resp_s3_pr02_123",
             input_tokens=34,
             output_tokens=19,
         )
-
-
-@pytest.fixture(scope="session")
-def postgres_url() -> Generator[str, None, None]:
-    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
-        url = postgres.get_connection_url()
-        yield url.replace("psycopg2", "psycopg")
 
 
 @pytest.fixture(autouse=True)
@@ -214,11 +181,11 @@ def test_s3_pr02_news_results_have_sources_citations_and_allowlisted_read_lifecy
 
     _patch_capability_lookup(monkeypatch, capability_id="cap.search.news", mutate=mutate)
 
-    adapter = ActionProposalAdapter(
-        proposals_by_message={
+    adapter = ActionRunAdapter(
+        run_calls_by_message={
             "news update": [
                 {
-                    "capability_id": "cap.search.news",
+                    "name": "search.news",
                     "input": {"query": "ai regulation europe"},
                 }
             ]
@@ -286,11 +253,11 @@ def test_s3_pr02_news_egress_fails_closed_before_execute(
 
     _patch_capability_lookup(monkeypatch, capability_id="cap.search.news", mutate=mutate)
 
-    adapter = ActionProposalAdapter(
-        proposals_by_message={
+    adapter = ActionRunAdapter(
+        run_calls_by_message={
             "news egress deny": [
                 {
-                    "capability_id": "cap.search.news",
+                    "name": "search.news",
                     "input": {"query": "ai regulation europe"},
                 }
             ]
@@ -340,11 +307,11 @@ def test_s3_pr02_news_recency_discloses_stale_and_ambiguous_timing(
 
     _patch_capability_lookup(monkeypatch, capability_id="cap.search.news", mutate=mutate)
 
-    adapter = ActionProposalAdapter(
-        proposals_by_message={
+    adapter = ActionRunAdapter(
+        run_calls_by_message={
             "news recency": [
                 {
-                    "capability_id": "cap.search.news",
+                    "name": "search.news",
                     "input": {"query": "battery market updates"},
                 }
             ]
@@ -393,11 +360,11 @@ def test_s3_pr02_weather_explicit_location_wins_and_response_contains_location_t
 
     _patch_capability_lookup(monkeypatch, capability_id="cap.weather.forecast", mutate=mutate)
 
-    adapter = ActionProposalAdapter(
-        proposals_by_message={
+    adapter = ActionRunAdapter(
+        run_calls_by_message={
             "weather explicit": [
                 {
-                    "capability_id": "cap.weather.forecast",
+                    "name": "weather.forecast",
                     "input": {"location": "Tokyo, JP", "timeframe": "tomorrow"},
                 }
             ]
@@ -464,11 +431,11 @@ def test_s3_pr02_weather_default_location_is_canonical_state_with_env_bootstrap_
 
     _patch_capability_lookup(monkeypatch, capability_id="cap.weather.forecast", mutate=mutate)
 
-    adapter = ActionProposalAdapter(
-        proposals_by_message={
+    adapter = ActionRunAdapter(
+        run_calls_by_message={
             "weather default": [
                 {
-                    "capability_id": "cap.weather.forecast",
+                    "name": "weather.forecast",
                     "input": {"timeframe": "today"},
                 }
             ]
@@ -522,11 +489,11 @@ def test_s3_pr02_weather_without_resolvable_location_asks_clarification_instead_
 
     _patch_capability_lookup(monkeypatch, capability_id="cap.weather.forecast", mutate=mutate)
 
-    adapter = ActionProposalAdapter(
-        proposals_by_message={
+    adapter = ActionRunAdapter(
+        run_calls_by_message={
             "weather missing location": [
                 {
-                    "capability_id": "cap.weather.forecast",
+                    "name": "weather.forecast",
                     "input": {"timeframe": "today"},
                 }
             ]
@@ -566,11 +533,11 @@ def test_s3_pr02_weather_upstream_failure_is_explicit_and_recoverable(
 
     _patch_capability_lookup(monkeypatch, capability_id="cap.weather.forecast", mutate=mutate)
 
-    adapter = ActionProposalAdapter(
-        proposals_by_message={
+    adapter = ActionRunAdapter(
+        run_calls_by_message={
             "weather timeout": [
                 {
-                    "capability_id": "cap.weather.forecast",
+                    "name": "weather.forecast",
                     "input": {"location": "Berlin, DE", "timeframe": "today"},
                 }
             ]
@@ -622,11 +589,11 @@ def test_s3_pr02_weather_egress_fails_closed_before_execute(
 
     _patch_capability_lookup(monkeypatch, capability_id="cap.weather.forecast", mutate=mutate)
 
-    adapter = ActionProposalAdapter(
-        proposals_by_message={
+    adapter = ActionRunAdapter(
+        run_calls_by_message={
             "weather egress deny": [
                 {
-                    "capability_id": "cap.weather.forecast",
+                    "name": "weather.forecast",
                     "input": {"location": "Berlin, DE", "timeframe": "today"},
                 }
             ]

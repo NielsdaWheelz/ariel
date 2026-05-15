@@ -1,17 +1,14 @@
 from __future__ import annotations
 
-import json
-from collections.abc import Generator
 from dataclasses import dataclass, field
 from typing import Any, cast
 
 from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import text
-from testcontainers.postgres import PostgresContainer
 
 from ariel.app import ModelAdapter, ModelAdapterError, create_app
-from tests.integration.responses_helpers import responses_message
+from tests.integration.responses_helpers import responses_run_message
 
 
 @dataclass
@@ -30,27 +27,8 @@ class CaptureProbeAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         del input_items, tools, history
-        if context_bundle.get("origin") == "tool_strategy":
-            return responses_message(
-                assistant_text=json.dumps(
-                    {
-                        "decision": "no_tools",
-                        "selected_capability_ids": [],
-                        "rationale": "capture turn does not need runtime tools",
-                        "unavailable_reason": None,
-                        "confidence": 1.0,
-                    },
-                    sort_keys=True,
-                ),
-                provider=self.provider,
-                model=self.model,
-                provider_response_id="resp_s8_pr01_strategy",
-                input_tokens=3,
-                output_tokens=2,
-            )
-
         self.seen_user_messages.append(user_message)
-        return responses_message(
+        return responses_run_message(
             assistant_text=f"assistant::{user_message}",
             provider=self.provider,
             model=self.model,
@@ -82,13 +60,6 @@ class CaptureFailingAdapter:
             message="model provider unavailable",
             retryable=False,
         )
-
-
-@pytest.fixture(scope="session")
-def postgres_url() -> Generator[str, None, None]:
-    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
-        url = postgres.get_connection_url()
-        yield url.replace("psycopg2", "psycopg")
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
