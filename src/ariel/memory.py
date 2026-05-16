@@ -4,6 +4,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import json
+import re
 from typing import Any
 
 import httpx
@@ -406,6 +407,13 @@ _STOPWORDS = {
     "why",
     "with",
 }
+
+
+def count_context_tokens(text: str) -> int:
+    """Count tokens the same way the turn pipeline measures ``max_context_tokens``:
+    whitespace-delimited words. The hot-index budget reuses this so its limit is
+    expressed in the same unit as every other context budget."""
+    return len(re.findall(r"\S+", text))
 
 
 def _clean_text(value: str, *, max_chars: int = 700) -> str:
@@ -4123,7 +4131,11 @@ def consolidate_memory(
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
     source_session_id: str | None = None,
+    settings: AppSettings | None = None,
 ) -> dict[str, Any]:
+    resolved_settings = settings or AppSettings()
+    budget_tokens = resolved_settings.memory_hot_index_budget_tokens
+    hard_max_tokens = resolved_settings.memory_hot_index_hard_max_tokens
     now = now_fn()
     project_key, repo_key = scope_keys_for_policy(scope_key)
     policy = resolve_memory_policy(
@@ -4300,6 +4312,12 @@ def consolidate_memory(
                 member.rank = rank
                 member.metadata_json = {"source": "consolidation"}
             rank += 1
+        # A topic context block must point at its topic; the schema CHECK also
+        # enforces this, but a typed defect here is clearer than an IntegrityError.
+        if not topic.id:
+            raise MemoryProjectionError(
+                f"topic context block for family {family} in scope {scope_key} has no topic_id"
+            )
         topic_block = db.scalar(
             select(MemoryContextBlockRecord)
             .where(
@@ -4547,18 +4565,85 @@ def consolidate_memory(
                     }
                 )
 
-    content = json.dumps(
+    # Hot index: a salience-ranked set of pointer entries plus the WS-5 "do not
+    # repeat" section. Entries carry source ids only, never verbatim values, so
+    # the block stays a compact index. The rebuild is held inside the token
+    # budget by evicting the lowest-salience entries; the "do not repeat" section
+    # is policy-mandated and is not evicted.
+    salience_by_id = {
+        row.assertion_id: row.score
+        for row in db.scalars(
+            select(MemorySalienceRecord).where(
+                MemorySalienceRecord.assertion_id.in_(source_assertion_ids or [""])
+            )
+        ).all()
+    }
+    hot_entries: list[dict[str, Any]] = [
         {
-            "scope_key": scope_key,
-            "generated_at": to_rfc3339(now),
-            "selected_source_ids": source_assertion_ids,
-            "omitted_sources": omitted_sources,
-            "proposed_changes": proposed_changes,
-            "applied_projection_changes": applied_projection_changes,
-            "rejected_changes": rejected_changes,
-        },
-        sort_keys=True,
-    )
+            "predicate": assertion.predicate,
+            "scope_key": assertion.scope_key,
+            "salience_score": salience_by_id.get(assertion.id, 0.0),
+            "source_assertion_ids": [assertion.id],
+        }
+        for assertion in selected_assertions
+        if assertion.assertion_type != "negative"
+    ]
+    # Highest salience first; updated_at then id break ties deterministically so
+    # eviction always drops the same lowest-priority entry for a given state.
+    salience_rank_by_id = {
+        assertion.id: (
+            -salience_by_id.get(assertion.id, 0.0),
+            assertion.updated_at,
+            assertion.id,
+        )
+        for assertion in selected_assertions
+    }
+    hot_entries.sort(key=lambda entry: salience_rank_by_id[entry["source_assertion_ids"][0]])
+    negative_assertions = db.scalars(
+        select(MemoryAssertionRecord)
+        .where(
+            MemoryAssertionRecord.lifecycle_state == "active",
+            MemoryAssertionRecord.assertion_type == "negative",
+        )
+        .order_by(MemoryAssertionRecord.updated_at.desc(), MemoryAssertionRecord.id.asc())
+        .limit(24)
+    ).all()
+    if scope_key != "global":
+        negative_assertions = [
+            assertion
+            for assertion in negative_assertions
+            if assertion.scope_key == scope_key or assertion.subject_key == scope_key
+        ]
+    do_not_repeat: list[dict[str, Any]] = [
+        {"predicate": assertion.predicate, "source_assertion_ids": [assertion.id]}
+        for assertion in negative_assertions
+    ]
+
+    def _render_hot_index(entries: list[dict[str, Any]]) -> str:
+        return json.dumps(
+            {
+                "scope_key": scope_key,
+                "generated_at": to_rfc3339(now),
+                "entry_count": len(entries),
+                "entries": entries,
+                "do_not_repeat": do_not_repeat,
+            },
+            sort_keys=True,
+        )
+
+    content = _render_hot_index(hot_entries)
+    while hot_entries and count_context_tokens(content) > budget_tokens:
+        hot_entries.pop()
+        content = _render_hot_index(hot_entries)
+    hot_index_tokens = count_context_tokens(content)
+    if hot_index_tokens > hard_max_tokens:
+        raise MemoryProjectionError(
+            f"rebuilt hot index for scope {scope_key} is {hot_index_tokens} tokens, "
+            f"over the {hard_max_tokens}-token hard max"
+        )
+    hot_index_source_ids = [entry["source_assertion_ids"][0] for entry in hot_entries] + [
+        entry["source_assertion_ids"][0] for entry in do_not_repeat
+    ]
     block = db.scalar(
         select(MemoryContextBlockRecord)
         .where(
@@ -4576,7 +4661,7 @@ def consolidate_memory(
             content=content,
             topic_id=None,
             lifecycle_state="active",
-            source_assertion_ids=source_assertion_ids,
+            source_assertion_ids=hot_index_source_ids,
             source_episode_ids=[],
             source_trace_ids=[],
             source_action_trace_ids=[],
@@ -4592,7 +4677,7 @@ def consolidate_memory(
     else:
         block.content = content
         block.lifecycle_state = "active"
-        block.source_assertion_ids = source_assertion_ids
+        block.source_assertion_ids = hot_index_source_ids
         block.source_memory_versions = source_versions
         block.source_projection_versions = {"memory_context_blocks": MEMORY_PROJECTION_VERSION}
         block.updated_at = now

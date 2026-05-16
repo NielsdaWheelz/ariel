@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import itertools
+import json
 from typing import Any, cast
 
 import pytest
@@ -1012,3 +1014,254 @@ def test_process_one_task_retries_then_dead_letters_malformed_task_payload(
             assert task.attempts == 2
             assert task.error == "memory_extract_turn task payload invalid"
             assert task.run_after == retry_now
+
+
+_hot_index_id_counter = itertools.count()
+
+
+def _hot_index_new_id(prefix: str) -> str:
+    return f"{prefix}_hib_{next(_hot_index_id_counter)}"
+
+
+def _seed_scoped_assertion(
+    db: Session,
+    *,
+    assertion_id: str,
+    assertion_type: str,
+    predicate: str,
+    text: str,
+    now: datetime,
+) -> None:
+    entity_id = f"ent_{assertion_id}"
+    db.add(
+        MemoryEntityRecord(
+            id=entity_id,
+            entity_type="user",
+            entity_key=assertion_id,
+            display_name="Hot index test user",
+            summary=None,
+            metadata_json={},
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    db.flush()
+    db.add(
+        MemoryAssertionRecord(
+            id=assertion_id,
+            subject_entity_id=entity_id,
+            subject_key="global",
+            predicate=predicate,
+            scope_key="global",
+            object_value={"text": text},
+            assertion_type=assertion_type,
+            is_multi_valued=True,
+            scope={},
+            lifecycle_state="active",
+            confidence=0.9,
+            valid_from=None,
+            valid_to=None,
+            superseded_by_assertion_id=None,
+            extraction_model=None,
+            extraction_prompt_version=None,
+            last_verified_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+
+def test_consolidate_memory_keeps_rebuilt_hot_index_within_budget(
+    session_factory: sessionmaker[Session],
+) -> None:
+    # A scope with many active memories produces a hot index inside the default
+    # 1500-token budget, and a tight budget forces the rebuild to evict the
+    # lowest-salience entries until the index fits.
+    now = datetime(2026, 5, 15, 9, 0, tzinfo=UTC)
+    with session_factory() as db:
+        with db.begin():
+            for index in range(60):
+                _seed_scoped_assertion(
+                    db,
+                    assertion_id=f"mas_hot_budget_{index:02d}",
+                    assertion_type="preference",
+                    predicate=f"preference.code_style.{index:02d}",
+                    text=("verbatim preference detail " * 40),
+                    now=now,
+                )
+
+    with session_factory() as db:
+        with db.begin():
+            memory_module.consolidate_memory(
+                db,
+                scope_key="global",
+                actor_id="system",
+                now_fn=lambda: now,
+                new_id_fn=_hot_index_new_id,
+                settings=_settings(),
+            )
+
+    with session_factory() as db:
+        default_block = db.scalar(
+            select(MemoryContextBlockRecord).where(
+                MemoryContextBlockRecord.block_type == "hot_index",
+                MemoryContextBlockRecord.scope_key == "global",
+            )
+        )
+        assert default_block is not None
+        assert memory_module.count_context_tokens(default_block.content) <= 1500
+        full_entry_count = json.loads(default_block.content)["entry_count"]
+
+    # Re-run with a budget below the natural index size: eviction must shrink the
+    # rebuilt index to fit, dropping the lowest-salience entries.
+    with session_factory() as db:
+        with db.begin():
+            memory_module.consolidate_memory(
+                db,
+                scope_key="global",
+                actor_id="system",
+                now_fn=lambda: now,
+                new_id_fn=_hot_index_new_id,
+                settings=_settings(
+                    memory_hot_index_budget_tokens=40,
+                    memory_hot_index_hard_max_tokens=2500,
+                ),
+            )
+
+    with session_factory() as db:
+        tight_block = db.scalar(
+            select(MemoryContextBlockRecord).where(
+                MemoryContextBlockRecord.block_type == "hot_index",
+                MemoryContextBlockRecord.scope_key == "global",
+            )
+        )
+        assert tight_block is not None
+        assert memory_module.count_context_tokens(tight_block.content) <= 40
+        assert json.loads(tight_block.content)["entry_count"] < full_entry_count
+
+
+def test_consolidate_memory_raises_when_rebuilt_hot_index_exceeds_hard_max(
+    session_factory: sessionmaker[Session],
+) -> None:
+    # The "do not repeat" section is policy-mandated and is not evicted, so a
+    # scope with enough negative memory and a low hard max cannot be made to fit:
+    # an over-budget rebuild is a defect and raises MemoryProjectionError.
+    now = datetime(2026, 5, 15, 9, 5, tzinfo=UTC)
+    with session_factory() as db:
+        with db.begin():
+            for index in range(40):
+                _seed_scoped_assertion(
+                    db,
+                    assertion_id=f"mas_hot_neg_{index:02d}",
+                    assertion_type="negative",
+                    predicate="negative.rejected_approach",
+                    text="rejected approach detail",
+                    now=now,
+                )
+
+    with pytest.raises(memory_module.MemoryProjectionError, match="hard max"):
+        with session_factory() as db:
+            with db.begin():
+                memory_module.consolidate_memory(
+                    db,
+                    scope_key="global",
+                    actor_id="system",
+                    now_fn=lambda: now,
+                    new_id_fn=_hot_index_new_id,
+                    settings=_settings(
+                        memory_hot_index_budget_tokens=20,
+                        memory_hot_index_hard_max_tokens=60,
+                    ),
+                )
+
+
+def test_consolidate_memory_hot_index_entries_carry_source_ids(
+    session_factory: sessionmaker[Session],
+) -> None:
+    # Every hot-index entry, in both the salience-ranked section and the "do not
+    # repeat" section, references its source assertions by id and never carries
+    # verbatim memory values.
+    now = datetime(2026, 5, 15, 9, 10, tzinfo=UTC)
+    with session_factory() as db:
+        with db.begin():
+            _seed_scoped_assertion(
+                db,
+                assertion_id="mas_hot_entry_pref",
+                assertion_type="preference",
+                predicate="preference.code_style",
+                text="prefers explicit typing",
+                now=now,
+            )
+            _seed_scoped_assertion(
+                db,
+                assertion_id="mas_hot_entry_neg",
+                assertion_type="negative",
+                predicate="negative.rejected_approach",
+                text="do not use the legacy adapter",
+                now=now,
+            )
+
+    with session_factory() as db:
+        with db.begin():
+            memory_module.consolidate_memory(
+                db,
+                scope_key="global",
+                actor_id="system",
+                now_fn=lambda: now,
+                new_id_fn=_hot_index_new_id,
+                settings=_settings(),
+            )
+
+    with session_factory() as db:
+        block = db.scalar(
+            select(MemoryContextBlockRecord).where(
+                MemoryContextBlockRecord.block_type == "hot_index",
+                MemoryContextBlockRecord.scope_key == "global",
+            )
+        )
+        assert block is not None
+        content = json.loads(block.content)
+        entries = content["entries"]
+        do_not_repeat = content["do_not_repeat"]
+        assert entries and do_not_repeat
+        for entry in [*entries, *do_not_repeat]:
+            assert entry["source_assertion_ids"]
+            assert all(isinstance(ref, str) and ref for ref in entry["source_assertion_ids"])
+            assert "text" not in entry
+            assert "object_value" not in entry
+        # The hot-index entry points at the preference assertion; the "do not
+        # repeat" entry points at the negative assertion.
+        assert entries[0]["source_assertion_ids"] == ["mas_hot_entry_pref"]
+        assert do_not_repeat[0]["source_assertion_ids"] == ["mas_hot_entry_neg"]
+
+
+def test_topic_context_block_without_topic_id_is_rejected_by_schema_check(
+    session_factory: sessionmaker[Session],
+) -> None:
+    # A topic-type context block must point at a topic; the model CHECK rejects a
+    # topic block whose topic_id is null.
+    now = datetime(2026, 5, 15, 9, 15, tzinfo=UTC)
+    with pytest.raises(IntegrityError, match="ck_memory_context_block_topic_binding"):
+        with session_factory() as db:
+            with db.begin():
+                db.add(
+                    MemoryContextBlockRecord(
+                        id="mcb_topic_no_topic_id",
+                        block_type="topic",
+                        scope_key="global",
+                        content="topic block without a topic",
+                        topic_id=None,
+                        lifecycle_state="active",
+                        source_assertion_ids=[],
+                        source_episode_ids=[],
+                        source_trace_ids=[],
+                        source_action_trace_ids=[],
+                        source_procedure_ids=[],
+                        source_project_state_snapshot_ids=[],
+                        source_memory_versions={},
+                        source_projection_versions={},
+                        projection_version=memory_module.MEMORY_PROJECTION_VERSION,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )

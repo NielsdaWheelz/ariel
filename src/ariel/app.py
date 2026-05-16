@@ -6,7 +6,6 @@ import hmac
 import hashlib
 import json
 from pathlib import Path
-import re
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -69,6 +68,7 @@ from ariel.memory import (
     consolidate_memory,
     context_text,
     correct_assertion,
+    count_context_tokens,
     create_relationship,
     delete_assertion,
     edit_candidate,
@@ -1719,10 +1719,6 @@ class TurnLimitViolation:
     limit: int
 
 
-def _estimate_text_tokens(text: str) -> int:
-    return len(re.findall(r"\S+", text))
-
-
 def _response_tokens_from_model_payload(
     assistant_response: dict[str, Any],
     *,
@@ -1733,21 +1729,21 @@ def _response_tokens_from_model_payload(
         output_tokens = usage_payload.get("output_tokens")
         if isinstance(output_tokens, int) and output_tokens >= 0:
             return output_tokens
-    return _estimate_text_tokens(assistant_text)
+    return count_context_tokens(assistant_text)
 
 
 def _estimate_context_tokens(*, context_bundle: dict[str, Any], user_message: str) -> int:
-    token_total = _estimate_text_tokens(user_message)
+    token_total = count_context_tokens(user_message)
 
     policy_system_instructions = context_bundle.get("policy_system_instructions")
     if isinstance(policy_system_instructions, list):
         for instruction in policy_system_instructions:
             if isinstance(instruction, str):
-                token_total += _estimate_text_tokens(instruction)
+                token_total += count_context_tokens(instruction)
 
     discord_context_text = _discord_context_text(context_bundle.get("discord_context"))
     if discord_context_text is not None:
-        token_total += _estimate_text_tokens(discord_context_text)
+        token_total += count_context_tokens(discord_context_text)
 
     discord_channel_recent_turns = context_bundle.get("discord_channel_recent_turns")
     if isinstance(discord_channel_recent_turns, list):
@@ -1756,10 +1752,10 @@ def _estimate_context_tokens(*, context_bundle: dict[str, Any], user_message: st
                 continue
             prior_user_message = prior_turn.get("user_message")
             if isinstance(prior_user_message, str):
-                token_total += _estimate_text_tokens(prior_user_message)
+                token_total += count_context_tokens(prior_user_message)
             prior_assistant_message = prior_turn.get("assistant_message")
             if isinstance(prior_assistant_message, str):
-                token_total += _estimate_text_tokens(prior_assistant_message)
+                token_total += count_context_tokens(prior_assistant_message)
 
     recent_active_session_turns = context_bundle.get("recent_active_session_turns")
     if isinstance(recent_active_session_turns, list):
@@ -1768,14 +1764,14 @@ def _estimate_context_tokens(*, context_bundle: dict[str, Any], user_message: st
                 continue
             prior_user_message = prior_turn.get("user_message")
             if isinstance(prior_user_message, str):
-                token_total += _estimate_text_tokens(prior_user_message)
+                token_total += count_context_tokens(prior_user_message)
             prior_assistant_message = prior_turn.get("assistant_message")
             if isinstance(prior_assistant_message, str):
-                token_total += _estimate_text_tokens(prior_assistant_message)
+                token_total += count_context_tokens(prior_assistant_message)
 
     memory_context = context_bundle.get("memory_context")
     if isinstance(memory_context, dict):
-        token_total += _estimate_text_tokens(context_text(memory_context))
+        token_total += count_context_tokens(context_text(memory_context))
 
     open_commitments_and_jobs = context_bundle.get("open_commitments_and_jobs")
     if isinstance(open_commitments_and_jobs, dict):
@@ -1800,7 +1796,7 @@ def _estimate_context_tokens(*, context_bundle: dict[str, Any], user_message: st
                 ):
                     raw_value = commitment.get(key)
                     if isinstance(raw_value, str):
-                        token_total += _estimate_text_tokens(raw_value)
+                        token_total += count_context_tokens(raw_value)
 
         review_prompts_raw = open_commitments_and_jobs.get("commitment_review_prompts")
         if isinstance(review_prompts_raw, list):
@@ -1823,7 +1819,7 @@ def _estimate_context_tokens(*, context_bundle: dict[str, Any], user_message: st
                 ):
                     raw_value = commitment.get(key)
                     if isinstance(raw_value, str):
-                        token_total += _estimate_text_tokens(raw_value)
+                        token_total += count_context_tokens(raw_value)
 
         loops_raw = open_commitments_and_jobs.get("due_follow_up_loops")
         if isinstance(loops_raw, list):
@@ -1845,7 +1841,7 @@ def _estimate_context_tokens(*, context_bundle: dict[str, Any], user_message: st
                 ):
                     raw_value = loop.get(key)
                     if isinstance(raw_value, str):
-                        token_total += _estimate_text_tokens(raw_value)
+                        token_total += count_context_tokens(raw_value)
 
         jobs_raw = open_commitments_and_jobs.get("open_jobs")
         if isinstance(jobs_raw, list):
@@ -1855,7 +1851,7 @@ def _estimate_context_tokens(*, context_bundle: dict[str, Any], user_message: st
                 for key in ("id", "status", "title", "external_job_id", "summary"):
                     raw_value = job.get(key)
                     if isinstance(raw_value, str):
-                        token_total += _estimate_text_tokens(raw_value)
+                        token_total += count_context_tokens(raw_value)
 
     relevant_artifacts_and_observations = context_bundle.get("relevant_artifacts_and_observations")
     if isinstance(relevant_artifacts_and_observations, dict):
@@ -1867,7 +1863,7 @@ def _estimate_context_tokens(*, context_bundle: dict[str, Any], user_message: st
                 for key in ("title", "source"):
                     raw_value = artifact.get(key)
                     if isinstance(raw_value, str):
-                        token_total += _estimate_text_tokens(raw_value)
+                        token_total += count_context_tokens(raw_value)
 
     return token_total
 

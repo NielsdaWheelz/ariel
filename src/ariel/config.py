@@ -51,6 +51,8 @@ class AppSettings(BaseSettings):
     memory_consolidation_candidate_threshold: int = 12
     memory_consolidation_conflict_threshold: int = 3
     memory_consolidation_interval_seconds: int = 86400
+    memory_hot_index_budget_tokens: int = 1500
+    memory_hot_index_hard_max_tokens: int = 2500
     auto_rotate_max_turns: int = 120
     auto_rotate_max_age_seconds: int = 172800
     auto_rotate_context_pressure_tokens: int = 5400
@@ -318,6 +320,16 @@ class AppSettings(BaseSettings):
         if value < 1:
             raise ValueError("memory consolidation settings must be >= 1")
         return value
+
+    @model_validator(mode="after")
+    def _memory_hot_index_budgets_must_be_ordered(self) -> AppSettings:
+        if self.memory_hot_index_budget_tokens < 1:
+            raise ValueError("memory_hot_index_budget_tokens must be >= 1")
+        if self.memory_hot_index_hard_max_tokens < self.memory_hot_index_budget_tokens:
+            raise ValueError(
+                "memory_hot_index_hard_max_tokens must be >= memory_hot_index_budget_tokens"
+            )
+        return self
 
     @field_validator("auto_rotate_max_turns")
     @classmethod
