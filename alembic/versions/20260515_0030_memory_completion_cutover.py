@@ -49,6 +49,12 @@ _MEMORY_VERSION_CANONICAL_TABLE_AFTER = (
     "'memory_scope_bindings', 'memory_salience', 'memory_conflict_sets', "
     "'memory_events', 'project_state_snapshots')"
 )
+_MEMORY_SCOPE_BINDING_SCOPE_TYPE_BEFORE = (
+    "scope_type IN ('user', 'project', 'repo', 'session', 'thread', 'proactive_case')"
+)
+_MEMORY_SCOPE_BINDING_SCOPE_TYPE_AFTER = (
+    "scope_type IN ('user', 'project', 'repo', 'thread', 'proactive_case')"
+)
 _MEMORY_KEYWORD_PROJECTION_CANONICAL_TABLE_BEFORE = (
     "canonical_table IN ('memory_assertions', 'memory_evidence', "
     "'memory_episodes', 'memory_reasoning_traces', 'memory_procedures')"
@@ -106,6 +112,19 @@ def _upgrade_memory_conflict_sets() -> None:
     op.alter_column("memory_conflict_sets", "conflict_type", server_default=None)
 
 
+def _upgrade_memory_scope_bindings() -> None:
+    op.drop_constraint(
+        "ck_memory_scope_binding_scope_type",
+        "memory_scope_bindings",
+        type_="check",
+    )
+    op.create_check_constraint(
+        "ck_memory_scope_binding_scope_type",
+        "memory_scope_bindings",
+        _MEMORY_SCOPE_BINDING_SCOPE_TYPE_AFTER,
+    )
+
+
 def _upgrade_memory_keyword_projections() -> None:
     op.add_column(
         "memory_keyword_projections",
@@ -157,6 +176,7 @@ def upgrade() -> None:
         _MEMORY_VERSION_CANONICAL_TABLE_AFTER,
     )
 
+    _upgrade_memory_scope_bindings()
     _upgrade_memory_keyword_projections()
 
 
@@ -179,6 +199,19 @@ def _downgrade_memory_keyword_projections() -> None:
     op.drop_column("memory_keyword_projections", "search_document")
 
 
+def _downgrade_memory_scope_bindings() -> None:
+    op.drop_constraint(
+        "ck_memory_scope_binding_scope_type",
+        "memory_scope_bindings",
+        type_="check",
+    )
+    op.create_check_constraint(
+        "ck_memory_scope_binding_scope_type",
+        "memory_scope_bindings",
+        _MEMORY_SCOPE_BINDING_SCOPE_TYPE_BEFORE,
+    )
+
+
 def _downgrade_memory_conflict_sets() -> None:
     op.drop_constraint(
         "ck_memory_conflict_set_type",
@@ -198,6 +231,7 @@ def _downgrade_memory_events() -> None:
 
 def downgrade() -> None:
     _downgrade_memory_keyword_projections()
+    _downgrade_memory_scope_bindings()
 
     op.drop_constraint("ck_memory_version_canonical_table", "memory_versions", type_="check")
     op.create_check_constraint(

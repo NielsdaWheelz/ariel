@@ -1454,17 +1454,19 @@ def _validate_memory_set_never_remember_input(
 def _validate_memory_set_scope_mode_input(
     raw_input: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
-    if set(raw_input.keys()) != {"scope_type", "scope_key", "memory_mode", "reason"}:
+    if set(raw_input.keys()) != {"scope_type", "scope_key", "memory_mode", "reason", "expires_at"}:
         return None, "schema_invalid"
     scope_type = _normalize_optional_text(raw_input.get("scope_type"), max_length=32)
     scope_key = _normalize_optional_text(raw_input.get("scope_key"), max_length=200)
     memory_mode = _normalize_optional_text(raw_input.get("memory_mode"), max_length=32)
     reason, reason_valid = _normalize_nullable_memory_text(raw_input.get("reason"), max_length=500)
+    expires_at = _normalize_optional_rfc3339_input(raw_input.get("expires_at"))
     if (
-        scope_type not in {"user", "project", "repo", "session", "thread", "proactive_case"}
+        scope_type not in {"user", "project", "repo", "thread", "proactive_case"}
         or scope_key is None
         or memory_mode not in {"normal", "temporary", "no_memory"}
         or not reason_valid
+        or (raw_input.get("expires_at") is not None and expires_at is None)
     ):
         return None, "schema_invalid"
     return {
@@ -1472,6 +1474,7 @@ def _validate_memory_set_scope_mode_input(
         "scope_key": scope_key,
         "memory_mode": memory_mode,
         "reason": reason,
+        "expires_at": expires_at,
     }, None
 
 

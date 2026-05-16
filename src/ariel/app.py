@@ -84,6 +84,7 @@ from ariel.memory import (
     reject_candidate,
     retry_projection_job,
     resolve_conflict,
+    resolve_memory_policy,
     retract_assertion,
     run_memory_eval,
     search_memory,
@@ -448,10 +449,11 @@ class SessionMemoryModeRequest(BaseModel):
 class MemoryScopeModeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    scope_type: Literal["user", "project", "repo", "session", "thread", "proactive_case"]
+    scope_type: Literal["user", "project", "repo", "thread", "proactive_case"]
     scope_key: str = Field(min_length=1, max_length=200)
     memory_mode: Literal["normal", "temporary", "no_memory"]
     reason: str | None = Field(default=None, max_length=500)
+    expires_at: datetime | None = Field(default=None)
 
     @field_validator("scope_key")
     @classmethod
@@ -3950,16 +3952,6 @@ def create_app(
                 now = _utcnow()
                 session.memory_mode = payload.memory_mode
                 session.updated_at = now
-                set_memory_scope_binding(
-                    db,
-                    scope_type="session",
-                    scope_key=session.id,
-                    memory_mode=payload.memory_mode,
-                    actor_id=str(app.state.approval_actor_id),
-                    reason="session memory mode updated",
-                    now_fn=lambda: now,
-                    new_id_fn=_new_id,
-                )
                 return {"ok": True, "session": serialize_session(session)}
 
     @app.post("/v1/sessions/rotate", response_model=None)
@@ -5010,7 +5002,7 @@ def create_app(
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
-                binding = set_memory_scope_binding(
+                binding_events = set_memory_scope_binding(
                     db,
                     scope_type=payload.scope_type,
                     scope_key=payload.scope_key,
@@ -5019,8 +5011,9 @@ def create_app(
                     reason=payload.reason,
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
+                    expires_at=payload.expires_at,
                 )
-                if binding is None:
+                if not binding_events:
                     raise ApiError(
                         status_code=422,
                         code="E_MEMORY_SCOPE_MODE_INVALID",
@@ -7325,7 +7318,21 @@ def create_app(
                 }
             assistant_message = assistant_response["assistant_text"]
             turn.assistant_message = assistant_message
-            if active_session.memory_mode == "normal":
+            memory_thread_id = (
+                str(discord_context["thread_id"])
+                if isinstance(discord_context, dict)
+                and discord_context.get("thread_id") is not None
+                else None
+            )
+            memory_write_policy = resolve_memory_policy(
+                db,
+                operation="write",
+                now=_utcnow(),
+                session_id=effective_session_id,
+                thread_id=memory_thread_id,
+                actor_id=str(app.state.approval_actor_id),
+            )
+            if memory_write_policy.allowed:
                 memory_events, user_evidence_id = record_turn_memory_evidence(
                     db,
                     session_id=effective_session_id,
@@ -7335,6 +7342,7 @@ def create_app(
                     actor_id=str(app.state.approval_actor_id),
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
+                    thread_id=memory_thread_id,
                 )
                 for memory_event in memory_events:
                     event_type = memory_event.get("event_type")

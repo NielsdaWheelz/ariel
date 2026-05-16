@@ -7,7 +7,7 @@ import json
 from typing import Any
 
 import httpx
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from .config import AppSettings
@@ -445,192 +445,151 @@ def _memory_version_number(db: Session, *, table: str, record_id: str) -> int:
     )
 
 
-def session_allows_memory_operation(
+@dataclass(frozen=True, slots=True)
+class MemoryPolicyDecision:
+    allowed: bool
+    operation: str  # "recall" | "extract" | "write" | "consolidate"
+    effective_mode: str  # "normal" | "temporary" | "no_memory"
+    controlling_scope_type: str
+    controlling_scope_key: str
+    controlling_binding_id: str | None
+    reason: str
+    considered_scopes: tuple[dict[str, Any], ...]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "allowed": self.allowed,
+            "operation": self.operation,
+            "effective_mode": self.effective_mode,
+            "controlling_scope_type": self.controlling_scope_type,
+            "controlling_scope_key": self.controlling_scope_key,
+            "controlling_binding_id": self.controlling_binding_id,
+            "reason": self.reason,
+            "considered_scopes": list(self.considered_scopes),
+        }
+
+
+# Mode precedence: a stricter mode in any scope of the chain wins over a laxer one.
+_MODE_SEVERITY = {"normal": 0, "temporary": 1, "no_memory": 2}
+# Scope specificity decides which carrier of the winning mode is reported; lower is
+# more specific. Session is the most specific (severity 0 in the considered list).
+_SCOPE_SPECIFICITY = {
+    "thread": 10,
+    "proactive_case": 20,
+    "repo": 30,
+    "project": 40,
+    "user": 50,
+}
+
+
+def resolve_memory_policy(
     db: Session,
     *,
-    session_id: str,
     operation: str,
-    subject_key: str | None = None,
-    scope_key: str | None = None,
+    now: datetime,
+    session_id: str | None = None,
     thread_id: str | None = None,
     proactive_case_id: str | None = None,
+    project_key: str | None = None,
+    repo_key: str | None = None,
     actor_id: str | None = None,
-) -> tuple[bool, dict[str, Any]]:
-    session = db.get(SessionRecord, session_id)
-    if session is None:
-        return False, {
-            "session_id": session_id,
-            "operation": operation,
-            "actor_id": actor_id,
-            "memory_mode": "missing_session",
-            "binding_id": None,
-            "reason": "session not found",
-        }
+) -> MemoryPolicyDecision:
+    """Resolve the effective memory mode for an operation across the full scope
+    chain. The strictest mode wins; the most specific scope carrying that mode is
+    reported as controlling. Expired bindings are ignored. Operations recall,
+    extract, write, and consolidate all require an effective mode of normal."""
+    del actor_id  # accepted for call-site symmetry; resolution does not key on it
+    considered: list[dict[str, Any]] = []
 
-    now = datetime.now(UTC)
-    candidate_scopes: list[tuple[int, str, str]] = []
-    if thread_id is not None:
-        candidate_scopes.append((10, "thread", thread_id))
-    if proactive_case_id is not None:
-        candidate_scopes.append((20, "proactive_case", proactive_case_id))
-    for key in (scope_key, subject_key):
-        if key is None:
+    # Session scope: mode lives on SessionRecord, not in the bindings table.
+    if session_id is not None:
+        session = db.get(SessionRecord, session_id)
+        if session is None:
+            return MemoryPolicyDecision(
+                False, operation, "no_memory", "session", session_id, None, "session not found", ()
+            )
+        considered.append(
+            {
+                "scope_type": "session",
+                "scope_key": session_id,
+                "specificity": 0,
+                "memory_mode": session.memory_mode,
+                "binding_id": None,
+            }
+        )
+
+    # The other five scope types come from memory_scope_bindings.
+    wanted: list[tuple[str, str | None]] = [
+        ("thread", thread_id),
+        ("proactive_case", proactive_case_id),
+        ("repo", repo_key),
+        ("project", project_key),
+        ("user", USER_SUBJECT_KEY),
+    ]
+    for scope_type, scope_key in wanted:
+        if scope_key is None:
             continue
-        if key.startswith("project:"):
-            candidate_scopes.append((30, "project", key))
-            candidate_scopes.append((30, "project", key.removeprefix("project:")))
-        if key.startswith("repo:"):
-            candidate_scopes.append((30, "repo", key))
-            candidate_scopes.append((30, "repo", key.removeprefix("repo:")))
-    candidate_scopes.append((40, "session", session_id))
-    candidate_scopes.append((50, "user", USER_SUBJECT_KEY))
-    candidate_scopes.append((50, "user", "default"))
-
-    bindings = db.scalars(
-        select(MemoryScopeBindingRecord)
-        .where(
-            (MemoryScopeBindingRecord.expires_at.is_(None))
-            | (MemoryScopeBindingRecord.expires_at > now)
+        binding = db.scalar(
+            select(MemoryScopeBindingRecord)
+            .where(
+                MemoryScopeBindingRecord.scope_type == scope_type,
+                MemoryScopeBindingRecord.scope_key == scope_key,
+                or_(
+                    MemoryScopeBindingRecord.expires_at.is_(None),
+                    MemoryScopeBindingRecord.expires_at > now,
+                ),
+            )
+            .order_by(
+                MemoryScopeBindingRecord.updated_at.desc(),
+                MemoryScopeBindingRecord.id.asc(),
+            )
+            .limit(1)
         )
-        .order_by(MemoryScopeBindingRecord.updated_at.desc(), MemoryScopeBindingRecord.id.asc())
-    ).all()
-    binding: MemoryScopeBindingRecord | None = None
-    binding_priority = 100
-    for priority, scope_type, key in candidate_scopes:
-        for candidate in bindings:
-            if candidate.scope_type == scope_type and candidate.scope_key == key:
-                if priority < binding_priority:
-                    binding = candidate
-                    binding_priority = priority
-                break
+        if binding is not None:
+            considered.append(
+                {
+                    "scope_type": scope_type,
+                    "scope_key": scope_key,
+                    "specificity": _SCOPE_SPECIFICITY[scope_type],
+                    "memory_mode": binding.memory_mode,
+                    "binding_id": binding.id,
+                }
+            )
 
-    if session.memory_mode != "normal":
-        return False, {
-            "session_id": session_id,
-            "operation": operation,
-            "actor_id": actor_id,
-            "memory_mode": session.memory_mode,
-            "binding_id": binding.id if binding is not None else None,
-            "binding_scope_type": binding.scope_type if binding is not None else None,
-            "binding_scope_key": binding.scope_key if binding is not None else None,
-            "scope_resolution": [
-                {"scope_type": scope_type, "scope_key": key, "priority": priority}
-                for priority, scope_type, key in candidate_scopes
-            ],
-            "reason": f"session memory mode is {session.memory_mode}",
-        }
+    if not considered:
+        return MemoryPolicyDecision(
+            True, operation, "normal", "default", "default", None, "no binding applies", ()
+        )
 
-    if binding is None:
-        return True, {
-            "session_id": session_id,
-            "operation": operation,
-            "actor_id": actor_id,
-            "memory_mode": session.memory_mode,
-            "binding_id": None,
-            "binding_scope_type": None,
-            "binding_scope_key": None,
-            "scope_resolution": [
-                {"scope_type": scope_type, "scope_key": key, "priority": priority}
-                for priority, scope_type, key in candidate_scopes
-            ],
-            "reason": "session memory mode allows operation",
-        }
-
-    if operation == "recall":
-        allowed = binding.memory_mode == "normal" and binding.recall_enabled
-    else:
-        allowed = binding.memory_mode == "normal" and binding.extraction_enabled
-    return allowed, {
-        "session_id": session_id,
-        "operation": operation,
-        "actor_id": actor_id,
-        "memory_mode": binding.memory_mode,
-        "binding_id": binding.id,
-        "binding_scope_type": binding.scope_type,
-        "binding_scope_key": binding.scope_key,
-        "scope_resolution": [
-            {"scope_type": scope_type, "scope_key": key, "priority": priority}
-            for priority, scope_type, key in candidate_scopes
-        ],
-        "reason": binding.reason or "session memory binding applied",
-    }
+    # Strictest mode wins; the most specific scope carrying it is controlling.
+    strictest = max(_MODE_SEVERITY[s["memory_mode"]] for s in considered)
+    carriers = [s for s in considered if _MODE_SEVERITY[s["memory_mode"]] == strictest]
+    controlling = min(carriers, key=lambda s: s["specificity"])
+    mode = controlling["memory_mode"]
+    return MemoryPolicyDecision(
+        allowed=(mode == "normal"),
+        operation=operation,
+        effective_mode=mode,
+        controlling_scope_type=controlling["scope_type"],
+        controlling_scope_key=controlling["scope_key"],
+        controlling_binding_id=controlling["binding_id"],
+        reason=f"effective mode {mode} from {controlling['scope_type']} scope",
+        considered_scopes=tuple(considered),
+    )
 
 
-def scope_allows_memory_operation(
-    db: Session,
-    *,
-    scope_key: str,
-    operation: str,
-    actor_id: str | None = None,
-) -> tuple[bool, dict[str, Any]]:
-    now = datetime.now(UTC)
-    candidate_scopes: list[tuple[int, str, str]] = []
+def _scope_keys_for_policy(scope_key: str | None) -> tuple[str | None, str | None]:
+    """Split a memory scope_key into the (project_key, repo_key) pair that
+    resolve_memory_policy consumes. A bare key (no prefix) is treated as both."""
+    if scope_key is None or scope_key in {"global", USER_SUBJECT_KEY, "default"}:
+        return None, None
     if scope_key.startswith("project:"):
-        candidate_scopes.append((10, "project", scope_key))
-        candidate_scopes.append((10, "project", scope_key.removeprefix("project:")))
-    elif scope_key.startswith("repo:"):
-        candidate_scopes.append((10, "repo", scope_key))
-        candidate_scopes.append((10, "repo", scope_key.removeprefix("repo:")))
-    elif scope_key.startswith("session:"):
-        candidate_scopes.append((10, "session", scope_key.removeprefix("session:")))
-    elif scope_key not in {"global", USER_SUBJECT_KEY, "default"}:
-        candidate_scopes.append((10, "project", scope_key))
-        candidate_scopes.append((10, "repo", scope_key))
-    candidate_scopes.append((50, "user", USER_SUBJECT_KEY))
-    candidate_scopes.append((50, "user", "default"))
-
-    binding: MemoryScopeBindingRecord | None = None
-    binding_priority = 100
-    bindings = db.scalars(
-        select(MemoryScopeBindingRecord)
-        .where(
-            (MemoryScopeBindingRecord.expires_at.is_(None))
-            | (MemoryScopeBindingRecord.expires_at > now)
-        )
-        .order_by(MemoryScopeBindingRecord.updated_at.desc(), MemoryScopeBindingRecord.id.asc())
-    ).all()
-    for priority, scope_type, key in candidate_scopes:
-        for candidate in bindings:
-            if candidate.scope_type == scope_type and candidate.scope_key == key:
-                if priority < binding_priority:
-                    binding = candidate
-                    binding_priority = priority
-                break
-
-    if binding is None:
-        return True, {
-            "scope_key": scope_key,
-            "operation": operation,
-            "actor_id": actor_id,
-            "memory_mode": "normal",
-            "binding_id": None,
-            "binding_scope_type": None,
-            "binding_scope_key": None,
-            "scope_resolution": [
-                {"scope_type": scope_type, "scope_key": key, "priority": priority}
-                for priority, scope_type, key in candidate_scopes
-            ],
-            "reason": "scope has no blocking memory binding",
-        }
-
-    if operation == "recall":
-        allowed = binding.memory_mode == "normal" and binding.recall_enabled
-    else:
-        allowed = binding.memory_mode == "normal" and binding.extraction_enabled
-    return allowed, {
-        "scope_key": scope_key,
-        "operation": operation,
-        "actor_id": actor_id,
-        "memory_mode": binding.memory_mode,
-        "binding_id": binding.id,
-        "binding_scope_type": binding.scope_type,
-        "binding_scope_key": binding.scope_key,
-        "scope_resolution": [
-            {"scope_type": scope_type, "scope_key": key, "priority": priority}
-            for priority, scope_type, key in candidate_scopes
-        ],
-        "reason": binding.reason or "scope memory binding applied",
-    }
+        return scope_key, None
+    if scope_key.startswith("repo:"):
+        return None, scope_key
+    if scope_key.startswith("proactive:") or scope_key.startswith("session:"):
+        return None, None
+    return scope_key, scope_key
 
 
 def _matching_scope_key_for_text(db: Session, *, text: str) -> str | None:
@@ -2081,19 +2040,23 @@ def record_turn_memory_evidence(
     actor_id: str,
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
+    thread_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], str | None]:
-    matched_scope_key = _matching_scope_key_for_text(db, text=user_message)
-    allowed, _policy = session_allows_memory_operation(
-        db,
-        session_id=session_id,
-        operation="write",
-        subject_key=matched_scope_key,
-        scope_key=matched_scope_key,
-        actor_id=actor_id,
-    )
-    if not allowed:
-        return [], None
     now = now_fn()
+    project_key, repo_key = _scope_keys_for_policy(
+        _matching_scope_key_for_text(db, text=user_message)
+    )
+    if not resolve_memory_policy(
+        db,
+        operation="write",
+        now=now,
+        session_id=session_id,
+        thread_id=thread_id,
+        project_key=project_key,
+        repo_key=repo_key,
+        actor_id=actor_id,
+    ).allowed:
+        return [], None
     user_evidence = _record_evidence(
         db,
         session_id=session_id,
@@ -2187,17 +2150,22 @@ def propose_memory_candidate(
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
     source_evidence_id: str | None = None,
+    proactive_case_id: str | None = None,
 ) -> list[dict[str, Any]]:
     spec = resolve_predicate_spec(predicate)
     _validate_value_kind(spec, value)
-    allowed, _policy = session_allows_memory_operation(
+    now = now_fn()
+    project_key, repo_key = _scope_keys_for_policy(scope_key)
+    if not resolve_memory_policy(
         db,
-        session_id=source_session_id,
         operation="write",
-        subject_key=subject_key,
-        scope_key=scope_key,
-    )
-    if not allowed:
+        now=now,
+        session_id=source_session_id,
+        proactive_case_id=proactive_case_id,
+        project_key=project_key,
+        repo_key=repo_key,
+        actor_id=actor_id,
+    ).allowed:
         return []
     if (
         _never_remember_rule_for_text(
@@ -2209,7 +2177,6 @@ def propose_memory_candidate(
         is not None
     ):
         return []
-    now = now_fn()
     evidence = db.get(MemoryEvidenceRecord, source_evidence_id) if source_evidence_id else None
     if evidence is not None and evidence.lifecycle_state != "available":
         return []
@@ -2989,23 +2956,20 @@ def set_memory_scope_binding(
     reason: str | None,
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
-) -> dict[str, Any] | None:
+    expires_at: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Create or update a memory scope binding. Session mode lives on
+    SessionRecord, not here, so scope_type "session" is rejected. Returns an
+    evt.memory.scope_binding_changed event list ([] on rejected input)."""
     normalized_scope_type = _clean_text(scope_type, max_chars=32).lower()
     normalized_scope_key = _clean_text(scope_key, max_chars=200)
     normalized_memory_mode = _clean_text(memory_mode, max_chars=32).lower()
-    if normalized_scope_type not in {
-        "user",
-        "project",
-        "repo",
-        "session",
-        "thread",
-        "proactive_case",
-    }:
-        return None
+    if normalized_scope_type not in {"user", "project", "repo", "thread", "proactive_case"}:
+        return []
     if normalized_memory_mode not in {"normal", "temporary", "no_memory"}:
-        return None
+        return []
     if not normalized_scope_key:
-        return None
+        return []
     now = now_fn()
     binding = db.scalar(
         select(MemoryScopeBindingRecord)
@@ -3028,22 +2992,24 @@ def set_memory_scope_binding(
             extraction_enabled=enabled,
             recall_enabled=enabled,
             reason=reason or "memory scope mode updated",
-            expires_at=None,
+            expires_at=expires_at,
             metadata_json=metadata,
             created_at=now,
             updated_at=now,
         )
         db.add(binding)
         db.flush()
+        change_type = "created"
     else:
         binding.memory_mode = normalized_memory_mode
         binding.extraction_enabled = enabled
         binding.recall_enabled = enabled
         binding.reason = reason or "memory scope mode updated"
-        binding.expires_at = None
+        binding.expires_at = expires_at
         binding.metadata_json = metadata
         binding.updated_at = now
-    return {
+        change_type = "updated"
+    binding_state = {
         "id": binding.id,
         "scope_type": binding.scope_type,
         "scope_key": binding.scope_key,
@@ -3056,6 +3022,18 @@ def set_memory_scope_binding(
         "created_at": to_rfc3339(binding.created_at),
         "updated_at": to_rfc3339(binding.updated_at),
     }
+    _record_version(
+        db,
+        table="memory_scope_bindings",
+        record_id=binding.id,
+        change_type=change_type,
+        actor_id=actor_id,
+        reason=binding.reason,
+        new_state=binding_state,
+        now=now,
+        new_id_fn=new_id_fn,
+    )
+    return [{"event_type": "evt.memory.scope_binding_changed", "payload": binding_state}]
 
 
 def resolve_conflict(
@@ -3407,45 +3385,28 @@ def consolidate_memory(
     source_session_id: str | None = None,
 ) -> dict[str, Any]:
     now = now_fn()
-    if source_session_id is not None:
-        allowed, memory_policy = session_allows_memory_operation(
-            db,
-            session_id=source_session_id,
-            operation="write",
-            scope_key=scope_key,
-            subject_key=scope_key,
-        )
-        if not allowed:
-            return {
-                "scope_key": scope_key,
-                "status": "skipped",
-                "reason": memory_policy["reason"],
-                "memory_policy": memory_policy,
-                "selected_source_ids": [],
-                "omitted_sources": [],
-                "proposed_changes": [],
-                "applied_projection_changes": [],
-                "rejected_changes": [],
-            }
-    else:
-        allowed, memory_policy = scope_allows_memory_operation(
-            db,
-            scope_key=scope_key,
-            operation="write",
-            actor_id=actor_id,
-        )
-        if not allowed:
-            return {
-                "scope_key": scope_key,
-                "status": "skipped",
-                "reason": memory_policy["reason"],
-                "memory_policy": memory_policy,
-                "selected_source_ids": [],
-                "omitted_sources": [],
-                "proposed_changes": [],
-                "applied_projection_changes": [],
-                "rejected_changes": [],
-            }
+    project_key, repo_key = _scope_keys_for_policy(scope_key)
+    policy = resolve_memory_policy(
+        db,
+        operation="consolidate",
+        now=now,
+        session_id=source_session_id,
+        project_key=project_key,
+        repo_key=repo_key,
+        actor_id=actor_id,
+    )
+    if not policy.allowed:
+        return {
+            "scope_key": scope_key,
+            "status": "skipped",
+            "reason": policy.reason,
+            "memory_policy": policy.as_dict(),
+            "selected_source_ids": [],
+            "omitted_sources": [],
+            "proposed_changes": [],
+            "applied_projection_changes": [],
+            "rejected_changes": [],
+        }
 
     assertions = db.scalars(
         select(MemoryAssertionRecord)
@@ -3805,46 +3766,28 @@ def export_memory(
     source_session_id: str | None = None,
 ) -> dict[str, Any]:
     now = now_fn()
-    if source_session_id is not None:
-        allowed, memory_policy = session_allows_memory_operation(
-            db,
-            session_id=source_session_id,
-            operation="recall",
-            scope_key=scope_key,
-            subject_key=scope_key,
-            actor_id=actor_id,
-        )
-        if not allowed:
-            return {
-                "id": None,
-                "scope_key": scope_key,
-                "export_format": "json",
-                "status": "skipped",
-                "redaction_posture": "redacted",
-                "source_counts": {},
-                "content": {},
-                "memory_policy": memory_policy,
-                "created_at": to_rfc3339(now),
-            }
-    else:
-        allowed, memory_policy = scope_allows_memory_operation(
-            db,
-            scope_key=scope_key,
-            operation="recall",
-            actor_id=actor_id,
-        )
-        if not allowed:
-            return {
-                "id": None,
-                "scope_key": scope_key,
-                "export_format": "json",
-                "status": "skipped",
-                "redaction_posture": "redacted",
-                "source_counts": {},
-                "content": {},
-                "memory_policy": memory_policy,
-                "created_at": to_rfc3339(now),
-            }
+    project_key, repo_key = _scope_keys_for_policy(scope_key)
+    policy = resolve_memory_policy(
+        db,
+        operation="recall",
+        now=now,
+        session_id=source_session_id,
+        project_key=project_key,
+        repo_key=repo_key,
+        actor_id=actor_id,
+    )
+    if not policy.allowed:
+        return {
+            "id": None,
+            "scope_key": scope_key,
+            "export_format": "json",
+            "status": "skipped",
+            "redaction_posture": "redacted",
+            "source_counts": {},
+            "content": {},
+            "memory_policy": policy.as_dict(),
+            "created_at": to_rfc3339(now),
+        }
     payload = list_memory(db)
     if scope_key != "global":
         for key in ("active_assertions", "candidates"):
@@ -5514,7 +5457,6 @@ def build_memory_context(
     resolved_settings = settings or AppSettings()
     context: dict[str, Any]
     event_payload: dict[str, Any]
-    memory_policy: dict[str, Any] | None = None
     query_terms = set(_terms(user_message))
     effective_scope_key = scope_key
     if effective_scope_key is None and query_terms:
@@ -5529,64 +5471,68 @@ def build_memory_context(
         else:
             scope_aliases.add(f"project:{effective_scope_key}")
             scope_aliases.add(f"repo:{effective_scope_key}")
-    if current_session_id is not None:
-        allowed, memory_policy = session_allows_memory_operation(
-            db,
-            session_id=current_session_id,
-            operation="recall",
-            subject_key=effective_scope_key,
-            scope_key=effective_scope_key,
-            thread_id=thread_id,
-            proactive_case_id=proactive_case_id,
-            actor_id=actor_id,
-        )
-        if not allowed:
-            context = {
-                "schema_version": MEMORY_CONTEXT_SCHEMA_VERSION,
+    # Recall always resolves policy: with no session it resolves the
+    # project/repo/user chain; recall is never unrestricted.
+    project_key, repo_key = _scope_keys_for_policy(effective_scope_key)
+    policy = resolve_memory_policy(
+        db,
+        operation="recall",
+        now=datetime.now(UTC),
+        session_id=current_session_id,
+        thread_id=thread_id,
+        proactive_case_id=proactive_case_id,
+        project_key=project_key,
+        repo_key=repo_key,
+        actor_id=actor_id,
+    )
+    memory_policy = policy.as_dict()
+    if not policy.allowed:
+        context = {
+            "schema_version": MEMORY_CONTEXT_SCHEMA_VERSION,
+            "projection_version": MEMORY_PROJECTION_VERSION,
+            "hot_index": [],
+            "topic_index": [],
+            "pinned_core": [],
+            "project_state": [],
+            "commitments_and_decisions": [],
+            "semantic_assertions": [],
+            "episodic_evidence": [],
+            "procedural_memory": [],
+            "action_traces": [],
+            "conflicts": [],
+            "recall_window": {
+                "max_selected_memories": max_recalled_assertions,
+                "selected_memory_count": 0,
+                "memory_candidate_count": 0,
+                "omitted_memory_count": 0,
+                "selected_memory_ids": [],
+                "selected_memories": [],
+                "omitted_memories": [],
+                "candidate_memory_ids": [],
+                "candidate_memories": [],
+                "curation_rationale": f"Memory recall skipped: {policy.reason}.",
+                "curation_uncertainty": "",
+                "curation_confidence": 1.0,
+                "curation_model": None,
+                "curation_prompt_version": MEMORY_CURATION_PROMPT_VERSION,
+                "curation_parse_status": "not_required_no_candidates",
+                "curation_provider_response_id": None,
+            },
+            "memory_policy": memory_policy,
+            "projection_health": {
                 "projection_version": MEMORY_PROJECTION_VERSION,
-                "hot_index": [],
-                "topic_index": [],
-                "pinned_core": [],
-                "project_state": [],
-                "commitments_and_decisions": [],
-                "semantic_assertions": [],
-                "episodic_evidence": [],
-                "procedural_memory": [],
-                "action_traces": [],
-                "conflicts": [],
-                "recall_window": {
-                    "max_selected_memories": max_recalled_assertions,
-                    "selected_memory_count": 0,
-                    "memory_candidate_count": 0,
-                    "omitted_memory_count": 0,
-                    "selected_memory_ids": [],
-                    "selected_memories": [],
-                    "omitted_memories": [],
-                    "candidate_memory_ids": [],
-                    "candidate_memories": [],
-                    "curation_rationale": (f"Memory recall skipped: {memory_policy['reason']}."),
-                    "curation_uncertainty": "",
-                    "curation_confidence": 1.0,
-                    "curation_model": None,
-                    "curation_prompt_version": MEMORY_CURATION_PROMPT_VERSION,
-                    "curation_parse_status": "not_required_no_candidates",
-                    "curation_provider_response_id": None,
-                },
-                "memory_policy": memory_policy,
-                "projection_health": {
-                    "projection_version": MEMORY_PROJECTION_VERSION,
-                    "selected_assertion_count": 0,
-                    "selected_memory_count": 0,
-                },
-            }
-            event_payload = {
-                "schema_version": MEMORY_CONTEXT_SCHEMA_VERSION,
-                "projection_version": MEMORY_PROJECTION_VERSION,
-                **context["recall_window"],
-                "conflict_ids": [],
-                "memory_policy": memory_policy,
-            }
-            return context, event_payload
+                "selected_assertion_count": 0,
+                "selected_memory_count": 0,
+            },
+        }
+        event_payload = {
+            "schema_version": MEMORY_CONTEXT_SCHEMA_VERSION,
+            "projection_version": MEMORY_PROJECTION_VERSION,
+            **context["recall_window"],
+            "conflict_ids": [],
+            "memory_policy": memory_policy,
+        }
+        return context, event_payload
     candidate_limit = max(50, max_recalled_assertions * 8)
     entity_rows = db.scalars(select(MemoryEntityRecord)).all()
     matching_entity_ids = {
@@ -6365,15 +6311,17 @@ def process_memory_extract_turn(
             evidence = db.get(MemoryEvidenceRecord, evidence_id)
             if evidence is None or evidence.lifecycle_state != "available":
                 return
-            matched_scope_key = _matching_scope_key_for_text(db, text=evidence.source_text)
-            allowed, _policy = session_allows_memory_operation(
-                db,
-                session_id=session_id,
-                operation="extract",
-                subject_key=matched_scope_key,
-                scope_key=matched_scope_key,
+            project_key, repo_key = _scope_keys_for_policy(
+                _matching_scope_key_for_text(db, text=evidence.source_text)
             )
-            if not allowed:
+            if not resolve_memory_policy(
+                db,
+                operation="extract",
+                now=now_fn(),
+                session_id=session_id,
+                project_key=project_key,
+                repo_key=repo_key,
+            ).allowed:
                 return
             if (
                 _never_remember_rule_for_text(
@@ -6593,15 +6541,17 @@ def process_memory_extract_turn(
             evidence = db.get(MemoryEvidenceRecord, evidence_id)
             if evidence is None or evidence.lifecycle_state != "available":
                 return
-            matched_scope_key = _matching_scope_key_for_text(db, text=evidence.source_text)
-            allowed, _policy = session_allows_memory_operation(
-                db,
-                session_id=session_id,
-                operation="extract",
-                subject_key=matched_scope_key,
-                scope_key=matched_scope_key,
+            project_key, repo_key = _scope_keys_for_policy(
+                _matching_scope_key_for_text(db, text=evidence.source_text)
             )
-            if not allowed:
+            if not resolve_memory_policy(
+                db,
+                operation="extract",
+                now=now_fn(),
+                session_id=session_id,
+                project_key=project_key,
+                repo_key=repo_key,
+            ).allowed:
                 return
             proposed_candidate_ids: list[str] = []
             for raw_candidate in candidates:

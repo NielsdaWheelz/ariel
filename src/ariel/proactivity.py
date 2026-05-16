@@ -2319,6 +2319,7 @@ def _apply_remember_decision(
         extraction_prompt_version=PROACTIVE_POLICY_VERSION,
         now_fn=lambda: now,
         new_id_fn=new_id_fn,
+        proactive_case_id=case.id,
     )
     assertion_id: str | None = None
     for memory_event in memory_events:

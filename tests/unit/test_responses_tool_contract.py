@@ -444,9 +444,17 @@ def test_memory_runtime_passes_scoped_mutation_inputs(
         observed["never_remember"] = kwargs
         return {"scope_key": kwargs["scope_key"], "pattern": kwargs["pattern"]}
 
-    def scope_mode(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+    def scope_mode(*_args: Any, **kwargs: Any) -> list[dict[str, Any]]:
         observed["scope_mode"] = kwargs
-        return {"scope_key": kwargs["scope_key"], "memory_mode": kwargs["memory_mode"]}
+        return [
+            {
+                "event_type": "evt.memory.scope_binding_changed",
+                "payload": {
+                    "scope_key": kwargs["scope_key"],
+                    "memory_mode": kwargs["memory_mode"],
+                },
+            }
+        ]
 
     monkeypatch.setattr(action_runtime, "export_memory", export)
     monkeypatch.setattr(action_runtime, "consolidate_memory", consolidate)

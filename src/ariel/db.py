@@ -688,7 +688,7 @@ REQUIRED_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
         "ck_memory_salience_score_non_negative": ("score", ">=", "0.0"),
     },
     "memory_scope_bindings": {
-        "ck_memory_scope_binding_scope_type": ("'session'", "'proactive_case'"),
+        "ck_memory_scope_binding_scope_type": ("'project'", "'repo'", "'proactive_case'"),
         "ck_memory_scope_binding_memory_mode": ("'normal'", "'temporary'", "'no_memory'"),
     },
     "memory_retention_policies": {
@@ -836,6 +836,10 @@ REQUIRED_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
 FORBIDDEN_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
     "ai_judgments": {
         "ck_ai_judgment_type": ("'tool_strategy'",),
+    },
+    "memory_scope_bindings": {
+        # Session memory mode lives on SessionRecord; "session" is not a binding scope.
+        "ck_memory_scope_binding_scope_type": ("'session'",),
     },
 }
 

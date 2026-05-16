@@ -1092,7 +1092,7 @@ def _execute_memory_capability(
             "memory": _bounded_memory_payload(db, section="all", limit=20),
         }
     if capability_id == "cap.memory.set_scope_mode":
-        binding = set_memory_scope_binding(
+        events = set_memory_scope_binding(
             db,
             scope_type=str(normalized_input["scope_type"]),
             scope_key=str(normalized_input["scope_key"]),
@@ -1101,12 +1101,13 @@ def _execute_memory_capability(
             reason=normalized_input.get("reason"),
             now_fn=now_fn,
             new_id_fn=new_id_fn,
+            expires_at=_parse_memory_timestamp(normalized_input.get("expires_at")),
         )
-        if binding is None:
+        if not events:
             raise MemoryCapabilityExecutionError("memory_scope_mode_invalid")
         return {
             "status": "recorded",
-            "scope_binding": binding,
+            "events": events,
             "memory": _bounded_memory_payload(db, section="scope_bindings", limit=20),
         }
     if capability_id == "cap.memory.resolve_conflict":

@@ -926,9 +926,9 @@ def test_project_scope_binding_blocks_project_recall_and_search(
                     actor_id="system",
                 )
         assert memory_context["semantic_assertions"] == []
-        assert memory_context["memory_policy"]["binding_scope_type"] == "project"
+        assert memory_context["memory_policy"]["controlling_scope_type"] == "project"
         assert proactive_context["semantic_assertions"] == []
-        assert proactive_context["memory_policy"]["binding_scope_type"] == "project"
+        assert proactive_context["memory_policy"]["controlling_scope_type"] == "project"
 
         search = client.get(
             "/v1/memory/search",
@@ -974,7 +974,7 @@ def test_consolidation_respects_no_memory_mode(
                     new_id_fn=_new_id,
                 )
         assert result["status"] == "skipped"
-        assert result["memory_policy"]["memory_mode"] == "no_memory"
+        assert result["memory_policy"]["effective_mode"] == "no_memory"
 
 
 def test_import_is_cutover_only(
@@ -1380,18 +1380,16 @@ def test_no_memory_and_temporary_modes_disable_recall_and_extraction(
             assert response.json()["session"]["memory_mode"] == memory_mode
 
             with _session_factory(client)() as db:
-                binding = db.scalar(
-                    select(MemoryScopeBindingRecord)
-                    .where(
-                        MemoryScopeBindingRecord.scope_type == "session",
-                        MemoryScopeBindingRecord.scope_key == session_id,
+                # Session mode lives only on SessionRecord; no session-type
+                # binding row is written for it.
+                assert (
+                    db.scalar(
+                        select(func.count())
+                        .select_from(MemoryScopeBindingRecord)
+                        .where(MemoryScopeBindingRecord.scope_type == "session")
                     )
-                    .limit(1)
+                    == 0
                 )
-                assert binding is not None
-                assert binding.memory_mode == memory_mode
-                assert binding.extraction_enabled is False
-                assert binding.recall_enabled is False
                 before_evidence_count = db.scalar(
                     select(func.count()).select_from(MemoryEvidenceRecord)
                 )
@@ -1531,3 +1529,215 @@ def test_value_violating_value_kind_is_rejected(postgres_url: str) -> None:
         assert response.json()["error"]["code"] == "E_MEMORY_VALUE_KIND"
         with _session_factory(client)() as db:
             assert db.scalar(select(func.count()).select_from(MemoryAssertionRecord)) == 0
+
+
+def _set_scope_binding(
+    client: TestClient,
+    *,
+    scope_type: str,
+    scope_key: str,
+    memory_mode: str,
+    expires_at: str | None = None,
+) -> None:
+    body: dict[str, Any] = {
+        "scope_type": scope_type,
+        "scope_key": scope_key,
+        "memory_mode": memory_mode,
+        "reason": "ws3 test binding",
+    }
+    if expires_at is not None:
+        body["expires_at"] = expires_at
+    response = client.put("/v1/memory/scope-bindings", json=body)
+    assert response.status_code == 200, response.text
+
+
+def test_project_no_memory_binding_blocks_chat_turn_writes_under_normal_session(
+    postgres_url: str,
+) -> None:
+    # A project no_memory binding must block the chat-turn evidence, episode, and
+    # extraction-enqueue writes even though SessionRecord.memory_mode is normal.
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        session_id = _session_id(client)
+        _set_scope_binding(
+            client, scope_type="project", scope_key="project:phoenix", memory_mode="no_memory"
+        )
+
+        response = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "remember the phoenix deadline is tomorrow"},
+        )
+        assert response.status_code == 200, response.text
+
+        with _session_factory(client)() as db:
+            assert db.scalar(select(func.count()).select_from(MemoryEvidenceRecord)) == 0
+            assert (
+                db.scalar(
+                    select(func.count())
+                    .select_from(BackgroundTaskRecord)
+                    .where(BackgroundTaskRecord.task_type == "memory_extract_turn")
+                )
+                == 0
+            )
+            # SessionRecord.memory_mode itself is untouched: the block is the binding.
+            session = db.get(SessionRecord, session_id)
+            assert session is not None and session.memory_mode == "normal"
+
+
+def test_project_no_memory_binding_blocks_recall_and_extraction(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_fake_memory_models(monkeypatch)
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        session_id = _session_id(client)
+        candidate = _candidate(client)
+        assert client.post(f"/v1/memory/candidates/{candidate['id']}/approve").status_code == 200
+        _process_projection(client)
+        _set_scope_binding(
+            client, scope_type="project", scope_key="project:phoenix", memory_mode="no_memory"
+        )
+
+        with _session_factory(client)() as db:
+            with db.begin():
+                db.add(
+                    MemoryEvidenceRecord(
+                        id=_new_id("mev"),
+                        source_turn_id=None,
+                        source_session_id=session_id,
+                        actor_id="user.local",
+                        content_class="user_message",
+                        trust_boundary="trusted_user",
+                        source_text="phoenix ships friday",
+                        source_uri=None,
+                        lifecycle_state="available",
+                        metadata_json={},
+                        created_at=datetime.now(tz=UTC),
+                        updated_at=datetime.now(tz=UTC),
+                    )
+                )
+            evidence_id = db.scalar(
+                select(MemoryEvidenceRecord.id)
+                .where(MemoryEvidenceRecord.source_text == "phoenix ships friday")
+                .limit(1)
+            )
+        assert evidence_id is not None
+
+        with _session_factory(client)() as db:
+            with db.begin():
+                # Recall is blocked: no candidates surface for the project scope.
+                memory_context, _event = memory.build_memory_context(
+                    db,
+                    user_message="what is the phoenix deadline?",
+                    max_recalled_assertions=8,
+                    settings=_settings(),
+                    current_session_id=session_id,
+                    scope_key="project:phoenix",
+                )
+                assert memory_context["semantic_assertions"] == []
+                assert memory_context["memory_policy"]["effective_mode"] == "no_memory"
+                # Extraction is blocked: proposing a project-scoped candidate no-ops.
+                events = memory.propose_memory_candidate(
+                    db,
+                    source_session_id=session_id,
+                    actor_id="system",
+                    evidence_text="phoenix ships friday",
+                    subject_key="project:phoenix",
+                    predicate="project.deadline",
+                    assertion_type="project_state",
+                    value="phoenix ships friday",
+                    confidence=0.9,
+                    scope_key="project:phoenix",
+                    valid_from=None,
+                    valid_to=None,
+                    extraction_model="fixture",
+                    extraction_prompt_version="fixture",
+                    now_fn=lambda: datetime.now(tz=UTC),
+                    new_id_fn=_new_id,
+                    source_evidence_id=evidence_id,
+                )
+                assert events == []
+
+
+def test_broad_no_memory_binding_is_not_overridden_by_narrower_normal(
+    postgres_url: str,
+) -> None:
+    # Strictest mode wins: a broad user-scope no_memory binding is not overridden
+    # by a narrower project-scope normal binding.
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        _set_scope_binding(
+            client, scope_type="user", scope_key=memory.USER_SUBJECT_KEY, memory_mode="no_memory"
+        )
+        _set_scope_binding(
+            client, scope_type="project", scope_key="project:phoenix", memory_mode="normal"
+        )
+        with _session_factory(client)() as db:
+            with db.begin():
+                policy = memory.resolve_memory_policy(
+                    db,
+                    operation="recall",
+                    now=datetime.now(tz=UTC),
+                    project_key="project:phoenix",
+                )
+        assert policy.effective_mode == "no_memory"
+        assert policy.allowed is False
+        # The most specific carrier of the winning mode is reported as controlling.
+        assert policy.controlling_scope_type == "user"
+
+
+def test_expired_scope_binding_stops_applying(
+    postgres_url: str,
+) -> None:
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        _set_scope_binding(
+            client,
+            scope_type="project",
+            scope_key="project:phoenix",
+            memory_mode="no_memory",
+            expires_at="2020-01-01T00:00:00+00:00",
+        )
+        with _session_factory(client)() as db:
+            with db.begin():
+                policy = memory.resolve_memory_policy(
+                    db,
+                    operation="recall",
+                    now=datetime.now(tz=UTC),
+                    project_key="project:phoenix",
+                )
+        # The expired binding does not apply; resolution falls back to the default.
+        assert policy.effective_mode == "normal"
+        assert policy.allowed is True
+        assert policy.controlling_scope_type == "default"
+
+
+def test_scope_binding_change_writes_memory_version_record(
+    postgres_url: str,
+) -> None:
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        _set_scope_binding(
+            client, scope_type="project", scope_key="project:phoenix", memory_mode="no_memory"
+        )
+        with _session_factory(client)() as db:
+            binding = db.scalar(
+                select(MemoryScopeBindingRecord)
+                .where(MemoryScopeBindingRecord.scope_type == "project")
+                .limit(1)
+            )
+            assert binding is not None
+            version = db.scalar(
+                select(MemoryVersionRecord)
+                .where(
+                    MemoryVersionRecord.canonical_table == "memory_scope_bindings",
+                    MemoryVersionRecord.canonical_id == binding.id,
+                )
+                .order_by(MemoryVersionRecord.version.desc())
+                .limit(1)
+            )
+            assert version is not None
+            assert version.change_type == "created"
+            assert isinstance(version.new_state, dict)
+            assert version.new_state["memory_mode"] == "no_memory"

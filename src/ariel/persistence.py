@@ -1638,7 +1638,7 @@ class MemoryScopeBindingRecord(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "scope_type IN ('user', 'project', 'repo', 'session', 'thread', 'proactive_case')",
+            "scope_type IN ('user', 'project', 'repo', 'thread', 'proactive_case')",
             name="ck_memory_scope_binding_scope_type",
         ),
         CheckConstraint(
