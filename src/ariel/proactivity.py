@@ -19,6 +19,7 @@ from ariel.memory import (
     AIJudgmentFailure,
     MEMORY_CURATION_PROMPT_VERSION,
     build_memory_context,
+    emit_memory_events,
     propose_memory_candidate,
 )
 from ariel.persistence import (
@@ -2320,6 +2321,15 @@ def _apply_remember_decision(
         now_fn=lambda: now,
         new_id_fn=new_id_fn,
         proactive_case_id=case.id,
+    )
+    emit_memory_events(
+        db,
+        events=memory_events,
+        entry_path="proactive",
+        actor_id="system",
+        scope_key=f"proactive:{case.id}",
+        now=now,
+        new_id_fn=new_id_fn,
     )
     assertion_id: str | None = None
     for memory_event in memory_events:

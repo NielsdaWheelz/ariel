@@ -1432,8 +1432,6 @@ def test_single_active_session_and_ordered_turn_event_chain(postgres_url: str) -
             "evt.ai_judgment.completed",
             "evt.model.started",
             "evt.model.completed",
-            "evt.memory.evidence_recorded",
-            "evt.memory.evidence_recorded",
             "evt.memory.extraction_queued",
             "evt.assistant.emitted",
             "evt.turn.completed",

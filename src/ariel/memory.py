@@ -24,6 +24,7 @@ from .persistence import (
     MemoryEntityProjectionRecord,
     MemoryEntityRecord,
     MemoryEvalRunRecord,
+    MemoryEventRecord,
     MemoryEpisodeRecord,
     MemoryEvidenceRecord,
     MemoryExportArtifactRecord,
@@ -931,6 +932,72 @@ def _event_payload(
     if evidence_id is not None:
         payload["evidence_id"] = evidence_id
     return payload
+
+
+class MemoryEventError(RuntimeError):
+    """A memory mutation produced an event dict that does not match the event
+    shape. The producer is the defect; emission must not silently drop it."""
+
+
+_EVENT_SUBJECT_REF_KEYS = (
+    "assertion_id",
+    "assertion_ids",
+    "conflict_set_id",
+    "resolution_assertion_id",
+    "evidence_id",
+    "subject_key",
+    "predicate",
+    "scope_type",
+    "scope_key",
+    "binding_id",
+    "topic_id",
+)
+
+
+def _event_subject_refs(payload: dict[str, Any]) -> dict[str, Any]:
+    """Project the subject-reference fields of a memory event payload into the
+    indexed subject_refs column. A scope-binding payload carries its row id in
+    ``id``; every other payload references subjects by the keys above."""
+    refs = {key: payload[key] for key in _EVENT_SUBJECT_REF_KEYS if key in payload}
+    if "scope_type" in payload and "id" in payload:
+        refs["binding_id"] = payload["id"]
+    return refs
+
+
+def emit_memory_events(
+    db: Session,
+    *,
+    events: Sequence[dict[str, Any]],
+    entry_path: str,
+    actor_id: str,
+    scope_key: str,
+    now: datetime,
+    new_id_fn: Callable[[str], str],
+    source_turn_id: str | None = None,
+) -> None:
+    """Persist memory mutation events to the non-turn-scoped memory_events log.
+
+    entry_path is one of turn|http|capability|worker|proactive|consolidation.
+    A malformed event dict is a defect (MemoryEventError), never a silent drop.
+    """
+    for event in events:
+        event_type = event.get("event_type")
+        payload = event.get("payload")
+        if not isinstance(event_type, str) or not isinstance(payload, dict):
+            raise MemoryEventError(f"malformed memory event: {event!r}")
+        db.add(
+            MemoryEventRecord(
+                id=new_id_fn("mze"),
+                event_type=event_type,
+                scope_key=scope_key,
+                actor_id=actor_id,
+                entry_path=entry_path,
+                subject_refs=_event_subject_refs(payload),
+                payload=payload,
+                source_turn_id=source_turn_id,
+                created_at=now,
+            )
+        )
 
 
 def _active_single_assertions(
@@ -3892,6 +3959,26 @@ def consolidate_memory(
         block.source_memory_versions = source_versions
         block.source_projection_versions = {"memory_context_blocks": MEMORY_PROJECTION_VERSION}
         block.updated_at = now
+    emit_memory_events(
+        db,
+        events=[
+            {
+                "event_type": "evt.memory.consolidation_completed",
+                "payload": {
+                    "scope_key": scope_key,
+                    "context_block_id": block.id,
+                    "selected_source_ids": source_assertion_ids,
+                    "proposed_change_count": len(proposed_changes),
+                    "applied_projection_count": len(applied_projection_changes) + 1,
+                },
+            }
+        ],
+        entry_path="consolidation",
+        actor_id=actor_id,
+        scope_key=scope_key,
+        now=now,
+        new_id_fn=new_id_fn,
+    )
     return {
         "scope_key": scope_key,
         "status": "completed",
@@ -5258,6 +5345,47 @@ def list_memory(db: Session) -> dict[str, Any]:
             or 0,
         },
     }
+
+
+def list_memory_events(
+    db: Session,
+    *,
+    scope_key: str | None = None,
+    event_type: str | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Read the unified memory event log, newest first, optionally filtered by
+    scope, event type, and a right-open ``[since, until)`` time range."""
+    query = select(MemoryEventRecord)
+    if scope_key is not None:
+        query = query.where(MemoryEventRecord.scope_key == scope_key)
+    if event_type is not None:
+        query = query.where(MemoryEventRecord.event_type == event_type)
+    if since is not None:
+        query = query.where(MemoryEventRecord.created_at >= since)
+    if until is not None:
+        query = query.where(MemoryEventRecord.created_at < until)
+    events = db.scalars(
+        query.order_by(MemoryEventRecord.created_at.desc(), MemoryEventRecord.id.desc()).limit(
+            limit
+        )
+    ).all()
+    return [
+        {
+            "id": event.id,
+            "event_type": event.event_type,
+            "scope_key": event.scope_key,
+            "actor_id": event.actor_id,
+            "entry_path": event.entry_path,
+            "subject_refs": event.subject_refs,
+            "payload": event.payload,
+            "source_turn_id": event.source_turn_id,
+            "created_at": to_rfc3339(event.created_at),
+        }
+        for event in events
+    ]
 
 
 def _validated_memory_curation(
@@ -6743,6 +6871,15 @@ def process_memory_extract_turn(
                         and isinstance(payload_data.get("assertion_id"), str)
                     ):
                         proposed_candidate_ids.append(payload_data["assertion_id"])
+                emit_memory_events(
+                    db,
+                    events=memory_events,
+                    entry_path="worker",
+                    actor_id="system",
+                    scope_key=f"session:{session_id}",
+                    now=now_fn(),
+                    new_id_fn=new_id_fn,
+                )
             now = now_fn()
             db.add(
                 AIJudgmentRecord(

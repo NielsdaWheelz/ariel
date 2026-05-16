@@ -20,6 +20,7 @@ from ariel.persistence import (
     BackgroundTaskRecord,
     MemoryAssertionRecord,
     MemoryEmbeddingProjectionRecord,
+    MemoryEventRecord,
     MemoryKeywordProjectionRecord,
     MemorySalienceRecord,
 )
@@ -252,9 +253,11 @@ def test_s5_pr01_turns_record_evidence_and_queue_extraction_without_command_pars
         assert payload["evidence"]
 
         event_types = _event_types(_latest_turn(client, session_id))
-        assert "evt.memory.evidence_recorded" in event_types
         assert "evt.memory.extraction_queued" in event_types
         assert "evt.memory.candidate_proposed" not in event_types
+        # Memory lifecycle events are not in the turn EventRecord stream; they
+        # land in the non-turn-scoped memory_events log.
+        assert "evt.memory.evidence_recorded" not in event_types
 
         with cast(Any, client.app).state.session_factory() as db:
             assert (
@@ -265,6 +268,11 @@ def test_s5_pr01_turns_record_evidence_and_queue_extraction_without_command_pars
                 )
                 == 1
             )
+            memory_event_rows = db.scalars(
+                select(MemoryEventRecord).where(MemoryEventRecord.entry_path == "turn")
+            ).all()
+            assert {row.event_type for row in memory_event_rows} == {"evt.memory.evidence_recorded"}
+            assert all(row.source_turn_id is not None for row in memory_event_rows)
 
 
 def test_s5_pr01_reviewed_candidate_is_recalled_with_evidence_snippet(

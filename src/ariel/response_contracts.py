@@ -1020,6 +1020,20 @@ class SurfaceMemoryEvalRunContract(BaseModel):
     updated_at: str
 
 
+class SurfaceMemoryEventContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    event_type: str
+    scope_key: str
+    actor_id: str
+    entry_path: str
+    subject_refs: dict[str, Any]
+    payload: dict[str, Any]
+    source_turn_id: str | None
+    created_at: str
+
+
 class SurfaceMemoryResponseContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1062,6 +1076,14 @@ class SurfaceMemorySearchResponseContract(BaseModel):
     ok: bool
     schema_version: str
     results: list[SurfaceMemorySearchResultContract]
+
+
+class SurfaceMemoryEventListResponseContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    schema_version: str
+    events: list[SurfaceMemoryEventContract]
 
 
 class SurfaceConnectorSubscriptionContract(BaseModel):
@@ -2198,6 +2220,18 @@ def build_surface_memory_search_response(*, schema_version: Any, results: Any) -
             "ok": True,
             "schema_version": schema_version,
             "results": results,
+        },
+    )
+
+
+def build_surface_memory_event_list_response(*, schema_version: Any, events: Any) -> dict[str, Any]:
+    return _validate_contract(
+        "surface_memory_event_list_response",
+        SurfaceMemoryEventListResponseContract,
+        {
+            "ok": True,
+            "schema_version": schema_version,
+            "events": events if isinstance(events, list) else [],
         },
     )
 

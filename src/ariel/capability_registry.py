@@ -79,6 +79,7 @@ MEMORY_CAPABILITY_IDS = {
     "cap.memory.delete",
     "cap.memory.privacy_delete",
     "cap.memory.deletions",
+    "cap.memory.events",
     "cap.memory.redact_evidence",
     "cap.memory.set_never_remember",
     "cap.memory.set_scope_mode",
@@ -1297,6 +1298,33 @@ def _validate_memory_limit_input(
     if limit is None:
         return None, "schema_invalid"
     return {"limit": limit}, None
+
+
+def _validate_memory_events_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {"scope_key", "event_type", "since", "until", "limit"}:
+        return None, "schema_invalid"
+    scope_key = _normalize_optional_text(raw_input.get("scope_key"), max_length=200)
+    event_type = _normalize_optional_text(raw_input.get("event_type"), max_length=64)
+    since = _normalize_optional_rfc3339_input(raw_input.get("since"))
+    until = _normalize_optional_rfc3339_input(raw_input.get("until"))
+    limit = _normalize_bounded_int(raw_input.get("limit"), minimum=1, maximum=200)
+    if (
+        (raw_input.get("scope_key") is not None and scope_key is None)
+        or (raw_input.get("event_type") is not None and event_type is None)
+        or (raw_input.get("since") is not None and since is None)
+        or (raw_input.get("until") is not None and until is None)
+        or limit is None
+    ):
+        return None, "schema_invalid"
+    return {
+        "scope_key": scope_key,
+        "event_type": event_type,
+        "since": since,
+        "until": until,
+        "limit": limit,
+    }, None
 
 
 def _validate_memory_context_blocks_input(
@@ -4405,6 +4433,21 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         validate_input=_validate_memory_limit_input,
         execute=_execute_memory_runtime,
     ),
+    "cap.memory.events": CapabilityDefinition(
+        capability_id="cap.memory.events",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "memory_events_v1",
+            "output_schema": "memory_event_log_v1",
+            "idempotency": "deterministic_read",
+            "execution_mode": "memory_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_events_input,
+        execute=_execute_memory_runtime,
+    ),
     "cap.memory.redact_evidence": CapabilityDefinition(
         capability_id="cap.memory.redact_evidence",
         version="1.0",
@@ -4714,6 +4757,7 @@ _RUN_CALLABLE_ALIASES = {
     "memory.delete": "cap.memory.delete",
     "memory.deletions": "cap.memory.deletions",
     "memory.deprioritize": "cap.memory.deprioritize",
+    "memory.events": "cap.memory.events",
     "memory.edit_candidate": "cap.memory.edit_candidate",
     "memory.export": "cap.memory.export",
     "memory.hot_index": "cap.memory.hot_index",

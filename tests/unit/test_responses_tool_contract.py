@@ -426,6 +426,7 @@ def test_memory_runtime_passes_scoped_mutation_inputs(
         session_id = "ses_1"
 
     monkeypatch.setattr(action_runtime, "_memory_actor_id", lambda **_: "assistant")
+    monkeypatch.setattr(action_runtime, "emit_memory_events", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         action_runtime,
         "_bounded_memory_payload",
@@ -502,6 +503,7 @@ def test_memory_runtime_handles_candidate_and_priority_mutations(
         session_id = "ses_1"
 
     monkeypatch.setattr(action_runtime, "_memory_actor_id", lambda **_: "assistant")
+    monkeypatch.setattr(action_runtime, "emit_memory_events", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         action_runtime,
         "_bounded_memory_payload",
