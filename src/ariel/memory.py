@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import json
 import re
+import time
 from typing import Any
 
 import httpx
@@ -4977,6 +4978,15 @@ def run_memory_eval(
     case_results: list[dict[str, Any]] = []
     passed_count = 0
     failed_count = 0
+    retrieval_latency_ms = 0.0
+    context_tokens = 0
+    expected_total = 0
+    expected_recalled = 0
+    selected_labeled = 0
+    selected_relevant = 0
+    omitted_relevant = 0
+    conflict_case_total = 0
+    conflict_case_handled = 0
     for index, raw_case in enumerate(cases[:100], start=1):
         query = raw_case.get("query")
         if not isinstance(query, str) or not query.strip():
@@ -5006,15 +5016,20 @@ def run_memory_eval(
             for item in raw_case.get("forbidden_texts", [])
             if isinstance(item, str) and item
         ]
+        expect_conflict = bool(raw_case.get("expect_conflict"))
+        raw_max = raw_case.get("max_recalled_assertions")
+        max_selected = raw_max if isinstance(raw_max, int) and raw_max > 0 else 8
+        started = time.perf_counter()
         try:
             memory_context, recall_event = build_memory_context(
                 db,
                 user_message=query,
-                max_recalled_assertions=8,
+                max_recalled_assertions=max_selected,
                 settings=settings,
                 current_session_id=current_session_id,
             )
         except AIJudgmentFailure as exc:
+            retrieval_latency_ms += (time.perf_counter() - started) * 1000.0
             case_results.append(
                 {
                     "index": index,
@@ -5029,10 +5044,19 @@ def run_memory_eval(
             failed_count += 1
             continue
 
+        retrieval_latency_ms += (time.perf_counter() - started) * 1000.0
         recall_window = memory_context["recall_window"]
         selected_memory_ids = [
             item for item in recall_window["selected_memory_ids"] if isinstance(item, str)
         ]
+        candidate_memory_ids = [
+            item for item in recall_window["candidate_memory_ids"] if isinstance(item, str)
+        ]
+        omitted_memory_ids = {
+            item["id"]
+            for item in recall_window["omitted_memories"]
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        }
         selected_kinds = [
             item["kind"]
             for item in recall_window["selected_memories"]
@@ -5049,6 +5073,7 @@ def run_memory_eval(
             },
             sort_keys=True,
         ).lower()
+        context_tokens += count_context_tokens(context_text(memory_context))
         failures: list[str] = []
         for expected_id in expected_ids:
             if expected_id not in selected_memory_ids:
@@ -5067,11 +5092,28 @@ def run_memory_eval(
         for forbidden_text in forbidden_texts:
             if forbidden_text in selected_text:
                 failures.append("selected forbidden text")
-        if (
-            bool(raw_case.get("expect_policy_blocked"))
-            and memory_context.get("memory_policy") is None
+        memory_policy = memory_context.get("memory_policy")
+        if bool(raw_case.get("expect_policy_blocked")) and (
+            not isinstance(memory_policy, dict) or memory_policy.get("allowed") is not False
         ):
             failures.append("expected memory policy block")
+        if expect_conflict and not memory_context["conflicts"]:
+            failures.append("expected an open conflict to be surfaced")
+
+        # Metric accounting. A case's expected ids are its relevant set; recall
+        # is over the candidate pool; precision is over the selected memories the
+        # case explicitly labelled (expected or forbidden), so unlabelled
+        # selections in a case that only asserts a conflict do not skew it.
+        labelled_ids = set(expected_ids) | set(forbidden_ids)
+        expected_total += len(expected_ids)
+        expected_recalled += sum(1 for eid in expected_ids if eid in candidate_memory_ids)
+        selected_labeled += sum(1 for sid in selected_memory_ids if sid in labelled_ids)
+        selected_relevant += sum(1 for sid in selected_memory_ids if sid in expected_ids)
+        omitted_relevant += sum(1 for eid in expected_ids if eid in omitted_memory_ids)
+        if expect_conflict:
+            conflict_case_total += 1
+            if memory_context["conflicts"]:
+                conflict_case_handled += 1
 
         if failures:
             status = "failed"
@@ -5087,10 +5129,11 @@ def run_memory_eval(
                 "failures": failures,
                 "selected_memory_ids": selected_memory_ids,
                 "selected_memory_kinds": selected_kinds,
+                "candidate_memory_ids": candidate_memory_ids,
                 "omitted_memory_count": recall_window["omitted_memory_count"],
                 "memory_candidate_count": recall_window["memory_candidate_count"],
                 "curation_confidence": recall_window["curation_confidence"],
-                "memory_policy": memory_context.get("memory_policy"),
+                "memory_policy": memory_policy,
                 "projection_health": memory_context["projection_health"],
                 "recall_diagnostics": recall_event,
             }
@@ -5127,6 +5170,7 @@ def run_memory_eval(
         )
         or 0
     )
+    pass_rate = passed_count / len(case_results) if case_results else 1.0
     run = MemoryEvalRunRecord(
         id=new_id_fn("mer"),
         eval_name=_clean_text(eval_name, max_chars=200) or "memory eval",
@@ -5139,7 +5183,26 @@ def run_memory_eval(
             "case_count": len(cases),
             "passed_cases": passed_count,
             "failed_cases": failed_count,
-            "pass_rate": passed_count / len(case_results) if case_results else 1.0,
+            "pass_rate": pass_rate,
+            # The memory.md eval metric set. The eval exercises recall only, so
+            # retrieval latency is measured and the extraction/curation/projection/
+            # consolidation stages it does not run are recorded as zero.
+            "answer_accuracy": pass_rate,
+            "candidate_recall": expected_recalled / expected_total if expected_total else 1.0,
+            "curation_precision": (
+                selected_relevant / selected_labeled if selected_labeled else 1.0
+            ),
+            "selected_relevant_memory_count": selected_relevant,
+            "omitted_relevant_memory_count": omitted_relevant,
+            "conflict_handling_accuracy": (
+                conflict_case_handled / conflict_case_total if conflict_case_total else 1.0
+            ),
+            "context_tokens": context_tokens,
+            "extraction_latency_ms": 0.0,
+            "retrieval_latency_ms": retrieval_latency_ms,
+            "curation_latency_ms": 0.0,
+            "projection_latency_ms": 0.0,
+            "consolidation_latency_ms": 0.0,
         },
         cases=case_results,
         created_at=now,
