@@ -717,7 +717,7 @@ REQUIRED_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
         "ck_memory_deletion_redaction_posture": ("'none'", "'privacy_deleted'"),
     },
     "memory_projection_jobs": {
-        "ck_memory_projection_job_kind": ("'embedding'", "'topic_block'", "'export'"),
+        "ck_memory_projection_job_kind": ("'embedding'", "'topic_block'"),
         "ck_memory_projection_job_lifecycle_state": ("'pending'", "'dead_letter'"),
         "ck_memory_projection_job_attempts": ("attempts", ">=", "0"),
         "ck_memory_projection_job_max_retries": ("max_retries", ">=", "0"),

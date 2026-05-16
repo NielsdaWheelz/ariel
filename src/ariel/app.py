@@ -3076,7 +3076,14 @@ def _rotate_active_session(
         .where(TurnRecord.session_id == prior_session_id)
         .order_by(TurnRecord.created_at.asc(), TurnRecord.id.asc())
     ).all()
-    if active_session.memory_mode == "normal":
+    memory_allowed = resolve_memory_policy(
+        db,
+        operation="consolidate",
+        now=now,
+        session_id=prior_session_id,
+        actor_id=actor_id,
+    ).allowed
+    if memory_allowed:
         record_rotation_context_block(
             db=db,
             rotation_id=rotation_id,
@@ -3121,13 +3128,7 @@ def _rotate_active_session(
 
     # Session rotation absorbs the closed session's memory: enqueue a hot-index
     # consolidation for the global scope, gated by consolidate policy.
-    if resolve_memory_policy(
-        db,
-        operation="consolidate",
-        now=now,
-        session_id=prior_session_id,
-        actor_id=actor_id,
-    ).allowed:
+    if memory_allowed:
         enqueue_consolidation_job(
             db, scope_key="global", kind="hot_index", now=now, new_id_fn=_new_id
         )

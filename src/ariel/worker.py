@@ -41,7 +41,6 @@ from .persistence import (
 from .memory import (
     consolidate_memory,
     enqueue_consolidation_job,
-    export_memory,
     process_memory_extract_turn,
     process_memory_graph_projection_job,
     process_memory_projection_job,
@@ -78,15 +77,13 @@ PROACTIVE_RECOVERABLE_TASK_TYPES = (
 # Projection-job kinds the maintenance worker consumes. The schema CHECK
 # ck_memory_projection_job_kind is reconciled to exactly the enqueued-and-
 # consumed set: embedding and graph are handled by their own workers; these are
-# the consolidation/export kinds.
+# the consolidation kinds.
 MEMORY_CONSOLIDATION_PROJECTION_KINDS = (
     "context_block",
     "project_state",
     "hot_index",
     "topic_block",
 )
-
-MEMORY_MAINTENANCE_PROJECTION_KINDS = MEMORY_CONSOLIDATION_PROJECTION_KINDS + ("export",)
 
 
 class UnsupportedTaskType(RuntimeError):
@@ -495,7 +492,7 @@ def process_memory_maintenance_job(
                 select(MemoryProjectionJobRecord)
                 .where(
                     MemoryProjectionJobRecord.projection_kind.in_(
-                        MEMORY_MAINTENANCE_PROJECTION_KINDS
+                        MEMORY_CONSOLIDATION_PROJECTION_KINDS
                     ),
                     MemoryProjectionJobRecord.lifecycle_state == "pending",
                     MemoryProjectionJobRecord.run_after <= now,
@@ -518,7 +515,6 @@ def process_memory_maintenance_job(
             job.updated_at = now
             job_id = job.id
             attempt_token = str(job.attempt_token)
-            projection_kind = job.projection_kind
             scope_key = job.target_id.strip()
             if job.target_table != "memory_scopes":
                 job.lifecycle_state = "dead_letter"
@@ -555,24 +551,13 @@ def process_memory_maintenance_job(
                 )
                 if job is None:
                     return True
-                if projection_kind in MEMORY_CONSOLIDATION_PROJECTION_KINDS:
-                    consolidate_memory(
-                        db,
-                        scope_key=scope_key,
-                        actor_id=f"memory-worker:{job_id}",
-                        now_fn=now_fn,
-                        new_id_fn=new_id_fn,
-                    )
-                elif projection_kind == "export":
-                    export_memory(
-                        db,
-                        scope_key=scope_key,
-                        actor_id=f"memory-worker:{job_id}",
-                        now_fn=now_fn,
-                        new_id_fn=new_id_fn,
-                    )
-                else:
-                    raise RuntimeError(f"unsupported memory maintenance job: {projection_kind}")
+                consolidate_memory(
+                    db,
+                    scope_key=scope_key,
+                    actor_id=f"memory-worker:{job_id}",
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
                 now = now_fn()
                 job.lifecycle_state = "completed"
                 job.error = None

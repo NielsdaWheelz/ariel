@@ -71,7 +71,7 @@ _MEMORY_PROJECTION_JOB_KIND_BEFORE = (
 )
 _MEMORY_PROJECTION_JOB_KIND_AFTER = (
     "projection_kind IN ('embedding', 'graph', 'context_block', "
-    "'project_state', 'hot_index', 'topic_block', 'export')"
+    "'project_state', 'hot_index', 'topic_block')"
 )
 
 
