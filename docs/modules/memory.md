@@ -225,7 +225,8 @@ Every durable memory moves through this lifecycle:
   diagnostics, user corrections, and action outcomes.
 - Negative memory: durable "do not repeat" knowledge such as rejected
   approaches, invalid assumptions, unsafe operations, already-checked areas, and
-  insufficient evidence.
+  insufficient evidence. Negative memory is the `negative` value of
+  `assertion_type` and uses a dedicated `negative.*` predicate family.
 - Archival evidence: source records and artifacts that are not injected by
   default but remain inspectable and retrievable by explicit tools.
 
@@ -606,6 +607,9 @@ Conflicts:
 - `resolved`
 - `ignored`
 
+A conflict set always reaches a terminal state once its contradiction ends.
+Every conflict set records a `conflict_type`.
+
 Projection jobs:
 
 - `pending`
@@ -628,8 +632,10 @@ Topic blocks and context blocks:
 - Every active procedure links to evidence and review state.
 - Exactly one active assertion can own a single-valued predicate for a subject
   and scope.
-- Multi-valued predicates must declare that they are multi-valued in the schema
-  or type registry.
+- The predicate registry is the authoritative declaration of each predicate's
+  cardinality, conflict policy, value kind, sensitivity default, and confidence
+  decay. Whether a predicate is multi-valued is resolved from the registry, not
+  supplied per candidate.
 - A conflicted assertion must belong to an open conflict set.
 - A superseded assertion must identify its superseding assertion.
 - A stale assertion must identify staleness evidence or consolidation rationale.
@@ -691,6 +697,12 @@ Topic blocks and context blocks:
 - topic membership
 - symbol and repo map match
 
+Hybrid candidate retrieval fuses these signals with Reciprocal Rank Fusion. Each
+signal emits a ranked list and the fusion produces one bounded candidate pool.
+Fusion is deterministic with stable tie-breaking for identical inputs. Every
+candidate in the pool carries a feature vector recording its per-signal ranks
+and signal values.
+
 ### Candidate Retrieval Outputs
 
 - hot index block
@@ -742,6 +754,7 @@ Required endpoints or equivalent routes:
 - inspect memory assertion
 - inspect evidence
 - inspect memory history
+- inspect the memory event log (`GET /v1/memory/events`)
 - inspect recall for a turn
 - list candidates needing review
 - approve candidate
@@ -832,6 +845,10 @@ Required event concepts:
 Events must include ids, lifecycle state, actor id, projection version when
 relevant, source evidence ids when relevant, and enough metadata to reconstruct
 behavior.
+
+`evt.memory.*` events persist to the `memory_events` log, not the turn
+`EventRecord` stream. Every memory mutation appends to `memory_events` regardless
+of entry path.
 
 ## Files
 
