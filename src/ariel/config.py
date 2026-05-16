@@ -46,6 +46,8 @@ class AppSettings(BaseSettings):
     memory_embedding_model: str = "text-embedding-3-small"
     memory_embedding_dimensions: int = MEMORY_EMBEDDING_DIMENSIONS
     memory_import_cutover_enabled: bool = False
+    memory_vector_distance_ceiling: float = 0.6
+    memory_rrf_k: int = 60
     memory_consolidation_candidate_threshold: int = 12
     memory_consolidation_conflict_threshold: int = 3
     memory_consolidation_interval_seconds: int = 86400
@@ -290,6 +292,20 @@ class AppSettings(BaseSettings):
     def _memory_embedding_dimensions_must_match_schema(cls, value: int) -> int:
         if value != MEMORY_EMBEDDING_DIMENSIONS:
             raise ValueError(f"memory_embedding_dimensions must be {MEMORY_EMBEDDING_DIMENSIONS}")
+        return value
+
+    @field_validator("memory_vector_distance_ceiling")
+    @classmethod
+    def _memory_vector_distance_ceiling_must_be_in_range(cls, value: float) -> float:
+        if not 0.0 < value <= 2.0:
+            raise ValueError("memory_vector_distance_ceiling must be in (0.0, 2.0]")
+        return value
+
+    @field_validator("memory_rrf_k")
+    @classmethod
+    def _memory_rrf_k_must_be_positive(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("memory_rrf_k must be >= 1")
         return value
 
     @field_validator(

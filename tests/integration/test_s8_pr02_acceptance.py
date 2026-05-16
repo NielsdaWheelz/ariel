@@ -174,7 +174,7 @@ def _fake_memory_curation(
         "uncertainty": "",
         "confidence": 0.9,
         "model": "fixture-memory-curator",
-        "prompt_version": "memory-curation-v1",
+        "prompt_version": "memory-curation-v2",
         "parse_status": "parsed",
     }
 

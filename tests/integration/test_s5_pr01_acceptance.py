@@ -191,7 +191,7 @@ def _memory(client: TestClient) -> dict[str, Any]:
     assert response.status_code == 200
     payload = response.json()
     assert payload["ok"] is True
-    assert payload["schema_version"] == "memory.sota.v1"
+    assert payload["schema_version"] == "memory.sota.v2"
     return payload
 
 
@@ -436,7 +436,7 @@ def test_s5_pr01_projections_are_vector_and_keyword_not_legacy_terms(
                 == AppSettings().memory_embedding_dimensions
             )
             assert keyword.projection_version == MEMORY_PROJECTION_VERSION
-            assert keyword.weighted_terms
+            assert keyword.search_document
 
 
 def test_s5_pr01_recall_uses_ai_curation_and_reports_omissions(
@@ -532,8 +532,11 @@ def test_s5_pr01_recall_uses_ai_curation_and_reports_omissions(
         assert first_candidate["trust_boundary"]
         assert first_candidate["taint"]["provenance_status"]
         assert first_candidate["projection_version"] == MEMORY_PROJECTION_VERSION
-        assert first_candidate["transport_order"] >= 1
-        assert first_candidate["retrieval_features"]["updated_at_order"] >= 1
+        # The RRF pipeline attaches a feature vector, not a transport_order.
+        features = first_candidate["retrieval_features"]
+        assert features["rrf_score"] > 0.0
+        assert isinstance(features["signal_ranks"], dict) and features["signal_ranks"]
+        assert "effective_confidence" in features
         assert "conflict_status" in first_candidate
 
         with cast(Any, client.app).state.session_factory() as db:

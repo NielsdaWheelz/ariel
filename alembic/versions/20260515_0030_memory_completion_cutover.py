@@ -155,6 +155,9 @@ def _upgrade_memory_keyword_projections() -> None:
         ["search_vector"],
         postgresql_using="gin",
     )
+    # weighted_terms is superseded by the search_vector tsvector column; lexical
+    # retrieval is Postgres full-text only, so the JSONB term map is dropped.
+    op.drop_column("memory_keyword_projections", "weighted_terms")
     op.drop_constraint(
         "ck_memory_keyword_projection_canonical_table",
         "memory_keyword_projections",
@@ -214,6 +217,16 @@ def _downgrade_memory_keyword_projections() -> None:
         "memory_keyword_projections",
         _MEMORY_KEYWORD_PROJECTION_CANONICAL_TABLE_BEFORE,
     )
+    op.add_column(
+        "memory_keyword_projections",
+        sa.Column(
+            "weighted_terms",
+            postgresql.JSONB(astext_type=sa.Text()),
+            nullable=False,
+            server_default="{}",
+        ),
+    )
+    op.alter_column("memory_keyword_projections", "weighted_terms", server_default=None)
     op.drop_index(
         "ix_memory_keyword_projections_search_vector",
         table_name="memory_keyword_projections",

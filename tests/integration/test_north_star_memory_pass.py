@@ -39,6 +39,7 @@ from ariel.persistence import (
     MemoryConflictSetRecord,
     MemoryDeletionRecord,
     MemoryEmbeddingProjectionRecord,
+    MemoryEpisodeRecord,
     MemoryExportArtifactRecord,
     MemoryGraphProjectionRecord,
     MemoryEvidenceRecord,
@@ -165,10 +166,37 @@ def _build_client(
     return TestClient(app)
 
 
+# Each topic word maps to its own embedding dimension. Text that shares a topic
+# word lands close in cosine space; unrelated text is orthogonal (distance 1.0,
+# beyond the recall distance ceiling). This is non-degenerate: the vector signal
+# and the lexical signal genuinely diverge, so neither alone satisfies recall.
+_EMBEDDING_TOPIC_DIMENSIONS: dict[str, int] = {
+    "phoenix": 0,
+    "notebook": 1,
+    "notebooks": 1,
+    "zebra": 2,
+    "migration": 3,
+    "deploy": 4,
+    "smoke": 5,
+    "worker": 6,
+    "espresso": 7,
+    "milestone": 8,
+    "vendor": 9,
+}
+
+
 def _fake_memory_embedding(text: str, *, settings: AppSettings) -> list[float]:
     vector = [0.0] * settings.memory_embedding_dimensions
-    vector[0 if "phoenix" in text.lower() else 1] = 1.0
-    return vector
+    lowered = text.lower()
+    for token, dimension in _EMBEDDING_TOPIC_DIMENSIONS.items():
+        if token in lowered:
+            vector[dimension] = 1.0
+    if not any(vector):
+        # Text with no known topic word lands on a stable fallback dimension so it
+        # is still orthogonal to every topic vector.
+        vector[settings.memory_embedding_dimensions - 1] = 1.0
+    norm = sum(component * component for component in vector) ** 0.5
+    return [component / norm for component in vector]
 
 
 def _fake_memory_curation(
@@ -2698,3 +2726,415 @@ def test_consolidation_promotes_successful_traces_and_failures_to_candidates(
             assert negative.lifecycle_state == "candidate"
             assert negative.predicate == "negative.known_bad_path"
             assert negative.is_multi_valued is True
+
+
+def _top_rrf_curation(
+    *,
+    user_message: str,
+    history: Sequence[dict[str, Any]],
+    candidates: Sequence[dict[str, Any]],
+    max_selected: int,
+    settings: AppSettings,
+) -> dict[str, Any]:
+    """Curator fixture that selects the highest-rrf_score candidates. It mirrors a
+    relevance-aware curator just enough to let a test read which candidate the
+    fused pool ranked first."""
+    del user_message, history, settings
+    ranked = sorted(
+        candidates,
+        key=lambda candidate: (
+            -float(candidate["retrieval_features"]["rrf_score"]),
+            str(candidate["id"]),
+        ),
+    )
+    selected = [
+        {
+            "id": candidate["id"],
+            "kind": candidate.get("kind", "semantic_assertion"),
+            "rationale": "selected by fused rrf score",
+        }
+        for candidate in ranked[:max_selected]
+    ]
+    selected_ids = {item["id"] for item in selected}
+    return {
+        "selected_memories": selected,
+        "omitted_memories": [
+            {
+                "id": candidate["id"],
+                "kind": candidate.get("kind", "semantic_assertion"),
+                "reason": "omitted: lower fused rrf score",
+            }
+            for candidate in candidates
+            if candidate["id"] not in selected_ids
+        ],
+        "rationale": "fixture top-rrf curation",
+        "uncertainty": "",
+        "confidence": 0.9,
+        "model": "fixture-rrf-curator",
+        "prompt_version": memory.MEMORY_CURATION_PROMPT_VERSION,
+        "provider_response_id": "resp_fixture_rrf_curator",
+        "parse_status": "parsed",
+    }
+
+
+def test_hybrid_retrieval_requires_multiple_signals(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Three active assertions. The vector signal ranks A first, C second; the
+    # lexical signal ranks B first, C second. Under fused Reciprocal Rank Fusion C
+    # accumulates a contribution from both signals and ranks first overall, while A
+    # and B each score from one signal only. C is the correct answer, and it is
+    # reachable only by the hybrid pool: vector-only retrieval surfaces A and
+    # keyword-only retrieval surfaces B.
+    monkeypatch.setattr(memory, "embed_memory_text", _fake_memory_embedding)
+    monkeypatch.setattr(memory, "_curate_memory_context_with_model", _top_rrf_curation)
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        session_id = _session_id(client)
+        ids: dict[str, str] = {}
+        for label, value in (
+            ("A", "the alpha vector-only landing note"),
+            ("B", "the bravo keyword-only landing note"),
+            ("C", "the gamma fused landing note"),
+        ):
+            candidate = _candidate(
+                client,
+                subject_key="user:default",
+                predicate="commitment.todo",
+                assertion_type="commitment",
+                value=value,
+                evidence_text=f"The user recorded the {label} landing note.",
+            )
+            assert (
+                client.post(f"/v1/memory/candidates/{candidate['id']}/approve").status_code == 200
+            )
+            ids[label] = candidate["id"]
+
+        assertions_ref = ("memory_assertions",)
+
+        def _vector(a_first: bool) -> Any:
+            def signal(
+                db: Any, *, user_message: str, settings: AppSettings, limit: int
+            ) -> tuple[list[tuple[str, str]], dict[str, float]]:
+                del db, user_message, settings, limit
+                ranked = (
+                    [(assertions_ref[0], ids["A"]), (assertions_ref[0], ids["C"])]
+                    if a_first
+                    else []
+                )
+                return ranked, {ids["A"]: 0.1, ids["C"]: 0.2}
+
+            return signal
+
+        def _lexical(b_first: bool) -> Any:
+            def signal(
+                db: Any, *, user_message: str, limit: int
+            ) -> tuple[list[tuple[str, str]], dict[str, int]]:
+                del db, user_message, limit
+                ranked = (
+                    [(assertions_ref[0], ids["B"]), (assertions_ref[0], ids["C"])]
+                    if b_first
+                    else []
+                )
+                return ranked, {ids["B"]: 1, ids["C"]: 2}
+
+            return signal
+
+        def _recall(*, vector_on: bool, lexical_on: bool) -> dict[str, Any]:
+            monkeypatch.setattr(memory, "_vector_signal", _vector(vector_on))
+            monkeypatch.setattr(memory, "_lexical_signal", _lexical(lexical_on))
+            with _session_factory(client)() as db:
+                memory_context, _event = memory.build_memory_context(
+                    db,
+                    user_message="which landing note is the correct one",
+                    max_recalled_assertions=1,
+                    settings=_settings(),
+                    current_session_id=session_id,
+                )
+            return memory_context
+
+        # Hybrid: every signal runs. C is in the pool and is the selected answer.
+        hybrid = _recall(vector_on=True, lexical_on=True)
+        hybrid_candidate_ids = hybrid["recall_window"]["candidate_memory_ids"]
+        assert ids["C"] in hybrid_candidate_ids
+        assert hybrid["recall_window"]["selected_memory_ids"] == [ids["C"]]
+
+        # Vector-only retrieval surfaces A, never the fused-only answer C.
+        vector_only = _recall(vector_on=True, lexical_on=False)
+        assert vector_only["recall_window"]["selected_memory_ids"] == [ids["A"]]
+        assert vector_only["recall_window"]["selected_memory_ids"] != [ids["C"]]
+
+        # Keyword-only retrieval surfaces B, never the fused-only answer C.
+        keyword_only = _recall(vector_on=False, lexical_on=True)
+        assert keyword_only["recall_window"]["selected_memory_ids"] == [ids["B"]]
+        assert keyword_only["recall_window"]["selected_memory_ids"] != [ids["C"]]
+
+
+def test_recall_returns_every_memory_kind(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Seed one memory of every kind, then assert the recall candidate pool and the
+    # search results both cover all of them: semantic assertion, episode,
+    # reasoning trace, action trace, procedure, project state, negative memory,
+    # hot index, topic block, and conflict.
+    _use_fake_memory_models(monkeypatch)
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        session_id = _session_id(client)
+        now = datetime(2026, 5, 12, 9, 0, tzinfo=UTC)
+
+        semantic = _candidate(client, value="phoenix ships tomorrow")
+        assert client.post(f"/v1/memory/candidates/{semantic['id']}/approve").status_code == 200
+        _process_projection(client)
+
+        procedure_candidate = _candidate(
+            client,
+            subject_key="project:phoenix",
+            predicate="procedure.deploy",
+            assertion_type="procedure",
+            value="Before deploying phoenix run the smoke tests.",
+            evidence_text="The user described the phoenix deploy procedure.",
+        )
+        assert (
+            client.post(f"/v1/memory/candidates/{procedure_candidate['id']}/approve").status_code
+            == 200
+        )
+        _process_projection(client)
+
+        negative_candidate = _candidate(
+            client,
+            subject_key="repo:ariel",
+            predicate="negative.rejected_approach",
+            assertion_type="negative",
+            value="do not retry the synchronous phoenix import path",
+            evidence_text="The synchronous phoenix import path was rejected.",
+        )
+        assert (
+            client.post(f"/v1/memory/candidates/{negative_candidate['id']}/approve").status_code
+            == 200
+        )
+        _process_projection(client)
+
+        with _session_factory(client)() as db:
+            with db.begin():
+                evidence = MemoryEvidenceRecord(
+                    id=_new_id("mev"),
+                    source_turn_id=None,
+                    source_session_id=session_id,
+                    actor_id="system",
+                    content_class="system",
+                    trust_boundary="system",
+                    lifecycle_state="available",
+                    source_uri=None,
+                    source_artifact_id=None,
+                    source_text="phoenix kinds evidence",
+                    evidence_snippet="phoenix kinds evidence",
+                    redaction_posture="none",
+                    metadata_json={},
+                    created_at=now,
+                    updated_at=now,
+                )
+                db.add(evidence)
+                db.flush()
+                db.add(
+                    MemoryEpisodeRecord(
+                        id=_new_id("mep"),
+                        episode_type="task_event",
+                        scope_key="global",
+                        title="phoenix launch episode",
+                        summary="the phoenix launch review happened",
+                        outcome="phoenix review complete",
+                        occurred_at=now,
+                        valid_from=None,
+                        valid_to=None,
+                        lifecycle_state="active",
+                        primary_evidence_id=evidence.id,
+                        related_entity_ids=[],
+                        related_assertion_ids=[],
+                        metadata_json={},
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                memory.record_reasoning_trace(
+                    db,
+                    scope_key="global",
+                    trace_type="diagnostic",
+                    task_summary="diagnose the phoenix launch",
+                    trace_summary="checked the phoenix launch readiness",
+                    outcome="succeeded",
+                    primary_evidence_id=evidence.id,
+                    source_turn_id=None,
+                    now=now,
+                    new_id_fn=_new_id,
+                )
+                db.add(
+                    MemoryActionTraceRecord(
+                        id=_new_id("mat"),
+                        scope_key="global",
+                        trace_type="execution",
+                        action_attempt_id=None,
+                        source_turn_id=None,
+                        primary_evidence_id=evidence.id,
+                        capability_id="cap.memory.inspect",
+                        summary="ran the phoenix launch action",
+                        outcome="succeeded",
+                        result_refs={},
+                        lifecycle_state="active",
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                db.add(
+                    ProjectStateSnapshotRecord(
+                        id=_new_id("pss"),
+                        project_key="phoenix",
+                        summary="phoenix project state snapshot",
+                        state={"status": "active"},
+                        lifecycle_state="active",
+                        source_assertion_ids=[procedure_candidate["id"]],
+                        source_episode_ids=[],
+                        source_evidence_ids=[evidence.id],
+                        projection_version=MEMORY_PROJECTION_VERSION,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                db.add(
+                    MemoryContextBlockRecord(
+                        id=_new_id("mcb"),
+                        block_type="hot_index",
+                        scope_key="global",
+                        content="phoenix hot index block",
+                        topic_id=None,
+                        lifecycle_state="active",
+                        source_assertion_ids=[procedure_candidate["id"]],
+                        source_episode_ids=[],
+                        source_trace_ids=[],
+                        source_action_trace_ids=[],
+                        source_procedure_ids=[],
+                        source_project_state_snapshot_ids=[],
+                        source_memory_versions={},
+                        source_projection_versions={},
+                        projection_version=MEMORY_PROJECTION_VERSION,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                topic = MemoryTopicRecord(
+                    id=_new_id("mtp"),
+                    topic_key="phoenix-topic",
+                    family="active-projects",
+                    scope_key="global",
+                    title="phoenix topic",
+                    summary="phoenix topic summary",
+                    lifecycle_state="active",
+                    projection_version=MEMORY_PROJECTION_VERSION,
+                    metadata_json={},
+                    created_at=now,
+                    updated_at=now,
+                )
+                db.add(topic)
+                db.flush()
+                db.add(
+                    MemoryContextBlockRecord(
+                        id=_new_id("mcb"),
+                        block_type="topic",
+                        scope_key="global",
+                        content="phoenix topic block",
+                        topic_id=topic.id,
+                        lifecycle_state="active",
+                        source_assertion_ids=[procedure_candidate["id"]],
+                        source_episode_ids=[],
+                        source_trace_ids=[],
+                        source_action_trace_ids=[],
+                        source_procedure_ids=[],
+                        source_project_state_snapshot_ids=[],
+                        source_memory_versions={},
+                        source_projection_versions={},
+                        projection_version=MEMORY_PROJECTION_VERSION,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+
+        # An open conflict on the phoenix deadline gives the conflict kind.
+        conflicting = _candidate(client, value="phoenix ships next week")
+        assert client.post(f"/v1/memory/candidates/{conflicting['id']}/approve").status_code == 409
+
+        with _session_factory(client)() as db:
+            memory_context, _event = memory.build_memory_context(
+                db,
+                user_message="phoenix launch deploy review readiness import",
+                max_recalled_assertions=40,
+                settings=_settings(),
+                current_session_id=session_id,
+            )
+        candidate_kinds = {
+            item["kind"] for item in memory_context["recall_window"]["candidate_memories"]
+        }
+        assert candidate_kinds == {
+            "semantic_assertion",
+            "episode",
+            "reasoning_trace",
+            "action_trace",
+            "procedure",
+            "project_state",
+            "negative_memory",
+            "hot_index",
+            "topic",
+            "conflict",
+        }
+
+        search_results = client.get(
+            "/v1/memory/search",
+            params={"q": "phoenix launch deploy review readiness import", "limit": 40},
+        ).json()["results"]
+        assert {result["kind"] for result in search_results} == candidate_kinds
+
+
+def test_curation_accounts_for_every_candidate(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Curation must classify every pooled candidate as either selected or omitted:
+    # selected + omitted is exactly the candidate pool, with no overlap.
+    _use_fake_memory_models(monkeypatch)
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        session_id = _session_id(client)
+        for index in range(5):
+            candidate = _candidate(
+                client,
+                subject_key="user:default",
+                predicate="commitment.todo",
+                assertion_type="commitment",
+                value=f"phoenix follow-up task {index}",
+                evidence_text=f"The user noted phoenix follow-up task {index}.",
+            )
+            assert (
+                client.post(f"/v1/memory/candidates/{candidate['id']}/approve").status_code == 200
+            )
+
+        with _session_factory(client)() as db:
+            memory_context, _event = memory.build_memory_context(
+                db,
+                user_message="phoenix follow-up task",
+                max_recalled_assertions=2,
+                settings=_settings(),
+                current_session_id=session_id,
+            )
+        recall_window = memory_context["recall_window"]
+        pool = set(recall_window["candidate_memory_ids"])
+        assert pool
+        selected = {item["id"] for item in recall_window["selected_memories"]}
+        omitted = {item["id"] for item in recall_window["omitted_memories"]}
+        # Every candidate is accounted for, and nothing is both selected and omitted.
+        assert selected | omitted == pool
+        assert selected & omitted == set()
+        assert (
+            recall_window["selected_memory_count"] + recall_window["omitted_memory_count"]
+            == recall_window["memory_candidate_count"]
+        )

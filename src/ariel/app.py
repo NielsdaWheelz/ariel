@@ -4082,7 +4082,7 @@ def create_app(
                 )
                 try:
                     return build_surface_memory_search_response(
-                        schema_version="memory.sota.v1",
+                        schema_version=MEMORY_CONTEXT_SCHEMA_VERSION,
                         results=results,
                     )
                 except ResponseContractViolation as exc:

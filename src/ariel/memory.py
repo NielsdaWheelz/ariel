@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import json
@@ -53,9 +53,9 @@ from .persistence import (
 from .redaction import redact_text
 
 
-MEMORY_CONTEXT_SCHEMA_VERSION = "memory.sota.v1"
+MEMORY_CONTEXT_SCHEMA_VERSION = "memory.sota.v2"
 MEMORY_PROJECTION_VERSION = "embedding-v1"
-MEMORY_CURATION_PROMPT_VERSION = "memory-curation-v1"
+MEMORY_CURATION_PROMPT_VERSION = "memory-curation-v2"
 MEMORY_CONTINUITY_PROMPT_VERSION = "memory-continuity-v1"
 USER_SUBJECT_KEY = "user:default"
 ALLOWED_MEMORY_ASSERTION_TYPES = {
@@ -442,13 +442,6 @@ def _terms(value: str) -> list[str]:
         if token not in _STOPWORDS:
             terms.append(token)
     return terms
-
-
-def _weighted_terms(value: str) -> dict[str, float]:
-    weights: dict[str, float] = {}
-    for term in _terms(value):
-        weights[term] = weights.get(term, 0.0) + 1.0
-    return weights
 
 
 def _symbol_tokens(value: str) -> list[tuple[str, str]]:
@@ -1360,7 +1353,6 @@ def _record_projection_rows(
             projection_version=MEMORY_PROJECTION_VERSION,
             source_memory_version=source_memory_version,
             search_text=search_text,
-            weighted_terms=_weighted_terms(search_text),
             search_document=search_text,
             created_at=now,
             updated_at=now,
@@ -6247,12 +6239,21 @@ def _curate_memory_context_with_model(
 
     prompt = (
         "You are Ariel's memory curator. Select only memories that matter for the "
-        "current turn. Use the user request, recent history, memory values, evidence, "
-        "validity, conflicts, and provenance. Do not select memories just because they "
-        "appear first. Return JSON only with selected_memories, omitted_memories, "
-        "rationale, uncertainty, and confidence. selected_memories must contain objects "
-        "with id and rationale. omitted_memories must contain every unselected candidate "
-        "with id and reason. Select at most the provided max_selected."
+        "current turn. The candidates are a fused multi-signal pool; each carries a "
+        "kind (semantic_assertion, episode, reasoning_trace, action_trace, procedure, "
+        "project_state, hot_index, topic, negative_memory, conflict) and a "
+        "retrieval_features vector (rrf_score, signal_ranks, vector_distance, "
+        "lexical_rank, salience_score, user_priority, source_trust, "
+        "effective_confidence, verification_age_days, conflict_status, validity, "
+        "topic_membership). Reciprocal Rank Fusion produced the pool order; it is "
+        "transport order, not relevance — use the user request, recent history, "
+        "memory values, evidence, validity, conflicts, decay, and provenance to judge "
+        "relevance. A candidate whose conflict_status is open is unresolved: never "
+        "treat it as settled. Return JSON only with selected_memories, "
+        "omitted_memories, rationale, uncertainty, and confidence. selected_memories "
+        "must contain objects with id and rationale. omitted_memories must contain "
+        "every unselected candidate with id and reason — selected and omitted together "
+        "must account for every candidate. Select at most the provided max_selected."
     )
     try:
         response = httpx.post(
@@ -6459,6 +6460,503 @@ def _projection_health(db: Session) -> dict[str, Any]:
     }
 
 
+# Each retrieval signal and the fused pool address candidates by a canonical
+# (table, id) ref. These constants name the canonical tables every signal and the
+# kind map below agree on.
+_TABLE_ASSERTIONS = "memory_assertions"
+_TABLE_EPISODES = "memory_episodes"
+_TABLE_REASONING_TRACES = "memory_reasoning_traces"
+_TABLE_ACTION_TRACES = "memory_action_traces"
+_TABLE_PROCEDURES = "memory_procedures"
+_TABLE_SNAPSHOTS = "project_state_snapshots"
+_TABLE_CONTEXT_BLOCKS = "memory_context_blocks"
+_TABLE_CONFLICT_SETS = "memory_conflict_sets"
+
+
+def _fuse_candidates(
+    signal_rankings: Mapping[str, Sequence[tuple[str, str]]],
+    *,
+    k: int,
+) -> list[tuple[tuple[str, str], float, dict[str, int]]]:
+    """Reciprocal Rank Fusion. Returns (canonical_ref, fused_score, per-signal
+    rank) sorted by score desc then ref asc. Deterministic for fixed input: the
+    signals are visited in sorted name order and ties break on the ref."""
+    scores: dict[tuple[str, str], float] = {}
+    ranks: dict[tuple[str, str], dict[str, int]] = {}
+    for signal, ranking in sorted(signal_rankings.items()):
+        for rank, ref in enumerate(ranking):
+            scores[ref] = scores.get(ref, 0.0) + 1.0 / (k + rank + 1)
+            ranks.setdefault(ref, {})[signal] = rank + 1
+    return sorted(
+        ((ref, scores[ref], ranks[ref]) for ref in scores),
+        key=lambda item: (-item[1], item[0]),
+    )
+
+
+def _vector_signal(
+    db: Session,
+    *,
+    user_message: str,
+    settings: AppSettings,
+    limit: int,
+) -> tuple[list[tuple[str, str]], dict[str, float]]:
+    """pgvector cosine ranking over memory_embedding_projections, bounded by the
+    configured distance ceiling. Returns the ranked assertion refs and the
+    distance feature per assertion id."""
+    embedding_count = (
+        db.scalar(
+            select(func.count())
+            .select_from(MemoryEmbeddingProjectionRecord)
+            .where(
+                MemoryEmbeddingProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
+                MemoryEmbeddingProjectionRecord.embedding_provider
+                == settings.memory_embedding_provider,
+                MemoryEmbeddingProjectionRecord.embedding_model == settings.memory_embedding_model,
+                MemoryEmbeddingProjectionRecord.embedding_dimensions
+                == settings.memory_embedding_dimensions,
+            )
+        )
+        or 0
+    )
+    if not embedding_count:
+        return [], {}
+    query_vector = embed_memory_text(user_message, settings=settings)
+    distance = MemoryEmbeddingProjectionRecord.embedding.cosine_distance(query_vector)
+    rows = db.execute(
+        select(MemoryEmbeddingProjectionRecord.assertion_id, distance.label("distance"))
+        .where(
+            MemoryEmbeddingProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
+            MemoryEmbeddingProjectionRecord.embedding_provider
+            == settings.memory_embedding_provider,
+            MemoryEmbeddingProjectionRecord.embedding_model == settings.memory_embedding_model,
+            MemoryEmbeddingProjectionRecord.embedding_dimensions
+            == settings.memory_embedding_dimensions,
+            distance <= settings.memory_vector_distance_ceiling,
+        )
+        .order_by(distance.asc(), MemoryEmbeddingProjectionRecord.assertion_id.asc())
+        .limit(limit)
+    ).all()
+    ranking: list[tuple[str, str]] = []
+    distances: dict[str, float] = {}
+    for assertion_id, value in rows:
+        if value is None:
+            continue
+        ranking.append((_TABLE_ASSERTIONS, assertion_id))
+        distances[assertion_id] = float(value)
+    return ranking, distances
+
+
+def _lexical_signal(
+    db: Session,
+    *,
+    user_message: str,
+    limit: int,
+) -> tuple[list[tuple[str, str]], dict[str, int]]:
+    """Postgres full-text ranking. Assertions rank by ts_rank_cd over the
+    persisted search_vector; every other kind ranks by ts_rank_cd over an inline
+    to_tsvector of its own text columns. Returns the merged ranked refs and the
+    per-id lexical rank feature."""
+    tsquery = func.plainto_tsquery("english", user_message)
+    scored: list[tuple[tuple[str, str], float]] = []
+
+    # Assertions use the persisted search_vector tsvector column.
+    keyword_rank = func.ts_rank_cd(MemoryKeywordProjectionRecord.search_vector, tsquery)
+    for canonical_id, rank in db.execute(
+        select(MemoryKeywordProjectionRecord.canonical_id, keyword_rank.label("rank"))
+        .where(
+            MemoryKeywordProjectionRecord.canonical_table == _TABLE_ASSERTIONS,
+            MemoryKeywordProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
+            MemoryKeywordProjectionRecord.search_vector.op("@@")(tsquery),
+        )
+        .order_by(keyword_rank.desc(), MemoryKeywordProjectionRecord.canonical_id.asc())
+        .limit(limit)
+    ).all():
+        scored.append(((_TABLE_ASSERTIONS, str(canonical_id)), float(rank)))
+
+    # Every other kind is ranked by an inline to_tsvector of its own text columns.
+    episode_doc = func.to_tsvector(
+        "english",
+        func.concat_ws(
+            " ",
+            MemoryEpisodeRecord.title,
+            MemoryEpisodeRecord.summary,
+            MemoryEpisodeRecord.outcome,
+        ),
+    )
+    episode_rank = func.ts_rank_cd(episode_doc, tsquery)
+    for canonical_id, rank in db.execute(
+        select(MemoryEpisodeRecord.id, episode_rank.label("rank"))
+        .where(
+            MemoryEpisodeRecord.lifecycle_state == "active",
+            episode_doc.op("@@")(tsquery),
+        )
+        .order_by(episode_rank.desc(), MemoryEpisodeRecord.id.asc())
+        .limit(limit)
+    ).all():
+        scored.append(((_TABLE_EPISODES, str(canonical_id)), float(rank)))
+
+    trace_doc = func.to_tsvector(
+        "english",
+        func.concat_ws(
+            " ",
+            MemoryReasoningTraceRecord.task_summary,
+            MemoryReasoningTraceRecord.trace_summary,
+        ),
+    )
+    trace_rank = func.ts_rank_cd(trace_doc, tsquery)
+    for canonical_id, rank in db.execute(
+        select(MemoryReasoningTraceRecord.id, trace_rank.label("rank"))
+        .where(
+            MemoryReasoningTraceRecord.lifecycle_state == "active",
+            trace_doc.op("@@")(tsquery),
+        )
+        .order_by(trace_rank.desc(), MemoryReasoningTraceRecord.id.asc())
+        .limit(limit)
+    ).all():
+        scored.append(((_TABLE_REASONING_TRACES, str(canonical_id)), float(rank)))
+
+    action_doc = func.to_tsvector("english", MemoryActionTraceRecord.summary)
+    action_rank = func.ts_rank_cd(action_doc, tsquery)
+    for canonical_id, rank in db.execute(
+        select(MemoryActionTraceRecord.id, action_rank.label("rank"))
+        .where(
+            MemoryActionTraceRecord.lifecycle_state == "active",
+            action_doc.op("@@")(tsquery),
+        )
+        .order_by(action_rank.desc(), MemoryActionTraceRecord.id.asc())
+        .limit(limit)
+    ).all():
+        scored.append(((_TABLE_ACTION_TRACES, str(canonical_id)), float(rank)))
+
+    procedure_doc = func.to_tsvector(
+        "english",
+        func.concat_ws(" ", MemoryProcedureRecord.title, MemoryProcedureRecord.instruction),
+    )
+    procedure_rank = func.ts_rank_cd(procedure_doc, tsquery)
+    for canonical_id, rank in db.execute(
+        select(MemoryProcedureRecord.id, procedure_rank.label("rank"))
+        .where(
+            MemoryProcedureRecord.lifecycle_state == "active",
+            procedure_doc.op("@@")(tsquery),
+        )
+        .order_by(procedure_rank.desc(), MemoryProcedureRecord.id.asc())
+        .limit(limit)
+    ).all():
+        scored.append(((_TABLE_PROCEDURES, str(canonical_id)), float(rank)))
+
+    snapshot_doc = func.to_tsvector("english", ProjectStateSnapshotRecord.summary)
+    snapshot_rank = func.ts_rank_cd(snapshot_doc, tsquery)
+    for canonical_id, rank in db.execute(
+        select(ProjectStateSnapshotRecord.id, snapshot_rank.label("rank"))
+        .where(
+            ProjectStateSnapshotRecord.lifecycle_state == "active",
+            snapshot_doc.op("@@")(tsquery),
+        )
+        .order_by(snapshot_rank.desc(), ProjectStateSnapshotRecord.id.asc())
+        .limit(limit)
+    ).all():
+        scored.append(((_TABLE_SNAPSHOTS, str(canonical_id)), float(rank)))
+
+    block_doc = func.to_tsvector("english", MemoryContextBlockRecord.content)
+    block_rank = func.ts_rank_cd(block_doc, tsquery)
+    for canonical_id, rank in db.execute(
+        select(MemoryContextBlockRecord.id, block_rank.label("rank"))
+        .where(
+            MemoryContextBlockRecord.lifecycle_state == "active",
+            block_doc.op("@@")(tsquery),
+        )
+        .order_by(block_rank.desc(), MemoryContextBlockRecord.id.asc())
+        .limit(limit)
+    ).all():
+        scored.append(((_TABLE_CONTEXT_BLOCKS, str(canonical_id)), float(rank)))
+
+    scored.sort(key=lambda item: (-item[1], item[0]))
+    ranking = [ref for ref, _ in scored]
+    lexical_rank = {ref[1]: index + 1 for index, (ref, _) in enumerate(scored)}
+    return ranking, lexical_rank
+
+
+def _entity_signal(
+    db: Session,
+    *,
+    query_terms: set[str],
+    limit: int,
+) -> tuple[list[tuple[str, str]], dict[str, list[str]], set[str]]:
+    """Match query terms to memory_entities, then resolve assertion refs through
+    memory_entity_projections. Returns the ranked assertion refs, the matched
+    entity ids per assertion id, and the set of matched entity ids (for the graph
+    signal to expand)."""
+    if not query_terms:
+        return [], {}, set()
+    matched_entity_ids = sorted(
+        entity.id
+        for entity in db.scalars(
+            select(MemoryEntityRecord).order_by(MemoryEntityRecord.id.asc())
+        ).all()
+        if query_terms.intersection(set(_terms(f"{entity.entity_key} {entity.display_name}")))
+    )
+    if not matched_entity_ids:
+        return [], {}, set()
+    entity_ids_by_assertion: dict[str, list[str]] = {}
+    ranking: list[tuple[str, str]] = []
+    for row in db.scalars(
+        select(MemoryEntityProjectionRecord)
+        .where(
+            MemoryEntityProjectionRecord.canonical_table == _TABLE_ASSERTIONS,
+            MemoryEntityProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
+            MemoryEntityProjectionRecord.entity_id.in_(matched_entity_ids),
+        )
+        .order_by(
+            MemoryEntityProjectionRecord.canonical_id.asc(),
+            MemoryEntityProjectionRecord.entity_id.asc(),
+        )
+        .limit(limit)
+    ).all():
+        ref = (_TABLE_ASSERTIONS, row.canonical_id)
+        if ref not in ranking:
+            ranking.append(ref)
+        entity_ids_by_assertion.setdefault(row.canonical_id, []).append(row.entity_id)
+    return ranking, entity_ids_by_assertion, set(matched_entity_ids)
+
+
+def _graph_signal(
+    db: Session,
+    *,
+    seed_entity_ids: set[str],
+    limit: int,
+) -> list[tuple[str, str]]:
+    """Entities reachable from a query-matched entity within the depth-3 graph
+    projection, then the assertion refs whose subject is a reachable entity.
+    Ranked by hop distance (nearer first)."""
+    if not seed_entity_ids:
+        return []
+    reachable: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    for row in db.scalars(
+        select(MemoryGraphProjectionRecord)
+        .where(
+            MemoryGraphProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
+            or_(
+                MemoryGraphProjectionRecord.source_entity_id.in_(sorted(seed_entity_ids)),
+                MemoryGraphProjectionRecord.target_entity_id.in_(sorted(seed_entity_ids)),
+            ),
+        )
+        .order_by(
+            MemoryGraphProjectionRecord.distance.asc(),
+            MemoryGraphProjectionRecord.id.asc(),
+        )
+    ).all():
+        for entity_id in (row.source_entity_id, row.target_entity_id):
+            if entity_id not in seed_entity_ids and entity_id not in seen:
+                seen.add(entity_id)
+                reachable.append((row.distance, entity_id))
+    if not reachable:
+        return []
+    ordered_entity_ids = [entity_id for _, entity_id in reachable]
+    assertions = db.scalars(
+        select(MemoryAssertionRecord)
+        .where(MemoryAssertionRecord.subject_entity_id.in_(ordered_entity_ids))
+        .order_by(MemoryAssertionRecord.id.asc())
+    ).all()
+    by_entity: dict[str, list[str]] = {}
+    for assertion in assertions:
+        by_entity.setdefault(assertion.subject_entity_id, []).append(assertion.id)
+    ranking: list[tuple[str, str]] = []
+    for entity_id in ordered_entity_ids:
+        for assertion_id in by_entity.get(entity_id, []):
+            ranking.append((_TABLE_ASSERTIONS, assertion_id))
+    return ranking[:limit]
+
+
+def _symbol_signal(
+    db: Session,
+    *,
+    query_terms: set[str],
+    limit: int,
+) -> tuple[list[tuple[str, str]], dict[str, list[dict[str, str | None]]]]:
+    """Repo-scoped identifier/path tokens via memory_symbol_projections. Returns
+    the ranked assertion refs and the matched symbol features per assertion id."""
+    if not query_terms:
+        return [], {}
+    ranking: list[tuple[str, str]] = []
+    symbol_features: dict[str, list[dict[str, str | None]]] = {}
+    for row in db.scalars(
+        select(MemorySymbolProjectionRecord)
+        .where(
+            MemorySymbolProjectionRecord.canonical_table == _TABLE_ASSERTIONS,
+            MemorySymbolProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
+        )
+        .order_by(
+            MemorySymbolProjectionRecord.canonical_id.asc(),
+            MemorySymbolProjectionRecord.id.asc(),
+        )
+    ).all():
+        if not query_terms.intersection(set(_terms(f"{row.repo_key} {row.symbol} {row.path}"))):
+            continue
+        ref = (_TABLE_ASSERTIONS, row.canonical_id)
+        if ref not in ranking:
+            ranking.append(ref)
+        symbol_features.setdefault(row.canonical_id, []).append(
+            {
+                "repo_key": row.repo_key,
+                "symbol": row.symbol,
+                "path": row.path,
+                "language": row.language,
+            }
+        )
+    return ranking[:limit], symbol_features
+
+
+def _temporal_signal(db: Session, *, now: datetime, limit: int) -> list[tuple[str, str]]:
+    """Assertions and episodes whose bounded validity interval contains now, via
+    memory_temporal_projections. A row is a temporal match only when it has an
+    explicit valid_to upper bound — a perpetually-valid memory (valid_to is null)
+    carries no temporal signal and is left to the relevance signals. Activation
+    stamps valid_from on every assertion, so valid_from alone is not a signal."""
+    ranking: list[tuple[str, str]] = []
+    for row in db.scalars(
+        select(MemoryTemporalProjectionRecord)
+        .where(
+            MemoryTemporalProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
+            MemoryTemporalProjectionRecord.temporal_kind == "validity",
+            # Only genuinely time-scoped memory: an explicit upper bound.
+            MemoryTemporalProjectionRecord.valid_to.is_not(None),
+            MemoryTemporalProjectionRecord.valid_to > now,
+            or_(
+                MemoryTemporalProjectionRecord.valid_from.is_(None),
+                MemoryTemporalProjectionRecord.valid_from <= now,
+            ),
+        )
+        .order_by(
+            MemoryTemporalProjectionRecord.valid_from.desc().nulls_last(),
+            MemoryTemporalProjectionRecord.canonical_id.asc(),
+        )
+        .limit(limit)
+    ).all():
+        ranking.append((row.canonical_table, row.canonical_id))
+    return ranking
+
+
+def _recency_signal(db: Session, *, per_kind_limit: int) -> list[tuple[str, str]]:
+    """Most-recently-updated active rows of every non-assertion kind, as a
+    baseline signal so episodes, traces, procedures, project state, context
+    blocks, and open conflicts are all represented in the pool. Assertions
+    (including negative memory) are deliberately excluded: a semantic fact enters
+    the pool only through a relevance signal, never through pure recency."""
+    ranking: list[tuple[str, str]] = []
+    for episode in db.scalars(
+        select(MemoryEpisodeRecord)
+        .where(MemoryEpisodeRecord.lifecycle_state == "active")
+        .order_by(MemoryEpisodeRecord.occurred_at.desc(), MemoryEpisodeRecord.id.asc())
+        .limit(per_kind_limit)
+    ).all():
+        ranking.append((_TABLE_EPISODES, episode.id))
+    for reasoning_trace in db.scalars(
+        select(MemoryReasoningTraceRecord)
+        .where(MemoryReasoningTraceRecord.lifecycle_state == "active")
+        .order_by(MemoryReasoningTraceRecord.updated_at.desc(), MemoryReasoningTraceRecord.id.asc())
+        .limit(per_kind_limit)
+    ).all():
+        ranking.append((_TABLE_REASONING_TRACES, reasoning_trace.id))
+    for action_trace in db.scalars(
+        select(MemoryActionTraceRecord)
+        .where(MemoryActionTraceRecord.lifecycle_state == "active")
+        .order_by(MemoryActionTraceRecord.updated_at.desc(), MemoryActionTraceRecord.id.asc())
+        .limit(per_kind_limit)
+    ).all():
+        ranking.append((_TABLE_ACTION_TRACES, action_trace.id))
+    for procedure in db.scalars(
+        select(MemoryProcedureRecord)
+        .where(
+            MemoryProcedureRecord.lifecycle_state == "active",
+            MemoryProcedureRecord.review_state.in_(("approved", "auto_approved")),
+        )
+        .order_by(MemoryProcedureRecord.updated_at.desc(), MemoryProcedureRecord.id.asc())
+        .limit(per_kind_limit)
+    ).all():
+        ranking.append((_TABLE_PROCEDURES, procedure.id))
+    for snapshot in db.scalars(
+        select(ProjectStateSnapshotRecord)
+        .where(ProjectStateSnapshotRecord.lifecycle_state == "active")
+        .order_by(ProjectStateSnapshotRecord.updated_at.desc(), ProjectStateSnapshotRecord.id.asc())
+        .limit(per_kind_limit)
+    ).all():
+        ranking.append((_TABLE_SNAPSHOTS, snapshot.id))
+    for block in db.scalars(
+        select(MemoryContextBlockRecord)
+        .where(
+            MemoryContextBlockRecord.block_type.in_(("hot_index", "topic")),
+            MemoryContextBlockRecord.lifecycle_state == "active",
+            MemoryContextBlockRecord.projection_version == MEMORY_PROJECTION_VERSION,
+        )
+        .order_by(MemoryContextBlockRecord.updated_at.desc(), MemoryContextBlockRecord.id.asc())
+        .limit(per_kind_limit)
+    ).all():
+        ranking.append((_TABLE_CONTEXT_BLOCKS, block.id))
+    for conflict in db.scalars(
+        select(MemoryConflictSetRecord)
+        .where(MemoryConflictSetRecord.lifecycle_state == "open")
+        .order_by(MemoryConflictSetRecord.updated_at.desc(), MemoryConflictSetRecord.id.asc())
+        .limit(per_kind_limit)
+    ).all():
+        ranking.append((_TABLE_CONFLICT_SETS, conflict.id))
+    return ranking
+
+
+def _effective_confidence(assertion: MemoryAssertionRecord, *, now: datetime) -> float:
+    """Confidence decayed by the predicate's declared half-life. A recall feature,
+    never a filter: confidence * 0.5 ** (age_days / half_life)."""
+    spec = resolve_predicate_spec(assertion.predicate)
+    if spec.decay_half_life_days is None:
+        return assertion.confidence
+    age_days = max(0.0, (now - assertion.last_verified_at).total_seconds() / 86_400.0)
+    return assertion.confidence * 0.5 ** (age_days / spec.decay_half_life_days)
+
+
+def _topic_membership_for_ids(db: Session, canonical_ids: Sequence[str]) -> dict[str, list[str]]:
+    """The active topic ids each canonical row belongs to, for the recall feature
+    vector's topic_membership field."""
+    if not canonical_ids:
+        return {}
+    membership: dict[str, list[str]] = {}
+    for row in db.scalars(
+        select(MemoryTopicMemberRecord)
+        .join(MemoryTopicRecord, MemoryTopicRecord.id == MemoryTopicMemberRecord.topic_id)
+        .where(
+            MemoryTopicRecord.lifecycle_state == "active",
+            MemoryTopicMemberRecord.canonical_id.in_(list(canonical_ids)),
+        )
+        .order_by(MemoryTopicMemberRecord.topic_id.asc())
+    ).all():
+        membership.setdefault(row.canonical_id, []).append(row.topic_id)
+    return membership
+
+
+def _non_assertion_features(
+    rrf_score: float,
+    signal_ranks: dict[str, int],
+    lexical_rank: int | None,
+    topic_membership: list[str],
+) -> dict[str, Any]:
+    """The recall feature vector for a non-assertion candidate. The assertion-only
+    fields (vector distance, decay, validity) are null; the fused-pool fields are
+    always present so curation sees a uniform feature shape."""
+    return {
+        "rrf_score": rrf_score,
+        "signal_ranks": dict(sorted(signal_ranks.items())),
+        "vector_distance": None,
+        "lexical_rank": lexical_rank,
+        "salience_score": None,
+        "user_priority": None,
+        "source_trust": "reviewed_memory",
+        "effective_confidence": None,
+        "verification_age_days": None,
+        "conflict_status": {"state": "none", "conflict_ids": []},
+        "validity": {"valid_from": None, "valid_to": None},
+        "topic_membership": topic_membership,
+    }
+
+
 def build_memory_context(
     db: Session,
     *,
@@ -6471,7 +6969,12 @@ def build_memory_context(
     proactive_case_id: str | None = None,
     actor_id: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Assemble the recall context via a deterministic Reciprocal Rank Fusion
+    pipeline: resolve policy, run each retrieval signal, fuse the rankings into
+    one bounded candidate pool, apply the deterministic rails, attach a feature
+    vector to every survivor, then hand the pool to AI curation."""
     resolved_settings = settings or AppSettings()
+    now = datetime.now(UTC)
     context: dict[str, Any]
     event_payload: dict[str, Any]
     query_terms = set(_terms(user_message))
@@ -6488,13 +6991,15 @@ def build_memory_context(
         else:
             scope_aliases.add(f"project:{effective_scope_key}")
             scope_aliases.add(f"repo:{effective_scope_key}")
-    # Recall always resolves policy: with no session it resolves the
-    # project/repo/user chain; recall is never unrestricted.
+
+    # (a) Resolve policy. Recall always resolves policy: with no session it
+    # resolves the project/repo/user chain; recall is never unrestricted. A
+    # disallowed policy fails closed to a typed empty context.
     project_key, repo_key = scope_keys_for_policy(effective_scope_key)
     policy = resolve_memory_policy(
         db,
         operation="recall",
-        now=datetime.now(UTC),
+        now=now,
         session_id=current_session_id,
         thread_id=thread_id,
         proactive_case_id=proactive_case_id,
@@ -6516,17 +7021,21 @@ def build_memory_context(
             "episodic_evidence": [],
             "procedural_memory": [],
             "action_traces": [],
+            "reasoning_traces": [],
+            "negative_memory": [],
             "conflicts": [],
             "recall_window": {
                 "max_selected_memories": max_recalled_assertions,
                 "selected_memory_count": 0,
                 "memory_candidate_count": 0,
                 "omitted_memory_count": 0,
+                "rails_excluded_count": 0,
                 "selected_memory_ids": [],
                 "selected_memories": [],
                 "omitted_memories": [],
                 "candidate_memory_ids": [],
                 "candidate_memories": [],
+                "rails_excluded": [],
                 "curation_rationale": f"Memory recall skipped: {policy.reason}.",
                 "curation_uncertainty": "",
                 "curation_confidence": 1.0,
@@ -6551,464 +7060,511 @@ def build_memory_context(
             "memory_policy": memory_policy,
         }
         return context, event_payload
+
     candidate_limit = max(50, max_recalled_assertions * 8)
-    entity_rows = db.scalars(select(MemoryEntityRecord)).all()
-    matching_entity_ids = {
-        entity.id
-        for entity in entity_rows
-        if query_terms.intersection(set(_terms(f"{entity.entity_key} {entity.display_name}")))
-    }
-    # Graph signal: entities reachable from a query-matched entity within the
-    # depth-3 BFS graph projection (written by the graph projection job).
-    graph_neighbors = {
-        row.target_entity_id
-        for row in db.scalars(
-            select(MemoryGraphProjectionRecord).where(
-                MemoryGraphProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
-                MemoryGraphProjectionRecord.source_entity_id.in_(matching_entity_ids or {""}),
-            )
-        ).all()
-    } | {
-        row.source_entity_id
-        for row in db.scalars(
-            select(MemoryGraphProjectionRecord).where(
-                MemoryGraphProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
-                MemoryGraphProjectionRecord.target_entity_id.in_(matching_entity_ids or {""}),
-            )
-        ).all()
-    }
 
-    candidate_ids: set[str] = set()
-    vector_distance_by_assertion_id: dict[str, float] = {}
-    embedding_count = (
-        db.scalar(
-            select(func.count())
-            .select_from(MemoryEmbeddingProjectionRecord)
-            .where(
-                MemoryEmbeddingProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
-                MemoryEmbeddingProjectionRecord.embedding_provider
-                == resolved_settings.memory_embedding_provider,
-                MemoryEmbeddingProjectionRecord.embedding_model
-                == resolved_settings.memory_embedding_model,
-                MemoryEmbeddingProjectionRecord.embedding_dimensions
-                == resolved_settings.memory_embedding_dimensions,
-            )
-        )
-        or 0
+    # (b) Run each retrieval signal. Every signal returns a best-first ranked list
+    # of (canonical_table, canonical_id) refs.
+    vector_ranking, vector_distance_by_id = _vector_signal(
+        db, user_message=user_message, settings=resolved_settings, limit=candidate_limit
     )
-    if embedding_count:
-        query_vector = embed_memory_text(user_message, settings=resolved_settings)
-        vector_distance = MemoryEmbeddingProjectionRecord.embedding.cosine_distance(query_vector)
-        vector_rows = db.execute(
-            select(
-                MemoryEmbeddingProjectionRecord.assertion_id,
-                vector_distance.label("distance"),
-            )
-            .where(
-                MemoryEmbeddingProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
-                MemoryEmbeddingProjectionRecord.embedding_provider
-                == resolved_settings.memory_embedding_provider,
-                MemoryEmbeddingProjectionRecord.embedding_model
-                == resolved_settings.memory_embedding_model,
-                MemoryEmbeddingProjectionRecord.embedding_dimensions
-                == resolved_settings.memory_embedding_dimensions,
-            )
-            .order_by(vector_distance.asc(), MemoryEmbeddingProjectionRecord.assertion_id.asc())
-            .limit(candidate_limit)
-        ).all()
-        for assertion_id, distance in vector_rows:
-            if distance is not None:
-                candidate_ids.add(assertion_id)
-                vector_distance_by_assertion_id[assertion_id] = float(distance)
+    lexical_ranking, lexical_rank_by_id = _lexical_signal(
+        db, user_message=user_message, limit=candidate_limit
+    )
+    entity_ranking, entity_ids_by_id, matched_entity_ids = _entity_signal(
+        db, query_terms=query_terms, limit=candidate_limit
+    )
+    graph_ranking = _graph_signal(db, seed_entity_ids=matched_entity_ids, limit=candidate_limit)
+    symbol_ranking, symbol_features_by_id = _symbol_signal(
+        db, query_terms=query_terms, limit=candidate_limit
+    )
+    temporal_ranking = _temporal_signal(db, now=now, limit=candidate_limit)
+    recency_ranking = _recency_signal(db, per_kind_limit=max(8, max_recalled_assertions))
+    signal_rankings: dict[str, list[tuple[str, str]]] = {
+        "vector": vector_ranking,
+        "lexical": lexical_ranking,
+        "entity": entity_ranking,
+        "graph": graph_ranking,
+        "symbol": symbol_ranking,
+        "temporal": temporal_ranking,
+        "recency": recency_ranking,
+    }
 
-    keywords = {
-        row.canonical_id: row
+    # (c) Fuse the rankings into one deterministic pool: RRF with a fixed k, ties
+    # broken by ref.
+    fused = _fuse_candidates(signal_rankings, k=resolved_settings.memory_rrf_k)
+
+    # Load every canonical row a fused ref points at, keyed by ref.
+    fused_refs = [ref for ref, _, _ in fused]
+    ids_by_table: dict[str, list[str]] = {}
+    for table, canonical_id in fused_refs:
+        ids_by_table.setdefault(table, []).append(canonical_id)
+    assertions_by_id = {
+        row.id: row
         for row in db.scalars(
-            select(MemoryKeywordProjectionRecord).where(
-                MemoryKeywordProjectionRecord.canonical_table == "memory_assertions",
-                MemoryKeywordProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
+            select(MemoryAssertionRecord).where(
+                MemoryAssertionRecord.id.in_(ids_by_table.get(_TABLE_ASSERTIONS, []) or [""])
             )
         ).all()
     }
-    keyword_terms_by_assertion_id: dict[str, list[str]] = {}
-    for assertion_id, keyword in keywords.items():
-        matched_terms = sorted(query_terms.intersection(set(keyword.weighted_terms)))
-        if matched_terms:
-            candidate_ids.add(assertion_id)
-            keyword_terms_by_assertion_id[assertion_id] = matched_terms
-    entity_scope = matching_entity_ids | graph_neighbors
-    entity_ids_by_assertion_id: dict[str, list[str]] = {}
-    if entity_scope:
+    episodes_by_id = {
+        row.id: row
         for row in db.scalars(
-            select(MemoryEntityProjectionRecord).where(
-                MemoryEntityProjectionRecord.canonical_table == "memory_assertions",
-                MemoryEntityProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
-                MemoryEntityProjectionRecord.entity_id.in_(entity_scope),
+            select(MemoryEpisodeRecord).where(
+                MemoryEpisodeRecord.id.in_(ids_by_table.get(_TABLE_EPISODES, []) or [""])
             )
-        ).all():
-            candidate_ids.add(row.canonical_id)
-            entity_ids_by_assertion_id.setdefault(row.canonical_id, []).append(row.entity_id)
-    symbol_features_by_assertion_id: dict[str, list[dict[str, str | None]]] = {}
-    for symbol_projection in db.scalars(
-        select(MemorySymbolProjectionRecord).where(
-            MemorySymbolProjectionRecord.canonical_table == "memory_assertions",
-            MemorySymbolProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
-        )
-    ).all():
-        if not query_terms.intersection(
-            set(
-                _terms(
-                    f"{symbol_projection.repo_key} "
-                    f"{symbol_projection.symbol} "
-                    f"{symbol_projection.path}"
+        ).all()
+    }
+    reasoning_traces_by_id = {
+        row.id: row
+        for row in db.scalars(
+            select(MemoryReasoningTraceRecord).where(
+                MemoryReasoningTraceRecord.id.in_(
+                    ids_by_table.get(_TABLE_REASONING_TRACES, []) or [""]
                 )
             )
-        ):
-            continue
-        candidate_ids.add(symbol_projection.canonical_id)
-        symbol_features_by_assertion_id.setdefault(symbol_projection.canonical_id, []).append(
-            {
-                "repo_key": symbol_projection.repo_key,
-                "symbol": symbol_projection.symbol,
-                "path": symbol_projection.path,
-                "language": symbol_projection.language,
-            }
-        )
+        ).all()
+    }
+    action_traces_by_id = {
+        row.id: row
+        for row in db.scalars(
+            select(MemoryActionTraceRecord).where(
+                MemoryActionTraceRecord.id.in_(ids_by_table.get(_TABLE_ACTION_TRACES, []) or [""])
+            )
+        ).all()
+    }
+    procedures_by_id = {
+        row.id: row
+        for row in db.scalars(
+            select(MemoryProcedureRecord).where(
+                MemoryProcedureRecord.id.in_(ids_by_table.get(_TABLE_PROCEDURES, []) or [""])
+            )
+        ).all()
+    }
+    snapshots_by_id = {
+        row.id: row
+        for row in db.scalars(
+            select(ProjectStateSnapshotRecord).where(
+                ProjectStateSnapshotRecord.id.in_(ids_by_table.get(_TABLE_SNAPSHOTS, []) or [""])
+            )
+        ).all()
+    }
+    context_blocks_by_id = {
+        row.id: row
+        for row in db.scalars(
+            select(MemoryContextBlockRecord).where(
+                MemoryContextBlockRecord.id.in_(ids_by_table.get(_TABLE_CONTEXT_BLOCKS, []) or [""])
+            )
+        ).all()
+    }
+    conflict_sets_by_id = {
+        row.id: row
+        for row in db.scalars(
+            select(MemoryConflictSetRecord).where(
+                MemoryConflictSetRecord.id.in_(ids_by_table.get(_TABLE_CONFLICT_SETS, []) or [""])
+            )
+        ).all()
+    }
 
-    candidate_assertions: list[MemoryAssertionRecord] = []
-    if candidate_ids:
-        candidate_assertions.extend(
-            db.scalars(
-                select(MemoryAssertionRecord)
-                .where(
-                    MemoryAssertionRecord.lifecycle_state == "active",
-                    MemoryAssertionRecord.id.in_(candidate_ids),
-                )
-                .order_by(MemoryAssertionRecord.updated_at.desc(), MemoryAssertionRecord.id.asc())
-                .limit(candidate_limit)
-            ).all()
-        )
-    if scope_aliases:
-        candidate_assertions = [
-            assertion
-            for assertion in candidate_assertions
-            if assertion.scope_key in scope_aliases or assertion.subject_key in scope_aliases
-        ]
-    candidate_ids = {assertion.id for assertion in candidate_assertions}
-    salience_by_assertion_id = {
-        row.assertion_id: {"user_priority": row.user_priority, "score": row.score}
+    # Sensitivity labels and the open-conflict membership are rail and feature
+    # inputs; gather them once for every fused ref.
+    fused_ids = [canonical_id for _, canonical_id in fused_refs]
+    secret_labelled_ids = {
+        row.canonical_id
         for row in db.scalars(
-            select(MemorySalienceRecord).where(MemorySalienceRecord.assertion_id.in_(candidate_ids))
-        ).all()
-    }
-    temporal_by_assertion_id = {
-        row.canonical_id: {
-            "temporal_kind": row.temporal_kind,
-            "valid_from": to_rfc3339(row.valid_from) if row.valid_from else None,
-            "valid_to": to_rfc3339(row.valid_to) if row.valid_to else None,
-        }
-        for row in db.scalars(
-            select(MemoryTemporalProjectionRecord).where(
-                MemoryTemporalProjectionRecord.canonical_table == "memory_assertions",
-                MemoryTemporalProjectionRecord.canonical_id.in_(candidate_ids),
-                MemoryTemporalProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
-            )
-        ).all()
-    }
-    evidence_refs = _evidence_refs_by_assertion(
-        db, [assertion.id for assertion in candidate_assertions]
-    )
-    open_conflict_ids_by_assertion_id: dict[str, list[str]] = {}
-    if candidate_assertions:
-        for conflict_id, assertion_id in db.execute(
-            select(
-                MemoryConflictMemberRecord.conflict_set_id, MemoryConflictMemberRecord.assertion_id
-            )
-            .join(
-                MemoryConflictSetRecord,
-                MemoryConflictSetRecord.id == MemoryConflictMemberRecord.conflict_set_id,
-            )
-            .where(
-                MemoryConflictSetRecord.lifecycle_state == "open",
-                MemoryConflictMemberRecord.assertion_id.in_(
-                    [assertion.id for assertion in candidate_assertions]
+            select(MemorySensitivityLabelRecord).where(
+                MemorySensitivityLabelRecord.lifecycle_state == "active",
+                MemorySensitivityLabelRecord.label.in_(
+                    ("secret", "regulated", "source_confidential")
                 ),
+                MemorySensitivityLabelRecord.canonical_id.in_(fused_ids or [""]),
             )
-        ).all():
-            open_conflict_ids_by_assertion_id.setdefault(assertion_id, []).append(conflict_id)
-    candidate_payloads: list[dict[str, Any]] = []
-    for assertion in candidate_assertions:
-        refs = evidence_refs.get(assertion.id, [])
-        candidate_payload = serialize_assertion(
-            assertion,
-            evidence_refs=refs,
+        ).all()
+    }
+    assertion_ids = list(assertions_by_id)
+    open_conflict_ids_by_assertion_id: dict[str, list[str]] = {}
+    for conflict_id, member_assertion_id in db.execute(
+        select(MemoryConflictMemberRecord.conflict_set_id, MemoryConflictMemberRecord.assertion_id)
+        .join(
+            MemoryConflictSetRecord,
+            MemoryConflictSetRecord.id == MemoryConflictMemberRecord.conflict_set_id,
         )
-        candidate_payload["kind"] = "semantic_assertion"
-        candidate_payload["lifecycle_state"] = assertion.lifecycle_state
-        candidate_payload["trust_boundary"] = (
-            refs[0]["trust_boundary"]
-            if refs and isinstance(refs[0].get("trust_boundary"), str)
-            else "reviewed_memory"
+        .where(
+            MemoryConflictSetRecord.lifecycle_state == "open",
+            MemoryConflictMemberRecord.assertion_id.in_(assertion_ids or [""]),
         )
-        candidate_payload["taint"] = {
-            "provenance_status": candidate_payload["trust_boundary"],
-            "evidence_ids": [
-                ref["evidence_id"] for ref in refs if isinstance(ref.get("evidence_id"), str)
-            ],
-        }
-        candidate_payload["retrieval_features"] = {
-            "vector_distance": vector_distance_by_assertion_id.get(assertion.id),
-            "keyword_terms": keyword_terms_by_assertion_id.get(assertion.id, []),
-            "entity_ids": sorted(entity_ids_by_assertion_id.get(assertion.id, [])),
-            "symbol_matches": symbol_features_by_assertion_id.get(assertion.id, []),
-            "salience": salience_by_assertion_id.get(assertion.id),
-            "temporal": temporal_by_assertion_id.get(assertion.id),
-            "candidate_source": "retrieval_match"
+        .order_by(MemoryConflictMemberRecord.conflict_set_id.asc())
+    ).all():
+        open_conflict_ids_by_assertion_id.setdefault(member_assertion_id, []).append(conflict_id)
+    salience_by_assertion_id = {
+        row.assertion_id: row
+        for row in db.scalars(
+            select(MemorySalienceRecord).where(
+                MemorySalienceRecord.assertion_id.in_(assertion_ids or [""])
+            )
+        ).all()
+    }
+    evidence_refs = _evidence_refs_by_assertion(db, assertion_ids)
+    topic_membership_by_id = {
+        canonical_id: sorted(topic_ids)
+        for canonical_id, topic_ids in _topic_membership_for_ids(db, fused_ids).items()
+    }
+
+    # (d) Apply the deterministic rails to the fused list. Each excluded candidate
+    # is recorded with a reason; survivors keep their fused score and signal ranks.
+    survivors: list[tuple[tuple[str, str], float, dict[str, int]]] = []
+    rails_excluded: list[dict[str, Any]] = []
+
+    def _exclude(ref: tuple[str, str], kind: str, reason: str) -> None:
+        rails_excluded.append({"id": ref[1], "kind": kind, "table": ref[0], "reason": reason})
+
+    for ref, score, ranks in fused:
+        table, canonical_id = ref
+        if table == _TABLE_ASSERTIONS:
+            assertion = assertions_by_id.get(canonical_id)
+            kind = (
+                "negative_memory"
+                if assertion is not None and assertion.assertion_type == "negative"
+                else "semantic_assertion"
+            )
+            if assertion is None or assertion.lifecycle_state != "active":
+                _exclude(ref, kind, "lifecycle: assertion is not active")
+                continue
+            if scope_aliases and not (
+                assertion.scope_key in scope_aliases or assertion.subject_key in scope_aliases
+            ):
+                _exclude(ref, kind, "scope: assertion outside the requested scope")
+                continue
+            if canonical_id in secret_labelled_ids:
+                _exclude(ref, kind, "sensitivity: restricted label excludes this memory")
+                continue
+            refs = evidence_refs.get(canonical_id, [])
+            if any(
+                isinstance(item.get("trust_boundary"), str) and item["trust_boundary"] == "tainted"
+                for item in refs
+            ):
+                _exclude(ref, kind, "trust boundary: tainted evidence")
+                continue
+            survivors.append((ref, score, ranks))
+            continue
+        if table == _TABLE_EPISODES:
+            episode = episodes_by_id.get(canonical_id)
+            if episode is None or episode.lifecycle_state != "active":
+                _exclude(ref, "episode", "lifecycle: episode is not active")
+                continue
             if (
-                assertion.id in vector_distance_by_assertion_id
-                or assertion.id in keyword_terms_by_assertion_id
-                or assertion.id in entity_ids_by_assertion_id
-                or assertion.id in symbol_features_by_assertion_id
+                current_session_id is not None
+                and episode.scope_key == f"session:{current_session_id}"
+            ):
+                _exclude(ref, "episode", "scope: current-session episode")
+                continue
+            if scope_aliases and episode.scope_key not in scope_aliases:
+                _exclude(ref, "episode", "scope: episode outside the requested scope")
+                continue
+            survivors.append((ref, score, ranks))
+            continue
+        if table == _TABLE_REASONING_TRACES:
+            trace = reasoning_traces_by_id.get(canonical_id)
+            if trace is None or trace.lifecycle_state != "active":
+                _exclude(ref, "reasoning_trace", "lifecycle: reasoning trace is not active")
+                continue
+            if scope_aliases and trace.scope_key not in scope_aliases:
+                _exclude(ref, "reasoning_trace", "scope: trace outside the requested scope")
+                continue
+            survivors.append((ref, score, ranks))
+            continue
+        if table == _TABLE_ACTION_TRACES:
+            action_trace = action_traces_by_id.get(canonical_id)
+            if action_trace is None or action_trace.lifecycle_state != "active":
+                _exclude(ref, "action_trace", "lifecycle: action trace is not active")
+                continue
+            if (
+                current_session_id is not None
+                and action_trace.scope_key == f"session:{current_session_id}"
+            ):
+                _exclude(ref, "action_trace", "scope: current-session action trace")
+                continue
+            if scope_aliases and action_trace.scope_key not in scope_aliases:
+                _exclude(ref, "action_trace", "scope: action trace outside the requested scope")
+                continue
+            survivors.append((ref, score, ranks))
+            continue
+        if table == _TABLE_PROCEDURES:
+            procedure = procedures_by_id.get(canonical_id)
+            if procedure is None or procedure.lifecycle_state != "active":
+                _exclude(ref, "procedure", "lifecycle: procedure is not active")
+                continue
+            if procedure.review_state not in ("approved", "auto_approved"):
+                _exclude(ref, "procedure", "review: procedure is not approved")
+                continue
+            if scope_aliases and procedure.scope_key not in scope_aliases:
+                _exclude(ref, "procedure", "scope: procedure outside the requested scope")
+                continue
+            survivors.append((ref, score, ranks))
+            continue
+        if table == _TABLE_SNAPSHOTS:
+            snapshot = snapshots_by_id.get(canonical_id)
+            if snapshot is None or snapshot.lifecycle_state != "active":
+                _exclude(ref, "project_state", "lifecycle: project state is not active")
+                continue
+            if scope_aliases and not (
+                snapshot.project_key in scope_aliases
+                or f"project:{snapshot.project_key}" in scope_aliases
+            ):
+                _exclude(ref, "project_state", "scope: project state outside the requested scope")
+                continue
+            survivors.append((ref, score, ranks))
+            continue
+        if table == _TABLE_CONTEXT_BLOCKS:
+            block = context_blocks_by_id.get(canonical_id)
+            kind = "topic" if block is not None and block.block_type == "topic" else "hot_index"
+            if block is None or block.lifecycle_state != "active":
+                _exclude(ref, kind, "lifecycle: context block is not active")
+                continue
+            if scope_aliases and block.scope_key not in scope_aliases:
+                _exclude(ref, kind, "scope: context block outside the requested scope")
+                continue
+            survivors.append((ref, score, ranks))
+            continue
+        if table == _TABLE_CONFLICT_SETS:
+            conflict = conflict_sets_by_id.get(canonical_id)
+            if conflict is None or conflict.lifecycle_state != "open":
+                _exclude(ref, "conflict", "lifecycle: conflict set is not open")
+                continue
+            if scope_aliases and conflict.scope_key not in scope_aliases:
+                _exclude(ref, "conflict", "scope: conflict set outside the requested scope")
+                continue
+            survivors.append((ref, score, ranks))
+            continue
+
+    # (e+f) Build the per-candidate feature vector and (f) cap the pool to the
+    # candidate budget by fused score (survivors are already score-desc, ref-asc).
+    candidate_payloads: list[dict[str, Any]] = []
+    for ref, score, ranks in survivors[:candidate_limit]:
+        table, canonical_id = ref
+        topic_membership = topic_membership_by_id.get(canonical_id, [])
+        if table == _TABLE_ASSERTIONS:
+            assertion = assertions_by_id[canonical_id]
+            kind = (
+                "negative_memory"
+                if assertion.assertion_type == "negative"
+                else ("semantic_assertion")
             )
-            else "projection_match",
-            "updated_at_order": len(candidate_payloads) + 1,
-        }
-        candidate_payload["transport_order"] = len(candidate_payloads) + 1
-        candidate_payload["conflict_status"] = (
-            {
-                "state": "open",
-                "conflict_ids": sorted(open_conflict_ids_by_assertion_id[assertion.id]),
+            refs = evidence_refs.get(canonical_id, [])
+            payload = serialize_assertion(assertion, evidence_refs=refs)
+            payload["kind"] = kind
+            payload["lifecycle_state"] = assertion.lifecycle_state
+            payload["trust_boundary"] = (
+                refs[0]["trust_boundary"]
+                if refs and isinstance(refs[0].get("trust_boundary"), str)
+                else "reviewed_memory"
+            )
+            payload["taint"] = {
+                "provenance_status": payload["trust_boundary"],
+                "evidence_ids": [
+                    item["evidence_id"] for item in refs if isinstance(item.get("evidence_id"), str)
+                ],
             }
-            if assertion.id in open_conflict_ids_by_assertion_id
-            else {"state": "none", "conflict_ids": []}
-        )
-        candidate_payloads.append(candidate_payload)
-
-    candidate_project_snapshots = db.scalars(
-        select(ProjectStateSnapshotRecord)
-        .where(ProjectStateSnapshotRecord.lifecycle_state == "active")
-        .order_by(
-            ProjectStateSnapshotRecord.updated_at.desc(),
-            ProjectStateSnapshotRecord.id.desc(),
-        )
-        .limit(8)
-    ).all()
-    if scope_aliases:
-        candidate_project_snapshots = [
-            snapshot
-            for snapshot in candidate_project_snapshots
-            if snapshot.project_key in scope_aliases
-            or f"project:{snapshot.project_key}" in scope_aliases
-        ]
-    for snapshot in candidate_project_snapshots:
-        candidate_payloads.append(
-            {
-                "id": snapshot.id,
-                "kind": "project_state",
-                "project_key": snapshot.project_key,
-                "summary": redact_text(snapshot.summary),
-                "state": _redact_json_value(snapshot.state),
-                "lifecycle_state": snapshot.lifecycle_state,
-                "source_assertion_ids": snapshot.source_assertion_ids,
-                "source_evidence_ids": snapshot.source_evidence_ids,
-                "trust_boundary": "reviewed_memory",
-                "taint": {"provenance_status": "reviewed_memory"},
-                "retrieval_features": {
-                    "source": "active_project_state",
-                    "updated_at_order": len(candidate_payloads) + 1,
+            conflict_ids = open_conflict_ids_by_assertion_id.get(canonical_id, [])
+            conflict_status = (
+                {"state": "open", "conflict_ids": sorted(conflict_ids)}
+                if conflict_ids
+                else {"state": "none", "conflict_ids": []}
+            )
+            payload["conflict_status"] = conflict_status
+            salience = salience_by_assertion_id.get(canonical_id)
+            payload["retrieval_features"] = {
+                "rrf_score": score,
+                "signal_ranks": dict(sorted(ranks.items())),
+                "vector_distance": vector_distance_by_id.get(canonical_id),
+                "lexical_rank": lexical_rank_by_id.get(canonical_id),
+                "salience_score": salience.score if salience is not None else None,
+                "user_priority": salience.user_priority if salience is not None else None,
+                "source_trust": payload["trust_boundary"],
+                "effective_confidence": _effective_confidence(assertion, now=now),
+                "verification_age_days": max(
+                    0.0, (now - assertion.last_verified_at).total_seconds() / 86_400.0
+                ),
+                "conflict_status": conflict_status,
+                "validity": {
+                    "valid_from": to_rfc3339(assertion.valid_from)
+                    if assertion.valid_from
+                    else None,
+                    "valid_to": to_rfc3339(assertion.valid_to) if assertion.valid_to else None,
                 },
-                "transport_order": len(candidate_payloads) + 1,
-                "projection_version": MEMORY_PROJECTION_VERSION,
-                "updated_at": to_rfc3339(snapshot.updated_at),
+                "topic_membership": topic_membership,
+                "entity_ids": sorted(entity_ids_by_id.get(canonical_id, [])),
+                "symbol_matches": symbol_features_by_id.get(canonical_id, []),
             }
-        )
+            candidate_payloads.append(payload)
+            continue
+        if table == _TABLE_EPISODES:
+            episode = episodes_by_id[canonical_id]
+            candidate_payloads.append(
+                {
+                    "id": episode.id,
+                    "kind": "episode",
+                    "episode_type": episode.episode_type,
+                    "scope_key": episode.scope_key,
+                    "summary": redact_text(episode.summary),
+                    "outcome": redact_text(episode.outcome) if episode.outcome else None,
+                    "primary_evidence_id": episode.primary_evidence_id,
+                    "lifecycle_state": episode.lifecycle_state,
+                    "trust_boundary": "reviewed_memory",
+                    "taint": {"provenance_status": "reviewed_memory"},
+                    "conflict_status": {"state": "none", "conflict_ids": []},
+                    "retrieval_features": _non_assertion_features(
+                        score, ranks, lexical_rank_by_id.get(canonical_id), topic_membership
+                    ),
+                    "projection_version": MEMORY_PROJECTION_VERSION,
+                    "occurred_at": to_rfc3339(episode.occurred_at),
+                }
+            )
+            continue
+        if table == _TABLE_REASONING_TRACES:
+            trace = reasoning_traces_by_id[canonical_id]
+            candidate_payloads.append(
+                {
+                    "id": trace.id,
+                    "kind": "reasoning_trace",
+                    "scope_key": trace.scope_key,
+                    "trace_type": trace.trace_type,
+                    "task_summary": redact_text(trace.task_summary),
+                    "trace_summary": redact_text(trace.trace_summary),
+                    "outcome": trace.outcome,
+                    "primary_evidence_id": trace.primary_evidence_id,
+                    "source_turn_id": trace.source_turn_id,
+                    "lifecycle_state": trace.lifecycle_state,
+                    "trust_boundary": "reviewed_memory",
+                    "taint": {"provenance_status": "reviewed_memory"},
+                    "conflict_status": {"state": "none", "conflict_ids": []},
+                    "retrieval_features": _non_assertion_features(
+                        score, ranks, lexical_rank_by_id.get(canonical_id), topic_membership
+                    ),
+                    "projection_version": MEMORY_PROJECTION_VERSION,
+                    "updated_at": to_rfc3339(trace.updated_at),
+                }
+            )
+            continue
+        if table == _TABLE_ACTION_TRACES:
+            action_trace = action_traces_by_id[canonical_id]
+            candidate_payloads.append(
+                {
+                    "id": action_trace.id,
+                    "kind": "action_trace",
+                    "scope_key": action_trace.scope_key,
+                    "trace_type": action_trace.trace_type,
+                    "action_attempt_id": action_trace.action_attempt_id,
+                    "source_turn_id": action_trace.source_turn_id,
+                    "capability_id": action_trace.capability_id,
+                    "summary": redact_text(action_trace.summary),
+                    "outcome": action_trace.outcome,
+                    "primary_evidence_id": action_trace.primary_evidence_id,
+                    "lifecycle_state": action_trace.lifecycle_state,
+                    "trust_boundary": "reviewed_memory",
+                    "taint": {"provenance_status": "reviewed_memory"},
+                    "conflict_status": {"state": "none", "conflict_ids": []},
+                    "retrieval_features": _non_assertion_features(
+                        score, ranks, lexical_rank_by_id.get(canonical_id), topic_membership
+                    ),
+                    "projection_version": MEMORY_PROJECTION_VERSION,
+                    "updated_at": to_rfc3339(action_trace.updated_at),
+                }
+            )
+            continue
+        if table == _TABLE_PROCEDURES:
+            procedure = procedures_by_id[canonical_id]
+            candidate_payloads.append(
+                {
+                    "id": procedure.id,
+                    "kind": "procedure",
+                    "procedure_key": procedure.procedure_key,
+                    "scope_key": procedure.scope_key,
+                    "instruction": redact_text(procedure.instruction),
+                    "source_assertion_id": procedure.source_assertion_id,
+                    "lifecycle_state": procedure.lifecycle_state,
+                    "review_state": procedure.review_state,
+                    "trust_boundary": "reviewed_memory",
+                    "taint": {"provenance_status": "reviewed_memory"},
+                    "conflict_status": {"state": "none", "conflict_ids": []},
+                    "retrieval_features": _non_assertion_features(
+                        score, ranks, lexical_rank_by_id.get(canonical_id), topic_membership
+                    ),
+                    "projection_version": MEMORY_PROJECTION_VERSION,
+                    "updated_at": to_rfc3339(procedure.updated_at),
+                }
+            )
+            continue
+        if table == _TABLE_SNAPSHOTS:
+            snapshot = snapshots_by_id[canonical_id]
+            candidate_payloads.append(
+                {
+                    "id": snapshot.id,
+                    "kind": "project_state",
+                    "project_key": snapshot.project_key,
+                    "summary": redact_text(snapshot.summary),
+                    "state": _redact_json_value(snapshot.state),
+                    "lifecycle_state": snapshot.lifecycle_state,
+                    "source_assertion_ids": snapshot.source_assertion_ids,
+                    "source_evidence_ids": snapshot.source_evidence_ids,
+                    "trust_boundary": "reviewed_memory",
+                    "taint": {"provenance_status": "reviewed_memory"},
+                    "conflict_status": {"state": "none", "conflict_ids": []},
+                    "retrieval_features": _non_assertion_features(
+                        score, ranks, lexical_rank_by_id.get(canonical_id), topic_membership
+                    ),
+                    "projection_version": MEMORY_PROJECTION_VERSION,
+                    "updated_at": to_rfc3339(snapshot.updated_at),
+                }
+            )
+            continue
+        if table == _TABLE_CONTEXT_BLOCKS:
+            block = context_blocks_by_id[canonical_id]
+            candidate_payloads.append(
+                {
+                    "id": block.id,
+                    "kind": "topic" if block.block_type == "topic" else "hot_index",
+                    "topic_id": block.topic_id,
+                    "scope_key": block.scope_key,
+                    "content": redact_text(block.content),
+                    "source_assertion_ids": block.source_assertion_ids,
+                    "source_project_state_snapshot_ids": block.source_project_state_snapshot_ids,
+                    "lifecycle_state": block.lifecycle_state,
+                    "trust_boundary": "reviewed_memory",
+                    "taint": {"provenance_status": "reviewed_memory"},
+                    "conflict_status": {"state": "none", "conflict_ids": []},
+                    "retrieval_features": _non_assertion_features(
+                        score, ranks, lexical_rank_by_id.get(canonical_id), topic_membership
+                    ),
+                    "projection_version": block.projection_version,
+                    "updated_at": to_rfc3339(block.updated_at),
+                }
+            )
+            continue
+        if table == _TABLE_CONFLICT_SETS:
+            conflict = conflict_sets_by_id[canonical_id]
+            candidate_payloads.append(
+                {
+                    "id": conflict.id,
+                    "kind": "conflict",
+                    "scope_key": conflict.scope_key,
+                    "predicate": conflict.predicate,
+                    "conflict_type": conflict.conflict_type,
+                    "lifecycle_state": conflict.lifecycle_state,
+                    "resolution_assertion_id": conflict.resolution_assertion_id,
+                    "trust_boundary": "reviewed_memory",
+                    "taint": {"provenance_status": "reviewed_memory"},
+                    "conflict_status": {"state": "open", "conflict_ids": [conflict.id]},
+                    "retrieval_features": _non_assertion_features(
+                        score, ranks, lexical_rank_by_id.get(canonical_id), topic_membership
+                    ),
+                    "projection_version": MEMORY_PROJECTION_VERSION,
+                    "updated_at": to_rfc3339(conflict.updated_at),
+                }
+            )
+            continue
 
-    episode_query = select(MemoryEpisodeRecord).where(
-        MemoryEpisodeRecord.lifecycle_state == "active"
-    )
-    if current_session_id is not None:
-        episode_query = episode_query.where(
-            MemoryEpisodeRecord.scope_key != f"session:{current_session_id}"
-        )
-    candidate_episodes = db.scalars(
-        episode_query.order_by(
-            MemoryEpisodeRecord.occurred_at.desc(), MemoryEpisodeRecord.id.asc()
-        ).limit(6)
-    ).all()
-    if scope_aliases:
-        candidate_episodes = [
-            episode for episode in candidate_episodes if episode.scope_key in scope_aliases
-        ]
-    for episode in candidate_episodes:
-        candidate_payloads.append(
-            {
-                "id": episode.id,
-                "kind": "episode",
-                "episode_type": episode.episode_type,
-                "scope_key": episode.scope_key,
-                "summary": redact_text(episode.summary),
-                "outcome": redact_text(episode.outcome) if episode.outcome else None,
-                "primary_evidence_id": episode.primary_evidence_id,
-                "lifecycle_state": episode.lifecycle_state,
-                "trust_boundary": "reviewed_memory",
-                "taint": {"provenance_status": "reviewed_memory"},
-                "retrieval_features": {
-                    "source": "active_episode",
-                    "occurred_at_order": len(candidate_payloads) + 1,
-                },
-                "transport_order": len(candidate_payloads) + 1,
-                "projection_version": MEMORY_PROJECTION_VERSION,
-                "occurred_at": to_rfc3339(episode.occurred_at),
-            }
-        )
-
-    candidate_procedures = db.scalars(
-        select(MemoryProcedureRecord)
-        .where(
-            MemoryProcedureRecord.lifecycle_state == "active",
-            MemoryProcedureRecord.review_state.in_(("approved", "auto_approved")),
-        )
-        .order_by(MemoryProcedureRecord.updated_at.desc(), MemoryProcedureRecord.id.asc())
-        .limit(8)
-    ).all()
-    if scope_aliases:
-        candidate_procedures = [
-            procedure for procedure in candidate_procedures if procedure.scope_key in scope_aliases
-        ]
-    for procedure in candidate_procedures:
-        candidate_payloads.append(
-            {
-                "id": procedure.id,
-                "kind": "procedure",
-                "procedure_key": procedure.procedure_key,
-                "scope_key": procedure.scope_key,
-                "instruction": redact_text(procedure.instruction),
-                "source_assertion_id": procedure.source_assertion_id,
-                "lifecycle_state": procedure.lifecycle_state,
-                "review_state": procedure.review_state,
-                "trust_boundary": "reviewed_memory",
-                "taint": {"provenance_status": "reviewed_memory"},
-                "retrieval_features": {
-                    "source": "approved_procedure",
-                    "updated_at_order": len(candidate_payloads) + 1,
-                },
-                "transport_order": len(candidate_payloads) + 1,
-                "projection_version": MEMORY_PROJECTION_VERSION,
-                "updated_at": to_rfc3339(procedure.updated_at),
-            }
-        )
-
-    action_trace_query = select(MemoryActionTraceRecord).where(
-        MemoryActionTraceRecord.lifecycle_state == "active"
-    )
-    if current_session_id is not None:
-        action_trace_query = action_trace_query.where(
-            MemoryActionTraceRecord.scope_key != f"session:{current_session_id}"
-        )
-    candidate_action_traces = db.scalars(
-        action_trace_query.order_by(
-            MemoryActionTraceRecord.updated_at.desc(), MemoryActionTraceRecord.id.asc()
-        ).limit(8)
-    ).all()
-    if scope_aliases:
-        candidate_action_traces = [
-            trace for trace in candidate_action_traces if trace.scope_key in scope_aliases
-        ]
-    for trace in candidate_action_traces:
-        candidate_payloads.append(
-            {
-                "id": trace.id,
-                "kind": "action_trace",
-                "scope_key": trace.scope_key,
-                "trace_type": trace.trace_type,
-                "action_attempt_id": trace.action_attempt_id,
-                "source_turn_id": trace.source_turn_id,
-                "capability_id": trace.capability_id,
-                "summary": redact_text(trace.summary),
-                "outcome": trace.outcome,
-                "primary_evidence_id": trace.primary_evidence_id,
-                "trust_boundary": "reviewed_memory",
-                "taint": {"provenance_status": "reviewed_memory"},
-                "retrieval_features": {
-                    "source": "active_action_trace",
-                    "updated_at_order": len(candidate_payloads) + 1,
-                },
-                "transport_order": len(candidate_payloads) + 1,
-                "updated_at": to_rfc3339(trace.updated_at),
-            }
-        )
-
-    candidate_hot_blocks = db.scalars(
-        select(MemoryContextBlockRecord)
-        .where(
-            MemoryContextBlockRecord.block_type == "hot_index",
-            MemoryContextBlockRecord.lifecycle_state == "active",
-            MemoryContextBlockRecord.projection_version == MEMORY_PROJECTION_VERSION,
-        )
-        .order_by(MemoryContextBlockRecord.updated_at.desc(), MemoryContextBlockRecord.id.asc())
-        .limit(8)
-    ).all()
-    if scope_aliases:
-        candidate_hot_blocks = [
-            block for block in candidate_hot_blocks if block.scope_key in scope_aliases
-        ]
-    for block in candidate_hot_blocks:
-        candidate_payloads.append(
-            {
-                "id": block.id,
-                "kind": "hot_index",
-                "scope_key": block.scope_key,
-                "content": redact_text(block.content),
-                "source_assertion_ids": block.source_assertion_ids,
-                "source_project_state_snapshot_ids": block.source_project_state_snapshot_ids,
-                "trust_boundary": "reviewed_memory",
-                "taint": {"provenance_status": "reviewed_memory"},
-                "retrieval_features": {
-                    "source": "active_hot_index",
-                    "updated_at_order": len(candidate_payloads) + 1,
-                },
-                "transport_order": len(candidate_payloads) + 1,
-                "projection_version": block.projection_version,
-                "updated_at": to_rfc3339(block.updated_at),
-            }
-        )
-
-    candidate_topic_blocks = db.scalars(
-        select(MemoryContextBlockRecord)
-        .where(
-            MemoryContextBlockRecord.block_type == "topic",
-            MemoryContextBlockRecord.lifecycle_state == "active",
-            MemoryContextBlockRecord.projection_version == MEMORY_PROJECTION_VERSION,
-        )
-        .order_by(MemoryContextBlockRecord.updated_at.desc(), MemoryContextBlockRecord.id.asc())
-        .limit(8)
-    ).all()
-    if scope_aliases:
-        candidate_topic_blocks = [
-            block for block in candidate_topic_blocks if block.scope_key in scope_aliases
-        ]
-    for block in candidate_topic_blocks:
-        candidate_payloads.append(
-            {
-                "id": block.id,
-                "kind": "topic",
-                "topic_id": block.topic_id,
-                "scope_key": block.scope_key,
-                "content": redact_text(block.content),
-                "source_assertion_ids": block.source_assertion_ids,
-                "source_project_state_snapshot_ids": block.source_project_state_snapshot_ids,
-                "trust_boundary": "reviewed_memory",
-                "taint": {"provenance_status": "reviewed_memory"},
-                "retrieval_features": {
-                    "source": "active_topic",
-                    "updated_at_order": len(candidate_payloads) + 1,
-                },
-                "transport_order": len(candidate_payloads) + 1,
-                "projection_version": block.projection_version,
-                "updated_at": to_rfc3339(block.updated_at),
-            }
-        )
-
+    # Recent conversational turns are context for the curator's judgement.
     recent_turns = list(
         reversed(
             db.scalars(
@@ -7028,6 +7584,8 @@ def build_memory_context(
         for turn in recent_turns
     ]
 
+    # AI curation owns relevance: the deterministic pool is handed over whole and
+    # the curator must account for every candidate.
     if candidate_payloads:
         curation = _curate_memory_context_with_model(
             user_message=user_message,
@@ -7052,76 +7610,97 @@ def build_memory_context(
     selected_by_kind: dict[str, list[str]] = {}
     for item in curation["selected_memories"]:
         selected_by_kind.setdefault(item["kind"], []).append(item["id"])
-    assertions_by_id = {assertion.id: assertion for assertion in candidate_assertions}
+    candidate_payloads_by_id = {item["id"]: item for item in candidate_payloads}
+
     selected_assertions = [
         assertions_by_id[memory_id]
         for memory_id in selected_by_kind.get("semantic_assertion", [])
         if memory_id in assertions_by_id
     ]
-    candidate_payloads_by_id = {item["id"]: item for item in candidate_payloads}
     semantic_assertions = []
     for assertion in selected_assertions:
         serialized = serialize_assertion(
-            assertion,
-            evidence_refs=evidence_refs.get(assertion.id, []),
+            assertion, evidence_refs=evidence_refs.get(assertion.id, [])
         )
-        candidate_payload = candidate_payloads_by_id.get(assertion.id, {})
-        serialized["conflict_status"] = candidate_payload.get(
+        payload = candidate_payloads_by_id.get(assertion.id, {})
+        serialized["conflict_status"] = payload.get(
             "conflict_status", {"state": "none", "conflict_ids": []}
         )
-        serialized["retrieval_features"] = candidate_payload.get("retrieval_features", {})
+        serialized["retrieval_features"] = payload.get("retrieval_features", {})
         semantic_assertions.append(serialized)
-    conflicts = db.scalars(
-        select(MemoryConflictSetRecord)
-        .where(MemoryConflictSetRecord.lifecycle_state == "open")
-        .order_by(MemoryConflictSetRecord.updated_at.desc(), MemoryConflictSetRecord.id.asc())
-    ).all()
-    snapshots_by_id = {snapshot.id: snapshot for snapshot in candidate_project_snapshots}
-    project_snapshots = [
-        snapshots_by_id[memory_id]
-        for memory_id in selected_by_kind.get("project_state", [])
-        if memory_id in snapshots_by_id
+    selected_negatives = [
+        assertions_by_id[memory_id]
+        for memory_id in selected_by_kind.get("negative_memory", [])
+        if memory_id in assertions_by_id
     ]
-    episodes_by_id = {episode.id: episode for episode in candidate_episodes}
+    negative_memory = []
+    for assertion in selected_negatives:
+        serialized = serialize_assertion(
+            assertion, evidence_refs=evidence_refs.get(assertion.id, [])
+        )
+        payload = candidate_payloads_by_id.get(assertion.id, {})
+        serialized["conflict_status"] = payload.get(
+            "conflict_status", {"state": "none", "conflict_ids": []}
+        )
+        serialized["retrieval_features"] = payload.get("retrieval_features", {})
+        negative_memory.append(serialized)
+
     selected_episodes = [
         episodes_by_id[memory_id]
         for memory_id in selected_by_kind.get("episode", [])
         if memory_id in episodes_by_id
     ]
-    procedures_by_id = {procedure.id: procedure for procedure in candidate_procedures}
-    procedures = [
-        procedures_by_id[memory_id]
-        for memory_id in selected_by_kind.get("procedure", [])
-        if memory_id in procedures_by_id
+    selected_reasoning_traces = [
+        reasoning_traces_by_id[memory_id]
+        for memory_id in selected_by_kind.get("reasoning_trace", [])
+        if memory_id in reasoning_traces_by_id
     ]
-    action_traces_by_id = {trace.id: trace for trace in candidate_action_traces}
-    action_traces = [
+    selected_action_traces = [
         action_traces_by_id[memory_id]
         for memory_id in selected_by_kind.get("action_trace", [])
         if memory_id in action_traces_by_id
     ]
-    hot_blocks_by_id = {block.id: block for block in candidate_hot_blocks}
-    hot_blocks = [
-        hot_blocks_by_id[memory_id]
+    selected_procedures = [
+        procedures_by_id[memory_id]
+        for memory_id in selected_by_kind.get("procedure", [])
+        if memory_id in procedures_by_id
+    ]
+    selected_snapshots = [
+        snapshots_by_id[memory_id]
+        for memory_id in selected_by_kind.get("project_state", [])
+        if memory_id in snapshots_by_id
+    ]
+    selected_hot_blocks = [
+        context_blocks_by_id[memory_id]
         for memory_id in selected_by_kind.get("hot_index", [])
-        if memory_id in hot_blocks_by_id
+        if memory_id in context_blocks_by_id
     ]
-    topic_blocks_by_id = {block.id: block for block in candidate_topic_blocks}
-    topic_blocks = [
-        topic_blocks_by_id[memory_id]
+    selected_topic_blocks = [
+        context_blocks_by_id[memory_id]
         for memory_id in selected_by_kind.get("topic", [])
-        if memory_id in topic_blocks_by_id
+        if memory_id in context_blocks_by_id
     ]
+
+    # Open conflict sets are surfaced whole, independent of curation: a
+    # contradiction is always presented as uncertainty until it is resolved.
+    conflicts = db.scalars(
+        select(MemoryConflictSetRecord)
+        .where(MemoryConflictSetRecord.lifecycle_state == "open")
+        .order_by(MemoryConflictSetRecord.updated_at.desc(), MemoryConflictSetRecord.id.asc())
+    ).all()
+
     recall_window: dict[str, Any] = {
         "max_selected_memories": max_recalled_assertions,
         "selected_memory_count": len(curation["selected_memories"]),
         "memory_candidate_count": len(candidate_payloads),
         "omitted_memory_count": len(curation["omitted_memories"]),
+        "rails_excluded_count": len(rails_excluded),
         "selected_memory_ids": selected_ids,
         "selected_memories": list(curation["selected_memories"]),
         "omitted_memories": list(curation["omitted_memories"]),
         "candidate_memory_ids": [item["id"] for item in candidate_payloads],
         "candidate_memories": candidate_payloads,
+        "rails_excluded": rails_excluded,
         "curation_rationale": curation["rationale"],
         "curation_uncertainty": curation["uncertainty"],
         "curation_confidence": curation["confidence"],
@@ -7143,7 +7722,7 @@ def build_memory_context(
                 "projection_version": block.projection_version,
                 "updated_at": to_rfc3339(block.updated_at),
             }
-            for block in hot_blocks
+            for block in selected_hot_blocks
         ],
         "topic_index": [
             {
@@ -7156,7 +7735,7 @@ def build_memory_context(
                 "projection_version": block.projection_version,
                 "updated_at": to_rfc3339(block.updated_at),
             }
-            for block in topic_blocks
+            for block in selected_topic_blocks
         ],
         "pinned_core": [
             item for item in semantic_assertions if item["type"] in {"profile", "preference"}
@@ -7172,7 +7751,7 @@ def build_memory_context(
                 "created_at": to_rfc3339(snapshot.created_at),
                 "updated_at": to_rfc3339(snapshot.updated_at),
             }
-            for snapshot in project_snapshots
+            for snapshot in selected_snapshots
         ],
         "commitments_and_decisions": [
             item for item in semantic_assertions if item["type"] in {"commitment", "decision"}
@@ -7198,7 +7777,7 @@ def build_memory_context(
                 "instruction": redact_text(procedure.instruction),
                 "source_assertion_id": procedure.source_assertion_id,
             }
-            for procedure in procedures
+            for procedure in selected_procedures
         ],
         "action_traces": [
             {
@@ -7213,8 +7792,23 @@ def build_memory_context(
                 "primary_evidence_id": trace.primary_evidence_id,
                 "updated_at": to_rfc3339(trace.updated_at),
             }
-            for trace in action_traces
+            for trace in selected_action_traces
         ],
+        "reasoning_traces": [
+            {
+                "id": trace.id,
+                "scope_key": trace.scope_key,
+                "trace_type": trace.trace_type,
+                "task_summary": redact_text(trace.task_summary),
+                "trace_summary": redact_text(trace.trace_summary),
+                "outcome": trace.outcome,
+                "primary_evidence_id": trace.primary_evidence_id,
+                "source_turn_id": trace.source_turn_id,
+                "updated_at": to_rfc3339(trace.updated_at),
+            }
+            for trace in selected_reasoning_traces
+        ],
+        "negative_memory": negative_memory,
         "conflicts": [_serialize_conflict(conflict) for conflict in conflicts],
         "recall_window": recall_window,
         "memory_policy": memory_policy,
@@ -7290,6 +7884,22 @@ def context_text(memory_context: dict[str, Any]) -> str:
     for item in memory_context.get("action_traces", []):
         if isinstance(item, dict) and isinstance(item.get("summary"), str):
             lines.append("- action: " + item["summary"])
+    for item in memory_context.get("reasoning_traces", []):
+        if isinstance(item, dict) and isinstance(item.get("trace_summary"), str):
+            trace_type = item.get("trace_type")
+            prefix = f"reasoning ({trace_type})" if isinstance(trace_type, str) else "reasoning"
+            lines.append(f"- {prefix}: " + item["trace_summary"])
+    negative_memory = memory_context.get("negative_memory")
+    if isinstance(negative_memory, list) and negative_memory:
+        lines.append("do not repeat:")
+        for item in negative_memory:
+            if not isinstance(item, dict) or not isinstance(item.get("value"), str):
+                continue
+            conflict_status = item.get("conflict_status")
+            if isinstance(conflict_status, dict) and conflict_status.get("state") == "open":
+                lines.append("- conflicted negative memory: " + item["value"])
+                continue
+            lines.append("- " + item["value"])
     conflicts = memory_context.get("conflicts")
     if isinstance(conflicts, list) and conflicts:
         lines.append("- unresolved memory conflicts exist; state uncertainty when relevant")

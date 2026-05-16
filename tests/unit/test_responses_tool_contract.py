@@ -229,7 +229,7 @@ def test_memory_runtime_handles_projection_read_surfaces(
     def bounded_memory_payload(_: Any, *, section: str, limit: int) -> dict[str, Any]:
         calls.append((section, limit))
         return {
-            "schema_version": "memory.sota.v1",
+            "schema_version": "memory.sota.v2",
             "topics": [{"id": "mt_1"}] if section == "topics" else [],
             "context_blocks": [{"id": "mcb_1", "block_type": section, "topic_id": "mtp_1"}],
             "deletions": [{"id": "md_1"}] if section == "deletions" else [],
@@ -258,7 +258,7 @@ def test_memory_runtime_handles_projection_read_surfaces(
             new_id_fn=lambda prefix: f"{prefix}_1",
         )
         assert output["status"] == "listed"
-        assert output["memory"]["schema_version"] == "memory.sota.v1"
+        assert output["memory"]["schema_version"] == "memory.sota.v2"
         assert calls[-1] == (expected_section, normalized_input["limit"])
 
     output = action_runtime._execute_memory_capability(
@@ -303,7 +303,7 @@ def test_memory_runtime_handles_diagnostics_import_eval_and_projection_retry(
         )
         return (
             {
-                "schema_version": "memory.sota.v1",
+                "schema_version": "memory.sota.v2",
                 "hot_index": [{"id": "mcb_hot"}],
                 "topic_index": [],
                 "semantic_assertions": [],
@@ -338,7 +338,7 @@ def test_memory_runtime_handles_diagnostics_import_eval_and_projection_retry(
     monkeypatch.setattr(
         action_runtime,
         "_bounded_memory_payload",
-        lambda *_args, **_kwargs: {"schema_version": "memory.sota.v1"},
+        lambda *_args, **_kwargs: {"schema_version": "memory.sota.v2"},
     )
 
     diagnostics = action_runtime._execute_memory_capability(
@@ -430,7 +430,7 @@ def test_memory_runtime_passes_scoped_mutation_inputs(
     monkeypatch.setattr(
         action_runtime,
         "_bounded_memory_payload",
-        lambda *_args, **_kwargs: {"schema_version": "memory.sota.v1"},
+        lambda *_args, **_kwargs: {"schema_version": "memory.sota.v2"},
     )
 
     def export(*_args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -507,7 +507,7 @@ def test_memory_runtime_handles_candidate_and_priority_mutations(
     monkeypatch.setattr(
         action_runtime,
         "_bounded_memory_payload",
-        lambda *_args, **_kwargs: {"schema_version": "memory.sota.v1"},
+        lambda *_args, **_kwargs: {"schema_version": "memory.sota.v2"},
     )
 
     def edit(*_args: Any, **kwargs: Any) -> list[dict[str, Any]]:

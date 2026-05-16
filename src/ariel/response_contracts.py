@@ -186,6 +186,15 @@ class SurfaceMemoryRecallSelectionContract(BaseModel):
     rationale: str
 
 
+class SurfaceMemoryRailsExclusionContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    kind: str
+    table: str
+    reason: str
+
+
 class SurfaceEventMemoryCuratedPayloadContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -195,11 +204,13 @@ class SurfaceEventMemoryCuratedPayloadContract(BaseModel):
     selected_memory_count: int
     memory_candidate_count: int
     omitted_memory_count: int
+    rails_excluded_count: int
     selected_memory_ids: list[str]
     selected_memories: list[SurfaceMemoryRecallSelectionContract]
     omitted_memories: list[SurfaceMemoryRecallExclusionContract]
     candidate_memory_ids: list[str]
     candidate_memories: list[dict[str, Any]]
+    rails_excluded: list[SurfaceMemoryRailsExclusionContract]
     curation_rationale: str
     curation_uncertainty: str
     curation_confidence: float

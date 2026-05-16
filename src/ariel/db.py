@@ -278,7 +278,8 @@ REQUIRED_COLUMNS: Final[dict[str, tuple[str, ...]]] = {
         "projection_version",
         "source_memory_version",
         "search_text",
-        "weighted_terms",
+        "search_document",
+        "search_vector",
     ),
     "memory_entity_projections": (
         "canonical_table",

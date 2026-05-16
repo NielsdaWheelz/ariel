@@ -2056,7 +2056,6 @@ class MemoryKeywordProjectionRecord(Base):
     projection_version: Mapped[str] = mapped_column(String(32), nullable=False)
     source_memory_version: Mapped[int] = mapped_column(Integer, nullable=False)
     search_text: Mapped[str] = mapped_column(Text, nullable=False)
-    weighted_terms: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     search_document: Mapped[str] = mapped_column(Text, nullable=False, default="")
     search_vector: Mapped[str] = mapped_column(
         TSVECTOR,

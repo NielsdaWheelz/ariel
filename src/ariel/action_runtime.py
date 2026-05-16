@@ -45,6 +45,7 @@ from ariel.google_connector import (
     _encrypt_secret,
 )
 from ariel.memory import (
+    MEMORY_CONTEXT_SCHEMA_VERSION,
     approve_candidate,
     build_memory_context,
     consolidate_memory,
@@ -827,7 +828,11 @@ def _execute_memory_capability(
             actor_id=actor_id,
             settings=settings,
         )
-        return {"status": "searched", "schema_version": "memory.sota.v1", "results": results}
+        return {
+            "status": "searched",
+            "schema_version": MEMORY_CONTEXT_SCHEMA_VERSION,
+            "results": results,
+        }
     if capability_id == "cap.memory.recall_diagnostics":
         memory_context, recall_event = build_memory_context(
             db,
@@ -840,7 +845,7 @@ def _execute_memory_capability(
         )
         return {
             "status": "diagnosed",
-            "schema_version": memory_context.get("schema_version", "memory.sota.v1"),
+            "schema_version": memory_context.get("schema_version", MEMORY_CONTEXT_SCHEMA_VERSION),
             "recall_diagnostics": recall_event,
             "memory_context": {
                 "hot_index": memory_context.get("hot_index", []),
@@ -928,7 +933,7 @@ def _execute_memory_capability(
     if capability_id == "cap.memory.events":
         return {
             "status": "listed",
-            "schema_version": "memory.sota.v1",
+            "schema_version": MEMORY_CONTEXT_SCHEMA_VERSION,
             "events": list_memory_events(
                 db,
                 scope_key=normalized_input.get("scope_key"),
