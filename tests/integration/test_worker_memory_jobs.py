@@ -17,12 +17,17 @@ from ariel.persistence import (
     BackgroundTaskRecord,
     MemoryAssertionRecord,
     MemoryContextBlockRecord,
+    MemoryDeletionRecord,
     MemoryEmbeddingProjectionRecord,
     MemoryEntityRecord,
     MemoryEvidenceRecord,
     MemoryGraphProjectionRecord,
     MemoryProjectionJobRecord,
     MemoryRelationshipRecord,
+    MemoryRetentionPolicyRecord,
+    MemoryReviewRecord,
+    MemorySalienceRecord,
+    MemoryVersionRecord,
     SessionRecord,
 )
 
@@ -1124,3 +1129,424 @@ def test_topic_context_block_without_topic_id_is_rejected_by_schema_check(
                         updated_at=now,
                     )
                 )
+
+
+def _seed_forgetting_assertion(
+    db: Session,
+    *,
+    assertion_id: str,
+    predicate: str,
+    text: str,
+    confidence: float,
+    last_verified_at: datetime,
+    now: datetime,
+    assertion_type: str = "fact",
+    lifecycle_state: str = "active",
+    object_value: dict[str, Any] | None = None,
+    user_priority: str | None = None,
+    salience_score: float = 0.0,
+) -> None:
+    # An assertion whose confidence and last-verified age are fully controlled,
+    # plus an optional salience row, so the FO-3 forgetting pass can be exercised
+    # against a known value score.
+    entity_id = f"ent_{assertion_id}"
+    db.add(
+        MemoryEntityRecord(
+            id=entity_id,
+            entity_type="user",
+            entity_key=assertion_id,
+            display_name="Forgetting test user",
+            summary=None,
+            metadata_json={},
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    db.flush()
+    db.add(
+        MemoryAssertionRecord(
+            id=assertion_id,
+            subject_entity_id=entity_id,
+            subject_key=assertion_id,
+            predicate=predicate,
+            scope_key="global",
+            object_value=object_value if object_value is not None else {"text": text},
+            assertion_type=assertion_type,
+            is_multi_valued=True,
+            scope={},
+            lifecycle_state=lifecycle_state,
+            confidence=confidence,
+            valid_from=None,
+            valid_to=None,
+            superseded_by_assertion_id=None,
+            extraction_model=None,
+            extraction_prompt_version=None,
+            last_verified_at=last_verified_at,
+            created_at=last_verified_at,
+            updated_at=now,
+        )
+    )
+    db.flush()
+    if user_priority is not None or salience_score:
+        db.add(
+            MemorySalienceRecord(
+                id=f"msl_{assertion_id}",
+                assertion_id=assertion_id,
+                user_priority=user_priority or "none",
+                score=salience_score,
+                signals={},
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+
+def _consolidate_global(db: Session, *, now: datetime) -> dict[str, Any]:
+    return memory_module.consolidate_memory(
+        db,
+        scope_key="global",
+        actor_id="system",
+        now_fn=lambda: now,
+        new_id_fn=_hot_index_new_id,
+        settings=_settings(),
+    )
+
+
+def _hot_index_assertion_ids(db: Session) -> set[str]:
+    block = db.scalar(
+        select(MemoryContextBlockRecord).where(
+            MemoryContextBlockRecord.block_type == "hot_index",
+            MemoryContextBlockRecord.scope_key == "global",
+        )
+    )
+    if block is None:
+        return set()
+    content = json.loads(block.content)
+    refs: set[str] = set(block.source_assertion_ids)
+    for entry in [*content["entries"], *content["do_not_repeat"]]:
+        refs.update(entry["source_assertion_ids"])
+    return refs
+
+
+def test_consolidate_memory_demotes_low_value_long_unverified_assertion(
+    session_factory: sessionmaker[Session],
+) -> None:
+    # A low-confidence assertion of a decaying predicate, unverified far past the
+    # staleness horizon, has an effective value below the floor. The FO-3
+    # forgetting pass demotes it to `stale` with an audited rationale; it then
+    # drops out of the active set and the rebuilt hot index.
+    now = datetime(2026, 5, 16, 10, 0, tzinfo=UTC)
+    with session_factory() as db:
+        with db.begin():
+            _seed_forgetting_assertion(
+                db,
+                assertion_id="mas_forget_stale",
+                predicate="project.blocker",
+                text="the staging cluster is degraded",
+                confidence=0.4,
+                last_verified_at=now - timedelta(days=200),
+                now=now,
+            )
+
+    with session_factory() as db:
+        with db.begin():
+            result = _consolidate_global(db, now=now)
+
+    demotions = [c for c in result["proposed_changes"] if c["kind"] == "forgetting_demote"]
+    assert [c["assertion_id"] for c in demotions] == ["mas_forget_stale"]
+    assert demotions[0]["unverified_days"] == 200
+
+    with session_factory() as db:
+        assertion = db.get(MemoryAssertionRecord, "mas_forget_stale")
+        assert assertion is not None
+        # Demotion to `stale` is the whole "forget from recall" mechanism.
+        assert assertion.lifecycle_state == "stale"
+        assert assertion.invalidated_at == now
+        # The demotion rationale is audited on the version row by mark_assertion_stale.
+        stale_version = db.scalar(
+            select(MemoryVersionRecord).where(
+                MemoryVersionRecord.canonical_table == "memory_assertions",
+                MemoryVersionRecord.canonical_id == "mas_forget_stale",
+                MemoryVersionRecord.change_type == "updated",
+            )
+        )
+        assert stale_version is not None
+        assert stale_version.new_state is not None
+        assert stale_version.new_state["staleness_reason"].startswith("forgetting policy:")
+        # An active-only recall pool, the hot index, and topic blocks all exclude
+        # a `stale` assertion, so it has disappeared from recall.
+        assert "mas_forget_stale" not in _hot_index_assertion_ids(db)
+        assert (
+            db.scalar(
+                select(func.count())
+                .select_from(MemoryAssertionRecord)
+                .where(
+                    MemoryAssertionRecord.id == "mas_forget_stale",
+                    MemoryAssertionRecord.lifecycle_state == "active",
+                )
+            )
+            == 0
+        )
+
+
+def test_consolidate_memory_never_demotes_pinned_assertion(
+    session_factory: sessionmaker[Session],
+) -> None:
+    # A pinned assertion in exactly the demotable condition (low confidence,
+    # long unverified, decaying predicate) is never demoted by the forgetting
+    # pass, regardless of its value score.
+    now = datetime(2026, 5, 16, 10, 5, tzinfo=UTC)
+    with session_factory() as db:
+        with db.begin():
+            _seed_forgetting_assertion(
+                db,
+                assertion_id="mas_forget_pinned",
+                predicate="project.blocker",
+                text="the staging cluster is degraded",
+                confidence=0.4,
+                last_verified_at=now - timedelta(days=200),
+                now=now,
+                user_priority="pinned",
+            )
+
+    with session_factory() as db:
+        with db.begin():
+            result = _consolidate_global(db, now=now)
+
+    assert [c for c in result["proposed_changes"] if c["kind"] == "forgetting_demote"] == []
+    with session_factory() as db:
+        assertion = db.get(MemoryAssertionRecord, "mas_forget_pinned")
+        assert assertion is not None
+        assert assertion.lifecycle_state == "active"
+        assert "mas_forget_pinned" in _hot_index_assertion_ids(db)
+
+
+def test_consolidate_memory_keeps_recently_verified_and_high_salience_assertions(
+    session_factory: sessionmaker[Session],
+) -> None:
+    # The forgetting pass leaves two assertions alone: one verified moments ago
+    # (inside the staleness horizon), and one long-unverified and low-confidence
+    # but carrying a high salience score that lifts its value above the floor.
+    now = datetime(2026, 5, 16, 10, 10, tzinfo=UTC)
+    with session_factory() as db:
+        with db.begin():
+            _seed_forgetting_assertion(
+                db,
+                assertion_id="mas_forget_recent",
+                predicate="project.blocker",
+                text="the build pipeline is flaky",
+                confidence=0.4,
+                last_verified_at=now,
+                now=now,
+            )
+            _seed_forgetting_assertion(
+                db,
+                assertion_id="mas_forget_salient",
+                predicate="project.blocker",
+                text="the payments integration is blocked",
+                confidence=0.4,
+                last_verified_at=now - timedelta(days=200),
+                now=now,
+                salience_score=0.9,
+            )
+
+    with session_factory() as db:
+        with db.begin():
+            result = _consolidate_global(db, now=now)
+
+    assert [c for c in result["proposed_changes"] if c["kind"] == "forgetting_demote"] == []
+    with session_factory() as db:
+        for assertion_id in ("mas_forget_recent", "mas_forget_salient"):
+            assertion = db.get(MemoryAssertionRecord, assertion_id)
+            assert assertion is not None
+            assert assertion.lifecycle_state == "active"
+
+
+def test_consolidate_memory_deletes_assertion_past_delete_after_retention(
+    session_factory: sessionmaker[Session],
+) -> None:
+    # A delete_after retention policy past its day horizon routes the matching
+    # assertion to deletion in the forgetting pass; a non-matching assertion is
+    # untouched.
+    now = datetime(2026, 5, 16, 10, 15, tzinfo=UTC)
+    with session_factory() as db:
+        with db.begin():
+            _seed_forgetting_assertion(
+                db,
+                assertion_id="mas_retention_match",
+                predicate="fact.tooling",
+                text="we still call the obsolete vendor api for invoices",
+                confidence=0.95,
+                last_verified_at=now - timedelta(days=120),
+                now=now,
+            )
+            _seed_forgetting_assertion(
+                db,
+                assertion_id="mas_retention_other",
+                predicate="fact.tooling",
+                text="the current billing service handles invoices",
+                confidence=0.95,
+                last_verified_at=now - timedelta(days=120),
+                now=now,
+            )
+            db.add(
+                MemoryRetentionPolicyRecord(
+                    id="mrp_delete_after",
+                    scope_key="global",
+                    policy_kind="delete_after",
+                    pattern="obsolete vendor",
+                    retention_days=90,
+                    lifecycle_state="active",
+                    reason="vendor decommissioned",
+                    metadata_json={},
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
+    with session_factory() as db:
+        with db.begin():
+            result = _consolidate_global(db, now=now)
+
+    retention_deletes = [c for c in result["proposed_changes"] if c["kind"] == "retention_delete"]
+    assert [c["assertion_id"] for c in retention_deletes] == ["mas_retention_match"]
+    assert retention_deletes[0]["retention_policy_id"] == "mrp_delete_after"
+
+    with session_factory() as db:
+        matched = db.get(MemoryAssertionRecord, "mas_retention_match")
+        other = db.get(MemoryAssertionRecord, "mas_retention_other")
+        assert matched is not None and matched.lifecycle_state == "deleted"
+        # delete_after is "forget from recall + existence" via the standard
+        # delete path; a deletion audit row is written.
+        assert (
+            db.scalar(
+                select(func.count())
+                .select_from(MemoryDeletionRecord)
+                .where(
+                    MemoryDeletionRecord.target_id == "mas_retention_match",
+                    MemoryDeletionRecord.deletion_type == "delete",
+                )
+            )
+            == 1
+        )
+        # The high-confidence, recently-verified, unmatched assertion survives.
+        assert other is not None and other.lifecycle_state == "active"
+        assert "mas_retention_match" not in _hot_index_assertion_ids(db)
+
+
+def test_consolidate_memory_routes_review_after_retention_to_operator_review(
+    session_factory: sessionmaker[Session],
+) -> None:
+    # A review_after retention policy past its horizon routes the matching
+    # assertion to operator review; the assertion stays active pending that
+    # review and is not demoted by the forgetting pass.
+    now = datetime(2026, 5, 16, 10, 20, tzinfo=UTC)
+    with session_factory() as db:
+        with db.begin():
+            _seed_forgetting_assertion(
+                db,
+                assertion_id="mas_review_after",
+                predicate="fact.tooling",
+                text="the quarterly access review covers the audit log",
+                confidence=0.95,
+                last_verified_at=now - timedelta(days=120),
+                now=now,
+            )
+            db.add(
+                MemoryRetentionPolicyRecord(
+                    id="mrp_review_after",
+                    scope_key="global",
+                    policy_kind="review_after",
+                    pattern="quarterly access review",
+                    retention_days=90,
+                    lifecycle_state="active",
+                    reason="must be re-confirmed quarterly",
+                    metadata_json={},
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
+    with session_factory() as db:
+        with db.begin():
+            result = _consolidate_global(db, now=now)
+
+    reviews = [c for c in result["proposed_changes"] if c["kind"] == "retention_review"]
+    assert [c["assertion_id"] for c in reviews] == ["mas_review_after"]
+
+    with session_factory() as db:
+        assertion = db.get(MemoryAssertionRecord, "mas_review_after")
+        assert assertion is not None
+        assert assertion.lifecycle_state == "active"
+        review = db.scalar(
+            select(MemoryReviewRecord).where(
+                MemoryReviewRecord.assertion_id == "mas_review_after",
+                MemoryReviewRecord.decision == "needs_operator_review",
+            )
+        )
+        assert review is not None
+        assert review.reason is not None
+        assert "review_after" in review.reason
+
+
+def test_consolidate_memory_forgetting_pass_cannot_resurface_privacy_deleted_memory(
+    session_factory: sessionmaker[Session],
+) -> None:
+    # Privacy-deleted content is strictly separate from "forget from recall": the
+    # forgetting pass only ever reads active assertions, so a privacy-deleted row
+    # is never selected, never re-activated, and stays redacted. A retention
+    # policy whose pattern would otherwise match it changes nothing.
+    now = datetime(2026, 5, 16, 10, 25, tzinfo=UTC)
+    with session_factory() as db:
+        with db.begin():
+            _seed_forgetting_assertion(
+                db,
+                assertion_id="mas_privacy_deleted",
+                predicate="fact.contact_detail",
+                text="[privacy_deleted]",
+                object_value={"text": "[privacy_deleted]"},
+                confidence=0.95,
+                last_verified_at=now - timedelta(days=400),
+                now=now,
+                lifecycle_state="privacy_deleted",
+            )
+            _seed_forgetting_assertion(
+                db,
+                assertion_id="mas_active_neighbor",
+                predicate="fact.tooling",
+                text="the team uses the standard deploy script",
+                confidence=0.95,
+                last_verified_at=now,
+                now=now,
+            )
+            db.add(
+                MemoryRetentionPolicyRecord(
+                    id="mrp_delete_all",
+                    scope_key="global",
+                    policy_kind="delete_after",
+                    pattern="*",
+                    retention_days=30,
+                    lifecycle_state="active",
+                    reason="aggressive retention",
+                    metadata_json={},
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
+    with session_factory() as db:
+        with db.begin():
+            result = _consolidate_global(db, now=now)
+
+    touched_privacy = [
+        c for c in result["proposed_changes"] if c.get("assertion_id") == "mas_privacy_deleted"
+    ]
+    assert touched_privacy == []
+
+    with session_factory() as db:
+        privacy_deleted = db.get(MemoryAssertionRecord, "mas_privacy_deleted")
+        assert privacy_deleted is not None
+        # The privacy-deleted row is untouched and provably cannot resurface.
+        assert privacy_deleted.lifecycle_state == "privacy_deleted"
+        assert privacy_deleted.object_value == {"text": "[privacy_deleted]"}
+        assert "mas_privacy_deleted" not in _hot_index_assertion_ids(db)

@@ -51,6 +51,8 @@ class AppSettings(BaseSettings):
     memory_consolidation_interval_seconds: int = 86400
     memory_hot_index_budget_tokens: int = 1500
     memory_hot_index_hard_max_tokens: int = 2500
+    memory_forgetting_value_floor: float = 0.25
+    memory_forgetting_staleness_days: int = 180
     auto_rotate_max_turns: int = 120
     auto_rotate_max_age_seconds: int = 172800
     auto_rotate_context_pressure_tokens: int = 5400
@@ -326,6 +328,20 @@ class AppSettings(BaseSettings):
                 "memory_hot_index_hard_max_tokens must be >= memory_hot_index_budget_tokens"
             )
         return self
+
+    @field_validator("memory_forgetting_value_floor")
+    @classmethod
+    def _memory_forgetting_value_floor_must_be_in_range(cls, value: float) -> float:
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("memory_forgetting_value_floor must be in [0.0, 1.0]")
+        return value
+
+    @field_validator("memory_forgetting_staleness_days")
+    @classmethod
+    def _memory_forgetting_staleness_days_must_be_positive(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("memory_forgetting_staleness_days must be >= 1")
+        return value
 
     @field_validator("auto_rotate_max_turns")
     @classmethod

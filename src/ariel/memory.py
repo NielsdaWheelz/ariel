@@ -4228,6 +4228,141 @@ def consolidate_memory(
                 }
             )
 
+    # Selective forgetting (FO-3). A linear pass over the in-scope active
+    # assertions that demotes durably low-value knowledge out of recall without
+    # destroying it. Three outcomes, evaluated per assertion:
+    #   - a `delete_after` retention policy past its horizon -> deletion;
+    #   - a `review_after` retention policy past its horizon -> operator review;
+    #   - otherwise, when the decayed value score is below the floor and the
+    #     assertion is past the staleness horizon -> demotion to `stale`.
+    # `stale` is already excluded from active-only recall, the hot index, and
+    # topic blocks, so demotion is the whole "forget from recall" mechanism; the
+    # evidence and episode rows are untouched. A `pinned` assertion is never
+    # demoted. Demoted and deleted assertions drop out of the projection
+    # rebuilds below, so `selected_assertions` is filtered to the survivors.
+    forgetting_salience = {
+        row.assertion_id: row
+        for row in db.scalars(
+            select(MemorySalienceRecord).where(
+                MemorySalienceRecord.assertion_id.in_(source_assertion_ids or [""])
+            )
+        ).all()
+    }
+    retention_policies = [
+        (policy, policy.pattern.strip().lower())
+        for policy in db.scalars(
+            select(MemoryRetentionPolicyRecord)
+            .where(
+                MemoryRetentionPolicyRecord.lifecycle_state == "active",
+                MemoryRetentionPolicyRecord.policy_kind.in_(("delete_after", "review_after")),
+                MemoryRetentionPolicyRecord.scope_key.in_(
+                    ("global", scope_key, f"session:{source_session_id}")
+                ),
+                MemoryRetentionPolicyRecord.retention_days.is_not(None),
+            )
+            .order_by(
+                MemoryRetentionPolicyRecord.created_at.asc(),
+                MemoryRetentionPolicyRecord.id.asc(),
+            )
+        ).all()
+    ]
+    forgetting_events: list[dict[str, Any]] = []
+    forgotten_ids: set[str] = set()
+    floor = resolved_settings.memory_forgetting_value_floor
+    staleness_days = resolved_settings.memory_forgetting_staleness_days
+    for assertion in selected_assertions:
+        salience = forgetting_salience.get(assertion.id)
+        if salience is not None and salience.user_priority == "pinned":
+            continue
+        unverified_days = max(0.0, (now - assertion.last_verified_at).total_seconds() / 86_400.0)
+        policy_text = _assertion_search_text(assertion).lower()
+        matched_policy = next(
+            (
+                policy
+                for policy, pattern in retention_policies
+                if policy.retention_days is not None
+                and unverified_days >= policy.retention_days
+                and (pattern == "*" or (pattern and pattern in policy_text))
+            ),
+            None,
+        )
+        if matched_policy is not None and matched_policy.policy_kind == "delete_after":
+            forgetting_events.extend(
+                delete_assertion(
+                    db,
+                    assertion_id=assertion.id,
+                    actor_id="system",
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
+            )
+            forgotten_ids.add(assertion.id)
+            proposed_changes.append(
+                {
+                    "kind": "retention_delete",
+                    "assertion_id": assertion.id,
+                    "retention_policy_id": matched_policy.id,
+                }
+            )
+            continue
+        if matched_policy is not None and matched_policy.policy_kind == "review_after":
+            _record_review(
+                db,
+                assertion_id=assertion.id,
+                decision="needs_operator_review",
+                actor_id="system",
+                reason=(
+                    f"retention policy review_after: {matched_policy.retention_days} days "
+                    f"unverified (policy {matched_policy.id})"
+                ),
+                now=now,
+                new_id_fn=new_id_fn,
+            )
+            proposed_changes.append(
+                {
+                    "kind": "retention_review",
+                    "assertion_id": assertion.id,
+                    "retention_policy_id": matched_policy.id,
+                    "review_state": "needs_operator_review",
+                }
+            )
+            continue
+        # The value score blends the two existing durability signals: the
+        # predicate's half-life-decayed confidence and the salience score. Age
+        # is read twice on purpose — inside the decay term and as the staleness
+        # gate — so a still-confident but long-untouched memory is left alone.
+        value_score = _effective_confidence(assertion, now=now) + (
+            salience.score if salience is not None else 0.0
+        )
+        if value_score < floor and unverified_days >= staleness_days:
+            forgetting_events.extend(
+                mark_assertion_stale(
+                    db,
+                    assertion_id=assertion.id,
+                    actor_id="system",
+                    reason=(
+                        f"forgetting policy: effective value {value_score:.3f} below floor "
+                        f"{floor} after {int(unverified_days)} days unverified"
+                    ),
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
+            )
+            forgotten_ids.add(assertion.id)
+            proposed_changes.append(
+                {
+                    "kind": "forgetting_demote",
+                    "assertion_id": assertion.id,
+                    "value_score": value_score,
+                    "unverified_days": int(unverified_days),
+                }
+            )
+    if forgotten_ids:
+        selected_assertions = [
+            assertion for assertion in selected_assertions if assertion.id not in forgotten_ids
+        ]
+        source_assertion_ids = [assertion.id for assertion in selected_assertions]
+
     topic_family_by_type = {
         "profile": "user-profile",
         "preference": "user-preferences",
@@ -4676,6 +4811,7 @@ def consolidate_memory(
         db,
         events=[
             *candidate_events,
+            *forgetting_events,
             {
                 "event_type": "evt.memory.consolidation_completed",
                 "payload": {
