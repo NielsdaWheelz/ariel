@@ -1938,6 +1938,7 @@ def test_action_trace_completion_records_every_outcome_and_excludes_current_sess
                 if capability_id == "cap.memory.inspect"
                 else {"prior_action_id": "ema_prior", "idempotency_key": "undo-trace-1"},
                 status=status,
+                policy_decision="deny" if status == "denied" else "requires_approval",
                 execution_error="boom" if status == "failed" else None,
             )
 

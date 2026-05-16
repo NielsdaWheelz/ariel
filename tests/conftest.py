@@ -14,9 +14,14 @@ from ariel.db import reset_schema_for_tests
 
 
 @pytest.fixture(autouse=True)
-def _hermetic_app_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+def _hermetic_app_settings(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep the suite hermetic against a host .env/.env.local: every AppSettings()
-    resolves from env vars and code defaults only, never from a developer's env files."""
+    resolves from env vars and code defaults only, never from a developer's env files.
+
+    Tests marked ``uses_real_env_files`` opt out so they can assert the production
+    ``model_config`` env_file wiring directly."""
+    if request.node.get_closest_marker("uses_real_env_files") is not None:
+        return
     monkeypatch.setitem(AppSettings.model_config, "env_file", None)
 
 

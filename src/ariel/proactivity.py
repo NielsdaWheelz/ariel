@@ -31,6 +31,7 @@ from ariel.persistence import (
     GoogleConnectorRecord,
     AIJudgmentRecord,
     JobRecord,
+    MemoryActionTraceRecord,
     MemoryAssertionRecord,
     NotificationRecord,
     ProviderEvidenceBlockRecord,
@@ -2279,6 +2280,27 @@ def _follow_up_time(follow_up: dict[str, Any] | None, now: datetime) -> datetime
     return now + _FOLLOW_UP_INTERVALS.get(after, timedelta(minutes=15))
 
 
+def _active_or_new_session(
+    db: Session,
+    *,
+    now: datetime,
+    new_id_fn: Callable[[str], str],
+) -> SessionRecord:
+    """Return the active session, creating and flushing one if none exists."""
+    session = db.scalar(select(SessionRecord).where(SessionRecord.is_active.is_(True)).limit(1))
+    if session is None:
+        session = SessionRecord(
+            id=new_id_fn("ses"),
+            is_active=True,
+            lifecycle_state="active",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(session)
+        db.flush()
+    return session
+
+
 def _apply_remember_decision(
     *,
     db: Session,
@@ -2291,19 +2313,7 @@ def _apply_remember_decision(
     if not isinstance(raw_memory, dict):
         return
     memory = _normalized_remember_payload(raw_memory)
-    source_session = db.scalar(
-        select(SessionRecord).where(SessionRecord.is_active.is_(True)).limit(1)
-    )
-    if source_session is None:
-        source_session = SessionRecord(
-            id=new_id_fn("ses"),
-            is_active=True,
-            lifecycle_state="active",
-            created_at=now,
-            updated_at=now,
-        )
-        db.add(source_session)
-        db.flush()
+    source_session = _active_or_new_session(db, now=now, new_id_fn=new_id_fn)
     memory_events = propose_memory_candidate(
         db,
         source_session_id=source_session.id,
@@ -2488,19 +2498,21 @@ def _record_proactive_action_trace(
     now: datetime,
     new_id_fn: Callable[[str], str],
 ) -> None:
-    trace_session = db.scalar(
-        select(SessionRecord).where(SessionRecord.is_active.is_(True)).limit(1)
-    )
-    if trace_session is None:
-        trace_session = SessionRecord(
-            id=new_id_fn("ses"),
-            is_active=True,
-            lifecycle_state="active",
-            created_at=now,
-            updated_at=now,
+    # record_action_trace's no-attempt branch always inserts a fresh trace, and a
+    # re-runnable worker re-enters the late phases for an already-terminal
+    # execution; skip if this plan's execution trace was already recorded.
+    existing_trace = db.scalar(
+        select(MemoryActionTraceRecord)
+        .where(
+            MemoryActionTraceRecord.scope_key == f"proactive:{plan.case_id}",
+            MemoryActionTraceRecord.trace_type == "execution",
+            MemoryActionTraceRecord.result_refs["action_plan_id"].astext == plan.id,
         )
-        db.add(trace_session)
-        db.flush()
+        .limit(1)
+    )
+    if existing_trace is not None:
+        return
+    trace_session = _active_or_new_session(db, now=now, new_id_fn=new_id_fn)
     _, trace_events = record_action_trace(
         db,
         action_attempt=None,

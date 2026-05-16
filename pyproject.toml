@@ -44,6 +44,9 @@ where = ["src"]
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
+markers = [
+  "uses_real_env_files: opt out of the hermetic env-file fixture to verify AppSettings env_file wiring",
+]
 
 [tool.ruff]
 line-length = 100

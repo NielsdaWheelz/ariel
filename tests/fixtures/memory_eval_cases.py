@@ -7,11 +7,12 @@ labels (``expect_labels`` / ``forbid_labels`` / ``forbid_label`` / signal
 rankings) are placeholders the test resolves against its seeded-id map; every
 other field is the final value ``run_memory_eval`` consumes.
 
-``LONG_MEMORY_EVAL_CASES`` runs against the real hybrid retrieval pipeline.
-``ADVERSARIAL_EVAL_CASES`` runs with the vector and lexical signal functions
-monkeypatched to fixed rankings, so the same cases can be replayed with one
-signal disabled to prove the suite fails under vector-only or keyword-only
-retrieval.
+``LONG_MEMORY_EVAL_CASES`` runs against the real hybrid retrieval pipeline as a
+single ``run_memory_eval`` call over the whole case list. ``ADVERSARIAL_EVAL_CASES``
+runs with the vector and lexical signal functions monkeypatched to fixed rankings;
+because each case carries its own per-signal rankings, the suite runs each case as
+its own single-case ``run_memory_eval`` invocation, replaying every case with one
+signal disabled to prove the suite fails under vector-only or keyword-only retrieval.
 """
 
 from __future__ import annotations
@@ -161,9 +162,11 @@ LONG_MEMORY_EVAL_CASES: list[dict[str, Any]] = [
 # The adversarial cases prove no single retrieval signal suffices. Each correct
 # answer is reachable only when both the vector and the lexical signal run: the
 # vector signal alone yields one wrong memory, the lexical signal alone yields
-# another, and only the fused pool contains the correct memory. The suite test
-# replays these with the vector signal disabled (keyword-only) and the lexical
-# signal disabled (vector-only) and asserts the eval fails both times.
+# another, and only the fused pool contains the correct memory. Each case carries
+# its own per-signal rankings, so the suite runs every case as a separate
+# single-case ``run_memory_eval`` invocation; it replays the full set with the
+# vector signal disabled (keyword-only) and again with the lexical signal disabled
+# (vector-only), asserting the eval fails both times.
 #
 # ``vector_labels`` / ``lexical_labels`` are the ordered rankings the suite
 # installs on ``_vector_signal`` / ``_lexical_signal``; the test resolves the

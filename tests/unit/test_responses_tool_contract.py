@@ -16,6 +16,7 @@ from ariel.app import (
 )
 from ariel.capability_registry import (
     capability_id_for_run_callable,
+    get_capability,
     internal_callable_capability_ids,
     run_callable_name_for_capability_id,
 )
@@ -271,6 +272,75 @@ def test_memory_runtime_handles_projection_read_surfaces(
     )
     assert output["status"] == "listed"
     assert calls[-1] == ("context_blocks", 100)
+
+    event_calls: list[dict[str, Any]] = []
+
+    def list_events(_: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        event_calls.append(kwargs)
+        return [{"id": "mev_1"}]
+
+    monkeypatch.setattr(action_runtime, "list_memory_events", list_events)
+    events_output = action_runtime._execute_memory_capability(
+        db=cast(Session, object()),
+        capability_id="cap.memory.events",
+        normalized_input={
+            "scope_key": "project:phoenix",
+            "event_type": "evt.memory.candidate_proposed",
+            "since": "2026-04-01T00:00:00Z",
+            "until": "2026-04-27T00:00:00Z",
+            "limit": 12,
+        },
+        action_attempt=cast(Any, Attempt()),
+        now_fn=lambda: fixed_now,
+        new_id_fn=lambda prefix: f"{prefix}_1",
+    )
+    assert events_output["status"] == "listed"
+    assert events_output["events"] == [{"id": "mev_1"}]
+    assert event_calls[-1]["scope_key"] == "project:phoenix"
+    assert event_calls[-1]["event_type"] == "evt.memory.candidate_proposed"
+    assert event_calls[-1]["limit"] == 12
+
+    # The registry validator accepts the optional filters and bounded limit, and
+    # rejects an out-of-range limit, an unparseable timestamp, and unknown keys.
+    events_capability = get_capability("cap.memory.events")
+    assert events_capability is not None
+    normalized, error = events_capability.validate_input(
+        {
+            "scope_key": "project:phoenix",
+            "event_type": "evt.memory.candidate_proposed",
+            "since": "2026-04-01T00:00:00Z",
+            "until": "2026-04-27T00:00:00Z",
+            "limit": 12,
+        }
+    )
+    assert error is None
+    assert normalized == {
+        "scope_key": "project:phoenix",
+        "event_type": "evt.memory.candidate_proposed",
+        "since": "2026-04-01T00:00:00Z",
+        "until": "2026-04-27T00:00:00Z",
+        "limit": 12,
+    }
+    accepts_nulls, accepts_nulls_error = events_capability.validate_input(
+        {"scope_key": None, "event_type": None, "since": None, "until": None, "limit": 1}
+    )
+    assert accepts_nulls_error is None
+    assert accepts_nulls == {
+        "scope_key": None,
+        "event_type": None,
+        "since": None,
+        "until": None,
+        "limit": 1,
+    }
+    for rejected in (
+        {"scope_key": None, "event_type": None, "since": None, "until": None, "limit": 0},
+        {"scope_key": None, "event_type": None, "since": None, "until": None, "limit": 201},
+        {"scope_key": None, "event_type": None, "since": "not-a-time", "until": None, "limit": 5},
+        {"scope_key": None, "event_type": None, "since": None, "until": None},
+    ):
+        rejected_normalized, rejected_error = events_capability.validate_input(rejected)
+        assert rejected_normalized is None
+        assert rejected_error == "schema_invalid"
 
 
 def test_memory_runtime_handles_diagnostics_import_eval_and_projection_retry(

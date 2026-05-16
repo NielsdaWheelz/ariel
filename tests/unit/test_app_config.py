@@ -16,8 +16,10 @@ def _app_settings_without_env_files() -> AppSettings:
     return cast(Any, AppSettings)(_env_file=None)
 
 
+@pytest.mark.uses_real_env_files
 def test_app_settings_load_from_project_env_files() -> None:
     assert {path.name for path in _ENV_FILES} == {".env", ".env.local"}
+    assert AppSettings.model_config["env_file"] == _ENV_FILES
 
 
 def test_create_app_uses_ariel_database_url_env(monkeypatch: pytest.MonkeyPatch) -> None:
