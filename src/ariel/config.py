@@ -15,16 +15,14 @@ from ariel.google_connector import ConnectorTokenCipher
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MEMORY_EMBEDDING_DIMENSIONS = 1536
 _LOCAL_AUTH_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,}$")
+_ENV_FILES = (_PROJECT_ROOT / ".env", _PROJECT_ROOT / ".env.local")
 
 
 class AppSettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="ARIEL_",
         extra="ignore",
-        env_file=(
-            _PROJECT_ROOT / ".env",
-            _PROJECT_ROOT / ".env.local",
-        ),
+        env_file=_ENV_FILES,
         env_file_encoding="utf-8",
     )
 

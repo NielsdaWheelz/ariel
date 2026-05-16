@@ -7416,6 +7416,12 @@ def build_memory_context(
             if trace is None or trace.lifecycle_state != "active":
                 _exclude(ref, "reasoning_trace", "lifecycle: reasoning trace is not active")
                 continue
+            if (
+                current_session_id is not None
+                and trace.scope_key == f"session:{current_session_id}"
+            ):
+                _exclude(ref, "reasoning_trace", "scope: current-session reasoning trace")
+                continue
             if scope_aliases and trace.scope_key not in scope_aliases:
                 _exclude(ref, "reasoning_trace", "scope: trace outside the requested scope")
                 continue

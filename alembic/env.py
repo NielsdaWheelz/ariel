@@ -19,10 +19,12 @@ config = context.config
 # Schema is managed with explicit revision scripts.
 target_metadata = None
 
-settings = AppSettings()
 configured_database_url = config.get_main_option("sqlalchemy.url")
 if not configured_database_url or configured_database_url == "postgresql+psycopg://localhost/ariel":
-    config.set_main_option("sqlalchemy.url", settings.database_url)
+    # Build settings (which read .env/.env.local and run production validation)
+    # only when no explicit URL was given. run_migrations() and the test harness
+    # set sqlalchemy.url directly, so they never touch a host .env.local.
+    config.set_main_option("sqlalchemy.url", AppSettings().database_url)
 
 
 def run_migrations_offline() -> None:
