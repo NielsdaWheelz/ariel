@@ -46,6 +46,9 @@ class AppSettings(BaseSettings):
     memory_embedding_model: str = "text-embedding-3-small"
     memory_embedding_dimensions: int = MEMORY_EMBEDDING_DIMENSIONS
     memory_import_cutover_enabled: bool = False
+    memory_consolidation_candidate_threshold: int = 12
+    memory_consolidation_conflict_threshold: int = 3
+    memory_consolidation_interval_seconds: int = 86400
     auto_rotate_max_turns: int = 120
     auto_rotate_max_age_seconds: int = 172800
     auto_rotate_context_pressure_tokens: int = 5400
@@ -287,6 +290,17 @@ class AppSettings(BaseSettings):
     def _memory_embedding_dimensions_must_match_schema(cls, value: int) -> int:
         if value != MEMORY_EMBEDDING_DIMENSIONS:
             raise ValueError(f"memory_embedding_dimensions must be {MEMORY_EMBEDDING_DIMENSIONS}")
+        return value
+
+    @field_validator(
+        "memory_consolidation_candidate_threshold",
+        "memory_consolidation_conflict_threshold",
+        "memory_consolidation_interval_seconds",
+    )
+    @classmethod
+    def _memory_consolidation_settings_must_be_positive(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("memory consolidation settings must be >= 1")
         return value
 
     @field_validator("auto_rotate_max_turns")

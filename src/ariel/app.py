@@ -73,6 +73,7 @@ from ariel.memory import (
     delete_assertion,
     edit_candidate,
     emit_memory_events,
+    enqueue_consolidation_job,
     export_memory,
     import_memory_candidates,
     list_memory,
@@ -3119,6 +3120,19 @@ def _rotate_active_session(
     )
     db.add(rotation_record)
     db.flush()
+
+    # Session rotation absorbs the closed session's memory: enqueue a hot-index
+    # consolidation for the global scope, gated by consolidate policy.
+    if resolve_memory_policy(
+        db,
+        operation="consolidate",
+        now=now,
+        session_id=prior_session_id,
+        actor_id=actor_id,
+    ).allowed:
+        enqueue_consolidation_job(
+            db, scope_key="global", kind="hot_index", now=now, new_id_fn=_new_id
+        )
 
     return rotated_session, rotation_record, False
 

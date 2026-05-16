@@ -1897,9 +1897,8 @@ class MemoryProjectionJobRecord(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "projection_kind IN ('embedding', 'keyword', 'entity', 'graph', "
-            "'context_block', 'project_state', 'hot_index', 'topic_block', "
-            "'action_trace', 'temporal', 'symbol', 'export')",
+            "projection_kind IN ('embedding', 'graph', 'context_block', "
+            "'project_state', 'hot_index', 'topic_block', 'export')",
             name="ck_memory_projection_job_kind",
         ),
         CheckConstraint(

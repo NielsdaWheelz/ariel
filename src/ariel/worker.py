@@ -29,6 +29,7 @@ from .persistence import (
     EmailThreadWatchRecord,
     JobEventRecord,
     JobRecord,
+    MemoryContextBlockRecord,
     MemoryProjectionJobRecord,
     NotificationDeliveryRecord,
     NotificationRecord,
@@ -39,9 +40,13 @@ from .persistence import (
 )
 from .memory import (
     consolidate_memory,
+    enqueue_consolidation_job,
     export_memory,
     process_memory_extract_turn,
+    process_memory_graph_projection_job,
     process_memory_projection_job,
+    resolve_memory_policy,
+    scope_keys_for_policy,
 )
 from .proactivity import (
     mark_proactive_turn_delivered,
@@ -70,6 +75,10 @@ PROACTIVE_RECOVERABLE_TASK_TYPES = (
     "proactive_action_execution_due",
 )
 
+# Projection-job kinds the maintenance worker consumes. The schema CHECK
+# ck_memory_projection_job_kind is reconciled to exactly the enqueued-and-
+# consumed set: embedding and graph are handled by their own workers; these are
+# the consolidation/export kinds.
 MEMORY_CONSOLIDATION_PROJECTION_KINDS = (
     "context_block",
     "project_state",
@@ -78,7 +87,6 @@ MEMORY_CONSOLIDATION_PROJECTION_KINDS = (
 )
 
 MEMORY_MAINTENANCE_PROJECTION_KINDS = MEMORY_CONSOLIDATION_PROJECTION_KINDS + ("export",)
-SUPPORTED_MEMORY_PROJECTION_KINDS = ("embedding",) + MEMORY_MAINTENANCE_PROJECTION_KINDS
 
 
 class UnsupportedTaskType(RuntimeError):
@@ -352,6 +360,56 @@ def enqueue_due_worker_owned_ambient_task(
     )
 
 
+def enqueue_due_memory_consolidation_jobs(
+    db: Session,
+    *,
+    settings: AppSettings,
+    now: datetime,
+) -> int:
+    """Scheduled consolidation cadence: enqueue a hot_index consolidation job for
+    every scope whose last hot_index block is older than
+    ARIEL_memory_consolidation_interval_seconds. A scope with no prior
+    consolidation is left to the backlog and rotation triggers. Each enqueue is
+    gated by consolidate policy; enqueue_consolidation_job dedupes per scope.
+    """
+    stale_before = now - timedelta(seconds=settings.memory_consolidation_interval_seconds)
+    fresh_scopes = set(
+        db.scalars(
+            select(MemoryContextBlockRecord.scope_key).where(
+                MemoryContextBlockRecord.block_type == "hot_index",
+                MemoryContextBlockRecord.lifecycle_state == "active",
+                MemoryContextBlockRecord.updated_at > stale_before,
+            )
+        ).all()
+    )
+    consolidated_scopes = set(
+        db.scalars(
+            select(MemoryContextBlockRecord.scope_key).where(
+                MemoryContextBlockRecord.block_type == "hot_index"
+            )
+        ).all()
+    )
+    enqueued = 0
+    for scope_key in sorted(consolidated_scopes - fresh_scopes):
+        project_key, repo_key = scope_keys_for_policy(scope_key)
+        if not resolve_memory_policy(
+            db,
+            operation="consolidate",
+            now=now,
+            project_key=project_key,
+            repo_key=repo_key,
+        ).allowed:
+            continue
+        if (
+            enqueue_consolidation_job(
+                db, scope_key=scope_key, kind="hot_index", now=now, new_id_fn=_new_id
+            )
+            is not None
+        ):
+            enqueued += 1
+    return enqueued
+
+
 def enqueue_due_work_follow_up_evaluation_tasks(
     db: Session,
     *,
@@ -533,41 +591,6 @@ def process_memory_maintenance_job(
     return True
 
 
-def process_unsupported_memory_projection_job(
-    *,
-    session_factory: sessionmaker[Session],
-    now_fn: Callable[[], datetime],
-) -> bool:
-    with session_factory() as db:
-        with db.begin():
-            now = now_fn()
-            job = db.scalar(
-                select(MemoryProjectionJobRecord)
-                .where(
-                    MemoryProjectionJobRecord.projection_kind.not_in(
-                        SUPPORTED_MEMORY_PROJECTION_KINDS
-                    ),
-                    MemoryProjectionJobRecord.lifecycle_state == "pending",
-                    MemoryProjectionJobRecord.run_after <= now,
-                )
-                .order_by(
-                    MemoryProjectionJobRecord.run_after.asc(),
-                    MemoryProjectionJobRecord.created_at.asc(),
-                    MemoryProjectionJobRecord.id.asc(),
-                )
-                .limit(1)
-                .with_for_update(skip_locked=True)
-            )
-            if job is None:
-                return False
-            job.lifecycle_state = "dead_letter"
-            job.attempts += 1
-            job.error = f"unsupported memory projection job: {job.projection_kind}"
-            job.run_after = now
-            job.updated_at = now
-    return True
-
-
 def _google_runtime(settings: AppSettings) -> GoogleConnectorRuntime:
     return GoogleConnectorRuntime(
         oauth_client=DefaultGoogleOAuthClient(
@@ -638,10 +661,19 @@ def process_one_task(
                 now=now,
             )
             enqueue_due_worker_owned_ambient_task(db, settings=resolved_settings, now=now)
+            enqueue_due_memory_consolidation_jobs(db, settings=resolved_settings, now=now)
 
     if process_memory_projection_job(
         session_factory=session_factory,
         settings=resolved_settings,
+        now_fn=_utcnow,
+        new_id_fn=_new_id,
+        worker_id=resolved_worker_id,
+    ):
+        return True
+
+    if process_memory_graph_projection_job(
+        session_factory=session_factory,
         now_fn=_utcnow,
         new_id_fn=_new_id,
         worker_id=resolved_worker_id,
@@ -653,12 +685,6 @@ def process_one_task(
         now_fn=_utcnow,
         new_id_fn=_new_id,
         worker_id=resolved_worker_id,
-    ):
-        return True
-
-    if process_unsupported_memory_projection_job(
-        session_factory=session_factory,
-        now_fn=_utcnow,
     ):
         return True
 

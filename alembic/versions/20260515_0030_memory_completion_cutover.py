@@ -64,6 +64,15 @@ _MEMORY_KEYWORD_PROJECTION_CANONICAL_TABLE_AFTER = (
     "'memory_episodes', 'memory_reasoning_traces', 'memory_action_traces', "
     "'memory_procedures')"
 )
+_MEMORY_PROJECTION_JOB_KIND_BEFORE = (
+    "projection_kind IN ('embedding', 'keyword', 'entity', 'graph', "
+    "'context_block', 'project_state', 'hot_index', 'topic_block', "
+    "'action_trace', 'temporal', 'symbol', 'export')"
+)
+_MEMORY_PROJECTION_JOB_KIND_AFTER = (
+    "projection_kind IN ('embedding', 'graph', 'context_block', "
+    "'project_state', 'hot_index', 'topic_block', 'export')"
+)
 
 
 def _upgrade_memory_events() -> None:
@@ -158,6 +167,19 @@ def _upgrade_memory_keyword_projections() -> None:
     )
 
 
+def _upgrade_memory_projection_jobs() -> None:
+    op.drop_constraint(
+        "ck_memory_projection_job_kind",
+        "memory_projection_jobs",
+        type_="check",
+    )
+    op.create_check_constraint(
+        "ck_memory_projection_job_kind",
+        "memory_projection_jobs",
+        _MEMORY_PROJECTION_JOB_KIND_AFTER,
+    )
+
+
 def upgrade() -> None:
     _upgrade_memory_events()
     _upgrade_memory_conflict_sets()
@@ -178,6 +200,7 @@ def upgrade() -> None:
 
     _upgrade_memory_scope_bindings()
     _upgrade_memory_keyword_projections()
+    _upgrade_memory_projection_jobs()
 
 
 def _downgrade_memory_keyword_projections() -> None:
@@ -229,7 +252,21 @@ def _downgrade_memory_events() -> None:
     op.drop_table("memory_events")
 
 
+def _downgrade_memory_projection_jobs() -> None:
+    op.drop_constraint(
+        "ck_memory_projection_job_kind",
+        "memory_projection_jobs",
+        type_="check",
+    )
+    op.create_check_constraint(
+        "ck_memory_projection_job_kind",
+        "memory_projection_jobs",
+        _MEMORY_PROJECTION_JOB_KIND_BEFORE,
+    )
+
+
 def downgrade() -> None:
+    _downgrade_memory_projection_jobs()
     _downgrade_memory_keyword_projections()
     _downgrade_memory_scope_bindings()
 

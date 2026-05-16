@@ -441,6 +441,34 @@ def _weighted_terms(value: str) -> dict[str, float]:
     return weights
 
 
+def _symbol_tokens(value: str) -> list[tuple[str, str]]:
+    """Extract (symbol, path) pairs from an assertion's text: whitespace-bounded
+    substrings that look like a file path (contain '/') or a code identifier
+    (snake_case, interior-capital camelCase, or a dotted name). Deterministic;
+    de-duplicated in encounter order."""
+    pairs: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for raw in value.split():
+        token = raw.strip("()[]{}<>,;:'\"`.").strip()
+        if len(token) < 3 or len(token) > 200:
+            continue
+        if not all(c.isalnum() or c in "_./-" for c in token):
+            continue
+        is_path = "/" in token
+        has_camel = any(
+            token[i].islower() and token[i + 1].isupper() for i in range(len(token) - 1)
+        )
+        is_identifier = not is_path and ("_" in token or "." in token or has_camel)
+        if not (is_path or is_identifier):
+            continue
+        pair = (token, "") if is_identifier else ("", token)
+        if pair in seen:
+            continue
+        seen.add(pair)
+        pairs.append(pair)
+    return pairs
+
+
 def _memory_version_number(db: Session, *, table: str, record_id: str) -> int:
     return (
         db.scalar(
@@ -586,7 +614,7 @@ def resolve_memory_policy(
     )
 
 
-def _scope_keys_for_policy(scope_key: str | None) -> tuple[str | None, str | None]:
+def scope_keys_for_policy(scope_key: str | None) -> tuple[str | None, str | None]:
     """Split a memory scope_key into the (project_key, repo_key) pair that
     resolve_memory_policy consumes. A bare key (no prefix) is treated as both."""
     if scope_key is None or scope_key in {"global", USER_SUBJECT_KEY, "default"}:
@@ -938,6 +966,11 @@ def _event_payload(
 class MemoryEventError(RuntimeError):
     """A memory mutation produced an event dict that does not match the event
     shape. The producer is the defect; emission must not silently drop it."""
+
+
+class MemoryProjectionError(RuntimeError):
+    """A projection or consolidation job was asked to do something its contract
+    forbids (e.g. an unknown consolidation kind). The caller is the defect."""
 
 
 _EVENT_SUBJECT_REF_KEYS = (
@@ -1318,6 +1351,7 @@ def _record_projection_rows(
             source_memory_version=source_memory_version,
             search_text=search_text,
             weighted_terms=_weighted_terms(search_text),
+            search_document=search_text,
             created_at=now,
             updated_at=now,
         )
@@ -1367,6 +1401,31 @@ def _record_projection_rows(
             updated_at=now,
         )
     )
+    # Symbol projection: only repo-scoped assertions carry code identifiers and
+    # paths worth indexing for the symbol retrieval signal.
+    repo_key = ""
+    if assertion.scope_key.startswith("repo:"):
+        repo_key = assertion.scope_key
+    elif assertion.subject_key.startswith("repo:"):
+        repo_key = assertion.subject_key
+    if repo_key:
+        for symbol, path in _symbol_tokens(_assertion_text(assertion)):
+            db.add(
+                MemorySymbolProjectionRecord(
+                    id=new_id_fn("msy"),
+                    canonical_table="memory_assertions",
+                    canonical_id=assertion.id,
+                    repo_key=repo_key,
+                    symbol=symbol,
+                    path=path,
+                    language=None,
+                    projection_version=MEMORY_PROJECTION_VERSION,
+                    source_memory_version=source_memory_version,
+                    metadata_json={"source": "assertion_text"},
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
 
 
 def process_memory_projection_job(
@@ -1532,6 +1591,139 @@ def process_memory_projection_job(
                 row.embedding = vector
                 row.updated_at = now
 
+            job.lifecycle_state = "completed"
+            job.error = None
+            job.claimed_by = None
+            job.attempt_token = None
+            job.last_heartbeat = None
+            job.updated_at = now
+    return True
+
+
+_GRAPH_PROJECTION_MAX_DISTANCE = 3
+
+
+def _rebuild_graph_projection(
+    db: Session,
+    *,
+    source_entity_id: str,
+    now: datetime,
+    new_id_fn: Callable[[str], str],
+) -> None:
+    """Recompute the BFS reachability of one source entity to depth 3 over the
+    active relationship graph, replacing its memory_graph_projections rows."""
+    edges: dict[str, list[MemoryRelationshipRecord]] = {}
+    for relationship in db.scalars(
+        select(MemoryRelationshipRecord)
+        .where(MemoryRelationshipRecord.lifecycle_state == "active")
+        .order_by(MemoryRelationshipRecord.id.asc())
+    ).all():
+        edges.setdefault(relationship.source_entity_id, []).append(relationship)
+    db.execute(
+        delete(MemoryGraphProjectionRecord).where(
+            MemoryGraphProjectionRecord.source_entity_id == source_entity_id
+        )
+    )
+    reached: dict[str, tuple[int, list[dict[str, Any]], dict[str, int], float]] = {}
+    frontier: list[tuple[str, int, list[dict[str, Any]], dict[str, int], float]] = [
+        (source_entity_id, 0, [], {}, 1.0)
+    ]
+    while frontier:
+        entity_id, distance, path, versions, score = frontier.pop(0)
+        if distance >= _GRAPH_PROJECTION_MAX_DISTANCE:
+            continue
+        for relationship in edges.get(entity_id, []):
+            target_id = relationship.target_entity_id
+            if target_id == source_entity_id:
+                continue
+            next_distance = distance + 1
+            next_path = [
+                *path,
+                {
+                    "relationship_id": relationship.id,
+                    "relationship_type": relationship.relationship_type,
+                },
+            ]
+            next_versions = {**versions, relationship.id: 1}
+            next_score = score * relationship.confidence
+            existing = reached.get(target_id)
+            if existing is not None and existing[0] <= next_distance:
+                continue
+            reached[target_id] = (next_distance, next_path, next_versions, next_score)
+            frontier.append((target_id, next_distance, next_path, next_versions, next_score))
+    for target_id, (distance, path, versions, score) in sorted(reached.items()):
+        db.add(
+            MemoryGraphProjectionRecord(
+                id=new_id_fn("mgp"),
+                source_entity_id=source_entity_id,
+                target_entity_id=target_id,
+                projection_version=MEMORY_PROJECTION_VERSION,
+                source_memory_versions={"memory_relationships": versions},
+                source_projection_versions={"memory_graph_projections": MEMORY_PROJECTION_VERSION},
+                relationship_path=path,
+                distance=distance,
+                score=score,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+
+def process_memory_graph_projection_job(
+    *,
+    session_factory: sessionmaker[Session],
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+    worker_id: str = "memory-worker",
+) -> bool:
+    """Claim and run one pending graph projection job, rebuilding the BFS
+    reachability of its target source entity. One SERIALIZABLE transaction."""
+    with session_factory() as db:
+        with db.begin():
+            now = now_fn()
+            job = db.scalar(
+                select(MemoryProjectionJobRecord)
+                .where(
+                    MemoryProjectionJobRecord.projection_kind == "graph",
+                    MemoryProjectionJobRecord.lifecycle_state == "pending",
+                    MemoryProjectionJobRecord.run_after <= now,
+                )
+                .order_by(
+                    MemoryProjectionJobRecord.run_after.asc(),
+                    MemoryProjectionJobRecord.created_at.asc(),
+                    MemoryProjectionJobRecord.id.asc(),
+                )
+                .limit(1)
+                .with_for_update(skip_locked=True)
+            )
+            if job is None:
+                return False
+            job.lifecycle_state = "running"
+            job.attempts += 1
+            job.claimed_by = worker_id
+            job.attempt_token = new_id_fn("mpa")
+            job.last_heartbeat = now
+            job.updated_at = now
+            if job.target_table != "memory_entities":
+                job.lifecycle_state = "dead_letter"
+                job.error = f"malformed graph projection target table: {job.target_table}"
+                job.claimed_by = None
+                job.attempt_token = None
+                job.last_heartbeat = None
+                job.run_after = now
+                job.updated_at = now
+                return True
+            entity = db.get(MemoryEntityRecord, job.target_id)
+            if entity is None:
+                job.lifecycle_state = "dead_letter"
+                job.error = "malformed graph projection missing source entity"
+                job.claimed_by = None
+                job.attempt_token = None
+                job.last_heartbeat = None
+                job.run_after = now
+                job.updated_at = now
+                return True
+            _rebuild_graph_projection(db, source_entity_id=entity.id, now=now, new_id_fn=new_id_fn)
             job.lifecycle_state = "completed"
             job.error = None
             job.claimed_by = None
@@ -2192,7 +2384,7 @@ def record_turn_memory_evidence(
     thread_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], str | None]:
     now = now_fn()
-    project_key, repo_key = _scope_keys_for_policy(
+    project_key, repo_key = scope_keys_for_policy(
         _matching_scope_key_for_text(db, text=user_message)
     )
     if not resolve_memory_policy(
@@ -2423,11 +2615,13 @@ def propose_memory_candidate(
     new_id_fn: Callable[[str], str],
     source_evidence_id: str | None = None,
     proactive_case_id: str | None = None,
+    settings: AppSettings | None = None,
 ) -> list[dict[str, Any]]:
+    resolved_settings = settings or AppSettings()
     spec = resolve_predicate_spec(predicate)
     _validate_value_kind(spec, value)
     now = now_fn()
-    project_key, repo_key = _scope_keys_for_policy(scope_key)
+    project_key, repo_key = scope_keys_for_policy(scope_key)
     if not resolve_memory_policy(
         db,
         operation="write",
@@ -2557,6 +2751,18 @@ def propose_memory_candidate(
                     new_id_fn=new_id_fn,
                 )
             )
+    events.extend(
+        _maybe_enqueue_backlog_consolidation(
+            db,
+            scope_key=scope_key,
+            settings=resolved_settings,
+            now=now,
+            new_id_fn=new_id_fn,
+            project_key=project_key,
+            repo_key=repo_key,
+            actor_id=actor_id,
+        )
+    )
     return events
 
 
@@ -3680,25 +3886,19 @@ def create_relationship(
     )
     db.add(relationship)
     db.flush()
+    # The graph projection is rebuilt asynchronously: a graph job recomputes the
+    # BFS reachability of this relationship's source entity to depth 3.
     db.add(
-        MemoryGraphProjectionRecord(
-            id=new_id_fn("mgp"),
-            source_entity_id=source.id,
-            target_entity_id=target.id,
-            projection_version=MEMORY_PROJECTION_VERSION,
-            source_memory_versions={
-                "memory_relationships": {relationship.id: 1},
-                "memory_evidence": {evidence.id: 1},
-            },
-            source_projection_versions={"memory_graph_projections": MEMORY_PROJECTION_VERSION},
-            relationship_path=[
-                {
-                    "relationship_id": relationship.id,
-                    "relationship_type": relationship.relationship_type,
-                }
-            ],
-            distance=1,
-            score=relationship.confidence,
+        MemoryProjectionJobRecord(
+            id=new_id_fn("mpj"),
+            projection_kind="graph",
+            target_table="memory_entities",
+            target_id=source.id,
+            lifecycle_state="pending",
+            attempts=0,
+            max_retries=3,
+            error=None,
+            run_after=now,
             created_at=now,
             updated_at=now,
         )
@@ -3722,6 +3922,119 @@ def create_relationship(
     }
 
 
+_CONSOLIDATION_JOB_KINDS = ("context_block", "project_state", "hot_index", "topic_block")
+
+
+def enqueue_consolidation_job(
+    db: Session,
+    *,
+    scope_key: str,
+    kind: str,
+    now: datetime,
+    new_id_fn: Callable[[str], str],
+) -> MemoryProjectionJobRecord | None:
+    """Insert a consolidation MemoryProjectionJobRecord for a scope. Returns None
+    when a pending job of the same kind already targets the scope, so repeated
+    autonomous triggers do not pile up duplicate work."""
+    if kind not in _CONSOLIDATION_JOB_KINDS:
+        raise MemoryProjectionError(f"unsupported consolidation job kind: {kind}")
+    existing = db.scalar(
+        select(MemoryProjectionJobRecord)
+        .where(
+            MemoryProjectionJobRecord.projection_kind == kind,
+            MemoryProjectionJobRecord.target_table == "memory_scopes",
+            MemoryProjectionJobRecord.target_id == scope_key,
+            MemoryProjectionJobRecord.lifecycle_state == "pending",
+        )
+        .limit(1)
+    )
+    if existing is not None:
+        return None
+    job = MemoryProjectionJobRecord(
+        id=new_id_fn("mpj"),
+        projection_kind=kind,
+        target_table="memory_scopes",
+        target_id=scope_key,
+        lifecycle_state="pending",
+        attempts=0,
+        max_retries=3,
+        error=None,
+        run_after=now,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(job)
+    db.flush()
+    return job
+
+
+def _maybe_enqueue_backlog_consolidation(
+    db: Session,
+    *,
+    scope_key: str,
+    settings: AppSettings,
+    now: datetime,
+    new_id_fn: Callable[[str], str],
+    project_key: str | None,
+    repo_key: str | None,
+    actor_id: str | None,
+) -> list[dict[str, Any]]:
+    """Enqueue a hot_index consolidation job when the candidate or open-conflict
+    backlog for a scope crosses its threshold. Gated by consolidate policy."""
+    candidate_backlog = (
+        db.scalar(
+            select(func.count())
+            .select_from(MemoryAssertionRecord)
+            .where(
+                MemoryAssertionRecord.scope_key == scope_key,
+                MemoryAssertionRecord.lifecycle_state == "candidate",
+            )
+        )
+        or 0
+    )
+    conflict_backlog = (
+        db.scalar(
+            select(func.count())
+            .select_from(MemoryConflictSetRecord)
+            .where(
+                MemoryConflictSetRecord.scope_key == scope_key,
+                MemoryConflictSetRecord.lifecycle_state == "open",
+            )
+        )
+        or 0
+    )
+    candidate_crossed = candidate_backlog >= settings.memory_consolidation_candidate_threshold
+    conflict_crossed = conflict_backlog >= settings.memory_consolidation_conflict_threshold
+    if not (candidate_crossed or conflict_crossed):
+        return []
+    if not resolve_memory_policy(
+        db,
+        operation="consolidate",
+        now=now,
+        project_key=project_key,
+        repo_key=repo_key,
+        actor_id=actor_id,
+    ).allowed:
+        return []
+    job = enqueue_consolidation_job(
+        db, scope_key=scope_key, kind="hot_index", now=now, new_id_fn=new_id_fn
+    )
+    if job is None:
+        return []
+    return [
+        {
+            "event_type": "evt.memory.consolidation_enqueued",
+            "payload": {
+                "scope_key": scope_key,
+                "projection_job_id": job.id,
+                "trigger": "candidate_backlog" if candidate_crossed else "conflict_backlog",
+                "candidate_backlog": candidate_backlog,
+                "conflict_backlog": conflict_backlog,
+            },
+        }
+    ]
+
+
 def consolidate_memory(
     db: Session,
     *,
@@ -3732,7 +4045,7 @@ def consolidate_memory(
     source_session_id: str | None = None,
 ) -> dict[str, Any]:
     now = now_fn()
-    project_key, repo_key = _scope_keys_for_policy(scope_key)
+    project_key, repo_key = scope_keys_for_policy(scope_key)
     policy = resolve_memory_policy(
         db,
         operation="consolidate",
@@ -4133,7 +4446,7 @@ def export_memory(
     source_session_id: str | None = None,
 ) -> dict[str, Any]:
     now = now_fn()
-    project_key, repo_key = _scope_keys_for_policy(scope_key)
+    project_key, repo_key = scope_keys_for_policy(scope_key)
     policy = resolve_memory_policy(
         db,
         operation="recall",
@@ -5850,6 +6163,62 @@ def search_memory(
     return results[:limit]
 
 
+def _projection_health(db: Session) -> dict[str, Any]:
+    """Honest projection-health counters for recall diagnostics: failed and
+    dead-lettered projection jobs, and the number of active assertions whose
+    keyword projection lags the assertion's canonical memory version."""
+    failed = (
+        db.scalar(
+            select(func.count())
+            .select_from(MemoryProjectionJobRecord)
+            .where(MemoryProjectionJobRecord.lifecycle_state == "failed")
+        )
+        or 0
+    )
+    dead_letter = (
+        db.scalar(
+            select(func.count())
+            .select_from(MemoryProjectionJobRecord)
+            .where(MemoryProjectionJobRecord.lifecycle_state == "dead_letter")
+        )
+        or 0
+    )
+    canonical_version = (
+        select(
+            MemoryVersionRecord.canonical_id.label("assertion_id"),
+            func.max(MemoryVersionRecord.version).label("version"),
+        )
+        .where(MemoryVersionRecord.canonical_table == "memory_assertions")
+        .group_by(MemoryVersionRecord.canonical_id)
+        .subquery()
+    )
+    stale = (
+        db.scalar(
+            select(func.count())
+            .select_from(MemoryAssertionRecord)
+            .join(
+                MemoryKeywordProjectionRecord,
+                (MemoryKeywordProjectionRecord.canonical_table == "memory_assertions")
+                & (MemoryKeywordProjectionRecord.canonical_id == MemoryAssertionRecord.id),
+            )
+            .join(
+                canonical_version,
+                canonical_version.c.assertion_id == MemoryAssertionRecord.id,
+            )
+            .where(
+                MemoryAssertionRecord.lifecycle_state == "active",
+                MemoryKeywordProjectionRecord.source_memory_version < canonical_version.c.version,
+            )
+        )
+        or 0
+    )
+    return {
+        "failed_projection_jobs": failed,
+        "dead_letter_projection_jobs": dead_letter,
+        "stale_projection_count": stale,
+    }
+
+
 def build_memory_context(
     db: Session,
     *,
@@ -5881,7 +6250,7 @@ def build_memory_context(
             scope_aliases.add(f"repo:{effective_scope_key}")
     # Recall always resolves policy: with no session it resolves the
     # project/repo/user chain; recall is never unrestricted.
-    project_key, repo_key = _scope_keys_for_policy(effective_scope_key)
+    project_key, repo_key = scope_keys_for_policy(effective_scope_key)
     policy = resolve_memory_policy(
         db,
         operation="recall",
@@ -5931,6 +6300,7 @@ def build_memory_context(
                 "projection_version": MEMORY_PROJECTION_VERSION,
                 "selected_assertion_count": 0,
                 "selected_memory_count": 0,
+                **_projection_health(db),
             },
         }
         event_payload = {
@@ -5948,20 +6318,22 @@ def build_memory_context(
         for entity in entity_rows
         if query_terms.intersection(set(_terms(f"{entity.entity_key} {entity.display_name}")))
     }
+    # Graph signal: entities reachable from a query-matched entity within the
+    # depth-3 BFS graph projection (written by the graph projection job).
     graph_neighbors = {
         row.target_entity_id
         for row in db.scalars(
-            select(MemoryRelationshipRecord).where(
-                MemoryRelationshipRecord.lifecycle_state == "active",
-                MemoryRelationshipRecord.source_entity_id.in_(matching_entity_ids or {""}),
+            select(MemoryGraphProjectionRecord).where(
+                MemoryGraphProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
+                MemoryGraphProjectionRecord.source_entity_id.in_(matching_entity_ids or {""}),
             )
         ).all()
     } | {
         row.source_entity_id
         for row in db.scalars(
-            select(MemoryRelationshipRecord).where(
-                MemoryRelationshipRecord.lifecycle_state == "active",
-                MemoryRelationshipRecord.target_entity_id.in_(matching_entity_ids or {""}),
+            select(MemoryGraphProjectionRecord).where(
+                MemoryGraphProjectionRecord.projection_version == MEMORY_PROJECTION_VERSION,
+                MemoryGraphProjectionRecord.target_entity_id.in_(matching_entity_ids or {""}),
             )
         ).all()
     }
@@ -6610,6 +6982,7 @@ def build_memory_context(
             "projection_version": MEMORY_PROJECTION_VERSION,
             "selected_assertion_count": len(selected_assertions),
             "selected_memory_count": len(curation["selected_memories"]),
+            **_projection_health(db),
         },
     }
     event_payload = {
@@ -6719,7 +7092,7 @@ def process_memory_extract_turn(
             evidence = db.get(MemoryEvidenceRecord, evidence_id)
             if evidence is None or evidence.lifecycle_state != "available":
                 return
-            project_key, repo_key = _scope_keys_for_policy(
+            project_key, repo_key = scope_keys_for_policy(
                 _matching_scope_key_for_text(db, text=evidence.source_text)
             )
             if not resolve_memory_policy(
@@ -6949,7 +7322,7 @@ def process_memory_extract_turn(
             evidence = db.get(MemoryEvidenceRecord, evidence_id)
             if evidence is None or evidence.lifecycle_state != "available":
                 return
-            project_key, repo_key = _scope_keys_for_policy(
+            project_key, repo_key = scope_keys_for_policy(
                 _matching_scope_key_for_text(db, text=evidence.source_text)
             )
             if not resolve_memory_policy(

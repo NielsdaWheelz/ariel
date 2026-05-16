@@ -25,6 +25,7 @@ import ariel.memory as memory
 from ariel.memory import (
     MEMORY_PROJECTION_VERSION,
     process_memory_extract_turn,
+    process_memory_graph_projection_job,
     process_memory_projection_job,
     record_action_trace,
 )
@@ -43,6 +44,8 @@ from ariel.persistence import (
     MemoryEvidenceRecord,
     MemoryKeywordProjectionRecord,
     MemoryProcedureRecord,
+    MemoryProjectionJobRecord,
+    MemorySymbolProjectionRecord,
     MemoryRetentionPolicyRecord,
     MemoryReviewRecord,
     MemoryScopeBindingRecord,
@@ -249,6 +252,14 @@ def _process_projection(client: TestClient) -> None:
         new_id_fn=_new_id,
     )
     assert processed is True
+
+
+def _process_graph_job(client: TestClient) -> bool:
+    return process_memory_graph_projection_job(
+        session_factory=_session_factory(client),
+        now_fn=lambda: datetime.now(tz=UTC),
+        new_id_fn=_new_id,
+    )
 
 
 def _seed_proactive_case(client: TestClient, *, now: datetime) -> str:
@@ -1128,6 +1139,8 @@ def test_delete_memory_assertion_invalidates_graph_and_export_artifacts(
             },
         )
         assert relationship.status_code == 200
+        # The graph projection is written by the async graph projection job.
+        assert _process_graph_job(client) is True
 
         export = client.post("/v1/memory/export", json={"scope_key": "global"})
         assert export.status_code == 200
@@ -1147,6 +1160,161 @@ def test_delete_memory_assertion_invalidates_graph_and_export_artifacts(
             artifact = db.scalar(select(MemoryExportArtifactRecord).limit(1))
             assert artifact is not None
             assert artifact.status == "failed"
+
+
+def test_relationship_change_enqueues_graph_job_and_recall_uses_multi_hop_results(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Each subject gets a distinct one-hot embedding so vector and lexical signals
+    # surface only the directly-queried entity; the third entity can be reached
+    # only through the depth-3 graph projection the graph job builds.
+    def distinct_embedding(text: str, *, settings: AppSettings) -> list[float]:
+        vector = [0.0] * settings.memory_embedding_dimensions
+        lowered = text.lower()
+        for index, token in enumerate(("alphaco", "bravoco", "charlieco")):
+            if token in lowered:
+                vector[index] = 1.0
+                return vector
+        vector[3] = 1.0
+        return vector
+
+    monkeypatch.setattr(memory, "embed_memory_text", distinct_embedding)
+    monkeypatch.setattr(memory, "_curate_memory_context_with_model", _fake_memory_curation)
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        session_id = _session_id(client)
+        chain = []
+        for token in ("alphaco", "bravoco", "charlieco"):
+            candidate = _candidate(
+                client,
+                subject_key=f"project:{token}",
+                predicate="project.deadline",
+                value=f"{token} ships next month",
+                evidence_text=f"The user said {token} ships next month.",
+            )
+            assert (
+                client.post(f"/v1/memory/candidates/{candidate['id']}/approve").status_code == 200
+            )
+            chain.append(candidate["id"])
+        _process_projection(client)
+        _process_projection(client)
+        _process_projection(client)
+
+        entity_ids: list[str] = []
+        with _session_factory(client)() as db:
+            for assertion_id in chain:
+                assertion = db.get(MemoryAssertionRecord, assertion_id)
+                assert assertion is not None
+                entity_ids.append(assertion.subject_entity_id)
+            evidence_id = db.scalar(
+                select(MemoryAssertionEvidenceRecord.evidence_id)
+                .where(MemoryAssertionEvidenceRecord.assertion_id == chain[0])
+                .limit(1)
+            )
+            assert evidence_id is not None
+
+        for source_id, target_id in (
+            (entity_ids[0], entity_ids[1]),
+            (entity_ids[1], entity_ids[2]),
+        ):
+            relationship = client.post(
+                "/v1/memory/relationships",
+                json={
+                    "source_entity_id": source_id,
+                    "target_entity_id": target_id,
+                    "relationship_type": "depends_on",
+                    "evidence_id": evidence_id,
+                    "scope_key": "global",
+                    "confidence": 0.9,
+                },
+            )
+            assert relationship.status_code == 200
+
+        with _session_factory(client)() as db:
+            pending_graph_jobs = db.scalars(
+                select(MemoryProjectionJobRecord).where(
+                    MemoryProjectionJobRecord.projection_kind == "graph",
+                    MemoryProjectionJobRecord.lifecycle_state == "pending",
+                )
+            ).all()
+            assert len(pending_graph_jobs) == 2
+
+        assert _process_graph_job(client) is True
+        assert _process_graph_job(client) is True
+        assert _process_graph_job(client) is False
+
+        with _session_factory(client)() as db:
+            two_hop = db.scalar(
+                select(MemoryGraphProjectionRecord).where(
+                    MemoryGraphProjectionRecord.source_entity_id == entity_ids[0],
+                    MemoryGraphProjectionRecord.target_entity_id == entity_ids[2],
+                )
+            )
+            assert two_hop is not None
+            assert two_hop.distance == 2
+            assert len(two_hop.relationship_path) == 2
+
+        with _session_factory(client)() as db:
+            memory_context, _event_payload = memory.build_memory_context(
+                db,
+                user_message="status of alphaco",
+                max_recalled_assertions=8,
+                settings=_settings(),
+                current_session_id=session_id,
+            )
+        candidate_ids = memory_context["recall_window"]["candidate_memory_ids"]
+        # charlieco is two hops from alphaco: only the graph signal can surface it.
+        assert chain[2] in candidate_ids
+
+
+def test_symbol_projection_rows_written_for_repo_scoped_assertions(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_fake_memory_models(monkeypatch)
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        repo_candidate = _candidate(
+            client,
+            subject_key="repo:ariel",
+            predicate="repo.convention",
+            assertion_type="fact",
+            value="The retry helper lives in src/ariel/worker.py as reap_stale_tasks.",
+            evidence_text="The user described where the retry helper lives.",
+        )
+        user_candidate = _candidate(
+            client,
+            subject_key="user:default",
+            predicate="profile.role",
+            assertion_type="profile",
+            value="staff engineer",
+            evidence_text="The user said they are a staff engineer.",
+        )
+        assert (
+            client.post(f"/v1/memory/candidates/{repo_candidate['id']}/approve").status_code == 200
+        )
+        assert (
+            client.post(f"/v1/memory/candidates/{user_candidate['id']}/approve").status_code == 200
+        )
+
+        with _session_factory(client)() as db:
+            repo_symbols = db.scalars(
+                select(MemorySymbolProjectionRecord).where(
+                    MemorySymbolProjectionRecord.canonical_id == repo_candidate["id"]
+                )
+            ).all()
+            user_symbols = db.scalars(
+                select(MemorySymbolProjectionRecord).where(
+                    MemorySymbolProjectionRecord.canonical_id == user_candidate["id"]
+                )
+            ).all()
+        # Only the repo-scoped assertion yields symbol/path projection rows.
+        assert user_symbols == []
+        assert {row.repo_key for row in repo_symbols} == {"repo:ariel"}
+        tokens = {row.path for row in repo_symbols} | {row.symbol for row in repo_symbols}
+        assert "src/ariel/worker.py" in tokens
+        assert "reap_stale_tasks" in tokens
 
 
 def test_unrelated_recall_has_no_semantic_recency_candidate(
@@ -1296,6 +1464,100 @@ def test_consolidation_respects_no_memory_mode(
                 )
         assert result["status"] == "skipped"
         assert result["memory_policy"]["effective_mode"] == "no_memory"
+
+
+def test_candidate_backlog_crossing_threshold_enqueues_consolidation_job(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_fake_memory_models(monkeypatch)
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        session_id = _session_id(client)
+        now = datetime(2026, 5, 8, 9, 0, tzinfo=UTC)
+        settings = _settings(memory_consolidation_candidate_threshold=2)
+        with _session_factory(client)() as db:
+            with db.begin():
+                first_events = memory.propose_memory_candidate(
+                    db,
+                    source_session_id=session_id,
+                    actor_id="user.local",
+                    evidence_text="The user said to ship the alpha task.",
+                    subject_key="user:default",
+                    predicate="commitment.todo",
+                    assertion_type="commitment",
+                    value="ship the alpha task",
+                    confidence=0.9,
+                    scope_key="global",
+                    valid_from=None,
+                    valid_to=None,
+                    extraction_model=None,
+                    extraction_prompt_version=None,
+                    now_fn=lambda: now,
+                    new_id_fn=_new_id,
+                    settings=settings,
+                )
+                second_events = memory.propose_memory_candidate(
+                    db,
+                    source_session_id=session_id,
+                    actor_id="user.local",
+                    evidence_text="The user said to ship the bravo task.",
+                    subject_key="user:default",
+                    predicate="commitment.todo",
+                    assertion_type="commitment",
+                    value="ship the bravo task",
+                    confidence=0.9,
+                    scope_key="global",
+                    valid_from=None,
+                    valid_to=None,
+                    extraction_model=None,
+                    extraction_prompt_version=None,
+                    now_fn=lambda: now,
+                    new_id_fn=_new_id,
+                    settings=settings,
+                )
+
+        first_kinds = {event["event_type"] for event in first_events}
+        second_kinds = {event["event_type"] for event in second_events}
+        # The first candidate leaves the backlog below threshold; the second
+        # crosses it and enqueues a consolidation job, surfaced as an event.
+        assert "evt.memory.consolidation_enqueued" not in first_kinds
+        assert "evt.memory.consolidation_enqueued" in second_kinds
+
+        with _session_factory(client)() as db:
+            jobs = db.scalars(
+                select(MemoryProjectionJobRecord).where(
+                    MemoryProjectionJobRecord.projection_kind == "hot_index",
+                    MemoryProjectionJobRecord.target_table == "memory_scopes",
+                    MemoryProjectionJobRecord.target_id == "global",
+                )
+            ).all()
+            assert len(jobs) == 1
+            assert jobs[0].lifecycle_state == "pending"
+
+
+def test_session_rotation_enqueues_consolidation_job(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_fake_memory_models(monkeypatch)
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        _session_id(client)
+        rotate = client.post("/v1/sessions/rotate", json={})
+        assert rotate.status_code == 200
+
+        with _session_factory(client)() as db:
+            jobs = db.scalars(
+                select(MemoryProjectionJobRecord).where(
+                    MemoryProjectionJobRecord.projection_kind == "hot_index",
+                    MemoryProjectionJobRecord.target_table == "memory_scopes",
+                    MemoryProjectionJobRecord.target_id == "global",
+                )
+            ).all()
+            # Session rotation enqueued exactly one global consolidation job.
+            assert len(jobs) == 1
+            assert jobs[0].lifecycle_state == "pending"
 
 
 def test_import_is_cutover_only(

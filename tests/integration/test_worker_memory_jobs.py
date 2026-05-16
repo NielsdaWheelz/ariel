@@ -5,6 +5,7 @@ from typing import Any, cast
 
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 import ariel.memory as memory_module
@@ -18,7 +19,9 @@ from ariel.persistence import (
     MemoryEntityRecord,
     MemoryEvidenceRecord,
     MemoryExportArtifactRecord,
+    MemoryGraphProjectionRecord,
     MemoryProjectionJobRecord,
+    MemoryRelationshipRecord,
     SessionRecord,
 )
 
@@ -409,20 +412,102 @@ def test_process_one_task_recovers_and_retries_stale_running_embedding_projectio
             assert projection_count == 1
 
 
-def test_process_one_task_dead_letters_unsupported_memory_projection_job(
+def test_out_of_band_projection_job_kind_is_rejected_by_schema_check(
+    session_factory: sessionmaker[Session],
+) -> None:
+    # The reconciled ck_memory_projection_job_kind CHECK rejects any kind that is
+    # not enqueued and consumed. This is the stronger guarantee than a
+    # dead-letter worker: a bad kind cannot be written in the first place.
+    now = datetime(2026, 5, 13, 12, 18, tzinfo=UTC)
+    with pytest.raises(IntegrityError, match="ck_memory_projection_job_kind"):
+        with session_factory() as db:
+            with db.begin():
+                _seed_projection_job(
+                    db,
+                    job_id="mpj_keyword_unsupported",
+                    projection_kind="keyword",
+                    target_table="memory_assertions",
+                    target_id="mas_keyword_unsupported",
+                    max_retries=3,
+                    now=now,
+                )
+
+
+def _seed_graph_scenario(
+    db: Session,
+    *,
+    now: datetime,
+) -> None:
+    for suffix in ("a", "b", "c"):
+        db.add(
+            MemoryEntityRecord(
+                id=f"men_graph_{suffix}",
+                entity_type="project",
+                entity_key=f"project:graph-{suffix}",
+                display_name=f"Graph {suffix}",
+                summary=None,
+                metadata_json={},
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    _seed_session(db, session_id="ses_graph", memory_mode="normal", now=now)
+    db.flush()
+    db.add(
+        MemoryEvidenceRecord(
+            id="mev_graph",
+            source_turn_id=None,
+            source_session_id="ses_graph",
+            actor_id="user.local",
+            content_class="system",
+            trust_boundary="system",
+            lifecycle_state="available",
+            source_uri=None,
+            source_artifact_id=None,
+            source_text="graph evidence",
+            evidence_snippet="graph evidence",
+            redaction_posture="none",
+            metadata_json={},
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    db.flush()
+    for suffix, source, target in (("ab", "a", "b"), ("bc", "b", "c")):
+        db.add(
+            MemoryRelationshipRecord(
+                id=f"mrl_graph_{suffix}",
+                source_entity_id=f"men_graph_{source}",
+                target_entity_id=f"men_graph_{target}",
+                relationship_type="depends_on",
+                scope_key="global",
+                lifecycle_state="active",
+                confidence=0.9,
+                valid_from=now,
+                valid_to=None,
+                evidence_id="mev_graph",
+                metadata_json={},
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+
+def test_process_one_task_completes_graph_projection_job(
     session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    now = datetime(2026, 5, 13, 12, 18, tzinfo=UTC)
+    now = datetime(2026, 5, 13, 13, 0, tzinfo=UTC)
     monkeypatch.setattr(worker_module, "_utcnow", lambda: now)
     with session_factory() as db:
         with db.begin():
+            _seed_graph_scenario(db, now=now)
             _seed_projection_job(
                 db,
-                job_id="mpj_keyword_unsupported",
-                projection_kind="keyword",
-                target_table="memory_assertions",
-                target_id="mas_keyword_unsupported",
+                job_id="mpj_graph_ok",
+                projection_kind="graph",
+                target_table="memory_entities",
+                target_id="men_graph_a",
                 max_retries=3,
                 now=now,
             )
@@ -435,12 +520,141 @@ def test_process_one_task_dead_letters_unsupported_memory_projection_job(
 
     with session_factory() as db:
         with db.begin():
-            job = db.get(MemoryProjectionJobRecord, "mpj_keyword_unsupported")
+            job = db.get(MemoryProjectionJobRecord, "mpj_graph_ok")
+            assert job is not None
+            assert job.lifecycle_state == "completed"
+            assert job.attempts == 1
+            assert job.error is None
+            two_hop = db.scalar(
+                select(MemoryGraphProjectionRecord).where(
+                    MemoryGraphProjectionRecord.source_entity_id == "men_graph_a",
+                    MemoryGraphProjectionRecord.target_entity_id == "men_graph_c",
+                )
+            )
+            assert two_hop is not None
+            assert two_hop.distance == 2
+            assert len(two_hop.relationship_path) == 2
+
+
+def test_process_one_task_dead_letters_graph_projection_job_with_missing_entity(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 5, 13, 13, 5, tzinfo=UTC)
+    monkeypatch.setattr(worker_module, "_utcnow", lambda: now)
+    with session_factory() as db:
+        with db.begin():
+            _seed_projection_job(
+                db,
+                job_id="mpj_graph_missing",
+                projection_kind="graph",
+                target_table="memory_entities",
+                target_id="men_graph_absent",
+                max_retries=3,
+                now=now,
+            )
+
+    assert worker_module.process_one_task(
+        session_factory=session_factory,
+        settings=_settings(),
+        worker_id="worker-memory",
+    )
+
+    with session_factory() as db:
+        with db.begin():
+            job = db.get(MemoryProjectionJobRecord, "mpj_graph_missing")
             assert job is not None
             assert job.lifecycle_state == "dead_letter"
             assert job.attempts == 1
-            assert job.error == "unsupported memory projection job: keyword"
-            assert job.run_after == now
+            assert job.error == "malformed graph projection missing source entity"
+
+
+def test_process_one_task_enqueues_scheduled_consolidation_for_stale_scope(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 5, 13, 13, 10, tzinfo=UTC)
+    monkeypatch.setattr(worker_module, "_utcnow", lambda: now)
+    stale_at = now - timedelta(seconds=200_000)
+    with session_factory() as db:
+        with db.begin():
+            db.add(
+                MemoryContextBlockRecord(
+                    id="mcb_stale_hot_index",
+                    block_type="hot_index",
+                    scope_key="global",
+                    content="{}",
+                    topic_id=None,
+                    lifecycle_state="active",
+                    source_assertion_ids=[],
+                    source_episode_ids=[],
+                    source_trace_ids=[],
+                    source_action_trace_ids=[],
+                    source_procedure_ids=[],
+                    source_project_state_snapshot_ids=[],
+                    source_memory_versions={},
+                    source_projection_versions={},
+                    projection_version=memory_module.MEMORY_PROJECTION_VERSION,
+                    created_at=stale_at,
+                    updated_at=stale_at,
+                )
+            )
+
+    assert worker_module.process_one_task(
+        session_factory=session_factory,
+        settings=_settings(memory_consolidation_interval_seconds=86_400),
+        worker_id="worker-memory",
+    )
+
+    with session_factory() as db:
+        with db.begin():
+            consolidation_jobs = db.scalars(
+                select(MemoryProjectionJobRecord).where(
+                    MemoryProjectionJobRecord.projection_kind == "hot_index",
+                    MemoryProjectionJobRecord.target_table == "memory_scopes",
+                    MemoryProjectionJobRecord.target_id == "global",
+                )
+            ).all()
+            # The stale-scope cadence enqueued exactly one consolidation job, then
+            # the maintenance worker claimed and completed it on the same tick.
+            assert len(consolidation_jobs) == 1
+            assert consolidation_jobs[0].lifecycle_state == "completed"
+
+
+def test_projection_health_reports_seeded_dead_lettered_job(
+    session_factory: sessionmaker[Session],
+) -> None:
+    now = datetime(2026, 5, 13, 13, 15, tzinfo=UTC)
+    with session_factory() as db:
+        with db.begin():
+            _seed_session(db, session_id="ses_health", memory_mode="normal", now=now)
+            _seed_projection_job(
+                db,
+                job_id="mpj_dead_letter_health",
+                projection_kind="embedding",
+                target_table="memory_assertions",
+                target_id="mas_health_absent",
+                max_retries=0,
+                now=now,
+            )
+            job = db.get(MemoryProjectionJobRecord, "mpj_dead_letter_health")
+            assert job is not None
+            job.lifecycle_state = "dead_letter"
+            job.error = "seeded dead letter"
+
+    with session_factory() as db:
+        with db.begin():
+            context, _event = memory_module.build_memory_context(
+                db,
+                user_message="anything",
+                max_recalled_assertions=8,
+                settings=_settings(),
+                current_session_id="ses_health",
+            )
+    health = context["projection_health"]
+    assert health["dead_letter_projection_jobs"] == 1
+    assert health["failed_projection_jobs"] == 0
+    assert health["stale_projection_count"] == 0
 
 
 def test_process_one_task_dead_letters_malformed_embedding_projection_job(
@@ -484,6 +698,7 @@ def test_process_one_task_completes_memory_consolidation_job(
     monkeypatch.setattr(worker_module, "_utcnow", lambda: now)
     with session_factory() as db:
         with db.begin():
+            _seed_active_assertion(db, assertion_id="mas_consolidate_topic", now=now)
             _seed_projection_job(
                 db,
                 job_id="mpj_hot_index",
@@ -503,10 +718,18 @@ def test_process_one_task_completes_memory_consolidation_job(
     with session_factory() as db:
         with db.begin():
             job = db.get(MemoryProjectionJobRecord, "mpj_hot_index")
-            block = db.scalar(
+            hot_index_block = db.scalar(
                 select(MemoryContextBlockRecord)
                 .where(
                     MemoryContextBlockRecord.block_type == "hot_index",
+                    MemoryContextBlockRecord.scope_key == "global",
+                )
+                .limit(1)
+            )
+            topic_block = db.scalar(
+                select(MemoryContextBlockRecord)
+                .where(
+                    MemoryContextBlockRecord.block_type == "topic",
                     MemoryContextBlockRecord.scope_key == "global",
                 )
                 .limit(1)
@@ -515,8 +738,13 @@ def test_process_one_task_completes_memory_consolidation_job(
             assert job.lifecycle_state == "completed"
             assert job.attempts == 1
             assert job.error is None
-            assert block is not None
-            assert block.lifecycle_state == "active"
+            # The worker-run consolidation rebuilt both the hot index and the
+            # topic block for the seeded active assertion.
+            assert hot_index_block is not None
+            assert hot_index_block.lifecycle_state == "active"
+            assert topic_block is not None
+            assert topic_block.lifecycle_state == "active"
+            assert topic_block.topic_id is not None
 
 
 def test_process_one_task_dead_letters_malformed_memory_maintenance_job(
