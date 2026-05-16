@@ -17,8 +17,11 @@ from ariel.memory import AIJudgmentFailure
 from ariel.persistence import (
     AIJudgmentRecord,
     AutonomyScopeRecord,
+    MemoryActionTraceRecord,
     MemoryAssertionEvidenceRecord,
     MemoryAssertionRecord,
+    MemoryEventRecord,
+    MemoryEvidenceRecord,
     MemoryReviewRecord,
     ProactiveActionExecutionRecord,
     ProactiveActionPlanRecord,
@@ -681,6 +684,63 @@ def test_speak_and_act_authorizes_turn_then_marks_acted_after_action_receipt(
                 assert case.status == "acted"
                 assert execution is not None
                 assert execution.external_receipt == {"status": "drafted"}
+
+
+def test_proactive_action_execution_records_action_trace_with_evidence(
+    postgres_url: str,
+) -> None:
+    now = datetime(2026, 5, 7, 12, 19, tzinfo=UTC)
+    action = {
+        "action_type": "cap.email.draft",
+        "target": "team-email",
+        "target_system": "gmail",
+        "payload": _email_draft_payload("proactive-trace-draft", "Draft the traced note."),
+        "risk_tier": "low",
+    }
+    adapter = ProactiveAdapter(json.dumps(_decision_payload(decision="act_now", actions=[action])))
+    google_runtime = ProactiveGoogleRuntime(
+        [ExecutionResult(status="succeeded", output={"status": "drafted"}, error=None)]
+    )
+    with _build_client(postgres_url, adapter) as client:
+        _seed_scope(client, action_type="cap.email.draft", target_system="gmail", now=now)
+        case_id = _seed_case(client, now=now)
+        _run_deliberation(client, case_id=case_id, adapter=adapter, now=now)
+        with _session_factory(client)() as db:
+            with db.begin():
+                plan = db.scalar(select(ProactiveActionPlanRecord).limit(1))
+                assert plan is not None
+                plan_id = plan.id
+
+        process_proactive_action_execution_due(
+            session_factory=_session_factory(client),
+            task_payload={"action_plan_id": plan_id},
+            google_runtime=google_runtime,
+            now_fn=lambda: now,
+            new_id_fn=_new_id,
+        )
+
+        with _session_factory(client)() as db:
+            trace = db.scalar(select(MemoryActionTraceRecord).limit(1))
+            assert trace is not None
+            assert trace.scope_key == f"proactive:{case_id}"
+            assert trace.trace_type == "execution"
+            assert trace.outcome == "succeeded"
+            assert trace.action_attempt_id is None
+            assert trace.capability_id == "cap.email.draft"
+            assert trace.result_refs["case_id"] == case_id
+            # primary_evidence_id is NOT NULL and points to a recorded evidence row.
+            evidence = db.get(MemoryEvidenceRecord, trace.primary_evidence_id)
+            assert evidence is not None
+            assert evidence.content_class == "system"
+            assert evidence.metadata_json["capture_mode"] == "action_trace_evidence"
+            event = db.scalar(
+                select(MemoryEventRecord).where(
+                    MemoryEventRecord.event_type == "evt.memory.evidence_recorded"
+                )
+            )
+            assert event is not None
+            assert event.entry_path == "proactive"
+            assert event.scope_key == f"proactive:{case_id}"
 
 
 def test_speak_and_act_denies_non_low_risk_from_tainted_context(postgres_url: str) -> None:

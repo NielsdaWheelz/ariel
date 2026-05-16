@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from .config import AppSettings
 from .persistence import (
     AIJudgmentRecord,
+    ActionAttemptRecord,
     MemoryActionTraceRecord,
     MemoryAssertionEvidenceRecord,
     MemoryAssertionRecord,
@@ -2277,6 +2278,129 @@ def record_turn_memory_evidence(
         )
     )
     return events, user_evidence.id
+
+
+def record_action_trace(
+    db: Session,
+    *,
+    action_attempt: ActionAttemptRecord | None,
+    scope_key: str,
+    primary_evidence_id: str | None,
+    source_turn_id: str | None,
+    trace_type: str,
+    now: datetime,
+    new_id_fn: Callable[[str], str],
+    session_id: str | None = None,
+    capability_id: str | None = None,
+    outcome: str | None = None,
+    result_refs: dict[str, Any] | None = None,
+    evidence_text: str | None = None,
+) -> tuple[MemoryActionTraceRecord, list[dict[str, Any]]]:
+    """Create or update an action trace, ensuring its primary evidence exists.
+
+    With an ActionAttemptRecord the outcome, capability, summary, and result refs
+    are derived from the attempt exactly as the chat-turn block did; the trace is
+    upserted on action_attempt_id so a later denied/expired path updates the
+    chat-turn trace instead of duplicating it. Without an attempt (proactive
+    execution) the caller supplies capability_id, outcome, and result_refs.
+
+    primary_evidence_id may be None: paths without turn evidence (proactive
+    execution, a denied/expired action whose turn recorded none) pass session_id
+    and evidence_text, and an action-attempt evidence row is recorded so the NOT
+    NULL primary_evidence_id is always satisfiable. Returns the trace and any
+    evt.memory.evidence_recorded events the caller must persist.
+    """
+    if action_attempt is not None:
+        if action_attempt.status == "succeeded":
+            outcome = "succeeded"
+        elif action_attempt.status == "failed":
+            outcome = "failed"
+        elif (
+            action_attempt.status in {"rejected", "denied", "expired"}
+            or action_attempt.policy_decision == "deny"
+        ):
+            outcome = "denied"
+        else:
+            outcome = "unknown"
+        capability_id = action_attempt.capability_id
+        summary = (
+            f"{action_attempt.capability_id} {outcome} for proposal {action_attempt.proposal_index}"
+        )
+        result_refs = {
+            "impact_level": action_attempt.impact_level,
+            "policy_decision": action_attempt.policy_decision,
+            "approval_required": action_attempt.approval_required,
+            "execution_error": action_attempt.execution_error,
+        }
+        existing = db.scalar(
+            select(MemoryActionTraceRecord)
+            .where(MemoryActionTraceRecord.action_attempt_id == action_attempt.id)
+            .with_for_update()
+            .limit(1)
+        )
+        if existing is not None:
+            existing.trace_type = trace_type
+            existing.outcome = outcome
+            existing.capability_id = capability_id
+            existing.summary = summary
+            existing.result_refs = result_refs
+            existing.updated_at = now
+            return existing, []
+    else:
+        if capability_id is None or outcome is None:
+            raise MemoryEventError("record_action_trace needs capability_id and outcome")
+        summary = f"{capability_id} {outcome}"
+        result_refs = result_refs or {}
+    events: list[dict[str, Any]] = []
+    if primary_evidence_id is None:
+        evidence_session_id = (
+            action_attempt.session_id if action_attempt is not None else session_id
+        )
+        if evidence_session_id is None:
+            raise MemoryEventError("record_action_trace needs session_id to record evidence")
+        evidence = _record_evidence(
+            db,
+            session_id=evidence_session_id,
+            turn_id=source_turn_id,
+            actor_id="system",
+            content_class="system",
+            trust_boundary="system",
+            source_text=evidence_text or summary,
+            source_uri=None,
+            metadata={"capture_mode": "action_trace_evidence"},
+            now=now,
+            new_id_fn=new_id_fn,
+        )
+        primary_evidence_id = evidence.id
+        events.append(
+            {
+                "event_type": "evt.memory.evidence_recorded",
+                "payload": {
+                    "evidence_id": evidence.id,
+                    "source_turn_id": source_turn_id,
+                    "source_session_id": evidence_session_id,
+                    "content_class": evidence.content_class,
+                    "trust_boundary": evidence.trust_boundary,
+                },
+            }
+        )
+    trace = MemoryActionTraceRecord(
+        id=new_id_fn("mat"),
+        scope_key=scope_key,
+        trace_type=trace_type,
+        action_attempt_id=action_attempt.id if action_attempt is not None else None,
+        source_turn_id=source_turn_id,
+        primary_evidence_id=primary_evidence_id,
+        capability_id=capability_id,
+        summary=summary,
+        outcome=outcome,
+        result_refs=result_refs,
+        lifecycle_state="active",
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(trace)
+    return trace, events
 
 
 def propose_memory_candidate(

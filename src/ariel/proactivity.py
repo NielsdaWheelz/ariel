@@ -21,6 +21,7 @@ from ariel.memory import (
     build_memory_context,
     emit_memory_events,
     propose_memory_candidate,
+    record_action_trace,
 )
 from ariel.persistence import (
     ApprovalRequestRecord,
@@ -2666,6 +2667,50 @@ def process_proactive_action_execution_due(
                     now=now,
                     new_id_fn=new_id_fn,
                 )
+                trace_session = db.scalar(
+                    select(SessionRecord).where(SessionRecord.is_active.is_(True)).limit(1)
+                )
+                if trace_session is None:
+                    trace_session = SessionRecord(
+                        id=new_id_fn("ses"),
+                        is_active=True,
+                        lifecycle_state="active",
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    db.add(trace_session)
+                    db.flush()
+                _, trace_events = record_action_trace(
+                    db,
+                    action_attempt=None,
+                    scope_key=f"proactive:{plan.case_id}",
+                    primary_evidence_id=None,
+                    source_turn_id=None,
+                    trace_type="execution",
+                    now=now,
+                    new_id_fn=new_id_fn,
+                    session_id=trace_session.id,
+                    capability_id=plan.action_type,
+                    outcome=stored_execution.status,
+                    result_refs={
+                        "action_plan_id": plan.id,
+                        "case_id": plan.case_id,
+                        "target": plan.target,
+                        "risk_tier": plan.risk_tier,
+                        "execution_status": stored_execution.status,
+                        "execution_error": stored_execution.error,
+                    },
+                    evidence_text=f"proactive action {plan.action_type} for case {plan.case_id}",
+                )
+                emit_memory_events(
+                    db,
+                    events=trace_events,
+                    entry_path="proactive",
+                    actor_id="system",
+                    scope_key=f"proactive:{plan.case_id}",
+                    now=now,
+                    new_id_fn=new_id_fn,
+                )
         return
 
     with session_factory() as db:
@@ -2702,6 +2747,50 @@ def process_proactive_action_execution_due(
                 case_id=plan.case_id,
                 event_type="action_executed",
                 payload={"action_plan_id": plan.id, "status": stored_execution.status},
+                now=now,
+                new_id_fn=new_id_fn,
+            )
+            trace_session = db.scalar(
+                select(SessionRecord).where(SessionRecord.is_active.is_(True)).limit(1)
+            )
+            if trace_session is None:
+                trace_session = SessionRecord(
+                    id=new_id_fn("ses"),
+                    is_active=True,
+                    lifecycle_state="active",
+                    created_at=now,
+                    updated_at=now,
+                )
+                db.add(trace_session)
+                db.flush()
+            _, trace_events = record_action_trace(
+                db,
+                action_attempt=None,
+                scope_key=f"proactive:{plan.case_id}",
+                primary_evidence_id=None,
+                source_turn_id=None,
+                trace_type="execution",
+                now=now,
+                new_id_fn=new_id_fn,
+                session_id=trace_session.id,
+                capability_id=plan.action_type,
+                outcome=stored_execution.status,
+                result_refs={
+                    "action_plan_id": plan.id,
+                    "case_id": plan.case_id,
+                    "target": plan.target,
+                    "risk_tier": plan.risk_tier,
+                    "execution_status": stored_execution.status,
+                    "execution_error": stored_execution.error,
+                },
+                evidence_text=f"proactive action {plan.action_type} for case {plan.case_id}",
+            )
+            emit_memory_events(
+                db,
+                events=trace_events,
+                entry_path="proactive",
+                actor_id="system",
+                scope_key=f"proactive:{plan.case_id}",
                 now=now,
                 new_id_fn=new_id_fn,
             )

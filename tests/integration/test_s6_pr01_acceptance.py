@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy import select
 
 from ariel.app import ModelAdapter, create_app
-from ariel.persistence import ProviderWriteReceiptRecord
+from ariel.persistence import MemoryActionTraceRecord, ProviderWriteReceiptRecord
 from tests.integration.responses_helpers import (
     process_queued_action_execution,
     responses_with_run_calls,
@@ -841,6 +841,90 @@ def test_s6_pr01_drive_share_is_approval_gated_exact_payload_and_exactly_once(
             receipt.response_payload["authority"]["user_instruction_ref"]
             == (normalized_share_input["user_instruction_ref"])
         )
+
+
+def test_s6_pr01_drive_share_denial_settles_the_action_trace_to_denied(
+    postgres_url: str,
+) -> None:
+    adapter = ActionProposalAdapter(
+        run_calls_by_message={
+            "share launch plan": [
+                {
+                    "name": "drive.share",
+                    "input": {
+                        "file_id": "drv_plan",
+                        "grantee_email": "partner@example.com",
+                        "role": "reader",
+                        "idempotency_key": "drive-share-denied-1",
+                        "user_instruction_ref": "turn:current",
+                    },
+                }
+            ]
+        }
+    )
+    oauth_client = FakeGoogleOAuthClient(
+        tokens_by_code={
+            "connect-drive-share": FakeTokenBundle(
+                account_subject="sub_drive_share_deny",
+                account_email="drive-share-deny@example.com",
+                granted_scopes=[
+                    GOOGLE_CALENDAR_READ_SCOPE,
+                    GOOGLE_GMAIL_READ_SCOPE,
+                    GOOGLE_DRIVE_SHARE_SCOPE,
+                ],
+                access_token="tok_access_drive_share_deny",
+                refresh_token="tok_refresh_drive_share_deny",
+            )
+        }
+    )
+    workspace_provider = FakeGoogleWorkspaceProvider()
+    with _build_client(postgres_url, adapter) as client:
+        _bind_google_fakes(
+            client,
+            oauth_client=oauth_client,
+            workspace_provider=workspace_provider,
+        )
+        _connect_google(client, code="connect-drive-share")
+        session_id = _session_id(client)
+
+        sent = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "share launch plan"}
+        )
+        assert sent.status_code == 200
+        turn = sent.json()["turn"]
+        attempt = _surface_attempt(turn)
+        assert attempt["policy"]["decision"] == "requires_approval"
+        action_attempt_id = attempt["action_attempt_id"]
+
+        # The chat-turn path recorded an undecided policy_decision trace.
+        with cast(Any, client.app).state.session_factory() as db:
+            chat_trace = db.scalar(
+                select(MemoryActionTraceRecord).where(
+                    MemoryActionTraceRecord.action_attempt_id == action_attempt_id
+                )
+            )
+            assert chat_trace is not None
+            assert chat_trace.trace_type == "policy_decision"
+            assert chat_trace.outcome == "unknown"
+
+        approval_ref = _approval_ref(turn)
+        denied = client.post(
+            "/v1/approvals",
+            json={"approval_ref": approval_ref, "decision": "deny", "actor_id": "user.local"},
+        )
+        assert denied.status_code == 200
+
+        # The denial settles the existing trace; no duplicate trace is created.
+        with cast(Any, client.app).state.session_factory() as db:
+            traces = db.scalars(
+                select(MemoryActionTraceRecord).where(
+                    MemoryActionTraceRecord.action_attempt_id == action_attempt_id
+                )
+            ).all()
+            assert len(traces) == 1
+            assert traces[0].id == chat_trace.id
+            assert traces[0].outcome == "denied"
+        assert len(workspace_provider.drive_share_calls) == 0
 
 
 @pytest.mark.parametrize(

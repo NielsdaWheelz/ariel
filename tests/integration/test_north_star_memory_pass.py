@@ -26,10 +26,12 @@ from ariel.memory import (
     MEMORY_PROJECTION_VERSION,
     process_memory_extract_turn,
     process_memory_projection_job,
+    record_action_trace,
 )
 from ariel.persistence import (
     ActionAttemptRecord,
     BackgroundTaskRecord,
+    MemoryActionTraceRecord,
     MemoryAssertionEvidenceRecord,
     MemoryAssertionRecord,
     MemoryContextBlockRecord,
@@ -280,6 +282,9 @@ def _seed_memory_action_attempt(
     action_attempt_id: str,
     capability_id: str,
     proposed_input: dict[str, Any],
+    status: str = "executing",
+    policy_decision: str = "requires_approval",
+    execution_error: str | None = None,
 ) -> None:
     capability = get_capability(capability_id)
     assert capability is not None
@@ -325,12 +330,12 @@ def _seed_memory_action_attempt(
                     impact_level=capability.impact_level,
                     proposed_input=proposed_input,
                     payload_hash=action_hash,
-                    policy_decision="requires_approval",
+                    policy_decision=policy_decision,
                     policy_reason=None,
-                    status="executing",
-                    approval_required=True,
+                    status=status,
+                    approval_required=policy_decision == "requires_approval",
                     execution_output=None,
-                    execution_error=None,
+                    execution_error=execution_error,
                     created_at=now,
                     updated_at=now,
                 )
@@ -1617,6 +1622,124 @@ def test_memory_privacy_delete_redact_and_never_remember_actions(
                 .limit(1)
             )
             assert policy is not None
+
+
+def test_action_trace_completion_records_every_outcome_and_excludes_current_session(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_fake_memory_models(monkeypatch)
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        session_id = _session_id(client)
+        cases = [
+            ("act_trace_ok", "cap.memory.inspect", "succeeded", "succeeded"),
+            ("act_trace_fail", "cap.memory.inspect", "failed", "failed"),
+            ("act_trace_denied", "cap.memory.inspect", "denied", "denied"),
+            ("act_trace_undone", "cap.email.undo", "succeeded", "succeeded"),
+        ]
+        for attempt_id, capability_id, status, _outcome in cases:
+            _seed_memory_action_attempt(
+                client,
+                action_attempt_id=attempt_id,
+                capability_id=capability_id,
+                proposed_input={"section": "all"}
+                if capability_id == "cap.memory.inspect"
+                else {"prior_action_id": "ema_prior", "idempotency_key": "undo-trace-1"},
+                status=status,
+                execution_error="boom" if status == "failed" else None,
+            )
+
+        with _session_factory(client)() as db:
+            with db.begin():
+                for attempt_id, _capability_id, _status, expected_outcome in cases:
+                    attempt = db.get(ActionAttemptRecord, attempt_id)
+                    assert attempt is not None
+                    trace, events = record_action_trace(
+                        db,
+                        action_attempt=attempt,
+                        scope_key=f"session:{session_id}",
+                        primary_evidence_id=None,
+                        source_turn_id=attempt.turn_id,
+                        trace_type="execution"
+                        if attempt.status in {"executing", "succeeded", "failed"}
+                        else "policy_decision",
+                        now=datetime.now(tz=UTC),
+                        new_id_fn=_new_id,
+                    )
+                    assert trace.outcome == expected_outcome
+                    assert trace.action_attempt_id == attempt_id
+                    assert trace.capability_id == _capability_id
+                    # primary_evidence_id is NOT NULL and was self-recorded.
+                    evidence = db.get(MemoryEvidenceRecord, trace.primary_evidence_id)
+                    assert evidence is not None
+                    assert evidence.content_class == "system"
+                    assert len(events) == 1
+                    assert events[0]["event_type"] == "evt.memory.evidence_recorded"
+
+        # The async outcome hook updates a record_action_trace-created trace.
+        _seed_memory_action_attempt(
+            client,
+            action_attempt_id="act_trace_worker",
+            capability_id="cap.memory.set_never_remember",
+            proposed_input={"scope_key": "global", "rule": "do not remember trace probes"},
+            status="executing",
+        )
+        with _session_factory(client)() as db:
+            with db.begin():
+                worker_attempt = db.get(ActionAttemptRecord, "act_trace_worker")
+                assert worker_attempt is not None
+                worker_trace, _events = record_action_trace(
+                    db,
+                    action_attempt=worker_attempt,
+                    scope_key=f"session:{session_id}",
+                    primary_evidence_id=None,
+                    source_turn_id=worker_attempt.turn_id,
+                    trace_type="policy_decision",
+                    now=datetime.now(tz=UTC),
+                    new_id_fn=_new_id,
+                )
+                worker_trace_id = worker_trace.id
+        assert (
+            process_action_execution_task(
+                session_factory=_session_factory(client),
+                action_attempt_id="act_trace_worker",
+                google_runtime=None,
+                agency_runtime=None,
+                now_fn=lambda: datetime.now(tz=UTC),
+                new_id_fn=_new_id,
+            )
+            is True
+        )
+        with _session_factory(client)() as db:
+            updated = db.get(MemoryActionTraceRecord, worker_trace_id)
+            assert updated is not None
+            assert updated.trace_type == "execution"
+            assert updated.outcome == "succeeded"
+            assert updated.result_refs["execution_status"] == "succeeded"
+            # No duplicate trace was created for the same attempt.
+            trace_count = db.scalar(
+                select(func.count())
+                .select_from(MemoryActionTraceRecord)
+                .where(MemoryActionTraceRecord.action_attempt_id == "act_trace_worker")
+            )
+            assert trace_count == 1
+
+        # Trace recall excludes traces scoped to the current session.
+        with _session_factory(client)() as db:
+            memory_context, _payload = memory.build_memory_context(
+                db,
+                user_message="action trace recall probe",
+                max_recalled_assertions=8,
+                settings=_settings(),
+                current_session_id=session_id,
+            )
+        session_traces = [
+            item
+            for item in memory_context["recall_window"]["candidate_memories"]
+            if item["kind"] == "action_trace" and item["scope_key"] == f"session:{session_id}"
+        ]
+        assert session_traces == []
 
 
 def test_privacy_delete_scrubs_projection_content_and_scoped_export_filters_evidence(

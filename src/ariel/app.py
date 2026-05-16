@@ -81,6 +81,7 @@ from ariel.memory import (
     merge_candidates,
     privacy_delete_assertion,
     propose_memory_candidate,
+    record_action_trace,
     record_rotation_context_block,
     record_turn_memory_evidence,
     redact_evidence,
@@ -113,7 +114,6 @@ from ariel.persistence import (
     JobEventRecord,
     JobRecord,
     MemoryAssertionRecord,
-    MemoryActionTraceRecord,
     MemoryContextBlockRecord,
     MemoryEvidenceRecord,
     MemoryConflictSetRecord,
@@ -7517,44 +7517,19 @@ def create_app(
                 if user_evidence_id is not None:
                     now_memory_trace = _utcnow()
                     for action_attempt in created_action_attempts:
-                        outcome = "unknown"
-                        if action_attempt.status == "succeeded":
-                            outcome = "succeeded"
-                        elif action_attempt.status == "failed":
-                            outcome = "failed"
-                        elif (
-                            action_attempt.status in {"rejected", "denied", "expired"}
-                            or action_attempt.policy_decision == "deny"
-                        ):
-                            outcome = "denied"
-                        db.add(
-                            MemoryActionTraceRecord(
-                                id=_new_id("mat"),
-                                scope_key=f"session:{effective_session_id}",
-                                trace_type=(
-                                    "execution"
-                                    if action_attempt.status in {"executing", "succeeded", "failed"}
-                                    else "policy_decision"
-                                ),
-                                action_attempt_id=action_attempt.id,
-                                source_turn_id=turn.id,
-                                primary_evidence_id=user_evidence_id,
-                                capability_id=action_attempt.capability_id,
-                                summary=(
-                                    f"{action_attempt.capability_id} {outcome} "
-                                    f"for proposal {action_attempt.proposal_index}"
-                                ),
-                                outcome=outcome,
-                                result_refs={
-                                    "impact_level": action_attempt.impact_level,
-                                    "policy_decision": action_attempt.policy_decision,
-                                    "approval_required": action_attempt.approval_required,
-                                    "execution_error": action_attempt.execution_error,
-                                },
-                                lifecycle_state="active",
-                                created_at=now_memory_trace,
-                                updated_at=now_memory_trace,
-                            )
+                        record_action_trace(
+                            db,
+                            action_attempt=action_attempt,
+                            scope_key=f"session:{effective_session_id}",
+                            primary_evidence_id=user_evidence_id,
+                            source_turn_id=turn.id,
+                            trace_type=(
+                                "execution"
+                                if action_attempt.status in {"executing", "succeeded", "failed"}
+                                else "policy_decision"
+                            ),
+                            now=now_memory_trace,
+                            new_id_fn=_new_id,
                         )
                     task = enqueue_background_task(
                         db,

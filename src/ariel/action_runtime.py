@@ -60,6 +60,7 @@ from ariel.memory import (
     merge_candidates,
     privacy_delete_assertion,
     propose_memory_candidate,
+    record_action_trace,
     redact_evidence,
     reject_candidate,
     resolve_conflict,
@@ -4702,6 +4703,27 @@ def _mark_approval_expired(
         now_fn=now_fn,
     )
 
+    _, trace_events = record_action_trace(
+        db,
+        action_attempt=action_attempt,
+        scope_key=f"session:{action_attempt.session_id}",
+        primary_evidence_id=None,
+        source_turn_id=action_attempt.turn_id,
+        trace_type="policy_decision",
+        now=now,
+        new_id_fn=new_id_fn,
+    )
+    emit_memory_events(
+        db,
+        events=trace_events,
+        entry_path="capability",
+        actor_id=_memory_actor_id(db=db, action_attempt=action_attempt),
+        scope_key=f"session:{action_attempt.session_id}",
+        now=now,
+        new_id_fn=new_id_fn,
+        source_turn_id=action_attempt.turn_id,
+    )
+
 
 def reconcile_expired_approvals_for_session(
     *,
@@ -4866,6 +4888,26 @@ def resolve_approval_decision(
                 "actor_id": approval.actor_id,
                 "reason": approval.decision_reason,
             },
+        )
+        _, trace_events = record_action_trace(
+            db,
+            action_attempt=action_attempt,
+            scope_key=f"session:{action_attempt.session_id}",
+            primary_evidence_id=None,
+            source_turn_id=action_attempt.turn_id,
+            trace_type="policy_decision",
+            now=now,
+            new_id_fn=new_id_fn,
+        )
+        emit_memory_events(
+            db,
+            events=trace_events,
+            entry_path="capability",
+            actor_id=actor_id,
+            scope_key=f"session:{action_attempt.session_id}",
+            now=now,
+            new_id_fn=new_id_fn,
+            source_turn_id=action_attempt.turn_id,
         )
         db.flush()
         return ApprovalDecisionResult(
