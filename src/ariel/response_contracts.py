@@ -898,6 +898,23 @@ class SurfaceMemoryActionTraceContract(BaseModel):
     updated_at: str
 
 
+class SurfaceMemoryReasoningTraceContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    scope_key: str
+    trace_type: str
+    task_summary: str
+    trace_summary: str
+    outcome: str
+    primary_evidence_id: str
+    source_turn_id: str | None
+    related_entity_ids: list[str]
+    related_assertion_ids: list[str]
+    created_at: str
+    updated_at: str
+
+
 class SurfaceMemoryTopicContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1046,6 +1063,7 @@ class SurfaceMemoryResponseContract(BaseModel):
     evidence: list[SurfaceMemoryEvidenceContract]
     procedures: list[SurfaceMemoryProcedureContract]
     action_traces: list[SurfaceMemoryActionTraceContract] = Field(default_factory=list)
+    reasoning_traces: list[SurfaceMemoryReasoningTraceContract] = Field(default_factory=list)
     topics: list[SurfaceMemoryTopicContract] = Field(default_factory=list)
     context_blocks: list[SurfaceMemoryContextBlockContract] = Field(default_factory=list)
     deletions: list[SurfaceMemoryDeletionContract] = Field(default_factory=list)
@@ -2172,6 +2190,7 @@ def build_surface_memory_response(
     procedures: Any,
     projection_health: Any,
     action_traces: Any = None,
+    reasoning_traces: Any = None,
     topics: Any = None,
     context_blocks: Any = None,
     deletions: Any = None,
@@ -2194,6 +2213,7 @@ def build_surface_memory_response(
     }
     for key, value in (
         ("action_traces", action_traces),
+        ("reasoning_traces", reasoning_traces),
         ("topics", topics),
         ("context_blocks", context_blocks),
         ("deletions", deletions),

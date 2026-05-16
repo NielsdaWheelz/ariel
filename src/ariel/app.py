@@ -83,6 +83,7 @@ from ariel.memory import (
     privacy_delete_assertion,
     propose_memory_candidate,
     record_action_trace,
+    record_reasoning_trace,
     record_rotation_context_block,
     record_turn_memory_evidence,
     redact_evidence,
@@ -660,6 +661,7 @@ class MemoryCandidateRequest(BaseModel):
         "project_state",
         "procedure",
         "domain_concept",
+        "negative",
     ]
     value: str = Field(min_length=1, max_length=700)
     evidence_text: str = Field(min_length=1, max_length=12_000)
@@ -7542,6 +7544,37 @@ def create_app(
                                 if action_attempt.status in {"executing", "succeeded", "failed"}
                                 else "policy_decision"
                             ),
+                            now=now_memory_trace,
+                            new_id_fn=_new_id,
+                        )
+                    if created_action_attempts:
+                        all_succeeded = all(
+                            attempt.status == "succeeded" for attempt in created_action_attempts
+                        )
+                        any_failed = any(
+                            attempt.status == "failed" for attempt in created_action_attempts
+                        )
+                        record_reasoning_trace(
+                            db,
+                            scope_key=f"session:{effective_session_id}",
+                            trace_type="successful_pattern" if all_succeeded else "diagnostic",
+                            task_summary=user_message,
+                            trace_summary=(
+                                "turn ran callables: "
+                                + ", ".join(
+                                    f"{attempt.capability_id} ({attempt.status})"
+                                    for attempt in created_action_attempts
+                                )
+                            ),
+                            outcome=(
+                                "succeeded"
+                                if all_succeeded
+                                else "failed"
+                                if any_failed
+                                else "unknown"
+                            ),
+                            primary_evidence_id=user_evidence_id,
+                            source_turn_id=turn.id,
                             now=now_memory_trace,
                             new_id_fn=_new_id,
                         )

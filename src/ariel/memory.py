@@ -33,6 +33,7 @@ from .persistence import (
     MemoryKeywordProjectionRecord,
     MemoryProcedureRecord,
     MemoryProjectionJobRecord,
+    MemoryReasoningTraceRecord,
     MemoryRelationshipRecord,
     MemoryReviewRecord,
     MemoryRetentionPolicyRecord,
@@ -66,7 +67,16 @@ ALLOWED_MEMORY_ASSERTION_TYPES = {
     "project_state",
     "procedure",
     "domain_concept",
+    "negative",
 }
+ALLOWED_MEMORY_REASONING_TRACE_TYPES = {
+    "action_path",
+    "failure",
+    "user_correction",
+    "successful_pattern",
+    "diagnostic",
+}
+ALLOWED_MEMORY_REASONING_TRACE_OUTCOMES = {"succeeded", "failed", "corrected", "unknown"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -2595,6 +2605,84 @@ def record_action_trace(
     return trace, events
 
 
+def record_reasoning_trace(
+    db: Session,
+    *,
+    scope_key: str,
+    trace_type: str,
+    task_summary: str,
+    trace_summary: str,
+    outcome: str,
+    primary_evidence_id: str | None,
+    source_turn_id: str | None,
+    now: datetime,
+    new_id_fn: Callable[[str], str],
+    session_id: str | None = None,
+    related_entity_ids: list[str] | None = None,
+    related_assertion_ids: list[str] | None = None,
+    evidence_text: str | None = None,
+) -> tuple[MemoryReasoningTraceRecord, list[dict[str, Any]]]:
+    """Write a MemoryReasoningTraceRecord, ensuring its primary evidence exists.
+
+    trace_type is one of action_path|failure|user_correction|successful_pattern|
+    diagnostic; outcome is one of succeeded|failed|corrected|unknown.
+
+    primary_evidence_id may be None: a path without turn evidence (the extraction
+    worker, a turn that recorded none) passes session_id and evidence_text, and a
+    reasoning-trace evidence row is recorded so the NOT NULL primary_evidence_id is
+    always satisfiable. Returns the trace and any evt.memory.evidence_recorded
+    events the caller must persist.
+    """
+    events: list[dict[str, Any]] = []
+    if primary_evidence_id is None:
+        if session_id is None:
+            raise MemoryEventError("record_reasoning_trace needs session_id to record evidence")
+        evidence = _record_evidence(
+            db,
+            session_id=session_id,
+            turn_id=source_turn_id,
+            actor_id="system",
+            content_class="system",
+            trust_boundary="system",
+            source_text=evidence_text or trace_summary,
+            source_uri=None,
+            metadata={"capture_mode": "reasoning_trace_evidence"},
+            now=now,
+            new_id_fn=new_id_fn,
+        )
+        primary_evidence_id = evidence.id
+        events.append(
+            {
+                "event_type": "evt.memory.evidence_recorded",
+                "payload": {
+                    "evidence_id": evidence.id,
+                    "source_turn_id": source_turn_id,
+                    "source_session_id": session_id,
+                    "content_class": evidence.content_class,
+                    "trust_boundary": evidence.trust_boundary,
+                },
+            }
+        )
+    trace = MemoryReasoningTraceRecord(
+        id=new_id_fn("mrt"),
+        trace_type=trace_type,
+        scope_key=scope_key,
+        task_summary=_clean_text(task_summary, max_chars=700),
+        trace_summary=_clean_text(trace_summary, max_chars=2_000),
+        outcome=outcome,
+        primary_evidence_id=primary_evidence_id,
+        source_turn_id=source_turn_id,
+        related_entity_ids=related_entity_ids or [],
+        related_assertion_ids=related_assertion_ids or [],
+        lifecycle_state="active",
+        metadata_json={},
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(trace)
+    return trace, events
+
+
 def propose_memory_candidate(
     db: Session,
     *,
@@ -4347,6 +4435,126 @@ def consolidate_memory(
             }
         )
 
+    reasoning_traces = db.scalars(
+        select(MemoryReasoningTraceRecord)
+        .where(MemoryReasoningTraceRecord.lifecycle_state == "active")
+        .order_by(MemoryReasoningTraceRecord.updated_at.desc(), MemoryReasoningTraceRecord.id.asc())
+        .limit(50)
+    ).all()
+    if scope_key != "global":
+        reasoning_traces = [
+            reasoning_trace
+            for reasoning_trace in reasoning_traces
+            if reasoning_trace.scope_key == scope_key
+            or reasoning_trace.scope_key == f"session:{scope_key}"
+        ]
+    successful_by_task: dict[str, list[MemoryReasoningTraceRecord]] = {}
+    for reasoning_trace in reasoning_traces:
+        if reasoning_trace.trace_type == "successful_pattern":
+            successful_by_task.setdefault(_memory_key(reasoning_trace.task_summary), []).append(
+                reasoning_trace
+            )
+    for task_key, task_traces in successful_by_task.items():
+        if len(task_traces) < 2:
+            continue
+        procedure_key = _memory_key(f"reasoning {task_key}")
+        procedure = db.scalar(
+            select(MemoryProcedureRecord)
+            .where(
+                MemoryProcedureRecord.procedure_key == procedure_key,
+                MemoryProcedureRecord.scope_key == scope_key,
+            )
+            .limit(1)
+        )
+        if procedure is not None:
+            rejected_changes.append(
+                {
+                    "kind": "procedure_candidate",
+                    "task_key": task_key,
+                    "reason": "procedure already exists",
+                }
+            )
+            continue
+        db.add(
+            MemoryProcedureRecord(
+                id=new_id_fn("mpr"),
+                procedure_key=procedure_key,
+                scope_key=scope_key,
+                title=_clean_text(f"Pattern: {task_traces[0].task_summary}", max_chars=200),
+                instruction=(
+                    "Review repeated successful reasoning traces before converting this "
+                    "candidate into durable procedure memory."
+                ),
+                lifecycle_state="candidate",
+                review_state="needs_operator_review",
+                source_assertion_id=None,
+                primary_evidence_id=task_traces[0].primary_evidence_id,
+                valid_from=now,
+                valid_to=None,
+                metadata_json={
+                    "source": "consolidation",
+                    "task_key": task_key,
+                    "source_reasoning_trace_ids": [t.id for t in task_traces[:5]],
+                },
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        proposed_changes.append(
+            {
+                "kind": "procedure_candidate",
+                "task_key": task_key,
+                "source_reasoning_trace_ids": [t.id for t in task_traces[:5]],
+                "review_state": "needs_operator_review",
+            }
+        )
+
+    candidate_events: list[dict[str, Any]] = []
+    negative_predicate_by_trace_type = {
+        "failure": "negative.known_bad_path",
+        "user_correction": "negative.invalid_assumption",
+    }
+    for reasoning_trace in reasoning_traces:
+        predicate = negative_predicate_by_trace_type.get(reasoning_trace.trace_type)
+        if predicate is None:
+            continue
+        trace_evidence = db.get(MemoryEvidenceRecord, reasoning_trace.primary_evidence_id)
+        if trace_evidence is None or trace_evidence.lifecycle_state != "available":
+            continue
+        events = propose_memory_candidate(
+            db,
+            source_session_id=trace_evidence.source_session_id,
+            actor_id="system",
+            evidence_text=reasoning_trace.trace_summary,
+            subject_key=scope_key,
+            predicate=predicate,
+            assertion_type="negative",
+            value=_clean_text(reasoning_trace.trace_summary, max_chars=700),
+            confidence=0.6,
+            scope_key=scope_key,
+            valid_from=None,
+            valid_to=None,
+            extraction_model=None,
+            extraction_prompt_version=None,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+            source_evidence_id=reasoning_trace.primary_evidence_id,
+        )
+        candidate_events.extend(events)
+        for event in events:
+            event_payload = event.get("payload")
+            if event.get("event_type") == "evt.memory.candidate_proposed" and isinstance(
+                event_payload, dict
+            ):
+                proposed_changes.append(
+                    {
+                        "kind": "negative_memory_candidate",
+                        "predicate": predicate,
+                        "assertion_id": event_payload.get("assertion_id"),
+                        "source_reasoning_trace_id": reasoning_trace.id,
+                    }
+                )
+
     content = json.dumps(
         {
             "scope_key": scope_key,
@@ -4399,6 +4607,7 @@ def consolidate_memory(
     emit_memory_events(
         db,
         events=[
+            *candidate_events,
             {
                 "event_type": "evt.memory.consolidation_completed",
                 "payload": {
@@ -4408,7 +4617,7 @@ def consolidate_memory(
                     "proposed_change_count": len(proposed_changes),
                     "applied_projection_count": len(applied_projection_changes) + 1,
                 },
-            }
+            },
         ],
         entry_path="consolidation",
         actor_id=actor_id,
@@ -4484,7 +4693,14 @@ def export_memory(
             for item in payload["project_state"]
             if f"project:{item['project_key']}" == scope_key
         ]
-        for key in ("procedures", "action_traces", "topics", "context_blocks", "scope_bindings"):
+        for key in (
+            "procedures",
+            "action_traces",
+            "reasoning_traces",
+            "topics",
+            "context_blocks",
+            "scope_bindings",
+        ):
             payload[key] = [item for item in payload[key] if item["scope_key"] == scope_key]
         allowed_evidence_ids = {
             ref["evidence_id"]
@@ -4501,7 +4717,8 @@ def export_memory(
         )
         allowed_evidence_ids.update(
             item["primary_evidence_id"]
-            for item in payload["action_traces"]
+            for key in ("action_traces", "reasoning_traces")
+            for item in payload[key]
             if isinstance(item.get("primary_evidence_id"), str)
         )
         payload["evidence"] = [
@@ -5517,6 +5734,12 @@ def list_memory(db: Session) -> dict[str, Any]:
         .order_by(MemoryActionTraceRecord.updated_at.desc(), MemoryActionTraceRecord.id.asc())
         .limit(50)
     ).all()
+    reasoning_traces = db.scalars(
+        select(MemoryReasoningTraceRecord)
+        .where(MemoryReasoningTraceRecord.lifecycle_state == "active")
+        .order_by(MemoryReasoningTraceRecord.updated_at.desc(), MemoryReasoningTraceRecord.id.asc())
+        .limit(50)
+    ).all()
     topics = db.scalars(
         select(MemoryTopicRecord)
         .where(MemoryTopicRecord.lifecycle_state == "active")
@@ -5637,6 +5860,23 @@ def list_memory(db: Session) -> dict[str, Any]:
                 "updated_at": to_rfc3339(trace.updated_at),
             }
             for trace in action_traces
+        ],
+        "reasoning_traces": [
+            {
+                "id": trace.id,
+                "scope_key": trace.scope_key,
+                "trace_type": trace.trace_type,
+                "task_summary": redact_text(trace.task_summary),
+                "trace_summary": redact_text(trace.trace_summary),
+                "outcome": trace.outcome,
+                "primary_evidence_id": trace.primary_evidence_id,
+                "source_turn_id": trace.source_turn_id,
+                "related_entity_ids": trace.related_entity_ids,
+                "related_assertion_ids": trace.related_assertion_ids,
+                "created_at": to_rfc3339(trace.created_at),
+                "updated_at": to_rfc3339(trace.updated_at),
+            }
+            for trace in reasoning_traces
         ],
         "topics": [
             {
@@ -7120,12 +7360,21 @@ def process_memory_extract_turn(
         raise RuntimeError("memory extraction requires ARIEL_OPENAI_API_KEY")
 
     prompt = (
-        "Extract durable Ariel memory candidates from the evidence. "
-        "Return JSON only with a top-level candidates array. Each candidate must have "
-        "subject_key, predicate, assertion_type, value, confidence. "
-        "Use assertion_type values fact, profile, preference, commitment, decision, "
-        "project_state, procedure, or domain_concept. Return an empty array when the "
-        "evidence has no durable memory."
+        "Extract durable Ariel memory from the evidence. Return JSON only with two "
+        "top-level arrays: candidates and reasoning_traces. "
+        "Each candidate must have subject_key, predicate, assertion_type, value, "
+        "confidence. Use assertion_type values fact, profile, preference, commitment, "
+        "decision, project_state, procedure, domain_concept, or negative. Use the "
+        "negative assertion_type for knowledge about what NOT to do — rejected "
+        "approaches, invalid assumptions, areas already checked, or unsafe operations "
+        "— with a negative.* predicate (negative.rejected_approach, "
+        "negative.invalid_assumption, negative.already_checked, "
+        "negative.unsafe_operation, negative.known_bad_path). "
+        "Each reasoning_trace must have trace_type, task_summary, trace_summary, "
+        "outcome. Use trace_type values action_path, failure, user_correction, "
+        "successful_pattern, or diagnostic, and outcome values succeeded, failed, "
+        "corrected, or unknown. Return empty arrays when the evidence has no durable "
+        "memory."
     )
     provider_response_id: str | None = None
     try:
@@ -7252,11 +7501,16 @@ def process_memory_extract_turn(
                 )
         raise RuntimeError("memory extraction model returned malformed JSON") from exc
     candidates = payload.get("candidates")
+    reasoning_traces = payload.get("reasoning_traces", [])
     schema_error = None
     if not isinstance(candidates, list):
         schema_error = "memory extraction JSON missing candidates array"
     elif len(candidates) > 8:
         schema_error = "memory extraction JSON returned too many candidates"
+    elif not isinstance(reasoning_traces, list):
+        schema_error = "memory extraction JSON reasoning_traces must be an array"
+    elif len(reasoning_traces) > 8:
+        schema_error = "memory extraction JSON returned too many reasoning traces"
     else:
         for raw_candidate in candidates:
             if not isinstance(raw_candidate, dict) or set(raw_candidate.keys()) != {
@@ -7284,6 +7538,20 @@ def process_memory_extract_turn(
                 or float(confidence) != float(confidence)
             ):
                 schema_error = "memory extraction candidate schema invalid"
+                break
+        for raw_trace in reasoning_traces:
+            if (
+                not isinstance(raw_trace, dict)
+                or set(raw_trace.keys())
+                != {"trace_type", "task_summary", "trace_summary", "outcome"}
+                or raw_trace.get("trace_type") not in ALLOWED_MEMORY_REASONING_TRACE_TYPES
+                or raw_trace.get("outcome") not in ALLOWED_MEMORY_REASONING_TRACE_OUTCOMES
+                or not isinstance(raw_trace.get("task_summary"), str)
+                or not raw_trace["task_summary"].strip()
+                or not isinstance(raw_trace.get("trace_summary"), str)
+                or not raw_trace["trace_summary"].strip()
+            ):
+                schema_error = "memory extraction reasoning trace schema invalid"
                 break
     if schema_error is not None:
         with session_factory() as db:
@@ -7377,6 +7645,30 @@ def process_memory_extract_turn(
                     now=now_fn(),
                     new_id_fn=new_id_fn,
                 )
+            proposed_trace_ids: list[str] = []
+            for raw_trace in reasoning_traces:
+                trace, trace_events = record_reasoning_trace(
+                    db,
+                    scope_key=f"session:{session_id}",
+                    trace_type=raw_trace["trace_type"],
+                    task_summary=raw_trace["task_summary"],
+                    trace_summary=raw_trace["trace_summary"],
+                    outcome=raw_trace["outcome"],
+                    primary_evidence_id=evidence_id,
+                    source_turn_id=evidence.source_turn_id,
+                    now=now_fn(),
+                    new_id_fn=new_id_fn,
+                )
+                proposed_trace_ids.append(trace.id)
+                emit_memory_events(
+                    db,
+                    events=trace_events,
+                    entry_path="worker",
+                    actor_id="system",
+                    scope_key=f"session:{session_id}",
+                    now=now_fn(),
+                    new_id_fn=new_id_fn,
+                )
             now = now_fn()
             db.add(
                 AIJudgmentRecord(
@@ -7392,9 +7684,13 @@ def process_memory_extract_turn(
                     input_refs={"session_id": session_id, "evidence_id": evidence_id},
                     selected=[
                         {"assertion_id": assertion_id} for assertion_id in proposed_candidate_ids
-                    ],
+                    ]
+                    + [{"reasoning_trace_id": trace_id} for trace_id in proposed_trace_ids],
                     omitted=[],
-                    output={"candidate_count": len(proposed_candidate_ids)},
+                    output={
+                        "candidate_count": len(proposed_candidate_ids),
+                        "reasoning_trace_count": len(proposed_trace_ids),
+                    },
                     rationale="extracted durable memory candidates from evidence",
                     uncertainty=None,
                     confidence=None,

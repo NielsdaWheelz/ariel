@@ -45,6 +45,7 @@ from ariel.persistence import (
     MemoryKeywordProjectionRecord,
     MemoryProcedureRecord,
     MemoryProjectionJobRecord,
+    MemoryReasoningTraceRecord,
     MemorySymbolProjectionRecord,
     MemoryRetentionPolicyRecord,
     MemoryReviewRecord,
@@ -57,7 +58,7 @@ from ariel.persistence import (
     TurnRecord,
 )
 from ariel.proactivity import process_proactive_deliberation_due, upsert_proactive_observation
-from tests.integration.responses_helpers import responses_run_message
+from tests.integration.responses_helpers import responses_run_message, responses_with_run_calls
 
 
 _id_counter = count(1)
@@ -2442,3 +2443,258 @@ def test_scope_binding_change_writes_memory_version_record(
             assert version.change_type == "created"
             assert isinstance(version.new_state, dict)
             assert version.new_state["memory_mode"] == "no_memory"
+
+
+@dataclass
+class MemoryInspectTurnAdapter:
+    """First model turn invokes the cap.memory.inspect callable; the follow-up turn
+    emits the final message. The turn runs a callable, so the chat-turn path writes
+    a reasoning trace."""
+
+    provider: str = "provider.north-star-memory"
+    model: str = "model.north-star-memory"
+    calls_made: int = 0
+
+    def create_response(
+        self,
+        *,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
+        history: list[dict[str, Any]],
+        context_bundle: dict[str, Any],
+    ) -> dict[str, Any]:
+        del input_items, tools, history, context_bundle
+        self.calls_made += 1
+        if self.calls_made == 1:
+            calls = [{"name": "memory.inspect", "input": {"section": "all", "limit": 10}}]
+        else:
+            calls = [
+                {"name": "agent.emit_message", "input": {"text": f"inspected::{user_message}"}}
+            ]
+        return responses_with_run_calls(
+            assistant_text=f"inspected::{user_message}",
+            calls=calls,
+            provider=self.provider,
+            model=self.model,
+            provider_response_id=f"resp_north_star_memory_inspect_{self.calls_made}",
+        )
+
+
+def test_turn_that_runs_callables_writes_reasoning_trace(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_fake_memory_models(monkeypatch)
+    adapter = MemoryInspectTurnAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        session_id = _session_id(client)
+        response = client.post(
+            f"/v1/sessions/{session_id}/message",
+            json={"message": "inspect my memory please"},
+        )
+        assert response.status_code == 200
+
+        with _session_factory(client)() as db:
+            # The turn ran the cap.memory.inspect callable, so it created an action
+            # attempt and the chat-turn path wrote exactly one reasoning trace.
+            attempts = db.scalars(
+                select(ActionAttemptRecord).where(ActionAttemptRecord.session_id == session_id)
+            ).all()
+            assert [attempt.capability_id for attempt in attempts] == ["cap.memory.inspect"]
+            assert attempts[0].status == "succeeded"
+            traces = db.scalars(
+                select(MemoryReasoningTraceRecord).where(
+                    MemoryReasoningTraceRecord.scope_key == f"session:{session_id}"
+                )
+            ).all()
+            assert len(traces) == 1
+            trace = traces[0]
+            assert trace.trace_type == "successful_pattern"
+            assert trace.outcome == "succeeded"
+            assert trace.lifecycle_state == "active"
+            assert "cap.memory.inspect" in trace.trace_summary
+            # primary_evidence_id is NOT NULL and points at the turn's user evidence.
+            evidence = db.get(MemoryEvidenceRecord, trace.primary_evidence_id)
+            assert evidence is not None
+            assert evidence.source_session_id == session_id
+            assert trace.source_turn_id is not None
+
+
+def test_negative_candidate_flows_through_review_to_active(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_fake_memory_models(monkeypatch)
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        _session_id(client)
+        candidate = _candidate(
+            client,
+            value="do not retry the synchronous import path",
+            assertion_type="negative",
+            subject_key="repo:ariel",
+            predicate="negative.rejected_approach",
+            evidence_text="The synchronous import path was rejected after it deadlocked.",
+        )
+        assert candidate["type"] == "negative"
+        # negative.* predicates are coexist, so the candidate is multi-valued and
+        # opens no conflict; it flows through the standard review lifecycle.
+        assert candidate["is_multi_valued"] is True
+        assert candidate["state"] == "candidate"
+
+        approve = client.post(f"/v1/memory/candidates/{candidate['id']}/approve")
+        assert approve.status_code == 200
+
+        with _session_factory(client)() as db:
+            assertion = db.get(MemoryAssertionRecord, candidate["id"])
+            assert assertion is not None
+            assert assertion.assertion_type == "negative"
+            assert assertion.lifecycle_state == "active"
+            assert assertion.is_multi_valued is True
+            review = db.scalar(
+                select(MemoryReviewRecord)
+                .where(MemoryReviewRecord.assertion_id == candidate["id"])
+                .order_by(MemoryReviewRecord.created_at.desc())
+                .limit(1)
+            )
+            assert review is not None
+            assert review.decision == "approved"
+
+
+def _seed_reasoning_trace(
+    db: Any,
+    *,
+    trace_id: str,
+    trace_type: str,
+    task_summary: str,
+    trace_summary: str,
+    outcome: str,
+    session_id: str,
+    now: datetime,
+) -> None:
+    evidence_id = f"mev_{trace_id}"
+    db.add(
+        MemoryEvidenceRecord(
+            id=evidence_id,
+            source_turn_id=None,
+            source_session_id=session_id,
+            actor_id="system",
+            content_class="system",
+            trust_boundary="system",
+            lifecycle_state="available",
+            source_uri=None,
+            source_artifact_id=None,
+            source_text=trace_summary,
+            evidence_snippet=trace_summary[:360],
+            redaction_posture="none",
+            metadata_json={},
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    db.flush()
+    db.add(
+        MemoryReasoningTraceRecord(
+            id=trace_id,
+            trace_type=trace_type,
+            scope_key="global",
+            task_summary=task_summary,
+            trace_summary=trace_summary,
+            outcome=outcome,
+            primary_evidence_id=evidence_id,
+            source_turn_id=None,
+            related_entity_ids=[],
+            related_assertion_ids=[],
+            lifecycle_state="active",
+            metadata_json={},
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+
+def test_consolidation_promotes_successful_traces_and_failures_to_candidates(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_fake_memory_models(monkeypatch)
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        session_id = _session_id(client)
+        now = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
+        with _session_factory(client)() as db:
+            with db.begin():
+                # Two repeated successful_pattern traces for the same task become a
+                # procedure candidate; the failure trace becomes a negative-memory
+                # candidate.
+                _seed_reasoning_trace(
+                    db,
+                    trace_id="mrt_ok_a",
+                    trace_type="successful_pattern",
+                    task_summary="run the database migration",
+                    trace_summary="ran migration 0030 and verified the schema",
+                    outcome="succeeded",
+                    session_id=session_id,
+                    now=now,
+                )
+                _seed_reasoning_trace(
+                    db,
+                    trace_id="mrt_ok_b",
+                    trace_type="successful_pattern",
+                    task_summary="run the database migration",
+                    trace_summary="ran migration 0031 and verified the schema",
+                    outcome="succeeded",
+                    session_id=session_id,
+                    now=now,
+                )
+                _seed_reasoning_trace(
+                    db,
+                    trace_id="mrt_fail",
+                    trace_type="failure",
+                    task_summary="patch the worker loop",
+                    trace_summary="patching the worker loop in place deadlocked the queue",
+                    outcome="failed",
+                    session_id=session_id,
+                    now=now,
+                )
+
+        with _session_factory(client)() as db:
+            with db.begin():
+                result = memory.consolidate_memory(
+                    db,
+                    scope_key="global",
+                    actor_id="system",
+                    source_session_id=session_id,
+                    now_fn=lambda: now,
+                    new_id_fn=_new_id,
+                )
+        assert result["status"] == "completed"
+        change_kinds = [change["kind"] for change in result["proposed_changes"]]
+        assert "procedure_candidate" in change_kinds
+        assert "negative_memory_candidate" in change_kinds
+
+        with _session_factory(client)() as db:
+            # The repeated successful traces produced a reviewable procedure candidate.
+            procedure = db.scalar(
+                select(MemoryProcedureRecord)
+                .where(MemoryProcedureRecord.lifecycle_state == "candidate")
+                .limit(1)
+            )
+            assert procedure is not None
+            assert procedure.review_state == "needs_operator_review"
+            assert procedure.metadata_json["source_reasoning_trace_ids"] == [
+                "mrt_ok_a",
+                "mrt_ok_b",
+            ]
+            # The failure trace produced a negative-memory assertion candidate that
+            # routes through the standard review lifecycle (never a direct active write).
+            negative = db.scalar(
+                select(MemoryAssertionRecord)
+                .where(MemoryAssertionRecord.assertion_type == "negative")
+                .limit(1)
+            )
+            assert negative is not None
+            assert negative.lifecycle_state == "candidate"
+            assert negative.predicate == "negative.known_bad_path"
+            assert negative.is_multi_valued is True

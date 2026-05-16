@@ -1234,6 +1234,7 @@ _MEMORY_ASSERTION_TYPES = {
     "project_state",
     "procedure",
     "domain_concept",
+    "negative",
 }
 
 
