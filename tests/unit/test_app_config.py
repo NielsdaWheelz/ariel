@@ -103,7 +103,7 @@ def test_slice1_turn_budget_defaults_are_configured(monkeypatch: pytest.MonkeyPa
 
 
 def test_security_defaults_are_development_only() -> None:
-    settings = AppSettings.model_validate({})
+    settings = _app_settings_without_env_files()
     assert settings.deployment_mode == "development"
     assert settings.local_auth_required is False
     assert settings.connector_encryption_secret == "dev-local-connector-secret"
@@ -137,13 +137,12 @@ def test_production_rejects_dev_connector_encryption_secret() -> None:
 
 def test_production_requires_connector_keyring() -> None:
     with pytest.raises(ValidationError):
-        AppSettings.model_validate(
-            {
-                "deployment_mode": "production",
-                "local_auth_required": True,
-                "local_auth_token": STRONG_LOCAL_AUTH_TOKEN,
-                "connector_encryption_secret": "prod-connector-secret",
-            }
+        cast(Any, AppSettings)(
+            _env_file=None,
+            deployment_mode="production",
+            local_auth_required=True,
+            local_auth_token=STRONG_LOCAL_AUTH_TOKEN,
+            connector_encryption_secret="prod-connector-secret",
         )
 
 

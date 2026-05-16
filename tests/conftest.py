@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Generator
+from typing import Any, cast
 from uuid import uuid4
 
 import pytest
@@ -9,7 +10,15 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 from testcontainers.postgres import PostgresContainer
 
+from ariel.config import AppSettings
 from ariel.db import reset_schema_for_tests
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_app_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """create_app() in tests resolves settings from env vars only, never a developer's
+    .env or .env.local on the host."""
+    monkeypatch.setattr("ariel.app.AppSettings", lambda: cast(Any, AppSettings)(_env_file=None))
 
 
 @pytest.fixture(scope="session")
