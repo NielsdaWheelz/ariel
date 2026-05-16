@@ -671,15 +671,7 @@ def test_long_memory_eval_suite_passes(
         assert metrics["selected_relevant_memory_count"] >= 1
         assert metrics["omitted_relevant_memory_count"] == 0
         assert metrics["context_tokens"] >= 0
-        assert metrics["retrieval_latency_ms"] >= 0.0
-        for latency_key in (
-            "extraction_latency_ms",
-            "retrieval_latency_ms",
-            "curation_latency_ms",
-            "projection_latency_ms",
-            "consolidation_latency_ms",
-        ):
-            assert latency_key in metrics
+        assert metrics["recall_latency_ms"] >= 0.0
 
         # The metric set is durably persisted on the eval run record.
         with _session_factory(client)() as db:
@@ -694,11 +686,7 @@ def test_long_memory_eval_suite_passes(
                 "omitted_relevant_memory_count",
                 "conflict_handling_accuracy",
                 "context_tokens",
-                "extraction_latency_ms",
-                "retrieval_latency_ms",
-                "curation_latency_ms",
-                "projection_latency_ms",
-                "consolidation_latency_ms",
+                "recall_latency_ms",
             ):
                 assert key in run.metrics, key
 

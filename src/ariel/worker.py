@@ -74,17 +74,6 @@ PROACTIVE_RECOVERABLE_TASK_TYPES = (
     "proactive_action_execution_due",
 )
 
-# Projection-job kinds the maintenance worker consumes. The schema CHECK
-# ck_memory_projection_job_kind is reconciled to exactly the enqueued-and-
-# consumed set: embedding and graph are handled by their own workers; these are
-# the consolidation kinds.
-MEMORY_CONSOLIDATION_PROJECTION_KINDS = (
-    "context_block",
-    "project_state",
-    "hot_index",
-    "topic_block",
-)
-
 
 class UnsupportedTaskType(RuntimeError):
     pass
@@ -382,7 +371,8 @@ def enqueue_due_memory_consolidation_jobs(
     consolidated_scopes = set(
         db.scalars(
             select(MemoryContextBlockRecord.scope_key).where(
-                MemoryContextBlockRecord.block_type == "hot_index"
+                MemoryContextBlockRecord.block_type == "hot_index",
+                MemoryContextBlockRecord.lifecycle_state == "active",
             )
         ).all()
     )
@@ -398,9 +388,7 @@ def enqueue_due_memory_consolidation_jobs(
         ).allowed:
             continue
         if (
-            enqueue_consolidation_job(
-                db, scope_key=scope_key, kind="hot_index", now=now, new_id_fn=_new_id
-            )
+            enqueue_consolidation_job(db, scope_key=scope_key, now=now, new_id_fn=_new_id)
             is not None
         ):
             enqueued += 1
@@ -488,12 +476,13 @@ def process_memory_maintenance_job(
     with session_factory() as db:
         with db.begin():
             now = now_fn()
+            # ck_memory_projection_job_kind allows exactly embedding, graph, and
+            # hot_index; embedding and graph have their own workers, so the
+            # maintenance worker consumes only the hot_index consolidation kind.
             job = db.scalar(
                 select(MemoryProjectionJobRecord)
                 .where(
-                    MemoryProjectionJobRecord.projection_kind.in_(
-                        MEMORY_CONSOLIDATION_PROJECTION_KINDS
-                    ),
+                    MemoryProjectionJobRecord.projection_kind == "hot_index",
                     MemoryProjectionJobRecord.lifecycle_state == "pending",
                     MemoryProjectionJobRecord.run_after <= now,
                 )

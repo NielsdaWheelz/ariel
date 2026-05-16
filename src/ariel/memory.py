@@ -428,6 +428,14 @@ def _memory_version_number(db: Session, *, table: str, record_id: str) -> int:
 
 
 @dataclass(frozen=True, slots=True)
+class ScopeModeObservation:
+    scope_type: str
+    scope_key: str
+    memory_mode: str  # "normal" | "temporary" | "no_memory"
+    binding_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class MemoryPolicyDecision:
     allowed: bool
     operation: str  # "recall" | "extract" | "write" | "consolidate"
@@ -436,7 +444,7 @@ class MemoryPolicyDecision:
     controlling_scope_key: str
     controlling_binding_id: str | None
     reason: str
-    considered_scopes: tuple[dict[str, Any], ...]
+    considered_scopes: tuple[ScopeModeObservation, ...]
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -466,29 +474,34 @@ def resolve_memory_policy(
     proactive_case_id: str | None = None,
     project_key: str | None = None,
     repo_key: str | None = None,
-    actor_id: str | None = None,
 ) -> MemoryPolicyDecision:
     """Resolve the effective memory mode for an operation across the full scope
     chain. The strictest mode wins; the most specific scope carrying that mode is
     reported as controlling. Expired bindings are ignored. Operations recall,
     extract, write, and consolidate all require an effective mode of normal."""
-    del actor_id  # accepted for call-site symmetry; resolution does not key on it
-    considered: list[dict[str, Any]] = []
+    considered: list[ScopeModeObservation] = []
 
     # Session scope: mode lives on SessionRecord, not in the bindings table.
     if session_id is not None:
         session = db.get(SessionRecord, session_id)
         if session is None:
             return MemoryPolicyDecision(
-                False, operation, "no_memory", "session", session_id, None, "session not found", ()
+                allowed=False,
+                operation=operation,
+                effective_mode="no_memory",
+                controlling_scope_type="session",
+                controlling_scope_key=session_id,
+                controlling_binding_id=None,
+                reason="session not found",
+                considered_scopes=(),
             )
         considered.append(
-            {
-                "scope_type": "session",
-                "scope_key": session_id,
-                "memory_mode": session.memory_mode,
-                "binding_id": None,
-            }
+            ScopeModeObservation(
+                scope_type="session",
+                scope_key=session_id,
+                memory_mode=session.memory_mode,
+                binding_id=None,
+            )
         )
 
     # The other five scope types come from memory_scope_bindings.
@@ -520,32 +533,39 @@ def resolve_memory_policy(
         )
         if binding is not None:
             considered.append(
-                {
-                    "scope_type": scope_type,
-                    "scope_key": scope_key,
-                    "memory_mode": binding.memory_mode,
-                    "binding_id": binding.id,
-                }
+                ScopeModeObservation(
+                    scope_type=scope_type,
+                    scope_key=scope_key,
+                    memory_mode=binding.memory_mode,
+                    binding_id=binding.id,
+                )
             )
 
     if not considered:
         return MemoryPolicyDecision(
-            True, operation, "normal", "default", "default", None, "no binding applies", ()
+            allowed=True,
+            operation=operation,
+            effective_mode="normal",
+            controlling_scope_type="default",
+            controlling_scope_key="default",
+            controlling_binding_id=None,
+            reason="no binding applies",
+            considered_scopes=(),
         )
 
     # Strictest mode wins; the most specific scope carrying it is controlling.
-    strictest = max(_MODE_SEVERITY[s["memory_mode"]] for s in considered)
-    carriers = [s for s in considered if _MODE_SEVERITY[s["memory_mode"]] == strictest]
-    controlling = min(carriers, key=lambda s: _SCOPE_SPECIFICITY[s["scope_type"]])
-    mode = controlling["memory_mode"]
+    strictest = max(_MODE_SEVERITY[s.memory_mode] for s in considered)
+    carriers = [s for s in considered if _MODE_SEVERITY[s.memory_mode] == strictest]
+    controlling = min(carriers, key=lambda s: _SCOPE_SPECIFICITY[s.scope_type])
+    mode = controlling.memory_mode
     return MemoryPolicyDecision(
         allowed=(mode == "normal"),
         operation=operation,
         effective_mode=mode,
-        controlling_scope_type=controlling["scope_type"],
-        controlling_scope_key=controlling["scope_key"],
-        controlling_binding_id=controlling["binding_id"],
-        reason=f"effective mode {mode} from {controlling['scope_type']} scope",
+        controlling_scope_type=controlling.scope_type,
+        controlling_scope_key=controlling.scope_key,
+        controlling_binding_id=controlling.binding_id,
+        reason=f"effective mode {mode} from {controlling.scope_type} scope",
         considered_scopes=tuple(considered),
     )
 
@@ -1277,7 +1297,6 @@ def _record_projection_rows(
     source_memory_version = _memory_version_number(
         db, table="memory_assertions", record_id=assertion.id
     )
-    search_text = _assertion_search_text(assertion)
     db.add(
         MemoryKeywordProjectionRecord(
             id=new_id_fn("mkp"),
@@ -1285,8 +1304,7 @@ def _record_projection_rows(
             canonical_id=assertion.id,
             projection_version=MEMORY_PROJECTION_VERSION,
             source_memory_version=source_memory_version,
-            search_text=search_text,
-            search_document=search_text,
+            search_document=_assertion_search_text(assertion),
             created_at=now,
             updated_at=now,
         )
@@ -2274,7 +2292,7 @@ def _activate_assertion(
             "payload": {
                 "assertion_id": assertion.id,
                 "projection_version": MEMORY_PROJECTION_VERSION,
-                "projection_kinds": ["keyword", "entity", "salience"],
+                "projection_kinds": ["keyword", "entity", "symbol", "temporal", "salience"],
                 "queued_projection_kinds": ["embedding"],
             },
         }
@@ -2299,9 +2317,9 @@ def _settle_conflict_sets_for_assertion(
     ignored. Conflict sets always reach a terminal state. Returns event dicts."""
     events: list[dict[str, Any]] = []
     set_ids = db.scalars(
-        select(MemoryConflictMemberRecord.conflict_set_id).where(
-            MemoryConflictMemberRecord.assertion_id == assertion_id
-        )
+        select(MemoryConflictMemberRecord.conflict_set_id)
+        .where(MemoryConflictMemberRecord.assertion_id == assertion_id)
+        .order_by(MemoryConflictMemberRecord.conflict_set_id.asc())
     ).all()
     for set_id in set_ids:
         conflict = db.get(MemoryConflictSetRecord, set_id)
@@ -2380,7 +2398,6 @@ def record_turn_memory_evidence(
         thread_id=thread_id,
         project_key=project_key,
         repo_key=repo_key,
-        actor_id=actor_id,
     ).allowed:
         return [], None
     user_evidence = _record_evidence(
@@ -2693,7 +2710,6 @@ def propose_memory_candidate(
         proactive_case_id=proactive_case_id,
         project_key=project_key,
         repo_key=repo_key,
-        actor_id=actor_id,
     ).allowed:
         return []
     if (
@@ -3985,26 +4001,20 @@ def create_relationship(
     }
 
 
-_CONSOLIDATION_JOB_KINDS = ("context_block", "project_state", "hot_index", "topic_block")
-
-
 def enqueue_consolidation_job(
     db: Session,
     *,
     scope_key: str,
-    kind: str,
     now: datetime,
     new_id_fn: Callable[[str], str],
 ) -> MemoryProjectionJobRecord | None:
-    """Insert a consolidation MemoryProjectionJobRecord for a scope. Returns None
-    when a pending job of the same kind already targets the scope, so repeated
-    autonomous triggers do not pile up duplicate work."""
-    if kind not in _CONSOLIDATION_JOB_KINDS:
-        raise MemoryProjectionError(f"unsupported consolidation job kind: {kind}")
+    """Insert a hot_index consolidation MemoryProjectionJobRecord for a scope.
+    Returns None when a pending hot_index job already targets the scope, so
+    repeated autonomous triggers do not pile up duplicate work."""
     existing = db.scalar(
         select(MemoryProjectionJobRecord)
         .where(
-            MemoryProjectionJobRecord.projection_kind == kind,
+            MemoryProjectionJobRecord.projection_kind == "hot_index",
             MemoryProjectionJobRecord.target_table == "memory_scopes",
             MemoryProjectionJobRecord.target_id == scope_key,
             MemoryProjectionJobRecord.lifecycle_state == "pending",
@@ -4015,7 +4025,7 @@ def enqueue_consolidation_job(
         return None
     job = MemoryProjectionJobRecord(
         id=new_id_fn("mpj"),
-        projection_kind=kind,
+        projection_kind="hot_index",
         target_table="memory_scopes",
         target_id=scope_key,
         lifecycle_state="pending",
@@ -4076,12 +4086,9 @@ def _maybe_enqueue_backlog_consolidation(
         now=now,
         project_key=project_key,
         repo_key=repo_key,
-        actor_id=actor_id,
     ).allowed:
         return []
-    job = enqueue_consolidation_job(
-        db, scope_key=scope_key, kind="hot_index", now=now, new_id_fn=new_id_fn
-    )
+    job = enqueue_consolidation_job(db, scope_key=scope_key, now=now, new_id_fn=new_id_fn)
     if job is None:
         return []
     return [
@@ -4120,7 +4127,6 @@ def consolidate_memory(
         session_id=source_session_id,
         project_key=project_key,
         repo_key=repo_key,
-        actor_id=actor_id,
     )
     if not policy.allowed:
         return {
@@ -4715,7 +4721,6 @@ def export_memory(
         session_id=source_session_id,
         project_key=project_key,
         repo_key=repo_key,
-        actor_id=actor_id,
     )
     if not policy.allowed:
         return {
@@ -4952,7 +4957,7 @@ def run_memory_eval(
     case_results: list[dict[str, Any]] = []
     passed_count = 0
     failed_count = 0
-    retrieval_latency_ms = 0.0
+    recall_latency_ms = 0.0
     context_tokens = 0
     expected_total = 0
     expected_recalled = 0
@@ -5003,7 +5008,7 @@ def run_memory_eval(
                 current_session_id=current_session_id,
             )
         except AIJudgmentFailure as exc:
-            retrieval_latency_ms += (time.perf_counter() - started) * 1000.0
+            recall_latency_ms += (time.perf_counter() - started) * 1000.0
             case_results.append(
                 {
                     "index": index,
@@ -5018,7 +5023,7 @@ def run_memory_eval(
             failed_count += 1
             continue
 
-        retrieval_latency_ms += (time.perf_counter() - started) * 1000.0
+        recall_latency_ms += (time.perf_counter() - started) * 1000.0
         recall_window = memory_context["recall_window"]
         selected_memory_ids = [
             item for item in recall_window["selected_memory_ids"] if isinstance(item, str)
@@ -5158,9 +5163,10 @@ def run_memory_eval(
             "passed_cases": passed_count,
             "failed_cases": failed_count,
             "pass_rate": pass_rate,
-            # The memory.md eval metric set. The eval exercises recall only, so
-            # retrieval latency is measured and the extraction/curation/projection/
-            # consolidation stages it does not run are recorded as zero.
+            # The memory.md eval metric set. The eval exercises recall, which runs
+            # curation inline; recall_latency_ms is that combined measured cost. The
+            # extraction/projection/consolidation stages the eval never runs are
+            # omitted rather than reported as a misleading zero.
             "answer_accuracy": pass_rate,
             "candidate_recall": expected_recalled / expected_total if expected_total else 1.0,
             "curation_precision": (
@@ -5172,11 +5178,7 @@ def run_memory_eval(
                 conflict_case_handled / conflict_case_total if conflict_case_total else 1.0
             ),
             "context_tokens": context_tokens,
-            "extraction_latency_ms": 0.0,
-            "retrieval_latency_ms": retrieval_latency_ms,
-            "curation_latency_ms": 0.0,
-            "projection_latency_ms": 0.0,
-            "consolidation_latency_ms": 0.0,
+            "recall_latency_ms": recall_latency_ms,
         },
         cases=case_results,
         created_at=now,
@@ -6367,8 +6369,9 @@ def _curate_memory_context_with_model(
         "retrieval_features vector (rrf_score, signal_ranks, vector_distance, "
         "lexical_rank, salience_score, user_priority, source_trust, "
         "effective_confidence, verification_age_days, conflict_status, validity, "
-        "topic_membership). Reciprocal Rank Fusion produced the pool order; it is "
-        "transport order, not relevance — use the user request, recent history, "
+        "topic_membership, entity_ids, symbol_matches). Reciprocal Rank Fusion "
+        "produced the pool order; it is transport order, not relevance — use the "
+        "user request, recent history, "
         "memory values, evidence, validity, conflicts, decay, and provenance to judge "
         "relevance. A candidate whose conflict_status is open is unresolved: never "
         "treat it as settled. Return JSON only with selected_memories, "
@@ -6514,7 +6517,14 @@ def search_memory(
                         "id": memory_id,
                         "kind": kind,
                         "rationale": selected_rationales[memory_id],
-                        "value": item.get("value") or item.get("summary") or item.get("content"),
+                        "value": (
+                            item.get("value")
+                            or item.get("summary")
+                            or item.get("content")
+                            or item.get("trace_summary")
+                            or item.get("task_summary")
+                            or item.get("instruction")
+                        ),
                         "evidence_refs": item.get("evidence_refs", []),
                         "retrieval_features": item.get("retrieval_features", {}),
                         "conflict_status": item.get("conflict_status"),
@@ -6930,11 +6940,12 @@ def _symbol_signal(
 
 
 def _temporal_signal(db: Session, *, now: datetime, limit: int) -> list[tuple[str, str]]:
-    """Assertions and episodes whose bounded validity interval contains now, via
-    memory_temporal_projections. A row is a temporal match only when it has an
-    explicit valid_to upper bound — a perpetually-valid memory (valid_to is null)
-    carries no temporal signal and is left to the relevance signals. Activation
-    stamps valid_from on every assertion, so valid_from alone is not a signal."""
+    """Assertions whose bounded validity interval contains now, via
+    memory_temporal_projections (only assertion validity rows exist). A row is a
+    temporal match only when it has an explicit valid_to upper bound — a
+    perpetually-valid memory (valid_to is null) carries no temporal signal and is
+    left to the relevance signals. Activation stamps valid_from on every
+    assertion, so valid_from alone is not a signal."""
     ranking: list[tuple[str, str]] = []
     for row in db.scalars(
         select(MemoryTemporalProjectionRecord)
@@ -7127,7 +7138,6 @@ def build_memory_context(
         proactive_case_id=proactive_case_id,
         project_key=project_key,
         repo_key=repo_key,
-        actor_id=actor_id,
     )
     memory_policy = policy.as_dict()
     if not policy.allowed:
@@ -7476,7 +7486,7 @@ def build_memory_context(
             kind = (
                 "negative_memory"
                 if assertion.assertion_type == "negative"
-                else ("semantic_assertion")
+                else "semantic_assertion"
             )
             refs = evidence_refs.get(canonical_id, [])
             payload = serialize_assertion(assertion, evidence_refs=refs)
@@ -7671,6 +7681,11 @@ def build_memory_context(
             continue
         if table == _TABLE_CONFLICT_SETS:
             conflict = conflict_sets_by_id[canonical_id]
+            conflict_status = {"state": "open", "conflict_ids": [conflict.id]}
+            conflict_features = _non_assertion_features(
+                score, ranks, lexical_rank_by_id.get(canonical_id), topic_membership
+            )
+            conflict_features["conflict_status"] = conflict_status
             candidate_payloads.append(
                 {
                     "id": conflict.id,
@@ -7682,10 +7697,8 @@ def build_memory_context(
                     "resolution_assertion_id": conflict.resolution_assertion_id,
                     "trust_boundary": "reviewed_memory",
                     "taint": {"provenance_status": "reviewed_memory"},
-                    "conflict_status": {"state": "open", "conflict_ids": [conflict.id]},
-                    "retrieval_features": _non_assertion_features(
-                        score, ranks, lexical_rank_by_id.get(canonical_id), topic_membership
-                    ),
+                    "conflict_status": conflict_status,
+                    "retrieval_features": conflict_features,
                     "projection_version": MEMORY_PROJECTION_VERSION,
                     "updated_at": to_rfc3339(conflict.updated_at),
                 }

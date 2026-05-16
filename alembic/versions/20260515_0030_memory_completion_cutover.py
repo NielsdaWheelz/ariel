@@ -69,10 +69,7 @@ _MEMORY_PROJECTION_JOB_KIND_BEFORE = (
     "'context_block', 'project_state', 'hot_index', 'topic_block', "
     "'action_trace', 'temporal', 'symbol', 'export')"
 )
-_MEMORY_PROJECTION_JOB_KIND_AFTER = (
-    "projection_kind IN ('embedding', 'graph', 'context_block', "
-    "'project_state', 'hot_index', 'topic_block')"
-)
+_MEMORY_PROJECTION_JOB_KIND_AFTER = "projection_kind IN ('embedding', 'graph', 'hot_index')"
 
 
 def _upgrade_memory_events() -> None:
@@ -99,7 +96,6 @@ def _upgrade_memory_events() -> None:
     )
     op.create_index("ix_memory_events_event_type", "memory_events", ["event_type"])
     op.create_index("ix_memory_events_scope_key", "memory_events", ["scope_key"])
-    op.create_index("ix_memory_events_source_turn_id", "memory_events", ["source_turn_id"])
     op.create_index("ix_memory_events_created_at", "memory_events", ["created_at"])
 
 
@@ -127,6 +123,7 @@ def _upgrade_memory_scope_bindings() -> None:
         "memory_scope_bindings",
         type_="check",
     )
+    op.execute("DELETE FROM memory_scope_bindings WHERE scope_type = 'session'")
     op.create_check_constraint(
         "ck_memory_scope_binding_scope_type",
         "memory_scope_bindings",
@@ -150,7 +147,7 @@ def _upgrade_memory_keyword_projections() -> None:
         ),
     )
     op.create_index(
-        "ix_memory_keyword_projections_search_vector",
+        "ix_memory_keyword_projection_search_vector",
         "memory_keyword_projections",
         ["search_vector"],
         postgresql_using="gin",
@@ -158,6 +155,8 @@ def _upgrade_memory_keyword_projections() -> None:
     # weighted_terms is superseded by the search_vector tsvector column; lexical
     # retrieval is Postgres full-text only, so the JSONB term map is dropped.
     op.drop_column("memory_keyword_projections", "weighted_terms")
+    # search_text duplicated search_document and was never read; drop it.
+    op.drop_column("memory_keyword_projections", "search_text")
     op.drop_constraint(
         "ck_memory_keyword_projection_canonical_table",
         "memory_keyword_projections",
@@ -175,6 +174,11 @@ def _upgrade_memory_projection_jobs() -> None:
         "ck_memory_projection_job_kind",
         "memory_projection_jobs",
         type_="check",
+    )
+    op.execute(
+        "DELETE FROM memory_projection_jobs WHERE projection_kind IN ("
+        "'keyword', 'entity', 'context_block', 'project_state', 'topic_block', "
+        "'action_trace', 'temporal', 'symbol', 'export')"
     )
     op.create_check_constraint(
         "ck_memory_projection_job_kind",
@@ -212,6 +216,9 @@ def _downgrade_memory_keyword_projections() -> None:
         "memory_keyword_projections",
         type_="check",
     )
+    op.execute(
+        "DELETE FROM memory_keyword_projections WHERE canonical_table = 'memory_action_traces'"
+    )
     op.create_check_constraint(
         "ck_memory_keyword_projection_canonical_table",
         "memory_keyword_projections",
@@ -227,8 +234,13 @@ def _downgrade_memory_keyword_projections() -> None:
         ),
     )
     op.alter_column("memory_keyword_projections", "weighted_terms", server_default=None)
+    op.add_column(
+        "memory_keyword_projections",
+        sa.Column("search_text", sa.Text(), nullable=False, server_default=""),
+    )
+    op.alter_column("memory_keyword_projections", "search_text", server_default=None)
     op.drop_index(
-        "ix_memory_keyword_projections_search_vector",
+        "ix_memory_keyword_projection_search_vector",
         table_name="memory_keyword_projections",
     )
     op.drop_column("memory_keyword_projections", "search_vector")
@@ -259,7 +271,6 @@ def _downgrade_memory_conflict_sets() -> None:
 
 def _downgrade_memory_events() -> None:
     op.drop_index("ix_memory_events_created_at", table_name="memory_events")
-    op.drop_index("ix_memory_events_source_turn_id", table_name="memory_events")
     op.drop_index("ix_memory_events_scope_key", table_name="memory_events")
     op.drop_index("ix_memory_events_event_type", table_name="memory_events")
     op.drop_table("memory_events")
@@ -284,6 +295,11 @@ def downgrade() -> None:
     _downgrade_memory_scope_bindings()
 
     op.drop_constraint("ck_memory_version_canonical_table", "memory_versions", type_="check")
+    op.execute(
+        "DELETE FROM memory_versions WHERE canonical_table IN ("
+        "'memory_scope_bindings', 'memory_salience', 'memory_conflict_sets', "
+        "'memory_events')"
+    )
     op.create_check_constraint(
         "ck_memory_version_canonical_table",
         "memory_versions",
@@ -291,6 +307,7 @@ def downgrade() -> None:
     )
 
     op.drop_constraint("ck_memory_assertion_type", "memory_assertions", type_="check")
+    op.execute("DELETE FROM memory_assertions WHERE assertion_type = 'negative'")
     op.create_check_constraint(
         "ck_memory_assertion_type",
         "memory_assertions",

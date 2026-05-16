@@ -1851,7 +1851,7 @@ class MemoryEventRecord(Base):
     subject_refs: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     source_turn_id: Mapped[str | None] = mapped_column(
-        String(32), ForeignKey("turns.id", ondelete="RESTRICT"), nullable=True, index=True
+        String(32), ForeignKey("turns.id", ondelete="RESTRICT"), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
@@ -1897,8 +1897,7 @@ class MemoryProjectionJobRecord(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "projection_kind IN ('embedding', 'graph', 'context_block', "
-            "'project_state', 'hot_index', 'topic_block')",
+            "projection_kind IN ('embedding', 'graph', 'hot_index')",
             name="ck_memory_projection_job_kind",
         ),
         CheckConstraint(
@@ -2055,7 +2054,6 @@ class MemoryKeywordProjectionRecord(Base):
     canonical_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     projection_version: Mapped[str] = mapped_column(String(32), nullable=False)
     source_memory_version: Mapped[int] = mapped_column(Integer, nullable=False)
-    search_text: Mapped[str] = mapped_column(Text, nullable=False)
     search_document: Mapped[str] = mapped_column(Text, nullable=False, default="")
     search_vector: Mapped[str] = mapped_column(
         TSVECTOR,
@@ -2088,7 +2086,7 @@ class MemoryKeywordProjectionRecord(Base):
             unique=True,
         ),
         Index(
-            "ix_memory_keyword_projections_search_vector",
+            "ix_memory_keyword_projection_search_vector",
             "search_vector",
             postgresql_using="gin",
         ),

@@ -469,6 +469,15 @@ class MemoryScopeModeRequest(BaseModel):
             raise ValueError("scope key must not be blank")
         return normalized
 
+    @field_validator("expires_at")
+    @classmethod
+    def _expires_at_must_be_timezone_aware(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("expires_at must include a timezone")
+        return value
+
 
 class WorkCommitmentSnoozeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -3081,7 +3090,6 @@ def _rotate_active_session(
         operation="consolidate",
         now=now,
         session_id=prior_session_id,
-        actor_id=actor_id,
     ).allowed
     if memory_allowed:
         record_rotation_context_block(
@@ -3129,9 +3137,7 @@ def _rotate_active_session(
     # Session rotation absorbs the closed session's memory: enqueue a hot-index
     # consolidation for the global scope, gated by consolidate policy.
     if memory_allowed:
-        enqueue_consolidation_job(
-            db, scope_key="global", kind="hot_index", now=now, new_id_fn=_new_id
-        )
+        enqueue_consolidation_job(db, scope_key="global", now=now, new_id_fn=_new_id)
 
     return rotated_session, rotation_record, False
 
@@ -3723,6 +3729,19 @@ def create_app(
                 retryable=False,
             )
 
+    def _emit_http_memory_events(
+        db: Session, *, events: Sequence[dict[str, Any]], scope_key: str
+    ) -> None:
+        emit_memory_events(
+            db,
+            events=events,
+            entry_path="http",
+            actor_id=str(app.state.approval_actor_id),
+            scope_key=scope_key,
+            now=_utcnow(),
+            new_id_fn=_new_id,
+        )
+
     def _google_runtime() -> GoogleConnectorRuntime:
         return GoogleConnectorRuntime(
             oauth_client=app.state.google_oauth_client,
@@ -4146,15 +4165,7 @@ def create_app(
                         details={"predicate": payload.predicate},
                         retryable=False,
                     ) from exc
-                emit_memory_events(
-                    db,
-                    events=candidate_events,
-                    entry_path="http",
-                    actor_id=str(app.state.approval_actor_id),
-                    scope_key=payload.scope_key,
-                    now=_utcnow(),
-                    new_id_fn=_new_id,
-                )
+                _emit_http_memory_events(db, events=candidate_events, scope_key=payload.scope_key)
                 memory_payload = list_memory(db)
                 try:
                     return build_surface_memory_response(**memory_payload)
@@ -4353,15 +4364,7 @@ def create_app(
                         details={"assertion_id": assertion_id, "state": assertion.lifecycle_state},
                         retryable=False,
                     )
-                emit_memory_events(
-                    db,
-                    events=events,
-                    entry_path="http",
-                    actor_id=str(app.state.approval_actor_id),
-                    scope_key=assertion.scope_key,
-                    now=_utcnow(),
-                    new_id_fn=_new_id,
-                )
+                _emit_http_memory_events(db, events=events, scope_key=assertion.scope_key)
                 memory_payload = list_memory(db)
                 try:
                     return build_surface_memory_response(**memory_payload)
@@ -4375,23 +4378,19 @@ def create_app(
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
-                missing_id = next(
-                    (
-                        assertion_id
-                        for assertion_id in payload.assertion_ids
-                        if db.get(MemoryAssertionRecord, assertion_id) is None
-                    ),
-                    None,
-                )
-                if missing_id is not None:
-                    raise ApiError(
-                        status_code=404,
-                        code="E_MEMORY_ASSERTION_NOT_FOUND",
-                        message="memory candidate was not found",
-                        details={"assertion_id": missing_id},
-                        retryable=False,
-                    )
-                merge_scope_assertion = db.get(MemoryAssertionRecord, payload.assertion_ids[0])
+                merge_scope_key = ""
+                for index, assertion_id in enumerate(payload.assertion_ids):
+                    assertion = db.get(MemoryAssertionRecord, assertion_id)
+                    if assertion is None:
+                        raise ApiError(
+                            status_code=404,
+                            code="E_MEMORY_ASSERTION_NOT_FOUND",
+                            message="memory candidate was not found",
+                            details={"assertion_id": assertion_id},
+                            retryable=False,
+                        )
+                    if index == 0:
+                        merge_scope_key = assertion.scope_key
                 events = merge_candidates(
                     db,
                     assertion_ids=payload.assertion_ids,
@@ -4407,16 +4406,7 @@ def create_app(
                         details={"assertion_ids": payload.assertion_ids},
                         retryable=False,
                     )
-                assert merge_scope_assertion is not None
-                emit_memory_events(
-                    db,
-                    events=events,
-                    entry_path="http",
-                    actor_id=str(app.state.approval_actor_id),
-                    scope_key=merge_scope_assertion.scope_key,
-                    now=_utcnow(),
-                    new_id_fn=_new_id,
-                )
+                _emit_http_memory_events(db, events=events, scope_key=merge_scope_key)
                 memory_payload = list_memory(db)
                 try:
                     return build_surface_memory_response(**memory_payload)
@@ -4452,15 +4442,7 @@ def create_app(
                         details={"assertion_id": assertion_id, "state": assertion.lifecycle_state},
                         retryable=False,
                     )
-                emit_memory_events(
-                    db,
-                    events=events,
-                    entry_path="http",
-                    actor_id=str(app.state.approval_actor_id),
-                    scope_key=assertion.scope_key,
-                    now=_utcnow(),
-                    new_id_fn=_new_id,
-                )
+                _emit_http_memory_events(db, events=events, scope_key=assertion.scope_key)
                 payload = list_memory(db)
                 try:
                     return build_surface_memory_response(**payload)
@@ -4500,15 +4482,7 @@ def create_app(
                         details={"assertion_id": assertion_id, "state": assertion.lifecycle_state},
                         retryable=False,
                     )
-                emit_memory_events(
-                    db,
-                    events=events,
-                    entry_path="http",
-                    actor_id=str(app.state.approval_actor_id),
-                    scope_key=assertion.scope_key,
-                    now=_utcnow(),
-                    new_id_fn=_new_id,
-                )
+                _emit_http_memory_events(db, events=events, scope_key=assertion.scope_key)
                 memory_payload = list_memory(db)
                 try:
                     return build_surface_memory_response(**memory_payload)
@@ -4550,15 +4524,7 @@ def create_app(
                         details={"assertion_id": assertion_id, "state": assertion.lifecycle_state},
                         retryable=False,
                     )
-                emit_memory_events(
-                    db,
-                    events=events,
-                    entry_path="http",
-                    actor_id=str(app.state.approval_actor_id),
-                    scope_key=assertion.scope_key,
-                    now=_utcnow(),
-                    new_id_fn=_new_id,
-                )
+                _emit_http_memory_events(db, events=events, scope_key=assertion.scope_key)
                 memory_payload = list_memory(db)
                 try:
                     return build_surface_memory_response(**memory_payload)
@@ -4594,15 +4560,7 @@ def create_app(
                         details={"assertion_id": assertion_id, "state": assertion.lifecycle_state},
                         retryable=False,
                     )
-                emit_memory_events(
-                    db,
-                    events=events,
-                    entry_path="http",
-                    actor_id=str(app.state.approval_actor_id),
-                    scope_key=assertion.scope_key,
-                    now=_utcnow(),
-                    new_id_fn=_new_id,
-                )
+                _emit_http_memory_events(db, events=events, scope_key=assertion.scope_key)
                 payload = list_memory(db)
                 try:
                     return build_surface_memory_response(**payload)
@@ -4638,15 +4596,7 @@ def create_app(
                         details={"assertion_id": assertion_id, "state": assertion.lifecycle_state},
                         retryable=False,
                     )
-                emit_memory_events(
-                    db,
-                    events=events,
-                    entry_path="http",
-                    actor_id=str(app.state.approval_actor_id),
-                    scope_key=assertion.scope_key,
-                    now=_utcnow(),
-                    new_id_fn=_new_id,
-                )
+                _emit_http_memory_events(db, events=events, scope_key=assertion.scope_key)
                 payload = list_memory(db)
                 try:
                     return build_surface_memory_response(**payload)
@@ -4686,15 +4636,7 @@ def create_app(
                         details={"assertion_id": assertion_id, "state": assertion.lifecycle_state},
                         retryable=False,
                     )
-                emit_memory_events(
-                    db,
-                    events=events,
-                    entry_path="http",
-                    actor_id=str(app.state.approval_actor_id),
-                    scope_key=assertion.scope_key,
-                    now=_utcnow(),
-                    new_id_fn=_new_id,
-                )
+                _emit_http_memory_events(db, events=events, scope_key=assertion.scope_key)
                 memory_payload = list_memory(db)
                 try:
                     return build_surface_memory_response(**memory_payload)
@@ -4734,14 +4676,8 @@ def create_app(
                         details={"evidence_id": evidence_id, "state": evidence.lifecycle_state},
                         retryable=False,
                     )
-                emit_memory_events(
-                    db,
-                    events=events,
-                    entry_path="http",
-                    actor_id=str(app.state.approval_actor_id),
-                    scope_key=f"session:{evidence.source_session_id}",
-                    now=_utcnow(),
-                    new_id_fn=_new_id,
+                _emit_http_memory_events(
+                    db, events=events, scope_key=f"session:{evidence.source_session_id}"
                 )
                 memory_payload = list_memory(db)
                 try:
@@ -4893,15 +4829,7 @@ def create_app(
                         details={"assertion_id": assertion_id, "state": assertion.lifecycle_state},
                         retryable=False,
                     )
-                emit_memory_events(
-                    db,
-                    events=events,
-                    entry_path="http",
-                    actor_id=str(app.state.approval_actor_id),
-                    scope_key=assertion.scope_key,
-                    now=_utcnow(),
-                    new_id_fn=_new_id,
-                )
+                _emit_http_memory_events(db, events=events, scope_key=assertion.scope_key)
                 memory_payload = list_memory(db)
                 try:
                     return build_surface_memory_response(**memory_payload)
@@ -4982,15 +4910,7 @@ def create_app(
                         },
                         retryable=False,
                     )
-                emit_memory_events(
-                    db,
-                    events=events,
-                    entry_path="http",
-                    actor_id=str(app.state.approval_actor_id),
-                    scope_key=conflict.scope_key,
-                    now=_utcnow(),
-                    new_id_fn=_new_id,
-                )
+                _emit_http_memory_events(db, events=events, scope_key=conflict.scope_key)
                 memory_payload = list_memory(db)
                 try:
                     return build_surface_memory_response(**memory_payload)
@@ -5140,6 +5060,17 @@ def create_app(
         limit: int = 100,
     ) -> JSONResponse | dict[str, Any]:
         _ensure_schema_ready()
+        for bound_name, bound_value in (("since", since), ("until", until)):
+            if bound_value is not None and (
+                bound_value.tzinfo is None or bound_value.utcoffset() is None
+            ):
+                raise ApiError(
+                    status_code=422,
+                    code="E_VALIDATION",
+                    message=f"{bound_name} must include a timezone",
+                    details={"field": bound_name},
+                    retryable=False,
+                )
         bounded_limit = max(1, min(limit, 200))
         with session_factory() as db:
             with db.begin():
@@ -5185,15 +5116,7 @@ def create_app(
                         details={},
                         retryable=False,
                     )
-                emit_memory_events(
-                    db,
-                    events=binding_events,
-                    entry_path="http",
-                    actor_id=str(app.state.approval_actor_id),
-                    scope_key=payload.scope_key,
-                    now=_utcnow(),
-                    new_id_fn=_new_id,
-                )
+                _emit_http_memory_events(db, events=binding_events, scope_key=payload.scope_key)
                 memory_payload = list_memory(db)
                 try:
                     return build_surface_memory_response(
@@ -7503,7 +7426,6 @@ def create_app(
                 now=_utcnow(),
                 session_id=effective_session_id,
                 thread_id=memory_thread_id,
-                actor_id=str(app.state.approval_actor_id),
             )
             if memory_write_policy.allowed:
                 memory_events, user_evidence_id = record_turn_memory_evidence(
