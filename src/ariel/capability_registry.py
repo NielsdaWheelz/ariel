@@ -1330,7 +1330,6 @@ def _validate_memory_propose_input(
         "evidence_text",
         "confidence",
         "scope_key",
-        "is_multi_valued",
         "valid_from",
         "valid_to",
     }:
@@ -1342,7 +1341,6 @@ def _validate_memory_propose_input(
     evidence_text = _normalize_optional_text(raw_input.get("evidence_text"), max_length=12_000)
     scope_key = _normalize_optional_text(raw_input.get("scope_key"), max_length=200)
     confidence_raw = raw_input.get("confidence")
-    is_multi_valued_raw = raw_input.get("is_multi_valued")
     valid_from = _normalize_optional_rfc3339_input(raw_input.get("valid_from"))
     valid_to = _normalize_optional_rfc3339_input(raw_input.get("valid_to"))
     if (
@@ -1357,7 +1355,6 @@ def _validate_memory_propose_input(
         or float(confidence_raw) < 0.0
         or float(confidence_raw) > 1.0
         or scope_key is None
-        or not isinstance(is_multi_valued_raw, bool)
     ):
         return None, "schema_invalid"
     if raw_input.get("valid_from") is not None and valid_from is None:
@@ -1377,7 +1374,6 @@ def _validate_memory_propose_input(
         "evidence_text": evidence_text,
         "confidence": float(confidence_raw),
         "scope_key": scope_key,
-        "is_multi_valued": is_multi_valued_raw,
         "valid_from": valid_from,
         "valid_to": valid_to,
     }, None

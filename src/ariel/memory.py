@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import json
 from typing import Any
@@ -64,6 +65,275 @@ ALLOWED_MEMORY_ASSERTION_TYPES = {
     "procedure",
     "domain_concept",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class PredicateSpec:
+    predicate: str
+    assertion_type: str
+    resolution_policy: str  # "conflict" | "supersede" | "coexist"
+    value_kind: str  # "text" | "enum" | "date" | "datetime" | "number" | "json"
+    sensitivity_default: str  # MemorySensitivityLabelRecord.label value
+    decay_half_life_days: float | None
+    enum_values: tuple[str, ...] = ()
+    description: str = ""
+
+    @property
+    def is_multi_valued(self) -> bool:
+        return self.resolution_policy == "coexist"
+
+
+_DEFAULT_PREDICATE_SPEC = PredicateSpec(
+    predicate="*",
+    assertion_type="fact",
+    resolution_policy="conflict",  # unknown predicates are single-valued: fail safe
+    value_kind="text",
+    sensitivity_default="personal",
+    decay_half_life_days=None,
+)
+
+# Closed predicate vocabulary. Type behaviour (cardinality, conflict policy, value
+# kind, sensitivity, decay) is deterministic per predicate; the model authors only
+# predicate strings and values. Unknown predicates resolve to _DEFAULT_PREDICATE_SPEC.
+_PREDICATE_REGISTRY: dict[str, PredicateSpec] = {
+    # fact: observed user/world facts; most accumulate, identity-like facts supersede.
+    "fact.location": PredicateSpec("fact.location", "fact", "supersede", "text", "personal", None),
+    "fact.contact_detail": PredicateSpec(
+        "fact.contact_detail", "fact", "supersede", "text", "private", None
+    ),
+    "fact.relationship": PredicateSpec(
+        "fact.relationship", "fact", "coexist", "text", "personal", None
+    ),
+    "fact.tooling": PredicateSpec("fact.tooling", "fact", "coexist", "text", "public", 180.0),
+    "fact.environment": PredicateSpec(
+        "fact.environment", "fact", "supersede", "text", "public", 90.0
+    ),
+    # profile: stable identity attributes; a new value supersedes the old.
+    "profile.display_name": PredicateSpec(
+        "profile.display_name", "profile", "supersede", "text", "personal", None
+    ),
+    "profile.role": PredicateSpec(
+        "profile.role", "profile", "supersede", "text", "personal", 365.0
+    ),
+    "profile.timezone": PredicateSpec(
+        "profile.timezone", "profile", "supersede", "text", "personal", None
+    ),
+    "profile.employer": PredicateSpec(
+        "profile.employer", "profile", "supersede", "text", "personal", 365.0
+    ),
+    "profile.pronouns": PredicateSpec(
+        "profile.pronouns", "profile", "supersede", "text", "personal", None
+    ),
+    "profile.location": PredicateSpec(
+        "profile.location", "profile", "supersede", "text", "personal", 365.0
+    ),
+    "profile.expertise": PredicateSpec(
+        "profile.expertise", "profile", "coexist", "text", "public", None
+    ),
+    # preference: how the user wants Ariel to behave.
+    "preference.response_verbosity": PredicateSpec(
+        "preference.response_verbosity",
+        "preference",
+        "conflict",
+        "enum",
+        "personal",
+        None,
+        enum_values=("terse", "normal", "detailed"),
+    ),
+    "preference.communication_style": PredicateSpec(
+        "preference.communication_style", "preference", "conflict", "text", "personal", None
+    ),
+    "preference.code_style": PredicateSpec(
+        "preference.code_style", "preference", "coexist", "text", "public", None
+    ),
+    "preference.language": PredicateSpec(
+        "preference.language", "preference", "conflict", "text", "personal", None
+    ),
+    "preference.notification": PredicateSpec(
+        "preference.notification", "preference", "conflict", "text", "personal", None
+    ),
+    "preference.tooling": PredicateSpec(
+        "preference.tooling", "preference", "coexist", "text", "public", None
+    ),
+    "preference.review_depth": PredicateSpec(
+        "preference.review_depth",
+        "preference",
+        "conflict",
+        "enum",
+        "personal",
+        None,
+        enum_values=("light", "standard", "thorough"),
+    ),
+    # commitment: outstanding todos and promises; a scope accumulates many.
+    "commitment.todo": PredicateSpec(
+        "commitment.todo", "commitment", "coexist", "text", "personal", None
+    ),
+    "commitment.follow_up": PredicateSpec(
+        "commitment.follow_up", "commitment", "coexist", "text", "personal", 30.0
+    ),
+    "commitment.deadline_promise": PredicateSpec(
+        "commitment.deadline_promise", "commitment", "coexist", "datetime", "personal", None
+    ),
+    "commitment.recurring": PredicateSpec(
+        "commitment.recurring", "commitment", "coexist", "text", "personal", None
+    ),
+    # decision: decisions the user or team made; history is kept, so they coexist.
+    "decision.architecture": PredicateSpec(
+        "decision.architecture", "decision", "coexist", "text", "public", None
+    ),
+    "decision.tooling": PredicateSpec(
+        "decision.tooling", "decision", "coexist", "text", "public", None
+    ),
+    "decision.process": PredicateSpec(
+        "decision.process", "decision", "coexist", "text", "public", None
+    ),
+    "decision.scope": PredicateSpec(
+        "decision.scope", "decision", "coexist", "text", "public", None
+    ),
+    "decision.naming": PredicateSpec(
+        "decision.naming", "decision", "coexist", "text", "public", None
+    ),
+    # project_state: live project facts.
+    "project.deadline": PredicateSpec(
+        "project.deadline", "project_state", "conflict", "text", "personal", None
+    ),
+    "project.status": PredicateSpec(
+        "project.status",
+        "project_state",
+        "supersede",
+        "enum",
+        "personal",
+        21.0,
+        enum_values=("planned", "active", "blocked", "shipped", "abandoned"),
+    ),
+    "project.priority": PredicateSpec(
+        "project.priority",
+        "project_state",
+        "supersede",
+        "enum",
+        "personal",
+        30.0,
+        enum_values=("low", "medium", "high", "critical"),
+    ),
+    "project.owner": PredicateSpec(
+        "project.owner", "project_state", "supersede", "text", "personal", 90.0
+    ),
+    "project.open_question": PredicateSpec(
+        "project.open_question", "project_state", "coexist", "text", "personal", 60.0
+    ),
+    "project.risk": PredicateSpec(
+        "project.risk", "project_state", "coexist", "text", "personal", 60.0
+    ),
+    "project.blocker": PredicateSpec(
+        "project.blocker", "project_state", "coexist", "text", "personal", 30.0
+    ),
+    "project.milestone": PredicateSpec(
+        "project.milestone", "project_state", "coexist", "text", "personal", None
+    ),
+    # procedure: reusable how-to knowledge; a scope accumulates many.
+    "procedure.deploy": PredicateSpec(
+        "procedure.deploy", "procedure", "coexist", "text", "public", None
+    ),
+    "procedure.test": PredicateSpec(
+        "procedure.test", "procedure", "coexist", "text", "public", None
+    ),
+    "procedure.build": PredicateSpec(
+        "procedure.build", "procedure", "coexist", "text", "public", None
+    ),
+    "procedure.release": PredicateSpec(
+        "procedure.release", "procedure", "coexist", "text", "public", None
+    ),
+    "procedure.setup": PredicateSpec(
+        "procedure.setup", "procedure", "coexist", "text", "public", None
+    ),
+    "procedure.debug": PredicateSpec(
+        "procedure.debug", "procedure", "coexist", "text", "public", None
+    ),
+    # domain_concept: definitions and constraints; a new definition supersedes.
+    "domain.definition": PredicateSpec(
+        "domain.definition", "domain_concept", "supersede", "text", "public", None
+    ),
+    "domain.glossary_term": PredicateSpec(
+        "domain.glossary_term", "domain_concept", "supersede", "text", "public", None
+    ),
+    "domain.constraint": PredicateSpec(
+        "domain.constraint", "domain_concept", "coexist", "text", "public", None
+    ),
+    "domain.invariant": PredicateSpec(
+        "domain.invariant", "domain_concept", "coexist", "text", "public", None
+    ),
+    # negative: knowledge about what not to do; a scope accumulates many.
+    "negative.rejected_approach": PredicateSpec(
+        "negative.rejected_approach", "negative", "coexist", "text", "public", 120.0
+    ),
+    "negative.invalid_assumption": PredicateSpec(
+        "negative.invalid_assumption", "negative", "coexist", "text", "public", 120.0
+    ),
+    "negative.already_checked": PredicateSpec(
+        "negative.already_checked", "negative", "coexist", "text", "public", 30.0
+    ),
+    "negative.unsafe_operation": PredicateSpec(
+        "negative.unsafe_operation", "negative", "coexist", "text", "public", None
+    ),
+    "negative.known_bad_path": PredicateSpec(
+        "negative.known_bad_path", "negative", "coexist", "text", "public", 120.0
+    ),
+}
+
+
+def resolve_predicate_spec(predicate: str) -> PredicateSpec:
+    return _PREDICATE_REGISTRY.get(predicate.strip().lower(), _DEFAULT_PREDICATE_SPEC)
+
+
+class MemoryValueKindError(ValueError):
+    """A candidate value does not match its predicate's declared value kind."""
+
+    code = "E_MEMORY_VALUE_KIND"
+
+
+def _validate_value_kind(spec: PredicateSpec, value: str) -> None:
+    """Validate a candidate value against the predicate's declared value kind.
+
+    A value whose malformedness is locally knowable is a rail concern; a
+    violation raises MemoryValueKindError, never a silent skip.
+    """
+    text = value.strip()
+    if not text:
+        raise MemoryValueKindError("memory value must not be empty")
+    if spec.value_kind == "text":
+        return
+    if spec.value_kind == "enum":
+        if text not in spec.enum_values:
+            raise MemoryValueKindError(
+                f"value {text!r} is not one of {list(spec.enum_values)} "
+                f"for predicate {spec.predicate!r}"
+            )
+        return
+    if spec.value_kind in {"date", "datetime"}:
+        try:
+            datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise MemoryValueKindError(
+                f"value {text!r} is not a valid {spec.value_kind} for predicate {spec.predicate!r}"
+            ) from exc
+        return
+    if spec.value_kind == "number":
+        try:
+            float(text)
+        except ValueError as exc:
+            raise MemoryValueKindError(
+                f"value {text!r} is not numeric for predicate {spec.predicate!r}"
+            ) from exc
+        return
+    if spec.value_kind == "json":
+        try:
+            json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise MemoryValueKindError(
+                f"value for predicate {spec.predicate!r} is not valid JSON"
+            ) from exc
+        return
+    raise MemoryValueKindError(f"unknown value kind {spec.value_kind!r}")
 
 
 class AIJudgmentFailure(RuntimeError):
@@ -1910,7 +2180,6 @@ def propose_memory_candidate(
     value: str,
     confidence: float,
     scope_key: str,
-    is_multi_valued: bool,
     valid_from: datetime | None,
     valid_to: datetime | None,
     extraction_model: str | None,
@@ -1919,6 +2188,8 @@ def propose_memory_candidate(
     new_id_fn: Callable[[str], str],
     source_evidence_id: str | None = None,
 ) -> list[dict[str, Any]]:
+    spec = resolve_predicate_spec(predicate)
+    _validate_value_kind(spec, value)
     allowed, _policy = session_allows_memory_operation(
         db,
         session_id=source_session_id,
@@ -1974,7 +2245,7 @@ def propose_memory_candidate(
         value=value,
         confidence=confidence,
         scope_key=scope_key,
-        is_multi_valued=is_multi_valued,
+        is_multi_valued=spec.is_multi_valued,
         lifecycle_state="candidate",
         valid_from=valid_from,
         valid_to=valid_to,
@@ -2032,7 +2303,7 @@ def propose_memory_candidate(
         predicate=assertion.predicate,
         scope_key=assertion.scope_key,
     )
-    if active_assertions and not is_multi_valued:
+    if active_assertions and not spec.is_multi_valued:
         events.append(
             _open_conflict(
                 db,
@@ -3706,7 +3977,6 @@ def import_memory_candidates(
         value = item.get("value")
         confidence = item.get("confidence")
         scope_key = item.get("scope_key")
-        is_multi_valued = item.get("is_multi_valued")
         if (
             not isinstance(evidence_text, str)
             or not evidence_text.strip()
@@ -3724,7 +3994,6 @@ def import_memory_candidates(
             or float(confidence) != float(confidence)
             or not isinstance(scope_key, str)
             or not scope_key.strip()
-            or not isinstance(is_multi_valued, bool)
         ):
             continue
         evidence_text = evidence_text.strip()
@@ -3759,7 +4028,6 @@ def import_memory_candidates(
             value=value,
             confidence=float(confidence),
             scope_key=scope_key,
-            is_multi_valued=is_multi_valued,
             valid_from=None,
             valid_to=None,
             extraction_model=None,
@@ -6125,7 +6393,7 @@ def process_memory_extract_turn(
     prompt = (
         "Extract durable Ariel memory candidates from the evidence. "
         "Return JSON only with a top-level candidates array. Each candidate must have "
-        "subject_key, predicate, assertion_type, value, confidence, is_multi_valued. "
+        "subject_key, predicate, assertion_type, value, confidence. "
         "Use assertion_type values fact, profile, preference, commitment, decision, "
         "project_state, procedure, or domain_concept. Return an empty array when the "
         "evidence has no durable memory."
@@ -6268,7 +6536,6 @@ def process_memory_extract_turn(
                 "assertion_type",
                 "value",
                 "confidence",
-                "is_multi_valued",
             }:
                 schema_error = "memory extraction candidate schema invalid"
                 break
@@ -6286,7 +6553,6 @@ def process_memory_extract_turn(
                 or float(confidence) < 0.0
                 or float(confidence) > 1.0
                 or float(confidence) != float(confidence)
-                or not isinstance(raw_candidate.get("is_multi_valued"), bool)
             ):
                 schema_error = "memory extraction candidate schema invalid"
                 break
@@ -6344,7 +6610,6 @@ def process_memory_extract_turn(
                 assertion_type = raw_candidate.get("assertion_type")
                 value = raw_candidate.get("value")
                 confidence = raw_candidate.get("confidence")
-                is_multi_valued = raw_candidate.get("is_multi_valued")
                 memory_events = propose_memory_candidate(
                     db,
                     source_session_id=session_id,
@@ -6356,7 +6621,6 @@ def process_memory_extract_turn(
                     value=value,
                     confidence=float(confidence),
                     scope_key="global",
-                    is_multi_valued=is_multi_valued,
                     valid_from=None,
                     valid_to=None,
                     extraction_model=settings.model_name,

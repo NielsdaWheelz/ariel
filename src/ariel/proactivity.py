@@ -2313,7 +2313,6 @@ def _apply_remember_decision(
         value=memory["value"],
         confidence=decision.confidence,
         scope_key=f"proactive:{case.id}",
-        is_multi_valued=False,
         valid_from=now,
         valid_to=None,
         extraction_model=decision.model,

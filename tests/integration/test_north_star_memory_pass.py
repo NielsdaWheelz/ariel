@@ -223,7 +223,6 @@ def _candidate(
     subject_key: str = "project:phoenix",
     predicate: str = "project.deadline",
     evidence_text: str | None = None,
-    is_multi_valued: bool = False,
 ) -> dict[str, Any]:
     response = client.post(
         "/v1/memory/candidates",
@@ -234,7 +233,6 @@ def _candidate(
             "value": value,
             "evidence_text": evidence_text or f"The user said {value}.",
             "confidence": 0.94,
-            "is_multi_valued": is_multi_valued,
         },
     )
     assert response.status_code == 200
@@ -543,7 +541,6 @@ def test_extracted_candidate_links_original_turn_evidence(
                                                     "assertion_type": "project_state",
                                                     "value": "phoenix ships tomorrow",
                                                     "confidence": 0.9,
-                                                    "is_multi_valued": False,
                                                 }
                                             ]
                                         }
@@ -999,7 +996,6 @@ def test_import_is_cutover_only(
                         "evidence_text": "The user said to use matte notebooks.",
                         "confidence": 0.9,
                         "scope_key": "global",
-                        "is_multi_valued": False,
                     }
                 ]
             },
@@ -1471,5 +1467,67 @@ def test_stale_memory_extraction_task_noops_after_session_memory_mode_changes(
             new_id_fn=_new_id,
         )
 
+        with _session_factory(client)() as db:
+            assert db.scalar(select(func.count()).select_from(MemoryAssertionRecord)) == 0
+
+
+def test_predicate_registry_derives_cardinality_deterministically(
+    postgres_url: str,
+) -> None:
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        first = _candidate(client, value="phoenix ships tomorrow")
+        second = _candidate(client, value="phoenix ships next week")
+        with _session_factory(client)() as db:
+            first_row = db.get(MemoryAssertionRecord, first["id"])
+            second_row = db.get(MemoryAssertionRecord, second["id"])
+            assert first_row is not None and second_row is not None
+            # Same predicate always resolves to the same cardinality, registry-derived.
+            assert first_row.is_multi_valued == second_row.is_multi_valued
+            assert (
+                first_row.is_multi_valued
+                == memory.resolve_predicate_spec("project.deadline").is_multi_valued
+            )
+
+        # The candidate request contract no longer accepts is_multi_valued.
+        rejected = client.post(
+            "/v1/memory/candidates",
+            json={
+                "subject_key": "project:phoenix",
+                "predicate": "project.deadline",
+                "assertion_type": "project_state",
+                "value": "phoenix ships friday",
+                "evidence_text": "The user said phoenix ships friday.",
+                "confidence": 0.9,
+                "is_multi_valued": True,
+            },
+        )
+        assert rejected.status_code == 422
+
+
+def test_unknown_predicate_resolves_single_valued_conflict() -> None:
+    spec = memory.resolve_predicate_spec("entirely.unregistered.predicate")
+    assert spec is memory._DEFAULT_PREDICATE_SPEC
+    assert spec.resolution_policy == "conflict"
+    assert spec.is_multi_valued is False
+
+
+def test_value_violating_value_kind_is_rejected(postgres_url: str) -> None:
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        # project.status is an enum predicate; an unlisted value must be rejected.
+        response = client.post(
+            "/v1/memory/candidates",
+            json={
+                "subject_key": "project:phoenix",
+                "predicate": "project.status",
+                "assertion_type": "project_state",
+                "value": "not-a-real-status",
+                "evidence_text": "The user described the project status.",
+                "confidence": 0.9,
+            },
+        )
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "E_MEMORY_VALUE_KIND"
         with _session_factory(client)() as db:
             assert db.scalar(select(func.count()).select_from(MemoryAssertionRecord)) == 0

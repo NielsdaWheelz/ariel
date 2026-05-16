@@ -62,6 +62,7 @@ from ariel.memory import (
     MEMORY_CONTINUITY_PROMPT_VERSION,
     MEMORY_CURATION_PROMPT_VERSION,
     MEMORY_PROJECTION_VERSION,
+    MemoryValueKindError,
     approve_candidate,
     build_memory_context,
     consolidate_memory,
@@ -657,7 +658,6 @@ class MemoryCandidateRequest(BaseModel):
     evidence_text: str = Field(min_length=1, max_length=12_000)
     confidence: float = Field(ge=0.0, le=1.0)
     scope_key: str = Field(default="global", min_length=1, max_length=200)
-    is_multi_valued: bool = False
     valid_from: datetime | None = None
     valid_to: datetime | None = None
 
@@ -4110,25 +4110,33 @@ def create_app(
         with session_factory() as db:
             with db.begin():
                 active_session = _get_or_create_active_session(db)
-                propose_memory_candidate(
-                    db,
-                    source_session_id=active_session.id,
-                    actor_id=str(app.state.approval_actor_id),
-                    evidence_text=payload.evidence_text,
-                    subject_key=payload.subject_key,
-                    predicate=payload.predicate,
-                    assertion_type=payload.assertion_type,
-                    value=payload.value,
-                    confidence=payload.confidence,
-                    scope_key=payload.scope_key,
-                    is_multi_valued=payload.is_multi_valued,
-                    valid_from=payload.valid_from,
-                    valid_to=payload.valid_to,
-                    extraction_model=None,
-                    extraction_prompt_version=None,
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                )
+                try:
+                    propose_memory_candidate(
+                        db,
+                        source_session_id=active_session.id,
+                        actor_id=str(app.state.approval_actor_id),
+                        evidence_text=payload.evidence_text,
+                        subject_key=payload.subject_key,
+                        predicate=payload.predicate,
+                        assertion_type=payload.assertion_type,
+                        value=payload.value,
+                        confidence=payload.confidence,
+                        scope_key=payload.scope_key,
+                        valid_from=payload.valid_from,
+                        valid_to=payload.valid_to,
+                        extraction_model=None,
+                        extraction_prompt_version=None,
+                        now_fn=_utcnow,
+                        new_id_fn=_new_id,
+                    )
+                except MemoryValueKindError as exc:
+                    raise ApiError(
+                        status_code=422,
+                        code=MemoryValueKindError.code,
+                        message=str(exc),
+                        details={"predicate": payload.predicate},
+                        retryable=False,
+                    ) from exc
                 memory_payload = list_memory(db)
                 try:
                     return build_surface_memory_response(**memory_payload)

@@ -933,7 +933,6 @@ def _execute_memory_capability(
             value=str(normalized_input["value"]),
             confidence=float(normalized_input["confidence"]),
             scope_key=str(normalized_input["scope_key"]),
-            is_multi_valued=bool(normalized_input["is_multi_valued"]),
             valid_from=_parse_memory_timestamp(normalized_input.get("valid_from")),
             valid_to=_parse_memory_timestamp(normalized_input.get("valid_to")),
             extraction_model=None,
