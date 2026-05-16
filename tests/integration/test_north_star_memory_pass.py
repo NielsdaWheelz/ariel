@@ -4,7 +4,7 @@ import copy
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from itertools import count
 from typing import Any, cast
 
@@ -3139,3 +3139,250 @@ def test_curation_accounts_for_every_candidate(
             recall_window["selected_memory_count"] + recall_window["omitted_memory_count"]
             == recall_window["memory_candidate_count"]
         )
+
+
+def test_supersession_records_invalidated_at_leaving_validity_window_intact(
+    postgres_url: str,
+) -> None:
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        # profile.display_name is a supersede-policy predicate: approving a second
+        # value supersedes the first on activation, no conflict.
+        old_name = _candidate(
+            client,
+            value="Ada",
+            assertion_type="profile",
+            subject_key="user:default",
+            predicate="profile.display_name",
+        )
+        assert client.post(f"/v1/memory/candidates/{old_name['id']}/approve").status_code == 200
+
+        with _session_factory(client)() as db:
+            active = db.get(MemoryAssertionRecord, old_name["id"])
+            assert active is not None
+            # An active assertion is current belief: no transaction-time invalidation.
+            assert active.lifecycle_state == "active"
+            assert active.invalidated_at is None
+            valid_from_before = active.valid_from
+            valid_to_before = active.valid_to
+            assert valid_from_before is not None
+            assert valid_to_before is None
+
+        new_name = _candidate(
+            client,
+            value="Ada Lovelace",
+            assertion_type="profile",
+            subject_key="user:default",
+            predicate="profile.display_name",
+        )
+        assert client.post(f"/v1/memory/candidates/{new_name['id']}/approve").status_code == 200
+
+        with _session_factory(client)() as db:
+            superseded = db.get(MemoryAssertionRecord, old_name["id"])
+            replacement = db.get(MemoryAssertionRecord, new_name["id"])
+            assert superseded is not None and replacement is not None
+            assert superseded.lifecycle_state == "superseded"
+            # Supersession stamps transaction-time invalidation at the moment the
+            # replacement is activated.
+            assert superseded.invalidated_at is not None
+            assert superseded.invalidated_at == replacement.valid_from
+            # valid_from is real-world validity and is left untouched by the
+            # transaction-time stamp; valid_to is the pre-existing supersession
+            # behaviour, distinct from invalidated_at.
+            assert superseded.valid_from == valid_from_before
+            # The freshly activated replacement is current belief: not invalidated.
+            assert replacement.lifecycle_state == "active"
+            assert replacement.invalidated_at is None
+
+
+def test_retract_delete_and_stale_each_record_invalidated_at(postgres_url: str) -> None:
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        retracted = _candidate(client, value="phoenix ships tomorrow")
+        deleted = _candidate(client, value="zebra audit is overdue", subject_key="project:zebra")
+        stale = _candidate(
+            client, value="notebook migration is planned", subject_key="project:notebook"
+        )
+        for assertion in (retracted, deleted, stale):
+            assert (
+                client.post(f"/v1/memory/candidates/{assertion['id']}/approve").status_code == 200
+            )
+
+        assert client.post(f"/v1/memory/assertions/{retracted['id']}/retract").status_code == 200
+        assert client.delete(f"/v1/memory/assertions/{deleted['id']}").status_code == 200
+        assert (
+            client.post(
+                f"/v1/memory/assertions/{stale['id']}/mark-stale",
+                json={"reason": "no reconfirmation before the deadline"},
+            ).status_code
+            == 200
+        )
+
+        with _session_factory(client)() as db:
+            # Every transition out of active stamps invalidated_at.
+            for assertion_id, expected_state in (
+                (retracted["id"], "retracted"),
+                (deleted["id"], "deleted"),
+                (stale["id"], "stale"),
+            ):
+                row = db.get(MemoryAssertionRecord, assertion_id)
+                assert row is not None
+                assert row.lifecycle_state == expected_state
+                assert row.invalidated_at is not None
+                assert row.invalidated_at == row.updated_at
+
+
+def test_as_of_recall_reconstructs_past_transaction_time_belief_state(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_fake_memory_models(monkeypatch)
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        session_id = _session_id(client)
+        base = datetime(2026, 5, 16, 12, 0, 0, tzinfo=UTC)
+        # A fully time-controlled supersession so the as-of windows are exact.
+        #   base+0   old proposed
+        #   base+1   old activated -> active belief is "Ada"
+        #   base+3   new proposed
+        #   base+4   new activated -> "Ada" superseded, invalidated_at = base+4
+        timeline = iter(
+            [
+                base,
+                base + timedelta(minutes=1),
+                base + timedelta(minutes=3),
+                base + timedelta(minutes=4),
+            ]
+        )
+
+        def _next_now() -> datetime:
+            return next(timeline)
+
+        with _session_factory(client)() as db:
+            with db.begin():
+                memory.propose_memory_candidate(
+                    db,
+                    source_session_id=session_id,
+                    actor_id="system",
+                    evidence_text="the user is called Ada",
+                    subject_key="user:default",
+                    predicate="profile.display_name",
+                    assertion_type="profile",
+                    value="Ada",
+                    confidence=0.95,
+                    scope_key="global",
+                    valid_from=None,
+                    valid_to=None,
+                    extraction_model="fixture",
+                    extraction_prompt_version="fixture",
+                    now_fn=_next_now,
+                    new_id_fn=_new_id,
+                )
+        old_id = client.get("/v1/memory").json()["candidates"][0]["id"]
+        with _session_factory(client)() as db:
+            with db.begin():
+                memory.approve_candidate(
+                    db,
+                    assertion_id=old_id,
+                    actor_id="system",
+                    now_fn=_next_now,
+                    new_id_fn=_new_id,
+                )
+        with _session_factory(client)() as db:
+            with db.begin():
+                memory.propose_memory_candidate(
+                    db,
+                    source_session_id=session_id,
+                    actor_id="system",
+                    evidence_text="the user is called Ada Lovelace",
+                    subject_key="user:default",
+                    predicate="profile.display_name",
+                    assertion_type="profile",
+                    value="Ada Lovelace",
+                    confidence=0.95,
+                    scope_key="global",
+                    valid_from=None,
+                    valid_to=None,
+                    extraction_model="fixture",
+                    extraction_prompt_version="fixture",
+                    now_fn=_next_now,
+                    new_id_fn=_new_id,
+                )
+        new_id = next(
+            candidate["id"]
+            for candidate in client.get("/v1/memory").json()["candidates"]
+            if candidate["id"] != old_id
+        )
+        with _session_factory(client)() as db:
+            with db.begin():
+                memory.approve_candidate(
+                    db,
+                    assertion_id=new_id,
+                    actor_id="system",
+                    now_fn=_next_now,
+                    new_id_fn=_new_id,
+                )
+
+        with _session_factory(client)() as db:
+            superseded = db.get(MemoryAssertionRecord, old_id)
+            assert superseded is not None
+            assert superseded.lifecycle_state == "superseded"
+            assert superseded.invalidated_at == base + timedelta(minutes=4)
+
+        # As-of before the new value was even proposed: the belief state is the old
+        # value alone -- it reappears although it is now superseded -- and the new
+        # value is excluded because it did not yet exist.
+        with _session_factory(client)() as db:
+            past_context, _past_event = memory.build_memory_context(
+                db,
+                user_message="who is the user",
+                max_recalled_assertions=8,
+                settings=_settings(),
+                current_session_id=session_id,
+                as_of=base + timedelta(minutes=2),
+            )
+        past_pool = set(past_context["recall_window"]["candidate_memory_ids"])
+        assert old_id in past_pool
+        assert new_id not in past_pool
+
+        # As-of after the supersession: the old value is invalidated and gone; the
+        # current active value is the belief state.
+        with _session_factory(client)() as db:
+            now_context, _now_event = memory.build_memory_context(
+                db,
+                user_message="who is the user",
+                max_recalled_assertions=8,
+                settings=_settings(),
+                current_session_id=session_id,
+                as_of=base + timedelta(minutes=5),
+            )
+        now_pool = set(now_context["recall_window"]["candidate_memory_ids"])
+        assert new_id in now_pool
+        assert old_id not in now_pool
+
+
+def test_reactivation_clears_invalidated_at(postgres_url: str) -> None:
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        # project.deadline is a conflict-policy predicate: a second contradicting
+        # candidate enters the conflicted state, which stamps invalidated_at.
+        first = _candidate(client, value="phoenix ships tomorrow")
+        assert client.post(f"/v1/memory/candidates/{first['id']}/approve").status_code == 200
+        second = _candidate(client, value="phoenix ships next week")
+        assert client.post(f"/v1/memory/candidates/{second['id']}/approve").status_code == 409
+
+        with _session_factory(client)() as db:
+            conflicted = db.get(MemoryAssertionRecord, second["id"])
+            assert conflicted is not None
+            assert conflicted.lifecycle_state == "conflicted"
+            assert conflicted.invalidated_at is not None
+
+        # Retracting the active member leaves the conflicted candidate as the only
+        # live member, so the conflict settles by re-activating it. Re-activation
+        # restores it to current belief and clears the transaction-time stamp.
+        assert client.post(f"/v1/memory/assertions/{first['id']}/retract").status_code == 200
+        with _session_factory(client)() as db:
+            reactivated = db.get(MemoryAssertionRecord, second["id"])
+            assert reactivated is not None
+            assert reactivated.lifecycle_state == "active"
+            assert reactivated.invalidated_at is None

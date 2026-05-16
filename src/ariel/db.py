@@ -234,6 +234,7 @@ REQUIRED_COLUMNS: Final[dict[str, tuple[str, ...]]] = {
         "is_multi_valued",
         "lifecycle_state",
         "confidence",
+        "invalidated_at",
         "superseded_by_assertion_id",
     ),
     "memory_versions": (

@@ -1179,6 +1179,9 @@ class MemoryAssertionRecord(Base):
     confidence: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
     valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     valid_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    invalidated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
     superseded_by_assertion_id: Mapped[str | None] = mapped_column(
         String(32),
         ForeignKey("memory_assertions.id", ondelete="RESTRICT"),

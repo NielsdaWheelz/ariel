@@ -2121,6 +2121,7 @@ def _open_conflict(
 
     assertion_prior_state = {"lifecycle_state": assertion.lifecycle_state}
     assertion.lifecycle_state = "conflicted"
+    assertion.invalidated_at = now
     assertion.updated_at = now
     _record_version(
         db,
@@ -2202,6 +2203,7 @@ def _activate_assertion(
             existing.lifecycle_state = "superseded"
             existing.superseded_by_assertion_id = assertion.id
             existing.valid_to = now
+            existing.invalidated_at = now
             existing.updated_at = now
             projection_invalidation = _delete_projection_rows(db, assertion_id=existing.id, now=now)
             _record_version(
@@ -2231,6 +2233,7 @@ def _activate_assertion(
     )
     assertion.lifecycle_state = "active"
     assertion.valid_from = assertion.valid_from or now
+    assertion.invalidated_at = None
     assertion.last_verified_at = now
     assertion.updated_at = now
     _record_review(
@@ -2975,6 +2978,7 @@ def correct_assertion(
     old_assertion.lifecycle_state = "superseded"
     old_assertion.superseded_by_assertion_id = new_assertion.id
     old_assertion.valid_to = now
+    old_assertion.invalidated_at = now
     old_assertion.updated_at = now
     projection_invalidation = _delete_projection_rows(db, assertion_id=old_assertion.id, now=now)
     _record_version(
@@ -3033,6 +3037,7 @@ def retract_assertion(
     }
     assertion.lifecycle_state = "retracted"
     assertion.valid_to = now
+    assertion.invalidated_at = now
     assertion.updated_at = now
     projection_invalidation = _delete_projection_rows(db, assertion_id=assertion.id, now=now)
     _record_deletion(
@@ -3091,6 +3096,7 @@ def delete_assertion(
     }
     assertion.lifecycle_state = "deleted"
     assertion.valid_to = now
+    assertion.invalidated_at = now
     assertion.updated_at = now
     projection_invalidation = _delete_projection_rows(db, assertion_id=assertion.id, now=now)
     _record_deletion(
@@ -3145,6 +3151,7 @@ def privacy_delete_assertion(
     assertion.lifecycle_state = "privacy_deleted"
     assertion.object_value = {"text": "[privacy_deleted]"}
     assertion.valid_to = now
+    assertion.invalidated_at = now
     assertion.updated_at = now
     projection_invalidation = _delete_projection_rows(
         db,
@@ -3235,6 +3242,7 @@ def privacy_delete_assertion(
             linked_assertion.lifecycle_state = "privacy_deleted"
             linked_assertion.object_value = {"text": "[privacy_deleted]"}
             linked_assertion.valid_to = now
+            linked_assertion.invalidated_at = now
             linked_assertion.updated_at = now
             invalidated_assertion_ids.append(linked_assertion.id)
             linked_invalidation = _delete_projection_rows(
@@ -3680,6 +3688,7 @@ def resolve_conflict(
             losing_assertion.lifecycle_state = "superseded"
             losing_assertion.superseded_by_assertion_id = assertion.id
             losing_assertion.valid_to = losing_assertion.valid_to or now
+            losing_assertion.invalidated_at = now
             losing_assertion.updated_at = now
             projection_invalidation = _delete_projection_rows(
                 db, assertion_id=losing_assertion.id, now=now
@@ -3889,6 +3898,7 @@ def mark_assertion_stale(
     }
     assertion.lifecycle_state = "stale"
     assertion.valid_to = assertion.valid_to or now
+    assertion.invalidated_at = now
     assertion.updated_at = now
     projection_invalidation = _delete_projection_rows(db, assertion_id=assertion.id, now=now)
     _record_review(
@@ -7111,11 +7121,18 @@ def build_memory_context(
     thread_id: str | None = None,
     proactive_case_id: str | None = None,
     actor_id: str | None = None,
+    as_of: datetime | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Assemble the recall context via a deterministic Reciprocal Rank Fusion
     pipeline: resolve policy, run each retrieval signal, fuse the rankings into
     one bounded candidate pool, apply the deterministic rails, attach a feature
-    vector to every survivor, then hand the pool to AI curation."""
+    vector to every survivor, then hand the pool to AI curation.
+
+    With no ``as_of`` recall is over current belief: only ``active`` assertions.
+    With ``as_of`` set, recall reconstructs the transaction-time belief state at
+    that instant -- assertions created at or before it and not yet invalidated by
+    it, regardless of their current lifecycle state -- so a since-superseded fact
+    reappears for an as-of before its invalidation."""
     resolved_settings = settings or AppSettings()
     now = datetime.now(UTC)
     context: dict[str, Any]
@@ -7231,6 +7248,39 @@ def build_memory_context(
         "temporal": temporal_ranking,
         "recency": recency_ranking,
     }
+
+    # Bi-temporal as-of recall. The projection-backed signals above only ever
+    # surface active assertions, so reconstructing a past belief state requires a
+    # direct transaction-time query: assertions created at or before as_of and not
+    # yet invalidated by it. candidate/conflicted/rejected are never active belief
+    # (they reach those states without ever being activated), so they are excluded
+    # here. The matching ids become an extra signal that feeds the same fusion.
+    as_of_assertion_ids: set[str] = set()
+    if as_of is not None:
+        as_of_assertion_id_ranking = list(
+            db.scalars(
+                select(MemoryAssertionRecord.id)
+                .where(
+                    MemoryAssertionRecord.created_at <= as_of,
+                    or_(
+                        MemoryAssertionRecord.invalidated_at.is_(None),
+                        MemoryAssertionRecord.invalidated_at > as_of,
+                    ),
+                    MemoryAssertionRecord.lifecycle_state.not_in(
+                        ("candidate", "conflicted", "rejected")
+                    ),
+                )
+                .order_by(
+                    MemoryAssertionRecord.created_at.desc(),
+                    MemoryAssertionRecord.id.asc(),
+                )
+                .limit(candidate_limit)
+            ).all()
+        )
+        as_of_assertion_ids = set(as_of_assertion_id_ranking)
+        signal_rankings["as_of"] = [
+            (_TABLE_ASSERTIONS, assertion_id) for assertion_id in as_of_assertion_id_ranking
+        ]
 
     # (c) Fuse the rankings into one deterministic pool: RRF with a fixed k, ties
     # broken by ref.
@@ -7369,8 +7419,14 @@ def build_memory_context(
                 if assertion is not None and assertion.assertion_type == "negative"
                 else "semantic_assertion"
             )
-            if assertion is None or assertion.lifecycle_state != "active":
+            if assertion is None:
                 _exclude(ref, kind, "lifecycle: assertion is not active")
+                continue
+            if as_of is None and assertion.lifecycle_state != "active":
+                _exclude(ref, kind, "lifecycle: assertion is not active")
+                continue
+            if as_of is not None and canonical_id not in as_of_assertion_ids:
+                _exclude(ref, kind, "as_of: assertion not believed-active at as_of")
                 continue
             if scope_aliases and not (
                 assertion.scope_key in scope_aliases or assertion.subject_key in scope_aliases
