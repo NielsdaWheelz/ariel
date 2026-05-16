@@ -576,7 +576,7 @@ def test_extracted_candidate_links_original_turn_evidence(
             assert db.scalar(select(func.count()).select_from(MemoryEvidenceRecord)) == 2
 
 
-def test_conflicted_candidates_require_conflict_resolution_and_reject_losers(
+def test_conflicted_candidates_require_conflict_resolution_and_supersede_active_loser(
     postgres_url: str,
 ) -> None:
     adapter = MemoryContextProbeAdapter()
@@ -614,10 +614,13 @@ def test_conflicted_candidates_require_conflict_resolution_and_reject_losers(
             assert winner is not None
             assert loser is not None
             assert winner.lifecycle_state == "active"
-            assert loser.lifecycle_state == "rejected"
+            # A previously-active loser is superseded by the winner, not rejected:
+            # its history is preserved and links forward to the resolution.
+            assert loser.lifecycle_state == "superseded"
+            assert loser.superseded_by_assertion_id == second["id"]
 
 
-def test_rejected_conflict_member_cannot_be_reactivated_by_resolution(
+def test_rejecting_conflict_member_settles_conflict_toward_surviving_assertion(
     postgres_url: str,
 ) -> None:
     adapter = MemoryContextProbeAdapter()
@@ -628,21 +631,334 @@ def test_rejected_conflict_member_cannot_be_reactivated_by_resolution(
         assert client.post(f"/v1/memory/candidates/{second['id']}/approve").status_code == 409
         conflict_id = client.get("/v1/memory").json()["conflicts"][0]["id"]
 
+        # Rejecting the conflicted member leaves exactly one live member, so the
+        # set settles to resolved toward the surviving active assertion. It does
+        # not stay open, and a stale resolution attempt is no longer applicable.
         reject = client.post(f"/v1/memory/candidates/{second['id']}/reject")
         assert reject.status_code == 200
-        revived = client.post(
-            f"/v1/memory/conflicts/{conflict_id}/resolve",
-            json={"assertion_id": second["id"]},
-        )
-        assert revived.status_code == 409
-        assert revived.json()["error"]["code"] == "E_MEMORY_CONFLICT_NOT_APPLICABLE"
         with _session_factory(client)() as db:
+            conflict = db.get(MemoryConflictSetRecord, conflict_id)
+            assert conflict is not None
+            assert conflict.lifecycle_state == "resolved"
+            assert conflict.resolution_assertion_id == first["id"]
             rejected = db.get(MemoryAssertionRecord, second["id"])
             active = db.get(MemoryAssertionRecord, first["id"])
             assert rejected is not None
             assert active is not None
             assert rejected.lifecycle_state == "rejected"
             assert active.lifecycle_state == "active"
+
+        revived = client.post(
+            f"/v1/memory/conflicts/{conflict_id}/resolve",
+            json={"assertion_id": second["id"]},
+        )
+        assert revived.status_code == 409
+        assert revived.json()["error"]["code"] == "E_MEMORY_CONFLICT_NOT_APPLICABLE"
+
+
+def test_conflict_opens_only_for_conflict_policy_predicate(postgres_url: str) -> None:
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        # project.deadline is a "conflict"-policy predicate: a second contradicting
+        # candidate against the active assertion opens exactly one conflict set.
+        assert memory.resolve_predicate_spec("project.deadline").resolution_policy == "conflict"
+        first = _candidate(client, value="phoenix ships tomorrow")
+        assert client.post(f"/v1/memory/candidates/{first['id']}/approve").status_code == 200
+        second = _candidate(client, value="phoenix ships next week")
+        with _session_factory(client)() as db:
+            conflicted = db.get(MemoryAssertionRecord, second["id"])
+            assert conflicted is not None
+            assert conflicted.lifecycle_state == "conflicted"
+            conflict_sets = db.scalars(select(MemoryConflictSetRecord)).all()
+            assert len(conflict_sets) == 1
+            assert conflict_sets[0].lifecycle_state == "open"
+            assert conflict_sets[0].conflict_type == "value_contradiction"
+
+        # A "supersede"-policy predicate (profile.display_name) opens no conflict;
+        # the new candidate supersedes the active assertion on activation instead.
+        assert (
+            memory.resolve_predicate_spec("profile.display_name").resolution_policy == "supersede"
+        )
+        old_name = _candidate(
+            client,
+            value="Ada",
+            assertion_type="profile",
+            subject_key="user:default",
+            predicate="profile.display_name",
+        )
+        assert client.post(f"/v1/memory/candidates/{old_name['id']}/approve").status_code == 200
+        new_name = _candidate(
+            client,
+            value="Ada Lovelace",
+            assertion_type="profile",
+            subject_key="user:default",
+            predicate="profile.display_name",
+        )
+        assert client.post(f"/v1/memory/candidates/{new_name['id']}/approve").status_code == 200
+        with _session_factory(client)() as db:
+            assert db.scalar(select(func.count()).select_from(MemoryConflictSetRecord)) == 1
+            superseded = db.get(MemoryAssertionRecord, old_name["id"])
+            replacement = db.get(MemoryAssertionRecord, new_name["id"])
+            assert superseded is not None and replacement is not None
+            assert superseded.lifecycle_state == "superseded"
+            assert superseded.superseded_by_assertion_id == new_name["id"]
+            assert replacement.lifecycle_state == "active"
+
+
+def test_resolve_conflict_rejects_non_member_assertion(postgres_url: str) -> None:
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        first = _candidate(client, value="phoenix ships tomorrow")
+        assert client.post(f"/v1/memory/candidates/{first['id']}/approve").status_code == 200
+        second = _candidate(client, value="phoenix ships next week")
+        assert client.post(f"/v1/memory/candidates/{second['id']}/approve").status_code == 409
+        conflict_id = client.get("/v1/memory").json()["conflicts"][0]["id"]
+
+        # An unrelated assertion is not a member of this conflict set: the
+        # membership guard rejects resolving the conflict toward it.
+        outsider = _candidate(
+            client,
+            value="meeting at noon",
+            assertion_type="commitment",
+            subject_key="user:default",
+            predicate="commitment.todo",
+        )
+        assert client.post(f"/v1/memory/candidates/{outsider['id']}/approve").status_code == 200
+        rejected = client.post(
+            f"/v1/memory/conflicts/{conflict_id}/resolve",
+            json={"assertion_id": outsider["id"]},
+        )
+        assert rejected.status_code == 409
+        assert rejected.json()["error"]["code"] == "E_MEMORY_CONFLICT_NOT_APPLICABLE"
+        with _session_factory(client)() as db:
+            conflict = db.get(MemoryConflictSetRecord, conflict_id)
+            assert conflict is not None
+            assert conflict.lifecycle_state == "open"
+
+
+def test_resolve_conflict_preserves_winner_history_and_supersedes_active_loser(
+    postgres_url: str,
+) -> None:
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        first = _candidate(client, value="phoenix ships tomorrow")
+        assert client.post(f"/v1/memory/candidates/{first['id']}/approve").status_code == 200
+        second = _candidate(client, value="phoenix ships next week")
+        assert client.post(f"/v1/memory/candidates/{second['id']}/approve").status_code == 409
+        conflict_id = client.get("/v1/memory").json()["conflicts"][0]["id"]
+
+        winner_versions_before = client.get(
+            f"/v1/memory/versions/memory_assertions/{second['id']}"
+        ).json()["versions"]
+        resolved = client.post(
+            f"/v1/memory/conflicts/{conflict_id}/resolve",
+            json={"assertion_id": second["id"]},
+        )
+        assert resolved.status_code == 200
+
+        winner_versions_after = client.get(
+            f"/v1/memory/versions/memory_assertions/{second['id']}"
+        ).json()["versions"]
+        # The winner's prior version rows are preserved and its activation appends
+        # new ones; version history is never discarded by resolution.
+        assert len(winner_versions_after) > len(winner_versions_before)
+        for prior in winner_versions_before:
+            assert prior["id"] in {row["id"] for row in winner_versions_after}
+        with _session_factory(client)() as db:
+            loser = db.get(MemoryAssertionRecord, first["id"])
+            assert loser is not None
+            assert loser.lifecycle_state == "superseded"
+            assert loser.superseded_by_assertion_id == second["id"]
+
+
+def test_correcting_conflict_member_closes_conflict_set(postgres_url: str) -> None:
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        first = _candidate(client, value="phoenix ships tomorrow")
+        assert client.post(f"/v1/memory/candidates/{first['id']}/approve").status_code == 200
+        second = _candidate(client, value="phoenix ships next week")
+        assert client.post(f"/v1/memory/candidates/{second['id']}/approve").status_code == 409
+        conflict_id = client.get("/v1/memory").json()["conflicts"][0]["id"]
+
+        # Correcting the conflicted member supersedes it, and the fresh correction
+        # supersedes the formerly-active member on activation. Both original
+        # members are off the live set, so the conflict reaches a terminal state.
+        corrected = client.post(
+            f"/v1/memory/assertions/{second['id']}/correct",
+            json={"value": "phoenix ships in two weeks"},
+        )
+        assert corrected.status_code == 200
+        with _session_factory(client)() as db:
+            conflict = db.get(MemoryConflictSetRecord, conflict_id)
+            assert conflict is not None
+            assert conflict.lifecycle_state == "ignored"
+            for member_id in (first["id"], second["id"]):
+                member = db.get(MemoryAssertionRecord, member_id)
+                assert member is not None
+                assert member.lifecycle_state == "superseded"
+
+
+def test_retracting_conflict_member_closes_conflict_set(postgres_url: str) -> None:
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        first = _candidate(client, value="phoenix ships tomorrow")
+        assert client.post(f"/v1/memory/candidates/{first['id']}/approve").status_code == 200
+        second = _candidate(client, value="phoenix ships next week")
+        assert client.post(f"/v1/memory/candidates/{second['id']}/approve").status_code == 409
+        conflict_id = client.get("/v1/memory").json()["conflicts"][0]["id"]
+
+        retracted = client.post(f"/v1/memory/assertions/{first['id']}/retract")
+        assert retracted.status_code == 200
+        with _session_factory(client)() as db:
+            conflict = db.get(MemoryConflictSetRecord, conflict_id)
+            assert conflict is not None
+            # The active member retracted; only the conflicted candidate is live,
+            # so the conflict resolves toward it and activates it.
+            assert conflict.lifecycle_state == "resolved"
+            assert conflict.resolution_assertion_id == second["id"]
+            winner = db.get(MemoryAssertionRecord, second["id"])
+            assert winner is not None
+            assert winner.lifecycle_state == "active"
+
+
+def test_conflict_with_all_members_invalidated_reaches_ignored(postgres_url: str) -> None:
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        session_id = _session_id(client)
+        first = _candidate(client, value="phoenix ships tomorrow")
+        assert client.post(f"/v1/memory/candidates/{first['id']}/approve").status_code == 200
+        with _session_factory(client)() as db:
+            shared_evidence_id = db.scalar(
+                select(MemoryAssertionEvidenceRecord.evidence_id).where(
+                    MemoryAssertionEvidenceRecord.assertion_id == first["id"]
+                )
+            )
+        assert shared_evidence_id is not None
+
+        # The conflicted member is built on the same evidence as the active one,
+        # so a single privacy-delete invalidates every member of the conflict set
+        # at once. With no live member left, the set reaches ignored.
+        with _session_factory(client)() as db:
+            with db.begin():
+                memory.propose_memory_candidate(
+                    db,
+                    source_session_id=session_id,
+                    actor_id="system",
+                    evidence_text="phoenix ships next week",
+                    subject_key="project:phoenix",
+                    predicate="project.deadline",
+                    assertion_type="project_state",
+                    value="phoenix ships next week",
+                    confidence=0.9,
+                    scope_key="global",
+                    valid_from=None,
+                    valid_to=None,
+                    extraction_model="fixture",
+                    extraction_prompt_version="fixture",
+                    now_fn=lambda: datetime.now(tz=UTC),
+                    new_id_fn=_new_id,
+                    source_evidence_id=shared_evidence_id,
+                )
+        conflict_id = client.get("/v1/memory").json()["conflicts"][0]["id"]
+
+        assert client.post(f"/v1/memory/assertions/{first['id']}/privacy-delete").status_code == 200
+        with _session_factory(client)() as db:
+            conflict = db.get(MemoryConflictSetRecord, conflict_id)
+            assert conflict is not None
+            assert conflict.lifecycle_state == "ignored"
+            members = db.scalars(
+                select(MemoryAssertionRecord).where(
+                    MemoryAssertionRecord.subject_key == "project:phoenix",
+                    MemoryAssertionRecord.predicate == "project.deadline",
+                )
+            ).all()
+            assert members
+            assert all(member.lifecycle_state == "privacy_deleted" for member in members)
+
+
+def test_recall_surfaces_open_conflict_as_uncertainty(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_fake_memory_models(monkeypatch)
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        session_id = _session_id(client)
+        first = _candidate(client, value="phoenix ships tomorrow")
+        assert client.post(f"/v1/memory/candidates/{first['id']}/approve").status_code == 200
+        _process_projection(client)
+        second = _candidate(client, value="phoenix ships next week")
+        assert client.post(f"/v1/memory/candidates/{second['id']}/approve").status_code == 409
+
+        with _session_factory(client)() as db:
+            memory_context, _event_payload = memory.build_memory_context(
+                db,
+                user_message="when does phoenix ship?",
+                max_recalled_assertions=8,
+                settings=_settings(),
+                current_session_id=session_id,
+            )
+        # An open conflict is surfaced as uncertainty, and the contradicted fact
+        # is never presented as a settled semantic assertion while the conflict
+        # remains open.
+        assert memory_context["conflicts"]
+        assert memory_context["conflicts"][0]["state"] == "open"
+        for item in memory_context["semantic_assertions"]:
+            if item["subject_key"] == "project:phoenix" and item["predicate"] == "project.deadline":
+                assert item["conflict_status"]["state"] == "open"
+        rendered = memory.context_text(memory_context)
+        assert "unresolved memory conflicts exist" in rendered
+
+        # context_text renders an open-conflict semantic assertion as a conflict,
+        # never as a settled fact, whenever such a candidate is surfaced.
+        conflicted_render = memory.context_text(
+            {
+                "semantic_assertions": [
+                    {
+                        "type": "project_state",
+                        "subject_key": "project:phoenix",
+                        "predicate": "project.deadline",
+                        "value": "phoenix ships next week",
+                        "conflict_status": {"state": "open", "conflict_ids": ["mcf_x"]},
+                    }
+                ],
+                "conflicts": [{"id": "mcf_x", "state": "open"}],
+            }
+        )
+        assert "- conflict: project_state:" in conflicted_render
+        assert "- project_state: project:phoenix project.deadline" not in conflicted_render
+
+
+def test_mark_assertion_stale_requires_reason(postgres_url: str) -> None:
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        candidate = _candidate(client, value="phoenix ships tomorrow")
+        assert client.post(f"/v1/memory/candidates/{candidate['id']}/approve").status_code == 200
+
+        # A missing reason is a typed E_MEMORY_STALE_REASON_REQUIRED failure.
+        missing = client.post(f"/v1/memory/assertions/{candidate['id']}/mark-stale")
+        assert missing.status_code == 422
+        assert missing.json()["error"]["code"] == "E_MEMORY_STALE_REASON_REQUIRED"
+        blank = client.post(
+            f"/v1/memory/assertions/{candidate['id']}/mark-stale",
+            json={"reason": "   "},
+        )
+        assert blank.status_code == 422
+        assert blank.json()["error"]["code"] == "E_MEMORY_STALE_REASON_REQUIRED"
+
+        # A non-empty reason succeeds and is recorded in the version row.
+        ok = client.post(
+            f"/v1/memory/assertions/{candidate['id']}/mark-stale",
+            json={"reason": "deadline passed without confirmation"},
+        )
+        assert ok.status_code == 200
+        versions = client.get(f"/v1/memory/versions/memory_assertions/{candidate['id']}").json()[
+            "versions"
+        ]
+        stale_version = next(row for row in versions if row["new_state"].get("staleness_reason"))
+        assert (
+            stale_version["new_state"]["staleness_reason"] == "deadline passed without confirmation"
+        )
 
 
 def test_memory_context_exposes_hot_index_and_topic_projection_fields_if_implemented(

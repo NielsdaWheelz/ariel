@@ -62,6 +62,7 @@ from ariel.memory import (
     MEMORY_CONTINUITY_PROMPT_VERSION,
     MEMORY_CURATION_PROMPT_VERSION,
     MEMORY_PROJECTION_VERSION,
+    MemoryStaleReasonRequiredError,
     MemoryValueKindError,
     approve_candidate,
     build_memory_context,
@@ -4759,14 +4760,23 @@ def create_app(
                         details={"assertion_id": assertion_id},
                         retryable=False,
                     )
-                events = mark_assertion_stale(
-                    db,
-                    assertion_id=assertion_id,
-                    actor_id=str(app.state.approval_actor_id),
-                    reason=payload.reason if payload is not None else None,
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                )
+                try:
+                    events = mark_assertion_stale(
+                        db,
+                        assertion_id=assertion_id,
+                        actor_id=str(app.state.approval_actor_id),
+                        reason=payload.reason if payload is not None else None,
+                        now_fn=_utcnow,
+                        new_id_fn=_new_id,
+                    )
+                except MemoryStaleReasonRequiredError as exc:
+                    raise ApiError(
+                        status_code=422,
+                        code=MemoryStaleReasonRequiredError.code,
+                        message=str(exc),
+                        details={"assertion_id": assertion_id},
+                        retryable=False,
+                    ) from exc
                 if not events:
                     raise ApiError(
                         status_code=409,

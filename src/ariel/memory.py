@@ -291,6 +291,12 @@ class MemoryValueKindError(ValueError):
     code = "E_MEMORY_VALUE_KIND"
 
 
+class MemoryStaleReasonRequiredError(ValueError):
+    """Marking an assertion stale was attempted without a staleness rationale."""
+
+    code = "E_MEMORY_STALE_REASON_REQUIRED"
+
+
 def _validate_value_kind(spec: PredicateSpec, value: str) -> None:
     """Validate a candidate value against the predicate's declared value kind.
 
@@ -1848,6 +1854,7 @@ def _open_conflict(
             predicate=assertion.predicate,
             scope_key=assertion.scope_key,
             lifecycle_state="open",
+            conflict_type="value_contradiction",
             resolution_assertion_id=None,
             reason="candidate contradicts active memory",
             created_at=now,
@@ -2027,6 +2034,80 @@ def _activate_assertion(
             },
         }
     )
+    return events
+
+
+_LIVE_CONFLICT_MEMBER_STATES = {"active", "candidate", "conflicted"}
+
+
+def _settle_conflict_sets_for_assertion(
+    db: Session,
+    *,
+    assertion_id: str,
+    actor_id: str,
+    now: datetime,
+    new_id_fn: Callable[[str], str],
+) -> list[dict[str, Any]]:
+    """Re-evaluate every open conflict set the assertion belongs to and close any
+    that no longer has a live contradiction. A conflict with one live member
+    resolves toward it (activating it if needed); one with no live member is
+    ignored. Conflict sets always reach a terminal state. Returns event dicts."""
+    events: list[dict[str, Any]] = []
+    set_ids = db.scalars(
+        select(MemoryConflictMemberRecord.conflict_set_id).where(
+            MemoryConflictMemberRecord.assertion_id == assertion_id
+        )
+    ).all()
+    for set_id in set_ids:
+        conflict = db.get(MemoryConflictSetRecord, set_id)
+        if conflict is None or conflict.lifecycle_state != "open":
+            continue
+        member_ids = db.scalars(
+            select(MemoryConflictMemberRecord.assertion_id).where(
+                MemoryConflictMemberRecord.conflict_set_id == set_id
+            )
+        ).all()
+        live = [
+            member
+            for member in (db.get(MemoryAssertionRecord, mid) for mid in member_ids)
+            if member is not None and member.lifecycle_state in _LIVE_CONFLICT_MEMBER_STATES
+        ]
+        if len(live) >= 2:
+            continue  # contradiction still live: stays open
+        if len(live) == 1:
+            winner = live[0]
+            conflict.lifecycle_state = "resolved"
+            conflict.resolution_assertion_id = winner.id
+            if winner.lifecycle_state != "active":
+                events.extend(
+                    _activate_assertion(
+                        db, assertion=winner, actor_id=actor_id, now=now, new_id_fn=new_id_fn
+                    )
+                )
+        else:  # contradiction evaporated entirely
+            conflict.lifecycle_state = "ignored"
+        conflict.updated_at = now
+        _record_version(
+            db,
+            table="memory_conflict_sets",
+            record_id=conflict.id,
+            change_type="reviewed",
+            actor_id=actor_id,
+            reason="conflict settled by member lifecycle change",
+            new_state={"lifecycle_state": conflict.lifecycle_state},
+            now=now,
+            new_id_fn=new_id_fn,
+        )
+        events.append(
+            {
+                "event_type": "evt.memory.conflict_resolved",
+                "payload": {
+                    "conflict_set_id": conflict.id,
+                    "lifecycle_state": conflict.lifecycle_state,
+                    "resolution_assertion_id": conflict.resolution_assertion_id,
+                },
+            }
+        )
     return events
 
 
@@ -2264,23 +2345,27 @@ def propose_memory_candidate(
             {"event_type": "evt.memory.review_required", "payload": _event_payload(assertion)},
         ]
     )
-    active_assertions = _active_single_assertions(
-        db,
-        subject_entity_id=entity.id,
-        predicate=assertion.predicate,
-        scope_key=assertion.scope_key,
-    )
-    if active_assertions and not spec.is_multi_valued:
-        events.append(
-            _open_conflict(
-                db,
-                assertion=assertion,
-                active_assertions=active_assertions,
-                actor_id=actor_id,
-                now=now,
-                new_id_fn=new_id_fn,
-            )
+    # A conflict opens only for a "conflict"-policy predicate with a live active
+    # contradiction. "supersede" predicates supersede on activation; "coexist"
+    # predicates accumulate. Neither opens a conflict set.
+    if spec.resolution_policy == "conflict":
+        active_assertions = _active_single_assertions(
+            db,
+            subject_entity_id=entity.id,
+            predicate=assertion.predicate,
+            scope_key=assertion.scope_key,
         )
+        if active_assertions:
+            events.append(
+                _open_conflict(
+                    db,
+                    assertion=assertion,
+                    active_assertions=active_assertions,
+                    actor_id=actor_id,
+                    now=now,
+                    new_id_fn=new_id_fn,
+                )
+            )
     return events
 
 
@@ -2346,7 +2431,13 @@ def reject_candidate(
         now=now,
         new_id_fn=new_id_fn,
     )
-    return [{"event_type": "evt.memory.candidate_rejected", "payload": _event_payload(assertion)}]
+    events = [{"event_type": "evt.memory.candidate_rejected", "payload": _event_payload(assertion)}]
+    events.extend(
+        _settle_conflict_sets_for_assertion(
+            db, assertion_id=assertion.id, actor_id=actor_id, now=now, new_id_fn=new_id_fn
+        )
+    )
+    return events
 
 
 def correct_assertion(
@@ -2436,6 +2527,11 @@ def correct_assertion(
             new_id_fn=new_id_fn,
         )
     )
+    events.extend(
+        _settle_conflict_sets_for_assertion(
+            db, assertion_id=old_assertion.id, actor_id=actor_id, now=now, new_id_fn=new_id_fn
+        )
+    )
     return events
 
 
@@ -2486,7 +2582,15 @@ def retract_assertion(
         now=now,
         new_id_fn=new_id_fn,
     )
-    return [{"event_type": "evt.memory.assertion_retracted", "payload": _event_payload(assertion)}]
+    events = [
+        {"event_type": "evt.memory.assertion_retracted", "payload": _event_payload(assertion)}
+    ]
+    events.extend(
+        _settle_conflict_sets_for_assertion(
+            db, assertion_id=assertion.id, actor_id=actor_id, now=now, new_id_fn=new_id_fn
+        )
+    )
+    return events
 
 
 def delete_assertion(
@@ -2536,7 +2640,13 @@ def delete_assertion(
         now=now,
         new_id_fn=new_id_fn,
     )
-    return [{"event_type": "evt.memory.assertion_deleted", "payload": _event_payload(assertion)}]
+    events = [{"event_type": "evt.memory.assertion_deleted", "payload": _event_payload(assertion)}]
+    events.extend(
+        _settle_conflict_sets_for_assertion(
+            db, assertion_id=assertion.id, actor_id=actor_id, now=now, new_id_fn=new_id_fn
+        )
+    )
+    return events
 
 
 def privacy_delete_assertion(
@@ -2575,6 +2685,7 @@ def privacy_delete_assertion(
         ).all()
         if isinstance(evidence_id, str)
     ]
+    invalidated_assertion_ids = [assertion.id]
     for version in db.scalars(
         select(MemoryVersionRecord).where(
             MemoryVersionRecord.canonical_table == "memory_assertions",
@@ -2649,6 +2760,7 @@ def privacy_delete_assertion(
             linked_assertion.object_value = {"text": "[privacy_deleted]"}
             linked_assertion.valid_to = now
             linked_assertion.updated_at = now
+            invalidated_assertion_ids.append(linked_assertion.id)
             linked_invalidation = _delete_projection_rows(
                 db,
                 assertion_id=linked_assertion.id,
@@ -2709,7 +2821,7 @@ def privacy_delete_assertion(
         now=now,
         new_id_fn=new_id_fn,
     )
-    return [
+    events = [
         {
             "event_type": "evt.memory.assertion_deleted",
             "payload": {
@@ -2719,6 +2831,13 @@ def privacy_delete_assertion(
             },
         }
     ]
+    for invalidated_id in invalidated_assertion_ids:
+        events.extend(
+            _settle_conflict_sets_for_assertion(
+                db, assertion_id=invalidated_id, actor_id=actor_id, now=now, new_id_fn=new_id_fn
+            )
+        )
+    return events
 
 
 def redact_evidence(
@@ -3078,15 +3197,41 @@ def resolve_conflict(
         losing_assertion = db.get(MemoryAssertionRecord, losing_id)
         if losing_assertion is None:
             continue
-        if losing_assertion.lifecycle_state in {
-            "active",
-            "candidate",
-            "conflicted",
-            "superseded",
-        }:
+        # A previously-active loser is superseded by the winner so its history is
+        # preserved; a candidate/conflicted loser is rejected. Already-terminal
+        # members (superseded, retracted, ...) are left untouched.
+        if losing_assertion.lifecycle_state == "active":
+            losing_assertion.lifecycle_state = "superseded"
+            losing_assertion.superseded_by_assertion_id = assertion.id
+            losing_assertion.valid_to = losing_assertion.valid_to or now
+            losing_assertion.updated_at = now
+            projection_invalidation = _delete_projection_rows(
+                db, assertion_id=losing_assertion.id, now=now
+            )
+            _record_version(
+                db,
+                table="memory_assertions",
+                record_id=losing_assertion.id,
+                change_type="superseded",
+                actor_id=actor_id,
+                reason="conflict loser superseded by resolution winner",
+                new_state={
+                    "lifecycle_state": "superseded",
+                    "superseded_by_assertion_id": assertion.id,
+                },
+                projection_invalidation=projection_invalidation,
+                now=now,
+                new_id_fn=new_id_fn,
+            )
+            events.append(
+                {
+                    "event_type": "evt.memory.assertion_superseded",
+                    "payload": _event_payload(losing_assertion),
+                }
+            )
+        elif losing_assertion.lifecycle_state in {"candidate", "conflicted"}:
             losing_assertion.lifecycle_state = "rejected"
             losing_assertion.valid_to = losing_assertion.valid_to or now
-            losing_assertion.superseded_by_assertion_id = None
             losing_assertion.updated_at = now
             projection_invalidation = _delete_projection_rows(
                 db, assertion_id=losing_assertion.id, now=now
@@ -3253,6 +3398,11 @@ def mark_assertion_stale(
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
 ) -> list[dict[str, Any]]:
+    # A stale assertion must identify its staleness rationale; a missing or blank
+    # reason is a typed error, normalized at this boundary before any mutation.
+    staleness_reason = _clean_text(reason) if reason else ""
+    if not staleness_reason:
+        raise MemoryStaleReasonRequiredError("marking an assertion stale requires a reason")
     assertion = db.get(MemoryAssertionRecord, assertion_id)
     if assertion is None or assertion.lifecycle_state not in {"active", "candidate", "conflicted"}:
         return []
@@ -3270,7 +3420,7 @@ def mark_assertion_stale(
         assertion_id=assertion.id,
         decision="needs_operator_review",
         actor_id=actor_id,
-        reason=reason or "assertion marked stale",
+        reason=staleness_reason,
         now=now,
         new_id_fn=new_id_fn,
     )
@@ -3280,16 +3430,22 @@ def mark_assertion_stale(
         record_id=assertion.id,
         change_type="updated",
         actor_id=actor_id,
-        reason=reason or "assertion marked stale",
+        reason=staleness_reason,
         prior_state=prior_state,
-        new_state={"lifecycle_state": "stale"},
+        new_state={"lifecycle_state": "stale", "staleness_reason": staleness_reason},
         projection_invalidation=projection_invalidation,
         now=now,
         new_id_fn=new_id_fn,
     )
-    return [
+    events = [
         {"event_type": "evt.memory.assertion_marked_stale", "payload": _event_payload(assertion)}
     ]
+    events.extend(
+        _settle_conflict_sets_for_assertion(
+            db, assertion_id=assertion.id, actor_id=actor_id, now=now, new_id_fn=new_id_fn
+        )
+    )
+    return events
 
 
 def create_relationship(
