@@ -103,9 +103,8 @@ class AppSettings(BaseSettings):
     web_extract_timeout_seconds: float = 10.0
     web_extract_max_retries: int = 2
     web_extract_api_key: str | None = None
-    maps_provider_api_key_enc: str | None = None
-    maps_provider_endpoint: str | None = None
-    maps_provider_timeout_seconds: float = 8.0
+    maps_api_key: str | None = None
+    maps_timeout_seconds: float = 8.0
     weather_provider_mode: str = "production"
     weather_production_endpoint: str = "https://api.tomorrow.io/v4/weather/forecast"
     weather_production_timeout_seconds: float = 8.0
@@ -152,8 +151,7 @@ class AppSettings(BaseSettings):
         "search_news_api_key",
         "web_extract_provider_endpoint",
         "web_extract_api_key",
-        "maps_provider_api_key_enc",
-        "maps_provider_endpoint",
+        "maps_api_key",
         "weather_production_api_key",
         "weather_default_location",
         mode="before",
@@ -488,7 +486,7 @@ class AppSettings(BaseSettings):
         "search_web_timeout_seconds",
         "search_news_timeout_seconds",
         "web_extract_timeout_seconds",
-        "maps_provider_timeout_seconds",
+        "maps_timeout_seconds",
         "weather_production_timeout_seconds",
         "weather_dev_timeout_seconds",
         "worker_poll_seconds",

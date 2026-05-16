@@ -3349,8 +3349,7 @@ def _tool_surface_facts(
             "web_extract": web_extract_bound,
             "search_web": search_web_bound,
             "search_news": settings.search_news_api_key is not None or search_web_bound,
-            "maps": settings.maps_provider_api_key_enc is not None
-            and settings.maps_provider_endpoint is not None,
+            "maps": settings.maps_api_key is not None,
             "weather": settings.weather_provider_mode == "dev_fallback"
             or settings.weather_production_api_key is not None,
         },

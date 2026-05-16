@@ -16,7 +16,6 @@ import ariel.policy_engine as policy_engine_module
 from ariel.app import ModelAdapter, create_app
 from tests.integration.responses_helpers import responses_message, responses_with_run_calls
 from ariel.capability_registry import CapabilityDefinition
-from ariel.google_connector import ConnectorTokenCipher
 
 
 @dataclass
@@ -175,48 +174,65 @@ def _patch_capability_lookup(
     monkeypatch.setattr(action_runtime_module, "get_capability", patched_runtime_get_capability)
 
 
-def _set_valid_maps_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ARIEL_CONNECTOR_ENCRYPTION_SECRET", "dev-local-connector-secret")
-    monkeypatch.setenv("ARIEL_CONNECTOR_ENCRYPTION_KEY_VERSION", "v1")
-    monkeypatch.delenv("ARIEL_CONNECTOR_ENCRYPTION_KEYS", raising=False)
-    cipher = ConnectorTokenCipher.from_config(
-        active_key_version="v1",
-        configured_keys=None,
-        fallback_secret="dev-local-connector-secret",
+def _install_maps_responses(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    routes: _FakeHTTPResponse | None = None,
+    geocode: _FakeHTTPResponse | None = None,
+    places: _FakeHTTPResponse | None = None,
+) -> list[dict[str, Any]]:
+    """Route mocked ``httpx.request`` calls to the Google Maps Platform endpoint
+    the maps wire layer targets (Routes API, Geocoding API, Places API New)."""
+    calls: list[dict[str, Any]] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> _FakeHTTPResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        if "routes.googleapis.com" in url and routes is not None:
+            return routes
+        if "maps.googleapis.com/maps/api/geocode" in url and geocode is not None:
+            return geocode
+        if "places.googleapis.com" in url and places is not None:
+            return places
+        raise AssertionError(f"unexpected maps request: {method} {url}")
+
+    monkeypatch.setattr(capability_registry_module.httpx, "request", fake_request)
+    return calls
+
+
+def _seattle_geocode_response() -> _FakeHTTPResponse:
+    return _FakeHTTPResponse(
+        status_code=200,
+        payload={
+            "status": "OK",
+            "results": [{"geometry": {"location": {"lat": 47.6097, "lng": -122.3331}}}],
+        },
     )
-    monkeypatch.setenv("ARIEL_MAPS_PROVIDER_API_KEY_ENC", cipher.encrypt("maps-test-key"))
-    monkeypatch.setenv("ARIEL_MAPS_PROVIDER_ENDPOINT", "https://maps.example.test")
 
 
 @pytest.fixture(autouse=True)
 def _maps_provider_bound(monkeypatch: pytest.MonkeyPatch) -> None:
-    _set_valid_maps_credentials(monkeypatch)
+    monkeypatch.setenv("ARIEL_MAPS_API_KEY", "test-maps-key")
 
 
-def test_s6_pr02_maps_directions_execute_inline_with_citations_and_auditable_lifecycle(
+def test_s6_pr02_maps_directions_executes_against_routes_api_with_citations(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def mutate(capability: CapabilityDefinition) -> CapabilityDefinition:
-        def execute(input_payload: dict[str, Any]) -> dict[str, Any]:
-            return {
-                "origin": input_payload["origin"],
-                "destination": input_payload["destination"],
-                "travel_mode": input_payload["travel_mode"],
-                "retrieved_at": "2026-03-06T12:00:00Z",
-                "results": [
+    calls = _install_maps_responses(
+        monkeypatch,
+        routes=_FakeHTTPResponse(
+            status_code=200,
+            payload={
+                "routes": [
                     {
-                        "title": "Fastest route to destination",
-                        "source": "https://maps.example.test/directions/primary-route",
-                        "snippet": "distance_meters=17200 duration_seconds=1260 via i-5 northbound",
-                        "published_at": "2026-03-06T11:59:00Z",
+                        "distanceMeters": 17200,
+                        "duration": "1320s",
+                        "description": "I-5 N",
                     }
-                ],
-            }
-
-        return replace(capability, execute=execute)
-
-    _patch_capability_lookup(monkeypatch, capability_id="cap.maps.directions", mutate=mutate)
+                ]
+            },
+        ),
+    )
     adapter = ActionProposalAdapter(
         run_calls_by_message={
             "route to airport": [
@@ -244,51 +260,60 @@ def test_s6_pr02_maps_directions_execute_inline_with_citations_and_auditable_lif
         assert attempt["policy"]["decision"] == "allow_inline"
         assert attempt["approval"]["status"] == "not_requested"
         assert attempt["execution"]["status"] == "succeeded"
+
+        output = attempt["execution"]["output"]
+        assert output["distance_meters"] == 17200
+        assert output["duration_seconds"] == 1320
+        assert output["uncertainty"] is None
+        assert output["results"][0]["source"].startswith("https://www.google.com/maps/dir/?api=1")
+
+        assert calls[0]["url"] == "https://routes.googleapis.com/directions/v2:computeRoutes"
+        assert calls[0]["json"]["travelMode"] == "DRIVE"
+
         assert "[1]" in payload["assistant"]["message"]
         assert len(payload["assistant"]["sources"]) == 1
         _assert_source_contract(payload["assistant"]["sources"][0])
-        assert "maps.example.test" in payload["assistant"]["sources"][0]["source"]
 
         event_types = _event_types(payload["turn"])
         assert "evt.action.execution.started" in event_types
         assert "evt.action.execution.succeeded" in event_types
 
 
-def test_s6_pr02_maps_search_places_execute_inline_with_disambiguating_metadata_and_citations(
+def test_s6_pr02_maps_search_places_executes_against_places_api_with_metadata(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def mutate(capability: CapabilityDefinition) -> CapabilityDefinition:
-        def execute(input_payload: dict[str, Any]) -> dict[str, Any]:
-            return {
-                "query": input_payload["query"],
-                "location_context": input_payload["location_context"],
-                "retrieved_at": "2026-03-06T12:10:00Z",
-                "results": [
+    calls = _install_maps_responses(
+        monkeypatch,
+        geocode=_seattle_geocode_response(),
+        places=_FakeHTTPResponse(
+            status_code=200,
+            payload={
+                "places": [
                     {
-                        "title": "Blue Bottle Coffee",
-                        "source": "https://maps.example.test/place/blue-bottle",
-                        "snippet": (
-                            "address=300 1st Ave, Seattle WA distance_meters=260 "
-                            "rating=4.6 open_now=true"
-                        ),
-                        "published_at": "2026-03-06T12:09:00Z",
+                        "displayName": {"text": "Blue Bottle Coffee"},
+                        "formattedAddress": "300 1st Ave, Seattle, WA",
+                        "location": {"latitude": 47.6099, "longitude": -122.3335},
+                        "googleMapsUri": "https://maps.google.com/?cid=1",
+                        "rating": 4.6,
+                        "userRatingCount": 320,
+                        "regularOpeningHours": {"openNow": True},
+                        "businessStatus": "OPERATIONAL",
                     },
                     {
-                        "title": "Anchorhead Coffee",
-                        "source": "https://maps.example.test/place/anchorhead",
-                        "snippet": (
-                            "address=1600 7th Ave, Seattle WA distance_meters=420 "
-                            "rating=4.5 open_now=false"
-                        ),
-                        "published_at": "2026-03-06T12:08:00Z",
+                        "displayName": {"text": "Anchorhead Coffee"},
+                        "formattedAddress": "1600 7th Ave, Seattle, WA",
+                        "location": {"latitude": 47.6110, "longitude": -122.3340},
+                        "googleMapsUri": "https://maps.google.com/?cid=2",
+                        "rating": 4.5,
+                        "userRatingCount": 210,
+                        "regularOpeningHours": {"openNow": False},
+                        "businessStatus": "OPERATIONAL",
                     },
-                ],
-            }
-
-        return replace(capability, execute=execute)
-
-    _patch_capability_lookup(monkeypatch, capability_id="cap.maps.search_places", mutate=mutate)
+                ]
+            },
+        ),
+    )
     adapter = ActionProposalAdapter(
         run_calls_by_message={
             "find nearby coffee": [
@@ -297,7 +322,7 @@ def test_s6_pr02_maps_search_places_execute_inline_with_disambiguating_metadata_
                     "input": {
                         "query": "coffee",
                         "location_context": "Downtown Seattle, WA",
-                        "radius_meters": 1200,
+                        "radius_meters": 2000,
                     },
                 }
             ]
@@ -314,14 +339,78 @@ def test_s6_pr02_maps_search_places_execute_inline_with_disambiguating_metadata_
         attempt = _surface_attempt(payload["turn"])
         assert attempt["proposal"]["capability_id"] == "cap.maps.search_places"
         assert attempt["policy"]["decision"] == "allow_inline"
-        assert attempt["approval"]["status"] == "not_requested"
         assert attempt["execution"]["status"] == "succeeded"
+
         output = attempt["execution"]["output"]
-        assert isinstance(output["results"], list)
-        assert len(output["results"]) >= 2
-        assert "distance_meters=" in output["results"][0]["snippet"]
+        assert len(output["results"]) == 2
+        first = output["results"][0]
+        assert first["title"] == "Blue Bottle Coffee"
+        assert first["source"] == "https://maps.google.com/?cid=1"
+        assert "distance_meters=" in first["snippet"]
+        assert "rating=4.6" in first["snippet"]
+        assert "open_now=true" in first["snippet"]
+
+        assert calls[0]["url"] == "https://maps.googleapis.com/maps/api/geocode/json"
+        assert calls[1]["url"] == "https://places.googleapis.com/v1/places:searchText"
+
         assert "[1]" in payload["assistant"]["message"]
         assert len(payload["assistant"]["sources"]) >= 1
+
+
+def test_s6_pr02_maps_search_places_enforces_radius_with_haversine_filter(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_maps_responses(
+        monkeypatch,
+        geocode=_seattle_geocode_response(),
+        places=_FakeHTTPResponse(
+            status_code=200,
+            payload={
+                "places": [
+                    {
+                        "displayName": {"text": "Near Cafe"},
+                        "formattedAddress": "1 Near St, Seattle, WA",
+                        "location": {"latitude": 47.6099, "longitude": -122.3335},
+                        "googleMapsUri": "https://maps.google.com/?cid=near",
+                    },
+                    {
+                        "displayName": {"text": "Far Cafe"},
+                        "formattedAddress": "1 Far Rd, Tacoma, WA",
+                        "location": {"latitude": 47.7510, "longitude": -122.4400},
+                        "googleMapsUri": "https://maps.google.com/?cid=far",
+                    },
+                ]
+            },
+        ),
+    )
+    adapter = ActionProposalAdapter(
+        run_calls_by_message={
+            "radius filtered coffee": [
+                {
+                    "name": "maps.search_places",
+                    "input": {
+                        "query": "coffee",
+                        "location_context": "Downtown Seattle, WA",
+                        "radius_meters": 1000,
+                    },
+                }
+            ]
+        },
+        assistant_text_by_message={"radius filtered coffee": "Nearby coffee is available [1]."},
+    )
+    with _build_client(postgres_url, adapter) as client:
+        session_id = _session_id(client)
+        sent = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "radius filtered coffee"}
+        )
+        assert sent.status_code == 200
+        payload = sent.json()
+
+        attempt = _surface_attempt(payload["turn"])
+        assert attempt["execution"]["status"] == "succeeded"
+        output = attempt["execution"]["output"]
+        assert [result["title"] for result in output["results"]] == ["Near Cafe"]
 
 
 @pytest.mark.parametrize(
@@ -401,25 +490,11 @@ def test_s6_pr02_maps_search_places_missing_location_context_asks_explicit_clari
         assert payload["assistant"]["sources"] == []
 
 
-@pytest.mark.parametrize(
-    ("credential_mode", "expected_error", "expected_hint"),
-    [
-        ("missing", "provider_credentials_missing", "operator"),
-        ("invalid", "provider_credentials_invalid", "operator"),
-    ],
-)
-def test_s6_pr02_maps_credentials_failures_are_typed_and_recoverable(
+def test_s6_pr02_maps_credentials_missing_is_typed_and_recoverable(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
-    credential_mode: str,
-    expected_error: str,
-    expected_hint: str,
 ) -> None:
-    if credential_mode == "missing":
-        monkeypatch.delenv("ARIEL_MAPS_PROVIDER_API_KEY_ENC", raising=False)
-    else:
-        monkeypatch.setenv("ARIEL_MAPS_PROVIDER_API_KEY_ENC", "aeadv1:v1:bad_nonce:bad_payload")
-
+    monkeypatch.delenv("ARIEL_MAPS_API_KEY", raising=False)
     adapter = ActionProposalAdapter(
         run_calls_by_message={
             "maps credentials failure": [
@@ -434,7 +509,7 @@ def test_s6_pr02_maps_credentials_failures_are_typed_and_recoverable(
             ]
         },
         assistant_text_by_message={
-            "maps credentials failure": f"{expected_error}: contact the {expected_hint}."
+            "maps credentials failure": "provider_credentials_missing: contact the operator."
         },
     )
     with _build_client(postgres_url, adapter) as client:
@@ -445,21 +520,12 @@ def test_s6_pr02_maps_credentials_failures_are_typed_and_recoverable(
         )
         assert sent.status_code == 200
         payload = sent.json()
-        if credential_mode == "missing":
-            assert payload["turn"]["surface_action_lifecycle"] == []
-            assert "provider_credentials_missing" in payload["assistant"]["message"].lower()
-            assert all(
-                event["event_type"] != "evt.action.execution.started"
-                for event in payload["turn"]["events"]
-            )
-            return
-
-        attempt = _surface_attempt(payload["turn"])
-        assert attempt["execution"]["status"] == "failed"
-        assert attempt["execution"]["error"] == expected_error
-        rendered_message = payload["assistant"]["message"].lower()
-        assert expected_error in rendered_message
-        assert expected_hint in rendered_message
+        assert payload["turn"]["surface_action_lifecycle"] == []
+        assert "provider_credentials_missing" in payload["assistant"]["message"].lower()
+        assert all(
+            event["event_type"] != "evt.action.execution.started"
+            for event in payload["turn"]["events"]
+        )
 
 
 @pytest.mark.parametrize(
@@ -472,7 +538,6 @@ def test_s6_pr02_maps_credentials_failures_are_typed_and_recoverable(
         ("permission_denied", "provider_permission_denied", "permission"),
         ("request_rejected", "provider_request_rejected", "verify"),
         ("invalid_payload", "provider_invalid_payload", "retry"),
-        ("unreachable", "provider_unreachable", "operator"),
     ],
 )
 def test_s6_pr02_maps_provider_failures_are_typed_and_recoverable(
@@ -482,62 +547,59 @@ def test_s6_pr02_maps_provider_failures_are_typed_and_recoverable(
     expected_error: str,
     expected_hint: str,
 ) -> None:
-    _set_valid_maps_credentials(monkeypatch)
-    monkeypatch.setenv("ARIEL_MAPS_PROVIDER_TIMEOUT_SECONDS", "2.0")
-
     if failure_mode == "timeout":
 
-        def fake_get(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
-            del args, kwargs
+        def fake_request(method: str, url: str, **kwargs: Any) -> _FakeHTTPResponse:
+            del method, url, kwargs
             raise httpx.TimeoutException("maps timeout")
     elif failure_mode == "network":
 
-        def fake_get(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
-            del args, kwargs
+        def fake_request(method: str, url: str, **kwargs: Any) -> _FakeHTTPResponse:
+            del method, url, kwargs
             raise httpx.HTTPError("maps network failure")
     elif failure_mode == "rate_limited":
 
-        def fake_get(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
-            del args, kwargs
-            return _FakeHTTPResponse(status_code=429, payload={"error": "rate_limited"})
+        def fake_request(method: str, url: str, **kwargs: Any) -> _FakeHTTPResponse:
+            del method, url, kwargs
+            return _FakeHTTPResponse(
+                status_code=429, payload={"error": {"status": "RESOURCE_EXHAUSTED"}}
+            )
     elif failure_mode == "upstream_failure":
 
-        def fake_get(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
-            del args, kwargs
-            return _FakeHTTPResponse(status_code=503, payload={"error": "upstream"})
+        def fake_request(method: str, url: str, **kwargs: Any) -> _FakeHTTPResponse:
+            del method, url, kwargs
+            return _FakeHTTPResponse(status_code=503, payload={"error": {"status": "UNAVAILABLE"}})
     elif failure_mode == "permission_denied":
 
-        def fake_get(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
-            del args, kwargs
-            return _FakeHTTPResponse(status_code=403, payload={"error": "forbidden"})
+        def fake_request(method: str, url: str, **kwargs: Any) -> _FakeHTTPResponse:
+            del method, url, kwargs
+            return _FakeHTTPResponse(
+                status_code=403, payload={"error": {"status": "PERMISSION_DENIED"}}
+            )
     elif failure_mode == "request_rejected":
 
-        def fake_get(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
-            del args, kwargs
-            return _FakeHTTPResponse(status_code=400, payload={"error": "bad_request"})
-    elif failure_mode == "invalid_payload":
+        def fake_request(method: str, url: str, **kwargs: Any) -> _FakeHTTPResponse:
+            del method, url, kwargs
+            return _FakeHTTPResponse(
+                status_code=400, payload={"error": {"status": "INVALID_ARGUMENT"}}
+            )
+    else:  # invalid_payload
 
-        def fake_get(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
-            del args, kwargs
+        def fake_request(method: str, url: str, **kwargs: Any) -> _FakeHTTPResponse:
+            del method, url, kwargs
             return _FakeHTTPResponse(status_code=200, json_raises=True)
-    else:
-        monkeypatch.setenv("ARIEL_MAPS_PROVIDER_ENDPOINT", "ftp://maps.googleapis.com/maps/api")
 
-        def fake_get(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
-            msg = "unreachable should fail before httpx call"
-            raise AssertionError(msg)
-
-    monkeypatch.setattr(capability_registry_module.httpx, "get", fake_get)
+    monkeypatch.setattr(capability_registry_module.httpx, "request", fake_request)
 
     adapter = ActionProposalAdapter(
         run_calls_by_message={
             "maps runtime failure": [
                 {
-                    "name": "maps.search_places",
+                    "name": "maps.directions",
                     "input": {
-                        "query": "coffee",
-                        "location_context": "Downtown Seattle, WA",
-                        "radius_meters": 1200,
+                        "origin": "Pike Place Market, Seattle, WA",
+                        "destination": "SEA Airport, Seattle, WA",
+                        "travel_mode": "driving",
                     },
                 }
             ]
@@ -621,26 +683,15 @@ def test_s6_pr02_maps_retrieval_isolation_from_google_connector_readiness(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def mutate(capability: CapabilityDefinition) -> CapabilityDefinition:
-        def execute(input_payload: dict[str, Any]) -> dict[str, Any]:
-            return {
-                "origin": input_payload["origin"],
-                "destination": input_payload["destination"],
-                "travel_mode": input_payload["travel_mode"],
-                "retrieved_at": "2026-03-06T12:20:00Z",
-                "results": [
-                    {
-                        "title": "Default route",
-                        "source": "https://maps.example.test/directions/default",
-                        "snippet": "distance_meters=17200 duration_seconds=1260",
-                        "published_at": "2026-03-06T12:19:00Z",
-                    }
-                ],
-            }
-
-        return replace(capability, execute=execute)
-
-    _patch_capability_lookup(monkeypatch, capability_id="cap.maps.directions", mutate=mutate)
+    _install_maps_responses(
+        monkeypatch,
+        routes=_FakeHTTPResponse(
+            status_code=200,
+            payload={
+                "routes": [{"distanceMeters": 17200, "duration": "1260s", "description": "I-5 N"}]
+            },
+        ),
+    )
     adapter = ActionProposalAdapter(
         run_calls_by_message={
             "maps while google disconnected": [
@@ -678,25 +729,15 @@ def test_s6_pr02_maps_outputs_remain_normalized_for_mixed_retrieval_turns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("ARIEL_SEARCH_WEB_API_KEY", "fixture-search-key")
-
-    def mutate_maps(capability: CapabilityDefinition) -> CapabilityDefinition:
-        def execute(input_payload: dict[str, Any]) -> dict[str, Any]:
-            return {
-                "origin": input_payload["origin"],
-                "destination": input_payload["destination"],
-                "travel_mode": input_payload["travel_mode"],
-                "retrieved_at": "2026-03-06T12:30:00Z",
-                "results": [
-                    {
-                        "title": "Route option A",
-                        "source": "https://maps.example.test/directions/route-a",
-                        "snippet": "distance_meters=17200 duration_seconds=1260 tolls=false",
-                        "published_at": "2026-03-06T12:29:30Z",
-                    }
-                ],
-            }
-
-        return replace(capability, execute=execute)
+    _install_maps_responses(
+        monkeypatch,
+        routes=_FakeHTTPResponse(
+            status_code=200,
+            payload={
+                "routes": [{"distanceMeters": 17200, "duration": "1260s", "description": "I-5 N"}]
+            },
+        ),
+    )
 
     def mutate_web(capability: CapabilityDefinition) -> CapabilityDefinition:
         def execute(_: dict[str, Any]) -> dict[str, Any]:
@@ -715,7 +756,6 @@ def test_s6_pr02_maps_outputs_remain_normalized_for_mixed_retrieval_turns(
 
         return replace(capability, execute=execute)
 
-    _patch_capability_lookup(monkeypatch, capability_id="cap.maps.directions", mutate=mutate_maps)
     _patch_capability_lookup(monkeypatch, capability_id="cap.search.web", mutate=mutate_web)
     adapter = ActionProposalAdapter(
         run_calls_by_message={

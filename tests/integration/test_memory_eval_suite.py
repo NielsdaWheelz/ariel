@@ -26,7 +26,7 @@ from typing import Any, cast
 
 from fastapi.testclient import TestClient
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 import ariel.memory as memory
 from ariel.app import ModelAdapter, create_app
@@ -42,7 +42,11 @@ from ariel.persistence import (
     MemoryEvalRunRecord,
 )
 from ariel.proactivity import process_proactive_deliberation_due, upsert_proactive_observation
-from tests.fixtures.memory_eval_cases import ADVERSARIAL_EVAL_CASES, LONG_MEMORY_EVAL_CASES
+from tests.fixtures.memory_eval_cases import (
+    ADVERSARIAL_EVAL_CASES,
+    ADVERSARIAL_FAILURE_MODE_CASES,
+    LONG_MEMORY_EVAL_CASES,
+)
 from tests.integration.responses_helpers import responses_run_message
 
 _id_counter = count(1)
@@ -151,9 +155,9 @@ class _RememberAdapter:
 
 
 # Each topic word maps to its own embedding dimension: text sharing a topic word
-# is close in cosine space, unrelated text is orthogonal. Identical to the
-# fixture in test_north_star_memory_pass so the suite exercises a genuine,
-# non-degenerate vector signal.
+# is close in cosine space, unrelated text is orthogonal. Mirrors the fixture in
+# test_north_star_memory_pass so the suite exercises a genuine, non-degenerate
+# vector signal; dimensions 10-14 carry the FO-1 failure-mode case families.
 _EMBEDDING_TOPIC_DIMENSIONS: dict[str, int] = {
     "phoenix": 0,
     "notebook": 1,
@@ -165,6 +169,11 @@ _EMBEDDING_TOPIC_DIMENSIONS: dict[str, int] = {
     "espresso": 7,
     "milestone": 8,
     "vendor": 9,
+    "roster": 10,
+    "ledger": 11,
+    "harbor": 12,
+    "archive": 13,
+    "tariff": 14,
 }
 
 
@@ -568,6 +577,190 @@ def _seed_long_memory_corpus(client: TestClient) -> dict[str, str]:
     return ids
 
 
+def _correct(client: TestClient, assertion_id: str, value: str) -> str:
+    """Correct an assertion and return the id of the new active assertion the
+    correction supersedes its predecessor with."""
+    response = client.post(f"/v1/memory/assertions/{assertion_id}/correct", json={"value": value})
+    assert response.status_code == 200, response.text
+    with _session_factory(client)() as db:
+        old = cast(MemoryAssertionRecord, db.get(MemoryAssertionRecord, assertion_id))
+        new_id = old.superseded_by_assertion_id
+    assert isinstance(new_id, str)
+    return new_id
+
+
+def _seed_failure_mode_corpus(client: TestClient) -> dict[str, str]:
+    """Seed the canonical memory the ADVERSARIAL_FAILURE_MODE_CASES fixture
+    references, one block per field-identified failure mode. Returns the
+    case-label -> assertion-id map the suite resolves the fixture against."""
+    now = datetime(2026, 5, 15, 9, 0, tzinfo=UTC)
+    ids: dict[str, str] = {}
+
+    # Knowledge-update chain: a single-valued fact corrected twice. Each
+    # correction supersedes its predecessor, so only the third value stays
+    # active and the two earlier values must never resurface.
+    first = _candidate(
+        client,
+        subject_key="project:roster",
+        predicate="project.open_question",
+        assertion_type="project_state",
+        value="the roster headcount target is forty engineers",
+        evidence_text="The user first set the roster headcount target.",
+    )
+    _approve(client, first)
+    ids["roster_first"] = first
+    ids["roster_second"] = _correct(client, first, "the roster headcount target is fifty engineers")
+    ids["roster_latest"] = _correct(
+        client, ids["roster_second"], "the roster headcount target is sixty engineers"
+    )
+
+    # Multi-message evidence: the ledger release scope is stated across four
+    # separate messages, each its own assertion under its own subject. The
+    # correct answer is only complete when all four surface together.
+    for label, module in (
+        ("ledger_import", "import"),
+        ("ledger_export", "export"),
+        ("ledger_audit", "audit log"),
+        ("ledger_reconcile", "reconciliation"),
+    ):
+        node = _candidate(
+            client,
+            subject_key=f"project:ledger-{label.split('_')[1]}",
+            predicate="project.open_question",
+            assertion_type="project_state",
+            value=f"the ledger release covers the {module} module",
+            evidence_text=f"In a separate message the user named the ledger {module} module.",
+        )
+        _approve(client, node)
+        ids[label] = node
+
+    # Contradiction: two conflicting single-valued harbor ship dates. The second
+    # approval is rejected and opens a conflict that recall must surface.
+    harbor_first = _candidate(
+        client,
+        subject_key="project:harbor",
+        predicate="project.deadline",
+        assertion_type="project_state",
+        value="the harbor project ships this quarter",
+        evidence_text="The user said the harbor project ships this quarter.",
+    )
+    _approve(client, harbor_first)
+    harbor_second = _candidate(
+        client,
+        subject_key="project:harbor",
+        predicate="project.deadline",
+        assertion_type="project_state",
+        value="the harbor project ships next year",
+        evidence_text="The user said the harbor project ships next year.",
+    )
+    assert client.post(f"/v1/memory/candidates/{harbor_second}/approve").status_code == 409
+
+    # Deletion durability: a privacy-deleted fact must not resurface anywhere.
+    # The assertion is seeded, its scope's hot index is built so it would be
+    # indexed, then it is privacy-deleted and the hot index is rebuilt.
+    deleted = _candidate(
+        client,
+        subject_key="project:archive",
+        predicate="project.open_question",
+        assertion_type="project_state",
+        value="the archive vault passphrase is passphrase swordfish",
+        evidence_text="The user shared the archive vault passphrase.",
+    )
+    _approve(client, deleted)
+    ids["archive_deleted"] = deleted
+    _drain_embedding_jobs(client)
+    with _session_factory(client)() as db:
+        with db.begin():
+            memory.consolidate_memory(
+                db,
+                scope_key="project:archive",
+                actor_id="system",
+                now_fn=lambda: now,
+                new_id_fn=_new_id,
+                settings=_settings(),
+            )
+    assert client.post(f"/v1/memory/assertions/{deleted}/privacy-delete").status_code == 200
+    with _session_factory(client)() as db:
+        with db.begin():
+            memory.consolidate_memory(
+                db,
+                scope_key="project:archive",
+                actor_id="system",
+                now_fn=lambda: now,
+                new_id_fn=_new_id,
+                settings=_settings(),
+            )
+    # The privacy-deleted assertion is gone from every projection and the hot
+    # index: no embedding or keyword projection row survives, and neither its id
+    # nor its scrubbed value text appears in the rebuilt hot index.
+    with _session_factory(client)() as db:
+        assert (
+            db.scalar(
+                select(func.count())
+                .select_from(memory.MemoryEmbeddingProjectionRecord)
+                .where(memory.MemoryEmbeddingProjectionRecord.assertion_id == deleted)
+            )
+            == 0
+        )
+        assert (
+            db.scalar(
+                select(func.count())
+                .select_from(memory.MemoryKeywordProjectionRecord)
+                .where(memory.MemoryKeywordProjectionRecord.canonical_id == deleted)
+            )
+            == 0
+        )
+        archive_hot = db.scalar(
+            select(MemoryContextBlockRecord).where(
+                MemoryContextBlockRecord.block_type == "hot_index",
+                MemoryContextBlockRecord.scope_key == "project:archive",
+            )
+        )
+    assert archive_hot is not None
+    assert deleted not in archive_hot.source_assertion_ids
+    assert "swordfish" not in archive_hot.content.lower()
+
+    # Temporal decisive: two facts each carry an explicit validity window. One
+    # window is fully in the past; the other contains "now". The query's answer
+    # is decided purely by which window is currently valid.
+    for label, subject, value, valid_from, valid_to in (
+        (
+            "tariff_expired",
+            "project:tariff-spring",
+            "the tariff rate for the spring window is eight percent",
+            "2026-01-01T00:00:00Z",
+            "2026-04-01T00:00:00Z",
+        ),
+        (
+            "tariff_current",
+            "project:tariff-summer",
+            "the tariff rate for the summer window is twelve percent",
+            "2026-05-01T00:00:00Z",
+            "2026-08-01T00:00:00Z",
+        ),
+    ):
+        response = client.post(
+            "/v1/memory/candidates",
+            json={
+                "subject_key": subject,
+                "predicate": "project.open_question",
+                "assertion_type": "project_state",
+                "value": value,
+                "evidence_text": f"The user gave the {label} tariff rate.",
+                "confidence": 0.94,
+                "valid_from": valid_from,
+                "valid_to": valid_to,
+            },
+        )
+        assert response.status_code == 200, response.text
+        assertion_id = response.json()["candidates"][0]["id"]
+        _approve(client, assertion_id)
+        ids[label] = assertion_id
+
+    _drain_embedding_jobs(client)
+    return ids
+
+
 def _seed_proactive_case(client: TestClient, *, now: datetime) -> str:
     with _session_factory(client)() as db:
         with db.begin():
@@ -596,8 +789,10 @@ def _seed_proactive_case(client: TestClient, *, now: datetime) -> str:
 def _resolve_natural_cases(
     fixture_cases: list[dict[str, Any]], ids: dict[str, str]
 ) -> list[dict[str, Any]]:
-    """Turn the label-referenced LONG_MEMORY_EVAL_CASES into the concrete case
-    dicts run_memory_eval consumes, substituting seeded assertion ids."""
+    """Turn the label-referenced LONG_MEMORY_EVAL_CASES / ADVERSARIAL_FAILURE_MODE_CASES
+    into the concrete case dicts run_memory_eval consumes, substituting seeded
+    assertion ids. A case's failure_mode tag, when present, is passed through so
+    run_memory_eval can record a per-mode pass rate."""
     return [
         {
             "query": case["query"],
@@ -608,6 +803,7 @@ def _resolve_natural_cases(
             "expect_conflict": case["expect_conflict"],
             "expect_policy_blocked": case["expect_policy_blocked"],
             "max_recalled_assertions": case["max_recalled_assertions"],
+            **({"failure_mode": case["failure_mode"]} if "failure_mode" in case else {}),
         }
         for case in fixture_cases
     ]
@@ -617,13 +813,15 @@ def _resolve_adversarial_cases(
     fixture_cases: list[dict[str, Any]], ids: dict[str, str]
 ) -> list[dict[str, Any]]:
     """Turn the ADVERSARIAL_EVAL_CASES into the concrete case dicts; the per-case
-    signal rankings are resolved separately when the stubs are installed."""
+    signal rankings are resolved separately when the stubs are installed. A
+    failure_mode tag, when present, is passed through for per-mode metrics."""
     return [
         {
             "query": case["query"],
             "expected_memory_ids": [ids[case["expect_label"]]],
             "forbidden_memory_ids": [ids[case["forbid_label"]]],
             "max_recalled_assertions": case["max_recalled_assertions"],
+            **({"failure_mode": case["failure_mode"]} if "failure_mode" in case else {}),
         }
         for case in fixture_cases
     ]
@@ -691,15 +889,74 @@ def test_long_memory_eval_suite_passes(
                 assert key in run.metrics, key
 
 
+_FAILURE_MODES = {
+    "knowledge-update-chain",
+    "multi-message-evidence",
+    "contradiction",
+    "deletion-durability",
+    "temporal-decisive",
+}
+
+
+def test_failure_mode_eval_suite_passes(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The FO-1 adversarial cases cover one field-identified failure mode each.
+    # Seed their canonical memory, run them against the real hybrid pipeline,
+    # and assert every case passes and run_memory_eval records a per-failure-mode
+    # pass rate on the eval run record.
+    _use_fake_memory_models(monkeypatch)
+    with _build_client(postgres_url, cast(ModelAdapter, _ProbeAdapter())) as client:
+        session_id = _session_id(client)
+        ids = _seed_failure_mode_corpus(client)
+        cases = _resolve_natural_cases(ADVERSARIAL_FAILURE_MODE_CASES, ids)
+        assert len(cases) == 5
+        assert {case["failure_mode"] for case in cases} == _FAILURE_MODES
+
+        with _session_factory(client)() as db:
+            with db.begin():
+                result = run_memory_eval(
+                    db,
+                    eval_name="failure-mode regression suite",
+                    cases=cases,
+                    now_fn=lambda: datetime.now(tz=UTC),
+                    new_id_fn=_new_id,
+                    settings=_settings(),
+                    current_session_id=session_id,
+                )
+
+        assert result["status"] == "completed", [
+            (case["query"], case["failures"])
+            for case in result["cases"]
+            if case["status"] == "failed"
+        ]
+        # Every failure mode is recorded and passes under hybrid retrieval.
+        by_mode = result["metrics"]["pass_rate_by_failure_mode"]
+        assert set(by_mode) == _FAILURE_MODES
+        assert all(rate == 1.0 for rate in by_mode.values())
+
+        # The per-failure-mode metric is durably persisted on the eval run record.
+        with _session_factory(client)() as db:
+            run = db.get(MemoryEvalRunRecord, result["id"])
+            assert run is not None
+            assert set(run.metrics["pass_rate_by_failure_mode"]) == _FAILURE_MODES
+
+
 def _seed_adversarial_corpus(client: TestClient) -> dict[str, str]:
-    """Seed the three adversarial assertions. They are plain commitments with no
+    """Seed the adversarial assertions. They are plain commitments with no
     entity, temporal, graph, or symbol signal, so retrieval over them is fully
-    determined by the monkeypatched vector and lexical rankings."""
+    determined by the monkeypatched vector and lexical rankings. The first three
+    serve the vector-only / keyword-only cases; the last three serve the FO-1
+    discrimination-guard case."""
     ids: dict[str, str] = {}
     for label, value in (
         ("vector_decoy", "the vector decoy landing note"),
         ("lexical_decoy", "the lexical decoy release note"),
         ("fused_correct", "the fused correct answer note"),
+        ("single_signal_decoy_a", "the first single signal decoy planning note"),
+        ("single_signal_decoy_b", "the second single signal decoy planning note"),
+        ("fusion_correct", "the rank fusion correct planning note"),
     ):
         assertion_id = _candidate(
             client,
@@ -726,7 +983,7 @@ def test_eval_suite_fails_under_single_signal_retrieval(
         session_id = _session_id(client)
         ids = _seed_adversarial_corpus(client)
         cases = _resolve_adversarial_cases(ADVERSARIAL_EVAL_CASES, ids)
-        assert len(cases) == 2
+        assert len(cases) == 3
 
         assertions_table = "memory_assertions"
 

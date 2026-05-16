@@ -159,6 +159,100 @@ LONG_MEMORY_EVAL_CASES: list[dict[str, Any]] = [
 ]
 
 
+# FO-1 adversarial cases, one per field-identified failure mode. They run in the
+# same single ``run_memory_eval`` call over the real hybrid pipeline as
+# ``LONG_MEMORY_EVAL_CASES``; each carries a ``failure_mode`` tag so the harness
+# can record a per-mode pass rate. Each case is a genuine adversarial test: it
+# fails under a degraded retrieval or lifecycle path and passes only under the
+# full hybrid pipeline. The suite seeds the canonical memory they describe.
+ADVERSARIAL_FAILURE_MODE_CASES: list[dict[str, Any]] = [
+    {
+        # Knowledge-update chain: a single-valued fact corrected twice (three
+        # values total). Recall must return only the latest value; both
+        # superseded values are forbidden, so a pipeline that surfaces any stale
+        # link of the chain fails.
+        "name": "knowledge-update-chain-returns-latest",
+        "failure_mode": "knowledge-update-chain",
+        "query": "what is the current roster headcount target",
+        "expect_labels": ["roster_latest"],
+        "forbid_labels": ["roster_first", "roster_second"],
+        "expected_kinds": ["semantic_assertion"],
+        "forbidden_texts": ["forty engineers", "fifty engineers"],
+        "expect_conflict": False,
+        "expect_policy_blocked": False,
+        "max_recalled_assertions": 8,
+    },
+    {
+        # Multi-message evidence: the release scope is stated across four
+        # separate episodes/messages, each its own assertion. The correct answer
+        # requires fusing all four, so every required memory must surface.
+        "name": "multi-message-evidence-fuses-four-facts",
+        "failure_mode": "multi-message-evidence",
+        "query": "which modules does the ledger release cover",
+        "expect_labels": [
+            "ledger_import",
+            "ledger_export",
+            "ledger_audit",
+            "ledger_reconcile",
+        ],
+        "forbid_labels": [],
+        "expected_kinds": ["semantic_assertion"],
+        "forbidden_texts": [],
+        "expect_conflict": False,
+        "expect_policy_blocked": False,
+        "max_recalled_assertions": 8,
+    },
+    {
+        # Contradiction: two conflicting single-valued candidates open a
+        # conflict. Even at the tightest recall budget the conflict must surface
+        # as an open conflict, and neither contradicting value may leak into
+        # recall as a silently-settled fact.
+        "name": "contradiction-surfaces-under-tight-budget",
+        "failure_mode": "contradiction",
+        "query": "when does the harbor project ship",
+        "expect_labels": [],
+        "forbid_labels": [],
+        "expected_kinds": [],
+        "forbidden_texts": ["ships this quarter", "ships next year"],
+        "expect_conflict": True,
+        "expect_policy_blocked": False,
+        "max_recalled_assertions": 1,
+    },
+    {
+        # Deletion durability: a privacy-deleted fact must not resurface. It is
+        # absent from recall and its scrubbed value text never appears in any
+        # projection or the hot index. The suite asserts the projection- and
+        # hot-index-level absence directly when it seeds this case.
+        "name": "deletion-durability-no-resurfacing",
+        "failure_mode": "deletion-durability",
+        "query": "what is the archive vault passphrase",
+        "expect_labels": [],
+        "forbid_labels": ["archive_deleted"],
+        "expected_kinds": [],
+        "forbidden_texts": ["passphrase swordfish"],
+        "expect_conflict": False,
+        "expect_policy_blocked": False,
+        "max_recalled_assertions": 8,
+    },
+    {
+        # Temporal decisive: two facts each carry an explicit validity window.
+        # One window contains "now", the other is fully in the past. The answer
+        # is decided purely by which window is currently valid, so the temporal
+        # signal must discriminate by window, not merely by its presence.
+        "name": "temporal-window-decides-answer",
+        "failure_mode": "temporal-decisive",
+        "query": "what is the tariff rate in effect now",
+        "expect_labels": ["tariff_current"],
+        "forbid_labels": ["tariff_expired"],
+        "expected_kinds": ["semantic_assertion"],
+        "forbidden_texts": [],
+        "expect_conflict": False,
+        "expect_policy_blocked": False,
+        "max_recalled_assertions": 1,
+    },
+]
+
+
 # The adversarial cases prove no single retrieval signal suffices. Each correct
 # answer is reachable only when both the vector and the lexical signal run: the
 # vector signal alone yields one wrong memory, the lexical signal alone yields
@@ -194,6 +288,24 @@ ADVERSARIAL_EVAL_CASES: list[dict[str, Any]] = [
         "forbid_label": "lexical_decoy",
         "vector_labels": ["fused_correct"],
         "lexical_labels": ["lexical_decoy", "fused_correct"],
+        "max_recalled_assertions": 1,
+    },
+    {
+        # Discrimination guard (FO-1). The two cases above already prove
+        # vector-only and keyword-only retrieval each fail; this closes the
+        # remaining gap. The correct memory is ranked second by *both* signals
+        # while two distinct decoys are each ranked first by *one* signal. Only
+        # genuine rank fusion wins: a moderate rank from two signals beats a top
+        # rank from one. A recency-only or full-context-then-pick strategy fails
+        # too -- the correct memory is top-ranked by no single signal, so a
+        # baseline that does not fuse can never surface it at this budget.
+        "name": "rank-fusion-beats-single-signal-top-rank",
+        "failure_mode": "discrimination-guard",
+        "query": "which planning note is authoritative",
+        "expect_label": "fusion_correct",
+        "forbid_label": "single_signal_decoy_a",
+        "vector_labels": ["single_signal_decoy_a", "fusion_correct"],
+        "lexical_labels": ["single_signal_decoy_b", "fusion_correct"],
         "max_recalled_assertions": 1,
     },
 ]

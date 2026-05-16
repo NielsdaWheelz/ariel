@@ -4966,6 +4966,7 @@ def run_memory_eval(
     omitted_relevant = 0
     conflict_case_total = 0
     conflict_case_handled = 0
+    failure_mode_passes: dict[str, list[bool]] = {}
     for index, raw_case in enumerate(cases[:100], start=1):
         query = raw_case.get("query")
         if not isinstance(query, str) or not query.strip():
@@ -5100,6 +5101,9 @@ def run_memory_eval(
         else:
             status = "passed"
             passed_count += 1
+        failure_mode = raw_case.get("failure_mode")
+        if isinstance(failure_mode, str) and failure_mode:
+            failure_mode_passes.setdefault(failure_mode, []).append(not failures)
         case_results.append(
             {
                 "index": index,
@@ -5179,6 +5183,12 @@ def run_memory_eval(
             ),
             "context_tokens": context_tokens,
             "recall_latency_ms": recall_latency_ms,
+            # Per-failure-mode pass rate, aggregated from each case's failure_mode
+            # tag. Empty when no case carries a tag.
+            "pass_rate_by_failure_mode": {
+                mode: sum(passes) / len(passes)
+                for mode, passes in sorted(failure_mode_passes.items())
+            },
         },
         cases=case_results,
         created_at=now,

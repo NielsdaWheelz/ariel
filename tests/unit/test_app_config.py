@@ -296,9 +296,8 @@ def test_provider_runtime_settings_default_to_production_values() -> None:
     assert settings.web_extract_timeout_seconds == 10.0
     assert settings.web_extract_max_retries == 2
     assert settings.web_extract_api_key is None
-    assert settings.maps_provider_endpoint is None
-    assert settings.maps_provider_timeout_seconds == 8.0
-    assert settings.maps_provider_api_key_enc is None
+    assert settings.maps_api_key is None
+    assert settings.maps_timeout_seconds == 8.0
     assert settings.weather_provider_mode == "production"
     assert settings.weather_production_endpoint == "https://api.tomorrow.io/v4/weather/forecast"
     assert settings.weather_production_timeout_seconds == 8.0
@@ -319,9 +318,8 @@ def test_provider_runtime_settings_load_from_env(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("ARIEL_WEB_EXTRACT_TIMEOUT_SECONDS", "5.5")
     monkeypatch.setenv("ARIEL_WEB_EXTRACT_MAX_RETRIES", "4")
     monkeypatch.setenv("ARIEL_WEB_EXTRACT_API_KEY", "extract-key")
-    monkeypatch.setenv("ARIEL_MAPS_PROVIDER_ENDPOINT", "https://maps.example.test")
-    monkeypatch.setenv("ARIEL_MAPS_PROVIDER_TIMEOUT_SECONDS", "6.5")
-    monkeypatch.setenv("ARIEL_MAPS_PROVIDER_API_KEY_ENC", "encrypted-maps-key")
+    monkeypatch.setenv("ARIEL_MAPS_API_KEY", "maps-key")
+    monkeypatch.setenv("ARIEL_MAPS_TIMEOUT_SECONDS", "6.5")
     monkeypatch.setenv("ARIEL_WEATHER_PROVIDER_MODE", "dev_fallback")
     monkeypatch.setenv("ARIEL_WEATHER_PRODUCTION_ENDPOINT", "https://weather.example.test")
     monkeypatch.setenv("ARIEL_WEATHER_PRODUCTION_TIMEOUT_SECONDS", "7.5")
@@ -342,9 +340,8 @@ def test_provider_runtime_settings_load_from_env(monkeypatch: pytest.MonkeyPatch
     assert settings.web_extract_timeout_seconds == 5.5
     assert settings.web_extract_max_retries == 4
     assert settings.web_extract_api_key == "extract-key"
-    assert settings.maps_provider_endpoint == "https://maps.example.test"
-    assert settings.maps_provider_timeout_seconds == 6.5
-    assert settings.maps_provider_api_key_enc == "encrypted-maps-key"
+    assert settings.maps_api_key == "maps-key"
+    assert settings.maps_timeout_seconds == 6.5
     assert settings.weather_provider_mode == "dev_fallback"
     assert settings.weather_production_endpoint == "https://weather.example.test"
     assert settings.weather_production_timeout_seconds == 7.5
@@ -360,7 +357,7 @@ def test_provider_runtime_settings_load_from_env(monkeypatch: pytest.MonkeyPatch
         "ARIEL_SEARCH_WEB_TIMEOUT_SECONDS",
         "ARIEL_SEARCH_NEWS_TIMEOUT_SECONDS",
         "ARIEL_WEB_EXTRACT_TIMEOUT_SECONDS",
-        "ARIEL_MAPS_PROVIDER_TIMEOUT_SECONDS",
+        "ARIEL_MAPS_TIMEOUT_SECONDS",
         "ARIEL_WEATHER_PRODUCTION_TIMEOUT_SECONDS",
         "ARIEL_WEATHER_DEV_TIMEOUT_SECONDS",
     ],
