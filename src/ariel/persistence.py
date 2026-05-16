@@ -8,6 +8,7 @@ from pgvector.sqlalchemy import Vector  # type: ignore[import-untyped]
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
+    Computed,
     DateTime,
     Float,
     ForeignKey,
@@ -19,7 +20,7 @@ from sqlalchemy import (
     text,
     UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from ariel.redaction import redact_json_value, redact_text
@@ -1200,7 +1201,7 @@ class MemoryAssertionRecord(Base):
         CheckConstraint(
             "assertion_type IN "
             "('fact', 'profile', 'preference', 'commitment', 'decision', "
-            "'project_state', 'procedure', 'domain_concept')",
+            "'project_state', 'procedure', 'domain_concept', 'negative')",
             name="ck_memory_assertion_type",
         ),
         CheckConstraint(
@@ -1516,6 +1517,9 @@ class MemoryConflictSetRecord(Base):
     predicate: Mapped[str] = mapped_column(Text, nullable=False)
     scope_key: Mapped[str] = mapped_column(Text, nullable=False)
     lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    conflict_type: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="value_contradiction"
+    )
     resolution_assertion_id: Mapped[str | None] = mapped_column(
         String(32),
         ForeignKey("memory_assertions.id", ondelete="RESTRICT"),
@@ -1534,6 +1538,10 @@ class MemoryConflictSetRecord(Base):
         CheckConstraint(
             "lifecycle_state IN ('open', 'resolved', 'ignored')",
             name="ck_memory_conflict_set_lifecycle_state",
+        ),
+        CheckConstraint(
+            "conflict_type IN ('value_contradiction', 'staleness', 'scope_overlap')",
+            name="ck_memory_conflict_set_type",
         ),
         Index(
             "ix_memory_conflict_sets_open_unique",
@@ -1768,7 +1776,8 @@ class MemoryVersionRecord(Base):
             "'memory_retention_policies', 'memory_sensitivity_labels', "
             "'memory_temporal_projections', 'memory_symbol_projections', "
             "'memory_export_artifacts', 'memory_eval_runs', "
-            "'project_state_snapshots')",
+            "'memory_scope_bindings', 'memory_salience', 'memory_conflict_sets', "
+            "'memory_events', 'project_state_snapshots')",
             name="ck_memory_version_canonical_table",
         ),
         CheckConstraint(
@@ -1828,6 +1837,35 @@ class MemoryDeletionRecord(Base):
             name="ck_memory_deletion_redaction_posture",
         ),
         Index("ix_memory_deletions_target", "target_table", "target_id"),
+    )
+
+
+class MemoryEventRecord(Base):
+    __tablename__ = "memory_events"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    scope_key: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    actor_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    entry_path: Mapped[str] = mapped_column(String(32), nullable=False)
+    subject_refs: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    source_turn_id: Mapped[str | None] = mapped_column(
+        String(32), ForeignKey("turns.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "entry_path IN ('turn', 'http', 'capability', 'worker', 'proactive', 'consolidation')",
+            name="ck_memory_event_entry_path",
+        ),
+        CheckConstraint(
+            "event_type LIKE 'evt.memory.%'",
+            name="ck_memory_event_type_prefix",
+        ),
     )
 
 
@@ -2020,6 +2058,12 @@ class MemoryKeywordProjectionRecord(Base):
     source_memory_version: Mapped[int] = mapped_column(Integer, nullable=False)
     search_text: Mapped[str] = mapped_column(Text, nullable=False)
     weighted_terms: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    search_document: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    search_vector: Mapped[str] = mapped_column(
+        TSVECTOR,
+        Computed("to_tsvector('english', search_document)", persisted=True),
+        nullable=False,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )
@@ -2030,7 +2074,8 @@ class MemoryKeywordProjectionRecord(Base):
     __table_args__ = (
         CheckConstraint(
             "canonical_table IN ('memory_assertions', 'memory_evidence', "
-            "'memory_episodes', 'memory_reasoning_traces', 'memory_procedures')",
+            "'memory_episodes', 'memory_reasoning_traces', 'memory_action_traces', "
+            "'memory_procedures')",
             name="ck_memory_keyword_projection_canonical_table",
         ),
         CheckConstraint(
@@ -2043,6 +2088,11 @@ class MemoryKeywordProjectionRecord(Base):
             "canonical_id",
             "projection_version",
             unique=True,
+        ),
+        Index(
+            "ix_memory_keyword_projections_search_vector",
+            "search_vector",
+            postgresql_using="gin",
         ),
     )
 
