@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+import functools
 import hashlib
 import json
 from pathlib import Path
@@ -809,6 +810,14 @@ def _execute_memory_capability(
 ) -> dict[str, Any]:
     actor_id = _memory_actor_id(db=db, action_attempt=action_attempt)
     event_scope_key = f"session:{action_attempt.session_id}"
+    emit_events = functools.partial(
+        emit_memory_events,
+        db,
+        entry_path="capability",
+        actor_id=actor_id,
+        now=now_fn(),
+        new_id_fn=new_id_fn,
+    )
     if capability_id == "cap.memory.inspect":
         return {
             "status": "inspected",
@@ -962,15 +971,7 @@ def _execute_memory_capability(
             now_fn=now_fn,
             new_id_fn=new_id_fn,
         )
-        emit_memory_events(
-            db,
-            events=events,
-            entry_path="capability",
-            actor_id=actor_id,
-            scope_key=str(normalized_input["scope_key"]),
-            now=now_fn(),
-            new_id_fn=new_id_fn,
-        )
+        emit_events(events=events, scope_key=str(normalized_input["scope_key"]))
         return {
             "status": "proposed",
             "events": events,
@@ -997,15 +998,7 @@ def _execute_memory_capability(
             )
             status = "rejected"
         _require_memory_events(events, "memory_candidate_review_not_applicable")
-        emit_memory_events(
-            db,
-            events=events,
-            entry_path="capability",
-            actor_id=actor_id,
-            scope_key=event_scope_key,
-            now=now_fn(),
-            new_id_fn=new_id_fn,
-        )
+        emit_events(events=events, scope_key=event_scope_key)
         return {
             "status": status,
             "events": events,
@@ -1021,15 +1014,7 @@ def _execute_memory_capability(
             new_id_fn=new_id_fn,
         )
         _require_memory_events(events, "memory_candidate_edit_not_applicable")
-        emit_memory_events(
-            db,
-            events=events,
-            entry_path="capability",
-            actor_id=actor_id,
-            scope_key=event_scope_key,
-            now=now_fn(),
-            new_id_fn=new_id_fn,
-        )
+        emit_events(events=events, scope_key=event_scope_key)
         return {
             "status": "edited",
             "events": events,
@@ -1044,15 +1029,7 @@ def _execute_memory_capability(
             new_id_fn=new_id_fn,
         )
         _require_memory_events(events, "memory_candidates_merge_not_applicable")
-        emit_memory_events(
-            db,
-            events=events,
-            entry_path="capability",
-            actor_id=actor_id,
-            scope_key=event_scope_key,
-            now=now_fn(),
-            new_id_fn=new_id_fn,
-        )
+        emit_events(events=events, scope_key=event_scope_key)
         return {
             "status": "merged",
             "events": events,
@@ -1069,15 +1046,7 @@ def _execute_memory_capability(
             new_id_fn=new_id_fn,
         )
         _require_memory_events(events, "memory_assertion_correct_not_applicable")
-        emit_memory_events(
-            db,
-            events=events,
-            entry_path="capability",
-            actor_id=actor_id,
-            scope_key=event_scope_key,
-            now=now_fn(),
-            new_id_fn=new_id_fn,
-        )
+        emit_events(events=events, scope_key=event_scope_key)
         return {
             "status": "corrected",
             "events": events,
@@ -1092,15 +1061,7 @@ def _execute_memory_capability(
             new_id_fn=new_id_fn,
         )
         _require_memory_events(events, "memory_assertion_retract_not_applicable")
-        emit_memory_events(
-            db,
-            events=events,
-            entry_path="capability",
-            actor_id=actor_id,
-            scope_key=event_scope_key,
-            now=now_fn(),
-            new_id_fn=new_id_fn,
-        )
+        emit_events(events=events, scope_key=event_scope_key)
         return {
             "status": "retracted",
             "events": events,
@@ -1115,15 +1076,7 @@ def _execute_memory_capability(
             new_id_fn=new_id_fn,
         )
         _require_memory_events(events, "memory_assertion_delete_not_applicable")
-        emit_memory_events(
-            db,
-            events=events,
-            entry_path="capability",
-            actor_id=actor_id,
-            scope_key=event_scope_key,
-            now=now_fn(),
-            new_id_fn=new_id_fn,
-        )
+        emit_events(events=events, scope_key=event_scope_key)
         return {
             "status": "deleted",
             "events": events,
@@ -1139,15 +1092,7 @@ def _execute_memory_capability(
             new_id_fn=new_id_fn,
         )
         _require_memory_events(events, "memory_assertion_privacy_delete_not_applicable")
-        emit_memory_events(
-            db,
-            events=events,
-            entry_path="capability",
-            actor_id=actor_id,
-            scope_key=event_scope_key,
-            now=now_fn(),
-            new_id_fn=new_id_fn,
-        )
+        emit_events(events=events, scope_key=event_scope_key)
         return {
             "status": "privacy_deleted",
             "events": events,
@@ -1163,15 +1108,7 @@ def _execute_memory_capability(
             new_id_fn=new_id_fn,
         )
         _require_memory_events(events, "memory_evidence_redact_not_applicable")
-        emit_memory_events(
-            db,
-            events=events,
-            entry_path="capability",
-            actor_id=actor_id,
-            scope_key=event_scope_key,
-            now=now_fn(),
-            new_id_fn=new_id_fn,
-        )
+        emit_events(events=events, scope_key=event_scope_key)
         return {
             "status": "redacted",
             "events": events,
@@ -1208,15 +1145,7 @@ def _execute_memory_capability(
         )
         if not events:
             raise MemoryCapabilityExecutionError("memory_scope_mode_invalid")
-        emit_memory_events(
-            db,
-            events=events,
-            entry_path="capability",
-            actor_id=actor_id,
-            scope_key=str(normalized_input["scope_key"]),
-            now=now_fn(),
-            new_id_fn=new_id_fn,
-        )
+        emit_events(events=events, scope_key=str(normalized_input["scope_key"]))
         return {
             "status": "recorded",
             "events": events,
@@ -1232,15 +1161,7 @@ def _execute_memory_capability(
             new_id_fn=new_id_fn,
         )
         _require_memory_events(events, "memory_conflict_resolve_not_applicable")
-        emit_memory_events(
-            db,
-            events=events,
-            entry_path="capability",
-            actor_id=actor_id,
-            scope_key=event_scope_key,
-            now=now_fn(),
-            new_id_fn=new_id_fn,
-        )
+        emit_events(events=events, scope_key=event_scope_key)
         return {
             "status": "resolved",
             "events": events,
@@ -1288,15 +1209,7 @@ def _execute_memory_capability(
             new_id_fn=new_id_fn,
         )
         _require_memory_events(events, "memory_assertion_mark_stale_not_applicable")
-        emit_memory_events(
-            db,
-            events=events,
-            entry_path="capability",
-            actor_id=actor_id,
-            scope_key=event_scope_key,
-            now=now_fn(),
-            new_id_fn=new_id_fn,
-        )
+        emit_events(events=events, scope_key=event_scope_key)
         return {
             "status": "stale",
             "events": events,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 import json
 import re
@@ -84,13 +84,11 @@ ALLOWED_MEMORY_REASONING_TRACE_OUTCOMES = {"succeeded", "failed", "corrected", "
 @dataclass(frozen=True, slots=True)
 class PredicateSpec:
     predicate: str
-    assertion_type: str
     resolution_policy: str  # "conflict" | "supersede" | "coexist"
     value_kind: str  # "text" | "enum" | "date" | "datetime" | "number" | "json"
-    sensitivity_default: str  # MemorySensitivityLabelRecord.label value
+    sensitivity_default: str  # MemorySensitivityLabelRecord.label applied on activation
     decay_half_life_days: float | None
     enum_values: tuple[str, ...] = ()
-    description: str = ""
 
     @property
     def is_multi_valued(self) -> bool:
@@ -99,7 +97,6 @@ class PredicateSpec:
 
 _DEFAULT_PREDICATE_SPEC = PredicateSpec(
     predicate="*",
-    assertion_type="fact",
     resolution_policy="conflict",  # unknown predicates are single-valued: fail safe
     value_kind="text",
     sensitivity_default="personal",
@@ -111,43 +108,26 @@ _DEFAULT_PREDICATE_SPEC = PredicateSpec(
 # predicate strings and values. Unknown predicates resolve to _DEFAULT_PREDICATE_SPEC.
 _PREDICATE_REGISTRY: dict[str, PredicateSpec] = {
     # fact: observed user/world facts; most accumulate, identity-like facts supersede.
-    "fact.location": PredicateSpec("fact.location", "fact", "supersede", "text", "personal", None),
+    "fact.location": PredicateSpec("fact.location", "supersede", "text", "personal", None),
     "fact.contact_detail": PredicateSpec(
-        "fact.contact_detail", "fact", "supersede", "text", "private", None
+        "fact.contact_detail", "supersede", "text", "personal", None
     ),
-    "fact.relationship": PredicateSpec(
-        "fact.relationship", "fact", "coexist", "text", "personal", None
-    ),
-    "fact.tooling": PredicateSpec("fact.tooling", "fact", "coexist", "text", "public", 180.0),
-    "fact.environment": PredicateSpec(
-        "fact.environment", "fact", "supersede", "text", "public", 90.0
-    ),
+    "fact.relationship": PredicateSpec("fact.relationship", "coexist", "text", "personal", None),
+    "fact.tooling": PredicateSpec("fact.tooling", "coexist", "text", "public", 180.0),
+    "fact.environment": PredicateSpec("fact.environment", "supersede", "text", "public", 90.0),
     # profile: stable identity attributes; a new value supersedes the old.
     "profile.display_name": PredicateSpec(
-        "profile.display_name", "profile", "supersede", "text", "personal", None
+        "profile.display_name", "supersede", "text", "personal", None
     ),
-    "profile.role": PredicateSpec(
-        "profile.role", "profile", "supersede", "text", "personal", 365.0
-    ),
-    "profile.timezone": PredicateSpec(
-        "profile.timezone", "profile", "supersede", "text", "personal", None
-    ),
-    "profile.employer": PredicateSpec(
-        "profile.employer", "profile", "supersede", "text", "personal", 365.0
-    ),
-    "profile.pronouns": PredicateSpec(
-        "profile.pronouns", "profile", "supersede", "text", "personal", None
-    ),
-    "profile.location": PredicateSpec(
-        "profile.location", "profile", "supersede", "text", "personal", 365.0
-    ),
-    "profile.expertise": PredicateSpec(
-        "profile.expertise", "profile", "coexist", "text", "public", None
-    ),
+    "profile.role": PredicateSpec("profile.role", "supersede", "text", "personal", 365.0),
+    "profile.timezone": PredicateSpec("profile.timezone", "supersede", "text", "personal", None),
+    "profile.employer": PredicateSpec("profile.employer", "supersede", "text", "personal", 365.0),
+    "profile.pronouns": PredicateSpec("profile.pronouns", "supersede", "text", "personal", None),
+    "profile.location": PredicateSpec("profile.location", "supersede", "text", "personal", 365.0),
+    "profile.expertise": PredicateSpec("profile.expertise", "coexist", "text", "public", None),
     # preference: how the user wants Ariel to behave.
     "preference.response_verbosity": PredicateSpec(
         "preference.response_verbosity",
-        "preference",
         "conflict",
         "enum",
         "personal",
@@ -155,23 +135,20 @@ _PREDICATE_REGISTRY: dict[str, PredicateSpec] = {
         enum_values=("terse", "normal", "detailed"),
     ),
     "preference.communication_style": PredicateSpec(
-        "preference.communication_style", "preference", "conflict", "text", "personal", None
+        "preference.communication_style", "conflict", "text", "personal", None
     ),
     "preference.code_style": PredicateSpec(
-        "preference.code_style", "preference", "coexist", "text", "public", None
+        "preference.code_style", "coexist", "text", "public", None
     ),
     "preference.language": PredicateSpec(
-        "preference.language", "preference", "conflict", "text", "personal", None
+        "preference.language", "conflict", "text", "personal", None
     ),
     "preference.notification": PredicateSpec(
-        "preference.notification", "preference", "conflict", "text", "personal", None
+        "preference.notification", "conflict", "text", "personal", None
     ),
-    "preference.tooling": PredicateSpec(
-        "preference.tooling", "preference", "coexist", "text", "public", None
-    ),
+    "preference.tooling": PredicateSpec("preference.tooling", "coexist", "text", "public", None),
     "preference.review_depth": PredicateSpec(
         "preference.review_depth",
-        "preference",
         "conflict",
         "enum",
         "personal",
@@ -179,41 +156,28 @@ _PREDICATE_REGISTRY: dict[str, PredicateSpec] = {
         enum_values=("light", "standard", "thorough"),
     ),
     # commitment: outstanding todos and promises; a scope accumulates many.
-    "commitment.todo": PredicateSpec(
-        "commitment.todo", "commitment", "coexist", "text", "personal", None
-    ),
+    "commitment.todo": PredicateSpec("commitment.todo", "coexist", "text", "personal", None),
     "commitment.follow_up": PredicateSpec(
-        "commitment.follow_up", "commitment", "coexist", "text", "personal", 30.0
+        "commitment.follow_up", "coexist", "text", "personal", 30.0
     ),
     "commitment.deadline_promise": PredicateSpec(
-        "commitment.deadline_promise", "commitment", "coexist", "datetime", "personal", None
+        "commitment.deadline_promise", "coexist", "datetime", "personal", None
     ),
     "commitment.recurring": PredicateSpec(
-        "commitment.recurring", "commitment", "coexist", "text", "personal", None
+        "commitment.recurring", "coexist", "text", "personal", None
     ),
     # decision: decisions the user or team made; history is kept, so they coexist.
     "decision.architecture": PredicateSpec(
-        "decision.architecture", "decision", "coexist", "text", "public", None
+        "decision.architecture", "coexist", "text", "public", None
     ),
-    "decision.tooling": PredicateSpec(
-        "decision.tooling", "decision", "coexist", "text", "public", None
-    ),
-    "decision.process": PredicateSpec(
-        "decision.process", "decision", "coexist", "text", "public", None
-    ),
-    "decision.scope": PredicateSpec(
-        "decision.scope", "decision", "coexist", "text", "public", None
-    ),
-    "decision.naming": PredicateSpec(
-        "decision.naming", "decision", "coexist", "text", "public", None
-    ),
+    "decision.tooling": PredicateSpec("decision.tooling", "coexist", "text", "public", None),
+    "decision.process": PredicateSpec("decision.process", "coexist", "text", "public", None),
+    "decision.scope": PredicateSpec("decision.scope", "coexist", "text", "public", None),
+    "decision.naming": PredicateSpec("decision.naming", "coexist", "text", "public", None),
     # project_state: live project facts.
-    "project.deadline": PredicateSpec(
-        "project.deadline", "project_state", "conflict", "text", "personal", None
-    ),
+    "project.deadline": PredicateSpec("project.deadline", "conflict", "text", "personal", None),
     "project.status": PredicateSpec(
         "project.status",
-        "project_state",
         "supersede",
         "enum",
         "personal",
@@ -222,75 +186,48 @@ _PREDICATE_REGISTRY: dict[str, PredicateSpec] = {
     ),
     "project.priority": PredicateSpec(
         "project.priority",
-        "project_state",
         "supersede",
         "enum",
         "personal",
         30.0,
         enum_values=("low", "medium", "high", "critical"),
     ),
-    "project.owner": PredicateSpec(
-        "project.owner", "project_state", "supersede", "text", "personal", 90.0
-    ),
+    "project.owner": PredicateSpec("project.owner", "supersede", "text", "personal", 90.0),
     "project.open_question": PredicateSpec(
-        "project.open_question", "project_state", "coexist", "text", "personal", 60.0
+        "project.open_question", "coexist", "text", "personal", 60.0
     ),
-    "project.risk": PredicateSpec(
-        "project.risk", "project_state", "coexist", "text", "personal", 60.0
-    ),
-    "project.blocker": PredicateSpec(
-        "project.blocker", "project_state", "coexist", "text", "personal", 30.0
-    ),
-    "project.milestone": PredicateSpec(
-        "project.milestone", "project_state", "coexist", "text", "personal", None
-    ),
+    "project.risk": PredicateSpec("project.risk", "coexist", "text", "personal", 60.0),
+    "project.blocker": PredicateSpec("project.blocker", "coexist", "text", "personal", 30.0),
+    "project.milestone": PredicateSpec("project.milestone", "coexist", "text", "personal", None),
     # procedure: reusable how-to knowledge; a scope accumulates many.
-    "procedure.deploy": PredicateSpec(
-        "procedure.deploy", "procedure", "coexist", "text", "public", None
-    ),
-    "procedure.test": PredicateSpec(
-        "procedure.test", "procedure", "coexist", "text", "public", None
-    ),
-    "procedure.build": PredicateSpec(
-        "procedure.build", "procedure", "coexist", "text", "public", None
-    ),
-    "procedure.release": PredicateSpec(
-        "procedure.release", "procedure", "coexist", "text", "public", None
-    ),
-    "procedure.setup": PredicateSpec(
-        "procedure.setup", "procedure", "coexist", "text", "public", None
-    ),
-    "procedure.debug": PredicateSpec(
-        "procedure.debug", "procedure", "coexist", "text", "public", None
-    ),
+    "procedure.deploy": PredicateSpec("procedure.deploy", "coexist", "text", "public", None),
+    "procedure.test": PredicateSpec("procedure.test", "coexist", "text", "public", None),
+    "procedure.build": PredicateSpec("procedure.build", "coexist", "text", "public", None),
+    "procedure.release": PredicateSpec("procedure.release", "coexist", "text", "public", None),
+    "procedure.setup": PredicateSpec("procedure.setup", "coexist", "text", "public", None),
+    "procedure.debug": PredicateSpec("procedure.debug", "coexist", "text", "public", None),
     # domain_concept: definitions and constraints; a new definition supersedes.
-    "domain.definition": PredicateSpec(
-        "domain.definition", "domain_concept", "supersede", "text", "public", None
-    ),
+    "domain.definition": PredicateSpec("domain.definition", "supersede", "text", "public", None),
     "domain.glossary_term": PredicateSpec(
-        "domain.glossary_term", "domain_concept", "supersede", "text", "public", None
+        "domain.glossary_term", "supersede", "text", "public", None
     ),
-    "domain.constraint": PredicateSpec(
-        "domain.constraint", "domain_concept", "coexist", "text", "public", None
-    ),
-    "domain.invariant": PredicateSpec(
-        "domain.invariant", "domain_concept", "coexist", "text", "public", None
-    ),
+    "domain.constraint": PredicateSpec("domain.constraint", "coexist", "text", "public", None),
+    "domain.invariant": PredicateSpec("domain.invariant", "coexist", "text", "public", None),
     # negative: knowledge about what not to do; a scope accumulates many.
     "negative.rejected_approach": PredicateSpec(
-        "negative.rejected_approach", "negative", "coexist", "text", "public", 120.0
+        "negative.rejected_approach", "coexist", "text", "public", 120.0
     ),
     "negative.invalid_assumption": PredicateSpec(
-        "negative.invalid_assumption", "negative", "coexist", "text", "public", 120.0
+        "negative.invalid_assumption", "coexist", "text", "public", 120.0
     ),
     "negative.already_checked": PredicateSpec(
-        "negative.already_checked", "negative", "coexist", "text", "public", 30.0
+        "negative.already_checked", "coexist", "text", "public", 30.0
     ),
     "negative.unsafe_operation": PredicateSpec(
-        "negative.unsafe_operation", "negative", "coexist", "text", "public", None
+        "negative.unsafe_operation", "coexist", "text", "public", None
     ),
     "negative.known_bad_path": PredicateSpec(
-        "negative.known_bad_path", "negative", "coexist", "text", "public", 120.0
+        "negative.known_bad_path", "coexist", "text", "public", 120.0
     ),
 }
 
@@ -411,9 +348,7 @@ _STOPWORDS = {
 
 
 def count_context_tokens(text: str) -> int:
-    """Count tokens the same way the turn pipeline measures ``max_context_tokens``:
-    whitespace-delimited words. The hot-index budget reuses this so its limit is
-    expressed in the same unit as every other context budget."""
+    """Count whitespace-delimited words, the unit every context budget uses."""
     return len(re.findall(r"\S+", text))
 
 
@@ -453,13 +388,13 @@ def _terms(value: str) -> list[str]:
     return terms
 
 
-def _symbol_tokens(value: str) -> list[tuple[str, str]]:
-    """Extract (symbol, path) pairs from an assertion's text: whitespace-bounded
+def _symbol_tokens(value: str) -> list[tuple[str, bool]]:
+    """Extract (token, is_path) pairs from an assertion's text: whitespace-bounded
     substrings that look like a file path (contain '/') or a code identifier
     (snake_case, interior-capital camelCase, or a dotted name). Deterministic;
     de-duplicated in encounter order."""
-    pairs: list[tuple[str, str]] = []
-    seen: set[tuple[str, str]] = set()
+    pairs: list[tuple[str, bool]] = []
+    seen: set[str] = set()
     for raw in value.split():
         token = raw.strip("()[]{}<>,;:'\"`.").strip()
         if len(token) < 3 or len(token) > 200:
@@ -473,11 +408,10 @@ def _symbol_tokens(value: str) -> list[tuple[str, str]]:
         is_identifier = not is_path and ("_" in token or "." in token or has_camel)
         if not (is_path or is_identifier):
             continue
-        pair = (token, "") if is_identifier else ("", token)
-        if pair in seen:
+        if token in seen:
             continue
-        seen.add(pair)
-        pairs.append(pair)
+        seen.add(token)
+        pairs.append((token, is_path))
     return pairs
 
 
@@ -505,23 +439,15 @@ class MemoryPolicyDecision:
     considered_scopes: tuple[dict[str, Any], ...]
 
     def as_dict(self) -> dict[str, Any]:
-        return {
-            "allowed": self.allowed,
-            "operation": self.operation,
-            "effective_mode": self.effective_mode,
-            "controlling_scope_type": self.controlling_scope_type,
-            "controlling_scope_key": self.controlling_scope_key,
-            "controlling_binding_id": self.controlling_binding_id,
-            "reason": self.reason,
-            "considered_scopes": list(self.considered_scopes),
-        }
+        return asdict(self)
 
 
 # Mode precedence: a stricter mode in any scope of the chain wins over a laxer one.
 _MODE_SEVERITY = {"normal": 0, "temporary": 1, "no_memory": 2}
 # Scope specificity decides which carrier of the winning mode is reported; lower is
-# more specific. Session is the most specific (severity 0 in the considered list).
+# more specific. Session is the most specific.
 _SCOPE_SPECIFICITY = {
+    "session": 0,
     "thread": 10,
     "proactive_case": 20,
     "repo": 30,
@@ -560,7 +486,6 @@ def resolve_memory_policy(
             {
                 "scope_type": "session",
                 "scope_key": session_id,
-                "specificity": 0,
                 "memory_mode": session.memory_mode,
                 "binding_id": None,
             }
@@ -598,7 +523,6 @@ def resolve_memory_policy(
                 {
                     "scope_type": scope_type,
                     "scope_key": scope_key,
-                    "specificity": _SCOPE_SPECIFICITY[scope_type],
                     "memory_mode": binding.memory_mode,
                     "binding_id": binding.id,
                 }
@@ -612,7 +536,7 @@ def resolve_memory_policy(
     # Strictest mode wins; the most specific scope carrying it is controlling.
     strictest = max(_MODE_SEVERITY[s["memory_mode"]] for s in considered)
     carriers = [s for s in considered if _MODE_SEVERITY[s["memory_mode"]] == strictest]
-    controlling = min(carriers, key=lambda s: s["specificity"])
+    controlling = min(carriers, key=lambda s: _SCOPE_SPECIFICITY[s["scope_type"]])
     mode = controlling["memory_mode"]
     return MemoryPolicyDecision(
         allowed=(mode == "normal"),
@@ -1420,15 +1344,15 @@ def _record_projection_rows(
     elif assertion.subject_key.startswith("repo:"):
         repo_key = assertion.subject_key
     if repo_key:
-        for symbol, path in _symbol_tokens(_assertion_text(assertion)):
+        for token, is_path in _symbol_tokens(_assertion_text(assertion)):
             db.add(
                 MemorySymbolProjectionRecord(
                     id=new_id_fn("msy"),
                     canonical_table="memory_assertions",
                     canonical_id=assertion.id,
                     repo_key=repo_key,
-                    symbol=symbol,
-                    path=path,
+                    symbol="" if is_path else token,
+                    path=token if is_path else "",
                     language=None,
                     projection_version=MEMORY_PROJECTION_VERSION,
                     source_memory_version=source_memory_version,
@@ -1742,6 +1666,49 @@ def process_memory_graph_projection_job(
             job.last_heartbeat = None
             job.updated_at = now
     return True
+
+
+def _record_sensitivity_label(
+    db: Session,
+    *,
+    assertion: MemoryAssertionRecord,
+    actor_id: str,
+    now: datetime,
+    new_id_fn: Callable[[str], str],
+) -> None:
+    """Apply the predicate's default sensitivity label to a newly active assertion.
+
+    The sensitivity-label rail (secret/regulated/source_confidential gating in
+    build_memory_context) only protects assertions that carry a label row, so
+    every activation records one. Re-activation upserts the existing row."""
+    label = resolve_predicate_spec(assertion.predicate).sensitivity_default
+    row = db.scalar(
+        select(MemorySensitivityLabelRecord)
+        .where(
+            MemorySensitivityLabelRecord.canonical_table == "memory_assertions",
+            MemorySensitivityLabelRecord.canonical_id == assertion.id,
+        )
+        .limit(1)
+    )
+    if row is None:
+        db.add(
+            MemorySensitivityLabelRecord(
+                id=new_id_fn("mse"),
+                canonical_table="memory_assertions",
+                canonical_id=assertion.id,
+                label=label,
+                actor_id=actor_id,
+                lifecycle_state="active",
+                reason="predicate sensitivity default applied on activation",
+                metadata_json={"predicate": assertion.predicate},
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        return
+    row.label = label
+    row.lifecycle_state = "active"
+    row.updated_at = now
 
 
 def _record_salience(
@@ -2279,6 +2246,13 @@ def _activate_assertion(
         db,
         assertion=assertion,
         user_priority="none",
+        now=now,
+        new_id_fn=new_id_fn,
+    )
+    _record_sensitivity_label(
+        db,
+        assertion=assertion,
+        actor_id=actor_id,
         now=now,
         new_id_fn=new_id_fn,
     )

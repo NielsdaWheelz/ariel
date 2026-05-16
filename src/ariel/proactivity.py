@@ -2480,6 +2480,60 @@ def _create_action_plan(
     )
 
 
+def _record_proactive_action_trace(
+    db: Session,
+    *,
+    plan: ProactiveActionPlanRecord,
+    stored_execution: ProactiveActionExecutionRecord,
+    now: datetime,
+    new_id_fn: Callable[[str], str],
+) -> None:
+    trace_session = db.scalar(
+        select(SessionRecord).where(SessionRecord.is_active.is_(True)).limit(1)
+    )
+    if trace_session is None:
+        trace_session = SessionRecord(
+            id=new_id_fn("ses"),
+            is_active=True,
+            lifecycle_state="active",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(trace_session)
+        db.flush()
+    _, trace_events = record_action_trace(
+        db,
+        action_attempt=None,
+        scope_key=f"proactive:{plan.case_id}",
+        primary_evidence_id=None,
+        source_turn_id=None,
+        trace_type="execution",
+        now=now,
+        new_id_fn=new_id_fn,
+        session_id=trace_session.id,
+        capability_id=plan.action_type,
+        outcome=stored_execution.status,
+        result_refs={
+            "action_plan_id": plan.id,
+            "case_id": plan.case_id,
+            "target": plan.target,
+            "risk_tier": plan.risk_tier,
+            "execution_status": stored_execution.status,
+            "execution_error": stored_execution.error,
+        },
+        evidence_text=f"proactive action {plan.action_type} for case {plan.case_id}",
+    )
+    emit_memory_events(
+        db,
+        events=trace_events,
+        entry_path="proactive",
+        actor_id="system",
+        scope_key=f"proactive:{plan.case_id}",
+        now=now,
+        new_id_fn=new_id_fn,
+    )
+
+
 def process_proactive_action_execution_due(
     *,
     session_factory: sessionmaker[Session],
@@ -2667,47 +2721,10 @@ def process_proactive_action_execution_due(
                     now=now,
                     new_id_fn=new_id_fn,
                 )
-                trace_session = db.scalar(
-                    select(SessionRecord).where(SessionRecord.is_active.is_(True)).limit(1)
-                )
-                if trace_session is None:
-                    trace_session = SessionRecord(
-                        id=new_id_fn("ses"),
-                        is_active=True,
-                        lifecycle_state="active",
-                        created_at=now,
-                        updated_at=now,
-                    )
-                    db.add(trace_session)
-                    db.flush()
-                _, trace_events = record_action_trace(
+                _record_proactive_action_trace(
                     db,
-                    action_attempt=None,
-                    scope_key=f"proactive:{plan.case_id}",
-                    primary_evidence_id=None,
-                    source_turn_id=None,
-                    trace_type="execution",
-                    now=now,
-                    new_id_fn=new_id_fn,
-                    session_id=trace_session.id,
-                    capability_id=plan.action_type,
-                    outcome=stored_execution.status,
-                    result_refs={
-                        "action_plan_id": plan.id,
-                        "case_id": plan.case_id,
-                        "target": plan.target,
-                        "risk_tier": plan.risk_tier,
-                        "execution_status": stored_execution.status,
-                        "execution_error": stored_execution.error,
-                    },
-                    evidence_text=f"proactive action {plan.action_type} for case {plan.case_id}",
-                )
-                emit_memory_events(
-                    db,
-                    events=trace_events,
-                    entry_path="proactive",
-                    actor_id="system",
-                    scope_key=f"proactive:{plan.case_id}",
+                    plan=plan,
+                    stored_execution=stored_execution,
                     now=now,
                     new_id_fn=new_id_fn,
                 )
@@ -2750,47 +2767,10 @@ def process_proactive_action_execution_due(
                 now=now,
                 new_id_fn=new_id_fn,
             )
-            trace_session = db.scalar(
-                select(SessionRecord).where(SessionRecord.is_active.is_(True)).limit(1)
-            )
-            if trace_session is None:
-                trace_session = SessionRecord(
-                    id=new_id_fn("ses"),
-                    is_active=True,
-                    lifecycle_state="active",
-                    created_at=now,
-                    updated_at=now,
-                )
-                db.add(trace_session)
-                db.flush()
-            _, trace_events = record_action_trace(
+            _record_proactive_action_trace(
                 db,
-                action_attempt=None,
-                scope_key=f"proactive:{plan.case_id}",
-                primary_evidence_id=None,
-                source_turn_id=None,
-                trace_type="execution",
-                now=now,
-                new_id_fn=new_id_fn,
-                session_id=trace_session.id,
-                capability_id=plan.action_type,
-                outcome=stored_execution.status,
-                result_refs={
-                    "action_plan_id": plan.id,
-                    "case_id": plan.case_id,
-                    "target": plan.target,
-                    "risk_tier": plan.risk_tier,
-                    "execution_status": stored_execution.status,
-                    "execution_error": stored_execution.error,
-                },
-                evidence_text=f"proactive action {plan.action_type} for case {plan.case_id}",
-            )
-            emit_memory_events(
-                db,
-                events=trace_events,
-                entry_path="proactive",
-                actor_id="system",
-                scope_key=f"proactive:{plan.case_id}",
+                plan=plan,
+                stored_execution=stored_execution,
                 now=now,
                 new_id_fn=new_id_fn,
             )
