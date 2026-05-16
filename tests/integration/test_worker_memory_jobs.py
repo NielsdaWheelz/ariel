@@ -21,12 +21,15 @@ from ariel.persistence import (
     MemoryEmbeddingProjectionRecord,
     MemoryEntityRecord,
     MemoryEvidenceRecord,
+    MemoryExportArtifactRecord,
     MemoryGraphProjectionRecord,
+    MemoryProcedureRecord,
     MemoryProjectionJobRecord,
     MemoryRelationshipRecord,
     MemoryRetentionPolicyRecord,
     MemoryReviewRecord,
     MemorySalienceRecord,
+    MemoryTopicRecord,
     MemoryVersionRecord,
     SessionRecord,
 )
@@ -1550,3 +1553,382 @@ def test_consolidate_memory_forgetting_pass_cannot_resurface_privacy_deleted_mem
         assert privacy_deleted.lifecycle_state == "privacy_deleted"
         assert privacy_deleted.object_value == {"text": "[privacy_deleted]"}
         assert "mas_privacy_deleted" not in _hot_index_assertion_ids(db)
+
+
+def _seed_repo_procedure(
+    db: Session,
+    *,
+    suffix: str,
+    repo_scope: str,
+    title: str,
+    instruction: str,
+    now: datetime,
+) -> str:
+    # A repo-scoped, active, reviewed MemoryProcedureRecord backed by a real
+    # procedure assertion and evidence, so the FO-5 rules projection can
+    # materialise it and a deletion of the assertion can invalidate the
+    # artifact through the existing _delete_projection_rows content match.
+    # Returns the source assertion id.
+    entity_id = f"ent_repo_proc_{suffix}"
+    assertion_id = f"mas_repo_proc_{suffix}"
+    evidence_id = f"mev_repo_proc_{suffix}"
+    session_id = f"ses_repo_proc_{suffix}"
+    db.add(
+        SessionRecord(
+            id=session_id,
+            is_active=False,
+            lifecycle_state="closed",
+            memory_mode="normal",
+            rotated_from_session_id=None,
+            rotation_reason=None,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    db.add(
+        MemoryEntityRecord(
+            id=entity_id,
+            entity_type="repo",
+            entity_key=f"{repo_scope}:{suffix}",
+            display_name="Repo rules test repo",
+            summary=None,
+            metadata_json={},
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    db.flush()
+    db.add(
+        MemoryEvidenceRecord(
+            id=evidence_id,
+            source_turn_id=None,
+            source_session_id=session_id,
+            actor_id="user.local",
+            content_class="user_message",
+            trust_boundary="trusted_user",
+            lifecycle_state="available",
+            source_uri=None,
+            source_artifact_id=None,
+            source_text=instruction,
+            evidence_snippet=instruction,
+            redaction_posture="none",
+            metadata_json={},
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    db.flush()
+    db.add(
+        MemoryAssertionRecord(
+            id=assertion_id,
+            subject_entity_id=entity_id,
+            subject_key=repo_scope,
+            predicate=title,
+            scope_key=repo_scope,
+            object_value={"text": instruction},
+            assertion_type="procedure",
+            is_multi_valued=True,
+            scope={},
+            lifecycle_state="active",
+            confidence=0.95,
+            valid_from=None,
+            valid_to=None,
+            superseded_by_assertion_id=None,
+            extraction_model=None,
+            extraction_prompt_version=None,
+            last_verified_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    db.flush()
+    db.add(
+        MemoryProcedureRecord(
+            id=f"mpr_repo_proc_{suffix}",
+            procedure_key=f"procedure_{suffix}",
+            scope_key=repo_scope,
+            title=title,
+            instruction=instruction,
+            lifecycle_state="active",
+            review_state="approved",
+            source_assertion_id=assertion_id,
+            primary_evidence_id=evidence_id,
+            valid_from=now - timedelta(days=1),
+            valid_to=None,
+            metadata_json={},
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    return assertion_id
+
+
+def _seed_repo_conventions_block(
+    db: Session,
+    *,
+    repo_scope: str,
+    summary: str,
+    now: datetime,
+) -> None:
+    # An active repo-conventions topic plus its topic context block, the second
+    # source the FO-5 rules projection folds into the AGENTS.md-style file.
+    topic_id = "mtp_repo_conventions"
+    db.add(
+        MemoryTopicRecord(
+            id=topic_id,
+            topic_key=f"{repo_scope}:repo-conventions",
+            family="repo-conventions",
+            scope_key=repo_scope,
+            title="repo conventions",
+            summary=summary,
+            lifecycle_state="active",
+            projection_version=memory_module.MEMORY_PROJECTION_VERSION,
+            metadata_json={},
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    db.flush()
+    db.add(
+        MemoryContextBlockRecord(
+            id="mcb_repo_conventions",
+            block_type="topic",
+            scope_key=repo_scope,
+            content=summary,
+            topic_id=topic_id,
+            lifecycle_state="active",
+            source_assertion_ids=[],
+            source_episode_ids=[],
+            source_trace_ids=[],
+            source_action_trace_ids=[],
+            source_procedure_ids=[],
+            source_project_state_snapshot_ids=[],
+            source_memory_versions={},
+            source_projection_versions={
+                "memory_context_blocks": memory_module.MEMORY_PROJECTION_VERSION
+            },
+            projection_version=memory_module.MEMORY_PROJECTION_VERSION,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+
+def test_consolidate_repo_scope_produces_agents_md_artifact_with_rule_source_ids(
+    session_factory: sessionmaker[Session],
+) -> None:
+    # FO-5: consolidating a repo scope materialises its active, reviewed
+    # procedural memory plus the repo-conventions topic block into an
+    # AGENTS.md-style markdown export artifact. Each rule carries the source
+    # memory id it traces back to.
+    now = datetime(2026, 5, 16, 11, 0, tzinfo=UTC)
+    repo_scope = "repo:ariel"
+    with session_factory() as db:
+        with db.begin():
+            deploy_source = _seed_repo_procedure(
+                db,
+                suffix="deploy",
+                repo_scope=repo_scope,
+                title="deploy",
+                instruction="Run smoke tests before deploying.",
+                now=now,
+            )
+            test_source = _seed_repo_procedure(
+                db,
+                suffix="test",
+                repo_scope=repo_scope,
+                title="test",
+                instruction="Run uv run pytest before every push.",
+                now=now,
+            )
+            _seed_repo_conventions_block(
+                db,
+                repo_scope=repo_scope,
+                summary="Flat modules; from __future__ import annotations everywhere.",
+                now=now,
+            )
+
+    with session_factory() as db:
+        with db.begin():
+            result = memory_module.consolidate_memory(
+                db,
+                scope_key=repo_scope,
+                actor_id="system",
+                now_fn=lambda: now,
+                new_id_fn=_hot_index_new_id,
+                settings=_settings(),
+            )
+
+    rules_changes = [
+        change
+        for change in result["applied_projection_changes"]
+        if change.get("kind") == "repo_rules_artifact"
+    ]
+    assert len(rules_changes) == 1
+    assert rules_changes[0]["scope_key"] == repo_scope
+
+    with session_factory() as db:
+        artifact = db.scalar(
+            select(MemoryExportArtifactRecord).where(
+                MemoryExportArtifactRecord.scope_key == repo_scope,
+                MemoryExportArtifactRecord.artifact_kind == "agents_md",
+            )
+        )
+        assert artifact is not None
+        assert artifact.export_format == "markdown"
+        assert artifact.status == "created"
+        assert artifact.source_counts == {"procedures": 2, "repo_conventions_block": 1}
+        markdown = artifact.content["markdown"]
+        # The AGENTS.md-style file is organised in sections and folds in the
+        # repo-conventions topic-block content.
+        assert "## Repo Conventions" in markdown
+        assert "## Procedural Rules" in markdown
+        assert "from __future__ import annotations everywhere" in markdown
+        # Every rule names its source memory id so it traces back to canonical
+        # memory; the ids are the procedures' source assertions.
+        rule_sources = {rule["source_memory_id"] for rule in artifact.content["rules"]}
+        assert rule_sources == {deploy_source, test_source}
+        for rule in artifact.content["rules"]:
+            assert f"[source: {rule['source_memory_id']}]" in markdown
+        # Procedure instructions appear one rule per item.
+        assert "Run smoke tests before deploying." in markdown
+        assert "Run uv run pytest before every push." in markdown
+
+
+def test_repo_rules_artifact_is_a_refreshed_projection_not_canonical_state(
+    session_factory: sessionmaker[Session],
+) -> None:
+    # FO-5: the rules file is a projection. A regenerating consolidation
+    # refreshes the same artifact row in place, and editing the artifact
+    # content never mutates canonical memory -- only consolidation rebuilds it.
+    first = datetime(2026, 5, 16, 11, 5, tzinfo=UTC)
+    second = datetime(2026, 5, 16, 12, 5, tzinfo=UTC)
+    repo_scope = "repo:atlas"
+    with session_factory() as db:
+        with db.begin():
+            _seed_repo_procedure(
+                db,
+                suffix="deploy",
+                repo_scope=repo_scope,
+                title="deploy",
+                instruction="Run smoke tests before deploying.",
+                now=first,
+            )
+
+    with session_factory() as db:
+        with db.begin():
+            memory_module.consolidate_memory(
+                db,
+                scope_key=repo_scope,
+                actor_id="system",
+                now_fn=lambda: first,
+                new_id_fn=_hot_index_new_id,
+                settings=_settings(),
+            )
+
+    with session_factory() as db:
+        with db.begin():
+            artifact = db.scalar(
+                select(MemoryExportArtifactRecord).where(
+                    MemoryExportArtifactRecord.artifact_kind == "agents_md"
+                )
+            )
+            assert artifact is not None
+            artifact_id = artifact.id
+            # Simulate an out-of-band edit of the projection file.
+            artifact.content = {"markdown": "hand-edited", "rules": []}
+
+    with session_factory() as db:
+        with db.begin():
+            memory_module.consolidate_memory(
+                db,
+                scope_key=repo_scope,
+                actor_id="system",
+                now_fn=lambda: second,
+                new_id_fn=_hot_index_new_id,
+                settings=_settings(),
+            )
+
+    with session_factory() as db:
+        artifacts = db.scalars(
+            select(MemoryExportArtifactRecord).where(
+                MemoryExportArtifactRecord.artifact_kind == "agents_md"
+            )
+        ).all()
+        # The regenerating consolidation refreshed the same row, not a new one.
+        assert [artifact.id for artifact in artifacts] == [artifact_id]
+        refreshed = artifacts[0]
+        assert refreshed.content["markdown"] != "hand-edited"
+        assert "Run smoke tests before deploying." in refreshed.content["markdown"]
+        assert refreshed.updated_at == second
+        # The hand edit did not flow back to canonical memory: the procedure
+        # and its source assertion are untouched.
+        procedure = db.scalar(
+            select(MemoryProcedureRecord).where(MemoryProcedureRecord.scope_key == repo_scope)
+        )
+        assert procedure is not None
+        assert procedure.lifecycle_state == "active"
+        assert procedure.instruction == "Run smoke tests before deploying."
+
+
+def test_deleting_source_procedure_invalidates_repo_rules_artifact(
+    session_factory: sessionmaker[Session],
+) -> None:
+    # FO-5: deleting the procedural memory behind a rule invalidates the
+    # AGENTS.md-style artifact through the existing projection-invalidation
+    # path -- _delete_projection_rows marks the artifact failed because the
+    # deleted source memory id is in its content.
+    now = datetime(2026, 5, 16, 11, 10, tzinfo=UTC)
+    repo_scope = "repo:phoenix"
+    with session_factory() as db:
+        with db.begin():
+            source_assertion_id = _seed_repo_procedure(
+                db,
+                suffix="deploy",
+                repo_scope=repo_scope,
+                title="deploy",
+                instruction="Run smoke tests before deploying.",
+                now=now,
+            )
+
+    with session_factory() as db:
+        with db.begin():
+            memory_module.consolidate_memory(
+                db,
+                scope_key=repo_scope,
+                actor_id="system",
+                now_fn=lambda: now,
+                new_id_fn=_hot_index_new_id,
+                settings=_settings(),
+            )
+
+    with session_factory() as db:
+        artifact = db.scalar(
+            select(MemoryExportArtifactRecord).where(
+                MemoryExportArtifactRecord.artifact_kind == "agents_md"
+            )
+        )
+        assert artifact is not None
+        assert artifact.status == "created"
+
+    with session_factory() as db:
+        with db.begin():
+            events = memory_module.delete_assertion(
+                db,
+                assertion_id=source_assertion_id,
+                actor_id="system",
+                now_fn=lambda: now,
+                new_id_fn=_hot_index_new_id,
+            )
+    assert any(event["event_type"] == "evt.memory.assertion_deleted" for event in events)
+
+    with session_factory() as db:
+        artifact = db.scalar(
+            select(MemoryExportArtifactRecord).where(
+                MemoryExportArtifactRecord.artifact_kind == "agents_md"
+            )
+        )
+        assert artifact is not None
+        # The deletion invalidated the projection.
+        assert artifact.status == "failed"
+        assert artifact.source_counts["invalidated_by_assertion_id"] == source_assertion_id

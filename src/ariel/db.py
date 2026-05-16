@@ -335,6 +335,7 @@ REQUIRED_COLUMNS: Final[dict[str, tuple[str, ...]]] = {
     ),
     "memory_export_artifacts": (
         "scope_key",
+        "artifact_kind",
         "export_format",
         "status",
         "projection_version",
@@ -537,6 +538,7 @@ REQUIRED_CONSTRAINTS: Final[dict[str, tuple[str, ...]]] = {
         "ck_memory_topic_member_rank_nonnegative",
     ),
     "memory_export_artifacts": (
+        "ck_memory_export_artifact_kind",
         "ck_memory_export_artifact_format",
         "ck_memory_export_artifact_status",
         "ck_memory_export_artifact_redaction_posture",
@@ -815,7 +817,8 @@ REQUIRED_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
         "ck_memory_topic_member_rank_nonnegative": ("rank", ">=", "0"),
     },
     "memory_export_artifacts": {
-        "ck_memory_export_artifact_format": ("'json'",),
+        "ck_memory_export_artifact_kind": ("'memory_snapshot'", "'agents_md'"),
+        "ck_memory_export_artifact_format": ("'json'", "'markdown'"),
         "ck_memory_export_artifact_status": ("'created'", "'failed'"),
         "ck_memory_export_artifact_redaction_posture": ("'redacted'", "'privacy_deleted'"),
         "ck_memory_export_artifact_source_memory_versions_object": (

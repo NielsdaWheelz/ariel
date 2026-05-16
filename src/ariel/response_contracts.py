@@ -1026,6 +1026,7 @@ class SurfaceMemoryExportArtifactContract(BaseModel):
 
     id: str
     scope_key: str
+    artifact_kind: str
     export_format: str
     status: str
     projection_version: str

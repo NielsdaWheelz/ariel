@@ -2354,6 +2354,7 @@ class MemoryExportArtifactRecord(Base):
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     scope_key: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    artifact_kind: Mapped[str] = mapped_column(String(32), nullable=False)
     export_format: Mapped[str] = mapped_column(String(32), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     projection_version: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -2372,7 +2373,11 @@ class MemoryExportArtifactRecord(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "export_format IN ('json')",
+            "artifact_kind IN ('memory_snapshot', 'agents_md')",
+            name="ck_memory_export_artifact_kind",
+        ),
+        CheckConstraint(
+            "export_format IN ('json', 'markdown')",
             name="ck_memory_export_artifact_format",
         ),
         CheckConstraint(

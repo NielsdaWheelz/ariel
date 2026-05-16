@@ -5039,6 +5039,13 @@ def consolidate_memory(
         block.source_memory_versions = source_versions
         block.source_projection_versions = {"memory_context_blocks": MEMORY_PROJECTION_VERSION}
         block.updated_at = now
+    # Regenerate the repo-scoped AGENTS.md-style rules projection alongside the
+    # hot index and topic blocks. No-op for non-repo scopes.
+    rules_change = rebuild_repo_rules_artifact(
+        db, scope_key=scope_key, actor_id=actor_id, now=now, new_id_fn=new_id_fn
+    )
+    if rules_change is not None:
+        applied_projection_changes.append(rules_change)
     emit_memory_events(
         db,
         events=[
@@ -5169,6 +5176,7 @@ def export_memory(
     artifact = MemoryExportArtifactRecord(
         id=new_id_fn("mea"),
         scope_key=scope_key,
+        artifact_kind="memory_snapshot",
         export_format="json",
         status="created",
         projection_version=MEMORY_PROJECTION_VERSION,
@@ -5219,6 +5227,7 @@ def export_memory(
     return {
         "id": artifact.id,
         "scope_key": artifact.scope_key,
+        "artifact_kind": artifact.artifact_kind,
         "export_format": artifact.export_format,
         "status": artifact.status,
         "projection_version": artifact.projection_version,
@@ -5228,6 +5237,163 @@ def export_memory(
         "source_projection_versions": artifact.source_projection_versions,
         "content": artifact.content,
         "created_at": to_rfc3339(artifact.created_at),
+    }
+
+
+def rebuild_repo_rules_artifact(
+    db: Session,
+    *,
+    scope_key: str,
+    actor_id: str,
+    now: datetime,
+    new_id_fn: Callable[[str], str],
+) -> dict[str, Any] | None:
+    """Materialise a repo scope's active, reviewed procedural memory plus its
+    `repo-conventions` topic-block content into a single versionable
+    `AGENTS.md`-style markdown file.
+
+    The file is a projection: canonical state stays in PostgreSQL. The artifact
+    upserts on `(scope_key, artifact_kind='agents_md')` so a regenerating
+    consolidation refreshes one stable row in place. Every rule carries its
+    source memory id (the procedure's canonical assertion id when present, else
+    the procedure id), which both traces the rule back and lets the existing
+    `_delete_projection_rows` content-match invalidation catch this artifact
+    when a source procedure is deleted or redacted.
+
+    Returns the artifact summary, or None for a non-repo scope (rules files are
+    a repo-scoped affordance).
+    """
+    if not scope_key.startswith("repo:"):
+        return None
+    procedures = db.scalars(
+        select(MemoryProcedureRecord)
+        .where(
+            MemoryProcedureRecord.scope_key == scope_key,
+            MemoryProcedureRecord.lifecycle_state == "active",
+            MemoryProcedureRecord.review_state.in_(("approved", "auto_approved")),
+        )
+        .order_by(MemoryProcedureRecord.procedure_key.asc(), MemoryProcedureRecord.id.asc())
+    ).all()
+    conventions_block = db.scalar(
+        select(MemoryContextBlockRecord)
+        .join(MemoryTopicRecord, MemoryContextBlockRecord.topic_id == MemoryTopicRecord.id)
+        .where(
+            MemoryContextBlockRecord.block_type == "topic",
+            MemoryContextBlockRecord.scope_key == scope_key,
+            MemoryContextBlockRecord.lifecycle_state == "active",
+            MemoryContextBlockRecord.projection_version == MEMORY_PROJECTION_VERSION,
+            MemoryTopicRecord.family == "repo-conventions",
+        )
+        .order_by(MemoryContextBlockRecord.updated_at.desc(), MemoryContextBlockRecord.id.asc())
+        .limit(1)
+    )
+    rules = [
+        {
+            "procedure_id": procedure.id,
+            "source_memory_id": procedure.source_assertion_id or procedure.id,
+            "title": _clean_text(procedure.title, max_chars=200),
+            "instruction": _clean_text(procedure.instruction, max_chars=700),
+        }
+        for procedure in procedures
+    ]
+    lines = [f"# {scope_key} — Agent Rules", ""]
+    lines.append(
+        "Generated projection of reviewed memory. Canonical state lives in "
+        "Ariel's memory store; edit memory through the memory APIs, not this file."
+    )
+    lines.append("")
+    if conventions_block is not None:
+        lines.extend(["## Repo Conventions", "", _clean_text(conventions_block.content), ""])
+    lines.append("## Procedural Rules")
+    lines.append("")
+    if rules:
+        for rule in rules:
+            lines.append(
+                f"- {rule['title']}: {rule['instruction']} [source: {rule['source_memory_id']}]"
+            )
+    else:
+        lines.append("- (no reviewed procedural memory in this scope)")
+    markdown = "\n".join(lines) + "\n"
+    source_memory_versions = {
+        "memory_procedures": {
+            procedure.id: _memory_version_number(
+                db, table="memory_procedures", record_id=procedure.id
+            )
+            for procedure in procedures
+        },
+        "memory_context_blocks": (
+            {
+                conventions_block.id: _memory_version_number(
+                    db, table="memory_context_blocks", record_id=conventions_block.id
+                )
+            }
+            if conventions_block is not None
+            else {}
+        ),
+    }
+    artifact = db.scalar(
+        select(MemoryExportArtifactRecord)
+        .where(
+            MemoryExportArtifactRecord.scope_key == scope_key,
+            MemoryExportArtifactRecord.artifact_kind == "agents_md",
+        )
+        .order_by(MemoryExportArtifactRecord.created_at.asc(), MemoryExportArtifactRecord.id.asc())
+        .limit(1)
+    )
+    content = {"markdown": markdown, "rules": rules}
+    source_counts = {
+        "procedures": len(rules),
+        "repo_conventions_block": 1 if conventions_block is not None else 0,
+    }
+    source_projection_versions = {
+        "memory_export_artifacts": MEMORY_PROJECTION_VERSION,
+        "memory_context_blocks": MEMORY_PROJECTION_VERSION,
+    }
+    if artifact is None:
+        artifact = MemoryExportArtifactRecord(
+            id=new_id_fn("mea"),
+            scope_key=scope_key,
+            artifact_kind="agents_md",
+            export_format="markdown",
+            status="created",
+            projection_version=MEMORY_PROJECTION_VERSION,
+            redaction_posture="redacted",
+            content=content,
+            source_counts=source_counts,
+            source_memory_versions=source_memory_versions,
+            source_projection_versions=source_projection_versions,
+            actor_id=actor_id,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(artifact)
+        db.flush()
+    else:
+        artifact.export_format = "markdown"
+        artifact.status = "created"
+        artifact.projection_version = MEMORY_PROJECTION_VERSION
+        artifact.redaction_posture = "redacted"
+        artifact.content = content
+        artifact.source_counts = source_counts
+        artifact.source_memory_versions = source_memory_versions
+        artifact.source_projection_versions = source_projection_versions
+        artifact.updated_at = now
+    _record_version(
+        db,
+        table="memory_export_artifacts",
+        record_id=artifact.id,
+        change_type="exported",
+        actor_id=actor_id,
+        reason="repo rules artifact rebuilt",
+        new_state={"scope_key": scope_key, "source_counts": source_counts},
+        now=now,
+        new_id_fn=new_id_fn,
+    )
+    return {
+        "kind": "repo_rules_artifact",
+        "export_artifact_id": artifact.id,
+        "scope_key": scope_key,
+        "source_counts": source_counts,
     }
 
 
@@ -6481,6 +6647,7 @@ def list_memory(db: Session) -> dict[str, Any]:
             {
                 "id": artifact.id,
                 "scope_key": artifact.scope_key,
+                "artifact_kind": artifact.artifact_kind,
                 "export_format": artifact.export_format,
                 "status": artifact.status,
                 "projection_version": artifact.projection_version,
