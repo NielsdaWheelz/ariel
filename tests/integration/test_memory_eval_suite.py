@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from itertools import count
 import json
 from typing import Any, cast
@@ -157,7 +157,7 @@ class _RememberAdapter:
 # Each topic word maps to its own embedding dimension: text sharing a topic word
 # is close in cosine space, unrelated text is orthogonal. Mirrors the fixture in
 # test_north_star_memory_pass so the suite exercises a genuine, non-degenerate
-# vector signal; dimensions 10-14 carry the FO-1 failure-mode case families.
+# vector signal; dimensions 10-15 carry the FO-1 failure-mode case families.
 _EMBEDDING_TOPIC_DIMENSIONS: dict[str, int] = {
     "phoenix": 0,
     "notebook": 1,
@@ -174,6 +174,7 @@ _EMBEDDING_TOPIC_DIMENSIONS: dict[str, int] = {
     "harbor": 12,
     "archive": 13,
     "tariff": 14,
+    "granary": 15,
 }
 
 
@@ -782,6 +783,58 @@ def _seed_failure_mode_corpus(client: TestClient) -> dict[str, str]:
         _approve(client, assertion_id)
         ids[label] = assertion_id
 
+    # Selective forgetting: a fact seeded with full projections, then aged into
+    # the demotable condition -- low confidence, far past the staleness horizon --
+    # so the consolidation forgetting pass demotes it to `stale` with no operator
+    # action. last_verified_at and valid_from are not settable through the API, so
+    # the aged value score is established by backdating the activated row directly;
+    # valid_from is moved back too so the staleness-stamped valid_to stays after it.
+    demoted = _candidate(
+        client,
+        subject_key="project:granary",
+        predicate="project.open_question",
+        assertion_type="project_state",
+        value="the granary cold-storage retrofit estimate is nineteen idle months",
+        evidence_text="The user once floated the granary cold-storage retrofit estimate.",
+    )
+    _approve(client, demoted)
+    ids["granary_demoted"] = demoted
+    _drain_embedding_jobs(client)
+    with _session_factory(client)() as db:
+        with db.begin():
+            aged = db.get(MemoryAssertionRecord, demoted)
+            assert aged is not None
+            aged.confidence = 0.3
+            aged.last_verified_at = now - timedelta(days=200)
+            aged.valid_from = now - timedelta(days=200)
+    with _session_factory(client)() as db:
+        with db.begin():
+            memory.consolidate_memory(
+                db,
+                scope_key="project:granary",
+                actor_id="system",
+                now_fn=lambda: now,
+                new_id_fn=_new_id,
+                settings=_settings(),
+            )
+    # The forgetting pass demoted it to `stale`, stamping the transaction-time
+    # invalidation, and it is gone from the rebuilt hot index: a `stale` assertion
+    # is excluded from recall, the hot index, and topic blocks.
+    with _session_factory(client)() as db:
+        aged = db.get(MemoryAssertionRecord, demoted)
+        assert aged is not None
+        assert aged.lifecycle_state == "stale"
+        assert aged.invalidated_at == now
+        granary_hot = db.scalar(
+            select(MemoryContextBlockRecord).where(
+                MemoryContextBlockRecord.block_type == "hot_index",
+                MemoryContextBlockRecord.scope_key == "project:granary",
+            )
+        )
+    assert granary_hot is not None
+    assert demoted not in granary_hot.source_assertion_ids
+    assert "nineteen idle months" not in granary_hot.content.lower()
+
     _drain_embedding_jobs(client)
     return ids
 
@@ -920,6 +973,7 @@ _FAILURE_MODES = {
     "contradiction",
     "deletion-durability",
     "temporal-decisive",
+    "selective-forgetting",
 }
 
 
@@ -936,7 +990,7 @@ def test_failure_mode_eval_suite_passes(
         session_id = _session_id(client)
         ids = _seed_failure_mode_corpus(client)
         cases = _resolve_natural_cases(ADVERSARIAL_FAILURE_MODE_CASES, ids)
-        assert len(cases) == 5
+        assert len(cases) == 6
         assert {case["failure_mode"] for case in cases} == _FAILURE_MODES
 
         with _session_factory(client)() as db:

@@ -2192,7 +2192,57 @@ def _activate_assertion(
     new_id_fn: Callable[[str], str],
 ) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
+    reactivated_from_stale = False
     if not assertion.is_multi_valued:
+        # Re-confirmation (FO-3). A single-valued fact restated while a `stale`
+        # twin of the same value exists is the same demoted fact being verified
+        # again: the demoted assertion is re-activated below, and this fresh
+        # candidate folds into it as a superseded duplicate, so recall never
+        # carries a stale assertion beside a new active one.
+        stale_twin = db.scalar(
+            select(MemoryAssertionRecord)
+            .where(
+                MemoryAssertionRecord.subject_entity_id == assertion.subject_entity_id,
+                MemoryAssertionRecord.predicate == assertion.predicate,
+                MemoryAssertionRecord.scope_key == assertion.scope_key,
+                MemoryAssertionRecord.object_value == assertion.object_value,
+                MemoryAssertionRecord.is_multi_valued.is_(False),
+                MemoryAssertionRecord.lifecycle_state == "stale",
+                MemoryAssertionRecord.id != assertion.id,
+            )
+            .order_by(MemoryAssertionRecord.updated_at.desc(), MemoryAssertionRecord.id.asc())
+            .limit(1)
+        )
+        if stale_twin is not None:
+            candidate = assertion
+            candidate.lifecycle_state = "superseded"
+            candidate.superseded_by_assertion_id = stale_twin.id
+            candidate.valid_to = now
+            candidate.invalidated_at = now
+            candidate.updated_at = now
+            candidate_invalidation = _delete_projection_rows(db, assertion_id=candidate.id, now=now)
+            _record_version(
+                db,
+                table="memory_assertions",
+                record_id=candidate.id,
+                change_type="superseded",
+                actor_id=actor_id,
+                reason="re-confirmation folded into re-activated assertion",
+                new_state={"superseded_by_assertion_id": stale_twin.id},
+                projection_invalidation=candidate_invalidation,
+                now=now,
+                new_id_fn=new_id_fn,
+            )
+            events.append(
+                {
+                    "event_type": "evt.memory.assertion_superseded",
+                    "payload": _event_payload(candidate),
+                }
+            )
+            # The demoted twin is now the activation target: the rest of this
+            # function re-activates it and rebuilds its projections.
+            assertion = stale_twin
+            reactivated_from_stale = True
         for existing in _active_single_assertions(
             db,
             subject_entity_id=assertion.subject_entity_id,
@@ -2237,12 +2287,18 @@ def _activate_assertion(
     assertion.invalidated_at = None
     assertion.last_verified_at = now
     assertion.updated_at = now
+    if reactivated_from_stale and assertion.valid_to is not None and assertion.valid_to <= now:
+        # A demoted twin carries the staleness-stamped valid_to mark_assertion_stale
+        # set; a re-confirmed fact holds now, so a now-past valid_to is cleared.
+        assertion.valid_to = None
     _record_review(
         db,
         assertion_id=assertion.id,
         decision="approved",
         actor_id=actor_id,
-        reason="reviewed memory activated",
+        reason="reactivated by re-confirmation"
+        if reactivated_from_stale
+        else "reviewed memory activated",
         now=now,
         new_id_fn=new_id_fn,
     )
@@ -2252,7 +2308,7 @@ def _activate_assertion(
         record_id=assertion.id,
         change_type="reviewed",
         actor_id=actor_id,
-        reason="activated",
+        reason="reactivated by re-confirmation" if reactivated_from_stale else "activated",
         new_state={"lifecycle_state": "active"},
         now=now,
         new_id_fn=new_id_fn,
@@ -3393,6 +3449,7 @@ def redact_evidence(
         assertion.lifecycle_state = "retracted"
         assertion.object_value = {"text": "[redacted]"}
         assertion.valid_to = now
+        assertion.invalidated_at = now
         assertion.updated_at = now
         projection_invalidation = _delete_projection_rows(
             db, assertion_id=assertion.id, now=now, redaction_posture="redacted"
@@ -8021,7 +8078,7 @@ def build_memory_context(
     symbol_ranking, symbol_features_by_id = _symbol_signal(
         db, query_terms=query_terms, limit=candidate_limit
     )
-    temporal_ranking = _temporal_signal(db, now=now, limit=candidate_limit)
+    temporal_ranking = _temporal_signal(db, now=as_of or now, limit=candidate_limit)
     recency_ranking = _recency_signal(db, per_kind_limit=max(8, max_recalled_assertions))
     signal_rankings: dict[str, list[tuple[str, str]]] = {
         "vector": vector_ranking,

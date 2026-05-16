@@ -3648,6 +3648,42 @@ def test_retract_delete_and_stale_each_record_invalidated_at(postgres_url: str) 
                 assert row.invalidated_at == row.updated_at
 
 
+def test_redacting_evidence_records_invalidated_at_on_the_retracted_assertion(
+    postgres_url: str,
+) -> None:
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        # Redacting source evidence cascades its linked active assertion to
+        # `retracted`. That is a transition out of `active`, so -- like retract,
+        # delete, stale, and supersession -- it must stamp invalidated_at; without
+        # it an as-of recall would reconstruct the redacted assertion as
+        # believed-active for all time.
+        assertion = _candidate(client, value="orion launch secret is code violet")
+        assert client.post(f"/v1/memory/candidates/{assertion['id']}/approve").status_code == 200
+
+        with _session_factory(client)() as db:
+            evidence_id = db.scalar(
+                select(MemoryAssertionEvidenceRecord.evidence_id)
+                .where(MemoryAssertionEvidenceRecord.assertion_id == assertion["id"])
+                .limit(1)
+            )
+        assert evidence_id is not None
+        assert (
+            client.post(
+                f"/v1/memory/evidence/{evidence_id}/redact",
+                json={"reason": "user requested source redaction"},
+            ).status_code
+            == 200
+        )
+
+        with _session_factory(client)() as db:
+            redacted = db.get(MemoryAssertionRecord, assertion["id"])
+            assert redacted is not None
+            assert redacted.lifecycle_state == "retracted"
+            assert redacted.invalidated_at is not None
+            assert redacted.invalidated_at == redacted.updated_at
+
+
 def test_as_of_recall_reconstructs_past_transaction_time_belief_state(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -3802,3 +3838,123 @@ def test_reactivation_clears_invalidated_at(postgres_url: str) -> None:
             assert reactivated is not None
             assert reactivated.lifecycle_state == "active"
             assert reactivated.invalidated_at is None
+
+
+def test_reconfirmation_reactivates_an_assertion_demoted_by_the_forgetting_pass(
+    postgres_url: str,
+) -> None:
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        session_id = _session_id(client)
+        # Fully time-controlled instants so the forgetting pass and the
+        # re-confirmation are exact: propose and activate a single-valued fact,
+        # then consolidate 300 days later -- far past the staleness horizon -- and
+        # re-confirm two minutes after that. Each step gets a constant now so the
+        # several now_fn calls inside a step (consolidation calls it again through
+        # mark_assertion_stale) all agree.
+        base = datetime(2026, 5, 16, 12, 0, 0, tzinfo=UTC)
+        consolidate_at = base + timedelta(days=300)
+        reconfirm_at = consolidate_at + timedelta(minutes=2)
+
+        # fact.environment is a supersede-policy (single-valued), decaying
+        # predicate. The candidate is proposed with a low confidence so its
+        # half-life-decayed value score lands below the forgetting floor.
+        with _session_factory(client)() as db:
+            with db.begin():
+                memory.propose_memory_candidate(
+                    db,
+                    source_session_id=session_id,
+                    actor_id="system",
+                    evidence_text="The user said the staging database runs postgres 14.",
+                    subject_key="fact:staging-db",
+                    predicate="fact.environment",
+                    assertion_type="fact",
+                    value="the staging database runs postgres 14",
+                    confidence=0.3,
+                    scope_key="global",
+                    valid_from=None,
+                    valid_to=None,
+                    extraction_model="fixture",
+                    extraction_prompt_version="fixture",
+                    now_fn=lambda: base,
+                    new_id_fn=_new_id,
+                )
+        seeded_id = client.get("/v1/memory").json()["candidates"][0]["id"]
+        with _session_factory(client)() as db:
+            with db.begin():
+                memory.approve_candidate(
+                    db,
+                    assertion_id=seeded_id,
+                    actor_id="system",
+                    now_fn=lambda: base + timedelta(minutes=1),
+                    new_id_fn=_new_id,
+                )
+
+        # The forgetting pass, run 300 days on, demotes the now low-value fact to
+        # `stale`, stamping the transaction-time invalidation.
+        with _session_factory(client)() as db:
+            with db.begin():
+                memory.consolidate_memory(
+                    db,
+                    scope_key="global",
+                    actor_id="system",
+                    now_fn=lambda: consolidate_at,
+                    new_id_fn=_new_id,
+                    settings=_settings(),
+                )
+        with _session_factory(client)() as db:
+            demoted = db.get(MemoryAssertionRecord, seeded_id)
+            assert demoted is not None
+            assert demoted.lifecycle_state == "stale"
+            assert demoted.invalidated_at == consolidate_at
+
+        # Re-confirmation: the same fact is stated again and approved. Activation
+        # finds the demoted twin of the same value and re-activates it rather than
+        # leaving a stale assertion beside a fresh active one, so invalidated_at is
+        # cleared and last_verified_at is refreshed.
+        reconfirm = _candidate(
+            client,
+            value="the staging database runs postgres 14",
+            assertion_type="fact",
+            subject_key="fact:staging-db",
+            predicate="fact.environment",
+        )
+        assert reconfirm["id"] != seeded_id
+        with _session_factory(client)() as db:
+            with db.begin():
+                memory.approve_candidate(
+                    db,
+                    assertion_id=reconfirm["id"],
+                    actor_id="system",
+                    now_fn=lambda: reconfirm_at,
+                    new_id_fn=_new_id,
+                )
+
+        with _session_factory(client)() as db:
+            reactivated = db.get(MemoryAssertionRecord, seeded_id)
+            assert reactivated is not None
+            assert reactivated.lifecycle_state == "active"
+            assert reactivated.invalidated_at is None
+            assert reactivated.last_verified_at == reconfirm_at
+            # The re-confirmation candidate folds into the re-activated twin, so
+            # recall carries one active assertion, not a stale/active duplicate.
+            folded = db.get(MemoryAssertionRecord, reconfirm["id"])
+            assert folded is not None
+            assert folded.lifecycle_state == "superseded"
+            assert folded.superseded_by_assertion_id == seeded_id
+            # The re-activation is audited on a review and a version row.
+            review = db.scalar(
+                select(MemoryReviewRecord).where(
+                    MemoryReviewRecord.assertion_id == seeded_id,
+                    MemoryReviewRecord.reason == "reactivated by re-confirmation",
+                )
+            )
+            assert review is not None
+            version = db.scalar(
+                select(MemoryVersionRecord).where(
+                    MemoryVersionRecord.canonical_table == "memory_assertions",
+                    MemoryVersionRecord.canonical_id == seeded_id,
+                    MemoryVersionRecord.reason == "reactivated by re-confirmation",
+                )
+            )
+            assert version is not None

@@ -250,6 +250,25 @@ ADVERSARIAL_FAILURE_MODE_CASES: list[dict[str, Any]] = [
         "expect_policy_blocked": False,
         "max_recalled_assertions": 1,
     },
+    {
+        # Selective forgetting (FO-3). A low-confidence, low-salience fact left
+        # unverified far past the staleness horizon is demoted to `stale` by the
+        # consolidation forgetting pass with no operator action. A demoted
+        # assertion is excluded from recall, so it must not surface and its value
+        # text must not appear. The case fails under any lifecycle path that does
+        # not run the forgetting pass: the fact would stay active and be recalled.
+        # The suite seeds and demotes it, asserting the demotion directly.
+        "name": "selective-forgetting-demotes-low-value-fact",
+        "failure_mode": "selective-forgetting",
+        "query": "what is the granary cold-storage retrofit estimate",
+        "expect_labels": [],
+        "forbid_labels": ["granary_demoted"],
+        "expected_kinds": [],
+        "forbidden_texts": ["nineteen idle months"],
+        "expect_conflict": False,
+        "expect_policy_blocked": False,
+        "max_recalled_assertions": 8,
+    },
 ]
 
 
