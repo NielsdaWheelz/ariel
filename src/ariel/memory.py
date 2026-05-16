@@ -59,6 +59,7 @@ MEMORY_CONTEXT_SCHEMA_VERSION = "memory.sota.v2"
 MEMORY_PROJECTION_VERSION = "embedding-v1"
 MEMORY_CURATION_PROMPT_VERSION = "memory-curation-v2"
 MEMORY_CONTINUITY_PROMPT_VERSION = "memory-continuity-v1"
+MEMORY_REFLECTION_PROMPT_VERSION = "memory-reflection-v1"
 USER_SUBJECT_KEY = "user:default"
 ALLOWED_MEMORY_ASSERTION_TYPES = {
     "fact",
@@ -4646,6 +4647,11 @@ def consolidate_memory(
         )
 
     candidate_events: list[dict[str, Any]] = []
+    # Every (subject_key, predicate, normalized value) the mechanical WS-5
+    # negative promotion proposes this pass. The FO-4 reflection phase below
+    # dedupes its own proposals against this set so it never re-proposes a
+    # mechanical promotion from the same run.
+    mechanical_candidate_keys: set[tuple[str, str, str]] = set()
     negative_predicate_by_trace_type = {
         "failure": "negative.known_bad_path",
         "user_correction": "negative.invalid_assumption",
@@ -4657,6 +4663,7 @@ def consolidate_memory(
         trace_evidence = db.get(MemoryEvidenceRecord, reasoning_trace.primary_evidence_id)
         if trace_evidence is None or trace_evidence.lifecycle_state != "available":
             continue
+        negative_value = _clean_text(reasoning_trace.trace_summary, max_chars=700)
         events = propose_memory_candidate(
             db,
             source_session_id=trace_evidence.source_session_id,
@@ -4665,7 +4672,7 @@ def consolidate_memory(
             subject_key=scope_key,
             predicate=predicate,
             assertion_type="negative",
-            value=_clean_text(reasoning_trace.trace_summary, max_chars=700),
+            value=negative_value,
             confidence=0.6,
             scope_key=scope_key,
             valid_from=None,
@@ -4677,6 +4684,7 @@ def consolidate_memory(
             source_evidence_id=reasoning_trace.primary_evidence_id,
         )
         candidate_events.extend(events)
+        mechanical_candidate_keys.add((scope_key, predicate, _memory_key(negative_value)))
         for event in events:
             event_payload = event.get("payload")
             if event.get("event_type") == "evt.memory.candidate_proposed" and isinstance(
@@ -4690,6 +4698,230 @@ def consolidate_memory(
                         "source_reasoning_trace_id": reasoning_trace.id,
                     }
                 )
+
+    # Reflective consolidation (FO-4). One bounded AI judgment over the scope's
+    # recent episodes, reasoning traces, and action traces proposes higher-order
+    # memory no single record states: cross-record synthesised insights and
+    # negative memory from recurring failure patterns. This is LLM reflective
+    # synthesis layered on top of the mechanical WS-5 promotion above, not a
+    # restatement of it. The phase is skipped when there is nothing to reflect
+    # on. Every proposed item is routed through propose_memory_candidate -> the
+    # standard candidate -> review lifecycle and is deduped out when it overlaps
+    # an existing active/candidate assertion or a mechanical promotion from this
+    # same pass. The judgment is recorded as an AIJudgmentRecord.
+    reflection_episodes = (
+        db.scalars(
+            select(MemoryEpisodeRecord)
+            .where(
+                MemoryEpisodeRecord.lifecycle_state == "active",
+                MemoryEpisodeRecord.scope_key.in_((scope_key, f"session:{scope_key}")),
+            )
+            .order_by(MemoryEpisodeRecord.occurred_at.desc(), MemoryEpisodeRecord.id.asc())
+            .limit(24)
+        ).all()
+        if scope_key != "global"
+        else db.scalars(
+            select(MemoryEpisodeRecord)
+            .where(MemoryEpisodeRecord.lifecycle_state == "active")
+            .order_by(MemoryEpisodeRecord.occurred_at.desc(), MemoryEpisodeRecord.id.asc())
+            .limit(24)
+        ).all()
+    )
+    reflection_inputs = len(reflection_episodes) + len(reasoning_traces) + len(action_traces)
+    if reflection_inputs:
+        # A synthesised candidate has no single primary evidence row, so
+        # propose_memory_candidate mints a fresh system evidence row for each
+        # one; that write needs a real session. The reflected records carry it
+        # on their evidence (source_session_id is NOT NULL), so the session of
+        # the first reflected record's evidence is the evidence-attribution
+        # session — independent of whether consolidate_memory got a session.
+        reflection_evidence_ids: list[str] = [
+            *(trace.primary_evidence_id for trace in reasoning_traces),
+            *(episode.primary_evidence_id for episode in reflection_episodes),
+            *(trace.primary_evidence_id for trace in action_traces),
+        ]
+        first_evidence = db.get(MemoryEvidenceRecord, reflection_evidence_ids[0])
+        if first_evidence is None:
+            raise MemoryProjectionError(
+                f"reflection input evidence {reflection_evidence_ids[0]} "
+                f"for scope {scope_key} is missing"
+            )
+        reflection_session_id = first_evidence.source_session_id
+        reflection_episode_payloads = [
+            {
+                "id": episode.id,
+                "episode_type": episode.episode_type,
+                "title": _clean_text(episode.title, max_chars=200),
+                "summary": _clean_text(episode.summary, max_chars=500),
+                "outcome": _clean_text(episode.outcome, max_chars=300) if episode.outcome else None,
+            }
+            for episode in reflection_episodes
+        ]
+        reflection_trace_payloads = [
+            {
+                "id": reasoning_trace.id,
+                "trace_type": reasoning_trace.trace_type,
+                "task_summary": _clean_text(reasoning_trace.task_summary, max_chars=300),
+                "trace_summary": _clean_text(reasoning_trace.trace_summary, max_chars=500),
+                "outcome": reasoning_trace.outcome,
+            }
+            for reasoning_trace in reasoning_traces
+        ]
+        reflection_action_payloads = [
+            {
+                "id": action_trace.id,
+                "capability_id": action_trace.capability_id,
+                "summary": _clean_text(action_trace.summary, max_chars=300),
+                "outcome": action_trace.outcome,
+            }
+            for action_trace in action_traces
+        ]
+        ai_judgment_id = new_id_fn("ajg")
+        reflection_input_refs = {
+            "scope_key": scope_key,
+            "episode_ids": [episode["id"] for episode in reflection_episode_payloads],
+            "reasoning_trace_ids": [trace["id"] for trace in reflection_trace_payloads],
+            "action_trace_ids": [trace["id"] for trace in reflection_action_payloads],
+        }
+        try:
+            reflection = _reflect_on_scope_with_model(
+                scope_key=scope_key,
+                episodes=reflection_episode_payloads,
+                reasoning_traces=reflection_trace_payloads,
+                action_traces=reflection_action_payloads,
+                settings=resolved_settings,
+            )
+        except AIJudgmentFailure as exc:
+            db.add(
+                AIJudgmentRecord(
+                    id=ai_judgment_id,
+                    judgment_type="reflective_consolidation",
+                    source_type="memory_scope",
+                    source_id=scope_key,
+                    status="failed",
+                    model=resolved_settings.model_name,
+                    prompt_version=MEMORY_REFLECTION_PROMPT_VERSION,
+                    provider_response_id=exc.provider_response_id,
+                    input_summary="reflective consolidation over scope episodes and traces",
+                    input_refs=reflection_input_refs,
+                    selected=[],
+                    omitted=[],
+                    output={},
+                    rationale=None,
+                    uncertainty=None,
+                    confidence=None,
+                    parse_status=exc.parse_status,
+                    validation_status=exc.validation_status,
+                    failure_code=exc.code,
+                    failure_reason=exc.safe_reason,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            db.flush()
+            raise
+        # Existing active/candidate assertions in scope: a reflection proposal
+        # that matches one is already known and is deduped out.
+        existing_assertion_keys = {
+            (assertion.subject_key, assertion.predicate, _memory_key(_assertion_text(assertion)))
+            for assertion in db.scalars(
+                select(MemoryAssertionRecord).where(
+                    MemoryAssertionRecord.lifecycle_state.in_(("active", "candidate")),
+                    or_(
+                        MemoryAssertionRecord.scope_key == scope_key,
+                        MemoryAssertionRecord.subject_key == scope_key,
+                    ),
+                )
+            ).all()
+        }
+        reflection_selected: list[dict[str, Any]] = []
+        reflection_omitted: list[dict[str, Any]] = []
+        for item in reflection["proposed_memory"]:
+            item_key = (item["subject_key"], item["predicate"], _memory_key(item["value"]))
+            if item_key in existing_assertion_keys or item_key in mechanical_candidate_keys:
+                reflection_omitted.append(
+                    {
+                        "kind": item["kind"],
+                        "predicate": item["predicate"],
+                        "reason": "duplicate of an existing assertion or a mechanical promotion",
+                    }
+                )
+                continue
+            existing_assertion_keys.add(item_key)
+            events = propose_memory_candidate(
+                db,
+                source_session_id=reflection_session_id,
+                actor_id="system",
+                evidence_text=item["synthesis"],
+                subject_key=item["subject_key"],
+                predicate=item["predicate"],
+                assertion_type=item["assertion_type"],
+                value=item["value"],
+                confidence=item["confidence"],
+                scope_key=scope_key,
+                valid_from=None,
+                valid_to=None,
+                extraction_model=resolved_settings.model_name,
+                extraction_prompt_version=MEMORY_REFLECTION_PROMPT_VERSION,
+                now_fn=now_fn,
+                new_id_fn=new_id_fn,
+                settings=resolved_settings,
+            )
+            candidate_events.extend(events)
+            proposed_assertion_id = next(
+                (
+                    event["payload"].get("assertion_id")
+                    for event in events
+                    if event.get("event_type") == "evt.memory.candidate_proposed"
+                    and isinstance(event.get("payload"), dict)
+                ),
+                None,
+            )
+            change_kind = (
+                "reflective_negative_memory_candidate"
+                if item["kind"] == "negative"
+                else "reflective_insight_candidate"
+            )
+            proposed_changes.append(
+                {
+                    "kind": change_kind,
+                    "predicate": item["predicate"],
+                    "assertion_id": proposed_assertion_id,
+                    "synthesis": item["synthesis"],
+                }
+            )
+            reflection_selected.append(
+                {"assertion_id": proposed_assertion_id, "kind": item["kind"]}
+            )
+        db.add(
+            AIJudgmentRecord(
+                id=ai_judgment_id,
+                judgment_type="reflective_consolidation",
+                source_type="memory_scope",
+                source_id=scope_key,
+                status="succeeded",
+                model=reflection["model"],
+                prompt_version=reflection["prompt_version"],
+                provider_response_id=reflection.get("provider_response_id"),
+                input_summary="reflective consolidation over scope episodes and traces",
+                input_refs=reflection_input_refs,
+                selected=reflection_selected,
+                omitted=reflection_omitted,
+                output={
+                    "proposed_count": len(reflection_selected),
+                    "deduped_count": len(reflection_omitted),
+                },
+                rationale=reflection["rationale"],
+                uncertainty=reflection["uncertainty"] or None,
+                confidence=reflection["confidence"],
+                parse_status=reflection["parse_status"],
+                validation_status="valid",
+                failure_code=None,
+                failure_reason=None,
+                created_at=now,
+                updated_at=now,
+            )
+        )
 
     # Hot index: a salience-ranked set of pointer entries plus the WS-5 "do not
     # repeat" section. Entries carry source ids only, never verbatim values, so
@@ -6629,6 +6861,255 @@ def _curate_memory_context_with_model(
         raise
     curation["provider_response_id"] = provider_response_id
     return curation
+
+
+def _validated_memory_reflection(raw_payload: Any, *, model: str) -> dict[str, Any]:
+    """Validate the reflective-consolidation model output into a strict typed
+    contract. proposed_memory holds at most eight items; each is an `insight`
+    (a cross-record derived semantic fact) or a `negative` item (a recurring
+    failure pattern), carrying the predicate vocabulary the standard candidate
+    lifecycle accepts. A malformed item fails closed; there is no partial parse."""
+    if not isinstance(raw_payload, dict):
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_SCHEMA",
+            safe_reason="memory reflection model returned a non-object JSON value",
+            retryable=False,
+            parse_status="schema_invalid",
+            validation_status="invalid",
+        )
+    proposed_raw = raw_payload.get("proposed_memory")
+    rationale = raw_payload.get("rationale")
+    uncertainty = raw_payload.get("uncertainty")
+    confidence = raw_payload.get("confidence")
+    if not (
+        isinstance(proposed_raw, list)
+        and isinstance(rationale, str)
+        and isinstance(uncertainty, str)
+        and isinstance(confidence, int | float)
+    ):
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_SCHEMA",
+            safe_reason="memory reflection JSON missing required fields",
+            retryable=False,
+            parse_status="schema_invalid",
+            validation_status="invalid",
+        )
+    if len(proposed_raw) > 8:
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_VALIDATION",
+            safe_reason="memory reflection proposed too many items",
+            retryable=False,
+            parse_status="parsed",
+            validation_status="invalid",
+        )
+    proposed: list[dict[str, Any]] = []
+    for item in proposed_raw:
+        if not isinstance(item, dict) or set(item.keys()) != {
+            "kind",
+            "subject_key",
+            "predicate",
+            "assertion_type",
+            "value",
+            "confidence",
+            "synthesis",
+        }:
+            raise AIJudgmentFailure(
+                code="E_AI_JUDGMENT_SCHEMA",
+                safe_reason="memory reflection proposed_memory item schema invalid",
+                retryable=False,
+                parse_status="schema_invalid",
+                validation_status="invalid",
+            )
+        kind = item.get("kind")
+        assertion_type = item.get("assertion_type")
+        predicate = item.get("predicate")
+        item_confidence = item.get("confidence")
+        # An insight is a derived non-negative semantic fact; a negative item is
+        # a recurring failure pattern. The two kinds gate the predicate/type
+        # pairing so a malformed pairing fails closed before the lifecycle.
+        kind_valid = (
+            kind == "insight"
+            and isinstance(assertion_type, str)
+            and assertion_type in ALLOWED_MEMORY_ASSERTION_TYPES
+            and assertion_type != "negative"
+            and isinstance(predicate, str)
+            and not predicate.strip().lower().startswith("negative.")
+        ) or (
+            kind == "negative"
+            and assertion_type == "negative"
+            and isinstance(predicate, str)
+            and predicate.strip().lower().startswith("negative.")
+        )
+        if (
+            not kind_valid
+            or not isinstance(item.get("subject_key"), str)
+            or not item["subject_key"].strip()
+            or not isinstance(predicate, str)
+            or not predicate.strip()
+            or not isinstance(item.get("value"), str)
+            or not item["value"].strip()
+            or not isinstance(item.get("synthesis"), str)
+            or not item["synthesis"].strip()
+            or isinstance(item_confidence, bool)
+            or not isinstance(item_confidence, int | float)
+            or float(item_confidence) < 0.0
+            or float(item_confidence) > 1.0
+        ):
+            raise AIJudgmentFailure(
+                code="E_AI_JUDGMENT_VALIDATION",
+                safe_reason="memory reflection proposed_memory item is invalid",
+                retryable=False,
+                parse_status="parsed",
+                validation_status="invalid",
+            )
+        proposed.append(
+            {
+                "kind": kind,
+                "subject_key": item["subject_key"].strip(),
+                "predicate": predicate.strip().lower(),
+                "assertion_type": assertion_type,
+                "value": _clean_text(item["value"], max_chars=700),
+                "confidence": max(0.0, min(float(item_confidence), 1.0)),
+                "synthesis": _clean_text(item["synthesis"], max_chars=300),
+            }
+        )
+    return {
+        "proposed_memory": proposed,
+        "rationale": _clean_text(rationale, max_chars=700),
+        "uncertainty": _clean_text(uncertainty, max_chars=500),
+        "confidence": max(0.0, min(float(confidence), 1.0)),
+        "model": model,
+        "prompt_version": MEMORY_REFLECTION_PROMPT_VERSION,
+        "parse_status": "parsed",
+    }
+
+
+def _reflect_on_scope_with_model(
+    *,
+    scope_key: str,
+    episodes: Sequence[dict[str, Any]],
+    reasoning_traces: Sequence[dict[str, Any]],
+    action_traces: Sequence[dict[str, Any]],
+    settings: AppSettings,
+) -> dict[str, Any]:
+    """One bounded reflective-consolidation judgment over a scope's recent
+    episodes, reasoning traces, and action traces. The model synthesises
+    higher-order memory no single record states — cross-record derived semantic
+    insights and negative memory from recurring failure patterns — returned as a
+    strict typed contract. Every proposed item is later routed through the
+    standard candidate -> review lifecycle, never written active."""
+    if settings.openai_api_key is None:
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_CREDENTIALS",
+            safe_reason="AI memory reflection requires ARIEL_OPENAI_API_KEY",
+            retryable=False,
+            parse_status="missing_output",
+            validation_status="not_validated",
+        )
+    prompt = (
+        "You are Ariel's reflective-consolidation reasoner. Given a memory "
+        "scope's recent episodes, reasoning traces, and action traces, derive "
+        "higher-order memory that NO SINGLE record states: synthesised insights "
+        "(cross-record derived semantic facts) and negative memory from "
+        "recurring failure patterns. Do not restate a single record; only "
+        "propose what genuine synthesis across multiple records yields. Return "
+        "JSON only with proposed_memory, rationale, uncertainty, and confidence. "
+        "Each proposed_memory item has kind, subject_key, predicate, "
+        "assertion_type, value, confidence, and synthesis (which records "
+        "support it). For kind 'insight' use a non-negative assertion_type "
+        "(fact, profile, preference, commitment, decision, project_state, "
+        "procedure, domain_concept) with a matching predicate. For kind "
+        "'negative' use assertion_type 'negative' with a negative.* predicate "
+        "(negative.rejected_approach, negative.invalid_assumption, "
+        "negative.already_checked, negative.unsafe_operation, "
+        "negative.known_bad_path). Propose at most 8 items; return an empty "
+        "proposed_memory list when no cross-record synthesis is warranted."
+    )
+    try:
+        response = httpx.post(
+            "https://api.openai.com/v1/responses",
+            headers={
+                "authorization": f"Bearer {settings.openai_api_key}",
+                "content-type": "application/json",
+            },
+            json={
+                "model": settings.model_name,
+                "input": [
+                    {"role": "system", "content": prompt},
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "prompt_version": MEMORY_REFLECTION_PROMPT_VERSION,
+                                "scope_key": scope_key,
+                                "episodes": list(episodes),
+                                "reasoning_traces": list(reasoning_traces),
+                                "action_traces": list(action_traces),
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    },
+                ],
+                "store": False,
+                "text": {"verbosity": "low"},
+            },
+            timeout=settings.model_timeout_seconds,
+        )
+    except httpx.TimeoutException as exc:
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_TIMEOUT",
+            safe_reason="memory reflection model timed out",
+            retryable=True,
+            parse_status="missing_output",
+            validation_status="not_validated",
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_REQUIRED",
+            safe_reason="memory reflection model network request failed",
+            retryable=True,
+            parse_status="missing_output",
+            validation_status="not_validated",
+        ) from exc
+    if response.status_code >= 400:
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_REQUIRED",
+            safe_reason=f"memory reflection model returned HTTP {response.status_code}",
+            retryable=True,
+            parse_status="missing_output",
+            validation_status="not_validated",
+        )
+    try:
+        response_payload = response.json()
+    except ValueError as exc:
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_REQUIRED",
+            safe_reason="memory reflection provider returned invalid JSON",
+            retryable=True,
+            parse_status="missing_output",
+            validation_status="not_validated",
+        ) from exc
+    provider_response_id = response_payload.get("id")
+    provider_response_id = provider_response_id if isinstance(provider_response_id, str) else None
+    try:
+        payload = json.loads(_extract_output_text(response_payload.get("output")))
+    except json.JSONDecodeError as exc:
+        raise AIJudgmentFailure(
+            code="E_AI_JUDGMENT_INVALID_JSON",
+            safe_reason="memory reflection model returned malformed JSON",
+            retryable=False,
+            parse_status="invalid_json",
+            validation_status="invalid",
+            provider_response_id=provider_response_id,
+        ) from exc
+    try:
+        reflection = _validated_memory_reflection(payload, model=settings.model_name)
+    except AIJudgmentFailure as exc:
+        exc.provider_response_id = provider_response_id
+        raise
+    reflection["provider_response_id"] = provider_response_id
+    return reflection
 
 
 def search_memory(

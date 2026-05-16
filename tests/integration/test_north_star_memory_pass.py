@@ -30,6 +30,7 @@ from ariel.memory import (
     record_action_trace,
 )
 from ariel.persistence import (
+    AIJudgmentRecord,
     ActionAttemptRecord,
     BackgroundTaskRecord,
     MemoryActionTraceRecord,
@@ -238,9 +239,35 @@ def _fake_memory_curation(
     }
 
 
+def _fake_memory_reflection(
+    *,
+    scope_key: str,
+    episodes: Sequence[dict[str, Any]],
+    reasoning_traces: Sequence[dict[str, Any]],
+    action_traces: Sequence[dict[str, Any]],
+    settings: AppSettings,
+) -> dict[str, Any]:
+    """Reflection fixture that proposes nothing. The default fake keeps tests
+    that merely exercise consolidation with traces present from depending on a
+    reflective synthesis; tests that assert FO-4 behaviour install their own
+    fake that proposes a synthesised insight or negative-memory item."""
+    del scope_key, episodes, reasoning_traces, action_traces, settings
+    return {
+        "proposed_memory": [],
+        "rationale": "fixture reflection proposed nothing",
+        "uncertainty": "",
+        "confidence": 0.9,
+        "model": "fixture-memory-reflector",
+        "prompt_version": memory.MEMORY_REFLECTION_PROMPT_VERSION,
+        "provider_response_id": "resp_fixture_memory_reflector",
+        "parse_status": "parsed",
+    }
+
+
 def _use_fake_memory_models(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(memory, "embed_memory_text", _fake_memory_embedding)
     monkeypatch.setattr(memory, "_curate_memory_context_with_model", _fake_memory_curation)
+    monkeypatch.setattr(memory, "_reflect_on_scope_with_model", _fake_memory_reflection)
 
 
 def _session_id(client: TestClient) -> str:
@@ -2727,6 +2754,395 @@ def test_consolidation_promotes_successful_traces_and_failures_to_candidates(
             assert negative.lifecycle_state == "candidate"
             assert negative.predicate == "negative.known_bad_path"
             assert negative.is_multi_valued is True
+
+
+def _seed_episode(
+    db: Any,
+    *,
+    episode_id: str,
+    title: str,
+    summary: str,
+    outcome: str | None,
+    session_id: str,
+    now: datetime,
+) -> None:
+    evidence_id = f"mev_{episode_id}"
+    db.add(
+        MemoryEvidenceRecord(
+            id=evidence_id,
+            source_turn_id=None,
+            source_session_id=session_id,
+            actor_id="system",
+            content_class="system",
+            trust_boundary="system",
+            lifecycle_state="available",
+            source_uri=None,
+            source_artifact_id=None,
+            source_text=summary,
+            evidence_snippet=summary[:360],
+            redaction_posture="none",
+            metadata_json={},
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    db.flush()
+    db.add(
+        MemoryEpisodeRecord(
+            id=episode_id,
+            episode_type="task_event",
+            scope_key="global",
+            title=title,
+            summary=summary,
+            outcome=outcome,
+            occurred_at=now,
+            valid_from=now,
+            valid_to=None,
+            lifecycle_state="active",
+            primary_evidence_id=evidence_id,
+            related_entity_ids=[],
+            related_assertion_ids=[],
+            metadata_json={},
+            created_at=now,
+            updated_at=now,
+        )
+    )
+
+
+def test_reflection_phase_proposes_synthesized_insight_and_negative_memory_as_candidates(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FO-4. A scope whose episodes and reasoning traces share a pattern that no
+    # single record states yields, from one bounded AI judgment, a synthesised
+    # insight and a negative-memory item — both routed through the standard
+    # candidate -> review lifecycle, never written active.
+    _use_fake_memory_models(monkeypatch)
+    now = datetime(2026, 5, 12, 9, 0, tzinfo=UTC)
+
+    def _reflection(
+        *,
+        scope_key: str,
+        episodes: Sequence[dict[str, Any]],
+        reasoning_traces: Sequence[dict[str, Any]],
+        action_traces: Sequence[dict[str, Any]],
+        settings: AppSettings,
+    ) -> dict[str, Any]:
+        del settings, action_traces
+        # The reflection sees the whole bounded scope and synthesises across it.
+        assert {episode["id"] for episode in episodes} == {"mep_flake_a", "mep_flake_b"}
+        assert {trace["id"] for trace in reasoning_traces} == {"mrt_flake_a", "mrt_flake_b"}
+        return {
+            "proposed_memory": [
+                {
+                    "kind": "insight",
+                    "subject_key": scope_key,
+                    "predicate": "domain.invariant",
+                    "assertion_type": "domain_concept",
+                    "value": "the integration suite is flaky whenever the cache is cold",
+                    "confidence": 0.75,
+                    "synthesis": "derived from two cold-cache episodes and two retry traces",
+                },
+                {
+                    "kind": "negative",
+                    "subject_key": scope_key,
+                    "predicate": "negative.known_bad_path",
+                    "assertion_type": "negative",
+                    "value": "do not run the integration suite before warming the cache",
+                    "confidence": 0.7,
+                    "synthesis": "the same cold-cache failure recurred across both traces",
+                },
+            ],
+            "rationale": "synthesised a cross-record flakiness invariant",
+            "uncertainty": "",
+            "confidence": 0.8,
+            "model": "fixture-memory-reflector",
+            "prompt_version": memory.MEMORY_REFLECTION_PROMPT_VERSION,
+            "provider_response_id": "resp_fixture_reflection",
+            "parse_status": "parsed",
+        }
+
+    monkeypatch.setattr(memory, "_reflect_on_scope_with_model", _reflection)
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        session_id = _session_id(client)
+        with _session_factory(client)() as db:
+            with db.begin():
+                # No single record states "cold cache causes flakiness"; each one
+                # records only one cold-cache run or one retry.
+                _seed_episode(
+                    db,
+                    episode_id="mep_flake_a",
+                    title="integration run with a cold cache",
+                    summary="ran the integration suite with a cold cache",
+                    outcome="three tests failed intermittently",
+                    session_id=session_id,
+                    now=now,
+                )
+                _seed_episode(
+                    db,
+                    episode_id="mep_flake_b",
+                    title="another integration run with a cold cache",
+                    summary="ran the integration suite again with a cold cache",
+                    outcome="two tests failed intermittently",
+                    session_id=session_id,
+                    now=now,
+                )
+                _seed_reasoning_trace(
+                    db,
+                    trace_id="mrt_flake_a",
+                    trace_type="diagnostic",
+                    task_summary="investigate the integration suite",
+                    trace_summary="retried the suite and the failures cleared",
+                    outcome="succeeded",
+                    session_id=session_id,
+                    now=now,
+                )
+                _seed_reasoning_trace(
+                    db,
+                    trace_id="mrt_flake_b",
+                    trace_type="diagnostic",
+                    task_summary="investigate the integration suite once more",
+                    trace_summary="retried the suite a second time and it passed",
+                    outcome="succeeded",
+                    session_id=session_id,
+                    now=now,
+                )
+
+        with _session_factory(client)() as db:
+            with db.begin():
+                result = memory.consolidate_memory(
+                    db,
+                    scope_key="global",
+                    actor_id="system",
+                    source_session_id=session_id,
+                    now_fn=lambda: now,
+                    new_id_fn=_new_id,
+                )
+        assert result["status"] == "completed"
+        change_kinds = [change["kind"] for change in result["proposed_changes"]]
+        assert "reflective_insight_candidate" in change_kinds
+        assert "reflective_negative_memory_candidate" in change_kinds
+
+        with _session_factory(client)() as db:
+            # The synthesised insight is a candidate assertion, never an active
+            # write, and carries a review row through the standard lifecycle.
+            insight = db.scalar(
+                select(MemoryAssertionRecord).where(
+                    MemoryAssertionRecord.predicate == "domain.invariant"
+                )
+            )
+            assert insight is not None
+            assert insight.lifecycle_state == "candidate"
+            assert insight.extraction_prompt_version == memory.MEMORY_REFLECTION_PROMPT_VERSION
+            assert (
+                insight.object_value["text"]
+                == "the integration suite is flaky whenever the cache is cold"
+            )
+            insight_review = db.scalar(
+                select(MemoryReviewRecord).where(
+                    MemoryReviewRecord.assertion_id == insight.id,
+                    MemoryReviewRecord.decision == "needs_user_review",
+                )
+            )
+            assert insight_review is not None
+            # The synthesised negative memory is likewise only a candidate.
+            negative = db.scalar(
+                select(MemoryAssertionRecord).where(
+                    MemoryAssertionRecord.predicate == "negative.known_bad_path"
+                )
+            )
+            assert negative is not None
+            assert negative.lifecycle_state == "candidate"
+            assert negative.assertion_type == "negative"
+
+            # The reflection is recorded as an auditable AI-judgment row with
+            # full provenance: model, prompt version, provider response id, and
+            # the input/selected sources.
+            judgment = db.scalar(
+                select(AIJudgmentRecord).where(
+                    AIJudgmentRecord.judgment_type == "reflective_consolidation"
+                )
+            )
+            assert judgment is not None
+            assert judgment.status == "succeeded"
+            assert judgment.source_type == "memory_scope"
+            assert judgment.source_id == "global"
+            assert judgment.model == "fixture-memory-reflector"
+            assert judgment.prompt_version == memory.MEMORY_REFLECTION_PROMPT_VERSION
+            assert judgment.provider_response_id == "resp_fixture_reflection"
+            assert sorted(judgment.input_refs["episode_ids"]) == ["mep_flake_a", "mep_flake_b"]
+            assert sorted(judgment.input_refs["reasoning_trace_ids"]) == [
+                "mrt_flake_a",
+                "mrt_flake_b",
+            ]
+            assert {entry["assertion_id"] for entry in judgment.selected} == {
+                insight.id,
+                negative.id,
+            }
+            assert judgment.omitted == []
+
+
+def test_reflection_phase_skipped_under_no_memory_mode(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FO-4 reuses the policy consolidate_memory already resolved: under a
+    # no_memory scope the whole consolidation, reflection included, is skipped.
+    _use_fake_memory_models(monkeypatch)
+    now = datetime(2026, 5, 12, 10, 0, tzinfo=UTC)
+
+    def _must_not_run(
+        *,
+        scope_key: str,
+        episodes: Sequence[dict[str, Any]],
+        reasoning_traces: Sequence[dict[str, Any]],
+        action_traces: Sequence[dict[str, Any]],
+        settings: AppSettings,
+    ) -> dict[str, Any]:
+        raise AssertionError("reflection ran under no_memory mode")
+
+    monkeypatch.setattr(memory, "_reflect_on_scope_with_model", _must_not_run)
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        session_id = _session_id(client)
+        with _session_factory(client)() as db:
+            with db.begin():
+                _seed_reasoning_trace(
+                    db,
+                    trace_id="mrt_no_memory",
+                    trace_type="diagnostic",
+                    task_summary="investigate something",
+                    trace_summary="looked at the failing job",
+                    outcome="succeeded",
+                    session_id=session_id,
+                    now=now,
+                )
+        assert (
+            client.put(
+                f"/v1/sessions/{session_id}/memory-mode", json={"memory_mode": "no_memory"}
+            ).status_code
+            == 200
+        )
+
+        with _session_factory(client)() as db:
+            with db.begin():
+                result = memory.consolidate_memory(
+                    db,
+                    scope_key="global",
+                    actor_id="system",
+                    source_session_id=session_id,
+                    now_fn=lambda: now,
+                    new_id_fn=_new_id,
+                )
+        assert result["status"] == "skipped"
+        assert result["memory_policy"]["effective_mode"] == "no_memory"
+        with _session_factory(client)() as db:
+            # No reflective-consolidation judgment was recorded.
+            assert (
+                db.scalar(
+                    select(func.count())
+                    .select_from(AIJudgmentRecord)
+                    .where(AIJudgmentRecord.judgment_type == "reflective_consolidation")
+                )
+                == 0
+            )
+
+
+def test_reflection_dedupes_proposal_overlapping_mechanical_promotion(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FO-4 layers LLM synthesis on top of the mechanical WS-5 promotion; it must
+    # not re-propose what the mechanical pass already proposed. A failure trace
+    # is mechanically promoted to a negative.known_bad_path candidate; a
+    # reflection proposal with the identical (subject, predicate, value) is
+    # deduped out, leaving exactly one negative candidate.
+    _use_fake_memory_models(monkeypatch)
+    now = datetime(2026, 5, 12, 11, 0, tzinfo=UTC)
+    duplicate_value = "patching the worker loop in place deadlocked the queue"
+
+    def _reflection(
+        *,
+        scope_key: str,
+        episodes: Sequence[dict[str, Any]],
+        reasoning_traces: Sequence[dict[str, Any]],
+        action_traces: Sequence[dict[str, Any]],
+        settings: AppSettings,
+    ) -> dict[str, Any]:
+        del episodes, reasoning_traces, action_traces, settings
+        return {
+            "proposed_memory": [
+                {
+                    "kind": "negative",
+                    "subject_key": scope_key,
+                    "predicate": "negative.known_bad_path",
+                    "assertion_type": "negative",
+                    "value": duplicate_value,
+                    "confidence": 0.7,
+                    "synthesis": "restates the mechanically promoted failure trace",
+                }
+            ],
+            "rationale": "proposed a negative item that overlaps the mechanical promotion",
+            "uncertainty": "",
+            "confidence": 0.8,
+            "model": "fixture-memory-reflector",
+            "prompt_version": memory.MEMORY_REFLECTION_PROMPT_VERSION,
+            "provider_response_id": "resp_fixture_reflection_dupe",
+            "parse_status": "parsed",
+        }
+
+    monkeypatch.setattr(memory, "_reflect_on_scope_with_model", _reflection)
+    adapter = MemoryContextProbeAdapter()
+    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+        session_id = _session_id(client)
+        with _session_factory(client)() as db:
+            with db.begin():
+                _seed_reasoning_trace(
+                    db,
+                    trace_id="mrt_dupe_fail",
+                    trace_type="failure",
+                    task_summary="patch the worker loop",
+                    trace_summary=duplicate_value,
+                    outcome="failed",
+                    session_id=session_id,
+                    now=now,
+                )
+
+        with _session_factory(client)() as db:
+            with db.begin():
+                result = memory.consolidate_memory(
+                    db,
+                    scope_key="global",
+                    actor_id="system",
+                    source_session_id=session_id,
+                    now_fn=lambda: now,
+                    new_id_fn=_new_id,
+                )
+        assert result["status"] == "completed"
+        change_kinds = [change["kind"] for change in result["proposed_changes"]]
+        # The mechanical promotion proposed the negative candidate; the
+        # overlapping reflection proposal was deduped out.
+        assert "negative_memory_candidate" in change_kinds
+        assert "reflective_negative_memory_candidate" not in change_kinds
+
+        with _session_factory(client)() as db:
+            negatives = db.scalars(
+                select(MemoryAssertionRecord).where(
+                    MemoryAssertionRecord.assertion_type == "negative"
+                )
+            ).all()
+            assert len(negatives) == 1
+            judgment = db.scalar(
+                select(AIJudgmentRecord).where(
+                    AIJudgmentRecord.judgment_type == "reflective_consolidation"
+                )
+            )
+            assert judgment is not None
+            assert judgment.selected == []
+            assert len(judgment.omitted) == 1
+            assert judgment.omitted[0]["predicate"] == "negative.known_bad_path"
+            assert judgment.output["deduped_count"] == 1
 
 
 def _top_rrf_curation(

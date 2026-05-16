@@ -356,7 +356,7 @@ class AIJudgmentRecord(Base):
                 "judgment_type IN ('memory_curation', 'tool_result_interpretation', "
                 "'memory_extraction', 'continuity_compaction', 'feedback_learning', "
                 "'ambient_interpretation', 'proactive_deliberation', 'model_output', "
-                "'workspace_commitment_extraction')"
+                "'workspace_commitment_extraction', 'reflective_consolidation')"
             ),
             name="ck_ai_judgment_type",
         ),

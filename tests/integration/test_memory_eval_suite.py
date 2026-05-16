@@ -234,9 +234,34 @@ def _rrf_curation(
     }
 
 
+def _no_op_reflection(
+    *,
+    scope_key: str,
+    episodes: Sequence[dict[str, Any]],
+    reasoning_traces: Sequence[dict[str, Any]],
+    action_traces: Sequence[dict[str, Any]],
+    settings: AppSettings,
+) -> dict[str, Any]:
+    """Reflection fixture that proposes nothing. The eval suite asserts
+    retrieval and lifecycle invariants, not reflective synthesis, so it keeps
+    the FO-4 reflection phase a no-op when a consolidated scope has traces."""
+    del scope_key, episodes, reasoning_traces, action_traces, settings
+    return {
+        "proposed_memory": [],
+        "rationale": "fixture reflection proposed nothing",
+        "uncertainty": "",
+        "confidence": 0.9,
+        "model": "fixture-memory-reflector",
+        "prompt_version": memory.MEMORY_REFLECTION_PROMPT_VERSION,
+        "provider_response_id": "resp_fixture_memory_reflector",
+        "parse_status": "parsed",
+    }
+
+
 def _use_fake_memory_models(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(memory, "embed_memory_text", _fake_memory_embedding)
     monkeypatch.setattr(memory, "_curate_memory_context_with_model", _rrf_curation)
+    monkeypatch.setattr(memory, "_reflect_on_scope_with_model", _no_op_reflection)
 
 
 def _session_id(client: TestClient) -> str:
