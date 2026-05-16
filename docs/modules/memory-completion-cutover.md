@@ -13,6 +13,15 @@ is deleted as the first step of this cutover. Where this document and
 memory.md](#amendments-to-memorymd) section lists the precise design-doc edits
 to apply.
 
+**Status (2026-05-16): the cutover is implemented, verified, and merged to
+`main`** — all ten workstreams, migration `20260515_0030`, and `make verify`
+green (ruff, mypy, and the full 669-test suite). Everything through the
+"Amendments To memory.md" section describes the executed design. The two
+sections appended after it — "State Of The Art Positioning" and "Forward
+Opportunities And v2 Roadmap" — record how the implementation compares to the
+2026 field and define the next iteration; they are roadmap, not part of the
+completed cutover.
+
 This is not a polish pass. It changes the schema, deletes two policy functions,
 rewrites candidate retrieval, and adds a deterministic predicate registry.
 
@@ -1261,3 +1270,210 @@ stay MECE:
   add `GET /v1/memory/events`.
 - **Data Model / Required Lifecycles** — note that conflict sets always reach a
   terminal state and that `conflict_type` is recorded.
+
+## State Of The Art Positioning
+
+A web survey of the agent-memory field — commercial memory layers, foundation-
+model assistant memory, coding-agent memory, the academic literature, the
+benchmark landscape, the research frontier, and user sentiment — was conducted
+on 2026-05-16. This section records what it found and where this cutover's
+implementation sits, so the document stays the single source of truth for the
+subsystem's direction.
+
+**The 2026 consensus architecture.** Serious memory systems have converged on
+eight properties: (1) memory is a write -> manage -> read *lifecycle*, not a
+store — the write side (extract, update, invalidate, consolidate, forget) is
+what separates memory from RAG; (2) the working/episodic/semantic/procedural
+taxonomy, increasingly plus negative memory; (3) lossless episodes kept beside
+derived semantic facts, every fact carrying provenance; (4) hybrid multi-signal
+retrieval — vector, lexical, entity/graph, recency, salience — never pure
+vector; (5) explicit temporal modelling, ideally bi-temporal, with stale facts
+invalidated rather than deleted; (6) consolidation off the hot path
+("sleep-time" / background reflection); (7) a compact always-loaded index plus
+lazily-loaded topic detail; (8) for coding work, a split between
+version-controlled rules and machine-local memory, plus code-map memory.
+
+**Where this implementation stands.** The completed cutover realises all eight:
+the predicate registry (a typed schema more rigorous than any shipped product's
+taxonomy), the episodic/semantic/procedural/negative/reasoning kinds, the
+evidence -> assertion provenance chain, RRF hybrid retrieval over seven signals,
+`valid_from`/`valid_to` temporal validity, autonomous consolidation jobs, the
+hot-index plus topic-block projection, and the eval gate. On the two dimensions
+the field is *weakest* at — a conflict lifecycle that always closes, and honest
+evaluation in the build — this implementation is ahead of the shipped products.
+
+**The honest gaps** (each is addressed by a Forward Opportunity below).
+(a) Temporal modelling is three-quarters of a bi-temporal model: it tracks
+valid-time and record-time but has no explicit transaction-time invalidation
+usable for "as-of" queries. (b) `decay_half_life_days` is a declared retrieval
+feature, not an active forgetting policy — and selective forgetting is the
+capability the entire field fails. (c) Consolidation is mechanical (merge,
+supersede, rebuild); it does not yet do reflective synthesis. (d) Repo-scoped
+procedural memory lives only in the database; the coding-tool consensus is to
+promote durable knowledge into version-controlled rule files.
+
+**Benchmark discipline.** The field's public leaderboards are not trustworthy:
+on the most-cited benchmark (LoCoMo) a plain full-context baseline outscores
+every memory product, ground-truth defects are documented, and vendor
+self-reports for the same system on the same benchmark span roughly 58-84%. The
+credible external benchmarks to track are LongMemEval, BEAM, ConvoMem, and
+MemoryAgentBench. The discipline they enforce — fixed backbone model, multiple
+runs with variance, every category counted, and a full-context baseline always
+included — is the standard the eval suite holds to (WS-10, extended by FO-1).
+
+**The frontier, and why this design stays external.** The research frontier —
+neural test-time memory (the Titans / Nested-Learning line), parametric memory
+layers, test-time training, self-editing models — is moving memory *into model
+weights*. None ships at production scale, and weight-resident memory is neither
+auditable nor cleanly deletable. This cutover's external, evidence-backed,
+inspectable store is the deliberately correct choice for a system that must
+honour deletion, redaction, and scoped no-memory. Parametric memory is out of
+scope until it is both auditable and production-proven (see Out Of Scope).
+
+## Forward Opportunities And v2 Roadmap
+
+These opportunities are **not part of the completed cutover** and are **not a
+hard cutover**. Each is an independent, incremental enhancement on the finished
+v1, shippable on its own behind the existing review, policy, and eval gates.
+They are ordered by leverage.
+
+### FO-1 — Adversarial Long-Memory Eval Expansion
+
+**Motivation.** The field's failure modes are well documented: contradiction
+resolution and selective forgetting fail almost universally; temporal and
+multi-session reasoning are weak. The credible benchmarks (BEAM, ConvoMem,
+MemoryAgentBench) earn their value by constructing *adversarial* cases that the
+broken benchmarks cannot. WS-10 shipped a 12-case suite and the `run_memory_eval`
+harness; it should grow into a genuine regression gate against every
+field-identified failure mode.
+
+**Target.** Extend `tests/fixtures/memory_eval_cases.py` and
+`tests/integration/test_memory_eval_suite.py` with one adversarial case per
+failure mode: a **knowledge-update chain** (a single-valued fact revised three
+times — recall must return only the latest, never a superseded value); a
+**multi-message-evidence** case (the answer requires fusing three to six
+messages); a **contradiction** case (an open conflict must surface as
+uncertainty, never as settled fact); a **deletion-durability** case (a
+privacy-deleted fact must not resurface through any projection or the hot
+index); a **temporal-decisive** case (validity windows change the answer); and a
+**discrimination guard** (a case a recency-only or full-context strategy gets
+wrong). Extend `run_memory_eval` to record per-failure-mode pass rates on
+`MemoryEvalRunRecord`.
+
+**Acceptance.** At least one case per field-identified failure mode; each
+adversarial case fails under a degraded baseline and passes under hybrid
+retrieval; per-mode metrics recorded; the suite stays in `make verify`.
+
+### FO-2 — True Bi-Temporal Validity
+
+**Motivation.** The central result of the temporal-knowledge-graph literature is
+bi-temporal modelling: separating *valid-time* (when a fact holds in the world)
+from *transaction-time* (when the system recorded it and later un-recorded it),
+enabling both "what is true now" and "what did we believe at time T" queries,
+with stale facts *invalidated* rather than deleted. `MemoryAssertionRecord`
+already carries `valid_from`/`valid_to` (valid-time) and `created_at`
+(record-time); the missing quarter is an explicit transaction-time invalidation
+timestamp and the as-of query path.
+
+**Target.** Add `invalidated_at` to `MemoryAssertionRecord`, set whenever an
+assertion leaves `active` (superseded, retracted, deleted, conflicted loser) —
+distinct from `valid_to` (a real-world end) and from the `memory_deletions`
+audit row. Give `build_memory_context` an optional `as_of` parameter: with it,
+recall reconstructs the belief state at that instant (assertions with
+`created_at <= as_of` and `invalidated_at` null or `> as_of`). The temporal RRF
+signal and `projection_health` consume it.
+
+**Acceptance.** An assertion superseded at T carries `invalidated_at = T` with
+its `valid_*` window intact; an `as_of` recall returns exactly the assertions
+believed-active at that time; every non-active lifecycle transition sets
+`invalidated_at`.
+
+### FO-3 — Selective Forgetting And Unlearning Policy
+
+**Motivation.** Across every credible benchmark, *selective forgetting* is the
+worst-performing capability. Solving it would put this system ahead of every
+shipped product. The implementation has reactive deletion (privacy-delete) and a
+declared per-predicate `decay_half_life_days`, but no *active* policy that
+proactively demotes stale, low-salience, never-reconfirmed knowledge. The
+predicate registry already declares decay; the `memory_retention_policies` table
+already exists.
+
+**Target.** A forgetting pass inside `consolidate_memory`. For each active
+assertion, compute the existing `effective_confidence` (confidence decayed by
+age per the predicate's half-life) and combine it with salience and
+last-verified age. Assertions below a configured floor are **demoted** — dropped
+from the hot index and topic blocks, excluded from default recall — without
+being destroyed: the evidence and episode remain, the assertion moves to `stale`
+through the review lifecycle, and recall diagnostics record the reason. This is
+"forget from recall," strictly separate from privacy-delete's "forget from
+existence." Honour `memory_retention_policies` (`delete_after` / `review_after`).
+Re-confirmation re-activates a demoted assertion.
+
+**Acceptance.** A low-salience, long-unverified assertion is demoted out of
+recall by consolidation with no operator action and an audited rationale;
+demotion is reversible; privacy-deleted content provably cannot resurface; an
+FO-1 forgetting case covers it.
+
+### FO-4 — Reflective Consolidation
+
+**Motivation.** Sleep-time compute and reflection (Generative Agents; agentic
+memory-evolution work) show the highest-value memory work is *offline synthesis*
+— deriving higher-order knowledge between interactions, not merely merging
+duplicates. `consolidate_memory` today is mechanical: dedupe, supersede, rebuild
+projections, and promote repeated successful traces to procedure candidates. It
+does not synthesise insight.
+
+**Target.** Add a reflection phase to `consolidate_memory`. Given a scope's
+recent episodes, reasoning traces, and action traces, an AI judgment proposes
+higher-order memory — synthesised insights (cross-assertion derived facts),
+negative memory from repeated failure traces, and procedure candidates from
+repeated successful patterns — all routed through the candidate -> review
+lifecycle, never written active directly. Record it as an AI-judgment row with
+input/selected/omitted sources, model, and prompt version. The phase respects
+memory mode (no reflection under `temporary`/`no_memory`).
+
+**Acceptance.** A scope with a pattern recurring across episodes yields a
+reviewed insight, negative-memory, or procedure candidate that no single episode
+stated; the reflection is fully auditable; it is policy-gated.
+
+### FO-5 — Memory-To-Rules Promotion For Coding Continuity
+
+**Motivation.** The cross-tool consensus for *coding* memory is a two-layer split
+— machine-local auto-memory versus version-controlled, team-shared **rules**
+(`AGENTS.md`, `.cursor/rules`, `CLAUDE.md`) — and the standard practice is to
+*promote* durable knowledge from memory into a rule file once it must be
+reliable and shareable. This system's repo-scoped procedural memory and the
+`repo-conventions` topic block are the canonical analog, but they live only in
+the database; they cannot be reviewed in a pull request or shared through the
+repository.
+
+**Target.** A new export-artifact projection that materialises a scope's active,
+reviewed, repo-scoped procedural memory and `repo-conventions` topic content
+into a versionable `AGENTS.md`-style file. The `MemoryExportArtifactRecord` /
+`export_memory` machinery already exists; this is a new artifact kind. The file
+is a **projection** — canonical state stays in the database per the North Star —
+regenerated by consolidation. Optionally, ingest an existing `AGENTS.md` /
+`CLAUDE.md` as trust-labelled, review-gated evidence, closing the loop.
+
+**Acceptance.** Reviewed repo procedural memory round-trips to a versionable
+rules file; the file is a rebuildable projection, never canonical; editing the
+file does not mutate memory — only the memory APIs do.
+
+### Sequencing
+
+FO-1 first: it is cheap, it is the verification discipline, and it is how every
+other opportunity is validated. Then FO-2 and FO-3 together — FO-2's
+transaction-time makes FO-3's staleness reasoning exact. Then FO-4, then FO-5.
+Each ships independently; none is a cutover.
+
+### Out Of Scope
+
+- **Parametric / weight-resident memory** (neural test-time memory, parametric
+  memory layers, self-editing models) — not auditable, not cleanly deletable,
+  not production-proven. Revisit only when both auditability and production
+  evidence exist.
+- **A dedicated graph database** — the `memory_relationships` tables and the
+  graph projection are sufficient; the field shows no consensus that a graph
+  database is required, and the North Star keeps PostgreSQL canonical.
+- **External managed memory products** — reference models only, per the North
+  Star's non-goals.
