@@ -61,6 +61,7 @@ from ariel.persistence import (
 )
 from ariel.proactivity import process_proactive_deliberation_due, upsert_proactive_observation
 from tests.integration.responses_helpers import responses_run_message, responses_with_run_calls
+from tests.fake_sandbox import FakeSandboxRuntime
 
 
 _id_counter = count(1)
@@ -163,6 +164,7 @@ def _build_client(
         database_url=postgres_url,
         model_adapter=adapter,
         reset_database=reset_database,
+        sandbox=FakeSandboxRuntime(),
     )
     return TestClient(app)
 

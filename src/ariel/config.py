@@ -91,11 +91,6 @@ class AppSettings(BaseSettings):
     agency_timeout_seconds: float = 30.0
     agency_event_secret: str | None = None
     agency_event_max_skew_seconds: int = 300
-    terminal_dir: str = "~/.cache/ariel/terminal"
-    terminal_output_limit_bytes: int = 12000
-    terminal_run_timeout_seconds: float = 30.0
-    terminal_background_timeout_seconds: int = 3600
-    terminal_timeout_kill_after_seconds: float = 5.0
     search_brave_base_url: str = "https://api.search.brave.com/res/v1"
     search_web_timeout_seconds: float = 8.0
     search_web_api_key: str | None = None
@@ -182,14 +177,6 @@ class AppSettings(BaseSettings):
         normalized = value.strip()
         if not normalized:
             raise ValueError("provider endpoint settings must be nonblank")
-        return normalized
-
-    @field_validator("terminal_dir")
-    @classmethod
-    def _terminal_dir_must_be_nonblank(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("terminal_dir must be nonblank")
         return normalized
 
     @field_validator("google_provider_event_token", mode="before")
@@ -497,8 +484,6 @@ class AppSettings(BaseSettings):
         "attachment_fetch_timeout_seconds",
         "attachment_openai_timeout_seconds",
         "agency_timeout_seconds",
-        "terminal_run_timeout_seconds",
-        "terminal_timeout_kill_after_seconds",
         "search_web_timeout_seconds",
         "search_news_timeout_seconds",
         "web_extract_timeout_seconds",
@@ -517,8 +502,6 @@ class AppSettings(BaseSettings):
         "attachment_max_bytes",
         "attachment_handle_ttl_seconds",
         "agency_event_max_skew_seconds",
-        "terminal_output_limit_bytes",
-        "terminal_background_timeout_seconds",
         "worker_heartbeat_timeout_seconds",
         "proactive_ambient_interval_seconds",
         "proactive_worker_max_attempts",

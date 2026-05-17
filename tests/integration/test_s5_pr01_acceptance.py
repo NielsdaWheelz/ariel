@@ -25,6 +25,7 @@ from ariel.persistence import (
     MemorySalienceRecord,
 )
 from tests.integration.responses_helpers import responses_run_message
+from tests.fake_sandbox import FakeSandboxRuntime
 
 
 _projection_id_counter = count(1)
@@ -164,6 +165,7 @@ def _build_client(
         database_url=postgres_url,
         model_adapter=adapter,
         reset_database=reset_database,
+        sandbox=FakeSandboxRuntime(),
     )
     return TestClient(app, raise_server_exceptions=raise_server_exceptions)
 

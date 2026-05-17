@@ -20,7 +20,6 @@ REQUIRED_TABLES: Final[tuple[str, ...]] = (
     "events",
     "ai_judgments",
     "action_attempts",
-    "terminal_commands",
     "action_private_payloads",
     "approval_requests",
     "artifacts",
@@ -183,36 +182,6 @@ REQUIRED_COLUMNS: Final[dict[str, tuple[str, ...]]] = {
         "payload_digest",
         "payload_enc",
         "encryption_key_version",
-    ),
-    "terminal_commands": (
-        "command_id",
-        "session_id",
-        "turn_id",
-        "action_attempt_id",
-        "kind",
-        "status",
-        "cwd",
-        "command",
-        "purpose",
-        "policy_decision",
-        "policy_reason",
-        "pid",
-        "process_group_id",
-        "process_start_token",
-        "terminal_dir",
-        "stdout_path",
-        "stderr_path",
-        "exit_path",
-        "stdout_bytes",
-        "stderr_bytes",
-        "output_limit_bytes",
-        "exit_code",
-        "started_at",
-        "completed_at",
-        "duration_ms",
-        "error",
-        "created_at",
-        "updated_at",
     ),
     "work_commitments": ("dedupe_digest",),
     "memory_evidence": (
@@ -394,16 +363,6 @@ REQUIRED_CONSTRAINTS: Final[dict[str, tuple[str, ...]]] = {
     "action_private_payloads": (
         "ck_action_private_payload_kind",
         "ck_action_private_payload_digest",
-    ),
-    "terminal_commands": (
-        "ck_terminal_command_kind",
-        "ck_terminal_command_status",
-        "ck_terminal_command_policy_decision",
-        "ck_terminal_command_stdout_bytes_nonnegative",
-        "ck_terminal_command_stderr_bytes_nonnegative",
-        "ck_terminal_command_output_limit_bytes_positive",
-        "ck_terminal_command_duration_ms_nonnegative",
-        "ck_terminal_command_status_fields",
     ),
     "work_commitments": (
         "ck_work_commitment_lifecycle_state",
@@ -851,11 +810,6 @@ REQUIRED_FOREIGN_KEYS: Final[dict[str, dict[str, tuple[str, str]]]] = {
     "action_attempts": {
         "turn_id": ("turns", "RESTRICT"),
     },
-    "terminal_commands": {
-        "session_id": ("sessions", "RESTRICT"),
-        "turn_id": ("turns", "RESTRICT"),
-        "action_attempt_id": ("action_attempts", "RESTRICT"),
-    },
     "turn_idempotency_keys": {
         "session_id": ("sessions", "RESTRICT"),
         "turn_id": ("turns", "RESTRICT"),
@@ -898,7 +852,6 @@ REQUIRED_INDEXES: Final[dict[str, tuple[str, ...]]] = {
         "ix_provider_write_receipts_provider_timestamp",
     ),
     "action_private_payloads": ("ix_action_private_payloads_action_attempt_id",),
-    "terminal_commands": ("ix_terminal_commands_session_command_unique",),
 }
 
 REQUIRED_UNIQUE_INDEXES: Final[dict[str, tuple[str, ...]]] = {
@@ -923,7 +876,6 @@ REQUIRED_UNIQUE_INDEXES: Final[dict[str, tuple[str, ...]]] = {
         "ix_provider_write_receipts_attempt_idempotency_unique",
     ),
     "action_private_payloads": ("ix_action_private_payloads_action_attempt_id",),
-    "terminal_commands": ("ix_terminal_commands_session_command_unique",),
 }
 
 REQUIRED_INDEX_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
@@ -1021,9 +973,6 @@ REQUIRED_INDEX_COLUMNS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
     },
     "action_private_payloads": {
         "ix_action_private_payloads_action_attempt_id": ("action_attempt_id",),
-    },
-    "terminal_commands": {
-        "ix_terminal_commands_session_command_unique": ("session_id", "command_id"),
     },
 }
 

@@ -18,6 +18,7 @@ import ariel.memory as memory
 from ariel.memory import MEMORY_PROJECTION_VERSION, process_memory_projection_job
 from tests.integration.responses_helpers import responses_run_message, responses_with_run_calls
 from ariel.persistence import AIJudgmentRecord, SessionRecord
+from tests.fake_sandbox import FakeSandboxRuntime
 
 
 _projection_id_counter = count(1)
@@ -415,6 +416,7 @@ def _build_client(
         model_adapter=adapter,
         context_compaction_adapter=context_compaction_adapter,
         reset_database=reset_database,
+        sandbox=FakeSandboxRuntime(),
     )
     return TestClient(app, raise_server_exceptions=raise_server_exceptions)
 

@@ -33,6 +33,7 @@ from ariel.discord_bot import (
     undo_proactive_case,
     _is_ariel_custom_id,
 )
+from tests.fake_sandbox import FakeSandboxRuntime
 
 
 class StaticModelAdapter:
@@ -1692,6 +1693,7 @@ def test_root_is_discord_primary_status_not_phone_chat() -> None:
     app = create_app(
         database_url="sqlite+pysqlite:///:memory:",
         model_adapter=StaticModelAdapter(),
+        sandbox=FakeSandboxRuntime(),
     )
     with TestClient(app) as client:
         response = client.get("/")

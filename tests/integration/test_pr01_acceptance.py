@@ -19,6 +19,7 @@ from tests.integration.responses_helpers import (
 from ariel.db import run_migrations
 from ariel.google_connector import GOOGLE_CONNECTOR_ID
 from ariel.persistence import GoogleConnectorRecord, WorkCommitmentRecord, WorkFollowUpLoopRecord
+from tests.fake_sandbox import FakeSandboxRuntime
 
 
 def _parse_utc_rfc3339(value: str) -> datetime:
@@ -293,6 +294,7 @@ def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
         database_url=postgres_url,
         model_adapter=adapter,
         reset_database=True,
+        sandbox=FakeSandboxRuntime(),
     )
     return TestClient(app)
 
@@ -566,290 +568,6 @@ def test_discord_attachment_read_tool_reads_text_attachment(
     durable_payload = json.dumps(body, sort_keys=True)
     assert "https://cdn.discordapp.com/attachments/report.txt" not in durable_payload
     assert "download_url" not in durable_payload
-
-
-def test_large_attachment_read_writes_tool_result_interpretation_judgment(
-    postgres_url: str,
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    large_text = "quarterly revenue increased " * 320
-
-    class FakeStreamResponse:
-        status_code = 200
-        headers = {"content-length": str(len(large_text.encode()))}
-
-        def __enter__(self) -> "FakeStreamResponse":
-            return self
-
-        def __exit__(self, *_: Any) -> None:
-            return None
-
-        def iter_bytes(self) -> list[bytes]:
-            return [large_text.encode()]
-
-    class FakeHttpClient:
-        def __init__(self, *_: Any, **__: Any) -> None:
-            return None
-
-        def __enter__(self) -> "FakeHttpClient":
-            return self
-
-        def __exit__(self, *_: Any) -> None:
-            return None
-
-        def stream(self, method: str, url: str) -> FakeStreamResponse:
-            assert method == "GET"
-            assert url == "https://cdn.discordapp.com/attachments/large-report.txt"
-            return FakeStreamResponse()
-
-    monkeypatch.setenv("ARIEL_ATTACHMENT_SCANNER_MODE", "disabled")
-    monkeypatch.setenv("ARIEL_ATTACHMENT_BLOB_STORE_PATH", str(tmp_path / "attachments"))
-    monkeypatch.setattr("ariel.attachment_content.httpx.Client", FakeHttpClient)
-
-    adapter = AttachmentReadAdapter()
-    with _build_client(postgres_url, adapter) as client:
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        response = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={
-                "message": "please summarize this long report",
-                "discord": {
-                    "guild_id": 123,
-                    "channel_id": 456,
-                    "message_id": 789,
-                    "author_id": 101112,
-                    "mentioned_bot": False,
-                    "attachments": [
-                        {
-                            "source": "discord",
-                            "source_attachment_id": 131415,
-                            "filename": "large-report.txt",
-                            "content_type": "text/plain",
-                            "size_bytes": len(large_text.encode()),
-                            "attachment_ref": "discord:131415",
-                            "download_url": (
-                                "https://cdn.discordapp.com/attachments/large-report.txt"
-                            ),
-                        }
-                    ],
-                },
-            },
-        )
-        assert response.status_code == 200
-        turn_id = response.json()["turn"]["id"]
-        timeline = client.get(f"/v1/sessions/{session_id}/events")
-        assert timeline.status_code == 200
-        event = next(
-            event
-            for event in timeline.json()["turns"][0]["events"]
-            if event["event_type"] == "evt.ai_judgment.completed"
-            and event["payload"].get("judgment_type") == "tool_result_interpretation"
-        )
-        assert event["payload"]["response_output_shape"] == {
-            "output_type": "list",
-            "output_count": 1,
-            "text_present": True,
-        }
-
-        with cast(Any, client.app).state.session_factory() as db:
-            with db.begin():
-                judgment = (
-                    db.execute(
-                        text(
-                            "SELECT status, model, prompt_version, provider_response_id, "
-                            "parse_status, validation_status, selected, output "
-                            "FROM ai_judgments "
-                            "WHERE judgment_type = 'tool_result_interpretation' "
-                            "AND source_id = :turn_id "
-                            "ORDER BY created_at DESC LIMIT 1"
-                        ),
-                        {"turn_id": turn_id},
-                    )
-                    .mappings()
-                    .one()
-                )
-
-    assert judgment["status"] == "succeeded"
-    assert judgment["model"] == "model.attachment-read-v1"
-    assert judgment["prompt_version"] == "tool-result-interpretation-v1"
-    assert judgment["provider_response_id"] == "resp_attachment_interpreter_123"
-    assert judgment["parse_status"] == "parsed"
-    assert judgment["validation_status"] == "valid"
-    selected_refs = [
-        item["output_ref"]
-        for item in judgment["selected"]
-        if isinstance(item, dict) and isinstance(item.get("output_ref"), str)
-    ]
-    assert selected_refs
-    assert judgment["output"]["selected_output_refs"] == selected_refs
-    assert judgment["output"]["provider"] == "provider.attachment-read"
-    assert judgment["output"]["usage"] == {
-        "input_tokens": 7,
-        "output_tokens": 5,
-        "total_tokens": 12,
-    }
-
-
-def test_invalid_tool_result_interpreter_output_preserves_failure_provenance(
-    postgres_url: str,
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    large_text = "quarterly revenue increased " * 320
-
-    class InvalidInterpreterAdapter(AttachmentReadAdapter):
-        def create_response(
-            self,
-            *,
-            input_items: list[dict[str, Any]],
-            tools: list[dict[str, Any]],
-            user_message: str,
-            history: list[dict[str, Any]],
-            context_bundle: dict[str, Any],
-        ) -> dict[str, Any]:
-            if context_bundle.get("origin") == "tool_result_interpretation":
-                del input_items, tools, user_message, history
-                return responses_message(
-                    assistant_text="{not json",
-                    provider=self.provider,
-                    model=self.model,
-                    provider_response_id="resp_attachment_interpreter_invalid",
-                    input_tokens=17,
-                    output_tokens=11,
-                )
-            return super().create_response(
-                input_items=input_items,
-                tools=tools,
-                user_message=user_message,
-                history=history,
-                context_bundle=context_bundle,
-            )
-
-    class FakeStreamResponse:
-        status_code = 200
-        headers = {"content-length": str(len(large_text.encode()))}
-
-        def __enter__(self) -> "FakeStreamResponse":
-            return self
-
-        def __exit__(self, *_: Any) -> None:
-            return None
-
-        def iter_bytes(self) -> list[bytes]:
-            return [large_text.encode()]
-
-    class FakeHttpClient:
-        def __init__(self, *_: Any, **__: Any) -> None:
-            return None
-
-        def __enter__(self) -> "FakeHttpClient":
-            return self
-
-        def __exit__(self, *_: Any) -> None:
-            return None
-
-        def stream(self, method: str, url: str) -> FakeStreamResponse:
-            assert method == "GET"
-            assert url == "https://cdn.discordapp.com/attachments/large-report.txt"
-            return FakeStreamResponse()
-
-    monkeypatch.setenv("ARIEL_ATTACHMENT_SCANNER_MODE", "disabled")
-    monkeypatch.setenv("ARIEL_ATTACHMENT_BLOB_STORE_PATH", str(tmp_path / "attachments"))
-    monkeypatch.setattr("ariel.attachment_content.httpx.Client", FakeHttpClient)
-
-    with _build_client(postgres_url, InvalidInterpreterAdapter()) as client:
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        response = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={
-                "message": "please summarize this long report",
-                "discord": {
-                    "guild_id": 123,
-                    "channel_id": 456,
-                    "message_id": 789,
-                    "author_id": 101112,
-                    "mentioned_bot": False,
-                    "attachments": [
-                        {
-                            "source": "discord",
-                            "source_attachment_id": 131415,
-                            "filename": "large-report.txt",
-                            "content_type": "text/plain",
-                            "size_bytes": len(large_text.encode()),
-                            "attachment_ref": "discord:131415",
-                            "download_url": (
-                                "https://cdn.discordapp.com/attachments/large-report.txt"
-                            ),
-                        }
-                    ],
-                },
-            },
-        )
-        assert response.status_code == 502
-        body = response.json()
-        assert body["error"]["code"] == "E_AI_JUDGMENT_INVALID_JSON"
-        assert body["error"]["details"]["parse_status"] == "invalid_json"
-        assert body["error"]["details"]["validation_status"] == "not_validated"
-        assert body["error"]["details"]["provider"] == "provider.attachment-read"
-        assert body["error"]["details"]["model"] == "model.attachment-read-v1"
-        assert body["error"]["details"]["usage"] == {
-            "input_tokens": 17,
-            "output_tokens": 11,
-            "total_tokens": 28,
-        }
-        assert body["error"]["details"]["provider_response_id"] == (
-            "resp_attachment_interpreter_invalid"
-        )
-
-        timeline = client.get(f"/v1/sessions/{session_id}/events")
-        assert timeline.status_code == 200
-        turn = timeline.json()["turns"][0]
-        event_types = [event["event_type"] for event in turn["events"]]
-        assert "evt.assistant.emitted" not in event_types
-        failure_event = next(
-            event
-            for event in turn["events"]
-            if event["payload"].get("judgment_type") == "tool_result_interpretation"
-        )
-        assert failure_event["payload"]["failure_code"] == "E_AI_JUDGMENT_INVALID_JSON"
-        assert failure_event["payload"]["parse_status"] == "invalid_json"
-        assert failure_event["payload"]["validation_status"] == "not_validated"
-        assert failure_event["payload"]["provider_response_id"] == (
-            "resp_attachment_interpreter_invalid"
-        )
-        turn_id = turn["id"]
-
-        with cast(Any, client.app).state.session_factory() as db:
-            with db.begin():
-                judgment = (
-                    db.execute(
-                        text(
-                            "SELECT status, model, provider_response_id, parse_status, "
-                            "validation_status, failure_code, output "
-                            "FROM ai_judgments "
-                            "WHERE judgment_type = 'tool_result_interpretation' "
-                            "AND source_id = :turn_id "
-                            "ORDER BY created_at DESC LIMIT 1"
-                        ),
-                        {"turn_id": turn_id},
-                    )
-                    .mappings()
-                    .one()
-                )
-
-    assert judgment["status"] == "failed"
-    assert judgment["model"] == "model.attachment-read-v1"
-    assert judgment["provider_response_id"] == "resp_attachment_interpreter_invalid"
-    assert judgment["parse_status"] == "invalid_json"
-    assert judgment["validation_status"] == "not_validated"
-    assert judgment["failure_code"] == "E_AI_JUDGMENT_INVALID_JSON"
-    assert judgment["output"]["provider"] == "provider.attachment-read"
-    assert judgment["output"]["usage"] == {
-        "input_tokens": 17,
-        "output_tokens": 11,
-        "total_tokens": 28,
-    }
 
 
 def test_discord_turn_context_includes_bounded_same_channel_history(
@@ -1381,6 +1099,7 @@ def test_schema_not_ready_returns_503_until_migrated(unmigrated_postgres_url: st
         database_url=unmigrated_postgres_url,
         model_adapter=adapter,
         reset_database=False,
+        sandbox=FakeSandboxRuntime(),
     )
     with TestClient(app_without_migration) as client:
         health = client.get("/v1/health")
@@ -1401,6 +1120,7 @@ def test_schema_not_ready_returns_503_until_migrated(unmigrated_postgres_url: st
         database_url=unmigrated_postgres_url,
         model_adapter=adapter,
         reset_database=False,
+        sandbox=FakeSandboxRuntime(),
     )
     with TestClient(app_with_migration) as client:
         assert client.get("/v1/health").status_code == 200
@@ -1644,6 +1364,7 @@ def test_default_runtime_model_requires_server_secret_credentials(
         database_url=postgres_url,
         model_adapter=None,
         reset_database=True,
+        sandbox=FakeSandboxRuntime(),
     )
     with TestClient(app) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
@@ -1740,6 +1461,7 @@ def test_restart_preserves_history_and_appends_to_same_active_session(postgres_u
         database_url=postgres_url,
         model_adapter=adapter,
         reset_database=False,
+        sandbox=FakeSandboxRuntime(),
     )
     with TestClient(restarted_app) as second_client:
         active_after_restart = second_client.get("/v1/sessions/active")

@@ -63,7 +63,6 @@ SurfaceEventType = Literal[
     "evt.action.execution.succeeded",
     "evt.action.execution.failed",
     "evt.action.execution.retrying",
-    "evt.terminal.command.recorded",
     "evt.provider_write.reconcile_unavailable",
     "evt.provider_write.receipt_reconciled",
 ]
@@ -404,16 +403,6 @@ class SurfaceEventActionExecutionRetryingPayloadContract(BaseModel):
 
     action_attempt_id: str
     error: str
-
-
-class SurfaceEventTerminalCommandRecordedPayloadContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    action_attempt_id: str
-    terminal_command_record_id: str
-    command_id: str
-    status: str
-    exit_code: int | None = None
 
 
 class SurfaceEventProviderWriteReconcileUnavailablePayloadContract(BaseModel):
@@ -1893,12 +1882,6 @@ def _project_surface_event_payload(
         return _validate_contract(
             "surface_event_payload.evt.action.execution.retrying",
             SurfaceEventActionExecutionRetryingPayloadContract,
-            payload,
-        )
-    if event_type == "evt.terminal.command.recorded":
-        return _validate_contract(
-            "surface_event_payload.evt.terminal.command.recorded",
-            SurfaceEventTerminalCommandRecordedPayloadContract,
             payload,
         )
     if event_type == "evt.provider_write.reconcile_unavailable":

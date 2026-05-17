@@ -8,19 +8,11 @@ from ipaddress import ip_address
 from math import asin, cos, radians, sin, sqrt
 import hashlib
 import json
-import os
 from typing import Any, Literal, Protocol
 from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
 import httpx
 from .config import AppSettings
-from .terminal_runtime import (
-    execute_terminal_cancel,
-    execute_terminal_read_output,
-    execute_terminal_run,
-    execute_terminal_run_background,
-    execute_terminal_status,
-)
 from web_search_tool.brave import BraveSearchProvider
 from web_search_tool.types import (
     WebSearchError,
@@ -57,13 +49,6 @@ AGENCY_CAPABILITY_IDS = {
 }
 DISCORD_CAPABILITY_IDS: set[str] = set()
 ATTACHMENT_CAPABILITY_IDS = {"cap.attachment.read"}
-TERMINAL_CAPABILITY_IDS = {
-    "cap.terminal.run",
-    "cap.terminal.run_background",
-    "cap.terminal.status",
-    "cap.terminal.read_output",
-    "cap.terminal.cancel",
-}
 MEMORY_CAPABILITY_IDS = {
     "cap.memory.inspect",
     "cap.memory.search",
@@ -133,93 +118,6 @@ def _validate_search_web_input(
     raw_input: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
     return _validate_exact_text_input(raw_input, field_name="query", max_length=1000)
-
-
-def _validate_terminal_run_input(
-    raw_input: dict[str, Any],
-) -> tuple[dict[str, Any] | None, str | None]:
-    if set(raw_input.keys()) != {"cwd", "command", "purpose"}:
-        return None, "schema_invalid"
-    cwd = raw_input.get("cwd")
-    command = raw_input.get("command")
-    purpose = raw_input.get("purpose")
-    if not isinstance(cwd, str) or not isinstance(command, str) or not isinstance(purpose, str):
-        return None, "schema_invalid"
-    normalized_cwd = cwd.strip()
-    normalized_command = command.strip()
-    normalized_purpose = purpose.strip()
-    if (
-        not normalized_cwd
-        or not normalized_command
-        or not normalized_purpose
-        or "\x00" in normalized_cwd
-        or "\x00" in normalized_command
-        or "\x00" in normalized_purpose
-        or len(normalized_cwd) > 4096
-        or len(normalized_command) > 8000
-        or len(normalized_purpose) > 1000
-    ):
-        return None, "schema_invalid"
-    if not os.path.isdir(normalized_cwd):
-        return None, "schema_invalid"
-    return {
-        "cwd": normalized_cwd,
-        "command": normalized_command,
-        "purpose": normalized_purpose,
-    }, None
-
-
-def _validate_terminal_command_id_input(
-    raw_input: dict[str, Any],
-) -> tuple[dict[str, Any] | None, str | None]:
-    if set(raw_input.keys()) != {"command_id"}:
-        return None, "schema_invalid"
-    command_id = raw_input.get("command_id")
-    if not isinstance(command_id, str):
-        return None, "schema_invalid"
-    normalized = command_id.strip()
-    command_id_parts = normalized.split(".")
-    if (
-        not normalized
-        or len(normalized) > 80
-        or not command_id_parts
-        or any(
-            not part or not all(ch.isalnum() or ch == "_" for ch in part)
-            for part in command_id_parts
-        )
-    ):
-        return None, "schema_invalid"
-    return {"command_id": normalized}, None
-
-
-def _validate_terminal_read_output_input(
-    raw_input: dict[str, Any],
-) -> tuple[dict[str, Any] | None, str | None]:
-    if set(raw_input.keys()) != {"command_id", "stream", "offset", "limit"}:
-        return None, "schema_invalid"
-    command_id = raw_input.get("command_id")
-    stream = raw_input.get("stream")
-    offset = raw_input.get("offset")
-    limit = raw_input.get("limit")
-    if not isinstance(command_id, str) or stream not in {"stdout", "stderr"}:
-        return None, "schema_invalid"
-    if not isinstance(offset, int) or not isinstance(limit, int):
-        return None, "schema_invalid"
-    normalized = command_id.strip()
-    command_id_parts = normalized.split(".")
-    if (
-        not normalized
-        or len(normalized) > 80
-        or not command_id_parts
-        or any(
-            not part or not all(ch.isalnum() or ch == "_" for ch in part)
-            for part in command_id_parts
-        )
-    ):
-        return None, "schema_invalid"
-    if offset < 0 or limit < 1 or limit > AppSettings().terminal_output_limit_bytes:
-        return None, "schema_invalid"
-    return {"command_id": normalized, "stream": stream, "offset": offset, "limit": limit}, None
 
 
 def _validate_attachment_read_input(
@@ -3673,76 +3571,6 @@ def _execute_attachment_runtime(_: dict[str, Any]) -> dict[str, Any]:
 
 
 _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
-    "cap.terminal.run": CapabilityDefinition(
-        capability_id="cap.terminal.run",
-        version="1.0",
-        impact_level="read",
-        policy_decision="allow_inline",
-        contract_metadata={
-            "input_schema": "terminal_run_v1",
-            "output_schema": "terminal_run_result_v1",
-            "idempotency": "command_observation",
-        },
-        allowed_egress_destinations=(),
-        validate_input=_validate_terminal_run_input,
-        execute=execute_terminal_run,
-    ),
-    "cap.terminal.run_background": CapabilityDefinition(
-        capability_id="cap.terminal.run_background",
-        version="1.0",
-        impact_level="read",
-        policy_decision="allow_inline",
-        contract_metadata={
-            "input_schema": "terminal_run_v1",
-            "output_schema": "terminal_background_result_v1",
-            "idempotency": "command_observation",
-        },
-        allowed_egress_destinations=(),
-        validate_input=_validate_terminal_run_input,
-        execute=execute_terminal_run_background,
-    ),
-    "cap.terminal.status": CapabilityDefinition(
-        capability_id="cap.terminal.status",
-        version="1.0",
-        impact_level="read",
-        policy_decision="allow_inline",
-        contract_metadata={
-            "input_schema": "terminal_command_id_v1",
-            "output_schema": "terminal_status_v1",
-            "idempotency": "deterministic_read",
-        },
-        allowed_egress_destinations=(),
-        validate_input=_validate_terminal_command_id_input,
-        execute=execute_terminal_status,
-    ),
-    "cap.terminal.read_output": CapabilityDefinition(
-        capability_id="cap.terminal.read_output",
-        version="1.0",
-        impact_level="read",
-        policy_decision="allow_inline",
-        contract_metadata={
-            "input_schema": "terminal_read_output_v1",
-            "output_schema": "terminal_output_chunk_v1",
-            "idempotency": "deterministic_read",
-        },
-        allowed_egress_destinations=(),
-        validate_input=_validate_terminal_read_output_input,
-        execute=execute_terminal_read_output,
-    ),
-    "cap.terminal.cancel": CapabilityDefinition(
-        capability_id="cap.terminal.cancel",
-        version="1.0",
-        impact_level="write_reversible",
-        policy_decision="allow_inline",
-        contract_metadata={
-            "input_schema": "terminal_command_id_v1",
-            "output_schema": "terminal_cancel_result_v1",
-            "idempotency": "idempotent_command_control",
-        },
-        allowed_egress_destinations=(),
-        validate_input=_validate_terminal_command_id_input,
-        execute=execute_terminal_cancel,
-    ),
     "cap.calendar.list": CapabilityDefinition(
         capability_id="cap.calendar.list",
         version="2.0",
@@ -4811,11 +4639,6 @@ _RUN_CALLABLE_ALIASES = {
     "memory.topics": "cap.memory.topics",
     "search.news": "cap.search.news",
     "search.web": "cap.search.web",
-    "terminal.cancel": "cap.terminal.cancel",
-    "terminal.read_output": "cap.terminal.read_output",
-    "terminal.run": "cap.terminal.run",
-    "terminal.run_background": "cap.terminal.run_background",
-    "terminal.status": "cap.terminal.status",
     "weather.forecast": "cap.weather.forecast",
     "web.extract": "cap.web.extract",
 }

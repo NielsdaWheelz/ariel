@@ -25,6 +25,7 @@ from ariel.persistence import (
 from ariel.proactivity import process_proactive_deliberation_due
 from ariel.worker import process_one_task
 from tests.integration.responses_helpers import responses_message
+from tests.fake_sandbox import FakeSandboxRuntime
 
 
 _ID_COUNTER = 0
@@ -230,6 +231,7 @@ def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
         database_url=postgres_url,
         model_adapter=adapter,
         reset_database=True,
+        sandbox=FakeSandboxRuntime(),
     )
     return TestClient(app)
 

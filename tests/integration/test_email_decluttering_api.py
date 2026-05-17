@@ -15,6 +15,7 @@ from ariel.persistence import (
     SessionRecord,
     TurnRecord,
 )
+from tests.fake_sandbox import FakeSandboxRuntime
 
 
 class NoopModelAdapter:
@@ -46,6 +47,7 @@ def client(postgres_url: str) -> Generator[TestClient, None, None]:
         database_url=postgres_url,
         model_adapter=NoopModelAdapter(),
         reset_database=True,
+        sandbox=FakeSandboxRuntime(),
     )
     with TestClient(app) as test_client:
         yield test_client

@@ -17,6 +17,7 @@ from ariel.capability_registry import (
     CapabilityDefinition,
     get_capability as registry_get_capability,
 )
+from tests.fake_sandbox import FakeSandboxRuntime
 
 
 @dataclass
@@ -107,6 +108,7 @@ def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
         database_url=postgres_url,
         model_adapter=adapter,
         reset_database=True,
+        sandbox=FakeSandboxRuntime(),
     )
     return TestClient(app)
 

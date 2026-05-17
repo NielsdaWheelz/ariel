@@ -7,11 +7,13 @@ from typing import Any, cast
 
 import pytest
 from ariel import action_runtime
-from ariel.action_runtime import RuntimeProvenance, process_response_function_calls
+from ariel.action_runtime import (
+    RuntimeProvenance,
+    _FunctionCallProcessingContext,
+    process_one_call,
+)
 from ariel.app import (
-    ModelAdapterError,
     _POLICY_SYSTEM_INSTRUCTIONS,
-    _call_tool_result_interpreter,
     _eligible_internal_callable_capability_ids,
 )
 from ariel.capability_registry import (
@@ -22,7 +24,7 @@ from ariel.capability_registry import (
 )
 from ariel.executor import ExecutionResult
 from ariel.persistence import TurnRecord
-from ariel.run_runtime import parse_run_function_call, run_tool_definitions, unpack_run_source
+from ariel.run_runtime import parse_run_function_call, run_tool_definitions
 from sqlalchemy.orm import Session
 
 
@@ -97,8 +99,6 @@ def test_internal_callable_eligibility_is_default_deny() -> None:
         )
     )
 
-    assert "cap.terminal.run" in capability_ids
-    assert "cap.terminal.cancel" in capability_ids
     assert "cap.memory.search" in capability_ids
     assert "cap.memory.deprioritize" in capability_ids
     assert "cap.memory.eval" not in capability_ids
@@ -109,116 +109,30 @@ def test_internal_callable_eligibility_is_default_deny() -> None:
     assert "cap.weather.forecast" not in capability_ids
 
 
-def test_run_source_rejects_user_output_mixed_with_internal_calls() -> None:
-    source = json.dumps(
-        {
-            "calls": [
-                {"name": "agent.emit_message", "input": {"text": "Done."}},
-                {
-                    "name": "terminal.run",
-                    "input": {"cwd": "/tmp", "command": "pwd", "purpose": "inspect cwd"},
-                },
-                {
-                    "name": "memory.search",
-                    "input": {"query": "project phoenix", "limit": 3, "scope_key": None},
-                },
-            ]
-        }
+def test_run_source_is_a_python_program_string() -> None:
+    """A valid run call carries a Python-program source string; it is not parsed
+    as a flat-JSON call list. ``parse_run_function_call`` validates only the
+    tool-call envelope and the source-size budget; the program itself runs in
+    the sandbox."""
+
+    source = (
+        "results = memory.search(query='project phoenix')\n"
+        "agent.emit_message(text='Found ' + str(len(results)) + ' memories.')\n"
     )
-
-    effects = unpack_run_source(source)
-
-    assert effects.errors == ["agent_emit_message_must_not_share_run_with_internal_calls"]
-    assert effects.emitted_message == ""
-    assert effects.paused is False
-    assert effects.function_calls == []
-
-
-def test_run_source_rejects_user_output_mixed_with_emit_value() -> None:
-    effects = unpack_run_source(
-        json.dumps(
-            {
-                "calls": [
-                    {"name": "agent.emit_message", "input": {"text": "Done."}},
-                    {"name": "agent.emit_value", "input": {"value": {"answer": 42}}},
-                ]
-            }
-        )
+    parsed_source, error = parse_run_function_call(
+        [{"name": "run", "arguments": json.dumps({"source": source})}]
     )
-
-    assert effects.errors == ["agent_emit_message_must_not_share_run_with_emit_value"]
-    assert effects.emitted_message == ""
-    assert effects.emitted_values == []
+    assert error is None
+    assert parsed_source == source.strip()
 
 
-def test_run_source_rejects_capability_ids_as_call_names() -> None:
-    effects = unpack_run_source(
-        json.dumps({"calls": [{"name": "cap.memory.search", "input": {"query": "x"}}]})
-    )
-
-    assert effects.errors == [
-        "cap.memory.search: capability_ids_are_not_run_callables",
-        "run_source_no_effect",
-    ]
-
-
-def test_run_source_supports_emit_value_and_terminal_background_calls() -> None:
-    source = json.dumps(
-        {
-            "calls": [
-                {"name": "agent.emit_value", "input": {"value": {"answer": 42}}},
-                {
-                    "name": "terminal.run_background",
-                    "input": {"cwd": "/tmp", "command": "sleep 1", "purpose": "demo"},
-                },
-                {"name": "terminal.status", "input": {"command_id": "a" * 32}},
-                {
-                    "name": "terminal.read_output",
-                    "input": {
-                        "command_id": "a" * 32,
-                        "stream": "stdout",
-                        "offset": 0,
-                        "limit": 100,
-                    },
-                },
-            ]
-        }
-    )
-
-    effects = unpack_run_source(source)
-
-    assert effects.errors == []
-    assert effects.emitted_values == [{"answer": 42}]
-    assert [call["capability_id"] for call in effects.function_calls] == [
-        "cap.terminal.run_background",
-        "cap.terminal.status",
-        "cap.terminal.read_output",
-    ]
-
-
-def test_run_source_rejects_malformed_emit_value() -> None:
-    effects = unpack_run_source(
-        json.dumps({"calls": [{"name": "agent.emit_value", "input": {"text": "nope"}}]})
-    )
-
-    assert "agent_emit_value_schema_invalid" in effects.errors
-
-
-def test_run_source_enforces_source_and_call_budgets() -> None:
+def test_run_source_rejects_blank_and_oversized_programs() -> None:
+    assert parse_run_function_call(
+        [{"name": "run", "arguments": json.dumps({"source": "   "})}]
+    ) == (None, "run_source_empty")
     assert parse_run_function_call(
         [{"name": "run", "arguments": json.dumps({"source": "x" * 20001})}]
     ) == (None, "run_source_too_large")
-    effects = unpack_run_source(
-        json.dumps(
-            {
-                "calls": [
-                    {"name": "agent.emit_value", "input": {"value": index}} for index in range(21)
-                ]
-            }
-        )
-    )
-
-    assert effects.errors == ["run_source_too_many_calls"]
 
 
 def test_memory_runtime_handles_projection_read_surfaces(
@@ -648,182 +562,52 @@ def test_action_runtime_has_no_deterministic_tool_result_synthesizer() -> None:
     assert "attachment content:" not in source
 
 
-def test_tool_result_interpreter_failure_preserves_provider_response_id() -> None:
-    class InvalidInterpreterAdapter:
-        def create_response(self, **kwargs: Any) -> dict[str, Any]:
-            del kwargs
-            return {
-                "provider": "provider.test",
-                "model": "model.test",
-                "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
-                "provider_response_id": "resp_interpreter_invalid",
-                "output": [
-                    {
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": "{not-json"}],
-                    }
-                ],
-            }
+def _run_one_call(
+    *,
+    db: Session,
+    function_call_raw: dict[str, Any],
+    turn: TurnRecord,
+    now: datetime,
+    new_id_fn: Any,
+    add_event: Any,
+    runtime_provenance: RuntimeProvenance | None,
+    attachment_runtime: Any | None = None,
+    allowed_capability_ids: set[str],
+) -> _FunctionCallProcessingContext:
+    """Run one capability syscall through ``process_one_call``.
 
-    with pytest.raises(ModelAdapterError) as exc_info:
-        _call_tool_result_interpreter(
-            model_adapter=cast(Any, InvalidInterpreterAdapter()),
-            interpreter_input={
-                "judgment_type": "tool_result_interpretation",
-                "audited_tool_outputs": [],
-            },
-        )
+    This is the per-call lifecycle a ``run`` program's syscalls dispatch
+    through; the run-program host path drives the same function. The tests use
+    it directly to assert the per-call rails (turn scope, execution, taint).
+    """
 
-    assert exc_info.value.code == "E_AI_JUDGMENT_INVALID_JSON"
-    assert exc_info.value.provider == "provider.test"
-    assert exc_info.value.model == "model.test"
-    assert exc_info.value.usage == {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
-    assert exc_info.value.provider_response_id == "resp_interpreter_invalid"
-    assert exc_info.value.parse_status == "invalid_json"
-    assert exc_info.value.validation_status == "not_validated"
-    assert exc_info.value.raw_output_shape == {
-        "output_type": "list",
-        "output_count": 1,
-        "text_present": True,
-    }
-
-
-def test_tool_result_interpreter_success_preserves_provider_metadata() -> None:
-    class InterpreterAdapter:
-        def create_response(self, **kwargs: Any) -> dict[str, Any]:
-            del kwargs
-            return {
-                "provider": "provider.test",
-                "model": "model.test",
-                "usage": {"input_tokens": 4, "output_tokens": 3, "total_tokens": 7},
-                "provider_response_id": "resp_interpreter_valid",
-                "output": [
-                    {
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "type": "output_text",
-                                "text": json.dumps(
-                                    {
-                                        "findings": ["result"],
-                                        "contradictions": [],
-                                        "uncertainty": [],
-                                        "selected_output_refs": ["out_1"],
-                                        "omitted_output_refs": [],
-                                        "citation_refs": [],
-                                        "artifact_refs": [],
-                                        "recommended_next_evidence": [],
-                                        "confidence": 0.8,
-                                    },
-                                    sort_keys=True,
-                                ),
-                            }
-                        ],
-                    }
-                ],
-            }
-
-    result = _call_tool_result_interpreter(
-        model_adapter=cast(Any, InterpreterAdapter()),
-        interpreter_input={
-            "judgment_type": "tool_result_interpretation",
-            "audited_tool_outputs": [{"output_ref": "out_1"}],
-        },
+    ctx = _FunctionCallProcessingContext()
+    process_one_call(
+        ctx=ctx,
+        function_call_index=1,
+        function_call_raw=function_call_raw,
+        db=db,
+        session_factory=None,
+        session_id="ses_1",
+        turn=turn,
+        approval_ttl_seconds=300,
+        approval_actor_id="usr_1",
+        add_event=add_event,
+        now_fn=lambda: now,
+        new_id_fn=new_id_fn,
+        runtime_provenance=runtime_provenance,
+        google_runtime=None,
+        execute_google_reads_outside_transaction=False,
+        agency_runtime=None,
+        attachment_runtime=attachment_runtime,
+        allowed_capability_id_set=allowed_capability_ids,
+        settings=None,
+        memory_import_cutover_enabled=False,
     )
-
-    assert result["provider"] == "provider.test"
-    assert result["model"] == "model.test"
-    assert result["usage"] == {"input_tokens": 4, "output_tokens": 3, "total_tokens": 7}
-    assert result["provider_response_id"] == "resp_interpreter_valid"
-    assert result["response_output_shape"] == {
-        "output_type": "list",
-        "output_count": 1,
-        "text_present": True,
-    }
+    return ctx
 
 
-@pytest.mark.parametrize(
-    "interpreter_output",
-    [
-        {
-            "findings": [],
-            "contradictions": [],
-            "uncertainty": [],
-            "selected_output_refs": [],
-            "omitted_output_refs": [],
-            "citation_refs": [],
-            "artifact_refs": [],
-            "recommended_next_evidence": [],
-            "confidence": 0.8,
-            "extra": "not allowed",
-        },
-        {
-            "findings": [],
-            "contradictions": [],
-            "uncertainty": [],
-            "selected_output_refs": ["missing_ref"],
-            "omitted_output_refs": [],
-            "citation_refs": [],
-            "artifact_refs": [],
-            "recommended_next_evidence": [],
-            "confidence": 0.8,
-        },
-        {
-            "findings": [],
-            "contradictions": [],
-            "uncertainty": [],
-            "selected_output_refs": [],
-            "omitted_output_refs": [],
-            "citation_refs": [],
-            "artifact_refs": [],
-            "recommended_next_evidence": [],
-            "confidence": 1.1,
-        },
-    ],
-)
-def test_tool_result_interpreter_rejects_non_contract_output(
-    interpreter_output: dict[str, Any],
-) -> None:
-    class InterpreterAdapter:
-        def create_response(self, **kwargs: Any) -> dict[str, Any]:
-            del kwargs
-            return {
-                "provider": "provider.test",
-                "model": "model.test",
-                "provider_response_id": "resp_interpreter_invalid_contract",
-                "output": [
-                    {
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "type": "output_text",
-                                "text": json.dumps(interpreter_output, sort_keys=True),
-                            }
-                        ],
-                    }
-                ],
-            }
-
-    with pytest.raises(ModelAdapterError) as exc_info:
-        _call_tool_result_interpreter(
-            model_adapter=cast(Any, InterpreterAdapter()),
-            interpreter_input={
-                "judgment_type": "tool_result_interpretation",
-                "audited_tool_outputs": [{"output_ref": "out_1"}],
-                "citation_refs": [],
-                "artifact_refs": [],
-            },
-        )
-
-    assert exc_info.value.code == "E_AI_JUDGMENT_SCHEMA"
-    assert exc_info.value.validation_status == "invalid"
-    assert exc_info.value.provider_response_id == "resp_interpreter_invalid_contract"
-
-
-def test_process_response_function_calls_default_denies_without_turn_scope() -> None:
+def test_process_one_call_default_denies_without_turn_scope() -> None:
     fixed_now = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
     events: list[tuple[str, dict[str, Any]]] = []
 
@@ -847,29 +631,23 @@ def test_process_response_function_calls_default_denies_without_turn_scope() -> 
         updated_at=fixed_now,
     )
 
-    result = process_response_function_calls(
+    ctx = _run_one_call(
         db=cast(Session, Db()),
-        session_id="ses_1",
+        function_call_raw={
+            "call_id": "call_1",
+            "capability_id": "cap.legacy.no_response",
+            "input": {"reason": "nothing useful to add"},
+        },
         turn=turn,
-        assistant_message="done",
-        function_calls_raw=[
-            {
-                "call_id": "call_1",
-                "capability_id": "cap.legacy.no_response",
-                "input": {"reason": "nothing useful to add"},
-                "influenced_by_untrusted_content": False,
-            }
-        ],
-        approval_ttl_seconds=300,
-        approval_actor_id="usr_1",
-        add_event=lambda event_type, payload: events.append((event_type, payload)),
-        now_fn=lambda: fixed_now,
+        now=fixed_now,
         new_id_fn=lambda prefix: f"{prefix}_1",
+        add_event=lambda event_type, payload: events.append((event_type, payload)),
         runtime_provenance=RuntimeProvenance(status="clean"),
+        allowed_capability_ids=set(),
     )
 
-    assert result.action_attempts == []
-    function_call_output = result.function_call_outputs[0]
+    assert ctx.created_action_attempts == []
+    function_call_output = ctx.function_call_outputs[0]
     assert function_call_output["type"] == "function_call_output"
     assert function_call_output["call_id"] == "call_1"
     assert json.loads(function_call_output["output"]) == {
@@ -891,7 +669,7 @@ def test_process_response_function_calls_default_denies_without_turn_scope() -> 
     ]
 
 
-def test_process_response_function_calls_denies_unscoped_tools() -> None:
+def test_process_one_call_denies_unscoped_tools() -> None:
     fixed_now = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
 
     class Db:
@@ -914,35 +692,30 @@ def test_process_response_function_calls_denies_unscoped_tools() -> None:
         updated_at=fixed_now,
     )
 
-    result = process_response_function_calls(
+    ctx = _run_one_call(
         db=cast(Session, Db()),
-        session_id="ses_1",
+        function_call_raw={
+            "call_id": "call_1",
+            "capability_id": "cap.legacy.no_response",
+            "input": {"reason": "nothing useful to add"},
+        },
         turn=turn,
-        assistant_message="done",
-        function_calls_raw=[
-            {
-                "call_id": "call_1",
-                "capability_id": "cap.legacy.no_response",
-                "input": {"reason": "nothing useful to add"},
-            }
-        ],
-        approval_ttl_seconds=300,
-        approval_actor_id="usr_1",
-        add_event=lambda _event_type, _payload: None,
-        now_fn=lambda: fixed_now,
+        now=fixed_now,
         new_id_fn=lambda prefix: f"{prefix}_1",
-        allowed_capability_ids=[],
+        add_event=lambda _event_type, _payload: None,
+        runtime_provenance=None,
+        allowed_capability_ids=set(),
     )
 
-    assert result.action_attempts == []
-    assert json.loads(result.function_call_outputs[0]["output"]) == {
+    assert ctx.created_action_attempts == []
+    assert json.loads(ctx.function_call_outputs[0]["output"]) == {
         "status": "denied",
         "capability_id": "cap.legacy.no_response",
         "error": "tool_not_in_turn_scope",
     }
 
 
-def test_process_response_function_calls_executes_attachment_read_runtime() -> None:
+def test_process_one_call_executes_attachment_read_runtime() -> None:
     fixed_now = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
     events: list[tuple[str, dict[str, Any]]] = []
     id_counts: dict[str, int] = {}
@@ -1005,35 +778,30 @@ def test_process_response_function_calls_executes_attachment_read_runtime() -> N
         updated_at=fixed_now,
     )
 
-    result = process_response_function_calls(
+    ctx = _run_one_call(
         db=cast(Session, Db()),
-        session_id="ses_1",
+        function_call_raw={
+            "call_id": "call_1",
+            "capability_id": "cap.attachment.read",
+            "input": {"attachment_ref": "discord:777", "intent": "summarize"},
+        },
         turn=turn,
-        assistant_message="",
-        function_calls_raw=[
-            {
-                "call_id": "call_1",
-                "capability_id": "cap.attachment.read",
-                "input": {"attachment_ref": "discord:777", "intent": "summarize"},
-                "influenced_by_untrusted_content": False,
-            }
-        ],
-        approval_ttl_seconds=300,
-        approval_actor_id="usr_1",
-        add_event=lambda event_type, payload: events.append((event_type, payload)),
-        now_fn=lambda: fixed_now,
+        now=fixed_now,
         new_id_fn=new_id,
+        add_event=lambda event_type, payload: events.append((event_type, payload)),
         runtime_provenance=RuntimeProvenance(status="clean"),
         attachment_runtime=cast(Any, AttachmentRuntime()),
-        allowed_capability_ids=["cap.attachment.read"],
+        allowed_capability_ids={"cap.attachment.read"},
     )
 
-    assert result.action_attempts[0].capability_id == "cap.attachment.read"
-    assert result.action_attempts[0].status == "succeeded"
-    assert json.loads(result.function_call_outputs[0]["output"])["output"]["blocks"] == [
+    assert ctx.created_action_attempts[0].capability_id == "cap.attachment.read"
+    assert ctx.created_action_attempts[0].status == "succeeded"
+    assert json.loads(ctx.function_call_outputs[0]["output"])["output"]["blocks"] == [
         {"kind": "text", "text": "quarterly revenue increased"}
     ]
-    assert result.runtime_provenance == RuntimeProvenance(
+    # The attachment read returned untrusted-influenced content; process_one_call
+    # records the tainted provenance so a later same-program syscall sees it.
+    assert ctx.result_runtime_provenance == RuntimeProvenance(
         status="tainted",
         evidence=(
             {
@@ -1044,155 +812,3 @@ def test_process_response_function_calls_executes_attachment_read_runtime() -> N
             },
         ),
     )
-    tool_summary = json.loads(result.assistant_message)
-    assert tool_summary["kind"] == "audited_tool_results"
-    assert tool_summary["requires_model_final_answer"] is True
-    assert tool_summary["retrieval"] == {
-        "capability_ids": ["cap.attachment.read"],
-        "errors": [],
-        "requested": True,
-        "source_count": 1,
-        "sources": [
-            {
-                "artifact_id": "art_1",
-                "published_at": None,
-                "retrieved_at": "2026-04-27T12:00:00Z",
-                "source": "discord://channel/1/message/2/attachment/777",
-                "title": "report.txt",
-            }
-        ],
-    }
-    assert result.assistant_sources == tool_summary["retrieval"]["sources"]
-    assert result.tool_result_interpreter_input is None
-    assert result.tool_result_interpreter_output is None
-
-
-@pytest.mark.parametrize(
-    ("output_override", "expected_reason"),
-    [
-        (
-            {"blocks": [{"kind": "text", "text": "x" * 7_000}]},
-            "large",
-        ),
-        (
-            {"modality": "image", "blocks": [{"kind": "ocr", "text": "visible text"}]},
-            "modality_heavy",
-        ),
-    ],
-)
-def test_tool_outputs_requiring_interpretation_are_routed_without_raw_tool_output(
-    output_override: dict[str, Any],
-    expected_reason: str,
-) -> None:
-    fixed_now = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
-    events: list[tuple[str, dict[str, Any]]] = []
-    id_counts: dict[str, int] = {}
-
-    class Db:
-        def add(self, record: Any) -> None:
-            return None
-
-        def flush(self) -> None:
-            return None
-
-        def get_bind(self) -> None:
-            return None
-
-    base_output: dict[str, Any] = {
-        "attachment_ref": "discord:777",
-        "filename": "report.txt",
-        "retrieved_at": "2026-04-27T12:00:00Z",
-        "modality": "text",
-        "read_outcome": {"status": "ok", "reason_code": None, "recovery": None},
-        "blocks": [{"kind": "text", "text": "quarterly revenue increased"}],
-        "results": [
-            {
-                "title": "report.txt",
-                "source": "discord://channel/1/message/2/attachment/777",
-                "snippet": "quarterly revenue increased",
-                "published_at": None,
-            }
-        ],
-    }
-    base_output.update(output_override)
-
-    class AttachmentRuntime:
-        def execute_read(self, **_: Any) -> ExecutionResult:
-            return ExecutionResult(status="succeeded", output=base_output, error=None)
-
-    def new_id(prefix: str) -> str:
-        id_counts[prefix] = id_counts.get(prefix, 0) + 1
-        return f"{prefix}_{id_counts[prefix]}"
-
-    turn = TurnRecord(
-        id="trn_1",
-        session_id="ses_1",
-        user_message="read the attachment",
-        assistant_message=None,
-        status="in_progress",
-        created_at=fixed_now,
-        updated_at=fixed_now,
-    )
-
-    result = process_response_function_calls(
-        db=cast(Session, Db()),
-        session_id="ses_1",
-        turn=turn,
-        assistant_message="",
-        function_calls_raw=[
-            {
-                "call_id": "call_1",
-                "capability_id": "cap.attachment.read",
-                "input": {"attachment_ref": "discord:777", "intent": "summarize"},
-                "influenced_by_untrusted_content": False,
-            }
-        ],
-        approval_ttl_seconds=300,
-        approval_actor_id="usr_1",
-        add_event=lambda event_type, payload: events.append((event_type, payload)),
-        now_fn=lambda: fixed_now,
-        new_id_fn=new_id,
-        runtime_provenance=RuntimeProvenance(status="clean"),
-        attachment_runtime=cast(Any, AttachmentRuntime()),
-        allowed_capability_ids=["cap.attachment.read"],
-    )
-
-    tool_summary = json.loads(result.assistant_message)
-    assert tool_summary["kind"] == "audited_tool_results"
-    assert tool_summary["requires_model_final_answer"] is False
-    assert tool_summary["tool_result_interpreter"]["required"] is True
-    assert expected_reason in tool_summary["tool_result_interpreter"]["reason_codes"]
-    assert "attachment content:" not in result.assistant_message
-    assert "quarterly revenue increased [1]" not in result.assistant_message
-
-    assert result.tool_result_interpreter_input is not None
-    assert result.tool_result_interpreter_output is None
-    interpreter_input = result.tool_result_interpreter_input
-    assert interpreter_input["judgment_type"] == "tool_result_interpretation"
-    assert interpreter_input["action_attempt_ids"] == ["aat_1"]
-    assert expected_reason in interpreter_input["reason_codes"]
-    assert interpreter_input["audited_tool_outputs"][0]["output_ref"] == "aat_1"
-    assert interpreter_input["output_contract"] == {
-        "artifact_refs": [],
-        "citation_refs": [],
-        "confidence": None,
-        "contradictions": [],
-        "findings": [],
-        "omitted_output_refs": [],
-        "recommended_next_evidence": [],
-        "selected_output_refs": [],
-        "uncertainty": [],
-    }
-
-    function_call_output = json.loads(result.function_call_outputs[0]["output"])
-    assert function_call_output == {
-        "action_attempt_id": "aat_1",
-        "capability_id": "cap.attachment.read",
-        "status": "succeeded",
-        "tool_result_interpreter": {
-            "output": None,
-            "output_ref": "aat_1",
-            "reason_codes": interpreter_input["audited_tool_outputs"][0]["reason_codes"],
-            "required": True,
-        },
-    }

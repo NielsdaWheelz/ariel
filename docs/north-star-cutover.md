@@ -5,9 +5,9 @@
 This document owns the hard cutover plan for Ariel's new product and
 architecture north-star.
 
-It converts the repository-wide rules in [ai-first.md](ai-first.md) and
-[agent-tooling.md](agent-tooling.md) into an implementation spec for this
-codebase.
+It converts the repository-wide rules in [ai-first.md](ai-first.md) into an
+implementation spec for this codebase. The `run` execution model is narrowed by
+[run-program-cutover.md](run-program-cutover.md).
 
 The cutover is intentionally incompatible with the current broad tool-catalog
 runtime. There is no compatibility layer, no legacy mode, no fallback path, and
@@ -61,9 +61,9 @@ For ordinary turns, Ariel calls the answer model with exactly one direct tool:
 `run`.
 
 The model does not receive selected capability IDs as Responses tools. It writes
-a small run source that emits user-visible output, runs terminal commands, or
-calls internal Ariel operations. Internal capability calls still pass through
-policy, approval, idempotency, audit, and receipts before execution.
+a `run` program that emits user-visible output or calls internal Ariel
+operations. Internal capability calls still pass through policy, approval,
+idempotency, audit, and receipts before execution.
 
 Deterministic code may filter eligibility by hard facts: connector availability,
 attachment presence, policy, runtime binding, source surface, proactive case
@@ -72,9 +72,9 @@ perform semantic intent classification to choose tools or direct work.
 
 ### Coding Work
 
-Durable coding work routes through Agency. Bounded in-turn inspection and
-verification may use `terminal.*`; implementation jobs, PR ownership, and
-long-running repository work route through `agency.*`.
+Coding and repository work routes through Agency. Ariel has no terminal;
+implementation jobs, PR ownership, and repository inspection all route through
+`agency.*`.
 
 Ariel's direct responsibilities for coding work are:
 
@@ -366,8 +366,10 @@ The cutover is complete only when all of these are true:
 
 ## Key Risks
 
-- The single run tool can become a shell escape. Mitigation: typed host calls,
-  terminal policy, output bounds, approvals, and durable action attempts.
+- The single `run` tool can become an unaudited execution surface. Mitigation:
+  the program runs in a gVisor sandbox, every effect is a typed syscall through
+  policy and approval, output is bounded, and action attempts are durable. See
+  [run-program-cutover.md](run-program-cutover.md).
 - Agency can become too broad. Mitigation: sandbox, egress, approval, transcript,
   and outbox receipts are required before terminal-first is safe.
 - Tests can preserve legacy shape accidentally. Mitigation: write failing

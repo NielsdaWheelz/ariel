@@ -48,6 +48,7 @@ from tests.fixtures.memory_eval_cases import (
     LONG_MEMORY_EVAL_CASES,
 )
 from tests.integration.responses_helpers import responses_run_message
+from tests.fake_sandbox import FakeSandboxRuntime
 
 _id_counter = count(1)
 
@@ -66,7 +67,12 @@ def _session_factory(client: TestClient) -> Any:
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
     return TestClient(
-        create_app(database_url=postgres_url, model_adapter=adapter, reset_database=True)
+        create_app(
+            database_url=postgres_url,
+            model_adapter=adapter,
+            sandbox=FakeSandboxRuntime(),
+            reset_database=True,
+        )
     )
 
 

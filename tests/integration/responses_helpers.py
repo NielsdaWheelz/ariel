@@ -1,13 +1,80 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
+from datetime import datetime
 from typing import Any, cast
 
 from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session, sessionmaker
 
-from ariel.action_runtime import process_action_execution_task
+from ariel.action_runtime import (
+    RuntimeProvenance,
+    _FunctionCallProcessingContext,
+    process_action_execution_task,
+    process_one_call,
+)
 from ariel.app import _new_id, _utcnow
 from ariel.google_connector import GoogleConnectorRuntime
+from ariel.persistence import TurnRecord
+
+
+def run_function_calls(
+    *,
+    db: Session,
+    session_id: str,
+    turn: TurnRecord,
+    function_calls_raw: list[dict[str, Any]],
+    approval_ttl_seconds: int,
+    approval_actor_id: str,
+    add_event: Callable[[str, dict[str, Any]], None],
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+    allowed_capability_ids: list[str],
+    session_factory: sessionmaker[Session] | None = None,
+    runtime_provenance: RuntimeProvenance | None = None,
+    google_runtime: GoogleConnectorRuntime | None = None,
+    execute_google_reads_outside_transaction: bool = False,
+    agency_runtime: Any | None = None,
+    attachment_runtime: Any | None = None,
+    settings: Any | None = None,
+    memory_import_cutover_enabled: bool = False,
+) -> _FunctionCallProcessingContext:
+    """Drive a list of capability calls through ``process_one_call``.
+
+    The run-program host path dispatches each program syscall through
+    ``process_one_call``; this helper applies the same per-call lifecycle to a
+    plain call list so action-runtime tests can assert capability behavior
+    without authoring a sandbox program. It returns the shared context whose
+    ``created_action_attempts`` and ``function_call_outputs`` carry the results.
+    """
+
+    ctx = _FunctionCallProcessingContext()
+    allowed = set(allowed_capability_ids)
+    for index, function_call_raw in enumerate(function_calls_raw, start=1):
+        process_one_call(
+            ctx=ctx,
+            function_call_index=index,
+            function_call_raw=function_call_raw,
+            db=db,
+            session_factory=session_factory,
+            session_id=session_id,
+            turn=turn,
+            approval_ttl_seconds=approval_ttl_seconds,
+            approval_actor_id=approval_actor_id,
+            add_event=add_event,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+            runtime_provenance=runtime_provenance,
+            google_runtime=google_runtime,
+            execute_google_reads_outside_transaction=execute_google_reads_outside_transaction,
+            agency_runtime=agency_runtime,
+            attachment_runtime=attachment_runtime,
+            allowed_capability_id_set=allowed,
+            settings=settings,
+            memory_import_cutover_enabled=memory_import_cutover_enabled,
+        )
+    return ctx
 
 
 def responses_message(
@@ -58,6 +125,26 @@ def responses_run_message(
     )
 
 
+def run_program_source_from_calls(calls: list[dict[str, Any]]) -> str:
+    """Translate a flat ``[{"name", "input"}, ...]`` call list into a run program.
+
+    Each call becomes one ``namespace.member(**kwargs)`` statement, in order. This
+    adapts the turn-test suite onto the Python-program ``run`` source at one
+    point: tests still describe the calls they expect, and this renders the
+    equivalent linear program.
+    """
+
+    statements: list[str] = []
+    for call in calls:
+        name = call["name"]
+        call_input = call.get("input") or {}
+        if not isinstance(call_input, dict):
+            raise AssertionError(f"run call {name!r} input must be an object")
+        kwargs = ", ".join(f"{key}={value!r}" for key, value in call_input.items())
+        statements.append(f"{name}({kwargs})")
+    return "\n".join(statements) + "\n"
+
+
 def responses_with_run_calls(
     *,
     assistant_text: str,
@@ -87,7 +174,7 @@ def responses_with_run_calls(
                 "call_id": "call_run_test",
                 "name": "run",
                 "arguments": json.dumps(
-                    {"source": json.dumps({"calls": calls}, sort_keys=True)},
+                    {"source": run_program_source_from_calls(calls)},
                     sort_keys=True,
                 ),
                 "status": "completed",

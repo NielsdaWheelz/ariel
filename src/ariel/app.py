@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import asynccontextmanager, nullcontext
 import hmac
 import hashlib
@@ -33,7 +33,6 @@ from sqlalchemy.orm import Session, sessionmaker
 from ariel.action_runtime import (
     ActionRuntimeError,
     RuntimeProvenance,
-    process_response_function_calls,
     reconcile_expired_approvals_for_session,
     resolve_approval_decision,
 )
@@ -41,7 +40,6 @@ from ariel.agency_daemon import AgencyDaemonClient, AgencyRuntime
 from ariel.attachment_content import AttachmentContentRuntime
 from ariel.capability_registry import (
     MEMORY_CAPABILITY_IDS,
-    TERMINAL_CAPABILITY_IDS,
     get_capability,
     internal_callable_capability_ids,
     run_callable_name_for_capability_id,
@@ -218,7 +216,12 @@ from ariel.response_contracts import (
     build_surface_workspace_item_event_list_response,
     build_surface_workspace_item_list_response,
 )
-from ariel.run_runtime import parse_run_function_call, run_tool_definitions, unpack_run_source
+from ariel.run_runtime import (
+    execute_run_program,
+    parse_run_function_call,
+    run_tool_definitions,
+)
+from ariel.sandbox_runtime import RunSandbox, SandboxRuntime
 from ariel.weather_state import get_weather_default_location_state, set_weather_default_location
 from ariel.worker import enqueue_background_task
 from ariel.workspace_reasoning import CommitmentState, validate_lifecycle_transition
@@ -1283,7 +1286,12 @@ def _build_responses_input_items(
             input_items.append(
                 {
                     "role": "system",
-                    "content": "eligible run callables for this turn:\n"
+                    "content": (
+                        "syscall callables your run program may call this turn "
+                        "(each is namespace.member(...) and returns its result; "
+                        "agent.emit_message, agent.emit_value, and "
+                        "agent.pause_until_input are always available):\n"
+                    )
                     + "\n".join(callable_lines),
                 }
             )
@@ -1557,157 +1565,6 @@ def _extract_responses_assistant_text(output_items: Any) -> str:
             if isinstance(text, str) and text:
                 text_parts.append(text)
     return "".join(text_parts).strip()
-
-
-def _call_tool_result_interpreter(
-    *,
-    model_adapter: ModelAdapter,
-    interpreter_input: dict[str, Any],
-) -> dict[str, Any]:
-    response = model_adapter.create_response(
-        input_items=[
-            {
-                "role": "system",
-                "content": (
-                    "Interpret audited tool results for Ariel's master assistant. Return JSON only "
-                    "with findings, contradictions, uncertainty, selected_output_refs, "
-                    "omitted_output_refs, citation_refs, artifact_refs, recommended_next_evidence, "
-                    "and confidence. Do not write final user-facing prose. Do not authorize actions."
-                ),
-            },
-            {
-                "role": "user",
-                "content": json.dumps(interpreter_input, sort_keys=True, separators=(",", ":")),
-            },
-        ],
-        tools=[],
-        user_message="",
-        history=[],
-        context_bundle={
-            "origin": "tool_result_interpretation",
-            "tool_result_interpreter_input": interpreter_input,
-        },
-    )
-    provider_response_id = response.get("provider_response_id")
-    if not isinstance(provider_response_id, str):
-        provider_response_id = None
-    provider = response.get("provider")
-    if not isinstance(provider, str):
-        provider = None
-    model = response.get("model")
-    if not isinstance(model, str):
-        model = None
-    usage = response.get("usage")
-    if not isinstance(usage, dict):
-        usage = None
-    response_output = response.get("output")
-    text = _extract_responses_assistant_text(response_output)
-    raw_output_shape = {
-        "output_type": type(response_output).__name__,
-        "output_count": len(response_output) if isinstance(response_output, list) else None,
-        "text_present": bool(text),
-    }
-
-    def raise_schema_error(reason: str) -> None:
-        raise ModelAdapterError(
-            safe_reason=reason,
-            status_code=502,
-            code="E_AI_JUDGMENT_SCHEMA",
-            message="AI tool-result interpretation failed",
-            retryable=False,
-            provider=provider,
-            model=model,
-            usage=usage,
-            provider_response_id=provider_response_id,
-            parse_status="schema_invalid",
-            validation_status="invalid",
-            raw_output_shape=raw_output_shape,
-        )
-
-    try:
-        output = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise ModelAdapterError(
-            safe_reason="tool-result interpreter returned malformed JSON",
-            status_code=502,
-            code="E_AI_JUDGMENT_INVALID_JSON",
-            message="AI tool-result interpretation failed",
-            retryable=False,
-            provider=provider,
-            model=model,
-            usage=usage,
-            provider_response_id=provider_response_id,
-            parse_status="invalid_json",
-            validation_status="not_validated",
-            raw_output_shape=raw_output_shape,
-        ) from exc
-    if not isinstance(output, dict):
-        raise_schema_error("tool-result interpreter returned non-object JSON")
-
-    required_keys = {
-        "findings",
-        "contradictions",
-        "uncertainty",
-        "selected_output_refs",
-        "omitted_output_refs",
-        "citation_refs",
-        "artifact_refs",
-        "recommended_next_evidence",
-        "confidence",
-    }
-    if set(output.keys()) != required_keys:
-        raise_schema_error("tool-result interpreter returned unexpected schema keys")
-
-    for key in ("findings", "contradictions", "uncertainty", "recommended_next_evidence"):
-        values = output[key]
-        if not isinstance(values, list):
-            raise_schema_error(f"tool-result interpreter returned non-list {key}")
-        for value in values:
-            if not isinstance(value, str) or not value.strip():
-                raise_schema_error(f"tool-result interpreter returned invalid {key}")
-
-    audited_output_refs = {
-        audited.get("output_ref")
-        for audited in interpreter_input.get("audited_tool_outputs", [])
-        if isinstance(audited, dict) and isinstance(audited.get("output_ref"), str)
-    }
-    for key in ("selected_output_refs", "omitted_output_refs"):
-        values = output[key]
-        if not isinstance(values, list):
-            raise_schema_error(f"tool-result interpreter returned non-list {key}")
-        for value in values:
-            if not isinstance(value, str) or value not in audited_output_refs:
-                raise_schema_error(f"tool-result interpreter returned unknown {key}")
-
-    for key in ("citation_refs", "artifact_refs"):
-        values = output[key]
-        if not isinstance(values, list):
-            raise_schema_error(f"tool-result interpreter returned non-list {key}")
-        allowed_values = interpreter_input.get(key)
-        if not isinstance(allowed_values, list):
-            allowed_values = []
-        for value in values:
-            if value not in allowed_values:
-                raise_schema_error(f"tool-result interpreter returned unknown {key}")
-
-    confidence = output.get("confidence")
-    if (
-        not isinstance(confidence, int | float)
-        or isinstance(confidence, bool)
-        or float(confidence) < 0.0
-        or float(confidence) > 1.0
-        or float(confidence) != float(confidence)
-    ):
-        raise_schema_error("tool-result interpreter returned invalid confidence")
-    output["confidence"] = float(confidence)
-    return {
-        "output": output,
-        "provider": response.get("provider"),
-        "model": response.get("model"),
-        "usage": usage,
-        "provider_response_id": provider_response_id,
-        "response_output_shape": raw_output_shape,
-    }
 
 
 def _extract_responses_function_calls(output_items: Any) -> list[dict[str, Any]]:
@@ -3406,9 +3263,6 @@ def _eligible_internal_callable_capability_ids(
             if has_attachment_refs:
                 capability_ids.append(capability_id)
             continue
-        if capability_id in TERMINAL_CAPABILITY_IDS:
-            capability_ids.append(capability_id)
-            continue
         if capability_id in MEMORY_CAPABILITY_IDS:
             if capability_id != "cap.memory.eval":
                 capability_ids.append(capability_id)
@@ -3496,6 +3350,96 @@ def _merge_runtime_provenance(
     return RuntimeProvenance(status=merged_status, evidence=merged_evidence)
 
 
+def _turn_retrieval_sources(*, db: Session, turn_id: str) -> list[dict[str, Any]]:
+    """Citations for the turn's surfaced response.
+
+    A program's retrieval syscalls persist ``retrieval_provenance`` artifacts
+    through the per-call lifecycle. They are the durable citation record; this
+    reads them back for the turn so the response can cite its sources.
+    """
+
+    artifacts = db.scalars(
+        select(ArtifactRecord)
+        .where(
+            ArtifactRecord.turn_id == turn_id,
+            ArtifactRecord.artifact_type == "retrieval_provenance",
+        )
+        .order_by(ArtifactRecord.created_at.asc(), ArtifactRecord.id.asc())
+    ).all()
+    return [
+        {
+            "artifact_id": artifact.id,
+            "title": artifact.title,
+            "source": artifact.source,
+            "retrieved_at": to_rfc3339(artifact.retrieved_at),
+            "published_at": (
+                to_rfc3339(artifact.published_at) if artifact.published_at is not None else None
+            ),
+        }
+        for artifact in artifacts
+    ]
+
+
+def _run_program_action_attempt_summary(
+    action_attempts: list[ActionAttemptRecord],
+) -> list[dict[str, Any]]:
+    """Compact, model-facing summary of a program's syscall trace.
+
+    The model authored the program before any syscall ran; this tells it what
+    each capability syscall did so it can author the next program.
+    """
+
+    return [
+        {
+            "action_attempt_id": action_attempt.id,
+            "capability_id": action_attempt.capability_id,
+            "status": action_attempt.status,
+            "policy_decision": action_attempt.policy_decision,
+            "approval_required": action_attempt.approval_required,
+        }
+        for action_attempt in action_attempts
+    ]
+
+
+def _void_failed_program_approvals(
+    *,
+    db: Session,
+    action_attempts: list[ActionAttemptRecord],
+    add_event: Callable[[str, dict[str, Any]], None],
+) -> None:
+    """Void approval proposals staged by a program that did not complete cleanly.
+
+    Per the cutover's "Program Failure", a program that fails commits no
+    proposals. The syscall trace stays as the audit record, but any approval the
+    failed program staged must never surface as a live pending action: the
+    approval and its action attempt move to ``expired`` so nothing is left
+    ``pending`` for the user to act on.
+    """
+
+    now = _utcnow()
+    for action_attempt in action_attempts:
+        if action_attempt.status != "awaiting_approval":
+            continue
+        approval = action_attempt.approval_request
+        if approval is not None and approval.status == "pending":
+            approval.status = "expired"
+            approval.decision_reason = "program_failed"
+            approval.decided_at = now
+            approval.updated_at = now
+        action_attempt.status = "expired"
+        action_attempt.policy_reason = "program_failed"
+        action_attempt.updated_at = now
+        add_event(
+            "evt.action.approval.expired",
+            {
+                "action_attempt_id": action_attempt.id,
+                "approval_ref": approval.id if approval is not None else None,
+                "reason": "program_failed",
+            },
+        )
+    db.flush()
+
+
 def _get_or_create_active_session(db: Session) -> SessionRecord:
     bind = db.get_bind()
     if bind is not None and bind.dialect.name == "postgresql":
@@ -3539,6 +3483,7 @@ def create_app(
     database_url: str | None = None,
     model_adapter: ModelAdapter | None = None,
     context_compaction_adapter: ContextCompactionAdapter | None = None,
+    sandbox: RunSandbox | None = None,
     reset_database: bool = False,
 ) -> FastAPI:
     settings = AppSettings()
@@ -3549,6 +3494,7 @@ def create_app(
         model=settings.model_name,
         timeout_seconds=settings.model_timeout_seconds,
     )
+    run_sandbox = sandbox if sandbox is not None else SandboxRuntime()
 
     engine = create_engine(
         db_url,
@@ -3563,9 +3509,11 @@ def create_app(
         if reset_database:
             reset_schema_for_tests(engine, db_url)
         app.state.schema_missing_tables = missing_required_tables(engine)
+        run_sandbox.start()
         try:
             yield
         finally:
+            run_sandbox.close()
             engine.dispose()
 
     app = FastAPI(title="Ariel Slice 0", lifespan=lifespan)
@@ -3573,6 +3521,7 @@ def create_app(
     app.state.session_factory = session_factory
     app.state.model_adapter = adapter
     app.state.context_compaction_adapter = compaction_adapter
+    app.state.sandbox = run_sandbox
     app.state.bind_host = settings.bind_host
     app.state.bind_port = settings.bind_port
     app.state.local_auth_required = settings.local_auth_required
@@ -6113,7 +6062,6 @@ def create_app(
         responses_input_items: list[dict[str, Any]] = []
         responses_tools: list[dict[str, Any]] = []
         allowed_capability_ids: list[str] = []
-        last_tool_result_interpreter_judgment_id: str | None = None
 
         def record_model_output_budget_failure(
             *,
@@ -6136,9 +6084,6 @@ def create_app(
                     "turn_id": turn.id,
                     "attempt": attempt,
                     "max_model_attempts": int(app.state.max_model_attempts),
-                    "last_tool_result_interpreter_judgment_id": (
-                        last_tool_result_interpreter_judgment_id
-                    ),
                 },
                 parse_status="missing_output",
                 validation_status="not_validated",
@@ -6158,9 +6103,6 @@ def create_app(
                     "provider_response_id": provider_response_id,
                     "attempt": attempt,
                     "max_model_attempts": int(app.state.max_model_attempts),
-                    "last_tool_result_interpreter_judgment_id": (
-                        last_tool_result_interpreter_judgment_id
-                    ),
                 },
             )
             return ApiError(
@@ -6175,9 +6117,6 @@ def create_app(
                     "attempt": attempt,
                     "max_model_attempts": int(app.state.max_model_attempts),
                     "provider_response_id": provider_response_id,
-                    "last_tool_result_interpreter_judgment_id": (
-                        last_tool_result_interpreter_judgment_id
-                    ),
                 },
                 retryable=True,
             )
@@ -6654,7 +6593,6 @@ def create_app(
                                 "text_present": False,
                             },
                         )
-                    assistant_text = _extract_responses_assistant_text(output_items)
                     function_calls = _extract_responses_function_calls(output_items)
                     run_source, run_protocol_error = parse_run_function_call(function_calls)
                     if run_protocol_error is not None or run_source is None:
@@ -6714,8 +6652,9 @@ def create_app(
                                 "content": (
                                     "model protocol failure: the user did not see that response. "
                                     "Call exactly one tool named run with JSON arguments "
-                                    '{"source":"..."} and emit user-visible text inside '
-                                    "the run source with agent.emit_message."
+                                    '{"source":"..."} where source is a Python program; emit '
+                                    "user-visible text from the program with "
+                                    "agent.emit_message."
                                 ),
                             }
                         )
@@ -6742,10 +6681,64 @@ def create_app(
                             break
                         continue
 
-                    run_effects = unpack_run_source(run_source)
                     run_call_id = function_calls[0].get("call_id")
                     run_call_id = run_call_id if isinstance(run_call_id, str) else ""
-                    if run_effects.errors:
+                    run_program_result = execute_run_program(
+                        sandbox=app.state.sandbox,
+                        source=run_source,
+                        db=db,
+                        session_factory=session_factory,
+                        session_id=effective_session_id,
+                        turn=turn,
+                        # Capability syscalls from earlier programs in this turn
+                        # already consumed proposal indices; each one created
+                        # exactly one ActionAttemptRecord here. Offset by their
+                        # running count so proposal_index stays turn-unique.
+                        proposal_index_start=len(created_action_attempts),
+                        approval_ttl_seconds=int(app.state.approval_ttl_seconds),
+                        approval_actor_id=str(app.state.approval_actor_id),
+                        add_event=add_event,
+                        now_fn=_utcnow,
+                        new_id_fn=_new_id,
+                        runtime_provenance=runtime_provenance,
+                        google_runtime=_google_runtime(),
+                        execute_google_reads_outside_transaction=(
+                            execute_google_reads_outside_transaction
+                        ),
+                        agency_runtime=_agency_runtime(),
+                        attachment_runtime=app.state.attachment_runtime,
+                        allowed_capability_ids=set(allowed_capability_ids),
+                        settings=settings,
+                        memory_import_cutover_enabled=settings.memory_import_cutover_enabled,
+                    )
+                    # The syscall trace is the audit spine and is recorded whether
+                    # or not the program completed cleanly.
+                    created_action_attempts.extend(run_program_result.action_attempts)
+                    # Thread taint across programs in the same turn: a syscall
+                    # that returned untrusted-influenced content in this program
+                    # advanced its runtime provenance; merge that into the turn
+                    # baseline so the next program's syscalls are evaluated with
+                    # it. execute_run_program already threads taint within a
+                    # program; this closes the gap across programs.
+                    runtime_provenance = _merge_runtime_provenance(
+                        baseline=runtime_provenance,
+                        ingress=run_program_result.runtime_provenance,
+                    )
+                    if not run_program_result.program_ok:
+                        # Program Failure: the program did not complete cleanly, so
+                        # no proposal stands. Void any approval the failed program
+                        # staged so it never surfaces as a live pending action; the
+                        # action attempts stay as the audit trace.
+                        _void_failed_program_approvals(
+                            db=db,
+                            action_attempts=run_program_result.action_attempts,
+                            add_event=add_event,
+                        )
+                        program_errors = [
+                            error
+                            for error in [run_program_result.program_error]
+                            if error is not None
+                        ] + run_program_result.callback_errors
                         provider_response_id = candidate_response.get("provider_response_id")
                         add_ai_judgment(
                             judgment_type="model_output",
@@ -6759,7 +6752,7 @@ def create_app(
                             provider_response_id=provider_response_id
                             if isinstance(provider_response_id, str)
                             else None,
-                            input_summary="run source validation for model response",
+                            input_summary="run program execution for model response",
                             input_refs={
                                 "session_id": effective_session_id,
                                 "turn_id": turn.id,
@@ -6769,7 +6762,7 @@ def create_app(
                             parse_status="parsed",
                             validation_status="invalid",
                             failure_code="E_AI_JUDGMENT_VALIDATION",
-                            failure_reason=json.dumps(run_effects.errors, sort_keys=True),
+                            failure_reason=json.dumps(program_errors, sort_keys=True),
                         )
                         for output_item in output_items:
                             if (
@@ -6783,7 +6776,7 @@ def create_app(
                                     "type": "function_call_output",
                                     "call_id": run_call_id,
                                     "output": json.dumps(
-                                        {"status": "failed", "errors": run_effects.errors},
+                                        {"status": "failed", "errors": program_errors},
                                         sort_keys=True,
                                     ),
                                 }
@@ -6792,19 +6785,19 @@ def create_app(
                             {
                                 "role": "system",
                                 "content": (
-                                    "run source failed validation: "
-                                    + json.dumps(run_effects.errors, sort_keys=True)
-                                    + ". The user did not see any plain assistant text. "
-                                    "Retry with a JSON source shaped as "
-                                    '{"calls":[{"name":"agent.emit_message",'
-                                    '"input":{"text":"..."}}]}.'
+                                    "run program did not complete: "
+                                    + json.dumps(program_errors, sort_keys=True)
+                                    + ". No effects were committed and the user did not "
+                                    "see any output. Retry with exactly one run call whose "
+                                    "source is a Python program that completes cleanly and "
+                                    "emits user-visible text with agent.emit_message."
                                 ),
                             }
                         )
                         add_event(
                             "evt.run.validation_failed",
                             {
-                                "errors": run_effects.errors,
+                                "errors": program_errors,
                                 "attempt": attempt,
                                 "provider_response_id": candidate_response.get(
                                     "provider_response_id"
@@ -6817,9 +6810,9 @@ def create_app(
                                 provider_response_id=candidate_response.get("provider_response_id")
                                 if isinstance(candidate_response.get("provider_response_id"), str)
                                 else None,
-                                failure_reason="run source failed validation",
+                                failure_reason="run program did not complete cleanly",
                             )
-                            model_failure_reason = "AI model produced invalid run source"
+                            model_failure_reason = "AI model produced an invalid run program"
                             break
                         continue
 
@@ -6836,7 +6829,7 @@ def create_app(
                         provider_response_id=provider_response_id
                         if isinstance(provider_response_id, str)
                         else None,
-                        input_summary="validated run source for model response",
+                        input_summary="executed run program for model response",
                         input_refs={
                             "session_id": effective_session_id,
                             "turn_id": turn.id,
@@ -6845,16 +6838,22 @@ def create_app(
                             "response_output": jsonable_encoder(output_items),
                         },
                         output={
-                            "emitted_message": bool(run_effects.emitted_message),
-                            "paused": run_effects.paused,
-                            "emitted_value_count": len(run_effects.emitted_values),
-                            "internal_call_count": len(run_effects.function_calls),
+                            "emitted_message": bool(run_program_result.emitted_message),
+                            "paused": run_program_result.paused,
+                            "emitted_value_count": len(run_program_result.emitted_values),
+                            "action_attempt_count": len(run_program_result.action_attempts),
                         },
                         parse_status="parsed",
                         validation_status="valid",
                     )
 
-                    for index, emitted_value in enumerate(run_effects.emitted_values, start=1):
+                    # Retrieval syscalls in the program persisted citation
+                    # artifacts; surface them as the turn's response sources.
+                    assistant_sources = _turn_retrieval_sources(db=db, turn_id=turn.id)
+
+                    for index, emitted_value in enumerate(
+                        run_program_result.emitted_values, start=1
+                    ):
                         encoded_value = json.dumps(
                             jsonable_encoder(emitted_value),
                             sort_keys=True,
@@ -6873,301 +6872,58 @@ def create_app(
                             },
                         )
 
-                    if run_effects.function_calls:
-                        function_processing = process_response_function_calls(
-                            db=db,
-                            session_factory=session_factory,
-                            session_id=effective_session_id,
-                            turn=turn,
-                            assistant_message=run_effects.emitted_message or assistant_text,
-                            function_calls_raw=run_effects.function_calls,
-                            approval_ttl_seconds=int(app.state.approval_ttl_seconds),
-                            approval_actor_id=str(app.state.approval_actor_id),
-                            add_event=add_event,
-                            now_fn=_utcnow,
-                            new_id_fn=_new_id,
-                            runtime_provenance=runtime_provenance,
-                            allowed_capability_ids=allowed_capability_ids,
-                            google_runtime=_google_runtime(),
-                            execute_google_reads_outside_transaction=(
-                                execute_google_reads_outside_transaction
-                            ),
-                            agency_runtime=_agency_runtime(),
-                            attachment_runtime=app.state.attachment_runtime,
-                            settings=settings,
-                            memory_import_cutover_enabled=settings.memory_import_cutover_enabled,
+                    if run_program_result.emitted_message:
+                        # The program composed user-visible output. A program may
+                        # stage approval proposals and still emit a mechanical
+                        # confirmation; the emitted message is the turn answer.
+                        response_tokens = _response_tokens_from_model_payload(
+                            candidate_response,
+                            assistant_text=run_program_result.emitted_message,
                         )
-                        created_action_attempts.extend(function_processing.action_attempts)
-                        assistant_sources = (
-                            function_processing.assistant_sources or assistant_sources
-                        )
-                        runtime_provenance = _merge_runtime_provenance(
-                            baseline=runtime_provenance,
-                            ingress=function_processing.runtime_provenance,
-                        )
-                        if function_processing.silent_response:
-                            assistant_response = {
-                                **candidate_response,
-                                "assistant_text": "",
-                                "assistant_silent": True,
-                            }
+                        if response_tokens > app.state.max_response_tokens:
+                            bounded_failure = build_turn_limit_failure(
+                                budget="response_tokens",
+                                unit="tokens",
+                                measured=response_tokens,
+                                limit=app.state.max_response_tokens,
+                            )
                             break
+                        assistant_response = {
+                            **candidate_response,
+                            "assistant_text": run_program_result.emitted_message,
+                            "assistant_silent": False,
+                        }
+                        break
 
-                        if any(
-                            action_attempt.status == "awaiting_approval"
-                            for action_attempt in function_processing.action_attempts
-                        ):
-                            approval_message = (
-                                run_effects.emitted_message
-                                or "approval required. review the pending action."
-                            )
-                            response_tokens = _response_tokens_from_model_payload(
-                                candidate_response,
-                                assistant_text=approval_message,
-                            )
-                            if response_tokens > app.state.max_response_tokens:
-                                bounded_failure = build_turn_limit_failure(
-                                    budget="response_tokens",
-                                    unit="tokens",
-                                    measured=response_tokens,
-                                    limit=app.state.max_response_tokens,
-                                )
-                                break
-                            assistant_response = {
-                                **candidate_response,
-                                "assistant_text": approval_message,
-                                "assistant_silent": False,
-                            }
-                            break
-                        tool_result_interpreter_output: dict[str, Any] | None = None
-                        if function_processing.tool_result_interpreter_input is not None:
-                            try:
-                                interpreted = _call_tool_result_interpreter(
-                                    model_adapter=app.state.model_adapter,
-                                    interpreter_input=(
-                                        function_processing.tool_result_interpreter_input
-                                    ),
-                                )
-                            except ModelAdapterError as exc:
-                                failure_reason = safe_failure_reason(
-                                    exc.safe_reason,
-                                    fallback=f"unexpected {exc.__class__.__name__}",
-                                )
-                                parse_status = exc.parse_status or (
-                                    "invalid_json"
-                                    if exc.code == "E_AI_JUDGMENT_INVALID_JSON"
-                                    else "schema_invalid"
-                                )
-                                validation_status = exc.validation_status or (
-                                    "not_validated"
-                                    if exc.code == "E_AI_JUDGMENT_INVALID_JSON"
-                                    else "invalid"
-                                )
-                                last_tool_result_interpreter_judgment_id = add_ai_judgment(
-                                    judgment_type="tool_result_interpretation",
-                                    source_type="turn",
-                                    source_id=turn.id,
-                                    status="failed",
-                                    model=exc.model or app.state.model_adapter.model,
-                                    prompt_version="tool-result-interpretation-v1",
-                                    provider_response_id=exc.provider_response_id
-                                    if isinstance(exc.provider_response_id, str)
-                                    else None,
-                                    input_summary="tool-result interpretation for turn",
-                                    input_refs=function_processing.tool_result_interpreter_input,
-                                    parse_status=parse_status,
-                                    validation_status=validation_status,
-                                    failure_code=exc.code,
-                                    failure_reason=failure_reason,
-                                    output={
-                                        "provider": exc.provider
-                                        or app.state.model_adapter.provider,
-                                        "usage": exc.usage or {},
-                                        "response_output_shape": exc.raw_output_shape or {},
-                                    },
-                                )
-                                add_event(
-                                    "evt.ai_judgment.failed",
-                                    {
-                                        "judgment_type": "tool_result_interpretation",
-                                        "failure_code": exc.code,
-                                        "failure_reason": failure_reason,
-                                        "prompt_version": "tool-result-interpretation-v1",
-                                        "source_id": turn.id,
-                                        "parse_status": parse_status,
-                                        "validation_status": validation_status,
-                                        "provider": exc.provider
-                                        or app.state.model_adapter.provider,
-                                        "model": exc.model or app.state.model_adapter.model,
-                                        "usage": exc.usage or {},
-                                        "provider_response_id": exc.provider_response_id
-                                        if isinstance(exc.provider_response_id, str)
-                                        else None,
-                                        "response_output_shape": exc.raw_output_shape or {},
-                                    },
-                                )
-                                raise
-                            interpreted_output = interpreted["output"]
-                            if isinstance(interpreted_output, dict):
-                                tool_result_interpreter_output = interpreted_output
-                                function_processing.tool_result_interpreter_output = (
-                                    tool_result_interpreter_output
-                                )
-                                last_tool_result_interpreter_judgment_id = add_ai_judgment(
-                                    judgment_type="tool_result_interpretation",
-                                    source_type="turn",
-                                    source_id=turn.id,
-                                    status="succeeded",
-                                    model=interpreted.get("model")
-                                    if isinstance(interpreted.get("model"), str)
-                                    else app.state.model_adapter.model,
-                                    prompt_version="tool-result-interpretation-v1",
-                                    provider_response_id=interpreted.get("provider_response_id")
-                                    if isinstance(interpreted.get("provider_response_id"), str)
-                                    else None,
-                                    input_summary="tool-result interpretation for turn",
-                                    input_refs=function_processing.tool_result_interpreter_input,
-                                    selected=[
-                                        {"output_ref": output_ref}
-                                        for output_ref in interpreted_output.get(
-                                            "selected_output_refs", []
-                                        )
-                                        if isinstance(output_ref, str)
-                                    ],
-                                    omitted=interpreted_output.get("omitted_output_refs")
-                                    if isinstance(
-                                        interpreted_output.get("omitted_output_refs"), list
-                                    )
-                                    else [],
-                                    output={
-                                        **tool_result_interpreter_output,
-                                        "provider": interpreted.get("provider"),
-                                        "usage": interpreted.get("usage") or {},
-                                        "response_output_shape": interpreted.get(
-                                            "response_output_shape"
-                                        )
-                                        or {},
-                                    },
-                                    uncertainty=json.dumps(
-                                        interpreted_output.get("uncertainty", []),
-                                        sort_keys=True,
-                                    ),
-                                    confidence=interpreted_output.get("confidence")
-                                    if isinstance(interpreted_output.get("confidence"), int | float)
-                                    else None,
-                                    parse_status="parsed",
-                                    validation_status="valid",
-                                )
-                                add_event(
-                                    "evt.ai_judgment.completed",
-                                    {
-                                        "judgment_type": "tool_result_interpretation",
-                                        "prompt_version": "tool-result-interpretation-v1",
-                                        "source_id": turn.id,
-                                        "parse_status": "parsed",
-                                        "validation_status": "valid",
-                                        "provider": interpreted.get("provider"),
-                                        "model": interpreted.get("model"),
-                                        "usage": interpreted.get("usage") or {},
-                                        "provider_response_id": interpreted.get(
-                                            "provider_response_id"
-                                        ),
-                                        "response_output_shape": interpreted.get(
-                                            "response_output_shape"
-                                        )
-                                        or {},
-                                        "reason_codes": (
-                                            function_processing.tool_result_interpreter_input[
-                                                "reason_codes"
-                                            ]
-                                        ),
-                                    },
-                                )
-                        for output_item in output_items:
-                            if (
-                                isinstance(output_item, dict)
-                                and output_item.get("type") == "function_call"
-                            ):
-                                responses_input_items.append(jsonable_encoder(output_item))
-                        if run_call_id:
-                            decoded_call_outputs = []
-                            for call_output in function_processing.function_call_outputs:
-                                if not isinstance(call_output, dict):
-                                    continue
-                                raw_output = call_output.get("output")
-                                if not isinstance(raw_output, str):
-                                    continue
-                                try:
-                                    decoded_output = json.loads(raw_output)
-                                except ValueError:
-                                    decoded_output = {"raw_output": raw_output}
-                                decoded_call_outputs.append(
-                                    {
-                                        "call_id": call_output.get("call_id"),
-                                        "output": decoded_output,
-                                    }
-                                )
-                            responses_input_items.append(
-                                {
-                                    "type": "function_call_output",
-                                    "call_id": run_call_id,
-                                    "output": json.dumps(
-                                        {
-                                            "status": "completed",
-                                            "action_attempt_count": len(
-                                                function_processing.action_attempts
-                                            ),
-                                            "message_emitted": False,
-                                            "emitted_values": jsonable_encoder(
-                                                run_effects.emitted_values
-                                            ),
-                                            "internal_call_outputs": decoded_call_outputs,
-                                        },
-                                        sort_keys=True,
-                                    ),
-                                }
-                            )
-                        responses_input_items.append(
-                            {
-                                "role": "system",
-                                "content": (
-                                    "audited tool summary:\n"
-                                    + function_processing.assistant_message
-                                ),
-                            }
+                    if any(
+                        action_attempt.status == "awaiting_approval"
+                        for action_attempt in run_program_result.action_attempts
+                    ):
+                        # The program staged an approval proposal but did not emit
+                        # a message; surface a default approval prompt.
+                        approval_message = "approval required. review the pending action."
+                        response_tokens = _response_tokens_from_model_payload(
+                            candidate_response,
+                            assistant_text=approval_message,
                         )
-                        if tool_result_interpreter_output is not None:
-                            responses_input_items.append(
-                                {
-                                    "role": "system",
-                                    "content": (
-                                        "AI tool-result interpretation:\n"
-                                        + json.dumps(
-                                            jsonable_encoder(tool_result_interpreter_output),
-                                            sort_keys=True,
-                                            separators=(",", ":"),
-                                        )
-                                    ),
-                                }
+                        if response_tokens > app.state.max_response_tokens:
+                            bounded_failure = build_turn_limit_failure(
+                                budget="response_tokens",
+                                unit="tokens",
+                                measured=response_tokens,
+                                limit=app.state.max_response_tokens,
                             )
-                        if attempt >= app.state.max_model_attempts:
-                            candidate_provider_response_id = candidate_response.get(
-                                "provider_response_id"
-                            )
-                            model_failure = record_model_output_budget_failure(
-                                attempt=attempt,
-                                provider_response_id=candidate_provider_response_id
-                                if isinstance(candidate_provider_response_id, str)
-                                else None,
-                                failure_reason=(
-                                    "model exhausted its attempt budget before authoring "
-                                    "a final assistant response"
-                                ),
-                            )
-                            model_failure_reason = "AI model output exhausted its attempt budget"
                             break
-                        continue
-                    if run_effects.emitted_values and not run_effects.emitted_message:
+                        assistant_response = {
+                            **candidate_response,
+                            "assistant_text": approval_message,
+                            "assistant_silent": False,
+                        }
+                        break
+
+                    if run_program_result.emitted_values:
+                        # Internal structured data for a later turn: the model
+                        # reads the values and continues with another program.
                         for output_item in output_items:
                             if (
                                 isinstance(output_item, dict)
@@ -7183,7 +6939,7 @@ def create_app(
                                         {
                                             "status": "completed",
                                             "emitted_values": jsonable_encoder(
-                                                run_effects.emitted_values
+                                                run_program_result.emitted_values
                                             ),
                                         },
                                         sort_keys=True,
@@ -7194,8 +6950,8 @@ def create_app(
                             {
                                 "role": "system",
                                 "content": (
-                                    "agent emitted internal values. They are not visible to "
-                                    "the user. Continue with exactly one run call."
+                                    "run program emitted internal values. They are not "
+                                    "visible to the user. Continue with exactly one run call."
                                 ),
                             }
                         )
@@ -7212,41 +6968,78 @@ def create_app(
                             model_failure_reason = "AI model output exhausted its attempt budget"
                             break
                         continue
-                    if run_effects.emitted_message:
-                        response_tokens = _response_tokens_from_model_payload(
-                            candidate_response,
-                            assistant_text=run_effects.emitted_message,
-                        )
-                        if response_tokens > app.state.max_response_tokens:
-                            bounded_failure = build_turn_limit_failure(
-                                budget="response_tokens",
-                                unit="tokens",
-                                measured=response_tokens,
-                                limit=app.state.max_response_tokens,
-                            )
-                            break
 
-                        assistant_response = {
-                            **candidate_response,
-                            "assistant_text": run_effects.emitted_message,
-                            "assistant_silent": False,
-                        }
-                        break
-                    if run_effects.paused:
+                    if run_program_result.paused:
                         assistant_response = {
                             **candidate_response,
                             "assistant_text": "",
                             "assistant_silent": True,
                         }
                         break
+
+                    if run_program_result.action_attempts:
+                        # The program ran syscalls but emitted no user-visible
+                        # output and staged no approval; feed the audited syscall
+                        # trace back so the model can author the next program.
+                        for output_item in output_items:
+                            if (
+                                isinstance(output_item, dict)
+                                and output_item.get("type") == "function_call"
+                            ):
+                                responses_input_items.append(jsonable_encoder(output_item))
+                        action_attempt_summary = _run_program_action_attempt_summary(
+                            run_program_result.action_attempts
+                        )
+                        if run_call_id:
+                            responses_input_items.append(
+                                {
+                                    "type": "function_call_output",
+                                    "call_id": run_call_id,
+                                    "output": json.dumps(
+                                        {
+                                            "status": "completed",
+                                            "message_emitted": False,
+                                            "action_attempts": action_attempt_summary,
+                                        },
+                                        sort_keys=True,
+                                    ),
+                                }
+                            )
+                        responses_input_items.append(
+                            {
+                                "role": "system",
+                                "content": (
+                                    "run program syscall trace:\n"
+                                    + json.dumps(action_attempt_summary, sort_keys=True)
+                                    + "\nThe user saw no output. Continue with exactly one "
+                                    "run call that emits user-visible text with "
+                                    "agent.emit_message."
+                                ),
+                            }
+                        )
+                        if attempt >= app.state.max_model_attempts:
+                            model_failure = record_model_output_budget_failure(
+                                attempt=attempt,
+                                provider_response_id=candidate_response.get("provider_response_id")
+                                if isinstance(candidate_response.get("provider_response_id"), str)
+                                else None,
+                                failure_reason=(
+                                    "model exhausted its attempt budget before authoring "
+                                    "a final assistant response"
+                                ),
+                            )
+                            model_failure_reason = "AI model output exhausted its attempt budget"
+                            break
+                        continue
+
                     responses_input_items.append(
                         {
                             "role": "system",
                             "content": (
-                                "run completed without user-visible output. Plain assistant text "
-                                "is audit-only and was not shown. Continue with exactly one run "
-                                "call that emits output through agent.emit_message or pauses with "
-                                "agent.pause_until_input."
+                                "run program completed without user-visible output. Plain "
+                                "assistant text is audit-only and was not shown. Continue with "
+                                "exactly one run call whose program emits output through "
+                                "agent.emit_message or pauses with agent.pause_until_input."
                             ),
                         }
                     )

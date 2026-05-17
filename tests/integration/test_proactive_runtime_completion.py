@@ -37,6 +37,7 @@ from ariel.proactivity import (
     process_proactive_deliberation_due,
     upsert_proactive_observation,
 )
+from tests.fake_sandbox import FakeSandboxRuntime
 
 
 @dataclass
@@ -176,6 +177,7 @@ def _build_client(
         database_url=postgres_url,
         model_adapter=cast(Any, adapter),
         reset_database=True,
+        sandbox=FakeSandboxRuntime(),
     )
     return TestClient(app)
 

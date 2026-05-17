@@ -15,6 +15,7 @@ from ariel.app import ModelAdapter, ModelAdapterError, create_app
 from ariel.google_connector import GOOGLE_CONNECTOR_ID
 from ariel.persistence import GoogleConnectorRecord
 from tests.integration.responses_helpers import responses_message, responses_with_run_calls
+from tests.fake_sandbox import FakeSandboxRuntime
 
 
 @dataclass
@@ -115,6 +116,7 @@ def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
         database_url=postgres_url,
         model_adapter=adapter,
         reset_database=True,
+        sandbox=FakeSandboxRuntime(),
     )
     return TestClient(app)
 

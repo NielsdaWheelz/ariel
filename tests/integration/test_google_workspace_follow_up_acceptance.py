@@ -14,7 +14,6 @@ from sqlalchemy.orm import Session, sessionmaker
 from ariel.app import create_app
 from ariel.config import AppSettings
 from ariel.action_runtime import process_action_execution_task
-from ariel.action_runtime import process_response_function_calls
 from ariel.action_runtime import RuntimeProvenance
 from ariel.capability_registry import canonical_action_payload
 from ariel.capability_registry import capability_contract_hash
@@ -53,6 +52,8 @@ from ariel.proactivity import (
     process_work_follow_up_evaluate_due,
 )
 from ariel.worker import process_one_task
+from tests.fake_sandbox import FakeSandboxRuntime
+from tests.integration.responses_helpers import run_function_calls
 
 
 NOW = datetime(2026, 5, 12, 12, 0, tzinfo=UTC)
@@ -644,6 +645,7 @@ def client(
         database_url=postgres_url,
         model_adapter=FakeCommitmentAdapter("{}"),
         reset_database=True,
+        sandbox=FakeSandboxRuntime(),
     )
     with TestClient(app) as test_client:
         yield test_client
@@ -1135,11 +1137,10 @@ def test_gmail_search_read_extraction_review_follow_up_notification_pipeline(
                 turn_id="turn_gmail_pipeline",
                 user_message="Find the invoice and follow up if needed.",
             )
-            result = process_response_function_calls(
+            result = run_function_calls(
                 db=db,
                 session_id="ses_gmail_pipeline",
                 turn=turn,
-                assistant_message="",
                 function_calls_raw=[
                     {
                         "call_id": "call_search",
@@ -1163,7 +1164,10 @@ def test_gmail_search_read_extraction_review_follow_up_notification_pipeline(
                 allowed_capability_ids=["cap.email.search", "cap.email.read"],
             )
 
-    assert [attempt.status for attempt in result.action_attempts] == ["succeeded", "succeeded"]
+    assert [attempt.status for attempt in result.created_action_attempts] == [
+        "succeeded",
+        "succeeded",
+    ]
     assert google_runtime.calls == [
         ("cap.email.search", {"query": "invoice due"}),
         (
@@ -1344,11 +1348,10 @@ def test_gmail_read_persists_provider_evidence_and_grounded_artifact(
                 )
             )
             db.flush()
-            result = process_response_function_calls(
+            result = run_function_calls(
                 db=db,
                 session_id="ses_1",
                 turn=turn,
-                assistant_message="",
                 function_calls_raw=[
                     {
                         "call_id": "call_email",
@@ -1367,7 +1370,7 @@ def test_gmail_read_persists_provider_evidence_and_grounded_artifact(
                 allowed_capability_ids=["cap.email.read"],
             )
 
-    assert result.action_attempts[0].status == "succeeded"
+    assert result.created_action_attempts[0].status == "succeeded"
     with session_factory() as db:
         evidence = db.scalar(select(ProviderEvidenceRecord).limit(1))
         block = db.scalar(select(ProviderEvidenceBlockRecord).limit(1))
@@ -1390,7 +1393,7 @@ def test_gmail_read_persists_provider_evidence_and_grounded_artifact(
         )
         assert extraction_task is not None
         assert extraction_task.payload == {"evidence_id": evidence.id}
-        attempt = db.get(ActionAttemptRecord, result.action_attempts[0].id)
+        attempt = db.get(ActionAttemptRecord, result.created_action_attempts[0].id)
         assert attempt is not None
         output = attempt.execution_output
         assert isinstance(output, dict)
@@ -1455,11 +1458,10 @@ def test_gmail_thread_read_persists_provider_evidence_and_grounded_artifact(
                 )
             )
             db.flush()
-            result = process_response_function_calls(
+            result = run_function_calls(
                 db=db,
                 session_id="ses_thread",
                 turn=turn,
-                assistant_message="",
                 function_calls_raw=[
                     {
                         "call_id": "call_thread",
@@ -1478,7 +1480,7 @@ def test_gmail_thread_read_persists_provider_evidence_and_grounded_artifact(
                 allowed_capability_ids=["cap.email.read"],
             )
 
-    assert result.action_attempts[0].status == "succeeded"
+    assert result.created_action_attempts[0].status == "succeeded"
     with session_factory() as db:
         evidence = db.scalar(select(ProviderEvidenceRecord).limit(1))
         block = db.scalar(select(ProviderEvidenceBlockRecord).limit(1))
@@ -1492,7 +1494,7 @@ def test_gmail_thread_read_persists_provider_evidence_and_grounded_artifact(
         assert artifact.snippet == (
             "Gmail thread body evidence recorded: block=gmail:msg_1:body:0 digest=" + "c" * 64
         )
-        attempt = db.get(ActionAttemptRecord, result.action_attempts[0].id)
+        attempt = db.get(ActionAttemptRecord, result.created_action_attempts[0].id)
         assert attempt is not None
         output = attempt.execution_output
         assert isinstance(output, dict)
@@ -1512,11 +1514,10 @@ def test_calendar_read_persists_description_evidence_and_extraction_path(
                 turn_id="turn_calendar_pipeline",
                 user_message="Check today's launch review.",
             )
-            result = process_response_function_calls(
+            result = run_function_calls(
                 db=db,
                 session_id="ses_calendar_pipeline",
                 turn=turn,
-                assistant_message="",
                 function_calls_raw=[
                     {
                         "call_id": "call_calendar",
@@ -1536,7 +1537,7 @@ def test_calendar_read_persists_description_evidence_and_extraction_path(
                 allowed_capability_ids=["cap.calendar.list"],
             )
 
-    assert result.action_attempts[0].status == "succeeded"
+    assert result.created_action_attempts[0].status == "succeeded"
     with session_factory() as db:
         evidence = db.scalar(
             select(ProviderEvidenceRecord)
@@ -1555,7 +1556,7 @@ def test_calendar_read_persists_description_evidence_and_extraction_path(
         assert block is not None
         assert block.block_kind == "calendar_description"
         assert block.text == "Bring the launch checklist today."
-        attempt = db.get(ActionAttemptRecord, result.action_attempts[0].id)
+        attempt = db.get(ActionAttemptRecord, result.created_action_attempts[0].id)
         assert attempt is not None
         assert isinstance(attempt.execution_output, dict)
         output_json = json.dumps(attempt.execution_output, sort_keys=True)
@@ -1631,11 +1632,10 @@ def test_calendar_slot_options_persist_availability_evidence(
                 turn_id="turn_calendar_slots",
                 user_message="Find a time with the lead.",
             )
-            result = process_response_function_calls(
+            result = run_function_calls(
                 db=db,
                 session_id="ses_calendar_slots",
                 turn=turn,
-                assistant_message="",
                 function_calls_raw=[
                     {
                         "call_id": "call_slots",
@@ -1668,7 +1668,7 @@ def test_calendar_slot_options_persist_availability_evidence(
                 allowed_capability_ids=["cap.calendar.propose_slots"],
             )
 
-    assert result.action_attempts[0].status == "succeeded"
+    assert result.created_action_attempts[0].status == "succeeded"
     with session_factory() as db:
         evidence = db.scalar(
             select(ProviderEvidenceRecord)
@@ -1687,7 +1687,7 @@ def test_calendar_slot_options_persist_availability_evidence(
         assert block is not None
         assert block.block_kind == "availability"
         assert "2026-05-12T16:30:00Z" in block.text
-        attempt = db.get(ActionAttemptRecord, result.action_attempts[0].id)
+        attempt = db.get(ActionAttemptRecord, result.created_action_attempts[0].id)
         assert attempt is not None
         assert attempt.execution_output is not None
         assert (
@@ -1927,12 +1927,11 @@ def test_inline_google_read_commits_action_attempt_before_provider_call(
             session_factory,
             turn_id="turn_google_read_boundary",
         )
-        result = process_response_function_calls(
+        result = run_function_calls(
             db=db,
             session_factory=session_factory,
             session_id="ses_google_read_boundary",
             turn=turn,
-            assistant_message="",
             function_calls_raw=[
                 {
                     "call_id": "call_search",
@@ -1953,7 +1952,7 @@ def test_inline_google_read_commits_action_attempt_before_provider_call(
 
     assert google_runtime.action_status_seen_during_access_prepare == "executing"
     assert google_runtime.action_status_seen_by_provider == "executing"
-    assert result.action_attempts[0].status == "succeeded"
+    assert result.created_action_attempts[0].status == "succeeded"
 
 
 def _seed_provider_evidence(session_factory: sessionmaker[Session]) -> None:
@@ -2915,11 +2914,10 @@ def test_prompt_injection_blocks_do_not_create_provider_writes(
                 turn_id="turn_injection_write",
                 user_message="Handle the injected content safely.",
             )
-            result = process_response_function_calls(
+            result = run_function_calls(
                 db=db,
                 session_id="ses_injection_write",
                 turn=turn,
-                assistant_message="",
                 function_calls_raw=[
                     {
                         "call_id": "call_send",
@@ -2973,16 +2971,16 @@ def test_prompt_injection_blocks_do_not_create_provider_writes(
                 allowed_capability_ids=["cap.email.send", "cap.calendar.create_event"],
             )
 
-    assert [attempt.capability_id for attempt in result.action_attempts] == [
+    assert [attempt.capability_id for attempt in result.created_action_attempts] == [
         "cap.email.send",
         "cap.calendar.create_event",
     ]
-    assert [attempt.status for attempt in result.action_attempts] == [
+    assert [attempt.status for attempt in result.created_action_attempts] == [
         "rejected",
         "awaiting_approval",
     ]
-    assert result.action_attempts[0].policy_reason == "taint_denied_untrusted_side_effect"
-    assert result.action_attempts[1].policy_reason == "taint_escalated_requires_approval"
+    assert result.created_action_attempts[0].policy_reason == "taint_denied_untrusted_side_effect"
+    assert result.created_action_attempts[1].policy_reason == "taint_escalated_requires_approval"
     assert google_runtime.provider_write_calls == []
 
     with session_factory() as db:

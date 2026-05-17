@@ -14,7 +14,6 @@ from sqlalchemy.orm import Session, sessionmaker
 from ariel.action_runtime import (
     RuntimeProvenance,
     process_action_execution_task,
-    process_response_function_calls,
 )
 from ariel.capability_registry import (
     canonical_action_payload,
@@ -43,6 +42,7 @@ from ariel.persistence import (
     TurnRecord,
     serialize_action_attempt,
 )
+from tests.integration.responses_helpers import run_function_calls
 
 
 NOW = datetime(2026, 5, 8, 12, 0, tzinfo=UTC)
@@ -371,11 +371,10 @@ def test_memory_inspect_capability_executes_inline(
             db.add(turn)
             db.flush()
 
-            result = process_response_function_calls(
+            result = run_function_calls(
                 db=db,
                 session_id="ses_memory",
                 turn=turn,
-                assistant_message="",
                 function_calls_raw=[
                     {
                         "call_id": "call_memory_inspect",
@@ -393,8 +392,8 @@ def test_memory_inspect_capability_executes_inline(
                 allowed_capability_ids=["cap.memory.inspect"],
             )
 
-    assert result.action_attempts[0].capability_id == "cap.memory.inspect"
-    assert result.action_attempts[0].status == "succeeded"
+    assert result.created_action_attempts[0].capability_id == "cap.memory.inspect"
+    assert result.created_action_attempts[0].status == "succeeded"
     function_output = json.loads(result.function_call_outputs[0]["output"])
     assert function_output["status"] == "succeeded"
     assert function_output["capability_id"] == "cap.memory.inspect"
@@ -970,11 +969,10 @@ def test_email_thread_watch_list_is_scoped_to_current_google_account(
         with db.begin():
             turn = db.get(TurnRecord, "turn_watch_list")
             assert turn is not None
-            result = process_response_function_calls(
+            result = run_function_calls(
                 db=db,
                 session_id="ses_email",
                 turn=turn,
-                assistant_message="list watches",
                 function_calls_raw=[
                     {
                         "call_id": "call_watch_list",

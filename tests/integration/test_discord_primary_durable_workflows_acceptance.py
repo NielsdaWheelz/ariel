@@ -22,6 +22,7 @@ from ariel.worker import (
     process_one_task,
     reap_stale_tasks,
 )
+from tests.fake_sandbox import FakeSandboxRuntime
 
 
 @dataclass
@@ -221,6 +222,7 @@ def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
         database_url=postgres_url,
         model_adapter=adapter,
         reset_database=True,
+        sandbox=FakeSandboxRuntime(),
     )
     return TestClient(app)
 

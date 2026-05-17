@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 from ariel.app import create_app
+from tests.fake_sandbox import FakeSandboxRuntime
 
 LOCAL_AUTH_TOKEN = "test_local_auth_token_0123456789abcdef"
 
@@ -44,6 +45,7 @@ def test_local_auth_guards_authority_routes(
         database_url=postgres_url,
         model_adapter=NoModelAdapter(),
         reset_database=True,
+        sandbox=FakeSandboxRuntime(),
     )
     with TestClient(app) as client:
         assert client.get("/v1/health").status_code == 200
@@ -75,6 +77,7 @@ def test_provider_callback_auth_is_owned_by_provider_verification(
         database_url=postgres_url,
         model_adapter=NoModelAdapter(),
         reset_database=True,
+        sandbox=FakeSandboxRuntime(),
     )
     with TestClient(app) as client:
         response = client.get("/v1/connectors/google/callback")

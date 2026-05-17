@@ -55,6 +55,39 @@ apt-get install -y caddy git postgresql postgresql-contrib
 6. Install Agency using its production installation path.
 7. Clone Ariel into `/opt/ariel` and Agency into `/opt/agency`.
 
+## Sandbox Runtime
+
+The `run` tool executes each model-authored Python program inside a gVisor
+(`runsc`) sandbox. The sandbox runs in-process inside the `ariel-api` service —
+`SandboxRuntime` is started and stopped in the FastAPI lifespan. There is no
+separate systemd service. `ariel-api` therefore needs `runsc` reachable on its
+`PATH`.
+
+Install the `runsc` release binary onto the host `PATH`:
+
+```sh
+curl -fsSLO https://storage.googleapis.com/gvisor/releases/release/latest/$(uname -m)/runsc
+chmod 0755 runsc
+install -m 0755 runsc /usr/local/bin/runsc
+```
+
+`runsc` runs rootless and uses the Systrap platform, which needs no KVM. It
+requires a kernel with unprivileged user namespaces enabled. On Ubuntu 24.04+
+the AppArmor restriction `kernel.apparmor_restrict_unprivileged_userns` must be
+`0` for rootless `runsc` to launch a sandbox. Persist it with a sysctl drop-in:
+
+```sh
+echo 'kernel.apparmor_restrict_unprivileged_userns = 0' \
+  > /etc/sysctl.d/60-ariel-runsc.conf
+sysctl --system
+```
+
+Confirm the sandbox can launch a container as the `ariel` user:
+
+```sh
+sudo -u ariel runsc --rootless --network=none do true && echo runsc ok
+```
+
 ## Postgres
 
 Create the production role and database:
@@ -150,16 +183,6 @@ ARIEL_PROACTIVE_WORKER_MAX_ATTEMPTS=5
 ARIEL_PROACTIVE_DELIBERATION_TOOL_ROUNDS=2
 ```
 
-Required terminal settings:
-
-```sh
-ARIEL_TERMINAL_DIR=/var/lib/ariel/terminal
-ARIEL_TERMINAL_OUTPUT_LIMIT_BYTES=12000
-ARIEL_TERMINAL_RUN_TIMEOUT_SECONDS=30.0
-ARIEL_TERMINAL_BACKGROUND_TIMEOUT_SECONDS=3600
-ARIEL_TERMINAL_TIMEOUT_KILL_AFTER_SECONDS=5.0
-```
-
 Required provider callback settings when Google provider ingress is enabled:
 
 ```sh
@@ -214,6 +237,10 @@ All Ariel services use:
 - `EnvironmentFile=/etc/ariel/ariel.env`
 - `Restart=always`
 - `RestartSec=5`
+
+`ariel-api` hosts the in-process `run` sandbox, so its unit must reach `runsc`
+on `PATH`. Installing `runsc` to `/usr/local/bin` satisfies this; otherwise add
+the install directory to the unit's `PATH`.
 
 Service ordering:
 

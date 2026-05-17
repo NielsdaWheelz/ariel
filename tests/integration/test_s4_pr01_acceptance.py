@@ -11,6 +11,7 @@ from sqlalchemy import text
 
 from ariel.app import ModelAdapter, create_app
 from tests.integration.responses_helpers import responses_message, responses_with_run_calls
+from tests.fake_sandbox import FakeSandboxRuntime
 
 
 GOOGLE_CALENDAR_READ_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
@@ -456,6 +457,7 @@ def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
         database_url=postgres_url,
         model_adapter=adapter,
         reset_database=True,
+        sandbox=FakeSandboxRuntime(),
     )
     return TestClient(app)
 
