@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-import functools
 import hashlib
 import json
 import secrets
@@ -44,35 +43,7 @@ from ariel.google_connector import (
     _decrypt_secret,
     _encrypt_secret,
 )
-from ariel.memory import (
-    MEMORY_CONTEXT_SCHEMA_VERSION,
-    approve_candidate,
-    build_memory_context,
-    consolidate_memory,
-    correct_assertion,
-    delete_assertion,
-    edit_candidate,
-    emit_memory_events,
-    export_memory,
-    import_memory_candidates,
-    list_memory,
-    list_memory_events,
-    mark_assertion_stale,
-    merge_candidates,
-    privacy_delete_assertion,
-    propose_memory_candidate,
-    record_action_trace,
-    redact_evidence,
-    reject_candidate,
-    resolve_conflict,
-    retract_assertion,
-    retry_projection_job,
-    run_memory_eval,
-    search_memory,
-    set_never_remember_rule,
-    set_assertion_priority,
-    set_memory_scope_binding,
-)
+from ariel.memory import run_rememberer, run_retriever
 from ariel.persistence import (
     ActionAttemptRecord,
     ActionPrivatePayloadRecord,
@@ -83,7 +54,6 @@ from ariel.persistence import (
     EmailThreadWatchRecord,
     GoogleConnectorRecord,
     GoogleProviderObjectRecord,
-    MemoryActionTraceRecord,
     ProviderEvidenceBlockRecord,
     ProviderEvidenceRecord,
     ProviderWriteReceiptRecord,
@@ -123,15 +93,6 @@ _MAX_GMAIL_EVIDENCE_BLOCKS = 12
 _MAX_GMAIL_EVIDENCE_BLOCK_CHARS = 2000
 _GOOGLE_RECEIPT_CAPABILITY_IDS = GOOGLE_WRITE_CAPABILITY_IDS
 _AGENCY_RECEIPT_CAPABILITY_IDS = {"cap.agency.request_pr"}
-
-
-class MemoryCapabilityExecutionError(Exception):
-    pass
-
-
-def _require_memory_events(events: list[dict[str, Any]], error: str) -> None:
-    if not events:
-        raise MemoryCapabilityExecutionError(error)
 
 
 ModelDeclaredTaintStatus = Literal["missing", "true", "false", "malformed"]
@@ -657,624 +618,54 @@ def _fail_action_execution(
         now_fn=now_fn,
         new_id_fn=new_id_fn,
     )
-    _update_memory_action_traces(
-        db=db,
-        action_attempt=action_attempt,
-        now_fn=now_fn,
-    )
-
-
-def _trace_outcome_for_action_status(action_attempt: ActionAttemptRecord) -> str:
-    if action_attempt.status == "succeeded":
-        return "succeeded"
-    if action_attempt.status == "failed":
-        return "failed"
-    if (
-        action_attempt.status in {"rejected", "denied", "expired"}
-        or action_attempt.policy_decision == "deny"
-    ):
-        return "denied"
-    return "unknown"
-
-
-def _update_memory_action_traces(
-    *,
-    db: Session,
-    action_attempt: ActionAttemptRecord,
-    now_fn: Callable[[], datetime],
-) -> None:
-    traces = db.scalars(
-        select(MemoryActionTraceRecord)
-        .where(MemoryActionTraceRecord.action_attempt_id == action_attempt.id)
-        .with_for_update()
-    ).all()
-    if not traces:
-        return
-    now = now_fn()
-    outcome = _trace_outcome_for_action_status(action_attempt)
-    result_refs = {
-        "impact_level": action_attempt.impact_level,
-        "policy_decision": action_attempt.policy_decision,
-        "approval_required": action_attempt.approval_required,
-        "execution_error": action_attempt.execution_error,
-        "execution_status": action_attempt.status,
-        "execution_output_available": action_attempt.execution_output is not None,
-    }
-    for trace in traces:
-        if action_attempt.status in {"executing", "succeeded", "failed"}:
-            trace.trace_type = "execution"
-        trace.outcome = outcome
-        trace.summary = (
-            f"{action_attempt.capability_id} {outcome} for proposal {action_attempt.proposal_index}"
-        )
-        trace.result_refs = result_refs
-        trace.updated_at = now
-
-
-def _memory_actor_id(*, db: Session, action_attempt: ActionAttemptRecord) -> str:
-    approval = db.scalar(
-        select(ApprovalRequestRecord)
-        .where(ApprovalRequestRecord.action_attempt_id == action_attempt.id)
-        .order_by(ApprovalRequestRecord.created_at.desc(), ApprovalRequestRecord.id.desc())
-        .limit(1)
-    )
-    if approval is not None and approval.actor_id:
-        return approval.actor_id
-    return "assistant"
-
-
-def _parse_memory_timestamp(value: Any) -> datetime | None:
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise RuntimeError("schema_invalid")
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
-
-
-def _memory_action_trace_payloads(db: Session, *, limit: int) -> list[dict[str, Any]]:
-    traces = db.scalars(
-        select(MemoryActionTraceRecord)
-        .where(MemoryActionTraceRecord.lifecycle_state == "active")
-        .order_by(MemoryActionTraceRecord.updated_at.desc(), MemoryActionTraceRecord.id.asc())
-        .limit(limit)
-    ).all()
-    return [
-        {
-            "id": trace.id,
-            "scope_key": trace.scope_key,
-            "trace_type": trace.trace_type,
-            "action_attempt_id": trace.action_attempt_id,
-            "source_turn_id": trace.source_turn_id,
-            "capability_id": trace.capability_id,
-            "summary": trace.summary,
-            "outcome": trace.outcome,
-            "primary_evidence_id": trace.primary_evidence_id,
-            "result_refs": trace.result_refs,
-            "updated_at": to_rfc3339(trace.updated_at),
-        }
-        for trace in traces
-    ]
-
-
-def _bounded_memory_payload(
-    db: Session,
-    *,
-    section: str,
-    limit: int,
-) -> dict[str, Any]:
-    payload = dict(list_memory(db))
-    payload["action_traces"] = _memory_action_trace_payloads(db, limit=limit)
-    list_keys = (
-        "active_assertions",
-        "candidates",
-        "conflicts",
-        "project_state",
-        "evidence",
-        "procedures",
-        "action_traces",
-        "topics",
-        "context_blocks",
-        "deletions",
-        "scope_bindings",
-        "retention_policies",
-        "sensitivity_labels",
-        "export_artifacts",
-        "eval_runs",
-    )
-    for key in list_keys:
-        value = payload.get(key)
-        if not isinstance(value, list):
-            payload[key] = []
-            continue
-        if section == "hot_index" and key == "context_blocks":
-            payload[key] = [
-                item
-                for item in value
-                if isinstance(item, dict) and item.get("block_type") == "hot_index"
-            ][:limit]
-            continue
-        if section == "topics" and key == "context_blocks":
-            payload[key] = [
-                item
-                for item in value
-                if isinstance(item, dict) and item.get("block_type") == "topic"
-            ][:limit]
-            continue
-        payload[key] = value[:limit] if section in {"all", key} else []
-    return payload
 
 
 def _execute_memory_capability(
     *,
-    db: Session,
+    session_factory: sessionmaker[Session],
     capability_id: str,
     normalized_input: dict[str, Any],
-    action_attempt: ActionAttemptRecord,
+    session_id: str,
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
     settings: AppSettings | None = None,
-    memory_import_cutover_enabled: bool = False,
 ) -> dict[str, Any]:
-    actor_id = _memory_actor_id(db=db, action_attempt=action_attempt)
-    event_scope_key = f"session:{action_attempt.session_id}"
-    emit_events = functools.partial(
-        emit_memory_events,
-        db,
-        entry_path="capability",
-        actor_id=actor_id,
-        now=now_fn(),
-        new_id_fn=new_id_fn,
-    )
-    if capability_id == "cap.memory.inspect":
-        return {
-            "status": "inspected",
-            "memory": _bounded_memory_payload(
-                db,
-                section=str(normalized_input["section"]),
-                limit=int(normalized_input["limit"]),
-            ),
-        }
-    if capability_id == "cap.memory.search":
-        results = search_memory(
-            db,
+    """Run one memory syscall: ``cap.memory.recall`` delegates to the retriever
+    subagent, ``cap.memory.remember`` to the rememberer. Both subagents own their
+    own sessions and transactions, so they take ``session_factory`` rather than a
+    caller-held ``Session``. The main agent reaches memory only through these two
+    syscalls; it never touches the fact store, the profile, or the digest
+    directly."""
+    if settings is None:
+        raise RuntimeError("memory_runtime_settings_not_bound")
+    if capability_id == "cap.memory.recall":
+        facts = run_retriever(
+            session_factory=session_factory,
             query=str(normalized_input["query"]),
-            limit=int(normalized_input["limit"]),
-            current_session_id=action_attempt.session_id,
-            scope_key=normalized_input.get("scope_key"),
-            actor_id=actor_id,
+            source_type="session",
+            source_id=session_id,
             settings=settings,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
         )
-        return {
-            "status": "searched",
-            "schema_version": MEMORY_CONTEXT_SCHEMA_VERSION,
-            "results": results,
-        }
-    if capability_id == "cap.memory.recall_diagnostics":
-        memory_context, recall_event = build_memory_context(
-            db,
-            user_message=str(normalized_input["query"]),
-            max_recalled_assertions=int(normalized_input["limit"]),
-            current_session_id=action_attempt.session_id,
-            scope_key=normalized_input.get("scope_key"),
-            actor_id=actor_id,
+        return {"status": "recalled", "facts": [fact.content for fact in facts]}
+    if capability_id == "cap.memory.remember":
+        output = run_rememberer(
+            session_factory=session_factory,
             settings=settings,
-        )
-        return {
-            "status": "diagnosed",
-            "schema_version": memory_context.get("schema_version", MEMORY_CONTEXT_SCHEMA_VERSION),
-            "recall_diagnostics": recall_event,
-            "memory_context": {
-                "hot_index": memory_context.get("hot_index", []),
-                "topic_index": memory_context.get("topic_index", []),
-                "semantic_assertions": memory_context.get("semantic_assertions", []),
-                "project_state": memory_context.get("project_state", []),
-                "procedural_memory": memory_context.get("procedural_memory", []),
-                "action_traces": memory_context.get("action_traces", []),
-                "conflicts": memory_context.get("conflicts", []),
-            },
-            "memory_policy": memory_context.get("memory_policy"),
-            "projection_health": memory_context.get("projection_health", {}),
-        }
-    if capability_id == "cap.memory.topics":
-        return {
-            "status": "listed",
-            "memory": _bounded_memory_payload(
-                db,
-                section="topics",
-                limit=int(normalized_input["limit"]),
-            ),
-        }
-    if capability_id == "cap.memory.hot_index":
-        return {
-            "status": "listed",
-            "memory": _bounded_memory_payload(
-                db,
-                section="hot_index",
-                limit=int(normalized_input["limit"]),
-            ),
-        }
-    if capability_id == "cap.memory.context_blocks":
-        limit = int(normalized_input["limit"])
-        payload = _bounded_memory_payload(
-            db,
-            section="context_blocks",
-            limit=100,
-        )
-        block_type = str(normalized_input["block_type"])
-        topic_id = normalized_input.get("topic_id")
-        if block_type != "all":
-            payload["context_blocks"] = [
-                item
-                for item in payload["context_blocks"]
-                if isinstance(item, dict) and item.get("block_type") == block_type
-            ]
-        else:
-            payload["context_blocks"] = payload["context_blocks"]
-        if isinstance(topic_id, str):
-            payload["context_blocks"] = [
-                item
-                for item in payload["context_blocks"]
-                if isinstance(item, dict) and item.get("topic_id") == topic_id
-            ]
-        payload["context_blocks"] = payload["context_blocks"][:limit]
-        return {"status": "listed", "memory": payload}
-    if capability_id == "cap.memory.export":
-        artifact = export_memory(
-            db,
-            scope_key=str(normalized_input["scope_key"]),
-            actor_id=actor_id,
             now_fn=now_fn,
             new_id_fn=new_id_fn,
-            source_session_id=action_attempt.session_id,
-        )
-        return {"status": "exported", "format": "json", "export": artifact}
-    if capability_id == "cap.memory.deletions":
-        return {
-            "status": "listed",
-            "memory": _bounded_memory_payload(
-                db,
-                section="deletions",
-                limit=int(normalized_input["limit"]),
-            ),
-        }
-    if capability_id == "cap.memory.scope_bindings":
-        return {
-            "status": "listed",
-            "memory": _bounded_memory_payload(
-                db,
-                section="scope_bindings",
-                limit=int(normalized_input["limit"]),
-            ),
-        }
-    if capability_id == "cap.memory.events":
-        return {
-            "status": "listed",
-            "schema_version": MEMORY_CONTEXT_SCHEMA_VERSION,
-            "events": list_memory_events(
-                db,
-                scope_key=normalized_input.get("scope_key"),
-                event_type=normalized_input.get("event_type"),
-                since=_parse_memory_timestamp(normalized_input.get("since")),
-                until=_parse_memory_timestamp(normalized_input.get("until")),
-                limit=int(normalized_input["limit"]),
-            ),
-        }
-    if capability_id == "cap.memory.propose":
-        events = propose_memory_candidate(
-            db,
-            source_session_id=action_attempt.session_id,
-            actor_id=actor_id,
-            evidence_text=str(normalized_input["evidence_text"]),
-            subject_key=str(normalized_input["subject_key"]),
-            predicate=str(normalized_input["predicate"]),
-            assertion_type=str(normalized_input["assertion_type"]),
-            value=str(normalized_input["value"]),
-            confidence=float(normalized_input["confidence"]),
-            scope_key=str(normalized_input["scope_key"]),
-            valid_from=_parse_memory_timestamp(normalized_input.get("valid_from")),
-            valid_to=_parse_memory_timestamp(normalized_input.get("valid_to")),
-            extraction_model=None,
-            extraction_prompt_version=None,
-            now_fn=now_fn,
-            new_id_fn=new_id_fn,
-        )
-        emit_events(events=events, scope_key=str(normalized_input["scope_key"]))
-        return {
-            "status": "proposed",
-            "events": events,
-            "memory": _bounded_memory_payload(db, section="all", limit=20),
-        }
-    if capability_id == "cap.memory.review":
-        if normalized_input["decision"] == "approve":
-            events = approve_candidate(
-                db,
-                assertion_id=str(normalized_input["assertion_id"]),
-                actor_id=actor_id,
-                now_fn=now_fn,
-                new_id_fn=new_id_fn,
-            )
-            status = "approved"
-        else:
-            events = reject_candidate(
-                db,
-                assertion_id=str(normalized_input["assertion_id"]),
-                actor_id=actor_id,
-                reason=normalized_input.get("reason"),
-                now_fn=now_fn,
-                new_id_fn=new_id_fn,
-            )
-            status = "rejected"
-        _require_memory_events(events, "memory_candidate_review_not_applicable")
-        emit_events(events=events, scope_key=event_scope_key)
-        return {
-            "status": status,
-            "events": events,
-            "memory": _bounded_memory_payload(db, section="all", limit=20),
-        }
-    if capability_id == "cap.memory.edit_candidate":
-        events = edit_candidate(
-            db,
-            assertion_id=str(normalized_input["assertion_id"]),
-            value=str(normalized_input["value"]),
-            actor_id=actor_id,
-            now_fn=now_fn,
-            new_id_fn=new_id_fn,
-        )
-        _require_memory_events(events, "memory_candidate_edit_not_applicable")
-        emit_events(events=events, scope_key=event_scope_key)
-        return {
-            "status": "edited",
-            "events": events,
-            "memory": _bounded_memory_payload(db, section="all", limit=20),
-        }
-    if capability_id == "cap.memory.merge_candidates":
-        events = merge_candidates(
-            db,
-            assertion_ids=normalized_input["assertion_ids"],
-            actor_id=actor_id,
-            now_fn=now_fn,
-            new_id_fn=new_id_fn,
-        )
-        _require_memory_events(events, "memory_candidates_merge_not_applicable")
-        emit_events(events=events, scope_key=event_scope_key)
-        return {
-            "status": "merged",
-            "events": events,
-            "memory": _bounded_memory_payload(db, section="all", limit=20),
-        }
-    if capability_id == "cap.memory.correct":
-        events = correct_assertion(
-            db,
-            assertion_id=str(normalized_input["assertion_id"]),
-            value=str(normalized_input["value"]),
-            source_session_id=action_attempt.session_id,
-            actor_id=actor_id,
-            now_fn=now_fn,
-            new_id_fn=new_id_fn,
-        )
-        _require_memory_events(events, "memory_assertion_correct_not_applicable")
-        emit_events(events=events, scope_key=event_scope_key)
-        return {
-            "status": "corrected",
-            "events": events,
-            "memory": _bounded_memory_payload(db, section="all", limit=20),
-        }
-    if capability_id == "cap.memory.retract":
-        events = retract_assertion(
-            db,
-            assertion_id=str(normalized_input["assertion_id"]),
-            actor_id=actor_id,
-            now_fn=now_fn,
-            new_id_fn=new_id_fn,
-        )
-        _require_memory_events(events, "memory_assertion_retract_not_applicable")
-        emit_events(events=events, scope_key=event_scope_key)
-        return {
-            "status": "retracted",
-            "events": events,
-            "memory": _bounded_memory_payload(db, section="all", limit=20),
-        }
-    if capability_id == "cap.memory.delete":
-        events = delete_assertion(
-            db,
-            assertion_id=str(normalized_input["assertion_id"]),
-            actor_id=actor_id,
-            now_fn=now_fn,
-            new_id_fn=new_id_fn,
-        )
-        _require_memory_events(events, "memory_assertion_delete_not_applicable")
-        emit_events(events=events, scope_key=event_scope_key)
-        return {
-            "status": "deleted",
-            "events": events,
-            "memory": _bounded_memory_payload(db, section="all", limit=20),
-        }
-    if capability_id == "cap.memory.privacy_delete":
-        events = privacy_delete_assertion(
-            db,
-            assertion_id=str(normalized_input["assertion_id"]),
-            actor_id=actor_id,
-            reason="memory privacy delete requested",
-            now_fn=now_fn,
-            new_id_fn=new_id_fn,
-        )
-        _require_memory_events(events, "memory_assertion_privacy_delete_not_applicable")
-        emit_events(events=events, scope_key=event_scope_key)
-        return {
-            "status": "privacy_deleted",
-            "events": events,
-            "memory": _bounded_memory_payload(db, section="all", limit=20),
-        }
-    if capability_id == "cap.memory.redact_evidence":
-        events = redact_evidence(
-            db,
-            evidence_id=str(normalized_input["evidence_id"]),
-            actor_id=actor_id,
-            reason=str(normalized_input.get("reason") or "memory evidence redacted"),
-            now_fn=now_fn,
-            new_id_fn=new_id_fn,
-        )
-        _require_memory_events(events, "memory_evidence_redact_not_applicable")
-        emit_events(events=events, scope_key=event_scope_key)
-        return {
-            "status": "redacted",
-            "events": events,
-            "memory": _bounded_memory_payload(db, section="all", limit=20),
-        }
-    if capability_id == "cap.memory.set_never_remember":
-        rule = set_never_remember_rule(
-            db,
-            scope_key=str(normalized_input["scope_key"]),
-            pattern=str(normalized_input["rule"]),
-            actor_id=actor_id,
-            reason="never-remember rule requested",
-            now_fn=now_fn,
-            new_id_fn=new_id_fn,
-        )
-        if rule is None:
-            raise MemoryCapabilityExecutionError("memory_never_remember_rule_invalid")
-        return {
-            "status": "recorded",
-            "rule": rule,
-            "memory": _bounded_memory_payload(db, section="all", limit=20),
-        }
-    if capability_id == "cap.memory.set_scope_mode":
-        events = set_memory_scope_binding(
-            db,
-            scope_type=str(normalized_input["scope_type"]),
-            scope_key=str(normalized_input["scope_key"]),
-            memory_mode=str(normalized_input["memory_mode"]),
-            actor_id=actor_id,
-            reason=normalized_input.get("reason"),
-            now_fn=now_fn,
-            new_id_fn=new_id_fn,
-            expires_at=_parse_memory_timestamp(normalized_input.get("expires_at")),
-        )
-        if not events:
-            raise MemoryCapabilityExecutionError("memory_scope_mode_invalid")
-        emit_events(events=events, scope_key=str(normalized_input["scope_key"]))
-        return {
-            "status": "recorded",
-            "events": events,
-            "memory": _bounded_memory_payload(db, section="scope_bindings", limit=20),
-        }
-    if capability_id == "cap.memory.resolve_conflict":
-        events = resolve_conflict(
-            db,
-            conflict_set_id=str(normalized_input["conflict_set_id"]),
-            assertion_id=str(normalized_input["assertion_id"]),
-            actor_id=actor_id,
-            now_fn=now_fn,
-            new_id_fn=new_id_fn,
-        )
-        _require_memory_events(events, "memory_conflict_resolve_not_applicable")
-        emit_events(events=events, scope_key=event_scope_key)
-        return {
-            "status": "resolved",
-            "events": events,
-            "memory": _bounded_memory_payload(db, section="all", limit=20),
-        }
-    if capability_id == "cap.memory.prioritize":
-        updated = set_assertion_priority(
-            db,
-            assertion_id=str(normalized_input["assertion_id"]),
-            priority="pinned",
-            actor_id=actor_id,
-            now_fn=now_fn,
-            new_id_fn=new_id_fn,
-        )
-        if updated is None:
-            raise MemoryCapabilityExecutionError("memory_assertion_priority_not_applicable")
-        return {
-            "status": "prioritized",
-            "assertion": updated,
-            "memory": _bounded_memory_payload(db, section="all", limit=20),
-        }
-    if capability_id == "cap.memory.deprioritize":
-        updated = set_assertion_priority(
-            db,
-            assertion_id=str(normalized_input["assertion_id"]),
-            priority="deprioritized",
-            actor_id=actor_id,
-            now_fn=now_fn,
-            new_id_fn=new_id_fn,
-        )
-        if updated is None:
-            raise MemoryCapabilityExecutionError("memory_assertion_priority_not_applicable")
-        return {
-            "status": "deprioritized",
-            "assertion": updated,
-            "memory": _bounded_memory_payload(db, section="all", limit=20),
-        }
-    if capability_id == "cap.memory.mark_stale":
-        events = mark_assertion_stale(
-            db,
-            assertion_id=str(normalized_input["assertion_id"]),
-            actor_id=actor_id,
-            reason=normalized_input.get("reason"),
-            now_fn=now_fn,
-            new_id_fn=new_id_fn,
-        )
-        _require_memory_events(events, "memory_assertion_mark_stale_not_applicable")
-        emit_events(events=events, scope_key=event_scope_key)
-        return {
-            "status": "stale",
-            "events": events,
-            "memory": _bounded_memory_payload(db, section="all", limit=20),
-        }
-    if capability_id == "cap.memory.consolidate":
-        result = consolidate_memory(
-            db,
-            scope_key=str(normalized_input["scope_key"]),
-            actor_id=actor_id,
-            now_fn=now_fn,
-            new_id_fn=new_id_fn,
-            source_session_id=action_attempt.session_id,
-        )
-        return {"status": "consolidated", "consolidation": result}
-    if capability_id == "cap.memory.import":
-        if not memory_import_cutover_enabled:
-            raise MemoryCapabilityExecutionError("memory_import_disabled")
-        imported_ids = import_memory_candidates(
-            db,
-            source_session_id=action_attempt.session_id,
-            actor_id=actor_id,
-            candidates=normalized_input["candidates"],
-            now_fn=now_fn,
-            new_id_fn=new_id_fn,
-            cutover_enabled=memory_import_cutover_enabled,
+            trigger="note",
+            note=str(normalized_input["note"]),
+            session_id=session_id,
         )
         return {
-            "status": "imported",
-            "imported_candidate_ids": imported_ids,
-            "memory": _bounded_memory_payload(db, section="candidates", limit=20),
-        }
-    if capability_id == "cap.memory.eval":
-        result = run_memory_eval(
-            db,
-            eval_name=str(normalized_input["eval_name"]),
-            cases=normalized_input["cases"],
-            now_fn=now_fn,
-            new_id_fn=new_id_fn,
-            settings=settings,
-            current_session_id=action_attempt.session_id,
-        )
-        return {"status": "evaluated", "eval": result}
-    if capability_id == "cap.memory.retry_projection_job":
-        retried_job = retry_projection_job(
-            db,
-            job_id=str(normalized_input["job_id"]),
-            now_fn=now_fn,
-        )
-        if retried_job is None:
-            raise MemoryCapabilityExecutionError("memory_projection_job_not_found")
-        return {
-            "status": "queued",
-            "projection_job": retried_job,
-            "memory": _bounded_memory_payload(db, section="all", limit=20),
+            "status": "remembered",
+            "operation_count": len(output.operations),
+            "profile_updated": output.profile is not None,
+            "digest_updated": output.digest is not None,
         }
     raise RuntimeError("unknown_memory_capability")
-
 
 def approval_execution_failure_message(error: str) -> str:
     failure_reason = error.strip() or "execution_failed"
@@ -3195,11 +2586,6 @@ def process_provider_write_reconcile_due(
                 now_fn=now_fn,
                 new_id_fn=new_id_fn,
             )
-            _update_memory_action_traces(
-                db=db,
-                action_attempt=action_attempt,
-                now_fn=now_fn,
-            )
             return True
 
 
@@ -3742,7 +3128,10 @@ def process_one_call(
         )
         return
 
-    if evaluation.capability.impact_level != "read":
+    # Memory syscalls are write_reversible but execute inline: each runs a
+    # subagent host-side and returns its result (recalled facts, a remember
+    # summary) into the program, so they skip the durable execution queue.
+    if evaluation.capability.impact_level != "read" and not is_memory_capability_call:
         task = _enqueue_action_execution_task(
             db=db,
             action_attempt=action_attempt,
@@ -3914,17 +3303,22 @@ def process_one_call(
             output=None,
             error="attachment_runtime_not_bound",
         )
+    elif is_memory_capability_call and session_factory is None:
+        execution_result = ExecutionResult(
+            status="failed",
+            output=None,
+            error="memory_runtime_not_bound",
+        )
     elif is_memory_capability_call:
         try:
             memory_output = _execute_memory_capability(
-                db=db,
+                session_factory=session_factory,
                 capability_id=capability_id,
                 normalized_input=evaluation.normalized_input,
-                action_attempt=action_attempt,
+                session_id=session_id,
                 now_fn=now_fn,
                 new_id_fn=new_id_fn,
                 settings=settings,
-                memory_import_cutover_enabled=memory_import_cutover_enabled,
             )
         except Exception as exc:  # noqa: BLE001
             execution_result = ExecutionResult(
@@ -4172,27 +3566,6 @@ def _mark_approval_expired(
         now_fn=now_fn,
     )
 
-    _, trace_events = record_action_trace(
-        db,
-        action_attempt=action_attempt,
-        scope_key=f"session:{action_attempt.session_id}",
-        primary_evidence_id=None,
-        source_turn_id=action_attempt.turn_id,
-        trace_type="policy_decision",
-        now=now,
-        new_id_fn=new_id_fn,
-    )
-    emit_memory_events(
-        db,
-        events=trace_events,
-        entry_path="capability",
-        actor_id=_memory_actor_id(db=db, action_attempt=action_attempt),
-        scope_key=f"session:{action_attempt.session_id}",
-        now=now,
-        new_id_fn=new_id_fn,
-        source_turn_id=action_attempt.turn_id,
-    )
-
 
 def reconcile_expired_approvals_for_session(
     *,
@@ -4357,26 +3730,6 @@ def resolve_approval_decision(
                 "actor_id": approval.actor_id,
                 "reason": approval.decision_reason,
             },
-        )
-        _, trace_events = record_action_trace(
-            db,
-            action_attempt=action_attempt,
-            scope_key=f"session:{action_attempt.session_id}",
-            primary_evidence_id=None,
-            source_turn_id=action_attempt.turn_id,
-            trace_type="policy_decision",
-            now=now,
-            new_id_fn=new_id_fn,
-        )
-        emit_memory_events(
-            db,
-            events=trace_events,
-            entry_path="capability",
-            actor_id=actor_id,
-            scope_key=f"session:{action_attempt.session_id}",
-            now=now,
-            new_id_fn=new_id_fn,
-            source_turn_id=action_attempt.turn_id,
         )
         db.flush()
         return ApprovalDecisionResult(
@@ -4737,11 +4090,6 @@ def process_action_execution_task(
                             now_fn=now_fn,
                             new_id_fn=new_id_fn,
                         )
-                        _update_memory_action_traces(
-                            db=db,
-                            action_attempt=action_attempt,
-                            now_fn=now_fn,
-                        )
                         return True
                     existing_error = (
                         existing_receipt.response_payload.get("error")
@@ -4833,11 +4181,6 @@ def process_action_execution_task(
                             },
                             now_fn=now_fn,
                             new_id_fn=new_id_fn,
-                        )
-                        _update_memory_action_traces(
-                            db=db,
-                            action_attempt=action_attempt,
-                            now_fn=now_fn,
                         )
                         return True
                     if existing_receipt is not None and existing_receipt.status == "failed":
@@ -4977,14 +4320,13 @@ def process_action_execution_task(
             if action_attempt.capability_id in MEMORY_CAPABILITY_IDS:
                 try:
                     memory_output = _execute_memory_capability(
-                        db=db,
+                        session_factory=session_factory,
                         capability_id=action_attempt.capability_id,
                         normalized_input=normalized_input,
-                        action_attempt=action_attempt,
+                        session_id=action_attempt.session_id,
                         now_fn=now_fn,
                         new_id_fn=new_id_fn,
                         settings=settings,
-                        memory_import_cutover_enabled=memory_import_cutover_enabled,
                     )
                 except Exception as exc:  # noqa: BLE001
                     _fail_action_execution(
@@ -5012,11 +4354,6 @@ def process_action_execution_task(
                     },
                     now_fn=now_fn,
                     new_id_fn=new_id_fn,
-                )
-                _update_memory_action_traces(
-                    db=db,
-                    action_attempt=action_attempt,
-                    now_fn=now_fn,
                 )
                 return True
 
@@ -5224,11 +4561,6 @@ def process_action_execution_task(
                     now_fn=now_fn,
                     new_id_fn=new_id_fn,
                 )
-                _update_memory_action_traces(
-                    db=db,
-                    action_attempt=action_attempt,
-                    now_fn=now_fn,
-                )
                 return True
 
             if action_attempt.capability_id in _EMAIL_MUTATION_CAPABILITY_IDS:
@@ -5334,11 +4666,6 @@ def process_action_execution_task(
                             },
                             now_fn=now_fn,
                             new_id_fn=new_id_fn,
-                        )
-                        _update_memory_action_traces(
-                            db=db,
-                            action_attempt=action_attempt,
-                            now_fn=now_fn,
                         )
                         return True
                     elif email_action.status == "failed":
@@ -5562,11 +4889,6 @@ def process_action_execution_task(
                             now_fn=now_fn,
                             new_id_fn=new_id_fn,
                         )
-                        _update_memory_action_traces(
-                            db=db,
-                            action_attempt=action_attempt,
-                            now_fn=now_fn,
-                        )
                         return True
                     if existing_receipt is not None:
                         if existing_receipt.status == "executing":
@@ -5691,11 +5013,6 @@ def process_action_execution_task(
                             },
                             now_fn=now_fn,
                             new_id_fn=new_id_fn,
-                        )
-                        _update_memory_action_traces(
-                            db=db,
-                            action_attempt=action_attempt,
-                            now_fn=now_fn,
                         )
                         return True
                     receipt = _record_provider_write_receipt(
@@ -6309,11 +5626,6 @@ def process_action_execution_task(
                     },
                     now_fn=now_fn,
                     new_id_fn=new_id_fn,
-                )
-                _update_memory_action_traces(
-                    db=db,
-                    action_attempt=action_attempt,
-                    now_fn=now_fn,
                 )
             else:
                 provider_write_provider = "google"

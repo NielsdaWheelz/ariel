@@ -3264,8 +3264,7 @@ def _eligible_internal_callable_capability_ids(
                 capability_ids.append(capability_id)
             continue
         if capability_id in MEMORY_CAPABILITY_IDS:
-            if capability_id != "cap.memory.eval":
-                capability_ids.append(capability_id)
+            capability_ids.append(capability_id)
             continue
         if capability_id == "cap.web.extract":
             if bindings.get("web_extract") is True:
