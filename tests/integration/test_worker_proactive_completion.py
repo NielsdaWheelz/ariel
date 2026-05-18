@@ -117,15 +117,6 @@ def test_worker_marks_due_email_thread_watches_without_ambient_bridge(
             assert completed_watch.status == "failed"
             assert completed_watch.completed_at is None
             assert future_watch.status == "active"
-            internal_item_count = db.execute(
-                text(
-                    "SELECT COUNT(*) FROM workspace_items "
-                    "WHERE provider = 'ariel' "
-                    "AND item_type = 'internal_state' "
-                    "AND external_id = 'email-thread-watch:etw_due'"
-                )
-            ).scalar_one()
-            assert internal_item_count == 0
             ambient_task = db.scalar(
                 select(BackgroundTaskRecord).where(
                     BackgroundTaskRecord.task_type == "ambient_interpretation_due"

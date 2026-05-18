@@ -1211,19 +1211,11 @@ class SurfaceEmailThreadWatchContract(BaseModel):
     updated_at: str
 
 
-class SurfaceWorkspaceItemContract(BaseModel):
+class SurfaceDiscordMessageContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
-    provider: Literal["google", "ariel", "discord"]
-    item_type: Literal[
-        "calendar_event",
-        "email_message",
-        "drive_file",
-        "internal_state",
-        "discord_message",
-    ]
-    external_id: str
+    message_id: str
     title: str
     summary: str
     source_uri: str | None
@@ -1235,14 +1227,14 @@ class SurfaceWorkspaceItemContract(BaseModel):
     updated_at: str
 
 
-class SurfaceWorkspaceItemEventContract(BaseModel):
+class SurfaceDiscordMessageEventContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
-    workspace_item_id: str
+    discord_message_id: str
     dedupe_key: str
     provider_event_id: str | None
-    event_type: Literal["created", "updated", "deleted", "restored"]
+    event_type: Literal["created"]
     payload: dict[str, Any]
     created_at: str
 
@@ -1251,9 +1243,9 @@ class SurfaceProactiveObservationContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
-    workspace_item_id: str | None
+    discord_message_id: str | None
     source_type: Literal[
-        "workspace_item",
+        "discord_message",
         "job",
         "approval_request",
         "memory_assertion",
@@ -1457,19 +1449,19 @@ class SurfaceEmailThreadWatchResponseContract(BaseModel):
     email_thread_watch: SurfaceEmailThreadWatchContract
 
 
-class SurfaceWorkspaceItemListResponseContract(BaseModel):
+class SurfaceDiscordMessageListResponseContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     ok: bool
-    workspace_items: list[SurfaceWorkspaceItemContract]
+    discord_messages: list[SurfaceDiscordMessageContract]
 
 
-class SurfaceWorkspaceItemEventListResponseContract(BaseModel):
+class SurfaceDiscordMessageEventListResponseContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     ok: bool
-    workspace_item_id: str
-    events: list[SurfaceWorkspaceItemEventContract]
+    discord_message_id: str
+    events: list[SurfaceDiscordMessageEventContract]
 
 
 class SurfaceProactiveObservationListResponseContract(BaseModel):
@@ -2235,28 +2227,28 @@ def build_surface_email_thread_watch_response(
     )
 
 
-def build_surface_workspace_item_list_response(*, workspace_items: Any) -> dict[str, Any]:
+def build_surface_discord_message_list_response(*, discord_messages: Any) -> dict[str, Any]:
     return _validate_contract(
-        "surface_workspace_item_list_response",
-        SurfaceWorkspaceItemListResponseContract,
+        "surface_discord_message_list_response",
+        SurfaceDiscordMessageListResponseContract,
         {
             "ok": True,
-            "workspace_items": workspace_items if isinstance(workspace_items, list) else [],
+            "discord_messages": discord_messages if isinstance(discord_messages, list) else [],
         },
     )
 
 
-def build_surface_workspace_item_event_list_response(
+def build_surface_discord_message_event_list_response(
     *,
-    workspace_item_id: Any,
+    discord_message_id: Any,
     events: Any,
 ) -> dict[str, Any]:
     return _validate_contract(
-        "surface_workspace_item_event_list_response",
-        SurfaceWorkspaceItemEventListResponseContract,
+        "surface_discord_message_event_list_response",
+        SurfaceDiscordMessageEventListResponseContract,
         {
             "ok": True,
-            "workspace_item_id": workspace_item_id,
+            "discord_message_id": discord_message_id,
             "events": events if isinstance(events, list) else [],
         },
     )

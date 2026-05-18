@@ -206,7 +206,7 @@ def _seed_case(
                 taint=taint or {"provenance_status": "trusted_internal"},
                 trust_boundary="trusted_internal",
                 observed_at=now,
-                workspace_item_id=None,
+                discord_message_id=None,
                 now=now,
                 new_id_fn=_new_id,
             )

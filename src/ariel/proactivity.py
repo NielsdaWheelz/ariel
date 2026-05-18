@@ -28,6 +28,8 @@ from ariel.persistence import (
     AutonomyScopeRecord,
     BackgroundTaskRecord,
     CaptureRecord,
+    DiscordMessageEventRecord,
+    DiscordMessageRecord,
     GoogleConnectorRecord,
     AIJudgmentRecord,
     JobRecord,
@@ -45,8 +47,6 @@ from ariel.persistence import (
     ProactiveLearningRecord,
     ProactiveObservationRecord,
     SessionRecord,
-    WorkspaceItemEventRecord,
-    WorkspaceItemRecord,
     WorkCommitmentSourceRecord,
     WorkCommitmentRecord,
     WorkFollowUpEventRecord,
@@ -374,7 +374,7 @@ def upsert_proactive_observation(
     taint: dict[str, Any],
     trust_boundary: str,
     observed_at: datetime,
-    workspace_item_id: str | None,
+    discord_message_id: str | None,
     now: datetime,
     new_id_fn: Callable[[str], str],
 ) -> str | None:
@@ -389,7 +389,7 @@ def upsert_proactive_observation(
 
     observation = ProactiveObservationRecord(
         id=new_id_fn("obs"),
-        workspace_item_id=workspace_item_id,
+        discord_message_id=discord_message_id,
         source_type=source_type,
         source_id=source_id,
         dedupe_key=dedupe_key,
@@ -481,7 +481,7 @@ def _ambient_interpretation_candidates(
                 "candidate_id": f"job:{job.id}:{job.status}:{to_rfc3339(job.updated_at)}",
                 "source_type": "job",
                 "source_id": job.id,
-                "workspace_item_id": None,
+                "discord_message_id": None,
                 "observed_at": to_rfc3339(job.updated_at),
                 "trust_boundary": "trusted_internal",
                 "taint": {"provenance_status": "trusted_internal"},
@@ -509,7 +509,7 @@ def _ambient_interpretation_candidates(
                 "candidate_id": f"approval:{approval.id}:{to_rfc3339(approval.expires_at)}",
                 "source_type": "approval_request",
                 "source_id": approval.id,
-                "workspace_item_id": None,
+                "discord_message_id": None,
                 "observed_at": to_rfc3339(now),
                 "trust_boundary": "trusted_internal",
                 "taint": {"provenance_status": "trusted_internal"},
@@ -534,7 +534,7 @@ def _ambient_interpretation_candidates(
                 "candidate_id": f"memory:{assertion.id}:{to_rfc3339(assertion.updated_at)}",
                 "source_type": "memory_assertion",
                 "source_id": assertion.id,
-                "workspace_item_id": None,
+                "discord_message_id": None,
                 "observed_at": to_rfc3339(assertion.updated_at),
                 "trust_boundary": "reviewed_memory",
                 "taint": {"provenance_status": "reviewed_memory"},
@@ -564,7 +564,7 @@ def _ambient_interpretation_candidates(
                 ),
                 "source_type": "google_connector",
                 "source_id": connector.id,
-                "workspace_item_id": None,
+                "discord_message_id": None,
                 "observed_at": to_rfc3339(connector.updated_at),
                 "trust_boundary": "trusted_internal",
                 "taint": {"provenance_status": "trusted_internal"},
@@ -588,7 +588,7 @@ def _ambient_interpretation_candidates(
                 "candidate_id": f"capture:{capture.id}:{capture.terminal_state}",
                 "source_type": "capture",
                 "source_id": capture.id,
-                "workspace_item_id": None,
+                "discord_message_id": None,
                 "observed_at": to_rfc3339(capture.created_at),
                 "trust_boundary": "trusted_internal",
                 "taint": {"provenance_status": "trusted_internal"},
@@ -603,45 +603,43 @@ def _ambient_interpretation_candidates(
             }
         )
 
-    workspace_event_query = select(WorkspaceItemEventRecord)
+    discord_event_query = select(DiscordMessageEventRecord)
     if workspace_item_event_id is not None:
-        workspace_event_query = workspace_event_query.where(
-            WorkspaceItemEventRecord.id == workspace_item_event_id
+        discord_event_query = discord_event_query.where(
+            DiscordMessageEventRecord.id == workspace_item_event_id
         )
-    workspace_events = db.scalars(
-        workspace_event_query.order_by(
-            WorkspaceItemEventRecord.created_at.desc(),
-            WorkspaceItemEventRecord.id.asc(),
+    discord_events = db.scalars(
+        discord_event_query.order_by(
+            DiscordMessageEventRecord.created_at.desc(),
+            DiscordMessageEventRecord.id.asc(),
         ).limit(48)
     ).all()
-    for event in workspace_events:
-        item = db.get(WorkspaceItemRecord, event.workspace_item_id)
-        if item is None:
+    for event in discord_events:
+        message = db.get(DiscordMessageRecord, event.discord_message_id)
+        if message is None:
             continue
         candidates.append(
             {
-                "candidate_id": f"workspace-event:{event.dedupe_key}",
-                "source_type": "workspace_item",
-                "source_id": item.id,
-                "workspace_item_id": item.id,
+                "candidate_id": f"discord-message-event:{event.dedupe_key}",
+                "source_type": "discord_message",
+                "source_id": message.id,
+                "discord_message_id": message.id,
                 "observed_at": to_rfc3339(event.created_at),
                 "trust_boundary": "provider",
-                "taint": {"provenance_status": "tainted", "source": item.provider},
+                "taint": {"provenance_status": "tainted", "source": "discord"},
                 "raw_event": {
                     "event_id": event.id,
                     "event_type": event.event_type,
                     "provider_event_id": event.provider_event_id,
                     "payload": event.payload,
-                    "workspace_item": {
-                        "id": item.id,
-                        "provider": item.provider,
-                        "item_type": item.item_type,
-                        "external_id": item.external_id,
-                        "title": item.title,
-                        "summary": item.summary,
-                        "source_uri": item.source_uri,
-                        "status": item.status,
-                        "metadata": item.item_metadata,
+                    "discord_message": {
+                        "id": message.id,
+                        "message_id": message.message_id,
+                        "title": message.title,
+                        "summary": message.summary,
+                        "source_uri": message.source_uri,
+                        "status": message.status,
+                        "metadata": message.item_metadata,
                     },
                 },
             }
@@ -971,9 +969,9 @@ def process_ambient_interpretation_due(
                     taint=dict(candidate["taint"]),
                     trust_boundary=str(candidate["trust_boundary"]),
                     observed_at=datetime.fromisoformat(str(candidate["observed_at"])),
-                    workspace_item_id=(
-                        str(candidate["workspace_item_id"])
-                        if candidate.get("workspace_item_id") is not None
+                    discord_message_id=(
+                        str(candidate["discord_message_id"])
+                        if candidate.get("discord_message_id") is not None
                         else None
                     ),
                     now=now,

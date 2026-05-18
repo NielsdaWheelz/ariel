@@ -386,10 +386,9 @@ def test_no_visible_response_operation_completes_turn_without_visible_reply(
                 workspace_item = (
                     db.execute(
                         text(
-                            "SELECT id, provider, item_type, external_id, title, summary, "
-                            "source_uri, metadata FROM workspace_items "
-                            "WHERE provider = 'discord' AND item_type = 'discord_message' "
-                            "AND external_id = '101112'"
+                            "SELECT id, message_id, title, summary, "
+                            "source_uri, metadata FROM discord_messages "
+                            "WHERE message_id = '101112'"
                         )
                     )
                     .mappings()
@@ -398,11 +397,11 @@ def test_no_visible_response_operation_completes_turn_without_visible_reply(
                 workspace_event = (
                     db.execute(
                         text(
-                            "SELECT id, workspace_item_id, dedupe_key, event_type, payload "
-                            "FROM workspace_item_events "
-                            "WHERE workspace_item_id = :workspace_item_id"
+                            "SELECT id, discord_message_id, dedupe_key, event_type, payload "
+                            "FROM discord_message_events "
+                            "WHERE discord_message_id = :discord_message_id"
                         ),
-                        {"workspace_item_id": workspace_item["id"]},
+                        {"discord_message_id": workspace_item["id"]},
                     )
                     .mappings()
                     .one()
@@ -419,8 +418,6 @@ def test_no_visible_response_operation_completes_turn_without_visible_reply(
                     .mappings()
                     .one()
                 )
-        assert workspace_item["provider"] == "discord"
-        assert workspace_item["item_type"] == "discord_message"
         assert workspace_item["title"] == "Discord message in #ops"
         assert workspace_item["summary"] == "noted"
         assert workspace_item["source_uri"] == "https://discord.com/channels/123/456/101112"

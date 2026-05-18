@@ -336,7 +336,7 @@ def _seed_proactive_case(client: TestClient, *, now: datetime) -> str:
                 taint={"provenance_status": "trusted_internal"},
                 trust_boundary="trusted_internal",
                 observed_at=now,
-                workspace_item_id=None,
+                discord_message_id=None,
                 now=now,
                 new_id_fn=_new_id,
             )

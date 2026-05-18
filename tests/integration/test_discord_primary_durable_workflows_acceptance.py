@@ -81,17 +81,17 @@ def _ambient_interpretation_fixture(input_items: list[dict[str, Any]]) -> dict[s
     candidate = _first_ambient_candidate(input_items)
     source_type = str(candidate["source_type"])
     source_id = str(candidate["source_id"])
-    if source_type == "workspace_item":
+    if source_type == "discord_message":
         observation = {
             "candidate_id": candidate["candidate_id"],
-            "observation_key": "calendar-design-review",
-            "case_key": f"workspace-item:{source_id}",
-            "observation_type": "workspace_delta",
+            "observation_key": "discord-design-review",
+            "case_key": f"discord-message:{source_id}",
+            "observation_type": "discord_delta",
             "subject": "Design review changed",
-            "summary": "The calendar design review changed.",
-            "payload": {"workspace_status": "active"},
-            "evidence": {"workspace_item_id": source_id},
-            "rationale": "The changed calendar event may affect planning.",
+            "summary": "The Discord design review changed.",
+            "payload": {"discord_status": "active"},
+            "evidence": {"discord_message_id": source_id},
+            "rationale": "The changed Discord message may affect planning.",
         }
     else:
         observation = {
@@ -549,9 +549,9 @@ def test_google_calendar_sync_persists_provider_evidence_without_ambient_case(
         assert sync_runs.json()["sync_runs"][0]["status"] == "succeeded"
         assert sync_runs.json()["sync_runs"][0]["item_count"] == 1
 
-        workspace_items = client.get("/v1/workspace-items")
-        assert workspace_items.status_code == 200
-        assert workspace_items.json()["workspace_items"] == []
+        discord_messages = client.get("/v1/discord-messages")
+        assert discord_messages.status_code == 200
+        assert discord_messages.json()["discord_messages"] == []
 
         observations = client.get("/v1/proactive/observations", params={"status": "linked"})
         assert observations.status_code == 200

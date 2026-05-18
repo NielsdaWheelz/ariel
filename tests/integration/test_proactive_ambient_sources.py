@@ -17,6 +17,8 @@ from ariel.persistence import (
     ApprovalRequestRecord,
     BackgroundTaskRecord,
     CaptureRecord,
+    DiscordMessageEventRecord,
+    DiscordMessageRecord,
     GoogleConnectorRecord,
     JobRecord,
     MemoryAssertionRecord,
@@ -26,8 +28,6 @@ from ariel.persistence import (
     ProactiveObservationRecord,
     SessionRecord,
     TurnRecord,
-    WorkspaceItemEventRecord,
-    WorkspaceItemRecord,
 )
 from ariel.proactivity import process_ambient_interpretation_due
 
@@ -35,10 +35,10 @@ from ariel.proactivity import process_ambient_interpretation_due
 EXPECTED_SOURCE_TYPES = {
     "approval_request",
     "capture",
+    "discord_message",
     "google_connector",
     "job",
     "memory_assertion",
-    "workspace_item",
 }
 
 
@@ -473,19 +473,17 @@ def _seed_ambient_sources(db: Session, *, now: datetime, new_id: IdFactory) -> s
     )
     db.flush()
 
-    workspace_item_id = new_id("wki")
-    workspace_event_id = new_id("wie")
+    discord_message_id = new_id("dms")
+    workspace_event_id = new_id("dme")
     db.add(
-        WorkspaceItemRecord(
-            id=workspace_item_id,
-            provider="google",
-            item_type="calendar_event",
-            external_id="calendar-orion",
-            title="Orion launch review",
+        DiscordMessageRecord(
+            id=discord_message_id,
+            message_id="discord-orion",
+            title="Discord message in #launch",
             summary="Launch review moved.",
-            source_uri="https://calendar.google.com/event?eid=calendar-orion",
+            source_uri="https://discord.com/channels/1/2/discord-orion",
             status="active",
-            item_metadata={"resource_id": "primary"},
+            item_metadata={"channel_id": 2},
             observed_at=now,
             deleted_at=None,
             created_at=now,
@@ -494,13 +492,13 @@ def _seed_ambient_sources(db: Session, *, now: datetime, new_id: IdFactory) -> s
     )
     db.flush()
     db.add(
-        WorkspaceItemEventRecord(
+        DiscordMessageEventRecord(
             id=workspace_event_id,
-            workspace_item_id=workspace_item_id,
-            dedupe_key="google:calendar:primary:calendar-orion:active:2026-05-07T12:00:00Z",
+            discord_message_id=discord_message_id,
+            dedupe_key="discord:message:discord-orion:ingested",
             provider_event_id=None,
             event_type="created",
-            payload={"title": "Orion launch review", "status": "active"},
+            payload={"message_id": "discord-orion", "message": "Launch review moved."},
             created_at=now,
         )
     )

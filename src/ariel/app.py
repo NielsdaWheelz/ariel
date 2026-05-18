@@ -107,6 +107,8 @@ from ariel.persistence import (
     ArtifactRecord,
     BackgroundTaskRecord,
     CaptureRecord,
+    DiscordMessageEventRecord,
+    DiscordMessageRecord,
     EmailThreadWatchRecord,
     EventRecord,
     GoogleConnectorRecord,
@@ -140,13 +142,13 @@ from ariel.persistence import (
     WorkCommitmentSourceRecord,
     WorkFollowUpEventRecord,
     WorkFollowUpLoopRecord,
-    WorkspaceItemEventRecord,
-    WorkspaceItemRecord,
     serialize_agency_event,
     serialize_artifact,
     serialize_autonomy_scope,
     serialize_capture,
     serialize_action_attempt,
+    serialize_discord_message,
+    serialize_discord_message_event,
     serialize_email_action,
     serialize_email_thread_watch,
     serialize_job,
@@ -167,8 +169,6 @@ from ariel.persistence import (
     serialize_turn,
     serialize_work_commitment,
     serialize_work_follow_up_loop,
-    serialize_workspace_item,
-    serialize_workspace_item_event,
     to_rfc3339,
 )
 from ariel.redaction import redact_json_value, redact_text, safe_failure_reason
@@ -180,6 +180,8 @@ from ariel.response_contracts import (
     build_surface_approval_response,
     build_surface_capture_failure_response,
     build_surface_capture_success_response,
+    build_surface_discord_message_event_list_response,
+    build_surface_discord_message_list_response,
     build_surface_email_action_list_response,
     build_surface_email_action_response,
     build_surface_email_thread_watch_list_response,
@@ -202,8 +204,6 @@ from ariel.response_contracts import (
     build_surface_sync_cursor_list_response,
     build_surface_sync_run_list_response,
     build_surface_timeline_response,
-    build_surface_workspace_item_event_list_response,
-    build_surface_workspace_item_list_response,
 )
 from ariel.run_runtime import (
     execute_run_program,
@@ -3645,7 +3645,7 @@ def create_app(
                 "email_actions": "/v1/email/actions",
                 "email_thread_watches": "/v1/email/thread-watches",
                 "work_commitments": "/v1/work/commitments",
-                "workspace_items": "/v1/workspace-items",
+                "discord_messages": "/v1/discord-messages",
                 "proactive_observations": "/v1/proactive/observations",
                 "proactive_cases": "/v1/proactive/cases",
                 "autonomy_scopes": "/v1/proactive/autonomy-scopes",
@@ -7444,12 +7444,8 @@ def create_app(
                     now_discord = _utcnow()
                     discord_message_id = str(discord_context["message_id"])
                     discord_item = db.scalar(
-                        select(WorkspaceItemRecord)
-                        .where(
-                            WorkspaceItemRecord.provider == "discord",
-                            WorkspaceItemRecord.item_type == "discord_message",
-                            WorkspaceItemRecord.external_id == discord_message_id,
-                        )
+                        select(DiscordMessageRecord)
+                        .where(DiscordMessageRecord.message_id == discord_message_id)
                         .with_for_update()
                         .limit(1)
                     )
@@ -7477,11 +7473,9 @@ def create_app(
                         "attachments": discord_context.get("attachments", []),
                     }
                     if discord_item is None:
-                        discord_item = WorkspaceItemRecord(
-                            id=_new_id("wki"),
-                            provider="discord",
-                            item_type="discord_message",
-                            external_id=discord_message_id,
+                        discord_item = DiscordMessageRecord(
+                            id=_new_id("dms"),
+                            message_id=discord_message_id,
                             title=title,
                             summary=summary,
                             source_uri=discord_context.get("message_url")
@@ -7513,20 +7507,18 @@ def create_app(
 
                     discord_event_dedupe_key = f"discord:message:{discord_message_id}:ingested"
                     existing_discord_event = db.scalar(
-                        select(WorkspaceItemEventRecord)
-                        .where(WorkspaceItemEventRecord.dedupe_key == discord_event_dedupe_key)
+                        select(DiscordMessageEventRecord)
+                        .where(DiscordMessageEventRecord.dedupe_key == discord_event_dedupe_key)
                         .limit(1)
                     )
                     if existing_discord_event is None:
-                        discord_event = WorkspaceItemEventRecord(
-                            id=_new_id("wie"),
-                            workspace_item_id=discord_item.id,
+                        discord_event = DiscordMessageEventRecord(
+                            id=_new_id("dme"),
+                            discord_message_id=discord_item.id,
                             dedupe_key=discord_event_dedupe_key,
                             provider_event_id=None,
                             event_type="created",
                             payload={
-                                "provider": "discord",
-                                "item_type": "discord_message",
                                 "message_id": discord_message_id,
                                 "message": summary,
                                 "metadata": metadata,
@@ -9325,17 +9317,8 @@ def create_app(
                     ),
                 }
 
-    @app.get("/v1/workspace-items")
-    def get_workspace_items(
-        provider: Literal["google", "ariel", "discord"] | None = None,
-        item_type: Literal[
-            "calendar_event",
-            "email_message",
-            "drive_file",
-            "internal_state",
-            "discord_message",
-        ]
-        | None = None,
+    @app.get("/v1/discord-messages")
+    def get_discord_messages(
         status: Literal["active", "deleted"] | None = None,
         limit: int = 50,
     ) -> dict[str, Any]:
@@ -9343,57 +9326,53 @@ def create_app(
         bounded_limit = max(1, min(limit, 200))
         with session_factory() as db:
             with db.begin():
-                query = select(WorkspaceItemRecord)
-                if provider is not None:
-                    query = query.where(WorkspaceItemRecord.provider == provider)
-                if item_type is not None:
-                    query = query.where(WorkspaceItemRecord.item_type == item_type)
+                query = select(DiscordMessageRecord)
                 if status is not None:
-                    query = query.where(WorkspaceItemRecord.status == status)
-                workspace_items = db.scalars(
+                    query = query.where(DiscordMessageRecord.status == status)
+                discord_messages = db.scalars(
                     query.order_by(
-                        WorkspaceItemRecord.updated_at.desc(),
-                        WorkspaceItemRecord.id.desc(),
+                        DiscordMessageRecord.updated_at.desc(),
+                        DiscordMessageRecord.id.desc(),
                     ).limit(bounded_limit)
                 ).all()
                 try:
-                    return build_surface_workspace_item_list_response(
-                        workspace_items=[
-                            serialize_workspace_item(workspace_item)
-                            for workspace_item in workspace_items
+                    return build_surface_discord_message_list_response(
+                        discord_messages=[
+                            serialize_discord_message(discord_message)
+                            for discord_message in discord_messages
                         ]
                     )
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
 
-    @app.get("/v1/workspace-items/{workspace_item_id}/events")
-    def get_workspace_item_events(workspace_item_id: str, limit: int = 50) -> dict[str, Any]:
+    @app.get("/v1/discord-messages/{discord_message_id}/events")
+    def get_discord_message_events(discord_message_id: str, limit: int = 50) -> dict[str, Any]:
         _ensure_schema_ready()
         bounded_limit = max(1, min(limit, 200))
         with session_factory() as db:
             with db.begin():
-                workspace_item = db.get(WorkspaceItemRecord, workspace_item_id)
-                if workspace_item is None:
+                discord_message = db.get(DiscordMessageRecord, discord_message_id)
+                if discord_message is None:
                     raise ApiError(
                         status_code=404,
-                        code="E_WORKSPACE_ITEM_NOT_FOUND",
-                        message="workspace item not found",
-                        details={"workspace_item_id": workspace_item_id},
+                        code="E_DISCORD_MESSAGE_NOT_FOUND",
+                        message="discord message not found",
+                        details={"discord_message_id": discord_message_id},
                         retryable=False,
                     )
                 events = db.scalars(
-                    select(WorkspaceItemEventRecord)
-                    .where(WorkspaceItemEventRecord.workspace_item_id == workspace_item_id)
+                    select(DiscordMessageEventRecord)
+                    .where(DiscordMessageEventRecord.discord_message_id == discord_message_id)
                     .order_by(
-                        WorkspaceItemEventRecord.created_at.asc(),
-                        WorkspaceItemEventRecord.id.asc(),
+                        DiscordMessageEventRecord.created_at.asc(),
+                        DiscordMessageEventRecord.id.asc(),
                     )
                     .limit(bounded_limit)
                 ).all()
                 try:
-                    return build_surface_workspace_item_event_list_response(
-                        workspace_item_id=workspace_item_id,
-                        events=[serialize_workspace_item_event(event) for event in events],
+                    return build_surface_discord_message_event_list_response(
+                        discord_message_id=discord_message_id,
+                        events=[serialize_discord_message_event(event) for event in events],
                     )
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc

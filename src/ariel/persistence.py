@@ -2436,13 +2436,11 @@ class SyncRunRecord(Base):
     )
 
 
-class WorkspaceItemRecord(Base):
-    __tablename__ = "workspace_items"
+class DiscordMessageRecord(Base):
+    __tablename__ = "discord_messages"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    provider: Mapped[str] = mapped_column(String(32), nullable=False)
-    item_type: Mapped[str] = mapped_column(String(32), nullable=False)
-    external_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    message_id: Mapped[str] = mapped_column(String(160), nullable=False, unique=True)
     title: Mapped[str] = mapped_column(Text, nullable=False)
     summary: Mapped[str] = mapped_column(Text, nullable=False)
     source_uri: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -2465,30 +2463,17 @@ class WorkspaceItemRecord(Base):
     )
 
     __table_args__ = (
-        UniqueConstraint("provider", "item_type", "external_id", name="uq_workspace_item_external"),
-        CheckConstraint(
-            "provider IN ('google', 'ariel', 'discord')",
-            name="ck_workspace_item_provider",
-        ),
-        CheckConstraint(
-            (
-                "item_type IN ('calendar_event', 'email_message', 'drive_file', "
-                "'internal_state', 'discord_message')"
-            ),
-            name="ck_workspace_item_type",
-        ),
-        CheckConstraint("status IN ('active', 'deleted')", name="ck_workspace_item_status"),
-        Index("ix_workspace_items_provider_type", "provider", "item_type", "updated_at"),
+        CheckConstraint("status IN ('active', 'deleted')", name="ck_discord_message_status"),
     )
 
 
-class WorkspaceItemEventRecord(Base):
-    __tablename__ = "workspace_item_events"
+class DiscordMessageEventRecord(Base):
+    __tablename__ = "discord_message_events"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    workspace_item_id: Mapped[str] = mapped_column(
+    discord_message_id: Mapped[str] = mapped_column(
         String(32),
-        ForeignKey("workspace_items.id", ondelete="RESTRICT"),
+        ForeignKey("discord_messages.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
@@ -2507,8 +2492,8 @@ class WorkspaceItemEventRecord(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "event_type IN ('created', 'updated', 'deleted', 'restored')",
-            name="ck_workspace_item_event_type",
+            "event_type IN ('created')",
+            name="ck_discord_message_event_type",
         ),
     )
 
@@ -3092,9 +3077,9 @@ class ProactiveObservationRecord(Base):
     __tablename__ = "proactive_observations"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    workspace_item_id: Mapped[str | None] = mapped_column(
+    discord_message_id: Mapped[str | None] = mapped_column(
         String(32),
-        ForeignKey("workspace_items.id", ondelete="RESTRICT"),
+        ForeignKey("discord_messages.id", ondelete="RESTRICT"),
         nullable=True,
         index=True,
     )
@@ -3122,7 +3107,7 @@ class ProactiveObservationRecord(Base):
     __table_args__ = (
         CheckConstraint(
             (
-                "source_type IN ('workspace_item', 'job', 'approval_request', "
+                "source_type IN ('discord_message', 'job', 'approval_request', "
                 "'memory_assertion', 'google_connector', 'capture')"
             ),
             name="ck_proactive_observation_source_type",
@@ -4091,12 +4076,10 @@ def serialize_sync_run(run: SyncRunRecord) -> dict[str, Any]:
     }
 
 
-def serialize_workspace_item(item: WorkspaceItemRecord) -> dict[str, Any]:
+def serialize_discord_message(item: DiscordMessageRecord) -> dict[str, Any]:
     return {
         "id": item.id,
-        "provider": item.provider,
-        "item_type": item.item_type,
-        "external_id": item.external_id,
+        "message_id": item.message_id,
         "title": redact_text(item.title),
         "summary": redact_text(item.summary),
         "source_uri": redact_text(item.source_uri) if item.source_uri else None,
@@ -4109,10 +4092,10 @@ def serialize_workspace_item(item: WorkspaceItemRecord) -> dict[str, Any]:
     }
 
 
-def serialize_workspace_item_event(event: WorkspaceItemEventRecord) -> dict[str, Any]:
+def serialize_discord_message_event(event: DiscordMessageEventRecord) -> dict[str, Any]:
     return {
         "id": event.id,
-        "workspace_item_id": event.workspace_item_id,
+        "discord_message_id": event.discord_message_id,
         "dedupe_key": event.dedupe_key,
         "provider_event_id": event.provider_event_id,
         "event_type": event.event_type,
@@ -4239,7 +4222,7 @@ def serialize_work_follow_up_loop(loop: WorkFollowUpLoopRecord) -> dict[str, Any
 def serialize_proactive_observation(observation: ProactiveObservationRecord) -> dict[str, Any]:
     return {
         "id": observation.id,
-        "workspace_item_id": observation.workspace_item_id,
+        "discord_message_id": observation.discord_message_id,
         "source_type": observation.source_type,
         "source_id": observation.source_id,
         "dedupe_key": observation.dedupe_key,

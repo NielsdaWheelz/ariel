@@ -251,7 +251,7 @@ def _seed_case(
         with db.begin():
             observation = ProactiveObservationRecord(
                 id=f"pob_{case_id}",
-                workspace_item_id=None,
+                discord_message_id=None,
                 source_type="job",
                 source_id=f"job_{case_id}",
                 dedupe_key=f"job:{case_id}",
