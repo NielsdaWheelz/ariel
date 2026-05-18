@@ -39,6 +39,7 @@ from ariel.action_runtime import (
 from ariel.agency_daemon import AgencyDaemonClient, AgencyRuntime
 from ariel.attachment_content import AttachmentContentRuntime
 from ariel.capability_registry import (
+    EMAIL_MUTATION_CAPABILITY_IDS,
     MEMORY_CAPABILITY_IDS,
     get_capability,
     internal_callable_capability_ids,
@@ -106,7 +107,6 @@ from ariel.persistence import (
     ArtifactRecord,
     BackgroundTaskRecord,
     CaptureRecord,
-    EmailActionRecord,
     EmailThreadWatchRecord,
     EventRecord,
     GoogleConnectorRecord,
@@ -129,6 +129,7 @@ from ariel.persistence import (
     ProjectStateSnapshotRecord,
     ProviderEvidenceRecord,
     ProviderEventRecord,
+    ProviderWriteReceiptRecord,
     SessionRecord,
     SessionRotationRecord,
     SyncCursorRecord,
@@ -8446,7 +8447,7 @@ def create_app(
     def get_email_actions(
         provider_account_id: str,
         provider: Literal["google"] = "google",
-        status: Literal["pending", "executing", "succeeded", "failed", "undone"] | None = None,
+        status: Literal["executing", "succeeded", "failed", "ambiguous", "undone"] | None = None,
         action_attempt_id: str | None = None,
         limit: int = 50,
     ) -> dict[str, Any]:
@@ -8454,24 +8455,26 @@ def create_app(
         bounded_limit = max(1, min(limit, 200))
         with session_factory() as db:
             with db.begin():
-                query = select(EmailActionRecord)
-                query = query.where(
-                    EmailActionRecord.provider == provider,
-                    EmailActionRecord.provider_account_id == provider_account_id,
+                query = select(ProviderWriteReceiptRecord).where(
+                    ProviderWriteReceiptRecord.provider == provider,
+                    ProviderWriteReceiptRecord.provider_account_id == provider_account_id,
+                    ProviderWriteReceiptRecord.capability_id.in_(EMAIL_MUTATION_CAPABILITY_IDS),
                 )
                 if status is not None:
-                    query = query.where(EmailActionRecord.status == status)
+                    query = query.where(ProviderWriteReceiptRecord.status == status)
                 if action_attempt_id is not None:
-                    query = query.where(EmailActionRecord.action_attempt_id == action_attempt_id)
-                actions = db.scalars(
+                    query = query.where(
+                        ProviderWriteReceiptRecord.action_attempt_id == action_attempt_id
+                    )
+                receipts = db.scalars(
                     query.order_by(
-                        EmailActionRecord.created_at.desc(),
-                        EmailActionRecord.id.desc(),
+                        ProviderWriteReceiptRecord.created_at.desc(),
+                        ProviderWriteReceiptRecord.id.desc(),
                     ).limit(bounded_limit)
                 ).all()
                 try:
                     return build_surface_email_action_list_response(
-                        email_actions=[serialize_email_action(action) for action in actions]
+                        email_actions=[serialize_email_action(receipt) for receipt in receipts]
                     )
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
@@ -8481,15 +8484,16 @@ def create_app(
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
-                action = db.scalar(
-                    select(EmailActionRecord)
+                receipt = db.scalar(
+                    select(ProviderWriteReceiptRecord)
                     .where(
-                        EmailActionRecord.id == email_action_id,
-                        EmailActionRecord.provider_account_id == provider_account_id,
+                        ProviderWriteReceiptRecord.id == email_action_id,
+                        ProviderWriteReceiptRecord.provider_account_id == provider_account_id,
+                        ProviderWriteReceiptRecord.capability_id.in_(EMAIL_MUTATION_CAPABILITY_IDS),
                     )
                     .limit(1)
                 )
-                if action is None:
+                if receipt is None:
                     raise ApiError(
                         status_code=404,
                         code="E_EMAIL_ACTION_NOT_FOUND",
@@ -8499,7 +8503,7 @@ def create_app(
                     )
                 try:
                     return build_surface_email_action_response(
-                        email_action=serialize_email_action(action)
+                        email_action=serialize_email_action(receipt)
                     )
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc

@@ -31,7 +31,6 @@ from ariel.persistence import (
     ActionAttemptRecord,
     ActionPrivatePayloadRecord,
     BackgroundTaskRecord,
-    EmailActionRecord,
     EmailThreadWatchRecord,
     EventRecord,
     GoogleConnectorRecord,
@@ -57,6 +56,16 @@ def _email_idempotency_key(
 ) -> str:
     raw = f"{capability_id}\x1fgoogle\x1f{provider_account_id}\x1f{client_key}"
     return "email:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _provider_write_idempotency_key(
+    *,
+    capability_id: str,
+    provider_account_id: str,
+    client_key: str,
+) -> str:
+    raw = f"{capability_id}\x1fgoogle\x1f{provider_account_id}\x1f{client_key}"
+    return "provider-write:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 @dataclass
@@ -464,14 +473,6 @@ def test_email_action_partial_provider_failure_retries_without_false_success(
         assert action_attempt is not None
         assert action_attempt.status == "executing"
         assert action_attempt.execution_error == "google_upstream_500"
-        email_action = db.scalar(select(EmailActionRecord).limit(1))
-        assert email_action is not None
-        assert email_action.status == "executing"
-        assert email_action.failure_code is None
-        assert email_action.before_state == {"messages": before_state}
-        assert email_action.after_state["messages"][0]["label_ids"] == ["TRASH"]
-        assert email_action.provider_result["error"] == "google_upstream_500"
-        assert email_action.intended_state["before_state"] == before_state
         receipt = db.scalar(select(ProviderWriteReceiptRecord).limit(1))
         assert receipt is not None
         assert receipt.status == "failed"
@@ -481,6 +482,9 @@ def test_email_action_partial_provider_failure_retries_without_false_success(
         assert receipt.ambiguity_reason is None
         assert receipt.idempotency_key is not None
         assert "act_partial" not in receipt.idempotency_key
+        assert receipt.before_state == {"messages": before_state}
+        assert receipt.after_state is not None
+        assert receipt.after_state["messages"][0]["label_ids"] == ["TRASH"]
         assert receipt.response_payload["error"] == "google_upstream_500"
         assert receipt.response_payload["provider_result"]["mutated_message_ids"] == ["msg_ok"]
         assert receipt.provider_object_ids["message_ids"] == ["msg_ok", "msg_fail"]
@@ -520,10 +524,10 @@ def test_email_action_malformed_before_state_fails_before_provider_mutation(
 
     assert runtime.executions == []
     with session_factory() as db:
-        email_action = db.scalar(select(EmailActionRecord).limit(1))
-        assert email_action is not None
-        assert email_action.status == "executing"
-        assert email_action.before_state == {}
+        receipt = db.scalar(select(ProviderWriteReceiptRecord).limit(1))
+        assert receipt is not None
+        assert receipt.status == "executing"
+        assert receipt.before_state is None
 
 
 def test_email_action_provider_timeout_records_ambiguous_receipt_and_fails_closed(
@@ -559,10 +563,6 @@ def test_email_action_provider_timeout_records_ambiguous_receipt_and_fails_close
         assert action_attempt is not None
         assert action_attempt.status == "failed"
         assert action_attempt.execution_error == "provider_timeout"
-        email_action = db.scalar(select(EmailActionRecord).limit(1))
-        assert email_action is not None
-        assert email_action.status == "failed"
-        assert email_action.failure_code == "provider_timeout"
         receipt = db.scalar(select(ProviderWriteReceiptRecord).limit(1))
         assert receipt is not None
         assert receipt.status == "ambiguous"
@@ -641,10 +641,6 @@ def test_email_action_success_redacts_undo_token_from_event_audit(
         undo_token = action_attempt.execution_output["undo_token"]
         assert isinstance(undo_token, str)
         assert undo_token
-        email_action = db.scalar(select(EmailActionRecord).limit(1))
-        assert email_action is not None
-        assert email_action.undo_token_hash is not None
-        assert email_action.undo_token_hash != undo_token
         event = db.scalar(
             select(EventRecord)
             .where(EventRecord.event_type == "evt.action.execution.succeeded")
@@ -668,9 +664,16 @@ def test_email_action_success_redacts_undo_token_from_event_audit(
         assert receipt.ambiguity_reason is None
         assert receipt.idempotency_key is not None
         assert "act_success" not in receipt.idempotency_key
-        assert receipt.response_payload["email_action_id"] == email_action.id
+        assert receipt.response_payload["email_action_id"] == receipt.id
         assert receipt.provider_object_ids["message_ids"] == ["msg_1"]
         assert receipt.response_payload["undo_token"] == "[redacted]"
+        assert receipt.undo_token_hash is not None
+        assert receipt.undo_token_hash != undo_token
+        assert receipt.undo_expires_at is not None
+        assert receipt.before_state is not None
+        assert receipt.before_state["messages"][0]["message_id"] == "msg_1"
+        assert receipt.after_state is not None
+        assert receipt.after_state["messages"][0]["label_ids"] == []
         assert isinstance(receipt.response_digest, str)
         assert len(receipt.response_digest) == 64
 
@@ -779,30 +782,36 @@ def test_email_action_idempotency_replay_returns_existing_result_without_provide
     with session_factory() as db:
         with db.begin():
             db.add(
-                EmailActionRecord(
+                ProviderWriteReceiptRecord(
                     id="ema_original",
                     provider="google",
                     provider_account_id=PROVIDER_ACCOUNT_ID,
                     action_attempt_id="act_original",
                     capability_id="cap.email.archive",
-                    input_hash=original_hash,
-                    idempotency_key=_email_idempotency_key(
+                    idempotency_key=_provider_write_idempotency_key(
                         capability_id="cap.email.archive",
                         provider_account_id=PROVIDER_ACCOUNT_ID,
                         client_key="archive-1",
                     ),
                     status="succeeded",
-                    approval_id=None,
-                    provider_message_ids=["msg_1"],
-                    provider_thread_ids=["thr_1"],
-                    before_state={"messages": []},
-                    intended_state=proposed_input,
-                    after_state={"messages": []},
-                    provider_result={"operation": "archive"},
-                    undo_token_hash="hash_only",
+                    provider_object_ids={"message_ids": ["msg_1"], "thread_ids": ["thr_1"]},
+                    request_digest=original_hash,
+                    response_payload={
+                        "status": "succeeded",
+                        "email_action_id": "ema_original",
+                        "capability_id": "cap.email.archive",
+                        "undo_available": False,
+                        "provider_result": {"operation": "archive"},
+                    },
+                    ambiguity_reason=None,
+                    provider_timestamp=None,
+                    provider_etag=None,
+                    provider_history_id=None,
+                    response_digest="d" * 64,
+                    before_state={"messages": [{"message_id": "msg_1", "label_ids": ["INBOX"]}]},
+                    after_state={"messages": [{"message_id": "msg_1", "label_ids": []}]},
+                    undo_token_hash="u" * 64,
                     undo_expires_at=NOW,
-                    execution_attempts=1,
-                    failure_code=None,
                     created_at=NOW,
                     updated_at=NOW,
                 )
@@ -854,30 +863,36 @@ def test_email_undo_idempotency_replay_does_not_revalidate_prior_action(
     with session_factory() as db:
         with db.begin():
             db.add(
-                EmailActionRecord(
+                ProviderWriteReceiptRecord(
                     id="ema_undo_original",
                     provider="google",
                     provider_account_id=PROVIDER_ACCOUNT_ID,
                     action_attempt_id="act_undo_original",
                     capability_id="cap.email.undo",
-                    input_hash=undo_hash,
-                    idempotency_key=_email_idempotency_key(
+                    idempotency_key=_provider_write_idempotency_key(
                         capability_id="cap.email.undo",
                         provider_account_id=PROVIDER_ACCOUNT_ID,
                         client_key="undo-1",
                     ),
                     status="succeeded",
-                    approval_id=None,
-                    provider_message_ids=["msg_1"],
-                    provider_thread_ids=["thr_1"],
-                    before_state={"messages": []},
-                    intended_state={"message_ids": ["msg_1"]},
-                    after_state={"messages": []},
-                    provider_result={"operation": "undo"},
+                    provider_object_ids={"message_ids": ["msg_1"], "thread_ids": ["thr_1"]},
+                    request_digest=undo_hash,
+                    response_payload={
+                        "status": "succeeded",
+                        "email_action_id": "ema_undo_original",
+                        "capability_id": "cap.email.undo",
+                        "undo_available": False,
+                        "provider_result": {"operation": "undo"},
+                    },
+                    ambiguity_reason=None,
+                    provider_timestamp=None,
+                    provider_etag=None,
+                    provider_history_id=None,
+                    response_digest="d" * 64,
+                    before_state={"messages": [{"message_id": "msg_1", "label_ids": ["INBOX"]}]},
+                    after_state={"messages": [{"message_id": "msg_1", "label_ids": ["INBOX"]}]},
                     undo_token_hash=None,
                     undo_expires_at=None,
-                    execution_attempts=1,
-                    failure_code=None,
                     created_at=NOW,
                     updated_at=NOW,
                 )
@@ -904,6 +919,192 @@ def test_email_undo_idempotency_replay_does_not_revalidate_prior_action(
         assert action_attempt.status == "succeeded"
         assert action_attempt.execution_output is not None
         assert action_attempt.execution_output["email_action_id"] == "ema_undo_original"
+
+
+def test_email_action_crash_recovery_reconciles_against_the_write_receipt(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """A crashed email mutation left `provider_call_started` is reconciled against
+    the provider_write_receipts ledger -- the executing receipt written at dispatch
+    -- not a second ledger. The recovery path fails closed and enqueues reconcile."""
+    original_hash = _seed_action_attempt(
+        session_factory,
+        action_attempt_id="act_crash",
+        capability_id="cap.email.archive",
+        proposed_input={"message_ids": ["msg_1"], "idempotency_key": "archive-crash"},
+        proposal_index=1,
+    )
+    with session_factory() as db:
+        with db.begin():
+            action_attempt = db.get(ActionAttemptRecord, "act_crash")
+            assert action_attempt is not None
+            action_attempt.execution_output = {
+                "dispatch_state": "provider_call_started",
+                "provider_account_id": PROVIDER_ACCOUNT_ID,
+            }
+            db.add(
+                ProviderWriteReceiptRecord(
+                    id="pwr_crash",
+                    provider="google",
+                    provider_account_id=PROVIDER_ACCOUNT_ID,
+                    action_attempt_id="act_crash",
+                    capability_id="cap.email.archive",
+                    idempotency_key=_provider_write_idempotency_key(
+                        capability_id="cap.email.archive",
+                        provider_account_id=PROVIDER_ACCOUNT_ID,
+                        client_key="archive-crash",
+                    ),
+                    status="executing",
+                    provider_object_ids={},
+                    request_digest=original_hash,
+                    response_payload={"dispatch_state": "provider_call_started"},
+                    ambiguity_reason=None,
+                    provider_timestamp=None,
+                    provider_etag=None,
+                    provider_history_id=None,
+                    response_digest="d" * 64,
+                    before_state=None,
+                    after_state=None,
+                    undo_token_hash=None,
+                    undo_expires_at=None,
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+    runtime = FakeGoogleRuntime(
+        workspace_provider=FakeWorkspaceProvider(before_state=[]),
+        execution_output=None,
+    )
+    new_id = _id_factory("crash")
+
+    assert process_action_execution_task(
+        session_factory=session_factory,
+        action_attempt_id="act_crash",
+        google_runtime=runtime,  # type: ignore[arg-type]
+        agency_runtime=None,
+        now_fn=lambda: NOW,
+        new_id_fn=new_id,
+    )
+
+    assert runtime.executions == []
+    with session_factory() as db:
+        action_attempt = db.get(ActionAttemptRecord, "act_crash")
+        assert action_attempt is not None
+        assert action_attempt.status == "failed"
+        assert action_attempt.execution_error == "provider_result_unknown"
+        receipt = db.get(ProviderWriteReceiptRecord, "pwr_crash")
+        assert receipt is not None
+        assert receipt.status == "ambiguous"
+        assert receipt.ambiguity_reason == "provider_result_unknown"
+        event_types = [
+            row[0]
+            for row in db.execute(
+                select(EventRecord.event_type).order_by(EventRecord.sequence.asc())
+            ).all()
+        ]
+        assert event_types == [
+            "evt.provider_write.reconcile_unavailable",
+            "evt.action.execution.failed",
+        ]
+        reconcile_task = db.scalar(
+            select(BackgroundTaskRecord)
+            .where(BackgroundTaskRecord.task_type == "provider_write_reconcile_due")
+            .limit(1)
+        )
+        assert reconcile_task is not None
+        assert reconcile_task.provider_write_receipt_id == "pwr_crash"
+
+
+def test_email_undo_marks_prior_receipt_undone_on_the_single_ledger(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """A successful undo resolves the prior write receipt by undo_token_hash and
+    marks it `undone` -- both the original mutation and its undo live on
+    provider_write_receipts as one ledger."""
+    before_state = [{"message_id": "msg_1", "thread_id": "thr_1", "label_ids": ["INBOX"]}]
+    archive_runtime = FakeGoogleRuntime(
+        workspace_provider=FakeWorkspaceProvider(before_state=before_state),
+        execution_output={
+            "status": "archived",
+            "operation": "archive",
+            "message_ids": ["msg_1"],
+            "before_state": before_state,
+            "after_state": [{"message_id": "msg_1", "thread_id": "thr_1", "label_ids": []}],
+            "provider_result": {
+                "operation": "archive",
+                "mutated_message_ids": ["msg_1"],
+                "attempted_message_ids": ["msg_1"],
+            },
+        },
+    )
+    _seed_action_attempt(
+        session_factory,
+        action_attempt_id="act_arch",
+        capability_id="cap.email.archive",
+        proposed_input={"message_ids": ["msg_1"], "idempotency_key": "archive-undo-1"},
+        proposal_index=1,
+    )
+    assert process_action_execution_task(
+        session_factory=session_factory,
+        action_attempt_id="act_arch",
+        google_runtime=archive_runtime,  # type: ignore[arg-type]
+        agency_runtime=None,
+        now_fn=lambda: NOW,
+        new_id_fn=_id_factory("arch"),
+    )
+
+    with session_factory() as db:
+        archive_attempt = db.get(ActionAttemptRecord, "act_arch")
+        assert archive_attempt is not None
+        assert archive_attempt.execution_output is not None
+        undo_token = archive_attempt.execution_output["undo_token"]
+        assert isinstance(undo_token, str) and undo_token
+        prior_receipt_id = archive_attempt.execution_output["email_action_id"]
+
+    undo_runtime = FakeGoogleRuntime(
+        workspace_provider=FakeWorkspaceProvider(before_state=before_state),
+        execution_output={
+            "status": "restored",
+            "operation": "undo",
+            "message_ids": ["msg_1"],
+            "before_state": [{"message_id": "msg_1", "thread_id": "thr_1", "label_ids": []}],
+            "after_state": before_state,
+            "provider_result": {"operation": "undo", "restored_message_ids": ["msg_1"]},
+        },
+    )
+    _seed_action_attempt(
+        session_factory,
+        action_attempt_id="act_undo",
+        capability_id="cap.email.undo",
+        proposed_input={"undo_token": undo_token, "idempotency_key": "undo-go"},
+        proposal_index=2,
+    )
+    assert process_action_execution_task(
+        session_factory=session_factory,
+        action_attempt_id="act_undo",
+        google_runtime=undo_runtime,  # type: ignore[arg-type]
+        agency_runtime=None,
+        now_fn=lambda: NOW,
+        new_id_fn=_id_factory("undo"),
+    )
+
+    assert undo_runtime.workspace_provider.state_reads == 0
+    with session_factory() as db:
+        undo_attempt = db.get(ActionAttemptRecord, "act_undo")
+        assert undo_attempt is not None
+        assert undo_attempt.status == "succeeded", undo_attempt.execution_error
+        prior_receipt = db.get(ProviderWriteReceiptRecord, prior_receipt_id)
+        assert prior_receipt is not None
+        assert prior_receipt.status == "undone"
+        undo_receipt = db.scalar(
+            select(ProviderWriteReceiptRecord)
+            .where(ProviderWriteReceiptRecord.capability_id == "cap.email.undo")
+            .limit(1)
+        )
+        assert undo_receipt is not None
+        assert undo_receipt.status == "succeeded"
+        assert undo_receipt.undo_token_hash is None
+        assert undo_receipt.id != prior_receipt_id
 
 
 def test_email_thread_watch_list_is_scoped_to_current_google_account(

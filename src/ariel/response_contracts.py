@@ -1174,17 +1174,15 @@ class SurfaceEmailActionContract(BaseModel):
     ]
     input_hash: str
     idempotency_key: str
-    status: Literal["pending", "executing", "succeeded", "failed", "undone"]
+    status: Literal["executing", "succeeded", "failed", "ambiguous", "undone"]
     approval_id: str | None
     provider_message_ids: list[str]
     provider_thread_ids: list[str]
     before_state: dict[str, Any]
-    intended_state: dict[str, Any]
     after_state: dict[str, Any]
     provider_result: dict[str, Any]
     undo_available: bool
     undo_expires_at: str | None
-    execution_attempts: int
     failure_code: str | None
     created_at: str
     updated_at: str

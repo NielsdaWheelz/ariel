@@ -525,120 +525,6 @@ class ApprovalRequestRecord(Base):
     )
 
 
-class EmailActionRecord(Base):
-    __tablename__ = "email_actions"
-
-    id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    provider: Mapped[str] = mapped_column(String(32), nullable=False, default="google")
-    provider_account_id: Mapped[str] = mapped_column(String(128), nullable=False)
-    action_attempt_id: Mapped[str] = mapped_column(
-        String(32),
-        ForeignKey("action_attempts.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
-    capability_id: Mapped[str] = mapped_column(String(128), nullable=False)
-    input_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    status: Mapped[str] = mapped_column(String(32), nullable=False)
-    approval_id: Mapped[str | None] = mapped_column(
-        String(32),
-        ForeignKey("approval_requests.id", ondelete="RESTRICT"),
-        nullable=True,
-        index=True,
-    )
-    provider_message_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
-    provider_thread_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
-    before_state: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    intended_state: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    after_state: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    provider_result: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    undo_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    undo_expires_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True, index=True
-    )
-    execution_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    failure_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, index=True
-    )
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-
-    __table_args__ = (
-        CheckConstraint("provider IN ('google')", name="ck_email_action_provider"),
-        CheckConstraint(
-            (
-                "capability_id IN ('cap.email.archive', 'cap.email.trash', "
-                "'cap.email.labels.modify', 'cap.email.undo')"
-            ),
-            name="ck_email_action_capability",
-        ),
-        CheckConstraint(
-            "status IN ('pending', 'executing', 'succeeded', 'failed', 'undone')",
-            name="ck_email_action_status",
-        ),
-        CheckConstraint("execution_attempts >= 0", name="ck_email_action_attempts_nonnegative"),
-        CheckConstraint(
-            "jsonb_typeof(provider_message_ids) = 'array'",
-            name="ck_email_action_provider_message_ids_array",
-        ),
-        CheckConstraint(
-            "jsonb_typeof(provider_thread_ids) = 'array'",
-            name="ck_email_action_provider_thread_ids_array",
-        ),
-        CheckConstraint(
-            (
-                "(status = 'failed' AND failure_code IS NOT NULL) OR "
-                "(status != 'failed' AND failure_code IS NULL)"
-            ),
-            name="ck_email_action_failure_code_status",
-        ),
-        CheckConstraint(
-            (
-                "(undo_token_hash IS NULL AND undo_expires_at IS NULL) OR "
-                "(undo_token_hash IS NOT NULL AND undo_expires_at IS NOT NULL)"
-            ),
-            name="ck_email_action_undo_fields_paired",
-        ),
-        CheckConstraint(
-            (
-                "capability_id = 'cap.email.undo' OR status != 'succeeded' OR "
-                "(undo_token_hash IS NOT NULL AND undo_expires_at IS NOT NULL)"
-            ),
-            name="ck_email_action_succeeded_mutation_has_undo",
-        ),
-        Index(
-            "ix_email_actions_idempotency_key_unique",
-            "idempotency_key",
-            unique=True,
-            postgresql_where=(idempotency_key.is_not(None)),
-        ),
-        Index(
-            "ix_email_actions_provider_account_status",
-            "provider",
-            "provider_account_id",
-            "status",
-            "id",
-        ),
-        Index(
-            "ix_email_actions_undo_token_hash",
-            "undo_token_hash",
-            unique=True,
-            postgresql_where=undo_token_hash.is_not(None),
-        ),
-        Index(
-            "ix_email_actions_provider_message_ids",
-            "provider_message_ids",
-            postgresql_using="gin",
-        ),
-        Index(
-            "ix_email_actions_provider_thread_ids",
-            "provider_thread_ids",
-            postgresql_using="gin",
-        ),
-    )
-
-
 class EmailThreadWatchRecord(Base):
     __tablename__ = "email_thread_watches"
 
@@ -3129,6 +3015,10 @@ class ProviderWriteReceiptRecord(Base):
     provider_etag: Mapped[str | None] = mapped_column(String(256), nullable=True)
     provider_history_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     response_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    before_state: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    after_state: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    undo_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    undo_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )
@@ -3148,13 +3038,31 @@ class ProviderWriteReceiptRecord(Base):
             name="ck_provider_write_receipt_capability",
         ),
         CheckConstraint(
-            "status IN ('executing', 'succeeded', 'failed', 'ambiguous')",
+            "status IN ('executing', 'succeeded', 'failed', 'ambiguous', 'undone')",
             name="ck_provider_write_receipt_status",
         ),
         CheckConstraint(
             "(status = 'ambiguous' AND ambiguity_reason IS NOT NULL) OR "
             "(status != 'ambiguous' AND ambiguity_reason IS NULL)",
             name="ck_provider_write_receipt_ambiguity_reason",
+        ),
+        CheckConstraint(
+            "capability_id IN ('cap.email.archive', 'cap.email.trash', "
+            "'cap.email.labels.modify', 'cap.email.undo') OR "
+            "(before_state IS NULL AND after_state IS NULL AND "
+            "undo_token_hash IS NULL AND undo_expires_at IS NULL)",
+            name="ck_provider_write_receipt_undo_fields_email_only",
+        ),
+        CheckConstraint(
+            "(undo_token_hash IS NULL) = (undo_expires_at IS NULL)",
+            name="ck_provider_write_receipt_undo_fields_paired",
+        ),
+        CheckConstraint(
+            "capability_id NOT IN ('cap.email.archive', 'cap.email.trash', "
+            "'cap.email.labels.modify', 'cap.email.undo') OR "
+            "capability_id = 'cap.email.undo' OR status != 'succeeded' OR "
+            "(undo_token_hash IS NOT NULL AND undo_expires_at IS NOT NULL)",
+            name="ck_provider_write_receipt_succeeded_mutation_has_undo",
         ),
         Index(
             "ix_provider_write_receipts_idempotency_unique",
@@ -3170,6 +3078,12 @@ class ProviderWriteReceiptRecord(Base):
             "idempotency_key",
             unique=True,
             postgresql_where=(idempotency_key.is_not(None)),
+        ),
+        Index(
+            "ix_provider_write_receipts_undo_token_hash",
+            "undo_token_hash",
+            unique=True,
+            postgresql_where=undo_token_hash.is_not(None),
         ),
     )
 
@@ -4068,37 +3982,46 @@ def serialize_sync_cursor(cursor: SyncCursorRecord) -> dict[str, Any]:
     }
 
 
-def serialize_email_action(action: EmailActionRecord) -> dict[str, Any]:
+def serialize_email_action(receipt: ProviderWriteReceiptRecord) -> dict[str, Any]:
+    response_payload = (
+        receipt.response_payload if isinstance(receipt.response_payload, dict) else {}
+    )
+    provider_object_ids = (
+        receipt.provider_object_ids if isinstance(receipt.provider_object_ids, dict) else {}
+    )
+    provider_result = response_payload.get("provider_result")
+    if not isinstance(provider_result, dict):
+        provider_result = {}
+    authority = response_payload.get("authority")
+    approval_id = authority.get("approval_ref") if isinstance(authority, dict) else None
     undo_available = (
-        action.status == "succeeded"
-        and action.undo_token_hash is not None
-        and action.undo_expires_at is not None
-        and action.undo_expires_at > datetime.now(tz=UTC)
+        receipt.status == "succeeded"
+        and receipt.undo_token_hash is not None
+        and receipt.undo_expires_at is not None
+        and receipt.undo_expires_at > datetime.now(tz=UTC)
     )
     return {
-        "id": action.id,
-        "provider": action.provider,
-        "provider_account_id": redact_text(action.provider_account_id),
-        "action_attempt_id": action.action_attempt_id,
-        "capability_id": action.capability_id,
-        "input_hash": action.input_hash,
-        "idempotency_key": redact_text(action.idempotency_key)
-        if action.idempotency_key is not None
+        "id": receipt.id,
+        "provider": receipt.provider,
+        "provider_account_id": redact_text(receipt.provider_account_id),
+        "action_attempt_id": receipt.action_attempt_id,
+        "capability_id": receipt.capability_id,
+        "input_hash": receipt.request_digest,
+        "idempotency_key": redact_text(receipt.idempotency_key)
+        if receipt.idempotency_key is not None
         else None,
-        "status": action.status,
-        "approval_id": action.approval_id,
-        "provider_message_ids": redact_json_value(action.provider_message_ids),
-        "provider_thread_ids": redact_json_value(action.provider_thread_ids),
-        "before_state": redact_json_value(action.before_state),
-        "intended_state": redact_json_value(action.intended_state),
-        "after_state": redact_json_value(action.after_state),
-        "provider_result": redact_json_value(action.provider_result),
+        "status": receipt.status,
+        "approval_id": approval_id if isinstance(approval_id, str) else None,
+        "provider_message_ids": redact_json_value(provider_object_ids.get("message_ids", [])),
+        "provider_thread_ids": redact_json_value(provider_object_ids.get("thread_ids", [])),
+        "before_state": redact_json_value(receipt.before_state or {}),
+        "after_state": redact_json_value(receipt.after_state or {}),
+        "provider_result": redact_json_value(provider_result),
         "undo_available": undo_available,
-        "undo_expires_at": to_rfc3339(action.undo_expires_at) if action.undo_expires_at else None,
-        "execution_attempts": action.execution_attempts,
-        "failure_code": action.failure_code,
-        "created_at": to_rfc3339(action.created_at),
-        "updated_at": to_rfc3339(action.updated_at),
+        "undo_expires_at": to_rfc3339(receipt.undo_expires_at) if receipt.undo_expires_at else None,
+        "failure_code": response_payload.get("error"),
+        "created_at": to_rfc3339(receipt.created_at),
+        "updated_at": to_rfc3339(receipt.updated_at),
     }
 
 

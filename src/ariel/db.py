@@ -90,7 +90,6 @@ REQUIRED_TABLES: Final[tuple[str, ...]] = (
     "job_events",
     "notifications",
     "notification_deliveries",
-    "email_actions",
     "email_thread_watches",
 )
 
@@ -165,6 +164,10 @@ REQUIRED_COLUMNS: Final[dict[str, tuple[str, ...]]] = {
         "provider_etag",
         "provider_history_id",
         "response_digest",
+        "before_state",
+        "after_state",
+        "undo_token_hash",
+        "undo_expires_at",
         "created_at",
         "updated_at",
     ),
@@ -343,6 +346,9 @@ REQUIRED_CONSTRAINTS: Final[dict[str, tuple[str, ...]]] = {
         "ck_provider_write_receipt_capability",
         "ck_provider_write_receipt_status",
         "ck_provider_write_receipt_ambiguity_reason",
+        "ck_provider_write_receipt_undo_fields_email_only",
+        "ck_provider_write_receipt_undo_fields_paired",
+        "ck_provider_write_receipt_succeeded_mutation_has_undo",
     ),
     "jobs": (
         "ck_jobs_agency_sandbox_policy_object",
@@ -524,7 +530,7 @@ REQUIRED_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
     },
     "provider_write_receipts": {
         "ck_provider_write_receipt_provider": ("'google'", "'agency'"),
-        "ck_provider_write_receipt_status": ("'executing'", "'ambiguous'"),
+        "ck_provider_write_receipt_status": ("'executing'", "'ambiguous'", "'undone'"),
         "ck_provider_write_receipt_capability": (
             "'cap.email.draft'",
             "'cap.calendar.respond_to_event'",
@@ -534,6 +540,18 @@ REQUIRED_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
         "ck_provider_write_receipt_ambiguity_reason": (
             "'ambiguous'",
             "ambiguity_reason IS NOT NULL",
+        ),
+        "ck_provider_write_receipt_undo_fields_email_only": (
+            "'cap.email.archive'",
+            "undo_token_hash IS NULL",
+        ),
+        "ck_provider_write_receipt_undo_fields_paired": (
+            "undo_token_hash IS NULL",
+            "undo_expires_at IS NULL",
+        ),
+        "ck_provider_write_receipt_succeeded_mutation_has_undo": (
+            "'cap.email.undo'",
+            "undo_token_hash IS NOT NULL",
         ),
     },
     "jobs": {
@@ -828,6 +846,7 @@ REQUIRED_INDEXES: Final[dict[str, tuple[str, ...]]] = {
         "ix_provider_write_receipts_attempt_idempotency_unique",
         "ix_provider_write_receipts_action_attempt_id",
         "ix_provider_write_receipts_provider_timestamp",
+        "ix_provider_write_receipts_undo_token_hash",
     ),
     "action_private_payloads": ("ix_action_private_payloads_action_attempt_id",),
 }
@@ -852,6 +871,7 @@ REQUIRED_UNIQUE_INDEXES: Final[dict[str, tuple[str, ...]]] = {
     "provider_write_receipts": (
         "ix_provider_write_receipts_idempotency_unique",
         "ix_provider_write_receipts_attempt_idempotency_unique",
+        "ix_provider_write_receipts_undo_token_hash",
     ),
     "action_private_payloads": ("ix_action_private_payloads_action_attempt_id",),
 }
@@ -876,6 +896,7 @@ REQUIRED_INDEX_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
     "provider_write_receipts": {
         "ix_provider_write_receipts_idempotency_unique": ("idempotency_key IS NOT NULL",),
         "ix_provider_write_receipts_attempt_idempotency_unique": ("idempotency_key IS NOT NULL",),
+        "ix_provider_write_receipts_undo_token_hash": ("undo_token_hash IS NOT NULL",),
     },
 }
 
@@ -948,6 +969,7 @@ REQUIRED_INDEX_COLUMNS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
         ),
         "ix_provider_write_receipts_action_attempt_id": ("action_attempt_id",),
         "ix_provider_write_receipts_provider_timestamp": ("provider_timestamp",),
+        "ix_provider_write_receipts_undo_token_hash": ("undo_token_hash",),
     },
     "action_private_payloads": {
         "ix_action_private_payloads_action_attempt_id": ("action_attempt_id",),

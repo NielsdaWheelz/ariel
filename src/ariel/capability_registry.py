@@ -49,6 +49,12 @@ AGENCY_CAPABILITY_IDS = {
 }
 DISCORD_CAPABILITY_IDS: set[str] = set()
 ATTACHMENT_CAPABILITY_IDS = {"cap.attachment.read"}
+EMAIL_MUTATION_CAPABILITY_IDS = {
+    "cap.email.archive",
+    "cap.email.trash",
+    "cap.email.labels.modify",
+    "cap.email.undo",
+}
 MEMORY_CAPABILITY_IDS = {
     "cap.memory.inspect",
     "cap.memory.search",
@@ -3845,7 +3851,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
             "output_schema": "email_undo_result_v1",
             "idempotency": "client_key",
             "required_scopes": [_GOOGLE_GMAIL_MODIFY_SCOPE],
-            "undo_source": "email_action_record",
+            "undo_source": "provider_write_receipt",
             "supported_capabilities": [
                 "cap.email.archive",
                 "cap.email.trash",

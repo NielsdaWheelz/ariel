@@ -10,8 +10,8 @@ from fastapi.testclient import TestClient
 from ariel.app import create_app
 from ariel.persistence import (
     ActionAttemptRecord,
-    EmailActionRecord,
     EmailThreadWatchRecord,
+    ProviderWriteReceiptRecord,
     SessionRecord,
     TurnRecord,
 )
@@ -107,26 +107,26 @@ def test_email_state_inspection_endpoints_return_serialized_records(
             )
             db.flush()
             db.add(
-                EmailActionRecord(
+                ProviderWriteReceiptRecord(
                     id="ema_api",
                     provider="google",
                     provider_account_id="con_google",
                     action_attempt_id="aat_email_api",
                     capability_id="cap.email.archive",
-                    input_hash="p" * 64,
-                    idempotency_key="email:archive:idem_1",
+                    idempotency_key="provider-write:archive:idem_1",
                     status="succeeded",
-                    approval_id=None,
-                    provider_message_ids=["msg_1"],
-                    provider_thread_ids=["thr_1"],
-                    before_state={"messages": [{"id": "msg_1", "labelIds": ["INBOX"]}]},
-                    intended_state={"message_ids": ["msg_1"]},
-                    after_state={"messages": [{"id": "msg_1", "labelIds": []}]},
-                    provider_result={"archived": ["msg_1"]},
+                    provider_object_ids={"message_ids": ["msg_1"], "thread_ids": ["thr_1"]},
+                    request_digest="p" * 64,
+                    response_payload={"provider_result": {"archived": ["msg_1"]}},
+                    ambiguity_reason=None,
+                    provider_timestamp=None,
+                    provider_etag=None,
+                    provider_history_id=None,
+                    response_digest="d" * 64,
+                    before_state={"messages": [{"message_id": "msg_1", "label_ids": ["INBOX"]}]},
+                    after_state={"messages": [{"message_id": "msg_1", "label_ids": []}]},
                     undo_token_hash="u" * 64,
                     undo_expires_at=now + timedelta(days=30),
-                    execution_attempts=1,
-                    failure_code=None,
                     created_at=now,
                     updated_at=now,
                 )

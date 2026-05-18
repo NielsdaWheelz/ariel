@@ -20,6 +20,7 @@ from ariel.capability_registry import (
     ATTACHMENT_CAPABILITY_IDS,
     CapabilityDefinition,
     DISCORD_CAPABILITY_IDS,
+    EMAIL_MUTATION_CAPABILITY_IDS,
     MEMORY_CAPABILITY_IDS,
     canonical_action_payload,
     capability_contract_hash,
@@ -79,7 +80,6 @@ from ariel.persistence import (
     ApprovalRequestRecord,
     ArtifactRecord,
     BackgroundTaskRecord,
-    EmailActionRecord,
     EmailThreadWatchRecord,
     GoogleConnectorRecord,
     GoogleProviderObjectRecord,
@@ -96,12 +96,6 @@ from ariel.redaction import safe_failure_reason
 from ariel.weather_state import resolve_weather_location
 
 _SIDE_EFFECT_EXECUTION_LOCK_ID = 24_310_002
-_EMAIL_MUTATION_CAPABILITY_IDS = {
-    "cap.email.archive",
-    "cap.email.trash",
-    "cap.email.labels.modify",
-    "cap.email.undo",
-}
 _EMAIL_THREAD_WATCH_CAPABILITY_IDS = {
     "cap.email.thread_watch.create",
     "cap.email.thread_watch.cancel",
@@ -440,33 +434,32 @@ def _acquire_email_advisory_lock(db: Session, *parts: str) -> None:
     )
 
 
-def _email_action_result_payload(
+def _email_receipt_result_payload(
     *,
-    action: EmailActionRecord,
+    receipt: ProviderWriteReceiptRecord,
+    provider_result: dict[str, Any],
     undo_token: str | None = None,
-    now: datetime | None = None,
 ) -> dict[str, Any]:
-    undo_available = (
-        action.status == "succeeded"
-        and action.undo_token_hash is not None
-        and action.undo_expires_at is not None
-        and (now is None or action.undo_expires_at > now)
-    )
+    before_state = receipt.before_state if isinstance(receipt.before_state, dict) else {}
+    after_state = receipt.after_state if isinstance(receipt.after_state, dict) else {}
+    thread_ids = _email_thread_ids_from_state(before_state)
+    for thread_id in _email_thread_ids_from_state(after_state):
+        if thread_id not in thread_ids:
+            thread_ids.append(thread_id)
     payload: dict[str, Any] = {
-        "status": action.status,
-        "email_action_id": action.id,
-        "capability_id": action.capability_id,
-        "provider": action.provider,
-        "provider_account_id": action.provider_account_id,
-        "message_ids": action.provider_message_ids,
-        "thread_ids": action.provider_thread_ids,
-        "before_state": action.before_state,
-        "intended_state": action.intended_state,
-        "after_state": action.after_state,
-        "provider_result": action.provider_result,
-        "undo_available": undo_available,
-        "undo_expires_at": to_rfc3339(action.undo_expires_at)
-        if action.undo_expires_at is not None
+        "status": "succeeded",
+        "email_action_id": receipt.id,
+        "capability_id": receipt.capability_id,
+        "provider": receipt.provider,
+        "provider_account_id": receipt.provider_account_id,
+        "message_ids": _email_message_ids_from_state(before_state),
+        "thread_ids": thread_ids,
+        "before_state": before_state,
+        "after_state": after_state,
+        "provider_result": provider_result,
+        "undo_available": receipt.undo_token_hash is not None,
+        "undo_expires_at": to_rfc3339(receipt.undo_expires_at)
+        if receipt.undo_expires_at is not None
         else None,
     }
     if undo_token is not None:
@@ -493,6 +486,17 @@ def _email_thread_ids_from_state(state: dict[str, Any]) -> list[str]:
         if isinstance(thread_id, str) and thread_id and thread_id not in thread_ids:
             thread_ids.append(thread_id)
     return thread_ids
+
+
+def _email_message_ids_from_state(state: dict[str, Any]) -> list[str]:
+    message_ids: list[str] = []
+    for entry in state.get("messages", []):
+        if not isinstance(entry, dict):
+            continue
+        message_id = entry.get("message_id")
+        if isinstance(message_id, str) and message_id and message_id not in message_ids:
+            message_ids.append(message_id)
+    return message_ids
 
 
 def _redacted_provider_text_marker(value: Any) -> dict[str, Any]:
@@ -2457,7 +2461,7 @@ def _provider_source_evidence_target_error(
     input_payload: dict[str, Any],
     source_evidence: ProviderEvidenceRecord,
 ) -> str | None:
-    if action_attempt.capability_id in _EMAIL_MUTATION_CAPABILITY_IDS:
+    if action_attempt.capability_id in EMAIL_MUTATION_CAPABILITY_IDS:
         message_ids = input_payload.get("message_ids")
         if not isinstance(message_ids, list):
             return None
@@ -2802,7 +2806,7 @@ def _provider_write_success_identity_error(
         ):
             return "provider_write_identity_missing"
         return None
-    if capability_id in _EMAIL_MUTATION_CAPABILITY_IDS:
+    if capability_id in EMAIL_MUTATION_CAPABILITY_IDS:
         message_ids = provider_object_ids.get("message_ids")
         if not isinstance(message_ids, list) or not message_ids:
             return "provider_write_identity_missing"
@@ -4620,7 +4624,7 @@ def process_action_execution_task(
 ) -> bool:
     provider_call: tuple[str, dict[str, Any], str, set[str], str | None] | None = None
     email_provider_call: tuple[str, str, dict[str, Any], str, set[str], str] | None = None
-    email_undo_prior_action_id: str | None = None
+    email_undo_prior_receipt_id: str | None = None
     email_lock_parts: tuple[str, ...] | None = None
     agency_call: tuple[str, dict[str, Any], dict[str, Any], str | None] | None = None
     agency_result: (
@@ -4750,7 +4754,7 @@ def process_action_execution_task(
                         else None
                     )
                     if (
-                        action_attempt.capability_id in _EMAIL_MUTATION_CAPABILITY_IDS
+                        action_attempt.capability_id in EMAIL_MUTATION_CAPABILITY_IDS
                         and existing_receipt is not None
                         and existing_receipt.status == "failed"
                         and isinstance(existing_error, str)
@@ -4901,7 +4905,7 @@ def process_action_execution_task(
                     )
                     return True
                 elif (
-                    action_attempt.capability_id not in _EMAIL_MUTATION_CAPABILITY_IDS
+                    action_attempt.capability_id not in EMAIL_MUTATION_CAPABILITY_IDS
                     and action_attempt.capability_id not in _EMAIL_THREAD_WATCH_CAPABILITY_IDS
                 ):
                     _fail_action_execution(
@@ -5231,7 +5235,7 @@ def process_action_execution_task(
                 )
                 return True
 
-            if action_attempt.capability_id in _EMAIL_MUTATION_CAPABILITY_IDS:
+            if action_attempt.capability_id in EMAIL_MUTATION_CAPABILITY_IDS:
                 if google_runtime is None:
                     _fail_action_execution(
                         db=db,
@@ -5294,19 +5298,14 @@ def process_action_execution_task(
                         new_id_fn=new_id_fn,
                     )
                     return True
-                idempotency_key = _email_idempotency_key(
-                    capability_id=action_attempt.capability_id,
+                existing_receipt = _provider_write_receipt_for_attempt(
+                    db=db,
+                    action_attempt=action_attempt,
                     provider_account_id=provider_account_id,
-                    client_key=str(normalized_input["idempotency_key"]),
+                    normalized_input=normalized_input,
                 )
-                email_action = db.scalar(
-                    select(EmailActionRecord)
-                    .where(EmailActionRecord.idempotency_key == idempotency_key)
-                    .with_for_update()
-                    .limit(1)
-                )
-                if email_action is not None:
-                    if email_action.input_hash != action_attempt.payload_hash:
+                if existing_receipt is not None:
+                    if existing_receipt.request_digest != action_attempt.payload_hash:
                         _fail_action_execution(
                             db=db,
                             action_attempt=action_attempt,
@@ -5315,13 +5314,9 @@ def process_action_execution_task(
                             new_id_fn=new_id_fn,
                         )
                         return True
-                    if email_action.status in {"succeeded", "undone"}:
-                        replay_output = _email_action_result_payload(
-                            action=email_action,
-                            now=now_fn(),
-                        )
+                    if existing_receipt.status in {"succeeded", "undone"}:
                         action_attempt.status = "succeeded"
-                        action_attempt.execution_output = replay_output
+                        action_attempt.execution_output = existing_receipt.response_payload
                         action_attempt.execution_error = None
                         action_attempt.updated_at = now_fn()
                         _append_action_execution_event(
@@ -5330,7 +5325,8 @@ def process_action_execution_task(
                             event_type="evt.action.execution.succeeded",
                             payload_data={
                                 "action_attempt_id": action_attempt.id,
-                                "output": replay_output,
+                                "output": existing_receipt.response_payload,
+                                "replayed_provider_write_receipt_id": existing_receipt.id,
                             },
                             now_fn=now_fn,
                             new_id_fn=new_id_fn,
@@ -5341,131 +5337,111 @@ def process_action_execution_task(
                             now_fn=now_fn,
                         )
                         return True
-                    elif email_action.status == "failed":
-                        error = email_action.failure_code or "email_action_failed"
-                        if not _email_provider_error_is_retryable(error):
-                            _fail_action_execution(
-                                db=db,
-                                action_attempt=action_attempt,
-                                error=error,
-                                now_fn=now_fn,
-                                new_id_fn=new_id_fn,
-                            )
-                            return True
-                    stored_input = (
-                        email_action.intended_state
-                        if isinstance(email_action.intended_state, dict)
-                        else {}
-                    )
-                    provider_input = dict(stored_input)
-                    provider_message_ids = list(email_action.provider_message_ids)
-                    if "message_ids" not in provider_input:
-                        provider_input["message_ids"] = provider_message_ids
-                    before_messages = (
-                        email_action.before_state.get("messages")
-                        if isinstance(email_action.before_state, dict)
+                    existing_error = (
+                        existing_receipt.response_payload.get("error")
+                        if isinstance(existing_receipt.response_payload, dict)
                         else None
                     )
-                    if isinstance(before_messages, list) and "before_state" not in provider_input:
-                        provider_input["before_state"] = before_messages
-                    prior_action_id = provider_input.get("prior_email_action_id")
-                    if isinstance(prior_action_id, str):
-                        email_undo_prior_action_id = prior_action_id
+                    if existing_receipt.status == "executing":
+                        _fail_action_execution(
+                            db=db,
+                            action_attempt=action_attempt,
+                            error="provider_write_in_progress",
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        return True
+                    if not (
+                        existing_receipt.status == "failed"
+                        and isinstance(existing_error, str)
+                        and _email_provider_error_is_retryable(existing_error)
+                    ):
+                        _fail_action_execution(
+                            db=db,
+                            action_attempt=action_attempt,
+                            error=existing_error
+                            if isinstance(existing_error, str)
+                            else "provider_write_failed",
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        return True
+                if action_attempt.capability_id == "cap.email.undo":
+                    undo_token_hash = _email_hash(str(normalized_input["undo_token"]))
+                    prior_receipt = db.scalar(
+                        select(ProviderWriteReceiptRecord)
+                        .where(ProviderWriteReceiptRecord.undo_token_hash == undo_token_hash)
+                        .with_for_update()
+                        .limit(1)
+                    )
+                    prior_before_messages = (
+                        prior_receipt.before_state.get("messages")
+                        if prior_receipt is not None
+                        and isinstance(prior_receipt.before_state, dict)
+                        else None
+                    )
+                    if (
+                        prior_receipt is None
+                        or prior_receipt.status != "succeeded"
+                        or prior_receipt.undo_expires_at is None
+                        or prior_receipt.undo_expires_at <= now_fn()
+                        or prior_receipt.provider != "google"
+                        or prior_receipt.provider_account_id != provider_account_id
+                        or not isinstance(prior_before_messages, list)
+                        or not prior_before_messages
+                    ):
+                        _fail_action_execution(
+                            db=db,
+                            action_attempt=action_attempt,
+                            error="undo_unavailable",
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        return True
+                    email_undo_prior_receipt_id = prior_receipt.id
+                    provider_message_ids = _email_message_ids_from_state(
+                        {"messages": prior_before_messages}
+                    )
+                    provider_input = {
+                        "message_ids": provider_message_ids,
+                        "before_state": prior_before_messages,
+                        "idempotency_key": normalized_input["idempotency_key"],
+                    }
                 else:
                     provider_input = dict(normalized_input)
-                    provider_message_ids = list(normalized_input.get("message_ids", []))
-                    if action_attempt.capability_id == "cap.email.undo":
-                        undo_token_hash = _email_hash(str(normalized_input["undo_token"]))
-                        prior_action = db.scalar(
-                            select(EmailActionRecord)
-                            .where(EmailActionRecord.undo_token_hash == undo_token_hash)
-                            .with_for_update()
-                            .limit(1)
-                        )
-                        if (
-                            prior_action is None
-                            or prior_action.status != "succeeded"
-                            or prior_action.undo_expires_at is None
-                            or prior_action.undo_expires_at <= now_fn()
-                            or prior_action.provider != "google"
-                            or prior_action.provider_account_id != provider_account_id
-                            or not prior_action.before_state.get("messages")
-                            or not isinstance(prior_action.before_state.get("messages"), list)
-                        ):
-                            _fail_action_execution(
-                                db=db,
-                                action_attempt=action_attempt,
-                                error="undo_unavailable",
-                                now_fn=now_fn,
-                                new_id_fn=new_id_fn,
-                            )
-                            return True
-                        email_undo_prior_action_id = prior_action.id
-                        provider_message_ids = list(prior_action.provider_message_ids)
-                        provider_input = {
-                            "message_ids": provider_message_ids,
-                            "before_state": prior_action.before_state["messages"],
-                            "prior_email_action_id": prior_action.id,
-                        }
-                    email_action = EmailActionRecord(
-                        id=new_id_fn("ema"),
-                        provider="google",
-                        provider_account_id=provider_account_id,
-                        action_attempt_id=action_attempt.id,
-                        capability_id=action_attempt.capability_id,
-                        input_hash=action_attempt.payload_hash,
-                        idempotency_key=idempotency_key,
-                        status="pending",
-                        approval_id=(
-                            action_attempt.approval_request.id
-                            if action_attempt.approval_request is not None
-                            else None
-                        ),
-                        provider_message_ids=provider_message_ids,
-                        provider_thread_ids=[],
-                        before_state={},
-                        intended_state=provider_input,
-                        after_state={},
-                        provider_result={},
-                        undo_token_hash=None,
-                        undo_expires_at=None,
-                        execution_attempts=0,
-                        failure_code=None,
-                        created_at=now_fn(),
-                        updated_at=now_fn(),
+                    provider_message_ids = list(normalized_input["message_ids"])
+                    captured_before_messages = (
+                        existing_receipt.before_state.get("messages")
+                        if existing_receipt is not None
+                        and isinstance(existing_receipt.before_state, dict)
+                        else None
                     )
-                    db.add(email_action)
-                    db.flush()
-                if not provider_message_ids:
-                    _fail_action_execution(
-                        db=db,
-                        action_attempt=action_attempt,
-                        error="email_message_ids_missing",
-                        now_fn=now_fn,
-                        new_id_fn=new_id_fn,
-                    )
-                    return True
+                    if isinstance(captured_before_messages, list):
+                        provider_input["before_state"] = captured_before_messages
                 email_lock_parts = (
-                    "email_action",
+                    "email_mutation",
                     "google",
                     provider_account_id,
                     ",".join(sorted(provider_message_ids)),
                 )
                 _acquire_email_advisory_lock(db, *email_lock_parts)
-                email_action.status = "executing"
-                email_action.execution_attempts += 1
-                email_action.failure_code = None
-                email_action.provider_message_ids = provider_message_ids
-                email_action.intended_state = provider_input
-                email_action.updated_at = now_fn()
+                receipt = _record_provider_write_receipt(
+                    db=db,
+                    action_attempt=action_attempt,
+                    status="executing",
+                    normalized_input=normalized_input,
+                    provider_account_id=provider_account_id,
+                    output_payload={"dispatch_state": "provider_call_started"},
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
                 action_attempt.execution_output = {
                     "dispatch_state": "provider_call_started",
-                    "email_action_id": email_action.id,
                     "provider_account_id": provider_account_id,
                 }
                 action_attempt.updated_at = now_fn()
                 email_provider_call = (
-                    email_action.id,
+                    receipt.id,
                     action_attempt.capability_id,
                     provider_input,
                     access_token,
@@ -5774,7 +5750,7 @@ def process_action_execution_task(
 
     if email_provider_call is not None:
         (
-            email_action_id,
+            receipt_id,
             capability_id,
             normalized_input,
             access_token,
@@ -5820,29 +5796,17 @@ def process_action_execution_task(
                 normalized_input = {**normalized_input, "before_state": before_messages}
                 with session_factory() as db:
                     with db.begin():
-                        email_action = db.scalar(
-                            select(EmailActionRecord)
-                            .where(EmailActionRecord.id == email_action_id)
+                        receipt = db.scalar(
+                            select(ProviderWriteReceiptRecord)
+                            .where(ProviderWriteReceiptRecord.id == receipt_id)
                             .with_for_update()
                             .limit(1)
                         )
-                        if email_action is not None:
-                            email_action.before_state = {"messages": before_messages}
-                            email_action.provider_thread_ids = _email_thread_ids_from_state(
-                                email_action.before_state
-                            )
-                            stored_input = (
-                                email_action.intended_state
-                                if isinstance(email_action.intended_state, dict)
-                                else {}
-                            )
-                            email_action.intended_state = {
-                                **stored_input,
-                                "before_state": before_messages,
-                            }
-                            email_action.updated_at = now_fn()
+                        if receipt is not None:
+                            receipt.before_state = {"messages": before_messages}
+                            receipt.updated_at = now_fn()
             email_provider_call = (
-                email_action_id,
+                receipt_id,
                 capability_id,
                 normalized_input,
                 access_token,
@@ -5997,17 +5961,17 @@ def process_action_execution_task(
                             new_id_fn=new_id_fn,
                         )
             if email_provider_call is not None:
-                email_action_id, capability_id, provider_input, _, _, provider_account_id = (
+                receipt_id, capability_id, provider_input, _, _, provider_account_id = (
                     email_provider_call
                 )
-                email_action = db.scalar(
-                    select(EmailActionRecord)
-                    .where(EmailActionRecord.id == email_action_id)
+                receipt = db.scalar(
+                    select(ProviderWriteReceiptRecord)
+                    .where(ProviderWriteReceiptRecord.id == receipt_id)
                     .with_for_update()
                     .limit(1)
                 )
-                if email_action is None:
-                    raise RuntimeError("email action not found")
+                if receipt is None:
+                    raise RuntimeError("provider_write_receipt_not_found")
                 if execution_result.status == "succeeded" and execution_result.output is not None:
                     try:
                         before_state, after_state = _email_provider_state_lists(
@@ -6031,34 +5995,15 @@ def process_action_execution_task(
                             execution_result.output["provider_result"] = {
                                 "before_state_error": str(exc)
                             }
-                    email_action.before_state = before_state
-                    email_action.after_state = after_state
+                    receipt.before_state = before_state
+                    receipt.after_state = after_state
+                    receipt.updated_at = now_fn()
                     provider_result_raw = execution_result.output.get("provider_result")
                     provider_result: dict[str, Any] = (
                         provider_result_raw
                         if isinstance(provider_result_raw, dict)
                         else execution_result.output
                     )
-                    email_action.provider_result = provider_result
-                    message_ids_raw = provider_input.get("message_ids")
-                    email_action.provider_message_ids = (
-                        list(message_ids_raw) if isinstance(message_ids_raw, list) else []
-                    )
-                    email_action.provider_thread_ids = _email_thread_ids_from_state(before_state)
-                    for thread_id in _email_thread_ids_from_state(after_state):
-                        if thread_id not in email_action.provider_thread_ids:
-                            email_action.provider_thread_ids.append(thread_id)
-                    stored_intent = dict(provider_input)
-                    provider_label_ids = execution_result.output.get("provider_label_ids")
-                    if provider_label_ids is None:
-                        provider_label_ids = provider_result.get("provider_label_ids")
-                    if isinstance(provider_label_ids, dict):
-                        stored_intent["provider_label_ids"] = provider_label_ids
-                    label_resolution = execution_result.output.get("label_resolution")
-                    if isinstance(label_resolution, dict):
-                        stored_intent["label_resolution"] = label_resolution
-                    email_action.intended_state = stored_intent
-                    email_action.updated_at = now_fn()
                     provider_status = execution_result.output.get("status")
                     provider_error: str | None = None
                     provider_error_raw = provider_result.get("error")
@@ -6080,41 +6025,34 @@ def process_action_execution_task(
                         provider_write_failure_payload = dict(execution_result.output)
                         provider_write_failure_status = "failed"
                         if _email_provider_error_is_retryable(provider_error):
-                            email_action.status = "executing"
-                            email_action.failure_code = None
                             retryable_provider_error = provider_error
-                        else:
-                            email_action.status = "failed"
-                            email_action.failure_code = provider_error
                         execution_result = ExecutionResult(
                             status="failed",
                             output=None,
                             error=provider_error,
                         )
                     else:
-                        email_action.status = "succeeded"
-                        email_action.failure_code = None
                         undo_token: str | None = None
                         if capability_id != "cap.email.undo":
                             undo_token = secrets.token_urlsafe(32)
-                            email_action.undo_token_hash = _email_hash(undo_token)
-                            email_action.undo_expires_at = now_fn() + timedelta(days=30)
-                        elif email_undo_prior_action_id is not None:
-                            prior_action = db.scalar(
-                                select(EmailActionRecord)
-                                .where(EmailActionRecord.id == email_undo_prior_action_id)
+                            receipt.undo_token_hash = _email_hash(undo_token)
+                            receipt.undo_expires_at = now_fn() + timedelta(days=30)
+                        elif email_undo_prior_receipt_id is not None:
+                            prior_receipt = db.scalar(
+                                select(ProviderWriteReceiptRecord)
+                                .where(ProviderWriteReceiptRecord.id == email_undo_prior_receipt_id)
                                 .with_for_update()
                                 .limit(1)
                             )
-                            if prior_action is not None and prior_action.status == "succeeded":
-                                prior_action.status = "undone"
-                                prior_action.updated_at = now_fn()
+                            if prior_receipt is not None and prior_receipt.status == "succeeded":
+                                prior_receipt.status = "undone"
+                                prior_receipt.updated_at = now_fn()
                         execution_result = ExecutionResult(
                             status="succeeded",
-                            output=_email_action_result_payload(
-                                action=email_action,
+                            output=_email_receipt_result_payload(
+                                receipt=receipt,
+                                provider_result=provider_result,
                                 undo_token=undo_token,
-                                now=now_fn(),
                             ),
                             error=None,
                         )
@@ -6133,14 +6071,7 @@ def process_action_execution_task(
                         provider_write_failure_status != "ambiguous"
                         and _email_provider_error_is_retryable(error)
                     ):
-                        email_action.status = "executing"
-                        email_action.failure_code = None
                         retryable_provider_error = error
-                    else:
-                        email_action.status = "failed"
-                        email_action.failure_code = error
-                    email_action.provider_result = {"error": error}
-                    email_action.updated_at = now_fn()
             if retryable_provider_error is not None:
                 if action_attempt.capability_id in _GOOGLE_RECEIPT_CAPABILITY_IDS:
                     receipt_status = provider_write_failure_status or (
