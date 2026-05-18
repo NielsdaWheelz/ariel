@@ -40,12 +40,10 @@ from ariel.persistence import (
     ProactiveActionPlanRecord,
     ProactiveCaseEventRecord,
     ProactiveCaseRecord,
-    ProactiveContextSnapshotRecord,
     ProactiveDecisionRecord,
     ProactiveFeedbackRecord,
     ProactiveLearningRecord,
     ProactiveObservationRecord,
-    ProactivePolicyValidationRecord,
     ProactiveTurnRecord,
     SessionRecord,
     WorkspaceItemEventRecord,
@@ -1180,24 +1178,12 @@ def process_proactive_deliberation_due(
                         "content": json.dumps(context, sort_keys=True, separators=(",", ":")),
                     },
                 ]
-                snapshot = ProactiveContextSnapshotRecord(
-                    id=new_id_fn("pcs"),
-                    case_id=case.id,
-                    snapshot_key=f"case:{case.id}:context:{now.timestamp()}",
-                    context=context,
-                    model_input=model_input,
-                    omitted_context={},
-                    taint={"latest_observation": observation.taint},
-                    created_at=now,
-                )
-                db.add(snapshot)
-                db.flush()
-                snapshot_id = snapshot.id
+                context_taint = {"latest_observation": observation.taint}
                 _add_case_event(
                     db,
                     case_id=case.id,
                     event_type="context_built",
-                    payload={"context_snapshot_id": snapshot.id},
+                    payload={"latest_observation_id": observation.id},
                     now=now,
                     new_id_fn=new_id_fn,
                 )
@@ -1228,10 +1214,7 @@ def process_proactive_deliberation_due(
                         prompt_version=PROACTIVE_POLICY_VERSION,
                         provider_response_id=None,
                         input_summary="proactive case deliberation",
-                        input_refs={
-                            "case_id": case_id,
-                            "context_snapshot_id": snapshot_id,
-                        },
+                        input_refs={"case_id": case_id},
                         selected=[],
                         omitted=[],
                         output={},
@@ -1247,6 +1230,14 @@ def process_proactive_deliberation_due(
                     )
                 )
         raise RuntimeError(reason) from exc
+
+    tool_outputs = response.get("tool_outputs")
+    if isinstance(tool_outputs, list):
+        context["tool_outputs"] = tool_outputs
+    final_model_input = response.get("model_input")
+    if isinstance(final_model_input, list):
+        model_input = [item for item in final_model_input if isinstance(item, dict)]
+
     try:
         raw_decision = _parse_model_json(response)
     except (json.JSONDecodeError, RuntimeError) as exc:
@@ -1262,12 +1253,6 @@ def process_proactive_deliberation_due(
                     raise RuntimeError(
                         "proactive case not found after invalid deliberation"
                     ) from exc
-                stored_snapshot = db.get(ProactiveContextSnapshotRecord, snapshot_id)
-                if stored_snapshot is None:
-                    raise RuntimeError(
-                        "proactive context snapshot not found after invalid deliberation"
-                    ) from exc
-                _update_snapshot_tool_context(stored_snapshot, response)
                 reason = safe_proactive_error(exc)
                 parse_status = (
                     "invalid_json" if isinstance(exc, json.JSONDecodeError) else "missing_output"
@@ -1275,7 +1260,9 @@ def process_proactive_deliberation_due(
                 _record_invalid_decision(
                     db=db,
                     case=case,
-                    snapshot=stored_snapshot,
+                    context=context,
+                    model_input=model_input,
+                    context_taint=context_taint,
                     response=response,
                     reason=reason,
                     parse_status=parse_status,
@@ -1298,10 +1285,6 @@ def process_proactive_deliberation_due(
             )
             if case is None:
                 raise RuntimeError("proactive case not found after deliberation")
-            stored_snapshot = db.get(ProactiveContextSnapshotRecord, snapshot_id)
-            if stored_snapshot is None:
-                raise RuntimeError("proactive context snapshot not found after deliberation")
-            _update_snapshot_tool_context(stored_snapshot, response)
             now = now_fn()
             decision_type = str(raw_decision.get("decision") or "")
             confidence = raw_decision.get("confidence")
@@ -1361,7 +1344,10 @@ def process_proactive_deliberation_due(
             decision = ProactiveDecisionRecord(
                 id=new_id_fn("pdc"),
                 case_id=case.id,
-                context_snapshot_id=stored_snapshot.id,
+                context=context,
+                model_input=model_input,
+                omitted_context={},
+                context_taint=context_taint,
                 provider=str(response.get("provider") or "unknown"),
                 model=str(response.get("model") or "unknown"),
                 provider_response_id=_provider_response_id(response),
@@ -1381,6 +1367,13 @@ def process_proactive_deliberation_due(
                 }
                 if decision_type == "remember"
                 else raw_decision,
+                policy_result=None if valid else "invalid_decision",
+                policy_version=None if valid else PROACTIVE_POLICY_VERSION,
+                action_plan_hash=(
+                    None if valid else (_json_hash({"actions": actions}) if actions else None)
+                ),
+                policy_constraints=None if valid else {},
+                denial_reason=None if valid else "model decision failed schema validation",
                 created_at=now,
             )
             db.add(decision)
@@ -1399,7 +1392,6 @@ def process_proactive_deliberation_due(
                     input_summary="proactive case deliberation",
                     input_refs={
                         "case_id": case.id,
-                        "context_snapshot_id": stored_snapshot.id,
                         "latest_observation_id": case.latest_observation_id,
                     },
                     selected=[
@@ -1436,19 +1428,6 @@ def process_proactive_deliberation_due(
             )
 
             if not valid:
-                db.add(
-                    ProactivePolicyValidationRecord(
-                        id=new_id_fn("ppv"),
-                        case_id=case.id,
-                        decision_id=decision.id,
-                        result="invalid_decision",
-                        policy_version=PROACTIVE_POLICY_VERSION,
-                        action_plan_hash=_json_hash({"actions": actions}) if actions else None,
-                        constraints={},
-                        denial_reason="model decision failed schema validation",
-                        created_at=now,
-                    )
-                )
                 case.status = "failed"
                 case.updated_at = now
                 _add_case_event(
@@ -1465,7 +1444,6 @@ def process_proactive_deliberation_due(
                 db=db,
                 case=case,
                 decision=decision,
-                snapshot=stored_snapshot,
                 now=now,
                 new_id_fn=new_id_fn,
             )
@@ -1672,25 +1650,13 @@ def _provider_response_id(response: dict[str, Any]) -> str | None:
     return value if isinstance(value, str) and value.strip() else None
 
 
-def _update_snapshot_tool_context(
-    snapshot: ProactiveContextSnapshotRecord,
-    response: dict[str, Any],
-) -> None:
-    tool_outputs = response.get("tool_outputs")
-    if isinstance(tool_outputs, list):
-        context = dict(snapshot.context)
-        context["tool_outputs"] = tool_outputs
-        snapshot.context = context
-    model_input = response.get("model_input")
-    if isinstance(model_input, list):
-        snapshot.model_input = [item for item in model_input if isinstance(item, dict)]
-
-
 def _record_invalid_decision(
     *,
     db: Session,
     case: ProactiveCaseRecord,
-    snapshot: ProactiveContextSnapshotRecord,
+    context: dict[str, Any],
+    model_input: list[dict[str, Any]],
+    context_taint: dict[str, Any],
     response: dict[str, Any],
     reason: str,
     parse_status: str,
@@ -1701,7 +1667,10 @@ def _record_invalid_decision(
     decision = ProactiveDecisionRecord(
         id=new_id_fn("pdc"),
         case_id=case.id,
-        context_snapshot_id=snapshot.id,
+        context=context,
+        model_input=model_input,
+        omitted_context={},
+        context_taint=context_taint,
         provider=_provider_value(response, "provider", "unknown"),
         model=_provider_value(response, "model", "unknown"),
         provider_response_id=_provider_response_id(response),
@@ -1716,6 +1685,11 @@ def _record_invalid_decision(
         actions=[],
         follow_up=None,
         raw_model_output=raw_model_output,
+        policy_result="invalid_decision",
+        policy_version=PROACTIVE_POLICY_VERSION,
+        action_plan_hash=_json_hash({"actions": []}),
+        policy_constraints={},
+        denial_reason=reason,
         created_at=now,
     )
     db.add(decision)
@@ -1734,7 +1708,6 @@ def _record_invalid_decision(
             input_summary="proactive case deliberation",
             input_refs={
                 "case_id": case.id,
-                "context_snapshot_id": snapshot.id,
                 "latest_observation_id": case.latest_observation_id,
             },
             selected=[],
@@ -1753,19 +1726,6 @@ def _record_invalid_decision(
             failure_reason=reason,
             created_at=now,
             updated_at=now,
-        )
-    )
-    db.add(
-        ProactivePolicyValidationRecord(
-            id=new_id_fn("ppv"),
-            case_id=case.id,
-            decision_id=decision.id,
-            result="invalid_decision",
-            policy_version=PROACTIVE_POLICY_VERSION,
-            action_plan_hash=_json_hash({"actions": []}),
-            constraints={},
-            denial_reason=reason,
-            created_at=now,
         )
     )
     case.status = "failed"
@@ -2067,12 +2027,13 @@ def _validate_and_apply_decision(
     db: Session,
     case: ProactiveCaseRecord,
     decision: ProactiveDecisionRecord,
-    snapshot: ProactiveContextSnapshotRecord,
     now: datetime,
     new_id_fn: Callable[[str], str],
 ) -> None:
     latest_taint = (
-        snapshot.taint.get("latest_observation") if isinstance(snapshot.taint, dict) else {}
+        decision.context_taint.get("latest_observation")
+        if isinstance(decision.context_taint, dict)
+        else {}
     )
     tainted = _taint_blocks_autonomous_write(latest_taint)
     validation_result = "authorized"
@@ -2167,33 +2128,31 @@ def _validate_and_apply_decision(
         if validation_result in {"authorized", "authorized_with_constraints"}:
             decision.actions = normalized_actions
 
-    action_plan_hash = _json_hash({"actions": decision.actions}) if decision.actions else None
-
-    validation = ProactivePolicyValidationRecord(
-        id=new_id_fn("ppv"),
-        case_id=case.id,
-        decision_id=decision.id,
-        result=validation_result,
-        policy_version=PROACTIVE_POLICY_VERSION,
-        action_plan_hash=action_plan_hash,
-        constraints={"considered_scope_ids": considered_scope_ids} if considered_scope_ids else {},
-        denial_reason=denial_reason,
-        created_at=now,
+    # Rail verdict: write the policy-validation audit fields onto the decision. These
+    # columns are rail-owned and set exactly once per decision; model-output code must
+    # never touch them.
+    decision.policy_result = validation_result
+    decision.policy_version = PROACTIVE_POLICY_VERSION
+    decision.action_plan_hash = (
+        _json_hash({"actions": decision.actions}) if decision.actions else None
     )
-    db.add(validation)
+    decision.policy_constraints = (
+        {"considered_scope_ids": considered_scope_ids} if considered_scope_ids else {}
+    )
+    decision.denial_reason = denial_reason
     db.flush()
     _add_case_event(
         db,
         case_id=case.id,
         event_type="validated",
-        payload={"decision_id": decision.id, "result": validation.result},
+        payload={"decision_id": decision.id, "result": validation_result},
         now=now,
         new_id_fn=new_id_fn,
     )
 
-    if validation.result not in {"authorized", "authorized_with_constraints"}:
+    if validation_result not in {"authorized", "authorized_with_constraints"}:
         decision.status = "validated"
-        case.status = "failed" if validation.result == "invalid_decision" else "asked"
+        case.status = "failed" if validation_result == "invalid_decision" else "asked"
         case.updated_at = now
         return
 
@@ -2246,7 +2205,6 @@ def _validate_and_apply_decision(
             db=db,
             case=case,
             decision=decision,
-            validation=validation,
             now=now,
             new_id_fn=new_id_fn,
         )
@@ -2257,7 +2215,6 @@ def _validate_and_apply_decision(
                 db=db,
                 case=case,
                 decision=decision,
-                validation=validation,
                 action=action,
                 index=index,
                 now=now,
@@ -2372,7 +2329,6 @@ def _create_proactive_turn(
     db: Session,
     case: ProactiveCaseRecord,
     decision: ProactiveDecisionRecord,
-    validation: ProactivePolicyValidationRecord,
     now: datetime,
     new_id_fn: Callable[[str], str],
 ) -> None:
@@ -2397,7 +2353,6 @@ def _create_proactive_turn(
             delivery_payload={
                 "case_id": case.id,
                 "decision_id": decision.id,
-                "policy_validation_id": validation.id,
             },
             delivered_at=None,
             acked_at=None,
@@ -2444,7 +2399,6 @@ def _create_action_plan(
     db: Session,
     case: ProactiveCaseRecord,
     decision: ProactiveDecisionRecord,
-    validation: ProactivePolicyValidationRecord,
     action: dict[str, Any],
     index: int,
     now: datetime,
@@ -2467,7 +2421,6 @@ def _create_action_plan(
         payload_hash=payload_hash,
         risk_tier=str(action.get("risk_tier") or "low"),
         status="authorized",
-        policy_validation_id=validation.id,
         created_at=now,
         updated_at=now,
     )
@@ -4724,11 +4677,6 @@ def process_proactive_feedback_learning_due(
                 if case.last_decision_id is not None
                 else None
             )
-            snapshot = (
-                db.get(ProactiveContextSnapshotRecord, decision.context_snapshot_id)
-                if decision is not None
-                else None
-            )
             turns = db.scalars(
                 select(ProactiveTurnRecord)
                 .where(ProactiveTurnRecord.case_id == case.id)
@@ -4810,13 +4758,8 @@ def process_proactive_feedback_learning_due(
                     "actions": decision.actions,
                     "follow_up": decision.follow_up,
                     "raw_model_output": decision.raw_model_output,
-                },
-                "context_snapshot": None
-                if snapshot is None
-                else {
-                    "id": snapshot.id,
-                    "context": snapshot.context,
-                    "omitted_context": snapshot.omitted_context,
+                    "context": decision.context,
+                    "omitted_context": decision.omitted_context,
                 },
                 "turns": [
                     {
@@ -4871,7 +4814,6 @@ def process_proactive_feedback_learning_due(
                 "case_id": case.id,
                 "latest_observation_id": observation.id if observation is not None else None,
                 "decision_id": decision.id if decision is not None else None,
-                "context_snapshot_id": snapshot.id if snapshot is not None else None,
                 "turn_ids": [turn.id for turn in turns],
                 "action_plan_ids": [plan.id for plan in action_plans],
                 "action_execution_ids": [execution.id for execution in action_executions],

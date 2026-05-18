@@ -123,11 +123,9 @@ from ariel.persistence import (
     ProactiveActionPlanRecord,
     ProactiveCaseEventRecord,
     ProactiveCaseRecord,
-    ProactiveContextSnapshotRecord,
     ProactiveDecisionRecord,
     ProactiveLearningRecord,
     ProactiveObservationRecord,
-    ProactivePolicyValidationRecord,
     ProactiveTurnRecord,
     ProjectStateSnapshotRecord,
     ProviderEvidenceRecord,
@@ -158,12 +156,10 @@ from ariel.persistence import (
     serialize_proactive_action_plan,
     serialize_proactive_case,
     serialize_proactive_case_event,
-    serialize_proactive_context_snapshot,
     serialize_proactive_decision,
     serialize_proactive_feedback,
     serialize_proactive_learning_record,
     serialize_proactive_observation,
-    serialize_proactive_policy_validation,
     serialize_proactive_turn,
     serialize_provider_event,
     serialize_session,
@@ -198,12 +194,10 @@ from ariel.response_contracts import (
     build_surface_proactive_case_event_list_response,
     build_surface_proactive_case_list_response,
     build_surface_proactive_case_response,
-    build_surface_proactive_context_snapshot_list_response,
     build_surface_proactive_decision_list_response,
     build_surface_proactive_feedback_response,
     build_surface_proactive_learning_record_list_response,
     build_surface_proactive_observation_list_response,
-    build_surface_proactive_policy_validation_list_response,
     build_surface_proactive_turn_list_response,
     build_surface_rotation_list_response,
     build_surface_rotation_response,
@@ -9508,32 +9502,6 @@ def create_app(
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
 
-    @app.get("/v1/proactive/cases/{case_id}/context-snapshots")
-    def get_proactive_context_snapshots(case_id: str, limit: int = 50) -> dict[str, Any]:
-        _ensure_schema_ready()
-        bounded_limit = max(1, min(limit, 200))
-        with session_factory() as db:
-            with db.begin():
-                _require_proactive_case(db, case_id)
-                snapshots = db.scalars(
-                    select(ProactiveContextSnapshotRecord)
-                    .where(ProactiveContextSnapshotRecord.case_id == case_id)
-                    .order_by(
-                        ProactiveContextSnapshotRecord.created_at.desc(),
-                        ProactiveContextSnapshotRecord.id.desc(),
-                    )
-                    .limit(bounded_limit)
-                ).all()
-                try:
-                    return build_surface_proactive_context_snapshot_list_response(
-                        case_id=case_id,
-                        context_snapshots=[
-                            serialize_proactive_context_snapshot(snapshot) for snapshot in snapshots
-                        ],
-                    )
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
     @app.get("/v1/proactive/cases/{case_id}/decisions")
     def get_proactive_decisions(case_id: str, limit: int = 50) -> dict[str, Any]:
         _ensure_schema_ready()
@@ -9555,33 +9523,6 @@ def create_app(
                         case_id=case_id,
                         decisions=[
                             serialize_proactive_decision(decision) for decision in decisions
-                        ],
-                    )
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.get("/v1/proactive/cases/{case_id}/validations")
-    def get_proactive_validations(case_id: str, limit: int = 50) -> dict[str, Any]:
-        _ensure_schema_ready()
-        bounded_limit = max(1, min(limit, 200))
-        with session_factory() as db:
-            with db.begin():
-                _require_proactive_case(db, case_id)
-                validations = db.scalars(
-                    select(ProactivePolicyValidationRecord)
-                    .where(ProactivePolicyValidationRecord.case_id == case_id)
-                    .order_by(
-                        ProactivePolicyValidationRecord.created_at.desc(),
-                        ProactivePolicyValidationRecord.id.desc(),
-                    )
-                    .limit(bounded_limit)
-                ).all()
-                try:
-                    return build_surface_proactive_policy_validation_list_response(
-                        case_id=case_id,
-                        validations=[
-                            serialize_proactive_policy_validation(validation)
-                            for validation in validations
                         ],
                     )
                 except ResponseContractViolation as exc:
@@ -9641,21 +9582,6 @@ def create_app(
                         .order_by(ProactiveDecisionRecord.created_at.desc())
                         .limit(1)
                     )
-                snapshot = (
-                    db.get(ProactiveContextSnapshotRecord, decision.context_snapshot_id)
-                    if decision is not None
-                    else None
-                )
-                validation = (
-                    db.scalar(
-                        select(ProactivePolicyValidationRecord)
-                        .where(ProactivePolicyValidationRecord.decision_id == decision.id)
-                        .order_by(ProactivePolicyValidationRecord.created_at.desc())
-                        .limit(1)
-                    )
-                    if decision is not None
-                    else None
-                )
                 plans = db.scalars(
                     select(ProactiveActionPlanRecord)
                     .where(ProactiveActionPlanRecord.case_id == case_id)
@@ -9681,16 +9607,6 @@ def create_app(
                         ),
                         "decision": (
                             serialize_proactive_decision(decision) if decision is not None else None
-                        ),
-                        "context_snapshot": (
-                            serialize_proactive_context_snapshot(snapshot)
-                            if snapshot is not None
-                            else None
-                        ),
-                        "validation": (
-                            serialize_proactive_policy_validation(validation)
-                            if validation is not None
-                            else None
                         ),
                         "action_plans": [serialize_proactive_action_plan(plan) for plan in plans],
                         "action_executions": [

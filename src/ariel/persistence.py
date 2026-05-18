@@ -3297,30 +3297,6 @@ class ProactiveCaseEventRecord(Base):
     )
 
 
-class ProactiveContextSnapshotRecord(Base):
-    __tablename__ = "proactive_context_snapshots"
-
-    id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    case_id: Mapped[str] = mapped_column(
-        String(32),
-        ForeignKey("proactive_cases.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
-    snapshot_key: Mapped[str] = mapped_column(String(220), nullable=False, unique=True)
-    context: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    model_input: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
-    omitted_context: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    taint: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, index=True
-    )
-
-    __table_args__ = (
-        Index("ix_proactive_context_snapshots_case_created", "case_id", "created_at"),
-    )
-
-
 class ProactiveDecisionRecord(Base):
     __tablename__ = "proactive_decisions"
 
@@ -3331,12 +3307,10 @@ class ProactiveDecisionRecord(Base):
         nullable=False,
         index=True,
     )
-    context_snapshot_id: Mapped[str] = mapped_column(
-        String(32),
-        ForeignKey("proactive_context_snapshots.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
+    context: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    model_input: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    omitted_context: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    context_taint: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     provider: Mapped[str] = mapped_column(String(64), nullable=False)
     model: Mapped[str] = mapped_column(String(128), nullable=False)
     provider_response_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
@@ -3351,6 +3325,14 @@ class ProactiveDecisionRecord(Base):
     actions: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
     follow_up: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     raw_model_output: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    # Policy-validation verdict: a deterministic rail's audit record. Written once by the
+    # validation rail (proactivity._validate_and_apply_decision and the invalid-decision
+    # paths); never mutated afterward and never written by model-output code.
+    policy_result: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    policy_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    action_plan_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    policy_constraints: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    denial_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )
@@ -3375,45 +3357,15 @@ class ProactiveDecisionRecord(Base):
             "confidence >= 0.0 AND confidence <= 1.0",
             name="ck_proactive_decision_confidence",
         ),
-        Index("ix_proactive_decisions_case_created", "case_id", "created_at"),
-    )
-
-
-class ProactivePolicyValidationRecord(Base):
-    __tablename__ = "proactive_policy_validations"
-
-    id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    case_id: Mapped[str] = mapped_column(
-        String(32),
-        ForeignKey("proactive_cases.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
-    decision_id: Mapped[str] = mapped_column(
-        String(32),
-        ForeignKey("proactive_decisions.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
-    result: Mapped[str] = mapped_column(String(32), nullable=False)
-    policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
-    action_plan_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    constraints: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    denial_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, index=True
-    )
-
-    __table_args__ = (
         CheckConstraint(
             (
-                "result IN ('authorized', 'authorized_with_constraints', 'denied', "
+                "policy_result IN ('authorized', 'authorized_with_constraints', 'denied', "
                 "'needs_user_authority', 'stale_context', 'invalid_decision', "
                 "'duplicate', 'dead_letter')"
             ),
-            name="ck_proactive_policy_validation_result",
+            name="ck_proactive_decision_policy_result",
         ),
-        Index("ix_proactive_policy_validations_decision", "decision_id", "created_at"),
+        Index("ix_proactive_decisions_case_created", "case_id", "created_at"),
     )
 
 
@@ -3482,12 +3434,6 @@ class ProactiveActionPlanRecord(Base):
     payload_hash: Mapped[str] = mapped_column(String(128), nullable=False)
     risk_tier: Mapped[str] = mapped_column(String(32), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
-    policy_validation_id: Mapped[str | None] = mapped_column(
-        String(32),
-        ForeignKey("proactive_policy_validations.id", ondelete="RESTRICT"),
-        nullable=True,
-        index=True,
-    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )
@@ -4436,26 +4382,14 @@ def serialize_proactive_case_event(event: ProactiveCaseEventRecord) -> dict[str,
     }
 
 
-def serialize_proactive_context_snapshot(
-    snapshot: ProactiveContextSnapshotRecord,
-) -> dict[str, Any]:
-    return {
-        "id": snapshot.id,
-        "case_id": snapshot.case_id,
-        "snapshot_key": snapshot.snapshot_key,
-        "context": redact_json_value(snapshot.context),
-        "model_input": redact_json_value(snapshot.model_input),
-        "omitted_context": redact_json_value(snapshot.omitted_context),
-        "taint": redact_json_value(snapshot.taint),
-        "created_at": to_rfc3339(snapshot.created_at),
-    }
-
-
 def serialize_proactive_decision(decision: ProactiveDecisionRecord) -> dict[str, Any]:
     return {
         "id": decision.id,
         "case_id": decision.case_id,
-        "context_snapshot_id": decision.context_snapshot_id,
+        "context": redact_json_value(decision.context),
+        "model_input": redact_json_value(decision.model_input),
+        "omitted_context": redact_json_value(decision.omitted_context),
+        "context_taint": redact_json_value(decision.context_taint),
         "provider": decision.provider,
         "model": decision.model,
         "provider_response_id": decision.provider_response_id,
@@ -4474,25 +4408,14 @@ def serialize_proactive_decision(decision: ProactiveDecisionRecord) -> dict[str,
         "actions": redact_json_value(decision.actions),
         "follow_up": redact_json_value(decision.follow_up),
         "raw_model_output": redact_json_value(decision.raw_model_output),
-        "created_at": to_rfc3339(decision.created_at),
-    }
-
-
-def serialize_proactive_policy_validation(
-    validation: ProactivePolicyValidationRecord,
-) -> dict[str, Any]:
-    return {
-        "id": validation.id,
-        "case_id": validation.case_id,
-        "decision_id": validation.decision_id,
-        "result": validation.result,
-        "policy_version": validation.policy_version,
-        "action_plan_hash": validation.action_plan_hash,
-        "constraints": redact_json_value(validation.constraints),
+        "policy_result": decision.policy_result,
+        "policy_version": decision.policy_version,
+        "action_plan_hash": decision.action_plan_hash,
+        "policy_constraints": redact_json_value(decision.policy_constraints),
         "denial_reason": (
-            redact_text(validation.denial_reason) if validation.denial_reason is not None else None
+            redact_text(decision.denial_reason) if decision.denial_reason is not None else None
         ),
-        "created_at": to_rfc3339(validation.created_at),
+        "created_at": to_rfc3339(decision.created_at),
     }
 
 
@@ -4526,7 +4449,6 @@ def serialize_proactive_action_plan(plan: ProactiveActionPlanRecord) -> dict[str
         "payload_hash": plan.payload_hash,
         "risk_tier": plan.risk_tier,
         "status": plan.status,
-        "policy_validation_id": plan.policy_validation_id,
         "created_at": to_rfc3339(plan.created_at),
         "updated_at": to_rfc3339(plan.updated_at),
     }

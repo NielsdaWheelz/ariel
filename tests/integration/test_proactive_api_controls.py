@@ -16,10 +16,8 @@ from ariel.persistence import (
     ProactiveActionPlanRecord,
     ProactiveCaseEventRecord,
     ProactiveCaseRecord,
-    ProactiveContextSnapshotRecord,
     ProactiveDecisionRecord,
     ProactiveObservationRecord,
-    ProactivePolicyValidationRecord,
     ProactiveTurnRecord,
 )
 from ariel.proactivity import process_proactive_deliberation_due
@@ -280,20 +278,13 @@ def _seed_case(
                 created_at=now,
                 updated_at=now,
             )
-            snapshot = ProactiveContextSnapshotRecord(
-                id=f"pcs_{case_id}",
-                case_id=case_id,
-                snapshot_key=f"{case_id}:snapshot",
-                context={"observation_id": observation.id},
-                model_input=[{"role": "system", "content": "Inspect this case."}],
-                omitted_context={},
-                taint={"status": "clean"},
-                created_at=now,
-            )
             decision = ProactiveDecisionRecord(
                 id=f"pdc_{case_id}",
                 case_id=case_id,
-                context_snapshot_id=snapshot.id,
+                context={"observation_id": observation.id},
+                model_input=[{"role": "system", "content": "Inspect this case."}],
+                omitted_context={},
+                context_taint={"status": "clean"},
                 provider="provider.proactive-api",
                 model="model.proactive-api-v1",
                 provider_response_id="resp_proactive_api_decision",
@@ -308,16 +299,10 @@ def _seed_case(
                 actions=[],
                 follow_up=None,
                 raw_model_output={"decision": "speak_now"},
-                created_at=now,
-            )
-            validation = ProactivePolicyValidationRecord(
-                id=f"ppv_{case_id}",
-                case_id=case_id,
-                decision_id=decision.id,
-                result="authorized",
+                policy_result="authorized",
                 policy_version="test-policy-v1",
                 action_plan_hash="hash_proactive_api_validation",
-                constraints={},
+                policy_constraints={},
                 denial_reason=None,
                 created_at=now,
             )
@@ -340,7 +325,7 @@ def _seed_case(
             db.flush()
             db.add(proactive_case)
             db.flush()
-            db.add_all([snapshot, decision, validation, turn])
+            db.add_all([decision, turn])
             db.flush()
             proactive_case.last_decision_id = decision.id
             db.add(
@@ -364,7 +349,6 @@ def _seed_case(
                     payload_hash="hash_proactive_api_action",
                     risk_tier="low",
                     status="succeeded",
-                    policy_validation_id=validation.id,
                     created_at=now,
                     updated_at=now,
                 )
@@ -456,9 +440,7 @@ def test_missing_proactive_case_subresources_return_404(postgres_url: str) -> No
     with _build_client(postgres_url, StaticAdapter()) as client:
         get_paths = [
             "/v1/proactive/cases/case_missing/events",
-            "/v1/proactive/cases/case_missing/context-snapshots",
             "/v1/proactive/cases/case_missing/decisions",
-            "/v1/proactive/cases/case_missing/validations",
             "/v1/proactive/cases/case_missing/actions",
             "/v1/proactive/cases/case_missing/inspect-why",
         ]
@@ -866,7 +848,7 @@ def test_autonomy_scope_enforces_target_recipient_and_payload_shape(
                 allowed = (
                     db.execute(
                         text(
-                            "SELECT result, denial_reason FROM proactive_policy_validations "
+                            "SELECT policy_result, denial_reason FROM proactive_decisions "
                             "WHERE case_id = 'case_allowed' ORDER BY created_at DESC LIMIT 1"
                         )
                     )
@@ -879,7 +861,7 @@ def test_autonomy_scope_enforces_target_recipient_and_payload_shape(
                         "WHERE case_id = 'case_allowed' AND action_type = 'cap.email.draft'"
                     )
                 ).scalar_one()
-                assert allowed["result"] == "authorized"
+                assert allowed["policy_result"] == "authorized"
                 assert allowed["denial_reason"] is None
                 assert plan_count == 1
                 judgment = (
@@ -959,7 +941,7 @@ def test_autonomy_scope_enforces_target_recipient_and_payload_shape(
                     row["case_id"]: row["denial_reason"]
                     for row in db.execute(
                         text(
-                            "SELECT case_id, denial_reason FROM proactive_policy_validations "
+                            "SELECT case_id, denial_reason FROM proactive_decisions "
                             "WHERE case_id IN ("
                             "'case_bad_target', 'case_bad_recipient', 'case_bad_shape'"
                             ") ORDER BY case_id"
@@ -1036,11 +1018,11 @@ def test_autonomy_scope_selection_checks_later_full_scope(
 
         with _session_factory(client)() as db:
             with db.begin():
-                validation = (
+                decision = (
                     db.execute(
                         text(
-                            "SELECT result, denial_reason, constraints "
-                            "FROM proactive_policy_validations "
+                            "SELECT policy_result, denial_reason, policy_constraints "
+                            "FROM proactive_decisions "
                             "WHERE case_id = 'case_multi_scope' "
                             "ORDER BY created_at DESC LIMIT 1"
                         )
@@ -1055,9 +1037,9 @@ def test_autonomy_scope_selection_checks_later_full_scope(
                     )
                 ).scalar_one()
 
-    assert validation["result"] == "authorized"
-    assert validation["denial_reason"] is None
-    assert validation["constraints"]["considered_scope_ids"] == [
+    assert decision["policy_result"] == "authorized"
+    assert decision["denial_reason"] is None
+    assert decision["policy_constraints"]["considered_scope_ids"] == [
         "scope_multi_a_bad_recipient",
         "scope_multi_b_authorized",
     ]
@@ -1127,11 +1109,11 @@ def test_autonomy_scope_selection_does_not_union_partial_scopes(
 
         with _session_factory(client)() as db:
             with db.begin():
-                validation = (
+                decision = (
                     db.execute(
                         text(
-                            "SELECT result, denial_reason, constraints "
-                            "FROM proactive_policy_validations "
+                            "SELECT policy_result, denial_reason, policy_constraints "
+                            "FROM proactive_decisions "
                             "WHERE case_id = 'case_partial_scopes' "
                             "ORDER BY created_at DESC LIMIT 1"
                         )
@@ -1146,12 +1128,12 @@ def test_autonomy_scope_selection_does_not_union_partial_scopes(
                     )
                 ).scalar_one()
 
-    assert validation["result"] == "needs_user_authority"
-    assert validation["denial_reason"] in {
+    assert decision["policy_result"] == "needs_user_authority"
+    assert decision["denial_reason"] in {
         "recipient is outside autonomy scope for cap.email.draft",
         "target is outside autonomy scope for cap.email.draft",
     }
-    assert validation["constraints"]["considered_scope_ids"] == [
+    assert decision["policy_constraints"]["considered_scope_ids"] == [
         "scope_partial_recipient",
         "scope_partial_target",
     ]
@@ -1230,7 +1212,7 @@ def test_autonomy_scope_missing_target_or_recipient_scope_denies_writes(
                     row["case_id"]: row["denial_reason"]
                     for row in db.execute(
                         text(
-                            "SELECT case_id, denial_reason FROM proactive_policy_validations "
+                            "SELECT case_id, denial_reason FROM proactive_decisions "
                             "WHERE case_id IN ('case_no_target', 'case_no_recipient')"
                         )
                     ).mappings()
@@ -1298,10 +1280,10 @@ def test_tainted_context_cannot_execute_low_risk_autonomous_write(
 
         with _session_factory(client)() as db:
             with db.begin():
-                validation = (
+                decision = (
                     db.execute(
                         text(
-                            "SELECT result, denial_reason FROM proactive_policy_validations "
+                            "SELECT policy_result, denial_reason FROM proactive_decisions "
                             "WHERE case_id = 'case_tainted' ORDER BY created_at DESC LIMIT 1"
                         )
                     )
@@ -1313,8 +1295,8 @@ def test_tainted_context_cannot_execute_low_risk_autonomous_write(
                         "SELECT COUNT(*) FROM proactive_action_plans WHERE case_id = 'case_tainted'"
                     )
                 ).scalar_one()
-                assert validation["result"] == "denied"
-                assert validation["denial_reason"] == (
+                assert decision["policy_result"] == "denied"
+                assert decision["denial_reason"] == (
                     "tainted context cannot execute autonomous write"
                 )
                 assert plan_count == 0
@@ -1340,10 +1322,10 @@ def test_proactive_write_rejects_unknown_capability_before_action_plan(
 
         with _session_factory(client)() as db:
             with db.begin():
-                validation = (
+                decision = (
                     db.execute(
                         text(
-                            "SELECT result, denial_reason FROM proactive_policy_validations "
+                            "SELECT policy_result, denial_reason FROM proactive_decisions "
                             "WHERE case_id = 'case_egress' ORDER BY created_at DESC LIMIT 1"
                         )
                     )
@@ -1355,6 +1337,6 @@ def test_proactive_write_rejects_unknown_capability_before_action_plan(
                         "SELECT COUNT(*) FROM proactive_action_plans WHERE case_id = 'case_egress'"
                     )
                 ).scalar_one()
-                assert validation["result"] == "invalid_decision"
-                assert validation["denial_reason"] == "unknown capability cap.external.notify"
+                assert decision["policy_result"] == "invalid_decision"
+                assert decision["denial_reason"] == "unknown capability cap.external.notify"
                 assert plan_count == 0

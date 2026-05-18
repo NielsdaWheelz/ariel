@@ -27,9 +27,7 @@ from ariel.persistence import (
     ProactiveActionPlanRecord,
     ProactiveCaseEventRecord,
     ProactiveCaseRecord,
-    ProactiveContextSnapshotRecord,
     ProactiveDecisionRecord,
-    ProactivePolicyValidationRecord,
     ProactiveTurnRecord,
 )
 from ariel.proactivity import (
@@ -318,16 +316,16 @@ def _decision_payload(**overrides: Any) -> dict[str, Any]:
     return payload
 
 
-def _latest_validation(client: TestClient) -> ProactivePolicyValidationRecord:
+def _latest_decision(client: TestClient) -> ProactiveDecisionRecord:
     with _session_factory(client)() as db:
         with db.begin():
-            validation = db.scalar(
-                select(ProactivePolicyValidationRecord)
-                .order_by(ProactivePolicyValidationRecord.created_at.desc())
+            decision = db.scalar(
+                select(ProactiveDecisionRecord)
+                .order_by(ProactiveDecisionRecord.created_at.desc())
                 .limit(1)
             )
-            assert validation is not None
-            return validation
+            assert decision is not None
+            return decision
 
 
 def test_json_parse_failure_persists_invalid_decision_record(postgres_url: str) -> None:
@@ -341,15 +339,14 @@ def test_json_parse_failure_persists_invalid_decision_record(postgres_url: str) 
             with db.begin():
                 decision = db.scalar(select(ProactiveDecisionRecord).limit(1))
                 case = db.get(ProactiveCaseRecord, case_id)
-                validation = db.scalar(select(ProactivePolicyValidationRecord).limit(1))
 
                 assert decision is not None
                 assert decision.status == "invalid"
                 assert decision.raw_model_output["parse_error"]
+                assert decision.policy_result == "invalid_decision"
+                assert decision.denial_reason == decision.raw_model_output["parse_error"]
                 assert case is not None
                 assert case.status == "failed"
-                assert validation is not None
-                assert validation.result == "invalid_decision"
 
 
 def test_proactive_memory_curation_failure_is_case_audited_before_deliberation(
@@ -394,7 +391,6 @@ def test_proactive_memory_curation_failure_is_case_audited_before_deliberation(
             assert judgments[0].parse_status == "schema_invalid"
             assert judgments[0].validation_status == "invalid"
             assert judgments[1].input_refs["dependency"] == "memory_curation"
-            assert db.scalar(select(func.count()).select_from(ProactiveContextSnapshotRecord)) == 0
             assert db.scalar(select(func.count()).select_from(ProactiveDecisionRecord)) == 0
             assert db.scalar(select(func.count()).select_from(ProactiveTurnRecord)) == 0
             assert db.scalar(select(func.count()).select_from(ProactiveActionPlanRecord)) == 0
@@ -418,13 +414,12 @@ def test_deliberation_denies_unadvertised_function_calls(
 
         with _session_factory(client)() as db:
             with db.begin():
-                snapshot = db.scalar(select(ProactiveContextSnapshotRecord).limit(1))
                 decision = db.scalar(select(ProactiveDecisionRecord).limit(1))
                 turn = db.scalar(select(ProactiveTurnRecord).limit(1))
 
                 assert adapter.calls == 2
-                assert snapshot is not None
-                assert snapshot.context["tool_outputs"] == [
+                assert decision is not None
+                assert decision.context["tool_outputs"] == [
                     {
                         "call_id": "call_proactive_memory_search",
                         "tool_name": "cap_memory_search",
@@ -436,9 +431,8 @@ def test_deliberation_denies_unadvertised_function_calls(
                     }
                 ]
                 assert any(
-                    item.get("type") == "function_call_output" for item in snapshot.model_input
+                    item.get("type") == "function_call_output" for item in decision.model_input
                 )
-                assert decision is not None
                 assert decision.tool_refs == []
                 assert turn is not None
                 assert turn.message == "Leave now from the case evidence."
@@ -545,9 +539,9 @@ def test_act_now_duplicate_action_shapes_are_invalid(
     with _build_client(postgres_url, adapter) as client:
         case_id = _seed_case(client, now=now)
         _run_deliberation(client, case_id=case_id, adapter=adapter, now=now)
-        validation = _latest_validation(client)
-        assert validation.result == "invalid_decision"
-        assert validation.denial_reason == expected_reason
+        decision = _latest_decision(client)
+        assert decision.policy_result == "invalid_decision"
+        assert decision.denial_reason == expected_reason
 
         with _session_factory(client)() as db:
             with db.begin():
@@ -660,14 +654,14 @@ def test_speak_and_act_authorizes_turn_then_marks_acted_after_action_receipt(
                 case = db.get(ProactiveCaseRecord, case_id)
                 plan = db.scalar(select(ProactiveActionPlanRecord).limit(1))
                 turn = db.scalar(select(ProactiveTurnRecord).limit(1))
-                validation = db.scalar(select(ProactivePolicyValidationRecord).limit(1))
+                decision = db.scalar(select(ProactiveDecisionRecord).limit(1))
                 assert case is not None
                 assert case.status == "spoken"
                 assert plan is not None
                 assert turn is not None
                 assert turn.message == "I am drafting a short note."
-                assert validation is not None
-                assert validation.result == "authorized"
+                assert decision is not None
+                assert decision.policy_result == "authorized"
                 plan_id = plan.id
 
         process_proactive_action_execution_due(
@@ -780,14 +774,14 @@ def test_speak_and_act_denies_non_low_risk_from_tainted_context(postgres_url: st
 
         with _session_factory(client)() as db:
             with db.begin():
-                validation = db.scalar(select(ProactivePolicyValidationRecord).limit(1))
+                decision = db.scalar(select(ProactiveDecisionRecord).limit(1))
                 action_count = db.scalar(select(func.count(ProactiveActionPlanRecord.id)))
                 turn_count = db.scalar(select(func.count(ProactiveTurnRecord.id)))
 
-                assert validation is not None
-                assert validation.result == "denied"
+                assert decision is not None
+                assert decision.policy_result == "denied"
                 assert (
-                    validation.denial_reason == "tainted context cannot execute non-low-risk action"
+                    decision.denial_reason == "tainted context cannot execute non-low-risk action"
                 )
                 assert action_count == 0
                 assert turn_count == 0

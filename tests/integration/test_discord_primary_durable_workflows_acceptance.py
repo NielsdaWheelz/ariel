@@ -664,20 +664,15 @@ def test_proactive_interpretation_deliberates_speaks_and_acknowledges_case_and_t
             model_adapter=adapter,
         )
 
-        context_snapshots = client.get(
-            f"/v1/proactive/cases/{proactive_case['id']}/context-snapshots"
-        )
-        assert context_snapshots.status_code == 200
-        context = context_snapshots.json()["context_snapshots"][0]["context"]
-        assert context["latest_observation"]["id"] == observation["id"]
-        assert context["latest_observation"]["source_type"] == "job"
-
         decisions = client.get(f"/v1/proactive/cases/{proactive_case['id']}/decisions")
         assert decisions.status_code == 200
         decision = decisions.json()["decisions"][0]
         assert decision["decision_type"] == "speak_now"
         assert decision["status"] == "executed"
         assert decision["user_visible_message"] == "Sir, you should review this approval now."
+        assert decision["context"]["latest_observation"]["id"] == observation["id"]
+        assert decision["context"]["latest_observation"]["source_type"] == "job"
+        assert decision["policy_result"] == "authorized"
 
         with _session_factory(client)() as db:
             with db.begin():
@@ -704,10 +699,6 @@ def test_proactive_interpretation_deliberates_speaks_and_acknowledges_case_and_t
                     "parse_status": "parsed",
                     "validation_status": "valid",
                 }
-
-        validations = client.get(f"/v1/proactive/cases/{proactive_case['id']}/validations")
-        assert validations.status_code == 200
-        assert validations.json()["validations"][0]["result"] == "authorized"
 
         turns = client.get("/v1/proactive/turns")
         assert turns.status_code == 200

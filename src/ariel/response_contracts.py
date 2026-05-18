@@ -1326,25 +1326,15 @@ class SurfaceProactiveCaseEventContract(BaseModel):
     created_at: str
 
 
-class SurfaceProactiveContextSnapshotContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    id: str
-    case_id: str
-    snapshot_key: str
-    context: dict[str, Any]
-    model_input: list[dict[str, Any]]
-    omitted_context: dict[str, Any]
-    taint: dict[str, Any]
-    created_at: str
-
-
 class SurfaceProactiveDecisionContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
     case_id: str
-    context_snapshot_id: str
+    context: dict[str, Any]
+    model_input: list[dict[str, Any]]
+    omitted_context: dict[str, Any]
+    context_taint: dict[str, Any]
     provider: str
     model: str
     provider_response_id: str | None
@@ -1368,28 +1358,22 @@ class SurfaceProactiveDecisionContract(BaseModel):
     actions: list[dict[str, Any]]
     follow_up: dict[str, Any] | None
     raw_model_output: dict[str, Any]
-    created_at: str
-
-
-class SurfaceProactivePolicyValidationContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    id: str
-    case_id: str
-    decision_id: str
-    result: Literal[
-        "authorized",
-        "authorized_with_constraints",
-        "denied",
-        "needs_user_authority",
-        "stale_context",
-        "invalid_decision",
-        "duplicate",
-        "dead_letter",
-    ]
-    policy_version: str
+    policy_result: (
+        Literal[
+            "authorized",
+            "authorized_with_constraints",
+            "denied",
+            "needs_user_authority",
+            "stale_context",
+            "invalid_decision",
+            "duplicate",
+            "dead_letter",
+        ]
+        | None
+    )
+    policy_version: str | None
     action_plan_hash: str | None
-    constraints: dict[str, Any]
+    policy_constraints: dict[str, Any] | None
     denial_reason: str | None
     created_at: str
 
@@ -1427,7 +1411,6 @@ class SurfaceProactiveActionPlanContract(BaseModel):
     status: Literal[
         "proposed", "authorized", "denied", "executing", "succeeded", "failed", "cancelled"
     ]
-    policy_validation_id: str | None
     created_at: str
     updated_at: str
 
@@ -1540,28 +1523,12 @@ class SurfaceProactiveCaseEventListResponseContract(BaseModel):
     events: list[SurfaceProactiveCaseEventContract]
 
 
-class SurfaceProactiveContextSnapshotListResponseContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    ok: bool
-    case_id: str
-    context_snapshots: list[SurfaceProactiveContextSnapshotContract]
-
-
 class SurfaceProactiveDecisionListResponseContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     ok: bool
     case_id: str
     decisions: list[SurfaceProactiveDecisionContract]
-
-
-class SurfaceProactivePolicyValidationListResponseContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    ok: bool
-    case_id: str
-    validations: list[SurfaceProactivePolicyValidationContract]
 
 
 class SurfaceProactiveTurnListResponseContract(BaseModel):
@@ -2366,22 +2333,6 @@ def build_surface_proactive_case_event_list_response(
     )
 
 
-def build_surface_proactive_context_snapshot_list_response(
-    *,
-    case_id: Any,
-    context_snapshots: Any,
-) -> dict[str, Any]:
-    return _validate_contract(
-        "surface_proactive_context_snapshot_list_response",
-        SurfaceProactiveContextSnapshotListResponseContract,
-        {
-            "ok": True,
-            "case_id": case_id,
-            "context_snapshots": (context_snapshots if isinstance(context_snapshots, list) else []),
-        },
-    )
-
-
 def build_surface_proactive_decision_list_response(
     *,
     case_id: Any,
@@ -2394,22 +2345,6 @@ def build_surface_proactive_decision_list_response(
             "ok": True,
             "case_id": case_id,
             "decisions": decisions if isinstance(decisions, list) else [],
-        },
-    )
-
-
-def build_surface_proactive_policy_validation_list_response(
-    *,
-    case_id: Any,
-    validations: Any,
-) -> dict[str, Any]:
-    return _validate_contract(
-        "surface_proactive_policy_validation_list_response",
-        SurfaceProactivePolicyValidationListResponseContract,
-        {
-            "ok": True,
-            "case_id": case_id,
-            "validations": validations if isinstance(validations, list) else [],
         },
     )
 
