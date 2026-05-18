@@ -17,7 +17,6 @@ from ariel.persistence import (
     BackgroundTaskRecord,
     MemoryAssertionRecord,
     MemoryContextBlockRecord,
-    MemoryDeletionRecord,
     MemoryEmbeddingProjectionRecord,
     MemoryEntityRecord,
     MemoryEvidenceRecord,
@@ -1420,14 +1419,14 @@ def test_consolidate_memory_deletes_assertion_past_delete_after_retention(
         other = db.get(MemoryAssertionRecord, "mas_retention_other")
         assert matched is not None and matched.lifecycle_state == "deleted"
         # delete_after is "forget from recall + existence" via the standard
-        # delete path; a deletion audit row is written.
+        # delete path; a deletion version row is written.
         assert (
             db.scalar(
                 select(func.count())
-                .select_from(MemoryDeletionRecord)
+                .select_from(MemoryVersionRecord)
                 .where(
-                    MemoryDeletionRecord.target_id == "mas_retention_match",
-                    MemoryDeletionRecord.deletion_type == "delete",
+                    MemoryVersionRecord.canonical_id == "mas_retention_match",
+                    MemoryVersionRecord.change_type == "deleted",
                 )
             )
             == 1

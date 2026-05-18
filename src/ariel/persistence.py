@@ -1683,7 +1683,7 @@ class MemoryVersionRecord(Base):
             "canonical_table IN ('memory_evidence', 'memory_entities', "
             "'memory_relationships', 'memory_assertions', 'memory_episodes', "
             "'memory_reasoning_traces', 'memory_action_traces', 'memory_procedures', "
-            "'memory_topics', 'memory_topic_members', 'memory_deletions', "
+            "'memory_topics', 'memory_topic_members', "
             "'memory_retention_policies', 'memory_sensitivity_labels', "
             "'memory_temporal_projections', 'memory_symbol_projections', "
             "'memory_export_artifacts', 'memory_eval_runs', "
@@ -1712,42 +1712,6 @@ class MemoryVersionRecord(Base):
             "version",
             unique=True,
         ),
-    )
-
-
-class MemoryDeletionRecord(Base):
-    __tablename__ = "memory_deletions"
-
-    id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    target_table: Mapped[str] = mapped_column(String(64), nullable=False)
-    target_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
-    deletion_type: Mapped[str] = mapped_column(String(32), nullable=False)
-    actor_id: Mapped[str] = mapped_column(String(128), nullable=False)
-    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
-    redaction_posture: Mapped[str] = mapped_column(String(32), nullable=False, default="none")
-    projection_invalidation: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, default=dict
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, index=True
-    )
-
-    __table_args__ = (
-        CheckConstraint(
-            "target_table IN ('memory_evidence', 'memory_assertions', "
-            "'memory_relationships', 'memory_episodes', 'memory_reasoning_traces', "
-            "'memory_action_traces', 'memory_procedures', 'memory_topics')",
-            name="ck_memory_deletion_target_table",
-        ),
-        CheckConstraint(
-            "deletion_type IN ('delete', 'privacy_delete', 'redact', 'retract')",
-            name="ck_memory_deletion_type",
-        ),
-        CheckConstraint(
-            "redaction_posture IN ('none', 'redacted', 'privacy_deleted')",
-            name="ck_memory_deletion_redaction_posture",
-        ),
-        Index("ix_memory_deletions_target", "target_table", "target_id"),
     )
 
 

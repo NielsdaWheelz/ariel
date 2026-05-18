@@ -22,7 +22,6 @@ from .persistence import (
     MemoryConflictMemberRecord,
     MemoryConflictSetRecord,
     MemoryContextBlockRecord,
-    MemoryDeletionRecord,
     MemoryEmbeddingProjectionRecord,
     MemoryEntityProjectionRecord,
     MemoryEntityRecord,
@@ -870,34 +869,6 @@ def _record_version(
             new_state=new_state,
             redaction_posture=redaction_posture,
             projection_invalidation=projection_invalidation or {},
-            created_at=now,
-        )
-    )
-
-
-def _record_deletion(
-    db: Session,
-    *,
-    target_table: str = "memory_assertions",
-    target_id: str,
-    deletion_type: str,
-    actor_id: str,
-    reason: str,
-    now: datetime,
-    new_id_fn: Callable[[str], str],
-    redaction_posture: str = "none",
-    projection_invalidation: dict[str, Any] | None = None,
-) -> None:
-    db.add(
-        MemoryDeletionRecord(
-            id=new_id_fn("mdl"),
-            target_table=target_table,
-            target_id=target_id,
-            deletion_type=deletion_type,
-            actor_id=actor_id,
-            reason=reason,
-            redaction_posture=redaction_posture,
-            projection_invalidation=projection_invalidation or {target_table: target_id},
             created_at=now,
         )
     )
@@ -3097,16 +3068,6 @@ def retract_assertion(
     assertion.invalidated_at = now
     assertion.updated_at = now
     projection_invalidation = _delete_projection_rows(db, assertion_id=assertion.id, now=now)
-    _record_deletion(
-        db,
-        target_id=assertion.id,
-        deletion_type="retract",
-        actor_id=actor_id,
-        reason="assertion retracted",
-        projection_invalidation=projection_invalidation,
-        now=now,
-        new_id_fn=new_id_fn,
-    )
     _record_version(
         db,
         table="memory_assertions",
@@ -3156,16 +3117,6 @@ def delete_assertion(
     assertion.invalidated_at = now
     assertion.updated_at = now
     projection_invalidation = _delete_projection_rows(db, assertion_id=assertion.id, now=now)
-    _record_deletion(
-        db,
-        target_id=assertion.id,
-        deletion_type="delete",
-        actor_id=actor_id,
-        reason="assertion deleted",
-        projection_invalidation=projection_invalidation,
-        now=now,
-        new_id_fn=new_id_fn,
-    )
     _record_version(
         db,
         table="memory_assertions",
@@ -3252,17 +3203,6 @@ def privacy_delete_assertion(
         evidence.evidence_snippet = "[privacy_deleted]"
         evidence.redaction_posture = "privacy_deleted"
         evidence.updated_at = now
-        _record_deletion(
-            db,
-            target_table="memory_evidence",
-            target_id=evidence.id,
-            deletion_type="privacy_delete",
-            actor_id=actor_id,
-            reason=reason or "evidence privacy deleted",
-            redaction_posture="privacy_deleted",
-            now=now,
-            new_id_fn=new_id_fn,
-        )
         _record_version(
             db,
             table="memory_evidence",
@@ -3308,17 +3248,6 @@ def privacy_delete_assertion(
                 now=now,
                 redaction_posture="privacy_deleted",
             )
-            _record_deletion(
-                db,
-                target_id=linked_assertion.id,
-                deletion_type="privacy_delete",
-                actor_id=actor_id,
-                reason=reason or "shared privacy-deleted evidence invalidated assertion",
-                now=now,
-                new_id_fn=new_id_fn,
-                redaction_posture="privacy_deleted",
-                projection_invalidation=linked_invalidation,
-            )
             _record_version(
                 db,
                 table="memory_assertions",
@@ -3337,17 +3266,6 @@ def privacy_delete_assertion(
                 new_id_fn=new_id_fn,
                 projection_invalidation=linked_invalidation,
             )
-    _record_deletion(
-        db,
-        target_id=assertion.id,
-        deletion_type="privacy_delete",
-        actor_id=actor_id,
-        reason=reason or "assertion privacy deleted",
-        redaction_posture="privacy_deleted",
-        projection_invalidation=projection_invalidation,
-        now=now,
-        new_id_fn=new_id_fn,
-    )
     _record_version(
         db,
         table="memory_assertions",
@@ -3403,17 +3321,6 @@ def redact_evidence(
     evidence.evidence_snippet = "[redacted]"
     evidence.redaction_posture = "redacted"
     evidence.updated_at = now
-    _record_deletion(
-        db,
-        target_table="memory_evidence",
-        target_id=evidence.id,
-        deletion_type="redact",
-        actor_id=actor_id,
-        reason=reason or "evidence redacted",
-        redaction_posture="redacted",
-        now=now,
-        new_id_fn=new_id_fn,
-    )
     _record_version(
         db,
         table="memory_evidence",
@@ -3453,17 +3360,6 @@ def redact_evidence(
         assertion.updated_at = now
         projection_invalidation = _delete_projection_rows(
             db, assertion_id=assertion.id, now=now, redaction_posture="redacted"
-        )
-        _record_deletion(
-            db,
-            target_id=assertion.id,
-            deletion_type="redact",
-            actor_id=actor_id,
-            reason=reason or "source evidence redacted",
-            redaction_posture="redacted",
-            projection_invalidation=projection_invalidation,
-            now=now,
-            new_id_fn=new_id_fn,
         )
         _record_version(
             db,
@@ -6480,8 +6376,13 @@ def list_memory(db: Session) -> dict[str, Any]:
         .limit(50)
     ).all()
     deletions = db.scalars(
-        select(MemoryDeletionRecord)
-        .order_by(MemoryDeletionRecord.created_at.desc(), MemoryDeletionRecord.id.desc())
+        select(MemoryVersionRecord)
+        .where(
+            MemoryVersionRecord.change_type.in_(
+                ("retracted", "deleted", "privacy_deleted", "redacted")
+            )
+        )
+        .order_by(MemoryVersionRecord.created_at.desc(), MemoryVersionRecord.id.desc())
         .limit(50)
     ).all()
     scope_bindings = db.scalars(
@@ -6645,9 +6546,9 @@ def list_memory(db: Session) -> dict[str, Any]:
         "deletions": [
             {
                 "id": deletion.id,
-                "target_table": deletion.target_table,
-                "target_id": deletion.target_id,
-                "deletion_type": deletion.deletion_type,
+                "target_table": deletion.canonical_table,
+                "target_id": deletion.canonical_id,
+                "deletion_type": deletion.change_type,
                 "actor_id": deletion.actor_id,
                 "reason": deletion.reason,
                 "redaction_posture": deletion.redaction_posture,

@@ -38,7 +38,6 @@ from ariel.persistence import (
     MemoryAssertionRecord,
     MemoryContextBlockRecord,
     MemoryConflictSetRecord,
-    MemoryDeletionRecord,
     MemoryEmbeddingProjectionRecord,
     MemoryEpisodeRecord,
     MemoryExportArtifactRecord,
@@ -1133,11 +1132,11 @@ def test_delete_memory_assertion_removes_active_memory_and_projection_rows(
             assert (
                 db.scalar(
                     select(func.count())
-                    .select_from(MemoryDeletionRecord)
+                    .select_from(MemoryVersionRecord)
                     .where(
-                        MemoryDeletionRecord.target_table == "memory_assertions",
-                        MemoryDeletionRecord.target_id == assertion_id,
-                        MemoryDeletionRecord.deletion_type == "delete",
+                        MemoryVersionRecord.canonical_table == "memory_assertions",
+                        MemoryVersionRecord.canonical_id == assertion_id,
+                        MemoryVersionRecord.change_type == "deleted",
                     )
                 )
                 == 1
@@ -1911,11 +1910,11 @@ def test_memory_privacy_delete_redact_and_never_remember_actions(
             assert (
                 db.scalar(
                     select(func.count())
-                    .select_from(MemoryDeletionRecord)
+                    .select_from(MemoryVersionRecord)
                     .where(
-                        MemoryDeletionRecord.target_id == delete_id,
-                        MemoryDeletionRecord.deletion_type == "privacy_delete",
-                        MemoryDeletionRecord.redaction_posture == "privacy_deleted",
+                        MemoryVersionRecord.canonical_id == delete_id,
+                        MemoryVersionRecord.change_type == "privacy_deleted",
+                        MemoryVersionRecord.redaction_posture == "privacy_deleted",
                     )
                 )
                 == 1
@@ -1923,11 +1922,11 @@ def test_memory_privacy_delete_redact_and_never_remember_actions(
             assert (
                 db.scalar(
                     select(func.count())
-                    .select_from(MemoryDeletionRecord)
+                    .select_from(MemoryVersionRecord)
                     .where(
-                        MemoryDeletionRecord.target_id == redact_evidence_id,
-                        MemoryDeletionRecord.deletion_type == "redact",
-                        MemoryDeletionRecord.redaction_posture == "redacted",
+                        MemoryVersionRecord.canonical_id == redact_evidence_id,
+                        MemoryVersionRecord.change_type == "redacted",
+                        MemoryVersionRecord.redaction_posture == "redacted",
                     )
                 )
                 == 1

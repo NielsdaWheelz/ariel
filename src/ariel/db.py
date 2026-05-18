@@ -43,7 +43,6 @@ REQUIRED_TABLES: Final[tuple[str, ...]] = (
     "memory_retention_policies",
     "memory_sensitivity_labels",
     "memory_versions",
-    "memory_deletions",
     "memory_events",
     "memory_projection_jobs",
     "memory_embedding_projections",
@@ -210,13 +209,6 @@ REQUIRED_COLUMNS: Final[dict[str, tuple[str, ...]]] = {
         "canonical_id",
         "version",
         "change_type",
-        "redaction_posture",
-        "projection_invalidation",
-    ),
-    "memory_deletions": (
-        "target_table",
-        "target_id",
-        "deletion_type",
         "redaction_posture",
         "projection_invalidation",
     ),
@@ -439,11 +431,6 @@ REQUIRED_CONSTRAINTS: Final[dict[str, tuple[str, ...]]] = {
         "ck_memory_version_positive",
         "ck_memory_version_change_type",
         "ck_memory_version_redaction_posture",
-    ),
-    "memory_deletions": (
-        "ck_memory_deletion_target_table",
-        "ck_memory_deletion_type",
-        "ck_memory_deletion_redaction_posture",
     ),
     "memory_projection_jobs": (
         "ck_memory_projection_job_kind",
@@ -670,11 +657,6 @@ REQUIRED_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
         "ck_memory_version_positive": ("version", ">", "0"),
         "ck_memory_version_change_type": ("'deleted'", "'privacy_deleted'", "'exported'"),
         "ck_memory_version_redaction_posture": ("'none'", "'privacy_deleted'"),
-    },
-    "memory_deletions": {
-        "ck_memory_deletion_target_table": ("'memory_evidence'", "'memory_assertions'"),
-        "ck_memory_deletion_type": ("'delete'", "'privacy_delete'", "'retract'"),
-        "ck_memory_deletion_redaction_posture": ("'none'", "'privacy_deleted'"),
     },
     "memory_projection_jobs": {
         "ck_memory_projection_job_kind": ("'embedding'", "'hot_index'"),
