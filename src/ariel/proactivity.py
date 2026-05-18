@@ -1051,7 +1051,9 @@ def process_proactive_deliberation_due(
                         "ignore, remember, wait, observe_more, speak_now, ask_user, act_now, "
                         "or speak_and_act. Return only strict JSON with keys: decision, "
                         "confidence, urgency, user_visible_message, rationale, evidence_refs, "
-                        "tool_refs, actions, follow_up."
+                        "tool_refs, actions, follow_up, memory. On a remember decision set "
+                        "memory to a single plain-language note stating what to remember, in "
+                        "plain words."
                     ),
                 },
                 {
@@ -1186,7 +1188,7 @@ def process_proactive_deliberation_due(
             follow_up = raw_decision.get("follow_up")
             message = raw_decision.get("user_visible_message")
             rationale = raw_decision.get("rationale")
-            remember_payload = _remember_payload(raw_decision)
+            remember_note = _remember_note(raw_decision)
 
             evidence_refs = (
                 [item for item in evidence_refs_raw if isinstance(item, str)]
@@ -1230,7 +1232,7 @@ def process_proactive_deliberation_due(
             if decision_type in {"wait", "observe_more"}:
                 valid = valid and bool(evidence_refs) and _valid_follow_up(follow_up)
             if decision_type == "remember":
-                valid = valid and bool(evidence_refs) and _valid_remember_payload(remember_payload)
+                valid = valid and bool(evidence_refs) and remember_note is not None
 
             decision = ProactiveDecisionRecord(
                 id=new_id_fn("pdc"),
@@ -1251,7 +1253,7 @@ def process_proactive_deliberation_due(
                 follow_up=follow_up if isinstance(follow_up, dict) else None,
                 raw_model_output={
                     **raw_decision,
-                    "memory": remember_payload,
+                    "memory": remember_note,
                 }
                 if decision_type == "remember"
                 else raw_decision,
@@ -1673,57 +1675,10 @@ def _valid_follow_up(follow_up: Any) -> bool:
     return isinstance(follow_up, dict) and follow_up.get("after") in _FOLLOW_UP_INTERVALS
 
 
-def _remember_payload(raw_decision: dict[str, Any]) -> dict[str, Any] | None:
-    memory = raw_decision.get("memory")
-    if isinstance(memory, dict):
-        return memory
-    return None
-
-
-def _valid_remember_payload(payload: dict[str, Any] | None) -> bool:
-    if payload is None:
-        return False
-    value = payload.get("value")
-    return (
-        _normalized_text(payload.get("subject_key")) is not None
-        and _normalized_text(payload.get("predicate")) is not None
-        and _normalized_text(value) is not None
-        and str(payload.get("assertion_type") or "fact")
-        in {
-            "fact",
-            "profile",
-            "preference",
-            "commitment",
-            "decision",
-            "project_state",
-            "procedure",
-            "domain_concept",
-        }
-    )
-
-
-def _normalized_remember_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    subject_key = _normalized_text(payload.get("subject_key")) or "user:default"
-    predicate = _normalized_text(payload.get("predicate")) or "note"
-    value = _normalized_text(payload.get("value")) or ""
-    assertion_type = str(payload.get("assertion_type") or "fact")
-    if assertion_type not in {
-        "fact",
-        "profile",
-        "preference",
-        "commitment",
-        "decision",
-        "project_state",
-        "procedure",
-        "domain_concept",
-    }:
-        assertion_type = "fact"
-    return {
-        "subject_key": subject_key,
-        "predicate": predicate,
-        "value": value,
-        "assertion_type": assertion_type,
-    }
+def _remember_note(raw_decision: dict[str, Any]) -> str | None:
+    """A ``remember`` decision carries one plain-language note -- what to
+    remember, in plain words. The rememberer subagent owns all fact shaping."""
+    return _normalized_text(raw_decision.get("memory"))
 
 
 def _action_target_system(action_type: str, action: dict[str, Any]) -> str:
@@ -2174,10 +2129,9 @@ def _apply_remember_decision(
     rememberer is a bounded AI subagent that owns the fact store and audits its
     own ``ai_judgments`` row; a failure is non-fatal here -- the case still
     resolves, since the decision itself is already recorded."""
-    raw_memory = decision.raw_model_output.get("memory")
-    if not isinstance(raw_memory, dict):
+    note = _normalized_text(decision.raw_model_output.get("memory"))
+    if note is None:
         return
-    memory = _normalized_remember_payload(raw_memory)
     operations = 0
     try:
         output = run_rememberer(
@@ -2186,7 +2140,7 @@ def _apply_remember_decision(
             now_fn=lambda: now,
             new_id_fn=new_id_fn,
             trigger="note",
-            note=f"{case.title}\n{case.summary}\n{memory['value']}",
+            note=f"{case.title}\n{case.summary}\n{note}",
         )
         operations = len(output.operations)
     except Exception:
