@@ -56,6 +56,7 @@ EMAIL_MUTATION_CAPABILITY_IDS = {
     "cap.email.undo",
 }
 MEMORY_CAPABILITY_IDS = {"cap.memory.recall", "cap.memory.remember"}
+MAPS_CAPABILITY_IDS = {"cap.maps.directions", "cap.maps.search_places"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -388,12 +389,15 @@ def _validate_drive_read_input(
 
 
 _MAPS_ALLOWED_TRAVEL_MODES = {"driving", "walking", "bicycling", "transit"}
+_MAPS_MAX_WAYPOINTS = 10
 
 
 def _validate_maps_directions_input(
     raw_input: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
-    if not set(raw_input.keys()).issubset({"origin", "destination", "travel_mode"}):
+    if not set(raw_input.keys()).issubset(
+        {"origin", "destination", "travel_mode", "waypoints", "optimize_order"}
+    ):
         return None, "schema_invalid"
 
     origin_raw = raw_input.get("origin")
@@ -426,10 +430,28 @@ def _validate_maps_directions_input(
     if travel_mode not in _MAPS_ALLOWED_TRAVEL_MODES:
         return None, "schema_invalid"
 
+    waypoints_raw = raw_input.get("waypoints", [])
+    if not isinstance(waypoints_raw, list) or len(waypoints_raw) > _MAPS_MAX_WAYPOINTS:
+        return None, "schema_invalid"
+    waypoints: list[str] = []
+    for waypoint_raw in waypoints_raw:
+        if not isinstance(waypoint_raw, str):
+            return None, "schema_invalid"
+        waypoint = waypoint_raw.strip()
+        if not waypoint or len(waypoint) > 320:
+            return None, "schema_invalid"
+        waypoints.append(waypoint)
+
+    optimize_order = raw_input.get("optimize_order", False)
+    if not isinstance(optimize_order, bool):
+        return None, "schema_invalid"
+
     return {
         "origin": origin,
         "destination": destination,
         "travel_mode": travel_mode,
+        "waypoints": tuple(waypoints),
+        "optimize_order": optimize_order,
     }, None
 
 
@@ -1912,7 +1934,11 @@ _MAPS_GEOCODE_ENDPOINT = "https://maps.googleapis.com/maps/api/geocode/json"
 _MAPS_ROUTES_HOST = "routes.googleapis.com"
 _MAPS_PLACES_HOST = "places.googleapis.com"
 _MAPS_GEOCODE_HOST = "maps.googleapis.com"
-_MAPS_ROUTES_FIELD_MASK = "routes.distanceMeters,routes.duration,routes.description"
+_MAPS_ROUTES_FIELD_MASK = (
+    "routes.distanceMeters,routes.duration,routes.staticDuration,routes.description,"
+    "routes.legs.distanceMeters,routes.legs.duration,routes.legs.staticDuration,"
+    "routes.optimizedIntermediateWaypointIndex"
+)
 _MAPS_PLACES_FIELD_MASK = (
     "places.displayName,places.formattedAddress,places.location,"
     "places.googleMapsUri,places.rating,places.userRatingCount,"
@@ -1926,6 +1952,7 @@ _MAPS_TRAVEL_MODE_TO_ROUTES = {
 }
 _MAPS_MAX_ATTEMPTS = 3
 _MAPS_PLACE_RESULT_LIMIT = 5
+_MAPS_MAX_ALTERNATIVE_ROUTES = 3
 _MAPS_TRANSIENT_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 _EARTH_RADIUS_METERS = 6_371_000.0
 
@@ -1961,8 +1988,11 @@ def _maps_request_with_retry(
     json_payload: dict[str, Any] | None = None,
     params: dict[str, str] | None = None,
 ) -> httpx.Response:
-    timeout_seconds = _maps_timeout_seconds()
-    for attempt in range(1, _MAPS_MAX_ATTEMPTS + 1):
+    base_timeout_seconds = _maps_timeout_seconds()
+    for attempt_index in range(_MAPS_MAX_ATTEMPTS):
+        is_final_attempt = attempt_index == _MAPS_MAX_ATTEMPTS - 1
+        # Bounded linear backoff: each retry grants the provider more time (1.0x, 1.5x, 2.0x).
+        timeout_seconds = base_timeout_seconds * (1.0 + attempt_index * 0.5)
         try:
             response = httpx.request(
                 method,
@@ -1973,17 +2003,17 @@ def _maps_request_with_retry(
                 timeout=timeout_seconds,
             )
         except httpx.TimeoutException as exc:
-            if attempt < _MAPS_MAX_ATTEMPTS:
-                continue
-            raise RuntimeError("provider_timeout") from exc
+            if is_final_attempt:
+                raise RuntimeError("provider_timeout") from exc
+            continue
         except httpx.HTTPError as exc:
-            if attempt < _MAPS_MAX_ATTEMPTS:
-                continue
-            raise RuntimeError("provider_network_failure") from exc
-        if response.status_code in _MAPS_TRANSIENT_STATUS_CODES and attempt < _MAPS_MAX_ATTEMPTS:
+            if is_final_attempt:
+                raise RuntimeError("provider_network_failure") from exc
+            continue
+        if response.status_code in _MAPS_TRANSIENT_STATUS_CODES and not is_final_attempt:
             continue
         return response
-    raise RuntimeError("provider_network_failure")
+    raise AssertionError("maps retry loop exited without returning a response")
 
 
 def _raise_for_maps_status(response: httpx.Response) -> None:
@@ -2029,13 +2059,17 @@ def _normalize_int_like(value: Any) -> int | None:
         return None
 
 
-def _maps_route_candidate(payload: dict[str, Any]) -> dict[str, Any] | None:
+def _maps_route_candidates(payload: dict[str, Any]) -> list[dict[str, Any]]:
     routes_raw = payload.get("routes")
-    if isinstance(routes_raw, list):
-        for raw_route in routes_raw:
-            if isinstance(raw_route, dict):
-                return raw_route
-    return None
+    if not isinstance(routes_raw, list):
+        return []
+    candidates: list[dict[str, Any]] = []
+    for raw_route in routes_raw:
+        if isinstance(raw_route, dict):
+            candidates.append(raw_route)
+        if len(candidates) >= _MAPS_MAX_ALTERNATIVE_ROUTES:
+            break
+    return candidates
 
 
 def _maps_places_candidates(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2051,13 +2085,36 @@ def _maps_places_candidates(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return candidates
 
 
-def _maps_directions_source_url(*, origin: str, destination: str, travel_mode: str) -> str:
-    return (
+def _maps_directions_source_url(
+    *, origin: str, destination: str, travel_mode: str, waypoints: tuple[str, ...]
+) -> str:
+    url = (
         "https://www.google.com/maps/dir/?api=1"
         f"&origin={quote(origin, safe='')}"
         f"&destination={quote(destination, safe='')}"
         f"&travelmode={quote(travel_mode, safe='')}"
     )
+    if waypoints:
+        url += "&waypoints=" + quote("|".join(waypoints), safe="")
+    return url
+
+
+def _maps_ordered_stops(
+    *, route_payload: dict[str, Any], origin: str, destination: str, waypoints: tuple[str, ...]
+) -> list[str]:
+    # optimizedIntermediateWaypointIndex is present only when optimizeWaypointOrder
+    # was requested; it permutes waypoints into Google's chosen visiting order.
+    order_raw = route_payload.get("optimizedIntermediateWaypointIndex")
+    if (
+        isinstance(order_raw, list)
+        and len(order_raw) == len(waypoints)
+        and all(isinstance(index, int) and not isinstance(index, bool) for index in order_raw)
+        and sorted(order_raw) == list(range(len(waypoints)))
+    ):
+        ordered_waypoints = [waypoints[index] for index in order_raw]
+    else:
+        ordered_waypoints = list(waypoints)
+    return [origin, *ordered_waypoints, destination]
 
 
 def _build_maps_route_result(
@@ -2066,31 +2123,45 @@ def _build_maps_route_result(
     origin: str,
     destination: str,
     travel_mode: str,
+    waypoints: tuple[str, ...],
 ) -> dict[str, Any]:
-    distance_meters = _normalize_int_like(route_payload.get("distanceMeters"))
-    duration_seconds = _normalize_int_like(route_payload.get("duration"))
     description_raw = route_payload.get("description")
     description = (
         description_raw.strip()
         if isinstance(description_raw, str) and description_raw.strip()
         else None
     )
-    snippet_parts: list[str] = [f"travel_mode={travel_mode}"]
-    if distance_meters is not None:
-        snippet_parts.append(f"distance_meters={distance_meters}")
-    if duration_seconds is not None:
-        snippet_parts.append(f"duration_seconds={duration_seconds}")
-    if description is not None:
-        snippet_parts.append(description)
+    legs_raw = route_payload.get("legs")
+    legs: list[dict[str, Any]] = []
+    if isinstance(legs_raw, list):
+        for leg_raw in legs_raw:
+            if not isinstance(leg_raw, dict):
+                continue
+            legs.append(
+                {
+                    "distance_meters": _normalize_int_like(leg_raw.get("distanceMeters")),
+                    "duration_seconds": _normalize_int_like(leg_raw.get("duration")),
+                    "static_duration_seconds": _normalize_int_like(leg_raw.get("staticDuration")),
+                }
+            )
     return {
-        "title": f"Route from {origin} to {destination}",
-        "source": _maps_directions_source_url(
-            origin=origin, destination=destination, travel_mode=travel_mode
+        "distance_meters": _normalize_int_like(route_payload.get("distanceMeters")),
+        "duration_seconds": _normalize_int_like(route_payload.get("duration")),
+        "static_duration_seconds": _normalize_int_like(route_payload.get("staticDuration")),
+        "description": description,
+        "stops": _maps_ordered_stops(
+            route_payload=route_payload,
+            origin=origin,
+            destination=destination,
+            waypoints=waypoints,
         ),
-        "snippet": " ".join(snippet_parts),
-        "published_at": None,
-        "distance_meters": distance_meters,
-        "duration_seconds": duration_seconds,
+        "legs": legs,
+        "source": _maps_directions_source_url(
+            origin=origin,
+            destination=destination,
+            travel_mode=travel_mode,
+            waypoints=waypoints,
+        ),
     }
 
 
@@ -2133,47 +2204,64 @@ def _build_maps_place_result(
         if isinstance(maps_uri_raw, str) and maps_uri_raw.strip()
         else f"https://www.google.com/maps/search/?api=1&query={quote(title, safe='')}"
     )
-    snippet_parts: list[str] = []
+
+    address: str | None = None
     address_raw = place_payload.get("formattedAddress")
     if isinstance(address_raw, str) and address_raw.strip():
-        snippet_parts.append(f"address={address_raw.strip()}")
-    snippet_parts.append(f"distance_meters={distance_meters}")
+        address = address_raw.strip()
+
+    rating: float | None = None
     rating_raw = place_payload.get("rating")
     if isinstance(rating_raw, (int, float)) and not isinstance(rating_raw, bool):
-        snippet_parts.append(f"rating={rating_raw}")
+        rating = float(rating_raw)
+
+    rating_count: int | None = None
     rating_count_raw = place_payload.get("userRatingCount")
     if isinstance(rating_count_raw, int) and not isinstance(rating_count_raw, bool):
-        snippet_parts.append(f"rating_count={rating_count_raw}")
+        rating_count = rating_count_raw
+
+    open_now: bool | None = None
     opening_hours = place_payload.get("regularOpeningHours")
-    if isinstance(opening_hours, dict) and isinstance(opening_hours.get("openNow"), bool):
-        snippet_parts.append(f"open_now={str(opening_hours['openNow']).lower()}")
+    if isinstance(opening_hours, dict):
+        open_now_raw = opening_hours.get("openNow")
+        if isinstance(open_now_raw, bool):
+            open_now = open_now_raw
+
+    business_status: str | None = None
     business_status_raw = place_payload.get("businessStatus")
     if isinstance(business_status_raw, str) and business_status_raw.strip():
-        snippet_parts.append(f"business_status={business_status_raw.strip()}")
+        business_status = business_status_raw.strip()
+
     return {
         "title": title,
         "source": source,
-        "snippet": " ".join(snippet_parts),
+        # Place facts travel as structured fields; the snippet carries the
+        # human-readable address for the citation.
+        "snippet": address or title,
         "published_at": None,
+        "address": address,
+        "distance_meters": distance_meters,
+        "rating": rating,
+        "rating_count": rating_count,
+        "open_now": open_now,
+        "business_status": business_status,
     }
 
 
 def _execute_maps_directions(input_payload: dict[str, Any]) -> dict[str, Any]:
-    origin_raw = input_payload.get("origin")
-    destination_raw = input_payload.get("destination")
-    if not isinstance(origin_raw, str) or not origin_raw.strip():
+    # Input is validator-normalized: origin/destination are non-empty str | None
+    # (a missing endpoint is a clarification), travel_mode is an allowed mode,
+    # waypoints is a stripped tuple (<=10), optimize_order is a bool.
+    origin = input_payload["origin"]
+    destination = input_payload["destination"]
+    if origin is None:
         raise RuntimeError("maps_origin_required")
-    if not isinstance(destination_raw, str) or not destination_raw.strip():
+    if destination is None:
         raise RuntimeError("maps_destination_required")
-    origin = origin_raw.strip()
-    destination = destination_raw.strip()
-    travel_mode_raw = input_payload.get("travel_mode")
-    travel_mode = (
-        travel_mode_raw.strip().lower()
-        if isinstance(travel_mode_raw, str) and travel_mode_raw.strip()
-        else "driving"
-    )
-    routes_travel_mode = _MAPS_TRAVEL_MODE_TO_ROUTES.get(travel_mode, "DRIVE")
+    travel_mode = input_payload["travel_mode"]
+    waypoints: tuple[str, ...] = input_payload["waypoints"]
+    optimize_order = input_payload["optimize_order"]
+    routes_travel_mode = _MAPS_TRAVEL_MODE_TO_ROUTES[travel_mode]
 
     api_key = _maps_api_key()
     request_body: dict[str, Any] = {
@@ -2183,6 +2271,13 @@ def _execute_maps_directions(input_payload: dict[str, Any]) -> dict[str, Any]:
     }
     if routes_travel_mode == "DRIVE":
         request_body["routingPreference"] = "TRAFFIC_AWARE"
+    if waypoints:
+        request_body["intermediates"] = [{"address": waypoint} for waypoint in waypoints]
+        if optimize_order:
+            request_body["optimizeWaypointOrder"] = True
+    else:
+        # Alternatives and intermediates are mutually exclusive on the Routes API.
+        request_body["computeAlternativeRoutes"] = True
     response = _maps_request_with_retry(
         method="POST",
         endpoint=_MAPS_ROUTES_ENDPOINT,
@@ -2197,31 +2292,35 @@ def _execute_maps_directions(input_payload: dict[str, Any]) -> dict[str, Any]:
     payload = _maps_response_json(response)
 
     retrieved_at = datetime.now(tz=UTC).isoformat().replace("+00:00", "Z")
-    route_payload = _maps_route_candidate(payload)
+    routes: list[dict[str, Any]] = []
     results: list[dict[str, Any]] = []
-    uncertainty: str | None = None
-    distance_meters: int | None = None
-    duration_seconds: int | None = None
-    if route_payload is None:
-        uncertainty = "insufficient_evidence"
-    else:
-        result = _build_maps_route_result(
+    for route_payload in _maps_route_candidates(payload):
+        route = _build_maps_route_result(
             route_payload=route_payload,
             origin=origin,
             destination=destination,
             travel_mode=travel_mode,
+            waypoints=waypoints,
         )
-        distance_meters = result.pop("distance_meters")
-        duration_seconds = result.pop("duration_seconds")
-        results.append(result)
+        routes.append(route)
+        results.append(
+            {
+                "title": f"Route from {origin} to {destination}",
+                "source": route["source"],
+                # The snippet carries the provider's human-readable route
+                # descriptor for the citation; route facts are structured fields.
+                "snippet": route["description"] or f"{travel_mode} route",
+                "published_at": None,
+            }
+        )
     return {
         "origin": origin,
         "destination": destination,
+        "waypoints": list(waypoints),
         "travel_mode": travel_mode,
-        "distance_meters": distance_meters,
-        "duration_seconds": duration_seconds,
         "retrieved_at": retrieved_at,
-        "uncertainty": uncertainty,
+        "uncertainty": "insufficient_evidence" if not routes else None,
+        "routes": routes,
         "results": results,
     }
 
@@ -2257,7 +2356,12 @@ def _maps_geocode_location(location_context: str) -> tuple[float, float]:
                 ):
                     return float(lat), float(lng)
         raise RuntimeError("provider_invalid_payload")
-    if status in {"ZERO_RESULTS", "INVALID_REQUEST"}:
+    if status == "ZERO_RESULTS":
+        # The location text is well-formed but Google resolved no place for it.
+        # This is a clarification condition, not a provider fault: the assistant
+        # must ask for a clearer location rather than retry the same string.
+        raise RuntimeError("maps_location_not_found")
+    if status == "INVALID_REQUEST":
         raise RuntimeError("provider_request_rejected")
     if status == "OVER_QUERY_LIMIT":
         raise RuntimeError("provider_rate_limited")
@@ -2267,18 +2371,13 @@ def _maps_geocode_location(location_context: str) -> tuple[float, float]:
 
 
 def _execute_maps_search_places(input_payload: dict[str, Any]) -> dict[str, Any]:
-    query_raw = input_payload.get("query")
-    if not isinstance(query_raw, str) or not query_raw.strip():
-        raise RuntimeError("provider_request_rejected")
-    location_context_raw = input_payload.get("location_context")
-    if not isinstance(location_context_raw, str) or not location_context_raw.strip():
+    # Input is validator-normalized: query is a non-empty str, radius_meters is a
+    # valid int, location_context is a non-empty str | None (None is a clarification).
+    query = input_payload["query"]
+    location_context = input_payload["location_context"]
+    if location_context is None:
         raise RuntimeError("maps_location_context_required")
-    radius_raw = input_payload.get("radius_meters")
-    radius_meters = (
-        radius_raw if isinstance(radius_raw, int) and not isinstance(radius_raw, bool) else 2000
-    )
-    query = query_raw.strip()
-    location_context = location_context_raw.strip()
+    radius_meters = input_payload["radius_meters"]
 
     center_lat, center_lng = _maps_geocode_location(location_context)
     api_key = _maps_api_key()
@@ -2336,6 +2435,8 @@ def _declare_maps_directions_egress_intent(input_payload: dict[str, Any]) -> lis
                 "origin": input_payload.get("origin"),
                 "destination": input_payload.get("destination"),
                 "travel_mode": input_payload.get("travel_mode"),
+                "waypoints": input_payload.get("waypoints"),
+                "optimize_order": input_payload.get("optimize_order"),
             },
         }
     ]
@@ -3157,12 +3258,12 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
     ),
     "cap.maps.directions": CapabilityDefinition(
         capability_id="cap.maps.directions",
-        version="1.0",
+        version="2.0",
         impact_level="read",
         policy_decision="allow_inline",
         contract_metadata={
-            "input_schema": "maps_directions_query_v1",
-            "output_schema": "maps_directions_result_v1",
+            "input_schema": "maps_directions_query_v2",
+            "output_schema": "maps_directions_result_v2",
             "idempotency": "deterministic_read",
         },
         allowed_egress_destinations=(_MAPS_ROUTES_HOST,),
@@ -3177,7 +3278,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         policy_decision="allow_inline",
         contract_metadata={
             "input_schema": "maps_search_places_query_v1",
-            "output_schema": "maps_search_places_result_v1",
+            "output_schema": "maps_search_places_result_v2",
             "idempotency": "deterministic_read",
         },
         allowed_egress_destinations=(_MAPS_GEOCODE_HOST, _MAPS_PLACES_HOST),
