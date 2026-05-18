@@ -38,21 +38,12 @@ class AppSettings(BaseSettings):
     model_reasoning_effort: str = "medium"
     model_verbosity: str = "low"
     max_recent_turns: int = 12
-    max_recalled_assertions: int = 8
+    memory_recall_candidate_limit: int = 24
     max_context_tokens: int = 6000
     memory_embedding_provider: str = "openai"
     memory_embedding_model: str = "text-embedding-3-small"
     memory_embedding_dimensions: int = MEMORY_EMBEDDING_DIMENSIONS
-    memory_import_cutover_enabled: bool = False
-    memory_vector_distance_ceiling: float = 0.6
-    memory_rrf_k: int = 60
-    memory_consolidation_candidate_threshold: int = 12
-    memory_consolidation_conflict_threshold: int = 3
-    memory_consolidation_interval_seconds: int = 86400
-    memory_hot_index_budget_tokens: int = 1500
-    memory_hot_index_hard_max_tokens: int = 2500
-    memory_forgetting_value_floor: float = 0.25
-    memory_forgetting_staleness_days: int = 180
+    memory_sweep_interval_seconds: int = 86400
     auto_rotate_max_turns: int = 120
     auto_rotate_max_age_seconds: int = 172800
     auto_rotate_context_pressure_tokens: int = 5400
@@ -249,11 +240,11 @@ class AppSettings(BaseSettings):
             raise ValueError("max_recent_turns must be >= 1")
         return value
 
-    @field_validator("max_recalled_assertions")
+    @field_validator("memory_recall_candidate_limit")
     @classmethod
-    def _max_recalled_assertions_must_be_positive(cls, value: int) -> int:
+    def _memory_recall_candidate_limit_must_be_positive(cls, value: int) -> int:
         if value < 1:
-            raise ValueError("max_recalled_assertions must be >= 1")
+            raise ValueError("memory_recall_candidate_limit must be >= 1")
         return value
 
     @field_validator("max_context_tokens")
@@ -281,53 +272,11 @@ class AppSettings(BaseSettings):
             raise ValueError(f"memory_embedding_dimensions must be {MEMORY_EMBEDDING_DIMENSIONS}")
         return value
 
-    @field_validator("memory_vector_distance_ceiling")
+    @field_validator("memory_sweep_interval_seconds")
     @classmethod
-    def _memory_vector_distance_ceiling_must_be_in_range(cls, value: float) -> float:
-        if not 0.0 < value <= 2.0:
-            raise ValueError("memory_vector_distance_ceiling must be in (0.0, 2.0]")
-        return value
-
-    @field_validator("memory_rrf_k")
-    @classmethod
-    def _memory_rrf_k_must_be_positive(cls, value: int) -> int:
+    def _memory_sweep_interval_seconds_must_be_positive(cls, value: int) -> int:
         if value < 1:
-            raise ValueError("memory_rrf_k must be >= 1")
-        return value
-
-    @field_validator(
-        "memory_consolidation_candidate_threshold",
-        "memory_consolidation_conflict_threshold",
-        "memory_consolidation_interval_seconds",
-    )
-    @classmethod
-    def _memory_consolidation_settings_must_be_positive(cls, value: int) -> int:
-        if value < 1:
-            raise ValueError("memory consolidation settings must be >= 1")
-        return value
-
-    @model_validator(mode="after")
-    def _memory_hot_index_budgets_must_be_ordered(self) -> AppSettings:
-        if self.memory_hot_index_budget_tokens < 1:
-            raise ValueError("memory_hot_index_budget_tokens must be >= 1")
-        if self.memory_hot_index_hard_max_tokens < self.memory_hot_index_budget_tokens:
-            raise ValueError(
-                "memory_hot_index_hard_max_tokens must be >= memory_hot_index_budget_tokens"
-            )
-        return self
-
-    @field_validator("memory_forgetting_value_floor")
-    @classmethod
-    def _memory_forgetting_value_floor_must_be_in_range(cls, value: float) -> float:
-        if not 0.0 <= value <= 1.0:
-            raise ValueError("memory_forgetting_value_floor must be in [0.0, 1.0]")
-        return value
-
-    @field_validator("memory_forgetting_staleness_days")
-    @classmethod
-    def _memory_forgetting_staleness_days_must_be_positive(cls, value: int) -> int:
-        if value < 1:
-            raise ValueError("memory_forgetting_staleness_days must be >= 1")
+            raise ValueError("memory_sweep_interval_seconds must be >= 1")
         return value
 
     @field_validator("auto_rotate_max_turns")

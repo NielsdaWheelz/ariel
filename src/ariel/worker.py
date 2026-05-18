@@ -522,7 +522,6 @@ def process_one_task(
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                     settings=resolved_settings,
-                    memory_import_cutover_enabled=resolved_settings.memory_import_cutover_enabled,
                 )
             case "provider_write_reconcile_due":
                 shape_error = _payload_text(task_payload, "shape_error")

@@ -595,7 +595,7 @@ def run_retriever(
                 db,
                 query=query,
                 settings=settings,
-                limit=settings.max_recalled_assertions,
+                limit=settings.memory_recall_candidate_limit,
             )
             candidate_payload = [
                 {"id": fact.id, "content": fact.content} for fact in candidates
@@ -877,7 +877,7 @@ def run_rememberer(
                     )
                 deleted = len(long_forgotten)
                 candidates = list_active_facts(
-                    db, limit=settings.max_recalled_assertions
+                    db, limit=settings.memory_recall_candidate_limit
                 )
             else:
                 deleted = 0
@@ -885,7 +885,7 @@ def run_rememberer(
                     db,
                     query=review_text,
                     settings=settings,
-                    limit=settings.max_recalled_assertions,
+                    limit=settings.memory_recall_candidate_limit,
                 )
 
             profile = read_profile(db)
@@ -1059,7 +1059,7 @@ def enqueue_due_memory_sweep(
     when the last sweep is older than the configured interval, otherwise enqueue
     nothing. Returns the new task id, or ``None`` when a sweep is not yet due.
     Called from the worker's enqueue-due pass."""
-    interval = timedelta(seconds=settings.memory_consolidation_interval_seconds)
+    interval = timedelta(seconds=settings.memory_sweep_interval_seconds)
     recent_sweep = db.scalar(
         select(BackgroundTaskRecord.id)
         .where(

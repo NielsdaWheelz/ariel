@@ -193,7 +193,6 @@ def execute_run_program(
     attachment_runtime: AttachmentContentRuntime | None,
     allowed_capability_ids: set[str],
     settings: AppSettings | None,
-    memory_import_cutover_enabled: bool,
 ) -> RunProgramResult:
     """Run one model-authored Python ``run`` program inside the sandbox.
 
@@ -314,7 +313,6 @@ def execute_run_program(
             attachment_runtime=attachment_runtime,
             allowed_capability_id_set=allowed_capability_ids,
             settings=settings,
-            memory_import_cutover_enabled=memory_import_cutover_enabled,
         )
         # Within-program taint: a syscall that returned untrusted-influenced
         # content taints every later syscall in this program, and contributes

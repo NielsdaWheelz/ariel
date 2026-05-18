@@ -3017,7 +3017,6 @@ def create_app(
     app.state.local_auth_required = settings.local_auth_required
     app.state.local_auth_token = settings.local_auth_token
     app.state.max_recent_turns = settings.max_recent_turns
-    app.state.max_recalled_assertions = settings.max_recalled_assertions
     app.state.max_context_tokens = settings.max_context_tokens
     app.state.auto_rotate_max_turns = settings.auto_rotate_max_turns
     app.state.auto_rotate_max_age_seconds = settings.auto_rotate_max_age_seconds
@@ -4274,7 +4273,6 @@ def create_app(
                     attachment_runtime=app.state.attachment_runtime,
                     allowed_capability_ids=set(allowed_capability_ids),
                     settings=settings,
-                    memory_import_cutover_enabled=settings.memory_import_cutover_enabled,
                 )
                 # The syscall trace is the audit spine and is recorded whether
                 # or not the program completed cleanly.

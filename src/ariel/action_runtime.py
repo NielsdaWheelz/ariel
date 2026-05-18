@@ -2610,7 +2610,6 @@ def process_one_call(
     attachment_runtime: AttachmentContentRuntime | None,
     allowed_capability_id_set: set[str],
     settings: AppSettings | None,
-    memory_import_cutover_enabled: bool,
 ) -> None:
     function_call_payload = function_call_raw if isinstance(function_call_raw, dict) else {}
     call_id_raw = function_call_payload.get("call_id")
@@ -3969,7 +3968,6 @@ def process_action_execution_task(
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
     settings: AppSettings | None = None,
-    memory_import_cutover_enabled: bool = False,
 ) -> bool:
     provider_call: tuple[str, dict[str, Any], str, set[str], str | None] | None = None
     email_provider_call: tuple[str, str, dict[str, Any], str, set[str], str] | None = None
