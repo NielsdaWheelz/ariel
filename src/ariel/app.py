@@ -407,12 +407,6 @@ class MessageRequest(BaseModel):
         return value
 
 
-class SessionMemoryModeRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    memory_mode: Literal["normal", "temporary", "no_memory"]
-
-
 class WorkCommitmentSnoozeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -2467,7 +2461,6 @@ def _rotate_active_session(
         id=rotated_session_id,
         is_active=True,
         lifecycle_state="active",
-        memory_mode=active_session.memory_mode,
         digest=active_session.digest,
         rotated_from_session_id=prior_session_id,
         rotation_reason=reason,
@@ -3389,30 +3382,6 @@ def create_app(
             with db.begin():
                 active_session = _get_or_create_active_session(db)
             return {"ok": True, "session": serialize_session(active_session)}
-
-    @app.put("/v1/sessions/{session_id}/memory-mode", response_model=None)
-    def put_session_memory_mode(
-        session_id: str,
-        payload: SessionMemoryModeRequest,
-    ) -> dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                session = db.scalar(
-                    select(SessionRecord).where(SessionRecord.id == session_id).limit(1)
-                )
-                if session is None:
-                    raise ApiError(
-                        status_code=404,
-                        code="E_SESSION_NOT_FOUND",
-                        message="session not found",
-                        details={"session_id": session_id},
-                        retryable=False,
-                    )
-                now = _utcnow()
-                session.memory_mode = payload.memory_mode
-                session.updated_at = now
-                return {"ok": True, "session": serialize_session(session)}
 
     @app.post("/v1/sessions/rotate", response_model=None)
     def rotate_active_session(request: Request) -> JSONResponse | dict[str, Any]:

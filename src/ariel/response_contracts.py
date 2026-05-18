@@ -18,7 +18,6 @@ class SurfaceSessionContract(BaseModel):
     id: str
     is_active: bool
     lifecycle_state: str
-    memory_mode: Literal["normal", "temporary", "no_memory"]
     created_at: str
     updated_at: str
 

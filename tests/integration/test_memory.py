@@ -327,7 +327,6 @@ def _insert_active_session(db: Session) -> str:
         id=session_id,
         is_active=True,
         lifecycle_state="active",
-        memory_mode="normal",
         rotated_from_session_id=None,
         rotation_reason=None,
         digest=None,

@@ -75,7 +75,6 @@ REQUIRED_COLUMNS: Final[dict[str, tuple[str, ...]]] = {
     "sessions": (
         "is_active",
         "lifecycle_state",
-        "memory_mode",
         "rotated_from_session_id",
         "rotation_reason",
         "created_at",
@@ -177,7 +176,6 @@ REQUIRED_CONSTRAINTS: Final[dict[str, tuple[str, ...]]] = {
     "sessions": (
         "ck_session_rotation_reason",
         "ck_session_lifecycle_state",
-        "ck_session_memory_mode",
         "ck_session_lifecycle_matches_is_active",
         "ck_session_rotation_fields_paired",
     ),
@@ -241,7 +239,6 @@ REQUIRED_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
     "sessions": {
         "ck_session_rotation_reason": ("'threshold_context_pressure'",),
         "ck_session_lifecycle_state": ("'active'", "'rotating'", "'recovery_needed'"),
-        "ck_session_memory_mode": ("'normal'", "'temporary'", "'no_memory'"),
         "ck_session_lifecycle_matches_is_active": ("is_active", "lifecycle_state"),
         "ck_session_rotation_fields_paired": ("rotation_reason", "rotated_from_session_id"),
     },

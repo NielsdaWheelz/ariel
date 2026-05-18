@@ -42,7 +42,6 @@ class SessionRecord(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
-    memory_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="normal")
     rotated_from_session_id: Mapped[str | None] = mapped_column(
         String(32),
         ForeignKey("sessions.id", ondelete="SET NULL"),
@@ -68,10 +67,6 @@ class SessionRecord(Base):
         CheckConstraint(
             "lifecycle_state IN ('active', 'rotating', 'closed', 'recovery_needed')",
             name="ck_session_lifecycle_state",
-        ),
-        CheckConstraint(
-            "memory_mode IN ('normal', 'temporary', 'no_memory')",
-            name="ck_session_memory_mode",
         ),
         CheckConstraint(
             (
@@ -2755,7 +2750,6 @@ def serialize_session(session: SessionRecord) -> dict[str, Any]:
         "id": session.id,
         "is_active": session.is_active,
         "lifecycle_state": session.lifecycle_state,
-        "memory_mode": session.memory_mode,
         "created_at": to_rfc3339(session.created_at),
         "updated_at": to_rfc3339(session.updated_at),
     }
