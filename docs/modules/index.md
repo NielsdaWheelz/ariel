@@ -14,4 +14,6 @@ This directory contains docs owned by specific infrastructure modules or feature
   concrete Google Workspace reasoning completion plan
 - [memory.md](memory.md): north-star long-memory hard cutover
 - [memory-completion-cutover.md](memory-completion-cutover.md): memory completion hard-cutover spec
+- [memory-consolidation-cutover.md](memory-consolidation-cutover.md): memory schema consolidation hard cutover
+- [proactive-consolidation-cutover.md](proactive-consolidation-cutover.md): proactive schema consolidation hard cutover
 - [transport.md](transport.md): transport lifecycle ownership

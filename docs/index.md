@@ -44,6 +44,8 @@ This directory is the canonical home for repository documentation.
 
 - [codebase.md](codebase.md): tech stack, repo structure, imports, and module boundaries
 - [database.md](database.md): PostgreSQL schema, queries, and transactions
+- [schema-consolidation-cutover.md](schema-consolidation-cutover.md): phased plan to consolidate the schema from 86 tables toward ~72
+- [schema-cross-cutting-cutover.md](schema-cross-cutting-cutover.md): Phase 4 of the consolidation — job queues, write ledgers, event logs
 
 ### Product operations
 
