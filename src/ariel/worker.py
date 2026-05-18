@@ -35,6 +35,7 @@ from .persistence import (
     WorkFollowUpLoopRecord,
     to_rfc3339,
 )
+from .leave_by import process_leave_by_evaluate_due, process_leave_by_scan_due
 from .memory import enqueue_due_memory_sweep, run_rememberer
 from .proactivity import (
     process_proactive_action_execution_due,
@@ -60,6 +61,8 @@ PROACTIVE_RECOVERABLE_TASK_TYPES = (
     "work_follow_up_evaluate_due",
     "proactive_feedback_learning_due",
     "proactive_action_execution_due",
+    "leave_by_scan_due",
+    "leave_by_evaluate_due",
 )
 
 
@@ -302,6 +305,37 @@ def enqueue_due_worker_owned_ambient_task(
     )
 
 
+def enqueue_due_worker_owned_leave_by_scan_task(
+    db: Session,
+    *,
+    settings: AppSettings,
+    now: datetime,
+) -> BackgroundTaskRecord | None:
+    latest = db.scalar(
+        select(BackgroundTaskRecord)
+        .where(BackgroundTaskRecord.task_type == "leave_by_scan_due")
+        .order_by(
+            BackgroundTaskRecord.run_after.desc(),
+            BackgroundTaskRecord.created_at.desc(),
+            BackgroundTaskRecord.id.desc(),
+        )
+        .with_for_update(skip_locked=True)
+        .limit(1)
+    )
+    if latest is not None and latest.status in {"pending", "running"}:
+        return None
+    due_after = now - timedelta(seconds=settings.leave_by_scan_interval_seconds)
+    if latest is not None and latest.run_after > due_after:
+        return None
+    return enqueue_background_task(
+        db,
+        task_type="leave_by_scan_due",
+        payload={"origin": "worker_leave_by_scan"},
+        now=now,
+        max_attempts=settings.proactive_worker_max_attempts,
+    )
+
+
 def enqueue_due_work_follow_up_evaluation_tasks(
     db: Session,
     *,
@@ -438,6 +472,7 @@ def process_one_task(
                 now=now,
             )
             enqueue_due_worker_owned_ambient_task(db, settings=resolved_settings, now=now)
+            enqueue_due_worker_owned_leave_by_scan_task(db, settings=resolved_settings, now=now)
             enqueue_due_memory_sweep(db, settings=resolved_settings, now=now, new_id_fn=_new_id)
 
     with session_factory() as db:
@@ -637,6 +672,22 @@ def process_one_task(
                     session_factory=session_factory,
                     task_payload=task_payload,
                     google_runtime=_google_runtime(resolved_settings),
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+            case "leave_by_scan_due":
+                process_leave_by_scan_due(
+                    session_factory=session_factory,
+                    settings=resolved_settings,
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+            case "leave_by_evaluate_due":
+                process_leave_by_evaluate_due(
+                    session_factory=session_factory,
+                    task_payload=task_payload,
+                    settings=resolved_settings,
+                    model_adapter=model_adapter,
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                 )

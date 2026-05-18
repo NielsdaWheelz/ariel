@@ -12,6 +12,9 @@ This directory contains docs owned by specific infrastructure modules or feature
   Calendar, commitment, due-date, and follow-up reasoning hard cutover
 - [google-workspace-reasoning-completion-plan.md](google-workspace-reasoning-completion-plan.md):
   concrete Google Workspace reasoning completion plan
+- [leave-by.md](leave-by.md): leave-by reminder subsystem — proactive traffic-aware departure notifications
+- [maps.md](maps.md): maps read vertical — directions and nearby-place capabilities
+- [maps-expansion-cutover.md](maps-expansion-cutover.md): hard-cutover spec — multi-stop routing, alternative routes, and the proactive leave-by reminder
 - [memory.md](memory.md): memory subsystem — fact store, profile and digest, retriever and rememberer
 - [memory-cutover.md](memory-cutover.md): memory subsystem hard-cutover record
 - [proactive-consolidation-cutover.md](proactive-consolidation-cutover.md): proactive schema consolidation hard cutover

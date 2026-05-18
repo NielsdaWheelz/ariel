@@ -285,6 +285,8 @@ def test_provider_runtime_settings_default_to_production_values() -> None:
     assert settings.web_extract_api_key is None
     assert settings.maps_api_key is None
     assert settings.maps_timeout_seconds == 8.0
+    assert settings.home_address is None
+    assert settings.leave_by_scan_interval_seconds == 1800.0
     assert settings.weather_provider_mode == "production"
     assert settings.weather_production_endpoint == "https://api.tomorrow.io/v4/weather/forecast"
     assert settings.weather_production_timeout_seconds == 8.0
@@ -306,6 +308,8 @@ def test_provider_runtime_settings_load_from_env(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("ARIEL_WEB_EXTRACT_API_KEY", "extract-key")
     monkeypatch.setenv("ARIEL_MAPS_API_KEY", "maps-key")
     monkeypatch.setenv("ARIEL_MAPS_TIMEOUT_SECONDS", "6.5")
+    monkeypatch.setenv("ARIEL_HOME_ADDRESS", "789 Residential Ave")
+    monkeypatch.setenv("ARIEL_LEAVE_BY_SCAN_INTERVAL_SECONDS", "900.0")
     monkeypatch.setenv("ARIEL_WEATHER_PROVIDER_MODE", "dev_fallback")
     monkeypatch.setenv("ARIEL_WEATHER_PRODUCTION_ENDPOINT", "https://weather.example.test")
     monkeypatch.setenv("ARIEL_WEATHER_PRODUCTION_TIMEOUT_SECONDS", "7.5")
@@ -327,6 +331,8 @@ def test_provider_runtime_settings_load_from_env(monkeypatch: pytest.MonkeyPatch
     assert settings.web_extract_api_key == "extract-key"
     assert settings.maps_api_key == "maps-key"
     assert settings.maps_timeout_seconds == 6.5
+    assert settings.home_address == "789 Residential Ave"
+    assert settings.leave_by_scan_interval_seconds == 900.0
     assert settings.weather_provider_mode == "dev_fallback"
     assert settings.weather_production_endpoint == "https://weather.example.test"
     assert settings.weather_production_timeout_seconds == 7.5
@@ -343,6 +349,7 @@ def test_provider_runtime_settings_load_from_env(monkeypatch: pytest.MonkeyPatch
         "ARIEL_SEARCH_NEWS_TIMEOUT_SECONDS",
         "ARIEL_WEB_EXTRACT_TIMEOUT_SECONDS",
         "ARIEL_MAPS_TIMEOUT_SECONDS",
+        "ARIEL_LEAVE_BY_SCAN_INTERVAL_SECONDS",
         "ARIEL_WEATHER_PRODUCTION_TIMEOUT_SECONDS",
         "ARIEL_WEATHER_DEV_TIMEOUT_SECONDS",
     ],
