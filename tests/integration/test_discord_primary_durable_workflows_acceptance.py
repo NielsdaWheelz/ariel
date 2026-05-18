@@ -700,22 +700,18 @@ def test_proactive_interpretation_deliberates_speaks_and_acknowledges_case_and_t
                     "validation_status": "valid",
                 }
 
-        turns = client.get("/v1/proactive/turns")
-        assert turns.status_code == 200
-        turn = turns.json()["turns"][0]
-        assert turn["case_id"] == proactive_case["id"]
-        assert turn["decision_id"] == decision["id"]
-        assert turn["status"] == "pending"
-        assert turn["message"] == "Sir, you should review this approval now."
-
-        notifications = client.get("/v1/notifications")
+        notifications = client.get("/v1/notifications?source_type=proactive_turn")
         assert notifications.status_code == 200
         notification = notifications.json()["notifications"][0]
         assert notification["source_type"] == "proactive_turn"
-        assert notification["source_id"] == turn["id"]
+        assert notification["source_id"] == decision["id"]
+        assert notification["proactive_case_id"] == proactive_case["id"]
+        assert notification["proactive_decision_id"] == decision["id"]
+        assert notification["status"] == "pending"
+        assert notification["body"] == "Sir, you should review this approval now."
         assert notification["payload"] == {
-            "proactive_turn_id": turn["id"],
             "case_id": proactive_case["id"],
+            "decision_id": decision["id"],
         }
 
         acked = client.post(f"/v1/notifications/{notification['id']}/ack")
@@ -725,9 +721,9 @@ def test_proactive_interpretation_deliberates_speaks_and_acknowledges_case_and_t
         assert case_after_ack.status_code == 200
         assert case_after_ack.json()["case"]["status"] == "acknowledged"
 
-        turns_after_ack = client.get("/v1/proactive/turns")
-        assert turns_after_ack.status_code == 200
-        assert turns_after_ack.json()["turns"][0]["status"] == "acknowledged"
+        notifications_after_ack = client.get("/v1/notifications?source_type=proactive_turn")
+        assert notifications_after_ack.status_code == 200
+        assert notifications_after_ack.json()["notifications"][0]["status"] == "acknowledged"
 
         events = client.get(f"/v1/proactive/cases/{proactive_case['id']}/events")
         assert events.status_code == 200

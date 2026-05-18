@@ -12,13 +12,13 @@ from ariel.app import ModelAdapter, create_app
 from ariel.config import AppSettings
 from ariel.persistence import (
     AutonomyScopeRecord,
+    NotificationRecord,
     ProactiveActionExecutionRecord,
     ProactiveActionPlanRecord,
     ProactiveCaseEventRecord,
     ProactiveCaseRecord,
     ProactiveDecisionRecord,
     ProactiveObservationRecord,
-    ProactiveTurnRecord,
 )
 from ariel.proactivity import process_proactive_deliberation_due
 from ariel.worker import process_one_task
@@ -306,16 +306,18 @@ def _seed_case(
                 denial_reason=None,
                 created_at=now,
             )
-            turn = ProactiveTurnRecord(
-                id=f"ptr_{case_id}",
-                case_id=case_id,
-                decision_id=decision.id,
+            turn = NotificationRecord(
+                id=f"ntf_{case_id}",
                 dedupe_key=f"{case_id}:turn",
-                origin="proactive",
+                source_type="proactive_turn",
+                source_id=decision.id,
                 channel="discord",
                 status="delivered",
-                message="Please review this proactive case.",
-                delivery_payload={"case_id": case_id},
+                title="Proactive case",
+                body="Please review this proactive case.",
+                payload={"case_id": case_id, "decision_id": decision.id},
+                proactive_case_id=case_id,
+                proactive_decision_id=decision.id,
                 delivered_at=now,
                 acked_at=None,
                 created_at=now,
@@ -325,7 +327,9 @@ def _seed_case(
             db.flush()
             db.add(proactive_case)
             db.flush()
-            db.add_all([decision, turn])
+            db.add(decision)
+            db.flush()
+            db.add(turn)
             db.flush()
             proactive_case.last_decision_id = decision.id
             db.add(
@@ -481,8 +485,8 @@ def test_proactive_case_controls_update_state_and_explain_why(postgres_url: str)
         assert ack.status_code == 200
         assert ack.json()["case"]["status"] == "acknowledged"
         assert ack.json()["feedback"]["feedback_type"] == "ack"
-        turns = client.get("/v1/proactive/turns")
-        assert turns.json()["turns"][0]["status"] == "acknowledged"
+        turns = client.get("/v1/notifications?source_type=proactive_turn")
+        assert turns.json()["notifications"][0]["status"] == "acknowledged"
 
         correct = client.post(
             "/v1/proactive/cases/case_api/correct",

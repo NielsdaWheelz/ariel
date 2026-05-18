@@ -3369,48 +3369,6 @@ class ProactiveDecisionRecord(Base):
     )
 
 
-class ProactiveTurnRecord(Base):
-    __tablename__ = "proactive_turns"
-
-    id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    case_id: Mapped[str] = mapped_column(
-        String(32),
-        ForeignKey("proactive_cases.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
-    decision_id: Mapped[str] = mapped_column(
-        String(32),
-        ForeignKey("proactive_decisions.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
-    dedupe_key: Mapped[str] = mapped_column(String(220), nullable=False, unique=True)
-    origin: Mapped[str] = mapped_column(String(32), nullable=False, default="proactive")
-    channel: Mapped[str] = mapped_column(String(32), nullable=False)
-    status: Mapped[str] = mapped_column(String(32), nullable=False)
-    message: Mapped[str] = mapped_column(Text, nullable=False)
-    delivery_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    acked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, index=True
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, index=True
-    )
-
-    __table_args__ = (
-        CheckConstraint(
-            ("status IN ('pending', 'delivered', 'acknowledged', 'failed', 'cancelled')"),
-            name="ck_proactive_turn_status",
-        ),
-        CheckConstraint("origin IN ('proactive')", name="ck_proactive_turn_origin"),
-        CheckConstraint("channel IN ('discord')", name="ck_proactive_turn_channel"),
-        Index("ix_proactive_turns_status_updated", "status", "updated_at"),
-    )
-
-
 class ProactiveActionPlanRecord(Base):
     __tablename__ = "proactive_action_plans"
 
@@ -3871,7 +3829,7 @@ class NotificationRecord(Base):
     __tablename__ = "notifications"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    dedupe_key: Mapped[str] = mapped_column(String(160), nullable=False, unique=True)
+    dedupe_key: Mapped[str] = mapped_column(String(220), nullable=False, unique=True)
     source_type: Mapped[str] = mapped_column(String(32), nullable=False)
     source_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     channel: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -3879,6 +3837,18 @@ class NotificationRecord(Base):
     title: Mapped[str] = mapped_column(Text, nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    proactive_case_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("proactive_cases.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    proactive_decision_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("proactive_decisions.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )
@@ -3902,6 +3872,11 @@ class NotificationRecord(Base):
         CheckConstraint(
             "status IN ('pending', 'delivered', 'failed', 'acknowledged')",
             name="ck_notification_status",
+        ),
+        CheckConstraint(
+            "(source_type = 'proactive_turn') = "
+            "(proactive_case_id IS NOT NULL AND proactive_decision_id IS NOT NULL)",
+            name="ck_notification_proactive_shape",
         ),
     )
 
@@ -4419,24 +4394,6 @@ def serialize_proactive_decision(decision: ProactiveDecisionRecord) -> dict[str,
     }
 
 
-def serialize_proactive_turn(turn: ProactiveTurnRecord) -> dict[str, Any]:
-    return {
-        "id": turn.id,
-        "case_id": turn.case_id,
-        "decision_id": turn.decision_id,
-        "dedupe_key": turn.dedupe_key,
-        "origin": turn.origin,
-        "channel": turn.channel,
-        "status": turn.status,
-        "message": redact_text(turn.message),
-        "delivery_payload": redact_json_value(turn.delivery_payload),
-        "delivered_at": to_rfc3339(turn.delivered_at) if turn.delivered_at is not None else None,
-        "acked_at": to_rfc3339(turn.acked_at) if turn.acked_at is not None else None,
-        "created_at": to_rfc3339(turn.created_at),
-        "updated_at": to_rfc3339(turn.updated_at),
-    }
-
-
 def serialize_proactive_action_plan(plan: ProactiveActionPlanRecord) -> dict[str, Any]:
     return {
         "id": plan.id,
@@ -4537,6 +4494,8 @@ def serialize_notification(notification: NotificationRecord) -> dict[str, Any]:
         "title": redact_text(notification.title),
         "body": redact_text(notification.body),
         "payload": redact_json_value(notification.payload),
+        "proactive_case_id": notification.proactive_case_id,
+        "proactive_decision_id": notification.proactive_decision_id,
         "created_at": to_rfc3339(notification.created_at),
         "updated_at": to_rfc3339(notification.updated_at),
         "delivered_at": (

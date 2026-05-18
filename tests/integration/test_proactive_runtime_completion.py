@@ -23,12 +23,12 @@ from ariel.persistence import (
     MemoryEventRecord,
     MemoryEvidenceRecord,
     MemoryReviewRecord,
+    NotificationRecord,
     ProactiveActionExecutionRecord,
     ProactiveActionPlanRecord,
     ProactiveCaseEventRecord,
     ProactiveCaseRecord,
     ProactiveDecisionRecord,
-    ProactiveTurnRecord,
 )
 from ariel.proactivity import (
     process_proactive_action_execution_due,
@@ -392,7 +392,14 @@ def test_proactive_memory_curation_failure_is_case_audited_before_deliberation(
             assert judgments[0].validation_status == "invalid"
             assert judgments[1].input_refs["dependency"] == "memory_curation"
             assert db.scalar(select(func.count()).select_from(ProactiveDecisionRecord)) == 0
-            assert db.scalar(select(func.count()).select_from(ProactiveTurnRecord)) == 0
+            assert (
+                db.scalar(
+                    select(func.count())
+                    .select_from(NotificationRecord)
+                    .where(NotificationRecord.source_type == "proactive_turn")
+                )
+                == 0
+            )
             assert db.scalar(select(func.count()).select_from(ProactiveActionPlanRecord)) == 0
 
 
@@ -415,7 +422,11 @@ def test_deliberation_denies_unadvertised_function_calls(
         with _session_factory(client)() as db:
             with db.begin():
                 decision = db.scalar(select(ProactiveDecisionRecord).limit(1))
-                turn = db.scalar(select(ProactiveTurnRecord).limit(1))
+                turn = db.scalar(
+                    select(NotificationRecord).where(
+                        NotificationRecord.source_type == "proactive_turn"
+                    )
+                )
 
                 assert adapter.calls == 2
                 assert decision is not None
@@ -435,7 +446,7 @@ def test_deliberation_denies_unadvertised_function_calls(
                 )
                 assert decision.tool_refs == []
                 assert turn is not None
-                assert turn.message == "Leave now from the case evidence."
+                assert turn.body == "Leave now from the case evidence."
 
 
 def test_remember_creates_reviewable_memory_candidate_and_ask_user_sets_asked(
@@ -485,7 +496,10 @@ def test_remember_creates_reviewable_memory_candidate_and_ask_user_sets_asked(
                 )
                 asked_case = db.get(ProactiveCaseRecord, ask_case_id)
                 turn = db.scalar(
-                    select(ProactiveTurnRecord).where(ProactiveTurnRecord.case_id == ask_case_id)
+                    select(NotificationRecord).where(
+                        NotificationRecord.source_type == "proactive_turn",
+                        NotificationRecord.proactive_case_id == ask_case_id,
+                    )
                 )
 
                 assert assertion is not None
@@ -502,7 +516,7 @@ def test_remember_creates_reviewable_memory_candidate_and_ask_user_sets_asked(
                 assert asked_case is not None
                 assert asked_case.status == "asked"
                 assert turn is not None
-                assert turn.message == "Should I keep watching this approval?"
+                assert turn.body == "Should I keep watching this approval?"
 
 
 @pytest.mark.parametrize(
@@ -653,13 +667,17 @@ def test_speak_and_act_authorizes_turn_then_marks_acted_after_action_receipt(
             with db.begin():
                 case = db.get(ProactiveCaseRecord, case_id)
                 plan = db.scalar(select(ProactiveActionPlanRecord).limit(1))
-                turn = db.scalar(select(ProactiveTurnRecord).limit(1))
+                turn = db.scalar(
+                    select(NotificationRecord).where(
+                        NotificationRecord.source_type == "proactive_turn"
+                    )
+                )
                 decision = db.scalar(select(ProactiveDecisionRecord).limit(1))
                 assert case is not None
                 assert case.status == "spoken"
                 assert plan is not None
                 assert turn is not None
-                assert turn.message == "I am drafting a short note."
+                assert turn.body == "I am drafting a short note."
                 assert decision is not None
                 assert decision.policy_result == "authorized"
                 plan_id = plan.id
@@ -776,7 +794,11 @@ def test_speak_and_act_denies_non_low_risk_from_tainted_context(postgres_url: st
             with db.begin():
                 decision = db.scalar(select(ProactiveDecisionRecord).limit(1))
                 action_count = db.scalar(select(func.count(ProactiveActionPlanRecord.id)))
-                turn_count = db.scalar(select(func.count(ProactiveTurnRecord.id)))
+                turn_count = db.scalar(
+                    select(func.count(NotificationRecord.id)).where(
+                        NotificationRecord.source_type == "proactive_turn"
+                    )
+                )
 
                 assert decision is not None
                 assert decision.policy_result == "denied"

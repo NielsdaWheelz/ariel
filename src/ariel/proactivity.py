@@ -44,7 +44,6 @@ from ariel.persistence import (
     ProactiveFeedbackRecord,
     ProactiveLearningRecord,
     ProactiveObservationRecord,
-    ProactiveTurnRecord,
     SessionRecord,
     WorkspaceItemEventRecord,
     WorkspaceItemRecord,
@@ -2201,7 +2200,7 @@ def _validate_and_apply_decision(
 
     should_create_turn = decision.decision_type in {"speak_now", "ask_user", "speak_and_act"}
     if should_create_turn:
-        _create_proactive_turn(
+        _create_proactive_notification(
             db=db,
             case=case,
             decision=decision,
@@ -2324,7 +2323,7 @@ def _apply_remember_decision(
     )
 
 
-def _create_proactive_turn(
+def _create_proactive_notification(
     *,
     db: Session,
     case: ProactiveCaseRecord,
@@ -2334,43 +2333,26 @@ def _create_proactive_turn(
 ) -> None:
     if decision.user_visible_message is None:
         return
-    turn = db.scalar(
-        select(ProactiveTurnRecord)
-        .where(ProactiveTurnRecord.dedupe_key == f"case:{case.id}:decision:{decision.id}:discord")
+    dedupe_key = f"case:{case.id}:decision:{decision.id}:discord"
+    notification = db.scalar(
+        select(NotificationRecord)
+        .where(NotificationRecord.dedupe_key == dedupe_key)
         .with_for_update()
         .limit(1)
     )
-    if turn is None:
-        turn = ProactiveTurnRecord(
-            id=new_id_fn("ptr"),
-            case_id=case.id,
-            decision_id=decision.id,
-            dedupe_key=f"case:{case.id}:decision:{decision.id}:discord",
-            origin="proactive",
-            channel="discord",
-            status="pending",
-            message=decision.user_visible_message,
-            delivery_payload={
-                "case_id": case.id,
-                "decision_id": decision.id,
-            },
-            delivered_at=None,
-            acked_at=None,
-            created_at=now,
-            updated_at=now,
-        )
-        db.add(turn)
-        db.flush()
+    if notification is None:
         notification = NotificationRecord(
             id=new_id_fn("ntf"),
-            dedupe_key=f"proactive-turn:{turn.id}",
+            dedupe_key=dedupe_key,
             source_type="proactive_turn",
-            source_id=turn.id,
+            source_id=decision.id,
             channel="discord",
             status="pending",
             title=case.title,
-            body=turn.message,
-            payload={"proactive_turn_id": turn.id, "case_id": case.id},
+            body=decision.user_visible_message,
+            payload={"case_id": case.id, "decision_id": decision.id},
+            proactive_case_id=case.id,
+            proactive_decision_id=decision.id,
             created_at=now,
             updated_at=now,
         )
@@ -2388,7 +2370,7 @@ def _create_proactive_turn(
             db,
             case_id=case.id,
             event_type="turn_created",
-            payload={"proactive_turn_id": turn.id},
+            payload={"notification_id": notification.id},
             now=now,
             new_id_fn=new_id_fn,
         )
@@ -4678,9 +4660,12 @@ def process_proactive_feedback_learning_due(
                 else None
             )
             turns = db.scalars(
-                select(ProactiveTurnRecord)
-                .where(ProactiveTurnRecord.case_id == case.id)
-                .order_by(ProactiveTurnRecord.created_at.desc(), ProactiveTurnRecord.id.asc())
+                select(NotificationRecord)
+                .where(
+                    NotificationRecord.source_type == "proactive_turn",
+                    NotificationRecord.proactive_case_id == case.id,
+                )
+                .order_by(NotificationRecord.created_at.desc(), NotificationRecord.id.asc())
                 .limit(5)
             ).all()
             action_plans = db.scalars(
@@ -4766,8 +4751,8 @@ def process_proactive_feedback_learning_due(
                         "id": turn.id,
                         "status": turn.status,
                         "channel": turn.channel,
-                        "message": turn.message,
-                        "delivery_payload": turn.delivery_payload,
+                        "message": turn.body,
+                        "delivery_payload": turn.payload,
                         "delivered_at": (
                             to_rfc3339(turn.delivered_at) if turn.delivered_at is not None else None
                         ),
@@ -5018,62 +5003,6 @@ def process_proactive_feedback_learning_due(
                     updated_at=now,
                 )
             )
-
-
-def mark_proactive_turn_delivered(
-    *,
-    db: Session,
-    proactive_turn_id: str,
-    now: datetime,
-) -> None:
-    turn = db.scalar(
-        select(ProactiveTurnRecord)
-        .where(ProactiveTurnRecord.id == proactive_turn_id)
-        .with_for_update()
-        .limit(1)
-    )
-    if turn is not None and turn.status == "pending":
-        turn.status = "delivered"
-        turn.delivered_at = now
-        turn.updated_at = now
-
-
-def mark_proactive_turn_acknowledged(
-    *,
-    db: Session,
-    proactive_turn_id: str,
-    now: datetime,
-    new_id_fn: Callable[[str], str],
-) -> None:
-    turn = db.scalar(
-        select(ProactiveTurnRecord)
-        .where(ProactiveTurnRecord.id == proactive_turn_id)
-        .with_for_update()
-        .limit(1)
-    )
-    if turn is None:
-        return
-    turn.status = "acknowledged"
-    turn.acked_at = now
-    turn.updated_at = now
-    case = db.scalar(
-        select(ProactiveCaseRecord)
-        .where(ProactiveCaseRecord.id == turn.case_id)
-        .with_for_update()
-        .limit(1)
-    )
-    if case is not None:
-        case.status = "acknowledged"
-        case.next_recheck_after = None
-        case.updated_at = now
-        _add_case_event(
-            db,
-            case_id=case.id,
-            event_type="acknowledged",
-            payload={"proactive_turn_id": turn.id},
-            now=now,
-            new_id_fn=new_id_fn,
-        )
 
 
 def safe_proactive_error(exc: Exception) -> str:

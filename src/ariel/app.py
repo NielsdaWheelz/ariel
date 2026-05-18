@@ -126,7 +126,6 @@ from ariel.persistence import (
     ProactiveDecisionRecord,
     ProactiveLearningRecord,
     ProactiveObservationRecord,
-    ProactiveTurnRecord,
     ProjectStateSnapshotRecord,
     ProviderEvidenceRecord,
     ProviderEventRecord,
@@ -160,7 +159,6 @@ from ariel.persistence import (
     serialize_proactive_feedback,
     serialize_proactive_learning_record,
     serialize_proactive_observation,
-    serialize_proactive_turn,
     serialize_provider_event,
     serialize_session,
     serialize_sync_cursor,
@@ -198,7 +196,6 @@ from ariel.response_contracts import (
     build_surface_proactive_feedback_response,
     build_surface_proactive_learning_record_list_response,
     build_surface_proactive_observation_list_response,
-    build_surface_proactive_turn_list_response,
     build_surface_rotation_list_response,
     build_surface_rotation_response,
     build_surface_sync_cursor_list_response,
@@ -3650,7 +3647,6 @@ def create_app(
                 "workspace_items": "/v1/workspace-items",
                 "proactive_observations": "/v1/proactive/observations",
                 "proactive_cases": "/v1/proactive/cases",
-                "proactive_turns": "/v1/proactive/turns",
                 "autonomy_scopes": "/v1/proactive/autonomy-scopes",
                 "jobs": "/v1/jobs",
                 "capture_records": "/v1/captures/record",
@@ -9673,24 +9669,6 @@ def create_app(
                     },
                 }
 
-    @app.get("/v1/proactive/turns")
-    def get_proactive_turns(limit: int = 50) -> dict[str, Any]:
-        _ensure_schema_ready()
-        bounded_limit = max(1, min(limit, 200))
-        with session_factory() as db:
-            with db.begin():
-                turns = db.scalars(
-                    select(ProactiveTurnRecord)
-                    .order_by(ProactiveTurnRecord.created_at.desc(), ProactiveTurnRecord.id.desc())
-                    .limit(bounded_limit)
-                ).all()
-                try:
-                    return build_surface_proactive_turn_list_response(
-                        turns=[serialize_proactive_turn(turn) for turn in turns]
-                    )
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
     @app.post("/v1/proactive/cases/{case_id}/deliberate")
     def deliberate_proactive_case(case_id: str) -> dict[str, Any]:
         _ensure_schema_ready()
@@ -9766,22 +9744,11 @@ def create_app(
                     proactive_case.status = "acknowledged"
                     proactive_case.next_recheck_after = None
                     proactive_case.updated_at = now
-                    turns = db.scalars(
-                        select(ProactiveTurnRecord)
-                        .where(ProactiveTurnRecord.case_id == case_id)
-                        .with_for_update()
-                    ).all()
-                    for turn in turns:
-                        turn.status = "acknowledged"
-                        turn.acked_at = now
-                        turn.updated_at = now
                     notifications = db.scalars(
                         select(NotificationRecord)
                         .where(
                             NotificationRecord.source_type == "proactive_turn",
-                            NotificationRecord.source_id.in_(
-                                [turn.id for turn in turns] or ["none"]
-                            ),
+                            NotificationRecord.proactive_case_id == case_id,
                             NotificationRecord.status != "acknowledged",
                         )
                         .with_for_update()
@@ -10017,15 +9984,24 @@ def create_app(
                 }
 
     @app.get("/v1/notifications")
-    def get_notifications(limit: int = 50) -> dict[str, Any]:
+    def get_notifications(
+        source_type: Literal[
+            "agency_event", "proactive_turn", "approval", "connector_event", "work_follow_up"
+        ]
+        | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
         _ensure_schema_ready()
         bounded_limit = max(1, min(limit, 200))
         with session_factory() as db:
             with db.begin():
+                query = select(NotificationRecord)
+                if source_type is not None:
+                    query = query.where(NotificationRecord.source_type == source_type)
                 notifications = db.scalars(
-                    select(NotificationRecord)
-                    .order_by(NotificationRecord.created_at.desc(), NotificationRecord.id.desc())
-                    .limit(bounded_limit)
+                    query.order_by(
+                        NotificationRecord.created_at.desc(), NotificationRecord.id.desc()
+                    ).limit(bounded_limit)
                 ).all()
                 return {
                     "ok": True,
@@ -10054,41 +10030,30 @@ def create_app(
                         retryable=False,
                     )
                 now = _utcnow()
+                already_acknowledged = notification.status == "acknowledged"
                 notification.status = "acknowledged"
                 notification.acked_at = now
                 notification.updated_at = now
-                payload = notification.payload if isinstance(notification.payload, dict) else {}
-                proactive_turn_id = payload.get("proactive_turn_id")
-                if isinstance(proactive_turn_id, str):
-                    proactive_turn = db.scalar(
-                        select(ProactiveTurnRecord)
-                        .where(ProactiveTurnRecord.id == proactive_turn_id)
+                if notification.proactive_case_id is not None and not already_acknowledged:
+                    proactive_case = db.scalar(
+                        select(ProactiveCaseRecord)
+                        .where(ProactiveCaseRecord.id == notification.proactive_case_id)
                         .with_for_update()
                         .limit(1)
                     )
-                    if proactive_turn is not None and proactive_turn.status != "acknowledged":
-                        proactive_turn.status = "acknowledged"
-                        proactive_turn.acked_at = now
-                        proactive_turn.updated_at = now
-                        proactive_case = db.scalar(
-                            select(ProactiveCaseRecord)
-                            .where(ProactiveCaseRecord.id == proactive_turn.case_id)
-                            .with_for_update()
-                            .limit(1)
+                    if proactive_case is not None:
+                        proactive_case.status = "acknowledged"
+                        proactive_case.next_recheck_after = None
+                        proactive_case.updated_at = now
+                    db.add(
+                        ProactiveCaseEventRecord(
+                            id=_new_id("pce"),
+                            case_id=notification.proactive_case_id,
+                            event_type="acknowledged",
+                            payload={"notification_id": notification.id},
+                            created_at=now,
                         )
-                        if proactive_case is not None:
-                            proactive_case.status = "acknowledged"
-                            proactive_case.next_recheck_after = None
-                            proactive_case.updated_at = now
-                        db.add(
-                            ProactiveCaseEventRecord(
-                                id=_new_id("pce"),
-                                case_id=proactive_turn.case_id,
-                                event_type="acknowledged",
-                                payload={"notification_id": notification.id},
-                                created_at=now,
-                            )
-                        )
+                    )
                 return {"ok": True, "notification": serialize_notification(notification)}
 
     @app.get("/v1/artifacts/{artifact_id}")

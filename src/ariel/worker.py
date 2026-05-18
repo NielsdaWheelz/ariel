@@ -47,7 +47,6 @@ from .memory import (
     scope_keys_for_policy,
 )
 from .proactivity import (
-    mark_proactive_turn_delivered,
     process_proactive_action_execution_due,
     process_proactive_deliberation_due,
     process_proactive_feedback_learning_due,
@@ -1124,7 +1123,6 @@ def _deliver_discord_notification(
             content = f"**{notification.title}**\n{notification.body}"
             payload = notification.payload if isinstance(notification.payload, dict) else {}
             job_id = payload.get("job_id")
-            proactive_turn_id = payload.get("proactive_turn_id")
             proactive_case_id = payload.get("case_id")
             job = (
                 db.scalar(
@@ -1237,13 +1235,6 @@ def _deliver_discord_notification(
             if job is not None and created_thread_id is not None:
                 job.discord_thread_id = created_thread_id
                 job.updated_at = now
-            proactive_turn_id = payload.get("proactive_turn_id")
-            if error is None and isinstance(proactive_turn_id, str):
-                mark_proactive_turn_delivered(
-                    db=db,
-                    proactive_turn_id=proactive_turn_id,
-                    now=now,
-                )
             db.add(
                 NotificationDeliveryRecord(
                     id=_new_id("ndl"),

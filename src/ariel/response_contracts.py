@@ -1378,24 +1378,6 @@ class SurfaceProactiveDecisionContract(BaseModel):
     created_at: str
 
 
-class SurfaceProactiveTurnContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    id: str
-    case_id: str
-    decision_id: str
-    dedupe_key: str
-    origin: Literal["proactive"]
-    channel: Literal["discord"]
-    status: Literal["pending", "delivered", "acknowledged", "failed", "cancelled"]
-    message: str
-    delivery_payload: dict[str, Any]
-    delivered_at: str | None
-    acked_at: str | None
-    created_at: str
-    updated_at: str
-
-
 class SurfaceProactiveActionPlanContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1529,13 +1511,6 @@ class SurfaceProactiveDecisionListResponseContract(BaseModel):
     ok: bool
     case_id: str
     decisions: list[SurfaceProactiveDecisionContract]
-
-
-class SurfaceProactiveTurnListResponseContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    ok: bool
-    turns: list[SurfaceProactiveTurnContract]
 
 
 class SurfaceProactiveActionListResponseContract(BaseModel):
@@ -2346,14 +2321,6 @@ def build_surface_proactive_decision_list_response(
             "case_id": case_id,
             "decisions": decisions if isinstance(decisions, list) else [],
         },
-    )
-
-
-def build_surface_proactive_turn_list_response(*, turns: Any) -> dict[str, Any]:
-    return _validate_contract(
-        "surface_proactive_turn_list_response",
-        SurfaceProactiveTurnListResponseContract,
-        {"ok": True, "turns": turns if isinstance(turns, list) else []},
     )
 
 

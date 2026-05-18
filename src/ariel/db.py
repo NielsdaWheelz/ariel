@@ -79,7 +79,6 @@ REQUIRED_TABLES: Final[tuple[str, ...]] = (
     "proactive_cases",
     "proactive_case_events",
     "proactive_decisions",
-    "proactive_turns",
     "proactive_action_plans",
     "proactive_action_executions",
     "autonomy_scopes",
