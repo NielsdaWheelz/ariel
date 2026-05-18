@@ -287,6 +287,7 @@ def test_subagent_context_carries_the_deterministic_travel_evidence(
     assert context["traffic_delta_seconds"] == 60
     assert context["resolved_origin"] == "Home Base, Seattle"
     assert context["event_location"] == "SEA Airport, Seattle, WA"
+    assert context["event_timezone"] == "UTC"
     assert "leave_by_at" in context
     assert "current_time" in context
 
@@ -318,6 +319,7 @@ def test_notification_contract_and_dedupe_key(
         assert notification.source_id == reminder_id
         assert notification.channel == "discord"
         assert notification.status == "pending"
+        assert notification.title == "Leave-by reminder: Dentist"
         # The version at notify time is one below the final bumped version.
         assert notification.dedupe_key == f"leave-by:{reminder_id}:{reminder.version - 1}"
         assert notification.proactive_case_id is None

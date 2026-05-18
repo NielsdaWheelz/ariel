@@ -304,6 +304,7 @@ def process_leave_by_evaluate_due(
     origin: str | None = None
     destination: str | None = None
     event_start_at: datetime | None = None
+    event_timezone: str | None = None
     with session_factory() as db:
         with db.begin():
             now = now_fn()
@@ -363,6 +364,10 @@ def process_leave_by_evaluate_due(
             origin = resolved_origin
             destination = reminder.event_location
             event_start_at = verified_start
+            start_meta = metadata.get("start")
+            start_tz = start_meta.get("timezone") if isinstance(start_meta, dict) else None
+            if isinstance(start_tz, str) and start_tz.strip():
+                event_timezone = start_tz
 
     # Step 4: compute travel via cap.maps.directions, outside any transaction.
     capability = get_capability("cap.maps.directions")
@@ -471,6 +476,7 @@ def process_leave_by_evaluate_due(
                 "event_summary": reminder.event_summary,
                 "event_location": reminder.event_location,
                 "event_start_at": to_rfc3339(event_start_at),
+                "event_timezone": event_timezone,
                 "resolved_origin": origin,
                 "duration_seconds": duration_seconds,
                 "static_duration_seconds": static_duration_seconds,
@@ -527,7 +533,6 @@ def process_leave_by_evaluate_due(
                 reminder.updated_at = now
                 return
 
-            assert reminder.leave_by_at is not None  # set in the compute transaction
             notification = NotificationRecord(
                 id=new_id_fn("ntf"),
                 dedupe_key=f"leave-by:{reminder.id}:{reminder.version}",
@@ -535,7 +540,7 @@ def process_leave_by_evaluate_due(
                 source_id=reminder.id,
                 channel="discord",
                 status="pending",
-                title=f"Leave by {to_rfc3339(reminder.leave_by_at)}",
+                title=f"Leave-by reminder: {reminder.event_summary or 'your next event'}",
                 body=decision.message,
                 payload={
                     "reminder_id": reminder.id,
@@ -654,11 +659,14 @@ def _run_leave_by_evaluation(
             "content": (
                 "You decide whether Ariel should send a leave-by reminder for an "
                 "upcoming calendar event. The travel evidence below is already "
-                "computed; do not invent numbers. A trivial or already-past trip "
-                "is a skip. When you notify, write the user-facing notification "
-                "body: state the leave-by time, the drive time, and the traffic "
-                "delta, and offer to add an approval-gated 'Leave for X' calendar "
-                "hold the user can accept by replying. Return strict JSON only."
+                "computed; do not invent numbers. Evidence timestamps are UTC; "
+                "render clock times for the user in event_timezone (an IANA zone), "
+                "or in UTC labelled as such when event_timezone is null. A trivial "
+                "or already-past trip is a skip. When you notify, write the "
+                "user-facing notification body: state the leave-by time, the drive "
+                "time, and the traffic delta, and offer to add an approval-gated "
+                "'Leave for X' calendar hold the user can accept by replying. "
+                "Return strict JSON only."
             ),
         },
         {
