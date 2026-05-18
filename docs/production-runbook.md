@@ -213,13 +213,31 @@ Set provider keys only for enabled capabilities:
 ARIEL_SEARCH_WEB_API_KEY=<brave-api-key>
 ARIEL_SEARCH_NEWS_API_KEY=<optional-news-api-key>
 ARIEL_WEB_EXTRACT_API_KEY=<optional-extract-api-key>
-ARIEL_MAPS_PROVIDER_API_KEY_ENC=<encrypted-maps-key>
-ARIEL_MAPS_PROVIDER_ENDPOINT=<custom-maps-provider-base-url>
+ARIEL_MAPS_API_KEY=<google-maps-platform-api-key>
 ARIEL_WEATHER_PROVIDER_MODE=production
 ARIEL_WEATHER_PRODUCTION_API_KEY=<weather-api-key>
 ```
 
 Do not set `ARIEL_MODEL_PROVIDER` or `ARIEL_MODEL_API_BASE_URL`.
+
+Restrict `ARIEL_MAPS_API_KEY` in the Google Cloud console to the Routes API, Places API
+(New), and Geocoding API, and to this deployment's egress IP address. An unrestricted Maps
+key is a direct billing liability if it leaks.
+
+Optional leave-by reminder settings:
+
+```sh
+ARIEL_HOME_ADDRESS=<street address>
+ARIEL_LEAVE_BY_SCAN_INTERVAL_SECONDS=1800.0
+```
+
+The leave-by subsystem watches the calendar for upcoming located events and sends a
+traffic-aware "leave by HH:MM" Discord notification near departure. The worker scans
+every `ARIEL_LEAVE_BY_SCAN_INTERVAL_SECONDS` (default 1800). `ARIEL_HOME_ADDRESS` is
+the trip origin when no preceding located calendar event resolves one; with it unset,
+leave-by-from-home trips are skipped. The subsystem is inert unless `ARIEL_MAPS_API_KEY`
+is set and the Google connector is connected with the calendar read scope — with either
+absent, the scan opens no reminders. See [modules/leave-by.md](modules/leave-by.md).
 
 ## Services
 

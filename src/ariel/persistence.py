@@ -351,7 +351,7 @@ class AIJudgmentRecord(Base):
                 "judgment_type IN ('memory_recall', 'tool_result_interpretation', "
                 "'memory_remember', 'feedback_learning', 'ambient_interpretation', "
                 "'proactive_deliberation', 'model_output', "
-                "'workspace_commitment_extraction')"
+                "'workspace_commitment_extraction', 'leave_by_evaluation')"
             ),
             name="ck_ai_judgment_type",
         ),
@@ -2196,7 +2196,8 @@ class BackgroundTaskRecord(Base):
                 "'proactive_action_execution_due', 'execute_action_attempt', "
                 "'google_object_hydration_due', 'provider_evidence_extraction_due', "
                 "'workspace_commitment_extraction_due', 'work_follow_up_evaluate_due', "
-                "'provider_write_reconcile_due')"
+                "'provider_write_reconcile_due', 'leave_by_scan_due', "
+                "'leave_by_evaluate_due')"
             ),
             name="ck_background_task_type",
         ),
@@ -2434,7 +2435,7 @@ class NotificationRecord(Base):
     __table_args__ = (
         CheckConstraint(
             "source_type IN ('agency_event', 'proactive_turn', 'approval', 'connector_event', "
-            "'work_follow_up')",
+            "'work_follow_up', 'leave_by')",
             name="ck_notification_source_type",
         ),
         CheckConstraint("channel IN ('discord')", name="ck_notification_channel"),
@@ -2476,6 +2477,53 @@ class NotificationDeliveryRecord(Base):
             "status IN ('succeeded', 'failed')",
             name="ck_notification_delivery_status",
         ),
+    )
+
+
+class LeaveByReminderRecord(Base):
+    __tablename__ = "leave_by_reminders"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    provider_account_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    calendar_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    event_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    event_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    event_location: Mapped[str] = mapped_column(Text, nullable=False)
+    event_start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    next_check_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    resolved_origin: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_static_duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    leave_by_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    notification_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("notifications.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "provider_account_id",
+            "calendar_id",
+            "event_id",
+            name="uq_leave_by_reminder_event",
+        ),
+        CheckConstraint(
+            "state IN ('scheduled', 'computed', 'notified', 'skipped', 'cancelled', 'failed')",
+            name="ck_leave_by_reminder_state",
+        ),
+        CheckConstraint("version > 0", name="ck_leave_by_reminder_version"),
     )
 
 

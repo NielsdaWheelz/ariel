@@ -5,6 +5,7 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi.testclient import TestClient
 import httpx
@@ -103,7 +104,6 @@ class ActionProposalAdapter:
 class _FakeHTTPResponse:
     status_code: int
     payload: Any = field(default_factory=dict)
-    text: str = ""
     json_raises: bool = False
 
     def json(self) -> Any:
@@ -229,7 +229,15 @@ def test_s6_pr02_maps_directions_executes_against_routes_api_with_citations(
                     {
                         "distanceMeters": 17200,
                         "duration": "1320s",
+                        "staticDuration": "1080s",
                         "description": "I-5 N",
+                        "legs": [
+                            {
+                                "distanceMeters": 17200,
+                                "duration": "1320s",
+                                "staticDuration": "1080s",
+                            }
+                        ],
                     }
                 ]
             },
@@ -264,13 +272,45 @@ def test_s6_pr02_maps_directions_executes_against_routes_api_with_citations(
         assert attempt["execution"]["status"] == "succeeded"
 
         output = attempt["execution"]["output"]
-        assert output["distance_meters"] == 17200
-        assert output["duration_seconds"] == 1320
+        assert output["origin"] == "Pike Place Market, Seattle, WA"
+        assert output["destination"] == "SEA Airport, Seattle, WA"
+        assert output["waypoints"] == []
+        assert output["travel_mode"] == "driving"
         assert output["uncertainty"] is None
-        assert output["results"][0]["source"].startswith("https://www.google.com/maps/dir/?api=1")
+        assert len(output["routes"]) == 1
+        route = output["routes"][0]
+        assert route["distance_meters"] == 17200
+        assert route["duration_seconds"] == 1320
+        assert route["static_duration_seconds"] == 1080
+        assert route["description"] == "I-5 N"
+        assert route["stops"] == [
+            "Pike Place Market, Seattle, WA",
+            "SEA Airport, Seattle, WA",
+        ]
+        assert route["legs"] == [
+            {"distance_meters": 17200, "duration_seconds": 1320, "static_duration_seconds": 1080}
+        ]
+        assert route["source"].startswith("https://www.google.com/maps/dir/?api=1")
+        assert output["results"][0]["source"] == route["source"]
 
         assert calls[0]["url"] == "https://routes.googleapis.com/directions/v2:computeRoutes"
-        assert calls[0]["json"]["travelMode"] == "DRIVE"
+        assert calls[0]["method"] == "POST"
+        routes_body = calls[0]["json"]
+        assert routes_body["origin"] == {"address": "Pike Place Market, Seattle, WA"}
+        assert routes_body["destination"] == {"address": "SEA Airport, Seattle, WA"}
+        assert routes_body["travelMode"] == "DRIVE"
+        assert routes_body["routingPreference"] == "TRAFFIC_AWARE"
+        # A no-waypoint query requests alternatives and carries no intermediates.
+        assert routes_body["computeAlternativeRoutes"] is True
+        assert "intermediates" not in routes_body
+        assert "optimizeWaypointOrder" not in routes_body
+        routes_headers = calls[0]["headers"]
+        assert routes_headers["x-goog-api-key"] == "test-maps-key"
+        assert routes_headers["x-goog-fieldmask"] == (
+            "routes.distanceMeters,routes.duration,routes.staticDuration,routes.description,"
+            "routes.legs.distanceMeters,routes.legs.duration,routes.legs.staticDuration,"
+            "routes.optimizedIntermediateWaypointIndex"
+        )
 
         assert "[1]" in payload["assistant"]["message"]
         assert len(payload["assistant"]["sources"]) == 1
@@ -348,12 +388,35 @@ def test_s6_pr02_maps_search_places_executes_against_places_api_with_metadata(
         first = output["results"][0]
         assert first["title"] == "Blue Bottle Coffee"
         assert first["source"] == "https://maps.google.com/?cid=1"
-        assert "distance_meters=" in first["snippet"]
-        assert "rating=4.6" in first["snippet"]
-        assert "open_now=true" in first["snippet"]
+        # Place facts are structured fields the model reads directly; the snippet
+        # carries the human-readable address for the citation.
+        assert first["snippet"] == "300 1st Ave, Seattle, WA"
+        assert first["address"] == "300 1st Ave, Seattle, WA"
+        assert first["rating"] == 4.6
+        assert first["rating_count"] == 320
+        assert first["open_now"] is True
+        assert first["business_status"] == "OPERATIONAL"
+        assert isinstance(first["distance_meters"], int)
+        assert output["results"][1]["open_now"] is False
 
+        # Geocoding leg: an address-only GET carrying the api key as a query param.
         assert calls[0]["url"] == "https://maps.googleapis.com/maps/api/geocode/json"
+        assert calls[0]["method"] == "GET"
+        assert calls[0]["params"]["address"] == "Downtown Seattle, WA"
+        assert calls[0]["params"]["key"] == "test-maps-key"
+        # Places leg: a text-search POST with a field mask and a circular location bias.
         assert calls[1]["url"] == "https://places.googleapis.com/v1/places:searchText"
+        assert calls[1]["method"] == "POST"
+        places_body = calls[1]["json"]
+        assert places_body["textQuery"] == "coffee near Downtown Seattle, WA"
+        assert places_body["pageSize"] == 5
+        places_circle = places_body["locationBias"]["circle"]
+        assert places_circle["center"] == {"latitude": 47.6097, "longitude": -122.3331}
+        assert places_circle["radius"] == 2000.0
+        places_headers = calls[1]["headers"]
+        assert places_headers["x-goog-api-key"] == "test-maps-key"
+        assert "places.displayName" in places_headers["x-goog-fieldmask"]
+        assert "places.rating" in places_headers["x-goog-fieldmask"]
 
         assert "[1]" in payload["assistant"]["message"]
         assert len(payload["assistant"]["sources"]) >= 1
@@ -492,14 +555,17 @@ def test_s6_pr02_maps_search_places_missing_location_context_asks_explicit_clari
         assert payload["assistant"]["sources"] == []
 
 
-def test_s6_pr02_maps_credentials_missing_is_typed_and_recoverable(
+def test_s6_pr02_maps_capability_not_offered_when_api_key_missing(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Maps capabilities are exposed only when ARIEL_MAPS_API_KEY is configured.
+    With no key the maps vertical is gated off before execution: no maps action
+    is surfaced and no maps execution lifecycle is recorded."""
     monkeypatch.delenv("ARIEL_MAPS_API_KEY", raising=False)
     adapter = ActionProposalAdapter(
         run_calls_by_message={
-            "maps credentials failure": [
+            "maps without key": [
                 {
                     "name": "maps.directions",
                     "input": {
@@ -510,20 +576,17 @@ def test_s6_pr02_maps_credentials_missing_is_typed_and_recoverable(
                 }
             ]
         },
-        assistant_text_by_message={
-            "maps credentials failure": "provider_credentials_missing: contact the operator."
-        },
+        assistant_text_by_message={"maps without key": "Maps is not configured."},
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
         sent = client.post(
             f"/v1/sessions/{session_id}/message",
-            json={"message": "maps credentials failure"},
+            json={"message": "maps without key"},
         )
         assert sent.status_code == 200
         payload = sent.json()
         assert payload["turn"]["surface_action_lifecycle"] == []
-        assert "provider_credentials_missing" in payload["assistant"]["message"].lower()
         assert all(
             event["event_type"] != "evt.action.execution.started"
             for event in payload["turn"]["events"]
@@ -795,3 +858,557 @@ def test_s6_pr02_maps_outputs_remain_normalized_for_mixed_retrieval_turns(
         assert second_attempt["proposal"]["capability_id"] == "cap.search.web"
         assert first_attempt["execution"]["status"] == "succeeded"
         assert second_attempt["execution"]["status"] == "succeeded"
+
+
+def test_s6_pr02_maps_directions_walking_mode_omits_traffic_routing_preference(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-driving travel mode maps to the right Routes enum and omits the
+    DRIVE-only traffic routing preference; a route with no provider description
+    yields a null `description` and a concise travel-mode citation snippet, and a
+    route with no `staticDuration` yields a null `static_duration_seconds`."""
+    calls = _install_maps_responses(
+        monkeypatch,
+        routes=_FakeHTTPResponse(
+            status_code=200,
+            payload={"routes": [{"distanceMeters": 1400, "duration": "1100s"}]},
+        ),
+    )
+    adapter = ActionProposalAdapter(
+        run_calls_by_message={
+            "walk there": [
+                {
+                    "name": "maps.directions",
+                    "input": {
+                        "origin": "Pike Place Market, Seattle, WA",
+                        "destination": "Seattle Art Museum, Seattle, WA",
+                        "travel_mode": "walking",
+                    },
+                }
+            ]
+        },
+        assistant_text_by_message={"walk there": "The walking route is available [1]."},
+    )
+    with _build_client(postgres_url, adapter) as client:
+        session_id = _session_id(client)
+        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "walk there"})
+        assert sent.status_code == 200
+        attempt = _surface_attempt(sent.json()["turn"])
+        assert attempt["execution"]["status"] == "succeeded"
+        routes_body = calls[0]["json"]
+        assert routes_body["travelMode"] == "WALK"
+        assert "routingPreference" not in routes_body
+        output = attempt["execution"]["output"]
+        route = output["routes"][0]
+        assert route["description"] is None
+        assert route["static_duration_seconds"] is None
+        assert route["legs"] == []
+        assert output["results"][0]["snippet"] == "walking route"
+
+
+def test_s6_pr02_maps_directions_reports_uncertainty_when_no_route(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the Routes API returns no route, the output declares explicit
+    uncertainty and empty `routes`/`results` rather than fabricating a route."""
+    _install_maps_responses(
+        monkeypatch,
+        routes=_FakeHTTPResponse(status_code=200, payload={"routes": []}),
+    )
+    adapter = ActionProposalAdapter(
+        run_calls_by_message={
+            "no route": [
+                {
+                    "name": "maps.directions",
+                    "input": {
+                        "origin": "Pike Place Market, Seattle, WA",
+                        "destination": "SEA Airport, Seattle, WA",
+                        "travel_mode": "driving",
+                    },
+                }
+            ]
+        },
+        assistant_text_by_message={"no route": "I could not find a route."},
+    )
+    with _build_client(postgres_url, adapter) as client:
+        session_id = _session_id(client)
+        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "no route"})
+        assert sent.status_code == 200
+        attempt = _surface_attempt(sent.json()["turn"])
+        assert attempt["execution"]["status"] == "succeeded"
+        output = attempt["execution"]["output"]
+        assert output["uncertainty"] == "insufficient_evidence"
+        assert output["routes"] == []
+        assert output["results"] == []
+
+
+def test_s6_pr02_maps_directions_multi_stop_routes_a_single_legged_trip(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A waypoint request carries `intermediates` and no alternatives flag, returns
+    exactly one route whose `stops` are origin → waypoints → destination, with one
+    leg per stop pair and a `source` deep link that includes the waypoints."""
+    calls = _install_maps_responses(
+        monkeypatch,
+        routes=_FakeHTTPResponse(
+            status_code=200,
+            payload={
+                "routes": [
+                    {
+                        "distanceMeters": 14300,
+                        "duration": "2100s",
+                        "staticDuration": "1980s",
+                        "description": "Errand loop",
+                        "legs": [
+                            {"distanceMeters": 4100, "duration": "660s", "staticDuration": "600s"},
+                            {"distanceMeters": 5200, "duration": "720s", "staticDuration": "690s"},
+                            {"distanceMeters": 5000, "duration": "720s", "staticDuration": "690s"},
+                        ],
+                    }
+                ]
+            },
+        ),
+    )
+    adapter = ActionProposalAdapter(
+        run_calls_by_message={
+            "plan my errands": [
+                {
+                    "name": "maps.directions",
+                    "input": {
+                        "origin": "Home, Seattle, WA",
+                        "destination": "Office, Seattle, WA",
+                        "travel_mode": "driving",
+                        "waypoints": ["Cleaner, Seattle, WA", "Grocery, Seattle, WA"],
+                    },
+                }
+            ]
+        },
+        assistant_text_by_message={"plan my errands": "Your errand route is planned [1]."},
+    )
+    with _build_client(postgres_url, adapter) as client:
+        session_id = _session_id(client)
+        sent = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "plan my errands"}
+        )
+        assert sent.status_code == 200
+        attempt = _surface_attempt(sent.json()["turn"])
+        assert attempt["execution"]["status"] == "succeeded"
+        output = attempt["execution"]["output"]
+        assert output["waypoints"] == ["Cleaner, Seattle, WA", "Grocery, Seattle, WA"]
+        assert len(output["routes"]) == 1
+        route = output["routes"][0]
+        assert route["stops"] == [
+            "Home, Seattle, WA",
+            "Cleaner, Seattle, WA",
+            "Grocery, Seattle, WA",
+            "Office, Seattle, WA",
+        ]
+        assert len(route["legs"]) == len(route["stops"]) - 1
+        assert route["legs"][0] == {
+            "distance_meters": 4100,
+            "duration_seconds": 660,
+            "static_duration_seconds": 600,
+        }
+        assert "&waypoints=" in route["source"]
+
+        routes_body = calls[0]["json"]
+        assert routes_body["intermediates"] == [
+            {"address": "Cleaner, Seattle, WA"},
+            {"address": "Grocery, Seattle, WA"},
+        ]
+        # Waypoint requests and alternatives are mutually exclusive on the Routes API.
+        assert "computeAlternativeRoutes" not in routes_body
+        assert "optimizeWaypointOrder" not in routes_body
+
+
+def test_s6_pr02_maps_directions_optimize_order_reports_googles_chosen_stop_order(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With `optimize_order`, the request sets `optimizeWaypointOrder` and the
+    output `stops` reflect Google's `optimizedIntermediateWaypointIndex` reorder."""
+    calls = _install_maps_responses(
+        monkeypatch,
+        routes=_FakeHTTPResponse(
+            status_code=200,
+            payload={
+                "routes": [
+                    {
+                        "distanceMeters": 13100,
+                        "duration": "1860s",
+                        "staticDuration": "1800s",
+                        "description": "Optimized loop",
+                        # Google visits the second supplied waypoint first.
+                        "optimizedIntermediateWaypointIndex": [1, 0],
+                        "legs": [
+                            {"distanceMeters": 3000, "duration": "500s", "staticDuration": "480s"},
+                            {"distanceMeters": 5100, "duration": "700s", "staticDuration": "680s"},
+                            {"distanceMeters": 5000, "duration": "660s", "staticDuration": "640s"},
+                        ],
+                    }
+                ]
+            },
+        ),
+    )
+    adapter = ActionProposalAdapter(
+        run_calls_by_message={
+            "best errand order": [
+                {
+                    "name": "maps.directions",
+                    "input": {
+                        "origin": "Home, Seattle, WA",
+                        "destination": "Office, Seattle, WA",
+                        "travel_mode": "driving",
+                        "waypoints": ["Cleaner, Seattle, WA", "Grocery, Seattle, WA"],
+                        "optimize_order": True,
+                    },
+                }
+            ]
+        },
+        assistant_text_by_message={"best errand order": "Best errand order found [1]."},
+    )
+    with _build_client(postgres_url, adapter) as client:
+        session_id = _session_id(client)
+        sent = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "best errand order"}
+        )
+        assert sent.status_code == 200
+        attempt = _surface_attempt(sent.json()["turn"])
+        assert attempt["execution"]["status"] == "succeeded"
+        route = attempt["execution"]["output"]["routes"][0]
+        # The reorder swaps the two supplied waypoints between origin and destination.
+        assert route["stops"] == [
+            "Home, Seattle, WA",
+            "Grocery, Seattle, WA",
+            "Cleaner, Seattle, WA",
+            "Office, Seattle, WA",
+        ]
+        routes_body = calls[0]["json"]
+        assert routes_body["optimizeWaypointOrder"] is True
+        assert routes_body["intermediates"] == [
+            {"address": "Cleaner, Seattle, WA"},
+            {"address": "Grocery, Seattle, WA"},
+        ]
+
+
+def test_s6_pr02_maps_directions_returns_alternative_routes_for_plain_query(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A no-waypoint query returns up to three routes; `routes[0]` is the
+    recommended route and the rest are alternatives, each with its own legs."""
+    calls = _install_maps_responses(
+        monkeypatch,
+        routes=_FakeHTTPResponse(
+            status_code=200,
+            payload={
+                "routes": [
+                    {
+                        "distanceMeters": 17200,
+                        "duration": "1200s",
+                        "staticDuration": "1100s",
+                        "description": "I-5 N",
+                        "legs": [
+                            {
+                                "distanceMeters": 17200,
+                                "duration": "1200s",
+                                "staticDuration": "1100s",
+                            }
+                        ],
+                    },
+                    {
+                        "distanceMeters": 19400,
+                        "duration": "1440s",
+                        "staticDuration": "1380s",
+                        "description": "I-405 N",
+                        "legs": [
+                            {
+                                "distanceMeters": 19400,
+                                "duration": "1440s",
+                                "staticDuration": "1380s",
+                            }
+                        ],
+                    },
+                ]
+            },
+        ),
+    )
+    adapter = ActionProposalAdapter(
+        run_calls_by_message={
+            "route options": [
+                {
+                    "name": "maps.directions",
+                    "input": {
+                        "origin": "Pike Place Market, Seattle, WA",
+                        "destination": "SEA Airport, Seattle, WA",
+                        "travel_mode": "driving",
+                    },
+                }
+            ]
+        },
+        assistant_text_by_message={"route options": "Two routes are available [1][2]."},
+    )
+    with _build_client(postgres_url, adapter) as client:
+        session_id = _session_id(client)
+        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "route options"})
+        assert sent.status_code == 200
+        attempt = _surface_attempt(sent.json()["turn"])
+        assert attempt["execution"]["status"] == "succeeded"
+        output = attempt["execution"]["output"]
+        assert len(output["routes"]) == 2
+        # routes[0] is Google's recommended route; the rest are alternatives.
+        assert output["routes"][0]["description"] == "I-5 N"
+        assert output["routes"][0]["duration_seconds"] == 1200
+        assert output["routes"][1]["description"] == "I-405 N"
+        assert output["routes"][1]["duration_seconds"] == 1440
+        # One citation per route.
+        assert len(output["results"]) == 2
+        assert calls[0]["json"]["computeAlternativeRoutes"] is True
+
+
+def test_s6_pr02_maps_directions_caps_alternatives_at_three_routes(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Routes API can return more than three routes; the directions output
+    caps `routes`/`results` at the three-route alternative bound."""
+    _install_maps_responses(
+        monkeypatch,
+        routes=_FakeHTTPResponse(
+            status_code=200,
+            payload={
+                "routes": [
+                    {"distanceMeters": 1000 * n, "duration": f"{600 * n}s", "description": f"R{n}"}
+                    for n in range(1, 6)
+                ]
+            },
+        ),
+    )
+    adapter = ActionProposalAdapter(
+        run_calls_by_message={
+            "many routes": [
+                {
+                    "name": "maps.directions",
+                    "input": {
+                        "origin": "Pike Place Market, Seattle, WA",
+                        "destination": "SEA Airport, Seattle, WA",
+                        "travel_mode": "driving",
+                    },
+                }
+            ]
+        },
+        assistant_text_by_message={"many routes": "Routes are available [1]."},
+    )
+    with _build_client(postgres_url, adapter) as client:
+        session_id = _session_id(client)
+        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "many routes"})
+        assert sent.status_code == 200
+        attempt = _surface_attempt(sent.json()["turn"])
+        assert attempt["execution"]["status"] == "succeeded"
+        output = attempt["execution"]["output"]
+        assert len(output["routes"]) == 3
+        assert len(output["results"]) == 3
+        assert [route["description"] for route in output["routes"]] == ["R1", "R2", "R3"]
+
+
+def test_s6_pr02_maps_search_places_reports_uncertainty_when_no_places(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the Places API returns no candidates, the output declares explicit
+    uncertainty and an empty result set."""
+    _install_maps_responses(
+        monkeypatch,
+        geocode=_seattle_geocode_response(),
+        places=_FakeHTTPResponse(status_code=200, payload={"places": []}),
+    )
+    adapter = ActionProposalAdapter(
+        run_calls_by_message={
+            "no places": [
+                {
+                    "name": "maps.search_places",
+                    "input": {
+                        "query": "coffee",
+                        "location_context": "Downtown Seattle, WA",
+                        "radius_meters": 2000,
+                    },
+                }
+            ]
+        },
+        assistant_text_by_message={"no places": "I could not find nearby places."},
+    )
+    with _build_client(postgres_url, adapter) as client:
+        session_id = _session_id(client)
+        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "no places"})
+        assert sent.status_code == 200
+        attempt = _surface_attempt(sent.json()["turn"])
+        assert attempt["execution"]["status"] == "succeeded"
+        output = attempt["execution"]["output"]
+        assert output["uncertainty"] == "insufficient_evidence"
+        assert output["results"] == []
+
+
+def test_s6_pr02_maps_search_places_unresolvable_location_asks_clarification(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A location string that geocodes to ZERO_RESULTS is a clarification
+    condition, not a provider fault: it surfaces the typed `maps_location_not_found`
+    outcome so the assistant asks for a clearer location instead of retrying."""
+    _install_maps_responses(
+        monkeypatch,
+        geocode=_FakeHTTPResponse(status_code=200, payload={"status": "ZERO_RESULTS"}),
+    )
+    adapter = ActionProposalAdapter(
+        run_calls_by_message={
+            "vague place": [
+                {
+                    "name": "maps.search_places",
+                    "input": {"query": "coffee", "location_context": "near my place"},
+                }
+            ]
+        },
+        assistant_text_by_message={
+            "vague place": "I could not resolve that location; please give a clearer one."
+        },
+    )
+    with _build_client(postgres_url, adapter) as client:
+        session_id = _session_id(client)
+        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "vague place"})
+        assert sent.status_code == 200
+        attempt = _surface_attempt(sent.json()["turn"])
+        assert attempt["execution"]["status"] == "failed"
+        assert attempt["execution"]["error"] == "maps_location_not_found"
+
+
+@pytest.mark.parametrize(
+    ("geocode_response", "places_response", "expected_error"),
+    [
+        (
+            _FakeHTTPResponse(status_code=200, payload={"status": "REQUEST_DENIED"}),
+            None,
+            "provider_permission_denied",
+        ),
+        (
+            _FakeHTTPResponse(status_code=200, payload={"status": "OVER_QUERY_LIMIT"}),
+            None,
+            "provider_rate_limited",
+        ),
+        (
+            _seattle_geocode_response(),
+            _FakeHTTPResponse(status_code=503, payload={"error": {"status": "UNAVAILABLE"}}),
+            "provider_upstream_failure",
+        ),
+    ],
+)
+def test_s6_pr02_maps_search_places_geocoding_and_places_leg_failures_are_typed(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    geocode_response: _FakeHTTPResponse,
+    places_response: _FakeHTTPResponse | None,
+    expected_error: str,
+) -> None:
+    """`search_places` has two wire legs. The Geocoding API signals failure as an
+    HTTP-200 body with a `status` field; the Places API signals it with an HTTP
+    status code. Both legs map to stable typed outcomes."""
+    _install_maps_responses(monkeypatch, geocode=geocode_response, places=places_response)
+    adapter = ActionProposalAdapter(
+        run_calls_by_message={
+            "geocode failure": [
+                {
+                    "name": "maps.search_places",
+                    "input": {"query": "coffee", "location_context": "Downtown Seattle, WA"},
+                }
+            ]
+        },
+        assistant_text_by_message={"geocode failure": f"maps failure: {expected_error}."},
+    )
+    with _build_client(postgres_url, adapter) as client:
+        session_id = _session_id(client)
+        sent = client.post(
+            f"/v1/sessions/{session_id}/message", json={"message": "geocode failure"}
+        )
+        assert sent.status_code == 200
+        attempt = _surface_attempt(sent.json()["turn"])
+        assert attempt["execution"]["status"] == "failed"
+        assert attempt["execution"]["error"] == expected_error
+
+
+def test_s6_pr02_maps_declared_egress_destinations_are_allowlisted() -> None:
+    """Every destination the maps capabilities declare for egress must be a host
+    on the capability's static allowlist. This is the real fail-closed contract;
+    the deny path is exercised separately with an injected hostile destination."""
+    samples: dict[str, dict[str, Any]] = {
+        "cap.maps.directions": {
+            "origin": "Pike Place Market, Seattle, WA",
+            "destination": "SEA Airport, Seattle, WA",
+            "travel_mode": "driving",
+        },
+        "cap.maps.search_places": {
+            "query": "coffee",
+            "location_context": "Downtown Seattle, WA",
+            "radius_meters": 2000,
+        },
+    }
+    for capability_id, sample_input in samples.items():
+        capability = capability_registry_module.get_capability(capability_id)
+        assert capability is not None
+        assert capability.declare_egress_intent is not None
+        declared = capability.declare_egress_intent(sample_input)
+        assert declared is not None and len(declared) >= 1
+        for request in declared:
+            host = urlparse(request["destination"]).hostname
+            assert host in capability.allowed_egress_destinations, (
+                f"{capability_id} declares un-allowlisted egress host {host!r}"
+            )
+
+
+@pytest.mark.parametrize(
+    ("capability_id", "raw_input"),
+    [
+        ("cap.maps.directions", {"origin": "A", "destination": "B", "unexpected": "x"}),
+        ("cap.maps.directions", {"origin": "A", "destination": "B", "travel_mode": "flying"}),
+        ("cap.maps.directions", {"origin": "x" * 321, "destination": "B"}),
+        ("cap.maps.directions", {"origin": "A", "destination": "B", "waypoints": "C"}),
+        (
+            "cap.maps.directions",
+            {"origin": "A", "destination": "B", "waypoints": [f"w{n}" for n in range(11)]},
+        ),
+        ("cap.maps.directions", {"origin": "A", "destination": "B", "waypoints": ["C", ""]}),
+        ("cap.maps.directions", {"origin": "A", "destination": "B", "waypoints": ["C", 7]}),
+        ("cap.maps.directions", {"origin": "A", "destination": "B", "waypoints": ["x" * 321]}),
+        ("cap.maps.directions", {"origin": "A", "destination": "B", "optimize_order": "yes"}),
+        ("cap.maps.search_places", {"query": "coffee", "radius_meters": 50}),
+        ("cap.maps.search_places", {"query": "coffee", "radius_meters": 99999}),
+        ("cap.maps.search_places", {"query": "", "location_context": "Seattle, WA"}),
+        ("cap.maps.search_places", {"query": "x" * 201, "location_context": "Seattle, WA"}),
+        ("cap.maps.search_places", {"query": "coffee", "unexpected": "x"}),
+    ],
+)
+def test_s6_pr02_maps_input_validation_rejects_malformed_payloads(
+    capability_id: str,
+    raw_input: dict[str, Any],
+) -> None:
+    """Maps input validators reject structurally invalid payloads at the boundary
+    with a `schema_invalid` typed error — before any provider call."""
+    capability = capability_registry_module.get_capability(capability_id)
+    assert capability is not None
+    normalized, error = capability.validate_input(raw_input)
+    assert normalized is None
+    assert error == "schema_invalid"
+
+
+def test_s6_pr02_maps_search_places_radius_defaults_when_omitted() -> None:
+    """radius_meters has a single owner — the input validator — which defaults it
+    to 2000 m when the caller omits it; execution trusts that normalized value."""
+    capability = capability_registry_module.get_capability("cap.maps.search_places")
+    assert capability is not None
+    normalized, error = capability.validate_input(
+        {"query": "coffee", "location_context": "Seattle, WA"}
+    )
+    assert error is None
+    assert normalized is not None
+    assert normalized["radius_meters"] == 2000

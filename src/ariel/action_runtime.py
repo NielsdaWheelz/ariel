@@ -20,6 +20,7 @@ from ariel.capability_registry import (
     CapabilityDefinition,
     DISCORD_CAPABILITY_IDS,
     EMAIL_MUTATION_CAPABILITY_IDS,
+    MAPS_CAPABILITY_IDS,
     MEMORY_CAPABILITY_IDS,
     canonical_action_payload,
     capability_contract_hash,
@@ -752,13 +753,12 @@ _MAX_SNIPPET_LENGTH = 320
 _MAX_DIRECT_TOOL_OUTPUT_JSON_CHARS = 6_000
 _MAX_INTERPRETER_OUTPUT_JSON_CHARS = 16_000
 _MODALITY_HEAVY_VALUES = {"audio", "document", "image", "video"}
-_MAPS_RETRIEVAL_CAPABILITY_IDS = {"cap.maps.directions", "cap.maps.search_places"}
 _WEB_EXTRACT_RETRIEVAL_CAPABILITY_IDS = {"cap.web.extract"}
 _GROUNDED_RETRIEVAL_CAPABILITIES = {
     "cap.search.web",
     "cap.search.news",
     "cap.weather.forecast",
-    *_MAPS_RETRIEVAL_CAPABILITY_IDS,
+    *MAPS_CAPABILITY_IDS,
     *_WEB_EXTRACT_RETRIEVAL_CAPABILITY_IDS,
     *ATTACHMENT_CAPABILITY_IDS,
     *GOOGLE_READ_CAPABILITY_IDS,

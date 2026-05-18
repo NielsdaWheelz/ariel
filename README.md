@@ -338,19 +338,36 @@ slice-6 pr-02 adds maps retrieval capabilities under explicit read-only policy a
 - allowlisted read callables (no approval path):
   - `maps.directions`
   - `maps.search_places`
-- maps execution uses server-managed provider credentials only (no google oauth reconnect/consent loop).
-- maps capability contracts remain strict and retrieval-native (citation-ready `results[]` + `retrieved_at`).
+- maps execution calls the Google Maps Platform directly with a server-managed api key
+  (no google oauth reconnect/consent loop):
+  - `maps.directions` calls the Routes API (`routes.googleapis.com`)
+  - `maps.search_places` calls the Geocoding API then the Places API New
+    (`maps.googleapis.com`, `places.googleapis.com`)
+- `maps.directions` is multi-stop: it accepts up to ten ordered `waypoints` and an
+  `optimize_order` flag that lets Google reorder them for the shortest trip. A plain
+  origin-to-destination query returns up to three alternative `routes` (`routes[0]` is
+  the recommended one); a waypoint query returns one route. Each route carries a
+  traffic-aware `duration_seconds`, a free-flow `static_duration_seconds`, the effective
+  ordered `stops`, and a per-leg breakdown.
+- `maps.search_places` enforces `radius_meters` exactly: the geocoded location centers a Places
+  location bias, and results are haversine-filtered to the requested radius.
+- maps capability contracts remain strict and retrieval-native (citation-ready `results[]` +
+  `retrieved_at`); citations are canonical Google Maps URLs. nearby-place results carry
+  structured `rating`, `open_now`, `business_status`, and `distance_meters` fields.
 - required-field clarification behavior is deterministic and explicit:
   - `maps_origin_required`
   - `maps_destination_required`
   - `maps_location_context_required`
-- maps credential/config failures are typed and recoverable:
+- an unresolvable `location_context` surfaces `maps_location_not_found` so the assistant
+  asks for a clearer location instead of retrying.
+- maps credential failures are typed and recoverable:
   - `provider_credentials_missing`
-  - `provider_credentials_invalid`
 - maps provider/runtime failures are typed and recoverable:
   - `provider_timeout`, `provider_network_failure`, `provider_rate_limited`,
     `provider_upstream_failure`, `provider_permission_denied`, `provider_request_rejected`,
-    `provider_invalid_payload`, `provider_unreachable`
+    `provider_invalid_payload`
+- transient provider failures (timeout, network, `429`, `5xx`) are retried with bounded attempts
+  before a typed failure is surfaced.
 - maps retrieval remains isolated from google connector readiness/consent state.
 - maps outputs stay grounded with inline citations and `assistant.sources[]` in single- and mixed-retrieval turns.
 
@@ -468,15 +485,12 @@ weather capability runtime config:
 
 maps capability runtime config:
 
-- `ARIEL_MAPS_PROVIDER_API_KEY_ENC` (required; encrypted maps provider api key)
-- `ARIEL_MAPS_PROVIDER_ENDPOINT` (required with maps credentials; custom maps provider/proxy base URL)
-- `ARIEL_MAPS_PROVIDER_TIMEOUT_SECONDS` (optional; defaults to `8.0`)
+- `ARIEL_MAPS_API_KEY` (required for maps; a Google Maps Platform api key with the Routes API,
+  Places API (New), and Geocoding API enabled)
+- `ARIEL_MAPS_TIMEOUT_SECONDS` (optional provider timeout; defaults to `8.0`)
 
-maps encrypted key handling uses the existing connector cipher/keyring settings:
-
-- `ARIEL_CONNECTOR_ENCRYPTION_KEY_VERSION`
-- `ARIEL_CONNECTOR_ENCRYPTION_KEYS`
-- `ARIEL_CONNECTOR_ENCRYPTION_SECRET`
+restrict the api key in the Google Cloud console to those three APIs and to the deployment's
+egress IP address. maps capabilities are exposed to the agent only when `ARIEL_MAPS_API_KEY` is set.
 
 web extract capability runtime config:
 

@@ -529,7 +529,8 @@ def test_google_provider_event_ingress_is_token_bound_deduped_and_conflict_safe(
                 task_type = db.execute(
                     text(
                         "SELECT task_type FROM background_tasks "
-                        "WHERE status = 'pending' AND task_type != 'memory_sweep' "
+                        "WHERE status = 'pending' "
+                        "AND task_type NOT IN ('memory_sweep', 'leave_by_scan_due') "
                         "ORDER BY created_at DESC LIMIT 1"
                     )
                 ).scalar_one()
@@ -695,7 +696,8 @@ def test_proactive_interpretation_deliberates_speaks_and_acknowledges_case_and_t
                 task_type = db.execute(
                     text(
                         "SELECT task_type FROM background_tasks "
-                        "WHERE status = 'pending' AND task_type != 'memory_sweep' "
+                        "WHERE status = 'pending' "
+                        "AND task_type NOT IN ('memory_sweep', 'leave_by_scan_due') "
                         "ORDER BY created_at DESC LIMIT 1"
                     )
                 ).scalar_one()
@@ -833,12 +835,14 @@ def test_proactive_wait_decision_schedules_and_runs_durable_follow_up(
         with _session_factory(client)() as db:
             with db.begin():
                 # The proactive follow-up is the only pending proactive task;
-                # the worker's self-gated memory_sweep is excluded.
+                # the worker's self-gated memory_sweep and leave_by_scan_due
+                # recurring tasks are excluded.
                 pending_tasks = (
                     db.execute(
                         text(
                             "SELECT task_type FROM background_tasks "
-                            "WHERE status = 'pending' AND task_type != 'memory_sweep' "
+                            "WHERE status = 'pending' "
+                            "AND task_type NOT IN ('memory_sweep', 'leave_by_scan_due') "
                             "ORDER BY created_at DESC"
                         )
                     )
@@ -866,7 +870,8 @@ def test_proactive_wait_decision_schedules_and_runs_durable_follow_up(
                 task_type = db.execute(
                     text(
                         "SELECT task_type FROM background_tasks "
-                        "WHERE status = 'pending' AND task_type != 'memory_sweep' "
+                        "WHERE status = 'pending' "
+                        "AND task_type NOT IN ('memory_sweep', 'leave_by_scan_due') "
                         "ORDER BY created_at DESC LIMIT 1"
                     )
                 ).scalar_one()

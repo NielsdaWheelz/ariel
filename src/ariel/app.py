@@ -40,6 +40,7 @@ from ariel.agency_daemon import AgencyDaemonClient, AgencyRuntime
 from ariel.attachment_content import AttachmentContentRuntime
 from ariel.capability_registry import (
     EMAIL_MUTATION_CAPABILITY_IDS,
+    MAPS_CAPABILITY_IDS,
     MEMORY_CAPABILITY_IDS,
     get_capability,
     internal_callable_capability_ids,
@@ -2758,7 +2759,7 @@ def _eligible_internal_callable_capability_ids(
             if bindings.get("search_news") is True:
                 capability_ids.append(capability_id)
             continue
-        if capability_id.startswith("cap.maps."):
+        if capability_id in MAPS_CAPABILITY_IDS:
             if bindings.get("maps") is True:
                 capability_ids.append(capability_id)
             continue

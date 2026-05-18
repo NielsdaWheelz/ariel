@@ -93,6 +93,8 @@ class AppSettings(BaseSettings):
     web_extract_api_key: str | None = None
     maps_api_key: str | None = None
     maps_timeout_seconds: float = 8.0
+    home_address: str | None = None
+    leave_by_scan_interval_seconds: float = 1800.0
     weather_provider_mode: str = "production"
     weather_production_endpoint: str = "https://api.tomorrow.io/v4/weather/forecast"
     weather_production_timeout_seconds: float = 8.0
@@ -142,6 +144,7 @@ class AppSettings(BaseSettings):
         "maps_api_key",
         "weather_production_api_key",
         "weather_default_location",
+        "home_address",
         mode="before",
     )
     @classmethod
@@ -437,6 +440,7 @@ class AppSettings(BaseSettings):
         "search_news_timeout_seconds",
         "web_extract_timeout_seconds",
         "maps_timeout_seconds",
+        "leave_by_scan_interval_seconds",
         "weather_production_timeout_seconds",
         "weather_dev_timeout_seconds",
         "worker_poll_seconds",
