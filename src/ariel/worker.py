@@ -440,9 +440,7 @@ def process_one_task(
                 now=now,
             )
             enqueue_due_worker_owned_ambient_task(db, settings=resolved_settings, now=now)
-            enqueue_due_memory_sweep(
-                db, settings=resolved_settings, now=now, new_id_fn=_new_id
-            )
+            enqueue_due_memory_sweep(db, settings=resolved_settings, now=now, new_id_fn=_new_id)
 
     with session_factory() as db:
         with db.begin():

@@ -300,9 +300,7 @@ def gather_candidates(
         .limit(1)
     )
     if embedded_exists is not None and query.strip():
-        distance = MemoryFactRecord.embedding.cosine_distance(
-            embed_text(query, settings=settings)
-        )
+        distance = MemoryFactRecord.embedding.cosine_distance(embed_text(query, settings=settings))
         for fact in db.scalars(
             select(MemoryFactRecord)
             .where(
@@ -597,9 +595,7 @@ def run_retriever(
                 settings=settings,
                 limit=settings.memory_recall_candidate_limit,
             )
-            candidate_payload = [
-                {"id": fact.id, "content": fact.content} for fact in candidates
-            ]
+            candidate_payload = [{"id": fact.id, "content": fact.content} for fact in candidates]
             candidate_ids = {fact.id for fact in candidates}
 
     # The bounded model call, then validation -- a failure in either path is
@@ -675,9 +671,7 @@ def run_retriever(
 # ---------------------------------------------------------------------------
 # The rememberer subagent
 # ---------------------------------------------------------------------------
-def _validated_rememberer_output(
-    raw_payload: Any, *, candidate_ids: set[str]
-) -> RemembererOutput:
+def _validated_rememberer_output(raw_payload: Any, *, candidate_ids: set[str]) -> RemembererOutput:
     """Narrow the rememberer's raw JSON into a :class:`RemembererOutput`, or fail
     closed.
 
@@ -718,9 +712,7 @@ def _validated_rememberer_output(
                 raise _schema_failure("memory rememberer edit operation missing content")
             if fact_id not in candidate_ids:
                 raise _validation_failure("memory rememberer edited an unknown fact id")
-            operations.append(
-                FactOperation(op="edit", content=content.strip(), fact_id=fact_id)
-            )
+            operations.append(FactOperation(op="edit", content=content.strip(), fact_id=fact_id))
         elif op == "forget":
             fact_id = item.get("fact_id")
             if not isinstance(fact_id, str) or not fact_id:
@@ -871,14 +863,10 @@ def run_rememberer(
                 )
                 if long_forgotten:
                     db.execute(
-                        delete(MemoryFactRecord).where(
-                            MemoryFactRecord.id.in_(long_forgotten)
-                        )
+                        delete(MemoryFactRecord).where(MemoryFactRecord.id.in_(long_forgotten))
                     )
                 deleted = len(long_forgotten)
-                candidates = list_active_facts(
-                    db, limit=settings.memory_recall_candidate_limit
-                )
+                candidates = list_active_facts(db, limit=settings.memory_recall_candidate_limit)
             else:
                 deleted = 0
                 candidates = gather_candidates(
@@ -893,9 +881,7 @@ def run_rememberer(
             if effective_session_id is not None:
                 session = db.get(SessionRecord, effective_session_id)
                 session_digest = session.digest if session is not None else None
-            candidate_payload = [
-                {"id": fact.id, "content": fact.content} for fact in candidates
-            ]
+            candidate_payload = [{"id": fact.id, "content": fact.content} for fact in candidates]
             candidate_ids = {fact.id for fact in candidates}
 
     # The audit row's source identifies what was reviewed: a session for a turn

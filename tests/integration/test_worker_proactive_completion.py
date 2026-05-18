@@ -262,16 +262,32 @@ def test_worker_owns_periodic_ambient_interpretation(
 
     with session_factory() as db:
         with db.begin():
-            tasks = db.scalars(select(BackgroundTaskRecord)).all()
-            assert len(tasks) == 1
-            task = tasks[0]
-            assert task.task_type == "ambient_interpretation_due"
+            # The worker's periodic-enqueue pass also self-gates a memory_sweep
+            # task; the ambient interpretation task is asserted on directly.
+            ambient_tasks = db.scalars(
+                select(BackgroundTaskRecord).where(
+                    BackgroundTaskRecord.task_type == "ambient_interpretation_due"
+                )
+            ).all()
+            assert len(ambient_tasks) == 1
+            task = ambient_tasks[0]
             assert task.payload == {"origin": "worker_ambient"}
             assert task.status == "completed"
             assert task.attempts == 1
             assert task.max_attempts == 4
 
-    assert not process_one_task(session_factory=session_factory, settings=settings, worker_id="w1")
+    # The ambient interpretation enqueuer is self-gating: a later tick never
+    # enqueues a second ambient_interpretation_due task while one is recent.
+    for _ in range(4):
+        process_one_task(session_factory=session_factory, settings=settings, worker_id="w1")
+    with session_factory() as db:
+        with db.begin():
+            ambient_tasks = db.scalars(
+                select(BackgroundTaskRecord).where(
+                    BackgroundTaskRecord.task_type == "ambient_interpretation_due"
+                )
+            ).all()
+            assert len(ambient_tasks) == 1
 
 
 def test_failed_proactive_tasks_recover_until_retry_budget_is_exhausted(

@@ -7,22 +7,15 @@ from typing import Any, cast
 
 from fastapi.testclient import TestClient
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 
 from ariel.app import create_app
 from ariel.config import AppSettings
 from ariel.executor import ExecutionResult
 from ariel.google_connector import GoogleCapabilityExecutionResult
-from ariel.memory import AIJudgmentFailure
 from ariel.persistence import (
     AIJudgmentRecord,
     AutonomyScopeRecord,
-    MemoryActionTraceRecord,
-    MemoryAssertionEvidenceRecord,
-    MemoryAssertionRecord,
-    MemoryEventRecord,
-    MemoryEvidenceRecord,
-    MemoryReviewRecord,
     ProactiveActionExecutionRecord,
     ProactiveActionPlanRecord,
     ProactiveCaseEventRecord,
@@ -92,8 +85,8 @@ class ToolCallingProactiveAdapter:
                 "output": [
                     {
                         "type": "function_call",
-                        "call_id": "call_proactive_memory_search",
-                        "name": "cap_memory_search",
+                        "call_id": "call_unadvertised_tool",
+                        "name": "unadvertised_tool",
                         "arguments": json.dumps({"query": "case evidence"}),
                     }
                 ],
@@ -352,52 +345,55 @@ def test_json_parse_failure_persists_invalid_decision_record(postgres_url: str) 
                 assert validation.result == "invalid_decision"
 
 
-def test_proactive_memory_curation_failure_is_case_audited_before_deliberation(
+def test_proactive_retriever_failure_is_audited_but_deliberation_still_completes(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A failed pre-deliberation retriever call is non-fatal: it is audited as a
+    failed ``memory_recall`` judgment, and the deliberation still runs on the
+    profile alone -- recall is never on the deliberation's critical-failure
+    path. The retriever's bounded model call is stubbed to return HTTP 500."""
+
     now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
     adapter = ProactiveAdapter(json.dumps(_decision_payload(decision="ignore")))
 
-    def fail_memory_context(*args: Any, **kwargs: Any) -> tuple[dict[str, Any], dict[str, Any]]:
-        del args, kwargs
-        raise AIJudgmentFailure(
-            code="E_AI_JUDGMENT_SCHEMA",
-            safe_reason="fixture memory curation failed",
-            retryable=True,
-            parse_status="schema_invalid",
-            validation_status="invalid",
-            provider_response_id="resp_memory_failure",
-        )
+    class _FailingResponse:
+        status_code = 500
 
-    monkeypatch.setattr("ariel.proactivity.build_memory_context", fail_memory_context)
+        def json(self) -> dict[str, Any]:
+            return {"error": "boom"}
+
+        def raise_for_status(self) -> None:
+            return None
+
+    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr("ariel.memory.httpx.post", lambda *args, **kwargs: _FailingResponse())
 
     with _build_client(postgres_url, adapter) as client:
         case_id = _seed_case(client, now=now)
-        with pytest.raises(RuntimeError, match="fixture memory curation failed"):
-            _run_deliberation(client, case_id=case_id, adapter=adapter, now=now)
+        _run_deliberation(client, case_id=case_id, adapter=adapter, now=now)
 
         with _session_factory(client)() as db:
             case = db.get(ProactiveCaseRecord, case_id)
             assert case is not None
-            assert case.status == "failed"
-            judgments = db.scalars(
-                select(AIJudgmentRecord).order_by(AIJudgmentRecord.created_at.asc())
-            ).all()
-            assert [judgment.judgment_type for judgment in judgments] == [
-                "memory_curation",
-                "proactive_deliberation",
-            ]
-            assert all(judgment.source_id == case_id for judgment in judgments)
-            assert judgments[0].provider_response_id == "resp_memory_failure"
-            assert judgments[0].failure_code == "E_AI_JUDGMENT_SCHEMA"
-            assert judgments[0].parse_status == "schema_invalid"
-            assert judgments[0].validation_status == "invalid"
-            assert judgments[1].input_refs["dependency"] == "memory_curation"
-            assert db.scalar(select(func.count()).select_from(ProactiveContextSnapshotRecord)) == 0
-            assert db.scalar(select(func.count()).select_from(ProactiveDecisionRecord)) == 0
-            assert db.scalar(select(func.count()).select_from(ProactiveTurnRecord)) == 0
-            assert db.scalar(select(func.count()).select_from(ProactiveActionPlanRecord)) == 0
+            # The deliberation completed despite the failed retriever call.
+            assert case.status == "ignored"
+            failed_recall = db.scalar(
+                select(AIJudgmentRecord).where(
+                    AIJudgmentRecord.judgment_type == "memory_recall",
+                    AIJudgmentRecord.status == "failed",
+                )
+            )
+            assert failed_recall is not None
+            assert failed_recall.source_id == case_id
+            # The deliberation judgment still ran and recorded its decision.
+            deliberation = db.scalar(
+                select(AIJudgmentRecord).where(
+                    AIJudgmentRecord.judgment_type == "proactive_deliberation"
+                )
+            )
+            assert deliberation is not None
+            assert db.scalar(select(func.count()).select_from(ProactiveDecisionRecord)) == 1
 
 
 def test_deliberation_denies_unadvertised_function_calls(
@@ -426,8 +422,8 @@ def test_deliberation_denies_unadvertised_function_calls(
                 assert snapshot is not None
                 assert snapshot.context["tool_outputs"] == [
                     {
-                        "call_id": "call_proactive_memory_search",
-                        "tool_name": "cap_memory_search",
+                        "call_id": "call_unadvertised_tool",
+                        "tool_name": "unadvertised_tool",
                         "capability_id": None,
                         "result": {
                             "status": "failed",
@@ -444,22 +440,18 @@ def test_deliberation_denies_unadvertised_function_calls(
                 assert turn.message == "Leave now from the case evidence."
 
 
-def test_remember_creates_reviewable_memory_candidate_and_ask_user_sets_asked(
+def test_remember_decision_runs_the_rememberer_and_ask_user_sets_asked(
     postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A proactive ``remember`` decision delegates to the rememberer subagent --
+    which writes facts directly, with no candidate or review step -- and the
+    case resolves with the applied operation count. An ``ask_user`` decision
+    sets the case to ``asked`` and emits the user-visible turn."""
+
     now = datetime(2026, 5, 7, 12, 5, tzinfo=UTC)
     remember = ProactiveAdapter(
-        json.dumps(
-            _decision_payload(
-                decision="remember",
-                memory={
-                    "subject_key": "project:phoenix",
-                    "predicate": "deadline",
-                    "value": "Ship tomorrow.",
-                    "assertion_type": "project_state",
-                },
-            )
-        )
+        json.dumps(_decision_payload(decision="remember", memory="Phoenix ships tomorrow."))
     )
     ask = ProactiveAdapter(
         json.dumps(
@@ -469,6 +461,52 @@ def test_remember_creates_reviewable_memory_candidate_and_ask_user_sets_asked(
             )
         )
     )
+
+    # The rememberer is a bounded model call; stub it to write one fact, and
+    # stub the embeddings call the write triggers.
+    class _Response:
+        def __init__(self, payload: dict[str, Any]) -> None:
+            self._payload = payload
+            self.status_code = 200
+
+        def json(self) -> dict[str, Any]:
+            return self._payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+    def fake_post(url: str, **_: Any) -> _Response:
+        if "embeddings" in url:
+            return _Response({"data": [{"embedding": [0.0] * 1535 + [1.0]}]})
+        return _Response(
+            {
+                "id": "resp_rememberer",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": json.dumps(
+                                    {
+                                        "operations": [
+                                            {"op": "write", "content": "Phoenix ships tomorrow."}
+                                        ],
+                                        "profile": None,
+                                        "digest": None,
+                                    }
+                                ),
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+
+    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr("ariel.memory.httpx.post", fake_post)
+
     with _build_client(postgres_url, remember) as client:
         remember_case_id = _seed_case(client, now=now)
         _run_deliberation(client, case_id=remember_case_id, adapter=remember, now=now)
@@ -476,39 +514,36 @@ def test_remember_creates_reviewable_memory_candidate_and_ask_user_sets_asked(
         _run_deliberation(client, case_id=ask_case_id, adapter=ask, now=now)
 
         with _session_factory(client)() as db:
-            with db.begin():
-                assertion = db.scalar(select(MemoryAssertionRecord).limit(1))
-                assertion_evidence = db.scalar(select(MemoryAssertionEvidenceRecord).limit(1))
-                review = db.scalar(select(MemoryReviewRecord).limit(1))
-                remember_event = db.scalar(
-                    select(ProactiveCaseEventRecord)
-                    .where(
-                        ProactiveCaseEventRecord.case_id == remember_case_id,
-                        ProactiveCaseEventRecord.event_type == "resolved",
-                    )
-                    .order_by(ProactiveCaseEventRecord.created_at.desc())
-                    .limit(1)
+            # The rememberer wrote the fact directly -- active immediately, no
+            # candidate or review state.
+            facts = list(db.execute(text("SELECT content, status FROM memory_facts")))
+            assert len(facts) == 1
+            assert facts[0][0] == "Phoenix ships tomorrow."
+            assert facts[0][1] == "active"
+            # Every rememberer run is audited as one memory_remember judgment.
+            remember_judgment = db.scalar(
+                select(AIJudgmentRecord).where(AIJudgmentRecord.judgment_type == "memory_remember")
+            )
+            assert remember_judgment is not None
+            remember_event = db.scalar(
+                select(ProactiveCaseEventRecord)
+                .where(
+                    ProactiveCaseEventRecord.case_id == remember_case_id,
+                    ProactiveCaseEventRecord.event_type == "resolved",
                 )
-                asked_case = db.get(ProactiveCaseRecord, ask_case_id)
-                turn = db.scalar(
-                    select(ProactiveTurnRecord).where(ProactiveTurnRecord.case_id == ask_case_id)
-                )
-
-                assert assertion is not None
-                assert assertion.subject_key == "project:phoenix"
-                assert assertion.object_value == {"text": "Ship tomorrow."}
-                assert assertion.lifecycle_state == "candidate"
-                assert assertion_evidence is not None
-                assert assertion_evidence.assertion_id == assertion.id
-                assert review is not None
-                assert review.assertion_id == assertion.id
-                assert review.decision == "needs_user_review"
-                assert remember_event is not None
-                assert remember_event.payload["memory_candidate_assertion_id"] == assertion.id
-                assert asked_case is not None
-                assert asked_case.status == "asked"
-                assert turn is not None
-                assert turn.message == "Should I keep watching this approval?"
+                .order_by(ProactiveCaseEventRecord.created_at.desc())
+                .limit(1)
+            )
+            assert remember_event is not None
+            assert remember_event.payload["memory_operation_count"] == 1
+            asked_case = db.get(ProactiveCaseRecord, ask_case_id)
+            turn = db.scalar(
+                select(ProactiveTurnRecord).where(ProactiveTurnRecord.case_id == ask_case_id)
+            )
+            assert asked_case is not None
+            assert asked_case.status == "asked"
+            assert turn is not None
+            assert turn.message == "Should I keep watching this approval?"
 
 
 @pytest.mark.parametrize(
@@ -520,7 +555,7 @@ def test_remember_creates_reviewable_memory_candidate_and_ask_user_sets_asked(
             "proactive Discord messages must use speak_now or ask_user",
         ),
         (
-            "cap.memory.propose",
+            "cap.memory.remember",
             "memory",
             "proactive memory updates must use decision=remember",
         ),
@@ -686,63 +721,6 @@ def test_speak_and_act_authorizes_turn_then_marks_acted_after_action_receipt(
                 assert case.status == "acted"
                 assert execution is not None
                 assert execution.external_receipt == {"status": "drafted"}
-
-
-def test_proactive_action_execution_records_action_trace_with_evidence(
-    postgres_url: str,
-) -> None:
-    now = datetime(2026, 5, 7, 12, 19, tzinfo=UTC)
-    action = {
-        "action_type": "cap.email.draft",
-        "target": "team-email",
-        "target_system": "gmail",
-        "payload": _email_draft_payload("proactive-trace-draft", "Draft the traced note."),
-        "risk_tier": "low",
-    }
-    adapter = ProactiveAdapter(json.dumps(_decision_payload(decision="act_now", actions=[action])))
-    google_runtime = ProactiveGoogleRuntime(
-        [ExecutionResult(status="succeeded", output={"status": "drafted"}, error=None)]
-    )
-    with _build_client(postgres_url, adapter) as client:
-        _seed_scope(client, action_type="cap.email.draft", target_system="gmail", now=now)
-        case_id = _seed_case(client, now=now)
-        _run_deliberation(client, case_id=case_id, adapter=adapter, now=now)
-        with _session_factory(client)() as db:
-            with db.begin():
-                plan = db.scalar(select(ProactiveActionPlanRecord).limit(1))
-                assert plan is not None
-                plan_id = plan.id
-
-        process_proactive_action_execution_due(
-            session_factory=_session_factory(client),
-            task_payload={"action_plan_id": plan_id},
-            google_runtime=google_runtime,
-            now_fn=lambda: now,
-            new_id_fn=_new_id,
-        )
-
-        with _session_factory(client)() as db:
-            trace = db.scalar(select(MemoryActionTraceRecord).limit(1))
-            assert trace is not None
-            assert trace.scope_key == f"proactive:{case_id}"
-            assert trace.trace_type == "execution"
-            assert trace.outcome == "succeeded"
-            assert trace.action_attempt_id is None
-            assert trace.capability_id == "cap.email.draft"
-            assert trace.result_refs["case_id"] == case_id
-            # primary_evidence_id is NOT NULL and points to a recorded evidence row.
-            evidence = db.get(MemoryEvidenceRecord, trace.primary_evidence_id)
-            assert evidence is not None
-            assert evidence.content_class == "system"
-            assert evidence.metadata_json["capture_mode"] == "action_trace_evidence"
-            event = db.scalar(
-                select(MemoryEventRecord).where(
-                    MemoryEventRecord.event_type == "evt.memory.evidence_recorded"
-                )
-            )
-            assert event is not None
-            assert event.entry_path == "proactive"
-            assert event.scope_key == f"proactive:{case_id}"
 
 
 def test_speak_and_act_denies_non_low_risk_from_tainted_context(postgres_url: str) -> None:

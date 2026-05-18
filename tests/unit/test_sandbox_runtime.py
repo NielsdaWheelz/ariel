@@ -138,11 +138,11 @@ def test_clean_program_result_is_reported() -> None:
 
 def test_run_program_message_carries_source_limits_and_syscalls() -> None:
     process = _FakeGuestProcess([{"type": "program-result", "ok": True, "error": None}])
-    _drive(process, source="x = 1\n", syscall_names=("email.search", "memory.search"))
+    _drive(process, source="x = 1\n", syscall_names=("email.search", "memory.recall"))
     assert process.received_run_program is not None
     assert process.received_run_program["type"] == "run-program"
     assert process.received_run_program["source"] == "x = 1\n"
-    assert process.received_run_program["syscall_names"] == ["email.search", "memory.search"]
+    assert process.received_run_program["syscall_names"] == ["email.search", "memory.recall"]
     limits = process.received_run_program["limits"]
     assert limits["source_bytes"] > 0
     assert limits["max_syscalls"] > 0

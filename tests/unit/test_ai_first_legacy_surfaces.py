@@ -180,7 +180,10 @@ def test_readme_and_env_example_do_not_describe_legacy_ambient_derivation(
 @pytest.mark.parametrize(
     "pattern",
     [
-        "evt.memory.recalled",
+        # ``evt.memory.recalled`` is deliberately not listed: the memory cutover
+        # keeps that event name for the retriever's recall audit event. The
+        # patterns below are the deterministic memory counters and the turn
+        # limit event that the cutover genuinely removed.
         "included_memory_count",
         "candidate_memory_count",
         "max_recalled_items",

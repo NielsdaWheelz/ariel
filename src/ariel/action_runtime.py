@@ -667,6 +667,7 @@ def _execute_memory_capability(
         }
     raise RuntimeError("unknown_memory_capability")
 
+
 def approval_execution_failure_message(error: str) -> str:
     failure_reason = error.strip() or "execution_failed"
     if failure_reason.startswith("integrity_mismatch"):
@@ -3309,6 +3310,8 @@ def process_one_call(
             error="memory_runtime_not_bound",
         )
     elif is_memory_capability_call:
+        # The prior branch handles a missing session_factory; here it is bound.
+        assert session_factory is not None
         try:
             memory_output = _execute_memory_capability(
                 session_factory=session_factory,

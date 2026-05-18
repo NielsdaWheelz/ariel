@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy import select
 
 from ariel.app import ModelAdapter, create_app
-from ariel.persistence import MemoryActionTraceRecord, ProviderWriteReceiptRecord
+from ariel.persistence import ProviderWriteReceiptRecord
 from tests.integration.responses_helpers import (
     process_queued_action_execution,
     responses_with_run_calls,
@@ -845,7 +845,7 @@ def test_s6_pr01_drive_share_is_approval_gated_exact_payload_and_exactly_once(
         )
 
 
-def test_s6_pr01_drive_share_denial_settles_the_action_trace_to_denied(
+def test_s6_pr01_drive_share_denial_blocks_the_provider_write(
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
@@ -896,18 +896,6 @@ def test_s6_pr01_drive_share_denial_settles_the_action_trace_to_denied(
         turn = sent.json()["turn"]
         attempt = _surface_attempt(turn)
         assert attempt["policy"]["decision"] == "requires_approval"
-        action_attempt_id = attempt["action_attempt_id"]
-
-        # The chat-turn path recorded an undecided policy_decision trace.
-        with cast(Any, client.app).state.session_factory() as db:
-            chat_trace = db.scalar(
-                select(MemoryActionTraceRecord).where(
-                    MemoryActionTraceRecord.action_attempt_id == action_attempt_id
-                )
-            )
-            assert chat_trace is not None
-            assert chat_trace.trace_type == "policy_decision"
-            assert chat_trace.outcome == "unknown"
 
         approval_ref = _approval_ref(turn)
         denied = client.post(
@@ -916,16 +904,7 @@ def test_s6_pr01_drive_share_denial_settles_the_action_trace_to_denied(
         )
         assert denied.status_code == 200
 
-        # The denial settles the existing trace; no duplicate trace is created.
-        with cast(Any, client.app).state.session_factory() as db:
-            traces = db.scalars(
-                select(MemoryActionTraceRecord).where(
-                    MemoryActionTraceRecord.action_attempt_id == action_attempt_id
-                )
-            ).all()
-            assert len(traces) == 1
-            assert traces[0].id == chat_trace.id
-            assert traces[0].outcome == "denied"
+        # A denied approval never reaches the provider: no drive-share call.
         assert len(workspace_provider.drive_share_calls) == 0
 
 

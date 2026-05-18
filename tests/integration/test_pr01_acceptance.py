@@ -697,7 +697,9 @@ def test_pr01_turn_context_is_bounded_ordered_and_auditable(
             assert context_bundle["section_order"] == [
                 "policy_system_instructions",
                 "recent_active_session_turns",
-                "memory_context",
+                "profile",
+                "session_digest",
+                "recalled_memory",
                 "open_commitments_and_jobs",
                 "relevant_artifacts_and_observations",
             ]
@@ -725,7 +727,9 @@ def test_pr01_turn_context_is_bounded_ordered_and_auditable(
         assert second_context_meta["section_order"] == [
             "policy_system_instructions",
             "recent_active_session_turns",
-            "memory_context",
+            "profile",
+            "session_digest",
+            "recalled_memory",
             "open_commitments_and_jobs",
             "relevant_artifacts_and_observations",
         ]
@@ -1064,7 +1068,9 @@ def test_pr01_context_audit_is_stable_even_if_adapter_mutates_context_bundle(
         assert context_meta["section_order"] == [
             "policy_system_instructions",
             "recent_active_session_turns",
-            "memory_context",
+            "profile",
+            "session_digest",
+            "recalled_memory",
             "open_commitments_and_jobs",
             "relevant_artifacts_and_observations",
         ]
@@ -1147,12 +1153,16 @@ def test_single_active_session_and_ordered_turn_event_chain(postgres_url: str) -
         turns = timeline.json()["turns"]
         assert [turn["user_message"] for turn in turns] == ["first message", "second message"]
 
+        # The cutover's pre-turn retriever emits a recall event before the
+        # model call (here ``recall_failed``: this turn-engine suite does not
+        # configure an OpenAI key, so the retriever subagent fails non-fatally),
+        # and the post-turn rememberer is enqueued as ``memory_remember``.
         expected_types = [
             "evt.turn.started",
-            "evt.ai_judgment.completed",
+            "evt.memory.recall_failed",
             "evt.model.started",
             "evt.model.completed",
-            "evt.memory.extraction_queued",
+            "evt.memory.remember_queued",
             "evt.assistant.emitted",
             "evt.turn.completed",
         ]
@@ -1216,7 +1226,7 @@ def test_model_failure_is_auditable_and_turn_terminates_failed(postgres_url: str
         event_types = [event["event_type"] for event in turn["events"]]
         assert event_types == [
             "evt.turn.started",
-            "evt.ai_judgment.completed",
+            "evt.memory.recall_failed",
             "evt.model.started",
             "evt.model.failed",
             "evt.turn.failed",
@@ -1386,7 +1396,7 @@ def test_default_runtime_model_requires_server_secret_credentials(
         event_types = [event["event_type"] for event in events]
         assert event_types == [
             "evt.turn.started",
-            "evt.ai_judgment.completed",
+            "evt.memory.recall_failed",
             "evt.model.started",
             "evt.model.failed",
             "evt.turn.failed",
@@ -1567,44 +1577,6 @@ class RetryableFailureAdapter:
         )
 
 
-def test_pr02_context_budget_exhaustion_returns_bounded_failure_with_audit_details(
-    postgres_url: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("ARIEL_MAX_CONTEXT_TOKENS", "1")
-
-    adapter = DeterministicModelAdapter()
-    with _build_client(postgres_url, adapter) as client:
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-
-        send = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "hello from bounded context"},
-        )
-        assert send.status_code == 503
-        body = send.json()
-        assert body["ok"] is False
-        assert body["error"]["code"].startswith("E_AI_JUDGMENT_")
-        assert "continuity" in body["error"]["message"].lower()
-        assert body["error"]["details"]["judgment_type"] == "continuity_compaction"
-        assert body["error"]["details"]["session_id"] == session_id
-
-        timeline = client.get(f"/v1/sessions/{session_id}/events")
-        assert timeline.status_code == 200
-        turns = timeline.json()["turns"]
-        assert len(turns) == 1
-        assert not any(saved_turn["status"] == "in_progress" for saved_turn in turns)
-
-        turn = turns[0]
-        assert turn["status"] == "failed"
-        event_types = [event["event_type"] for event in turn["events"]]
-        assert "evt.turn.started" in event_types
-        assert "evt.ai_judgment.failed" in event_types
-        assert "evt.turn.failed" in event_types
-        assert "evt.turn.limit_reached" not in event_types
-        assert "evt.assistant.emitted" not in event_types
-
-
 def test_pr02_response_budget_exhaustion_is_emitted_before_terminal_failed(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -1642,7 +1614,7 @@ def test_pr02_response_budget_exhaustion_is_emitted_before_terminal_failed(
         event_types = [event["event_type"] for event in turn["events"]]
         assert event_types == [
             "evt.turn.started",
-            "evt.ai_judgment.completed",
+            "evt.memory.recall_failed",
             "evt.model.started",
             "evt.model.completed",
             "evt.assistant.emitted",
@@ -1684,7 +1656,7 @@ def test_pr02_response_budget_uses_reported_output_tokens_when_present(
         event_types = [event["event_type"] for event in turn["events"]]
         assert event_types == [
             "evt.turn.started",
-            "evt.ai_judgment.completed",
+            "evt.memory.recall_failed",
             "evt.model.started",
             "evt.model.completed",
             "evt.assistant.emitted",
@@ -1772,7 +1744,7 @@ def test_pr02_wall_time_budget_takes_precedence_if_multiple_limits_exhaust(
         event_types = [event["event_type"] for event in turn["events"]]
         assert event_types == [
             "evt.turn.started",
-            "evt.ai_judgment.completed",
+            "evt.memory.recall_failed",
             "evt.model.started",
             "evt.model.failed",
             "evt.assistant.emitted",

@@ -35,8 +35,6 @@ from ariel.persistence import (
     EmailThreadWatchRecord,
     EventRecord,
     GoogleConnectorRecord,
-    MemoryActionTraceRecord,
-    MemoryEvidenceRecord,
     ProviderWriteReceiptRecord,
     SessionRecord,
     TurnRecord,
@@ -296,117 +294,6 @@ def _seed_google_connector(
             )
 
 
-def _seed_memory_action_trace(
-    session_factory: sessionmaker[Session],
-    *,
-    action_attempt_id: str,
-) -> None:
-    with session_factory() as db:
-        with db.begin():
-            db.add(
-                MemoryEvidenceRecord(
-                    id=f"mev_{action_attempt_id}",
-                    source_turn_id="turn_email",
-                    source_session_id="ses_email",
-                    actor_id="user:default",
-                    content_class="user_message",
-                    trust_boundary="trusted_user",
-                    lifecycle_state="available",
-                    source_uri=None,
-                    source_artifact_id=None,
-                    source_text="declutter email",
-                    evidence_snippet="declutter email",
-                    redaction_posture="none",
-                    metadata_json={},
-                    created_at=NOW,
-                    updated_at=NOW,
-                )
-            )
-            db.flush()
-            db.add(
-                MemoryActionTraceRecord(
-                    id=f"mat_{action_attempt_id}",
-                    scope_key="session:ses_email",
-                    trace_type="policy_decision",
-                    action_attempt_id=action_attempt_id,
-                    source_turn_id="turn_email",
-                    primary_evidence_id=f"mev_{action_attempt_id}",
-                    capability_id="cap.email.archive",
-                    summary="cap.email.archive unknown for proposal 1",
-                    outcome="unknown",
-                    result_refs={"execution_status": "executing"},
-                    lifecycle_state="active",
-                    created_at=NOW,
-                    updated_at=NOW,
-                )
-            )
-
-
-def test_memory_inspect_capability_executes_inline(
-    session_factory: sessionmaker[Session],
-) -> None:
-    events: list[dict[str, Any]] = []
-    with session_factory() as db:
-        with db.begin():
-            db.add(
-                SessionRecord(
-                    id="ses_memory",
-                    is_active=True,
-                    lifecycle_state="active",
-                    rotated_from_session_id=None,
-                    rotation_reason=None,
-                    created_at=NOW,
-                    updated_at=NOW,
-                )
-            )
-            turn = TurnRecord(
-                id="turn_memory",
-                session_id="ses_memory",
-                user_message="inspect memory",
-                assistant_message=None,
-                status="in_progress",
-                created_at=NOW,
-                updated_at=NOW,
-            )
-            db.add(turn)
-            db.flush()
-
-            result = run_function_calls(
-                db=db,
-                session_id="ses_memory",
-                turn=turn,
-                function_calls_raw=[
-                    {
-                        "call_id": "call_memory_inspect",
-                        "capability_id": "cap.memory.inspect",
-                        "input": {"section": "all", "limit": 10},
-                    }
-                ],
-                approval_ttl_seconds=300,
-                approval_actor_id="user:default",
-                add_event=lambda event_type, payload: events.append(
-                    {"event_type": event_type, "payload": payload}
-                ),
-                now_fn=lambda: NOW,
-                new_id_fn=lambda prefix: f"{prefix}_memory",
-                allowed_capability_ids=["cap.memory.inspect"],
-            )
-
-    assert result.created_action_attempts[0].capability_id == "cap.memory.inspect"
-    assert result.created_action_attempts[0].status == "succeeded"
-    function_output = json.loads(result.function_call_outputs[0]["output"])
-    assert function_output["status"] == "succeeded"
-    assert function_output["capability_id"] == "cap.memory.inspect"
-    assert function_output["output"]["status"] == "inspected"
-    assert function_output["output"]["memory"]["active_assertions"] == []
-    assert [event["event_type"] for event in events] == [
-        "evt.action.proposed",
-        "evt.action.policy_decided",
-        "evt.action.execution.started",
-        "evt.action.execution.succeeded",
-    ]
-
-
 def test_email_action_partial_provider_failure_retries_without_false_success(
     session_factory: sessionmaker[Session],
 ) -> None:
@@ -623,7 +510,6 @@ def test_email_action_success_redacts_undo_token_from_event_audit(
         proposed_input={"message_ids": ["msg_1"], "idempotency_key": "archive-success"},
         proposal_index=1,
     )
-    _seed_memory_action_trace(session_factory, action_attempt_id="act_success")
 
     assert process_action_execution_task(
         session_factory=session_factory,
@@ -652,13 +538,6 @@ def test_email_action_success_redacts_undo_token_from_event_audit(
         )
         assert event is not None
         assert event.payload["output"]["undo_token"] == "[redacted]"
-        trace = db.get(MemoryActionTraceRecord, "mat_act_success")
-        assert trace is not None
-        assert trace.trace_type == "execution"
-        assert trace.outcome == "succeeded"
-        assert trace.summary == "cap.email.archive succeeded for proposal 1"
-        assert trace.result_refs["execution_status"] == "succeeded"
-        assert trace.result_refs["execution_output_available"] is True
         receipt = db.scalar(select(ProviderWriteReceiptRecord).limit(1))
         assert receipt is not None
         assert receipt.status == "succeeded"

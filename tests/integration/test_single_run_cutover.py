@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
+import ariel.memory as memory
 import ariel.run_runtime as run_runtime_module
 from ariel.action_runtime import RuntimeProvenance
 from ariel.app import ModelAdapter, create_app
@@ -20,6 +21,31 @@ from tests.integration.responses_helpers import (
     responses_run_message,
     responses_with_run_calls,
 )
+
+
+def _stub_memory_retriever(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub the retriever's bounded model call so ``memory.recall`` is hermetic:
+    the retriever subagent selects no facts from the empty store."""
+
+    class _Response:
+        status_code = 200
+
+        def json(self) -> dict[str, Any]:
+            return {
+                "id": "resp_retriever_stub",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": json.dumps({"facts": []})}],
+                    }
+                ],
+            }
+
+        def raise_for_status(self) -> None:
+            return None
+
+    monkeypatch.setattr(memory.httpx, "post", lambda *args, **kwargs: _Response())
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
@@ -131,7 +157,7 @@ def test_normal_turn_exposes_only_strict_run_tool(postgres_url: str) -> None:
     rendered_input = json.dumps(adapter.input_items_seen[0])
     # The run tool's source is described to the model as a Python program.
     assert "Python program" in rendered_input or "run program" in rendered_input
-    assert "memory.search" in rendered_input
+    assert "memory.recall" in rendered_input
     assert "runtime facts:" in rendered_input
 
 
@@ -183,7 +209,7 @@ def test_plain_assistant_text_is_protocol_feedback_not_visible(postgres_url: str
                     "type": "function_call",
                     "id": "fc_wrong_tool",
                     "call_id": "call_wrong_tool",
-                    "name": "cap.memory.search",
+                    "name": "not_the_run_tool",
                     "arguments": json.dumps({"query": "phoenix"}),
                     "status": "completed",
                 }
@@ -450,14 +476,15 @@ def test_taint_threads_across_two_programs_in_one_turn(
 ) -> None:
     """A turn runs two programs; taint from program 1 reaches program 2.
 
-    Program 1 does an inline read whose result is untrusted-influenced, then
+    Program 1 does an inline recall whose result is untrusted-influenced, then
     emits a value -- which ends the program and continues the turn. Program 2
-    proposes a side-effecting syscall. Because the run-program path threads each
-    program's taint delta onto the turn baseline, program 2's syscall is
-    evaluated with that taint: it receives a tainted ``runtime_provenance`` and
-    real policy escalates it on the taint path -- reason
-    ``taint_escalated_requires_approval`` rather than the clean
-    ``approval_required``.
+    runs a side-effecting ``memory.remember`` syscall. Because the run-program
+    path threads each program's taint delta onto the turn baseline, program 2's
+    syscall is evaluated with that taint: it receives a tainted
+    ``runtime_provenance`` and real policy escalates it on the taint path --
+    ``memory.remember`` is ``allow_inline`` with a ``write_reversible`` impact,
+    so on clean provenance it runs inline, but a tainted side effect escalates
+    it to ``taint_escalated_requires_approval``.
 
     ``process_one_call`` is stubbed -- as in the within-program taint test --
     so the app-side cross-program taint merge is what is exercised; the stub
@@ -473,7 +500,7 @@ def test_taint_threads_across_two_programs_in_one_turn(
         capability_id = kwargs["function_call_raw"]["capability_id"]
         runtime_provenance = kwargs["runtime_provenance"]
         seen_provenance.append(runtime_provenance)
-        if capability_id == "cap.memory.propose":
+        if capability_id == "cap.memory.remember":
             # A side-effecting syscall: evaluate it through real policy with the
             # taint threaded in from the prior program. evaluate_proposal is a
             # pure function, so no DB write and no proposal_index is needed.
@@ -494,8 +521,8 @@ def test_taint_threads_across_two_programs_in_one_turn(
                 "output": '{"status":"succeeded","output":{"ok":true}}',
             }
         )
-        if capability_id == "cap.memory.search":
-            # The first read returned untrusted-influenced content; this is the
+        if capability_id == "cap.memory.recall":
+            # The first recall returned untrusted-influenced content; this is the
             # taint a real untrusted-content read would set on the context.
             ctx.result_runtime_provenance = RuntimeProvenance(
                 status="tainted",
@@ -504,19 +531,14 @@ def test_taint_threads_across_two_programs_in_one_turn(
 
     monkeypatch.setattr(run_runtime_module, "process_one_call", fake_process_one_call)
 
-    # Program 1: an untrusted read, then emit a value -- the value ends the
+    # Program 1: an untrusted recall, then emit a value -- the value ends the
     # program and the turn continues to program 2.
     program_one = (
-        "hits = memory.search(query='note')\nagent.emit_value(value={'searched': hits['ok']})\n"
+        "hits = memory.recall(query='note')\nagent.emit_value(value={'recalled': hits['status']})\n"
     )
     # Program 2: a side-effecting syscall in a fresh program of the same turn.
     program_two = (
-        "memory.propose(\n"
-        "    subject_key='user', predicate='likes', assertion_type='preference',\n"
-        "    value='tea', evidence_text='said so', confidence=0.9,\n"
-        "    scope_key='global', valid_from=None, valid_to=None,\n"
-        ")\n"
-        "agent.emit_message(text='proposed')\n"
+        "memory.remember(note='the user prefers tea')\nagent.emit_message(text='remembered')\n"
     )
     adapter = CapturingRunAdapter(
         responses=[
@@ -542,8 +564,8 @@ def test_taint_threads_across_two_programs_in_one_turn(
 
     payload = sent.json()
     assert sent.status_code == 200
-    assert payload["assistant"]["message"] == "proposed"
-    # Two syscalls ran: program 1's read (clean baseline) and program 2's
+    assert payload["assistant"]["message"] == "remembered"
+    # Two syscalls ran: program 1's recall (clean baseline) and program 2's
     # side-effecting syscall, which must have seen the taint program 1 produced.
     assert len(seen_provenance) == 2
     assert seen_provenance[0] is None or seen_provenance[0].status == "clean"
@@ -559,6 +581,7 @@ def test_taint_threads_across_two_programs_in_one_turn(
 
 def test_two_programs_with_capability_syscalls_get_distinct_proposal_index(
     postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A turn runs two programs that BOTH make a capability syscall.
 
@@ -573,16 +596,19 @@ def test_two_programs_with_capability_syscalls_get_distinct_proposal_index(
     the real ``process_one_call`` so the unique index is actually hit.
     """
 
-    # Each program runs a real capability read (memory.inspect, an inline,
-    # always-in-scope read) and then ends: program 1 with emit_value so the turn
-    # continues, program 2 with emit_message so the turn completes.
+    # Each program runs a real capability syscall (memory.recall -- allow_inline,
+    # so on a clean turn it executes inline) and then ends: program 1 with
+    # emit_value so the turn continues, program 2 with emit_message so the turn
+    # completes. The retriever's bounded model call is stubbed.
+    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
+    _stub_memory_retriever(monkeypatch)
     program_one = (
-        "snapshot = memory.inspect(section='all', limit=5)\n"
-        "agent.emit_value(value={'inspected_one': snapshot['status']})\n"
+        "recalled = memory.recall(query='status')\n"
+        "agent.emit_value(value={'recalled_one': recalled['status']})\n"
     )
     program_two = (
-        "snapshot = memory.inspect(section='all', limit=5)\n"
-        "agent.emit_message(text='inspected twice: ' + snapshot['status'])\n"
+        "recalled = memory.recall(query='status')\n"
+        "agent.emit_message(text='recalled twice: ' + recalled['status'])\n"
     )
     adapter = CapturingRunAdapter(
         responses=[
@@ -602,13 +628,13 @@ def test_two_programs_with_capability_syscalls_get_distinct_proposal_index(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "inspect twice"})
+        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "recall twice"})
 
     payload = sent.json()
     # The turn persisted: no UniqueViolation on the (turn_id, proposal_index)
     # index when the second program's capability syscall flushed.
     assert sent.status_code == 200, payload
-    assert payload["assistant"]["message"] == "inspected twice: inspected"
+    assert payload["assistant"]["message"] == "recalled twice: recalled"
 
     engine = create_engine(postgres_url, future=True)
     session_factory = sessionmaker(bind=engine, future=True, expire_on_commit=False)
@@ -623,8 +649,8 @@ def test_two_programs_with_capability_syscalls_get_distinct_proposal_index(
     # Both capability syscalls wrote an action attempt, and the two share a turn
     # but hold distinct proposal indices -- the turn-global counter at work.
     assert [attempt.capability_id for attempt in attempts] == [
-        "cap.memory.inspect",
-        "cap.memory.inspect",
+        "cap.memory.recall",
+        "cap.memory.recall",
     ]
     proposal_indices = [attempt.proposal_index for attempt in attempts]
     assert len(set(proposal_indices)) == 2, proposal_indices

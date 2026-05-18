@@ -4183,8 +4183,7 @@ def create_app(
                         parse_status="parsed",
                         validation_status="invalid",
                         failure_code="E_AI_JUDGMENT_VALIDATION",
-                        failure_reason=run_protocol_error
-                        or "model failed the run tool protocol",
+                        failure_reason=run_protocol_error or "model failed the run tool protocol",
                     )
                     for output_item in output_items:
                         if (
@@ -4227,9 +4226,7 @@ def create_app(
                         {
                             "reason": run_protocol_error,
                             "attempt": attempt,
-                            "provider_response_id": candidate_response.get(
-                                "provider_response_id"
-                            ),
+                            "provider_response_id": candidate_response.get("provider_response_id"),
                         },
                     )
                     if attempt >= app.state.max_model_attempts:
@@ -4298,9 +4295,7 @@ def create_app(
                         add_event=add_event,
                     )
                     program_errors = [
-                        error
-                        for error in [run_program_result.program_error]
-                        if error is not None
+                        error for error in [run_program_result.program_error] if error is not None
                     ] + run_program_result.callback_errors
                     provider_response_id = candidate_response.get("provider_response_id")
                     add_ai_judgment(
@@ -4362,9 +4357,7 @@ def create_app(
                         {
                             "errors": program_errors,
                             "attempt": attempt,
-                            "provider_response_id": candidate_response.get(
-                                "provider_response_id"
-                            ),
+                            "provider_response_id": candidate_response.get("provider_response_id"),
                         },
                     )
                     if attempt >= app.state.max_model_attempts:
@@ -4414,9 +4407,7 @@ def create_app(
                 # artifacts; surface them as the turn's response sources.
                 assistant_sources = _turn_retrieval_sources(db=db, turn_id=turn.id)
 
-                for index, emitted_value in enumerate(
-                    run_program_result.emitted_values, start=1
-                ):
+                for index, emitted_value in enumerate(run_program_result.emitted_values, start=1):
                     encoded_value = json.dumps(
                         jsonable_encoder(emitted_value),
                         sort_keys=True,
@@ -4429,9 +4420,7 @@ def create_app(
                             "value_digest": hashlib.sha256(encoded_value).hexdigest(),
                             "value_bytes": len(encoded_value),
                             "attempt": attempt,
-                            "provider_response_id": candidate_response.get(
-                                "provider_response_id"
-                            ),
+                            "provider_response_id": candidate_response.get("provider_response_id"),
                         },
                     )
 

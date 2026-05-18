@@ -153,8 +153,7 @@ def upgrade() -> None:
     )
     op.execute(
         sa.text(
-            "INSERT INTO memory_profile (id, content, updated_at) "
-            "VALUES (:id, '', now())"
+            "INSERT INTO memory_profile (id, content, updated_at) VALUES (:id, '', now())"
         ).bindparams(id=f"mpr_{ulid.new().str.lower()}")
     )
 
@@ -315,9 +314,7 @@ def _downgrade_core_tables() -> None:
             "(lifecycle_state != 'superseded') OR (superseded_by_assertion_id IS NOT NULL)",
             name="ck_memory_assertion_superseded_link",
         ),
-        sa.ForeignKeyConstraint(
-            ["subject_entity_id"], ["memory_entities.id"], ondelete="RESTRICT"
-        ),
+        sa.ForeignKeyConstraint(["subject_entity_id"], ["memory_entities.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(
             ["superseded_by_assertion_id"], ["memory_assertions.id"], ondelete="RESTRICT"
         ),
@@ -326,9 +323,7 @@ def _downgrade_core_tables() -> None:
     op.create_index(
         "ix_memory_assertions_subject_entity_id", "memory_assertions", ["subject_entity_id"]
     )
-    op.create_index(
-        "ix_memory_assertions_invalidated_at", "memory_assertions", ["invalidated_at"]
-    )
+    op.create_index("ix_memory_assertions_invalidated_at", "memory_assertions", ["invalidated_at"])
     op.create_index(
         "ix_memory_assertions_superseded_by_assertion_id",
         "memory_assertions",
@@ -381,12 +376,8 @@ def _downgrade_core_tables() -> None:
             "(valid_to IS NULL) OR (valid_from IS NULL) OR (valid_from < valid_to)",
             name="ck_memory_relationship_valid_interval",
         ),
-        sa.ForeignKeyConstraint(
-            ["source_entity_id"], ["memory_entities.id"], ondelete="RESTRICT"
-        ),
-        sa.ForeignKeyConstraint(
-            ["target_entity_id"], ["memory_entities.id"], ondelete="RESTRICT"
-        ),
+        sa.ForeignKeyConstraint(["source_entity_id"], ["memory_entities.id"], ondelete="RESTRICT"),
+        sa.ForeignKeyConstraint(["target_entity_id"], ["memory_entities.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(["evidence_id"], ["memory_evidence.id"], ondelete="RESTRICT"),
         sa.PrimaryKeyConstraint("id"),
     )
@@ -396,9 +387,7 @@ def _downgrade_core_tables() -> None:
     op.create_index(
         "ix_memory_relationships_target_entity_id", "memory_relationships", ["target_entity_id"]
     )
-    op.create_index(
-        "ix_memory_relationships_evidence_id", "memory_relationships", ["evidence_id"]
-    )
+    op.create_index("ix_memory_relationships_evidence_id", "memory_relationships", ["evidence_id"])
     op.create_index("ix_memory_relationships_created_at", "memory_relationships", ["created_at"])
     op.create_index("ix_memory_relationships_updated_at", "memory_relationships", ["updated_at"])
 
@@ -408,9 +397,7 @@ def _downgrade_core_tables() -> None:
         sa.Column("assertion_id", sa.String(length=32), nullable=False),
         sa.Column("evidence_id", sa.String(length=32), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.ForeignKeyConstraint(
-            ["assertion_id"], ["memory_assertions.id"], ondelete="RESTRICT"
-        ),
+        sa.ForeignKeyConstraint(["assertion_id"], ["memory_assertions.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(["evidence_id"], ["memory_evidence.id"], ondelete="RESTRICT"),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint(
@@ -445,9 +432,7 @@ def _downgrade_core_tables() -> None:
         sa.Column("lifecycle_state", sa.String(length=32), nullable=False),
         sa.Column("primary_evidence_id", sa.String(length=32), nullable=False),
         sa.Column("related_entity_ids", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column(
-            "related_assertion_ids", postgresql.JSONB(astext_type=sa.Text()), nullable=False
-        ),
+        sa.Column("related_assertion_ids", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
         sa.Column("metadata_json", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
@@ -487,9 +472,7 @@ def _downgrade_core_tables() -> None:
         sa.Column("primary_evidence_id", sa.String(length=32), nullable=False),
         sa.Column("source_turn_id", sa.String(length=32), nullable=True),
         sa.Column("related_entity_ids", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column(
-            "related_assertion_ids", postgresql.JSONB(astext_type=sa.Text()), nullable=False
-        ),
+        sa.Column("related_assertion_ids", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
         sa.Column("lifecycle_state", sa.String(length=32), nullable=False),
         sa.Column("metadata_json", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
@@ -562,9 +545,7 @@ def _downgrade_core_tables() -> None:
             "'deleted', 'privacy_deleted')",
             name="ck_memory_action_trace_lifecycle_state",
         ),
-        sa.ForeignKeyConstraint(
-            ["action_attempt_id"], ["action_attempts.id"], ondelete="RESTRICT"
-        ),
+        sa.ForeignKeyConstraint(["action_attempt_id"], ["action_attempts.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(["source_turn_id"], ["turns.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(
             ["primary_evidence_id"], ["memory_evidence.id"], ondelete="RESTRICT"
@@ -585,12 +566,8 @@ def _downgrade_core_tables() -> None:
         "memory_action_traces",
         ["primary_evidence_id"],
     )
-    op.create_index(
-        "ix_memory_action_traces_created_at", "memory_action_traces", ["created_at"]
-    )
-    op.create_index(
-        "ix_memory_action_traces_updated_at", "memory_action_traces", ["updated_at"]
-    )
+    op.create_index("ix_memory_action_traces_created_at", "memory_action_traces", ["created_at"])
+    op.create_index("ix_memory_action_traces_updated_at", "memory_action_traces", ["updated_at"])
 
     op.create_table(
         "memory_procedures",
@@ -663,9 +640,7 @@ def _downgrade_core_tables() -> None:
             "'needs_user_review', 'needs_operator_review', 'merged', 'superseded')",
             name="ck_memory_review_decision",
         ),
-        sa.ForeignKeyConstraint(
-            ["assertion_id"], ["memory_assertions.id"], ondelete="RESTRICT"
-        ),
+        sa.ForeignKeyConstraint(["assertion_id"], ["memory_assertions.id"], ondelete="RESTRICT"),
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index("ix_memory_reviews_assertion_id", "memory_reviews", ["assertion_id"])
@@ -691,9 +666,7 @@ def _downgrade_core_tables() -> None:
             "conflict_type IN ('value_contradiction', 'staleness', 'scope_overlap')",
             name="ck_memory_conflict_set_type",
         ),
-        sa.ForeignKeyConstraint(
-            ["subject_entity_id"], ["memory_entities.id"], ondelete="RESTRICT"
-        ),
+        sa.ForeignKeyConstraint(["subject_entity_id"], ["memory_entities.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(
             ["resolution_assertion_id"], ["memory_assertions.id"], ondelete="RESTRICT"
         ),
@@ -709,12 +682,8 @@ def _downgrade_core_tables() -> None:
         "memory_conflict_sets",
         ["resolution_assertion_id"],
     )
-    op.create_index(
-        "ix_memory_conflict_sets_created_at", "memory_conflict_sets", ["created_at"]
-    )
-    op.create_index(
-        "ix_memory_conflict_sets_updated_at", "memory_conflict_sets", ["updated_at"]
-    )
+    op.create_index("ix_memory_conflict_sets_created_at", "memory_conflict_sets", ["created_at"])
+    op.create_index("ix_memory_conflict_sets_updated_at", "memory_conflict_sets", ["updated_at"])
     op.create_index(
         "ix_memory_conflict_sets_open_unique",
         "memory_conflict_sets",
@@ -732,9 +701,7 @@ def _downgrade_core_tables() -> None:
         sa.ForeignKeyConstraint(
             ["conflict_set_id"], ["memory_conflict_sets.id"], ondelete="RESTRICT"
         ),
-        sa.ForeignKeyConstraint(
-            ["assertion_id"], ["memory_assertions.id"], ondelete="RESTRICT"
-        ),
+        sa.ForeignKeyConstraint(["assertion_id"], ["memory_assertions.id"], ondelete="RESTRICT"),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint(
             "conflict_set_id", "assertion_id", name="uq_memory_conflict_member_pair"
@@ -768,9 +735,7 @@ def _downgrade_core_tables() -> None:
             name="ck_memory_salience_user_priority",
         ),
         sa.CheckConstraint("score >= 0.0", name="ck_memory_salience_score_non_negative"),
-        sa.ForeignKeyConstraint(
-            ["assertion_id"], ["memory_assertions.id"], ondelete="RESTRICT"
-        ),
+        sa.ForeignKeyConstraint(["assertion_id"], ["memory_assertions.id"], ondelete="RESTRICT"),
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index(
@@ -805,12 +770,8 @@ def _downgrade_policy_tables() -> None:
         ),
         sa.PrimaryKeyConstraint("id"),
     )
-    op.create_index(
-        "ix_memory_scope_bindings_created_at", "memory_scope_bindings", ["created_at"]
-    )
-    op.create_index(
-        "ix_memory_scope_bindings_updated_at", "memory_scope_bindings", ["updated_at"]
-    )
+    op.create_index("ix_memory_scope_bindings_created_at", "memory_scope_bindings", ["created_at"])
+    op.create_index("ix_memory_scope_bindings_updated_at", "memory_scope_bindings", ["updated_at"])
     op.create_index(
         "ix_memory_scope_bindings_scope_actor_unique",
         "memory_scope_bindings",
@@ -984,9 +945,7 @@ def _downgrade_policy_tables() -> None:
     )
     op.create_index("ix_memory_deletions_target_id", "memory_deletions", ["target_id"])
     op.create_index("ix_memory_deletions_created_at", "memory_deletions", ["created_at"])
-    op.create_index(
-        "ix_memory_deletions_target", "memory_deletions", ["target_table", "target_id"]
-    )
+    op.create_index("ix_memory_deletions_target", "memory_deletions", ["target_table", "target_id"])
 
     op.create_table(
         "memory_events",
@@ -1079,9 +1038,7 @@ def _downgrade_projection_tables() -> None:
             "source_memory_version > 0",
             name="ck_memory_embedding_projection_source_memory_version",
         ),
-        sa.ForeignKeyConstraint(
-            ["assertion_id"], ["memory_assertions.id"], ondelete="RESTRICT"
-        ),
+        sa.ForeignKeyConstraint(["assertion_id"], ["memory_assertions.id"], ondelete="RESTRICT"),
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index(
@@ -1340,12 +1297,8 @@ def _downgrade_projection_tables() -> None:
             "jsonb_typeof(source_projection_versions) = 'object'",
             name="ck_memory_graph_projection_source_projection_versions_object",
         ),
-        sa.ForeignKeyConstraint(
-            ["source_entity_id"], ["memory_entities.id"], ondelete="RESTRICT"
-        ),
-        sa.ForeignKeyConstraint(
-            ["target_entity_id"], ["memory_entities.id"], ondelete="RESTRICT"
-        ),
+        sa.ForeignKeyConstraint(["source_entity_id"], ["memory_entities.id"], ondelete="RESTRICT"),
+        sa.ForeignKeyConstraint(["target_entity_id"], ["memory_entities.id"], ondelete="RESTRICT"),
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index(
@@ -1437,9 +1390,7 @@ def _downgrade_topic_and_artifact_tables() -> None:
     op.create_index(
         "ix_memory_topic_members_canonical_id", "memory_topic_members", ["canonical_id"]
     )
-    op.create_index(
-        "ix_memory_topic_members_created_at", "memory_topic_members", ["created_at"]
-    )
+    op.create_index("ix_memory_topic_members_created_at", "memory_topic_members", ["created_at"])
     op.create_index(
         "ix_memory_topic_members_unique",
         "memory_topic_members",
@@ -1455,17 +1406,13 @@ def _downgrade_topic_and_artifact_tables() -> None:
         sa.Column("content", sa.Text(), nullable=False),
         sa.Column("topic_id", sa.String(length=32), nullable=True),
         sa.Column("lifecycle_state", sa.String(length=32), nullable=False),
-        sa.Column(
-            "source_assertion_ids", postgresql.JSONB(astext_type=sa.Text()), nullable=False
-        ),
+        sa.Column("source_assertion_ids", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
         sa.Column("source_episode_ids", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
         sa.Column("source_trace_ids", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
         sa.Column(
             "source_action_trace_ids", postgresql.JSONB(astext_type=sa.Text()), nullable=False
         ),
-        sa.Column(
-            "source_procedure_ids", postgresql.JSONB(astext_type=sa.Text()), nullable=False
-        ),
+        sa.Column("source_procedure_ids", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
         sa.Column(
             "source_project_state_snapshot_ids",
             postgresql.JSONB(astext_type=sa.Text()),
@@ -1508,12 +1455,8 @@ def _downgrade_topic_and_artifact_tables() -> None:
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index("ix_memory_context_blocks_topic_id", "memory_context_blocks", ["topic_id"])
-    op.create_index(
-        "ix_memory_context_blocks_created_at", "memory_context_blocks", ["created_at"]
-    )
-    op.create_index(
-        "ix_memory_context_blocks_updated_at", "memory_context_blocks", ["updated_at"]
-    )
+    op.create_index("ix_memory_context_blocks_created_at", "memory_context_blocks", ["created_at"])
+    op.create_index("ix_memory_context_blocks_updated_at", "memory_context_blocks", ["updated_at"])
     op.create_index(
         "ix_memory_context_blocks_unique",
         "memory_context_blocks",
