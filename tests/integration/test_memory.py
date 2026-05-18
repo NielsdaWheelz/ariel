@@ -22,23 +22,29 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from itertools import count
 import json
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from fastapi.testclient import TestClient
+import httpx
 import pytest
 from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from ariel.app import ModelAdapter, create_app
-from ariel.capability_registry import (
-    capability_id_for_run_callable,
-    run_callable_name_for_capability_id,
-)
 import ariel.memory as memory
 from ariel.config import AppSettings
 from ariel.persistence import AIJudgmentRecord, BackgroundTaskRecord, SessionRecord
 from tests.fake_sandbox import FakeSandboxRuntime
-from tests.integration.responses_helpers import responses_with_run_calls
+
+# ``ariel.app``, ``ariel.capability_registry``, ``ariel.worker``, and
+# ``responses_helpers`` import the syscall and turn-engine surface that Phases
+# 4-5 of the memory cutover rewrite; against an intermediate Phase 3 tree they
+# still reference the old memory module and fail to import. They are therefore
+# imported lazily inside the tests that need them, so the Phase 3 tests that
+# depend only on ``memory.py`` plus the database -- the validators, the gather,
+# and the rememberer writes -- still collect and run. ``ModelAdapter`` is only
+# a typing reference here; ``cast`` takes it as a string.
+if TYPE_CHECKING:
+    from ariel.app import ModelAdapter
 
 
 _id_counter = count(1)
@@ -139,6 +145,8 @@ class RunProgramAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         del tools, user_message, history
+        from tests.integration.responses_helpers import responses_with_run_calls
+
         self.context_bundles.append(json.loads(json.dumps(context_bundle)))
         self.input_items.append(json.loads(json.dumps(input_items)))
         return responses_with_run_calls(
@@ -159,6 +167,17 @@ class _FakeResponse:
 
     def json(self) -> dict[str, Any]:
         return self.payload
+
+    def raise_for_status(self) -> None:
+        """Mimic ``httpx.Response.raise_for_status``: ``embed_text`` calls it on
+        the embeddings response."""
+
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                f"HTTP {self.status_code}",
+                request=httpx.Request("POST", "https://api.openai.com"),
+                response=cast(httpx.Response, self),
+            )
 
 
 def _responses_output(body: dict[str, Any]) -> dict[str, Any]:
@@ -198,28 +217,36 @@ def _fake_post(
     """Build one ``httpx.post`` stub standing in for every memory model call.
 
     Memory makes two kinds of bounded ``httpx.post`` calls to the OpenAI API:
-    the embeddings endpoint (rememberer fact embedding) and the Responses
-    endpoint (the retriever and rememberer subagents, shaped like
-    ``_curate_memory_context_with_model``). The stub branches on the request
-    URL, then on the Responses system prompt to tell a retriever call from a
-    rememberer call, returning the matching canned payload. ``retriever_fails``
-    makes the retriever Responses call return HTTP 500 so the non-fatal-failure
-    path can be exercised.
+    the embeddings endpoint (rememberer fact embedding, and the retriever's
+    vector candidate gather) and the Responses endpoint (the retriever and
+    rememberer subagents, shaped like the existing ``_*_with_model`` calls).
+    The stub branches on the request URL, then keys off the ``prompt_version``
+    field the subagent embeds in its user-message JSON -- a stable contract
+    value, ``memory.RETRIEVER_PROMPT_VERSION`` vs ``REMEMBERER_PROMPT_VERSION``,
+    not a prose substring -- to tell a retriever call from a rememberer call,
+    returning the matching canned payload. ``retriever_fails`` makes the
+    retriever Responses call return HTTP 500 so the non-fatal-failure path can
+    be exercised.
     """
 
     def fake_post(url: str, **kwargs: Any) -> _FakeResponse:
         if "embeddings" in url:
             return _embeddings_response()
         body = kwargs.get("json") or {}
-        system = ""
+        prompt_version = ""
         for item in body.get("input", []):
-            if item.get("role") == "system":
-                system = str(item.get("content", ""))
-        is_retriever = "retriev" in system.lower() or "recall" in system.lower()
-        if is_retriever:
+            if item.get("role") == "user":
+                try:
+                    prompt_version = json.loads(item.get("content", "")).get(
+                        "prompt_version", ""
+                    )
+                except (ValueError, AttributeError):
+                    prompt_version = ""
+        if prompt_version == memory.RETRIEVER_PROMPT_VERSION:
             if retriever_fails:
                 return _FakeResponse({"error": "boom"}, status_code=500)
             return _FakeResponse(_responses_output(retriever or {"facts": []}))
+        assert prompt_version == memory.REMEMBERER_PROMPT_VERSION, prompt_version
         return _FakeResponse(
             _responses_output(
                 rememberer or {"operations": [], "profile": None, "digest": None}
@@ -250,6 +277,8 @@ def _fake_subagent(
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
+    from ariel.app import create_app
+
     app = create_app(
         database_url=postgres_url,
         model_adapter=adapter,
@@ -274,6 +303,34 @@ def _send_turn(client: TestClient, session_id: str, message: str) -> dict[str, A
     return response.json()
 
 
+def _insert_active_session(db: Session) -> str:
+    """Insert one active ``sessions`` row directly and return its id.
+
+    Tests that exercise ``memory.py`` against the database -- the rememberer
+    writes -- need only a session row, not the whole turn engine. Building it
+    here keeps those Phase 3 tests off ``create_app``, which the syscall and
+    turn-engine phases (4-5) rewrite and which does not import against an
+    intermediate Phase 3 tree.
+    """
+
+    now = datetime.now(tz=UTC)
+    session_id = _new_id("ses")
+    session = SessionRecord(
+        id=session_id,
+        is_active=True,
+        lifecycle_state="active",
+        memory_mode="normal",
+        rotated_from_session_id=None,
+        rotation_reason=None,
+        digest=None,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(session)
+    db.flush()
+    return session_id
+
+
 # ===========================================================================
 # 1. Schema: two memory tables, the 31 are gone, sessions.digest exists
 # ===========================================================================
@@ -284,10 +341,12 @@ def test_schema_has_only_memory_facts_and_memory_profile(postgres_url: str) -> N
     ``memory_profile``; every one of the 31 legacy ``memory_*`` tables is
     dropped, and ``sessions`` carries a ``digest`` column."""
 
+    from ariel.app import create_app
+
     engine = create_engine(postgres_url, future=True)
     create_app(
         database_url=postgres_url,
-        model_adapter=cast(ModelAdapter, RunProgramAdapter()),
+        model_adapter=cast("ModelAdapter", RunProgramAdapter()),
         reset_database=True,
         sandbox=FakeSandboxRuntime(),
     )
@@ -311,10 +370,12 @@ def test_memory_facts_columns_are_flat_with_no_category_field(
     kind/type/category/tag column: classification is the subagents reading
     content, never a schema column."""
 
+    from ariel.app import create_app
+
     engine = create_engine(postgres_url, future=True)
     create_app(
         database_url=postgres_url,
-        model_adapter=cast(ModelAdapter, RunProgramAdapter()),
+        model_adapter=cast("ModelAdapter", RunProgramAdapter()),
         reset_database=True,
         sandbox=FakeSandboxRuntime(),
     )
@@ -330,10 +391,12 @@ def test_memory_profile_is_seeded_with_one_row(postgres_url: str) -> None:
     """``memory_profile`` is a singleton: the migration seeds exactly one
     profile row, so the profile document always exists to be injected."""
 
+    from ariel.app import create_app
+
     engine = create_engine(postgres_url, future=True)
     create_app(
         database_url=postgres_url,
-        model_adapter=cast(ModelAdapter, RunProgramAdapter()),
+        model_adapter=cast("ModelAdapter", RunProgramAdapter()),
         reset_database=True,
         sandbox=FakeSandboxRuntime(),
     )
@@ -352,10 +415,12 @@ def test_ai_judgment_type_check_admits_only_the_two_memory_judgments(
     (``memory_curation``, ``memory_extraction``, ``reflective_consolidation``,
     ``continuity_compaction``)."""
 
+    from ariel.app import create_app
+
     engine = create_engine(postgres_url, future=True)
     create_app(
         database_url=postgres_url,
-        model_adapter=cast(ModelAdapter, RunProgramAdapter()),
+        model_adapter=cast("ModelAdapter", RunProgramAdapter()),
         reset_database=True,
         sandbox=FakeSandboxRuntime(),
     )
@@ -416,6 +481,8 @@ def test_memory_syscall_surface_is_exactly_recall_and_remember() -> None:
     ``memory.recall`` and ``memory.remember`` resolve to their capabilities;
     every other legacy ``memory.*`` run-callable alias is gone."""
 
+    from ariel.capability_registry import capability_id_for_run_callable
+
     assert capability_id_for_run_callable("memory.recall") == "cap.memory.recall"
     assert capability_id_for_run_callable("memory.remember") == "cap.memory.remember"
 
@@ -437,7 +504,10 @@ def test_only_two_memory_capabilities_have_run_callable_aliases() -> None:
     """Exactly two ``cap.memory.*`` capabilities exist and each maps to its
     syscall alias; no third memory capability is reachable from a program."""
 
-    from ariel.capability_registry import MEMORY_CAPABILITY_IDS
+    from ariel.capability_registry import (
+        MEMORY_CAPABILITY_IDS,
+        run_callable_name_for_capability_id,
+    )
 
     assert MEMORY_CAPABILITY_IDS == {"cap.memory.recall", "cap.memory.remember"}
     assert run_callable_name_for_capability_id("cap.memory.recall") == "memory.recall"
@@ -465,7 +535,7 @@ def test_memory_syscalls_are_not_approval_gated() -> None:
 
 
 def test_rememberer_writes_a_fact_that_lands_active_immediately(
-    postgres_url: str,
+    session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The rememberer's ``write`` operation creates a ``memory_facts`` row that
@@ -482,26 +552,26 @@ def test_rememberer_writes_a_fact_that_lands_active_immediately(
             "digest": None,
         },
     )
-    adapter = RunProgramAdapter()
-    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
-        session_id = _active_session_id(client)
+    with session_factory() as db:
+        with db.begin():
+            session_id = _insert_active_session(db)
 
-        memory.run_rememberer(
-            session_factory=_session_factory(client),
-            note="Remember that I take my coffee black.",
-            session_id=session_id,
-            settings=_settings(openai_api_key="test-key"),
-            now_fn=lambda: datetime.now(tz=UTC),
-            new_id_fn=_new_id,
-        )
+    memory.run_rememberer(
+        session_factory=session_factory,
+        note="Remember that I take my coffee black.",
+        session_id=session_id,
+        settings=_settings(openai_api_key="test-key"),
+        now_fn=lambda: datetime.now(tz=UTC),
+        new_id_fn=_new_id,
+    )
 
-        with _session_factory(client)() as db:
-            facts = list(db.execute(text("SELECT content, status, embedding FROM memory_facts")))
-        assert len(facts) == 1
-        content, status, embedding = facts[0]
-        assert "coffee black" in content
-        assert status == "active"
-        assert embedding is not None
+    with session_factory() as db:
+        facts = list(db.execute(text("SELECT content, status, embedding FROM memory_facts")))
+    assert len(facts) == 1
+    content, status, embedding = facts[0]
+    assert "coffee black" in content
+    assert status == "active"
+    assert embedding is not None
 
 
 def test_retriever_surfaces_a_fact_it_judged_relevant(
@@ -524,7 +594,7 @@ def test_retriever_surfaces_a_fact_it_judged_relevant(
         },
     )
     adapter = RunProgramAdapter()
-    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+    with _build_client(postgres_url, cast("ModelAdapter", adapter)) as client:
         session_id = _active_session_id(client)
         memory.run_rememberer(
             session_factory=_session_factory(client),
@@ -537,8 +607,9 @@ def test_retriever_surfaces_a_fact_it_judged_relevant(
         with _session_factory(client)() as db:
             fact_id = db.execute(text("SELECT id FROM memory_facts LIMIT 1")).scalar_one()
 
-        # Step 2: the pre-turn retriever selects that fact by id.
-        _fake_subagent(monkeypatch, retriever={"facts": [{"id": fact_id}]})
+        # Step 2: the pre-turn retriever selects that fact by id. The retriever
+        # contract is {"facts": ["<fact_id>", ...]} -- a flat list of ids.
+        _fake_subagent(monkeypatch, retriever={"facts": [fact_id]})
         _send_turn(client, session_id, "how do I take my coffee?")
 
         recalled_section = json.dumps(adapter.context_bundles[-1])
@@ -567,7 +638,7 @@ def test_turn_injects_profile_and_session_digest(
 
     _fake_subagent(monkeypatch, retriever={"facts": []})
     adapter = RunProgramAdapter()
-    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+    with _build_client(postgres_url, cast("ModelAdapter", adapter)) as client:
         session_id = _active_session_id(client)
 
         # Seed the profile document and this session's digest directly, so the
@@ -607,7 +678,7 @@ def test_retriever_failure_does_not_fail_the_turn(
 
     _fake_subagent(monkeypatch, retriever_fails=True)
     adapter = RunProgramAdapter()
-    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+    with _build_client(postgres_url, cast("ModelAdapter", adapter)) as client:
         session_id = _active_session_id(client)
         with _session_factory(client)() as db:
             with db.begin():
@@ -648,7 +719,7 @@ def test_turn_enqueues_a_memory_remember_task(
 
     _fake_subagent(monkeypatch, retriever={"facts": []})
     adapter = RunProgramAdapter()
-    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+    with _build_client(postgres_url, cast("ModelAdapter", adapter)) as client:
         session_id = _active_session_id(client)
         _send_turn(client, session_id, "remember I like espresso")
 
@@ -668,7 +739,7 @@ def test_turn_enqueues_a_memory_remember_task(
 
 
 def test_rememberer_call_writes_one_ai_judgment_row(
-    postgres_url: str,
+    session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Every rememberer invocation is one bounded model call audited by exactly
@@ -682,26 +753,27 @@ def test_rememberer_call_writes_one_ai_judgment_row(
             "digest": None,
         },
     )
-    adapter = RunProgramAdapter()
-    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
-        session_id = _active_session_id(client)
-        memory.run_rememberer(
-            session_factory=_session_factory(client),
-            note="Remember that I use an espresso machine.",
-            session_id=session_id,
-            settings=_settings(openai_api_key="test-key"),
-            now_fn=lambda: datetime.now(tz=UTC),
-            new_id_fn=_new_id,
-        )
+    with session_factory() as db:
+        with db.begin():
+            session_id = _insert_active_session(db)
 
-        with _session_factory(client)() as db:
-            remember_judgments = db.scalars(
-                select(AIJudgmentRecord).where(
-                    AIJudgmentRecord.judgment_type == "memory_remember"
-                )
-            ).all()
-        assert len(remember_judgments) == 1
-        assert remember_judgments[0].status == "succeeded"
+    memory.run_rememberer(
+        session_factory=session_factory,
+        note="Remember that I use an espresso machine.",
+        session_id=session_id,
+        settings=_settings(openai_api_key="test-key"),
+        now_fn=lambda: datetime.now(tz=UTC),
+        new_id_fn=_new_id,
+    )
+
+    with session_factory() as db:
+        remember_judgments = db.scalars(
+            select(AIJudgmentRecord).where(
+                AIJudgmentRecord.judgment_type == "memory_remember"
+            )
+        ).all()
+    assert len(remember_judgments) == 1
+    assert remember_judgments[0].status == "succeeded"
 
 
 # ===========================================================================
@@ -719,7 +791,7 @@ def test_memory_sweep_forgets_stale_facts_and_deletes_long_forgotten_rows(
     row already ``forgotten`` long enough is hard-deleted."""
 
     adapter = RunProgramAdapter()
-    with _build_client(postgres_url, cast(ModelAdapter, adapter)) as client:
+    with _build_client(postgres_url, cast("ModelAdapter", adapter)) as client:
         old = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
         now = datetime(2026, 5, 18, 12, 0, tzinfo=UTC)
         fresh_id = _new_id("mfa")
@@ -796,3 +868,199 @@ def test_memory_sweep_forgets_stale_facts_and_deletes_long_forgotten_rows(
         assert fresh_status == "forgotten"
         # The long-forgotten row was hard-deleted by the sweep.
         assert stale_row is None
+
+
+# ===========================================================================
+# 8. The retriever output validator fails closed
+# ===========================================================================
+
+
+def test_validated_retrieval_accepts_known_ids() -> None:
+    """``_validated_retrieval`` accepts the ``{"facts": [...]}`` contract: a flat
+    list of ids drawn from the candidate set, returned in order."""
+
+    selected = memory._validated_retrieval(
+        {"facts": ["mfa_1", "mfa_2"]},
+        candidate_ids={"mfa_1", "mfa_2", "mfa_3"},
+    )
+    assert selected == ["mfa_1", "mfa_2"]
+    assert memory._validated_retrieval({"facts": []}, candidate_ids={"mfa_1"}) == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        ["mfa_1"],  # not an object
+        {"facts": "mfa_1"},  # facts is not a list
+        {"facts": [123]},  # an entry is not a string id
+        {"facts": ["mfa_1", "mfa_1"]},  # a duplicate id
+        {"facts": ["mfa_unknown"]},  # an id outside the candidate set
+        {},  # facts key missing
+    ],
+)
+def test_validated_retrieval_fails_closed_on_malformed_output(payload: Any) -> None:
+    """Any malformed retriever output -- a non-object, a missing or non-list
+    ``facts``, a non-string or duplicate entry, or an invented id -- raises
+    ``AIJudgmentFailure``. There is no partial parse."""
+
+    with pytest.raises(memory.AIJudgmentFailure):
+        memory._validated_retrieval(payload, candidate_ids={"mfa_1", "mfa_2"})
+
+
+# ===========================================================================
+# 9. The rememberer output validator fails closed
+# ===========================================================================
+
+
+def test_validated_rememberer_output_accepts_the_three_operations() -> None:
+    """``_validated_rememberer_output`` accepts the operations/profile/digest
+    contract: ``write`` carries content, ``edit`` carries a known id and
+    content, ``forget`` carries a known id; profile and digest may be a string
+    or null."""
+
+    output = memory._validated_rememberer_output(
+        {
+            "operations": [
+                {"op": "write", "content": "a new fact"},
+                {"op": "edit", "fact_id": "mfa_1", "content": "a corrected fact"},
+                {"op": "forget", "fact_id": "mfa_2"},
+            ],
+            "profile": "the rewritten profile",
+            "digest": None,
+        },
+        candidate_ids={"mfa_1", "mfa_2"},
+    )
+    assert [op.op for op in output.operations] == ["write", "edit", "forget"]
+    assert output.operations[0].content == "a new fact"
+    assert output.operations[1].fact_id == "mfa_1"
+    assert output.operations[2].fact_id == "mfa_2"
+    assert output.profile == "the rewritten profile"
+    assert output.digest is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"operations": {}, "profile": None, "digest": None},  # operations not a list
+        {"operations": [], "profile": 7, "digest": None},  # profile not str|null
+        {"operations": [], "profile": None, "digest": 7},  # digest not str|null
+        {"operations": [{"op": "noop"}], "profile": None, "digest": None},  # unknown op
+        {  # write missing content
+            "operations": [{"op": "write"}],
+            "profile": None,
+            "digest": None,
+        },
+        {  # edit references an unknown fact id
+            "operations": [{"op": "edit", "fact_id": "mfa_x", "content": "c"}],
+            "profile": None,
+            "digest": None,
+        },
+        {  # forget references an unknown fact id
+            "operations": [{"op": "forget", "fact_id": "mfa_x"}],
+            "profile": None,
+            "digest": None,
+        },
+    ],
+)
+def test_validated_rememberer_output_fails_closed_on_malformed_output(
+    payload: Any,
+) -> None:
+    """Any malformed rememberer output -- a bad operations array, a
+    non-string/non-null profile or digest, an unknown op, a write with no
+    content, or an edit/forget of an invented id -- raises
+    ``AIJudgmentFailure``."""
+
+    with pytest.raises(memory.AIJudgmentFailure):
+        memory._validated_rememberer_output(payload, candidate_ids={"mfa_1", "mfa_2"})
+
+
+# ===========================================================================
+# 10. gather_candidates is a generous unranked union, never a ranking
+# ===========================================================================
+
+
+def _insert_fact(
+    db: Session, *, content: str, status: str = "active", recalled: bool = False
+) -> str:
+    """Insert one ``memory_facts`` row directly, with no embedding so the gather
+    test stays hermetic (the vector branch is skipped when no fact is
+    embedded)."""
+
+    now = datetime.now(tz=UTC)
+    fact_id = _new_id("mfa")
+    db.execute(
+        text(
+            "INSERT INTO memory_facts "
+            "(id, content, status, created_at, updated_at, last_recalled_at) VALUES "
+            "(:id, :content, :status, :now, :now, :recalled)"
+        ),
+        {
+            "id": fact_id,
+            "content": content,
+            "status": status,
+            "now": now,
+            "recalled": now if recalled else None,
+        },
+    )
+    return fact_id
+
+
+def test_gather_candidates_unions_keyword_and_recency_without_a_threshold(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """``gather_candidates`` returns a generous unranked union: a keyword match
+    and a recent fact with no keyword overlap are both candidates, forgotten
+    facts are excluded, and there is no similarity threshold filtering the set.
+    """
+
+    with session_factory() as db:
+        with db.begin():
+            keyword_match = _insert_fact(
+                db, content="The user prefers espresso brewed strong."
+            )
+            unrelated_recent = _insert_fact(
+                db, content="The deploy pipeline runs on a self-hosted runner."
+            )
+            forgotten = _insert_fact(
+                db, content="The user once liked espresso.", status="forgotten"
+            )
+
+    settings = _settings(openai_api_key="test-key")
+    with session_factory() as db:
+        candidates = memory.gather_candidates(
+            db, query="espresso", settings=settings, limit=25
+        )
+
+    ids = {fact.id for fact in candidates}
+    # The keyword hit is in the union.
+    assert keyword_match in ids
+    # A recent fact with no keyword overlap is still gathered (recency arm).
+    assert unrelated_recent in ids
+    # A forgotten fact is never a candidate.
+    assert forgotten not in ids
+
+
+def test_gather_candidates_is_bounded_as_the_store_grows(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """The gather stays bounded as the store grows: each of its arms -- keyword,
+    vector, recency -- is ``LIMIT``ed, so a store far larger than the limit
+    still yields a bounded candidate set rather than the whole table. The union
+    is deliberately generous (up to one limit per arm), never a single cap."""
+
+    limit = 5
+    with session_factory() as db:
+        with db.begin():
+            for index in range(40):
+                _insert_fact(db, content=f"A distinct stored fact number {index}.")
+
+    settings = _settings(openai_api_key="test-key")
+    with session_factory() as db:
+        candidates = memory.gather_candidates(
+            db, query="stored fact", settings=settings, limit=limit
+        )
+
+    # 40 facts in the store; the gather returns a bounded subset. With no
+    # embeddings the vector arm is skipped, so keyword + recency bound it at
+    # 2 * limit -- generous, but far short of the whole table.
+    assert 0 < len(candidates) <= 2 * limit
