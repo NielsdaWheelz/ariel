@@ -257,11 +257,11 @@ A program that does not complete cleanly commits no proposals.
 
 ### Procedural Memory
 
-Repeated workflows are not a separate skills system. They live in procedural
-memory — the `procedure` memory type owned by the memory subsystem. The model
-recalls relevant procedures as context and applies them when authoring a `run`
-program. This cutover adds no skills runtime, no skills store, and no
-skill-loading syscall.
+Repeated workflows are not a separate skills system. A procedure is an ordinary
+plain-language fact in `memory_facts` — there is no separate procedure memory
+type. The retriever surfaces relevant procedures as context and the model
+applies them when authoring a `run` program. This cutover adds no skills
+runtime, no skills store, and no skill-loading syscall.
 
 ### Proactivity
 

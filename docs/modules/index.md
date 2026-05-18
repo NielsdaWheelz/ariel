@@ -12,6 +12,6 @@ This directory contains docs owned by specific infrastructure modules or feature
   Calendar, commitment, due-date, and follow-up reasoning hard cutover
 - [google-workspace-reasoning-completion-plan.md](google-workspace-reasoning-completion-plan.md):
   concrete Google Workspace reasoning completion plan
-- [memory.md](memory.md): north-star long-memory hard cutover
-- [memory-completion-cutover.md](memory-completion-cutover.md): memory completion hard-cutover spec
+- [memory.md](memory.md): memory subsystem — fact store, profile and digest, retriever and rememberer
+- [memory-cutover.md](memory-cutover.md): memory subsystem hard-cutover record
 - [transport.md](transport.md): transport lifecycle ownership
