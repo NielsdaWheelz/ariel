@@ -16,7 +16,9 @@ Ariel is an AI operator, not a deterministic workflow engine with model garnish.
 The master assistant owns the user-facing turn and delegates bounded cognitive
 work to task-specific AI subagents. Deterministic code exists to provide services
 the AI cannot yet perform safely or directly. Those services must be narrow,
-auditable, replaceable, and removable when model capability improves.
+auditable, replaceable, and removable when model capability improves. Code exists
+only to enable and facilitate AI judgment; it never performs product judgment on
+its own.
 
 ## Judgment Ownership
 
@@ -124,13 +126,16 @@ failure envelopes that stop the turn.
 
 ## Memory
 
-Memory storage is canonical in Ariel-owned persistence. Memory judgment is
-AI-owned.
+Memory is a flat fact store plus two AI-maintained documents — the profile and
+the per-session digest. Storage is canonical in Ariel-owned persistence; every
+memory judgment is AI-owned.
 
-Deterministic code records evidence, preserves lifecycle state, enforces
-review/conflict/deletion invariants, builds candidate pools, and returns bounded
-provenance. AI decides what is worth extracting, what matters now, what to omit,
-how conflicts affect the current turn, and how feedback changes future behavior.
+Two subagents own that judgment: the retriever decides which facts matter for
+the current wake; the rememberer decides what to write and keeps the profile and
+digest current. Deterministic code stores facts and the two documents, gathers
+candidate facts, injects the profile and digest into context, runs the
+subagents, and writes audit records. No extraction, curation, conflict,
+projection, or review machinery exists. See [modules/memory.md](modules/memory.md).
 
 ## Proactivity
 

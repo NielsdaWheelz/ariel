@@ -38,7 +38,6 @@ def run_function_calls(
     agency_runtime: Any | None = None,
     attachment_runtime: Any | None = None,
     settings: Any | None = None,
-    memory_import_cutover_enabled: bool = False,
 ) -> _FunctionCallProcessingContext:
     """Drive a list of capability calls through ``process_one_call``.
 
@@ -72,7 +71,6 @@ def run_function_calls(
             attachment_runtime=attachment_runtime,
             allowed_capability_id_set=allowed,
             settings=settings,
-            memory_import_cutover_enabled=memory_import_cutover_enabled,
         )
     return ctx
 
@@ -207,5 +205,4 @@ def process_queued_action_execution(client: TestClient, approval_payload: dict[s
         agency_runtime=None,
         now_fn=_utcnow,
         new_id_fn=_new_id,
-        memory_import_cutover_enabled=False,
     )

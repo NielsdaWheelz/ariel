@@ -240,6 +240,67 @@ def _count_rows(client: TestClient, table_name: str) -> int:
             return int(result["count"])
 
 
+def _run_worker_until(
+    client: TestClient,
+    *,
+    task_type: str,
+    settings: Any,
+    model_adapter: Any,
+    worker_id: str = "worker-a",
+    max_ticks: int = 8,
+) -> None:
+    """Drive ``process_one_task`` until a task of ``task_type`` is completed.
+
+    ``process_one_task`` does one unit of work per call, and the worker's
+    periodic-enqueue pass self-gates a ``memory_sweep`` task that can consume a
+    tick; looping until the target task completes absorbs that incidental work.
+    """
+
+    for _ in range(max_ticks):
+        process_one_task(
+            session_factory=_session_factory(client),
+            settings=settings,
+            worker_id=worker_id,
+            model_adapter=model_adapter,
+        )
+        with _session_factory(client)() as db:
+            with db.begin():
+                completed = db.execute(
+                    text(
+                        "SELECT COUNT(*) FROM background_tasks "
+                        "WHERE task_type = :task_type AND status = 'completed'"
+                    ),
+                    {"task_type": task_type},
+                ).scalar_one()
+        if completed:
+            return
+    raise AssertionError(f"task {task_type} did not complete within {max_ticks} ticks")
+
+
+def _drain_worker(
+    client: TestClient,
+    *,
+    settings: Any,
+    model_adapter: Any,
+    worker_id: str = "worker-a",
+    max_ticks: int = 10,
+) -> None:
+    """Run ``process_one_task`` until the worker reports no claimable work.
+
+    Each call does one unit; the periodic-enqueue pass self-gates a
+    ``memory_sweep`` task, so draining covers every chained task plus the sweep.
+    """
+
+    for _ in range(max_ticks):
+        if not process_one_task(
+            session_factory=_session_factory(client),
+            settings=settings,
+            worker_id=worker_id,
+            model_adapter=model_adapter,
+        ):
+            return
+
+
 def _signed_agency_body(
     payload: dict[str, Any], *, secret: str, timestamp: int
 ) -> SignedAgencyBody:
@@ -391,24 +452,7 @@ def test_agency_event_worker_creates_job_event_and_proactive_case_once(
         assert response.status_code == 202
 
         settings = cast(Any, AppSettings)(_env_file=None)
-        assert (
-            process_one_task(
-                session_factory=_session_factory(client),
-                settings=settings,
-                worker_id="worker-a",
-                model_adapter=adapter,
-            )
-            is True
-        )
-        assert (
-            process_one_task(
-                session_factory=_session_factory(client),
-                settings=settings,
-                worker_id="worker-a",
-                model_adapter=adapter,
-            )
-            is True
-        )
+        _drain_worker(client, settings=settings, model_adapter=adapter)
 
         assert _count_rows(client, "jobs") == 1
         assert _count_rows(client, "job_events") == 1
@@ -485,7 +529,7 @@ def test_google_provider_event_ingress_is_token_bound_deduped_and_conflict_safe(
                 task_type = db.execute(
                     text(
                         "SELECT task_type FROM background_tasks "
-                        "WHERE status = 'pending' "
+                        "WHERE status = 'pending' AND task_type != 'memory_sweep' "
                         "ORDER BY created_at DESC LIMIT 1"
                     )
                 ).scalar_one()
@@ -651,17 +695,18 @@ def test_proactive_interpretation_deliberates_speaks_and_acknowledges_case_and_t
                 task_type = db.execute(
                     text(
                         "SELECT task_type FROM background_tasks "
-                        "WHERE status = 'pending' "
+                        "WHERE status = 'pending' AND task_type != 'memory_sweep' "
                         "ORDER BY created_at DESC LIMIT 1"
                     )
                 ).scalar_one()
                 assert task_type == "proactive_deliberation_due"
 
-        assert process_one_task(
-            session_factory=_session_factory(client),
+        _run_worker_until(
+            client,
+            task_type="proactive_deliberation_due",
             settings=settings,
-            worker_id="worker-proactive",
             model_adapter=adapter,
+            worker_id="worker-proactive",
         )
 
         decisions = client.get(f"/v1/proactive/cases/{proactive_case['id']}/decisions")
@@ -769,11 +814,12 @@ def test_proactive_wait_decision_schedules_and_runs_durable_follow_up(
             worker_id="worker-proactive",
             model_adapter=adapter,
         )
-        assert process_one_task(
-            session_factory=_session_factory(client),
+        _run_worker_until(
+            client,
+            task_type="proactive_deliberation_due",
             settings=settings,
-            worker_id="worker-proactive",
             model_adapter=adapter,
+            worker_id="worker-proactive",
         )
 
         cases = client.get("/v1/proactive/cases", params={"status": "waiting"})
@@ -786,11 +832,13 @@ def test_proactive_wait_decision_schedules_and_runs_durable_follow_up(
 
         with _session_factory(client)() as db:
             with db.begin():
+                # The proactive follow-up is the only pending proactive task;
+                # the worker's self-gated memory_sweep is excluded.
                 pending_tasks = (
                     db.execute(
                         text(
                             "SELECT task_type FROM background_tasks "
-                            "WHERE status = 'pending' "
+                            "WHERE status = 'pending' AND task_type != 'memory_sweep' "
                             "ORDER BY created_at DESC"
                         )
                     )
@@ -800,11 +848,12 @@ def test_proactive_wait_decision_schedules_and_runs_durable_follow_up(
                 assert pending_tasks == ["proactive_follow_up_due"]
 
         monkeypatch.setattr("ariel.worker._utcnow", lambda: follow_up_at + timedelta(seconds=1))
-        assert process_one_task(
-            session_factory=_session_factory(client),
+        _run_worker_until(
+            client,
+            task_type="proactive_follow_up_due",
             settings=settings,
-            worker_id="worker-proactive",
             model_adapter=adapter,
+            worker_id="worker-proactive",
         )
 
         reopened = client.get(f"/v1/proactive/cases/{proactive_case['id']}")
@@ -817,7 +866,7 @@ def test_proactive_wait_decision_schedules_and_runs_durable_follow_up(
                 task_type = db.execute(
                     text(
                         "SELECT task_type FROM background_tasks "
-                        "WHERE status = 'pending' "
+                        "WHERE status = 'pending' AND task_type != 'memory_sweep' "
                         "ORDER BY created_at DESC LIMIT 1"
                     )
                 ).scalar_one()
@@ -855,11 +904,12 @@ def test_proactive_feedback_creates_durable_learning_record(
             worker_id="worker-proactive",
             model_adapter=adapter,
         )
-        assert process_one_task(
-            session_factory=_session_factory(client),
+        _run_worker_until(
+            client,
+            task_type="proactive_deliberation_due",
             settings=settings,
-            worker_id="worker-proactive",
             model_adapter=adapter,
+            worker_id="worker-proactive",
         )
 
         proactive_case = client.get("/v1/proactive/cases", params={"status": "spoken"}).json()[
@@ -886,17 +936,12 @@ def test_proactive_feedback_creates_durable_learning_record(
                 ).scalar_one()
                 assert task_type == "proactive_feedback_learning_due"
 
-        assert process_one_task(
-            session_factory=_session_factory(client),
+        _run_worker_until(
+            client,
+            task_type="proactive_feedback_learning_due",
             settings=settings,
-            worker_id="worker-proactive",
             model_adapter=adapter,
-        )
-        assert process_one_task(
-            session_factory=_session_factory(client),
-            settings=settings,
             worker_id="worker-proactive",
-            model_adapter=adapter,
         )
 
         with _session_factory(client)() as db:

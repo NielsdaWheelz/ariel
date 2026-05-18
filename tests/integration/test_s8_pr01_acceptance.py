@@ -73,66 +73,6 @@ def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
     return TestClient(app)
 
 
-def _fake_continuity_curation(
-    *,
-    rotation_reason: str,
-    prior_session_id: str,
-    new_session_id: str,
-    source_turns: list[dict[str, Any]],
-    settings: Any,
-) -> dict[str, Any]:
-    del settings
-    return {
-        "summary": f"fixture continuity for {rotation_reason}",
-        "preserved_turn_refs": [
-            {"turn_id": str(turn["turn_id"]), "reason": "fixture preserved this turn"}
-            for turn in source_turns
-        ],
-        "omitted_turn_refs": [],
-        "user_commitments": [],
-        "assistant_commitments": [],
-        "decisions": [],
-        "open_loops": [],
-        "unresolved_uncertainty": [],
-        "tool_action_outcomes": [],
-        "important_omissions": [],
-        "confidence": 0.9,
-        "model": "fixture-continuity-curator",
-        "parse_status": "parsed",
-        "validation_status": "valid",
-        "prior_session_id": prior_session_id,
-        "new_session_id": new_session_id,
-    }
-
-
-def _fake_memory_curation(
-    *,
-    user_message: str,
-    history: list[dict[str, Any]],
-    candidates: list[dict[str, Any]],
-    max_selected: int,
-    settings: Any,
-) -> dict[str, Any]:
-    del user_message, history, max_selected, settings
-    return {
-        "selected_memories": [],
-        "omitted_memories": [
-            {
-                "id": str(candidate["id"]),
-                "kind": str(candidate.get("kind") or "semantic_assertion"),
-                "reason": "fixture omitted",
-            }
-            for candidate in candidates
-        ],
-        "rationale": "fixture memory curation",
-        "uncertainty": "",
-        "confidence": 0.9,
-        "model": "fixture-memory-curator",
-        "prompt_version": "memory-curation-v2",
-        "parse_status": "parsed",
-    }
-
-
 def _session_id(client: TestClient) -> str:
     active = client.get("/v1/sessions/active")
     assert active.status_code == 200
@@ -283,10 +223,6 @@ def test_s8_pr01_capture_idempotency_survives_auto_rotation_between_retries(
     monkeypatch.setenv("ARIEL_AUTO_ROTATE_MAX_TURNS", "1")
     monkeypatch.setenv("ARIEL_AUTO_ROTATE_MAX_AGE_SECONDS", "999999")
     monkeypatch.setenv("ARIEL_AUTO_ROTATE_CONTEXT_PRESSURE_TOKENS", "999999")
-    monkeypatch.setattr(
-        "ariel.memory._curate_rotation_context_with_model", _fake_continuity_curation
-    )
-    monkeypatch.setattr("ariel.memory._curate_memory_context_with_model", _fake_memory_curation)
 
     adapter = CaptureProbeAdapter()
     with _build_client(postgres_url, adapter) as client:
@@ -486,14 +422,13 @@ def test_s8_pr01_bare_text_capture_is_observe_first_and_not_direct_memory_comman
         assert response.status_code == 200
         payload = response.json()
 
-        memory_projection = client.get("/v1/memory")
-        assert memory_projection.status_code == 200
-        memory_payload = memory_projection.json()
-        assert memory_payload["active_assertions"] == []
-        assert memory_payload["candidates"] == []
+        # The capture writes no fact synchronously: memory is the rememberer's
+        # job, run as a background task, never a direct effect of a capture.
+        memory_facts = client.get("/v1/memory/facts")
+        assert memory_facts.status_code == 200
+        assert memory_facts.json()["facts"] == []
 
         event_types = [event["event_type"] for event in payload["turn"]["events"]]
-        assert "evt.memory.candidate_proposed" not in event_types
-        assert "evt.memory.assertion_activated" not in event_types
+        assert "evt.memory.recalled" not in event_types
         assert adapter.seen_user_messages
         assert not adapter.seen_user_messages[0].strip().lower().startswith("remember ")

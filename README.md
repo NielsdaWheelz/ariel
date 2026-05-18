@@ -79,7 +79,7 @@ cases assemble context and ask the model whether to ignore, remember, wait, spea
 act, or speak and act.
 
 Configured ambient source families are workspace item events, Google connector health,
-captures, jobs, approval requests, and reviewed memory assertions. Location/travel,
+captures, jobs, approval requests, and memory writes. Location/travel,
 local or browser activity, repository, CI, and incident streams are absent until each is
 implemented end to end.
 
@@ -298,7 +298,9 @@ slice-5 adds canonical durable memory, explicit + threshold rotation, and harden
 - context assembly contract (deterministic order):
   - `policy_system_instructions`
   - `recent_active_session_turns`
-  - `memory_context`
+  - `profile`
+  - `session_digest`
+  - `recalled_memory`
   - `open_commitments_and_jobs`
   - `relevant_artifacts_and_observations`
 
@@ -438,7 +440,10 @@ memory runtime config:
 - `ARIEL_MEMORY_EMBEDDING_PROVIDER` (default `openai`)
 - `ARIEL_MEMORY_EMBEDDING_MODEL` (default `text-embedding-3-small`)
 - `ARIEL_MEMORY_EMBEDDING_DIMENSIONS` (default `1536`; must match schema)
-- `ARIEL_MEMORY_IMPORT_CUTOVER_ENABLED` (default `false`; enables one-time cutover import only)
+
+memory is a flat `memory_facts` store plus an always-loaded profile document and
+a per-session digest, maintained by the retriever and rememberer subagents. the
+model's memory surface is two syscalls, `memory.recall` and `memory.remember`.
 
 search capability runtime config:
 

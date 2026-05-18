@@ -16,12 +16,11 @@ from ariel.capability_registry import get_capability
 from ariel.config import AppSettings
 from ariel.executor import execute_capability, preflight_capability_execution
 from ariel.memory import (
-    AIJudgmentFailure,
-    MEMORY_CURATION_PROMPT_VERSION,
-    build_memory_context,
-    emit_memory_events,
-    propose_memory_candidate,
-    record_action_trace,
+    read_profile,
+    render_profile,
+    render_recalled_facts,
+    run_rememberer,
+    run_retriever,
 )
 from ariel.persistence import (
     ApprovalRequestRecord,
@@ -33,8 +32,6 @@ from ariel.persistence import (
     GoogleConnectorRecord,
     AIJudgmentRecord,
     JobRecord,
-    MemoryActionTraceRecord,
-    MemoryAssertionRecord,
     NotificationRecord,
     ProviderEvidenceBlockRecord,
     ProviderEvidenceRecord,
@@ -46,7 +43,6 @@ from ariel.persistence import (
     ProactiveFeedbackRecord,
     ProactiveLearningRecord,
     ProactiveObservationRecord,
-    SessionRecord,
     WorkCommitmentSourceRecord,
     WorkCommitmentRecord,
     WorkFollowUpEventRecord,
@@ -522,34 +518,6 @@ def _ambient_interpretation_candidates(
             }
         )
 
-    assertions = db.scalars(
-        select(MemoryAssertionRecord)
-        .where(MemoryAssertionRecord.lifecycle_state == "active")
-        .order_by(MemoryAssertionRecord.updated_at.desc(), MemoryAssertionRecord.id.asc())
-        .limit(24)
-    ).all()
-    for assertion in assertions:
-        candidates.append(
-            {
-                "candidate_id": f"memory:{assertion.id}:{to_rfc3339(assertion.updated_at)}",
-                "source_type": "memory_assertion",
-                "source_id": assertion.id,
-                "discord_message_id": None,
-                "observed_at": to_rfc3339(assertion.updated_at),
-                "trust_boundary": "reviewed_memory",
-                "taint": {"provenance_status": "reviewed_memory"},
-                "raw_event": {
-                    "id": assertion.id,
-                    "assertion_type": assertion.assertion_type,
-                    "subject_key": assertion.subject_key,
-                    "predicate": assertion.predicate,
-                    "object_value": assertion.object_value,
-                    "confidence": assertion.confidence,
-                    "updated_at": to_rfc3339(assertion.updated_at),
-                },
-            }
-        )
-
     connectors = db.scalars(
         select(GoogleConnectorRecord)
         .order_by(GoogleConnectorRecord.updated_at.desc(), GoogleConnectorRecord.id.asc())
@@ -992,8 +960,6 @@ def process_proactive_deliberation_due(
     if case_id is None:
         raise RuntimeError("proactive_deliberation_due task missing case_id")
 
-    memory_failure: RuntimeError | None = None
-    memory_failure_retryable = False
     with session_factory() as db:
         with db.begin():
             case = db.scalar(
@@ -1012,183 +978,97 @@ def process_proactive_deliberation_due(
                 raise RuntimeError("latest proactive observation not found")
 
             now = now_fn()
-            active_session = db.scalar(
-                select(SessionRecord).where(SessionRecord.is_active.is_(True)).limit(1)
-            )
-            try:
-                memory_context, memory_event = build_memory_context(
-                    db,
-                    user_message=f"{case.title}\n{case.summary}",
-                    max_recalled_assertions=settings.max_recalled_assertions,
-                    settings=settings,
-                    current_session_id=active_session.id if active_session is not None else None,
-                    proactive_case_id=case.id,
-                    actor_id="system",
-                )
-            except AIJudgmentFailure as exc:
-                safe_reason = safe_failure_reason(
-                    exc.safe_reason,
-                    fallback=f"unexpected {exc.__class__.__name__}",
-                )
-                candidate_memory_ids = [
-                    memory_id
-                    for memory_id in db.scalars(
-                        select(MemoryAssertionRecord.id)
-                        .where(MemoryAssertionRecord.lifecycle_state == "active")
-                        .order_by(MemoryAssertionRecord.updated_at.desc())
-                        .limit(max(50, int(settings.max_recalled_assertions) * 8))
-                    ).all()
-                    if isinstance(memory_id, str)
-                ]
-                db.add(
-                    AIJudgmentRecord(
-                        id=new_id_fn("ajg"),
-                        judgment_type="memory_curation",
-                        source_type="proactive_case",
-                        source_id=case.id,
-                        status="failed",
-                        model=settings.model_name,
-                        prompt_version=MEMORY_CURATION_PROMPT_VERSION,
-                        provider_response_id=exc.provider_response_id,
-                        input_summary="memory curation for proactive case",
-                        input_refs={
-                            "case_id": case.id,
-                            "latest_observation_id": observation.id,
-                            "candidate_memory_ids": candidate_memory_ids,
-                        },
-                        selected=[],
-                        omitted=[],
-                        output={},
-                        rationale=None,
-                        uncertainty=None,
-                        confidence=None,
-                        parse_status=exc.parse_status,
-                        validation_status=exc.validation_status,
-                        failure_code=exc.code,
-                        failure_reason=safe_reason,
-                        created_at=now,
-                        updated_at=now,
-                    )
-                )
-                db.add(
-                    AIJudgmentRecord(
-                        id=new_id_fn("ajg"),
-                        judgment_type="proactive_deliberation",
-                        source_type="proactive_case",
-                        source_id=case.id,
-                        status="failed",
-                        model=settings.model_name,
-                        prompt_version=PROACTIVE_POLICY_VERSION,
-                        provider_response_id=None,
-                        input_summary="proactive case deliberation",
-                        input_refs={
-                            "case_id": case.id,
-                            "latest_observation_id": observation.id,
-                            "dependency": "memory_curation",
-                        },
-                        selected=[],
-                        omitted=[],
-                        output={},
-                        rationale=None,
-                        uncertainty=None,
-                        confidence=None,
-                        parse_status="missing_output",
-                        validation_status="not_validated",
-                        failure_code=exc.code,
-                        failure_reason=safe_reason,
-                        created_at=now,
-                        updated_at=now,
-                    )
-                )
-                case.status = "failed"
-                case.updated_at = now
-                _add_case_event(
-                    db,
-                    case_id=case.id,
-                    event_type="failed",
-                    payload={
-                        "failure_type": "memory_curation",
-                        "failure_code": exc.code,
-                        "failure_reason": safe_reason,
-                        "parse_status": exc.parse_status,
-                        "validation_status": exc.validation_status,
-                        "retryable": exc.retryable,
-                    },
-                    now=now,
-                    new_id_fn=new_id_fn,
-                )
-                memory_failure = RuntimeError(safe_reason)
-                memory_failure_retryable = exc.retryable
-            else:
-                learning_records = db.scalars(
-                    select(ProactiveLearningRecord)
-                    .where(ProactiveLearningRecord.status == "active")
-                    .order_by(
-                        ProactiveLearningRecord.updated_at.desc(),
-                        ProactiveLearningRecord.id.asc(),
-                    )
-                    .limit(20)
-                ).all()
-                context = {
-                    "case": {
-                        "id": case.id,
-                        "status": case.status,
-                        "title": case.title,
-                        "summary": case.summary,
-                    },
-                    "latest_observation": {
-                        "id": observation.id,
-                        "source_type": observation.source_type,
-                        "source_id": observation.source_id,
-                        "observation_type": observation.observation_type,
-                        "subject": observation.subject,
-                        "summary": observation.summary,
-                        "payload": observation.payload,
-                        "evidence": observation.evidence,
-                        "trust_boundary": observation.trust_boundary,
-                        "observed_at": to_rfc3339(observation.observed_at),
-                    },
-                    "memory_context": memory_context,
-                    "memory_recall": memory_event,
-                    "learning_records": [
-                        {
-                            "id": record.id,
-                            "record_type": record.record_type,
-                            "content": record.content,
-                        }
-                        for record in learning_records
-                    ],
-                }
-                model_input = [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are Ariel's proactive deliberation engine. Decide whether to "
-                            "ignore, remember, wait, observe_more, speak_now, ask_user, act_now, "
-                            "or speak_and_act. Return only strict JSON with keys: decision, "
-                            "confidence, urgency, user_visible_message, rationale, evidence_refs, "
-                            "tool_refs, actions, follow_up."
-                        ),
-                    },
-                    {
-                        "role": "system",
-                        "content": json.dumps(context, sort_keys=True, separators=(",", ":")),
-                    },
-                ]
-                context_taint = {"latest_observation": observation.taint}
-                _add_case_event(
-                    db,
-                    case_id=case.id,
-                    event_type="context_built",
-                    payload={"latest_observation_id": observation.id},
-                    now=now,
-                    new_id_fn=new_id_fn,
-                )
 
-    if memory_failure is not None:
-        if memory_failure_retryable:
-            raise memory_failure
-        return
+            # Pre-deliberation memory: the always-loaded profile, plus the
+            # retriever's verdict on which stored facts matter for this case.
+            # Proactive deliberation is case-scoped, not session-scoped, so it
+            # gets no session digest. The retriever is a bounded AI subagent
+            # that audits its own ai_judgments row; it is non-fatal -- any
+            # failure leaves the deliberation alive on the profile alone.
+            profile = read_profile(db)
+            try:
+                recalled_facts = run_retriever(
+                    session_factory=session_factory,
+                    query=f"{case.title}\n{case.summary}",
+                    source_type="proactive_case",
+                    source_id=case.id,
+                    settings=settings,
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
+            except Exception:
+                recalled_facts = []
+
+            learning_records = db.scalars(
+                select(ProactiveLearningRecord)
+                .where(ProactiveLearningRecord.status == "active")
+                .order_by(
+                    ProactiveLearningRecord.updated_at.desc(),
+                    ProactiveLearningRecord.id.asc(),
+                )
+                .limit(20)
+            ).all()
+            context = {
+                "case": {
+                    "id": case.id,
+                    "status": case.status,
+                    "title": case.title,
+                    "summary": case.summary,
+                },
+                "latest_observation": {
+                    "id": observation.id,
+                    "source_type": observation.source_type,
+                    "source_id": observation.source_id,
+                    "observation_type": observation.observation_type,
+                    "subject": observation.subject,
+                    "summary": observation.summary,
+                    "payload": observation.payload,
+                    "evidence": observation.evidence,
+                    "trust_boundary": observation.trust_boundary,
+                    "observed_at": to_rfc3339(observation.observed_at),
+                },
+                "user_profile": render_profile(profile),
+                "recalled_memory": render_recalled_facts(recalled_facts),
+                "learning_records": [
+                    {
+                        "id": record.id,
+                        "record_type": record.record_type,
+                        "content": record.content,
+                    }
+                    for record in learning_records
+                ],
+            }
+            model_input = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are Ariel's proactive deliberation engine. Decide whether to "
+                        "ignore, remember, wait, observe_more, speak_now, ask_user, act_now, "
+                        "or speak_and_act. Return only strict JSON with keys: decision, "
+                        "confidence, urgency, user_visible_message, rationale, evidence_refs, "
+                        "tool_refs, actions, follow_up, memory. On a remember decision set "
+                        "memory to a single plain-language note stating what to remember, in "
+                        "plain words."
+                    ),
+                },
+                {
+                    "role": "system",
+                    "content": json.dumps(context, sort_keys=True, separators=(",", ":")),
+                },
+            ]
+            # The deliberation context is folded onto the decision row (the
+            # former proactive_context_snapshots satellite is gone): context,
+            # model_input, and context_taint are carried as locals into the
+            # ProactiveDecisionRecord build below.
+            context_taint = {"latest_observation": observation.taint}
+            _add_case_event(
+                db,
+                case_id=case.id,
+                event_type="context_built",
+                payload={"latest_observation_id": observation.id},
+                now=now,
+                new_id_fn=new_id_fn,
+            )
 
     try:
         response = _call_deliberation_model(
@@ -1292,7 +1172,7 @@ def process_proactive_deliberation_due(
             follow_up = raw_decision.get("follow_up")
             message = raw_decision.get("user_visible_message")
             rationale = raw_decision.get("rationale")
-            remember_payload = _remember_payload(raw_decision)
+            remember_note = _remember_note(raw_decision)
 
             evidence_refs = (
                 [item for item in evidence_refs_raw if isinstance(item, str)]
@@ -1336,7 +1216,7 @@ def process_proactive_deliberation_due(
             if decision_type in {"wait", "observe_more"}:
                 valid = valid and bool(evidence_refs) and _valid_follow_up(follow_up)
             if decision_type == "remember":
-                valid = valid and bool(evidence_refs) and _valid_remember_payload(remember_payload)
+                valid = valid and bool(evidence_refs) and remember_note is not None
 
             decision_id = new_id_fn("pdc")
             effective_decision_type = decision_type if valid else "ignore"
@@ -1345,7 +1225,7 @@ def process_proactive_deliberation_due(
                 rationale.strip() if isinstance(rationale, str) else "invalid decision"
             )
             model_output = (
-                {**raw_decision, "memory": remember_payload}
+                {**raw_decision, "memory": remember_note}
                 if decision_type == "remember"
                 else raw_decision
             )
@@ -1406,7 +1286,7 @@ def process_proactive_deliberation_due(
                 tool_refs=[],
                 actions=actions,
                 follow_up=follow_up if isinstance(follow_up, dict) else None,
-                memory_payload=remember_payload if decision_type == "remember" else None,
+                memory_payload=remember_note if decision_type == "remember" else None,
                 policy_result=None if valid else "invalid_decision",
                 policy_version=None if valid else PROACTIVE_POLICY_VERSION,
                 action_plan_hash=(
@@ -1443,6 +1323,8 @@ def process_proactive_deliberation_due(
 
             _validate_and_apply_decision(
                 db=db,
+                session_factory=session_factory,
+                settings=settings,
                 case=case,
                 decision=decision,
                 now=now,
@@ -1756,57 +1638,10 @@ def _valid_follow_up(follow_up: Any) -> bool:
     return isinstance(follow_up, dict) and follow_up.get("after") in _FOLLOW_UP_INTERVALS
 
 
-def _remember_payload(raw_decision: dict[str, Any]) -> dict[str, Any] | None:
-    memory = raw_decision.get("memory")
-    if isinstance(memory, dict):
-        return memory
-    return None
-
-
-def _valid_remember_payload(payload: dict[str, Any] | None) -> bool:
-    if payload is None:
-        return False
-    value = payload.get("value")
-    return (
-        _normalized_text(payload.get("subject_key")) is not None
-        and _normalized_text(payload.get("predicate")) is not None
-        and _normalized_text(value) is not None
-        and str(payload.get("assertion_type") or "fact")
-        in {
-            "fact",
-            "profile",
-            "preference",
-            "commitment",
-            "decision",
-            "project_state",
-            "procedure",
-            "domain_concept",
-        }
-    )
-
-
-def _normalized_remember_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    subject_key = _normalized_text(payload.get("subject_key")) or "user:default"
-    predicate = _normalized_text(payload.get("predicate")) or "note"
-    value = _normalized_text(payload.get("value")) or ""
-    assertion_type = str(payload.get("assertion_type") or "fact")
-    if assertion_type not in {
-        "fact",
-        "profile",
-        "preference",
-        "commitment",
-        "decision",
-        "project_state",
-        "procedure",
-        "domain_concept",
-    }:
-        assertion_type = "fact"
-    return {
-        "subject_key": subject_key,
-        "predicate": predicate,
-        "value": value,
-        "assertion_type": assertion_type,
-    }
+def _remember_note(raw_decision: dict[str, Any]) -> str | None:
+    """A ``remember`` decision carries one plain-language note -- what to
+    remember, in plain words. The rememberer subagent owns all fact shaping."""
+    return _normalized_text(raw_decision.get("memory"))
 
 
 def _action_target_system(action_type: str, action: dict[str, Any]) -> str:
@@ -2024,6 +1859,8 @@ def _taint_blocks_autonomous_write(latest_taint: Any) -> bool:
 def _validate_and_apply_decision(
     *,
     db: Session,
+    session_factory: sessionmaker[Session],
+    settings: AppSettings,
     case: ProactiveCaseRecord,
     decision: ProactiveDecisionRecord,
     now: datetime,
@@ -2164,6 +2001,8 @@ def _validate_and_apply_decision(
     if decision.decision_type == "remember":
         _apply_remember_decision(
             db=db,
+            session_factory=session_factory,
+            settings=settings,
             case=case,
             decision=decision,
             now=now,
@@ -2236,91 +2075,45 @@ def _follow_up_time(follow_up: dict[str, Any] | None, now: datetime) -> datetime
     return now + _FOLLOW_UP_INTERVALS.get(after, timedelta(minutes=15))
 
 
-def _active_or_new_session(
-    db: Session,
-    *,
-    now: datetime,
-    new_id_fn: Callable[[str], str],
-) -> SessionRecord:
-    """Return the active session, creating and flushing one if none exists."""
-    session = db.scalar(select(SessionRecord).where(SessionRecord.is_active.is_(True)).limit(1))
-    if session is None:
-        session = SessionRecord(
-            id=new_id_fn("ses"),
-            is_active=True,
-            lifecycle_state="active",
-            created_at=now,
-            updated_at=now,
-        )
-        db.add(session)
-        db.flush()
-    return session
-
-
 def _apply_remember_decision(
     *,
     db: Session,
+    session_factory: sessionmaker[Session],
+    settings: AppSettings,
     case: ProactiveCaseRecord,
     decision: ProactiveDecisionRecord,
     now: datetime,
     new_id_fn: Callable[[str], str],
 ) -> None:
-    raw_memory = decision.memory_payload
-    if not isinstance(raw_memory, dict):
+    """Run the rememberer over a proactive ``remember`` decision's content. The
+    rememberer is a bounded AI subagent that owns the fact store and audits its
+    own ``ai_judgments`` row; a failure is non-fatal here -- the case still
+    resolves, since the decision itself is already recorded.
+
+    The remember note is read from ``decision.memory_payload`` -- the narrow
+    column that survives the proactive call-record de-duplication; the full
+    model output now lives only on the linked ``ai_judgments`` row."""
+    note = _normalized_text(decision.memory_payload)
+    if note is None:
         return
-    memory = _normalized_remember_payload(raw_memory)
-    judgment = db.get(AIJudgmentRecord, decision.ai_judgment_id)
-    if judgment is None:
-        raise RuntimeError("proactive decision missing its ai_judgment record")
-    source_session = _active_or_new_session(db, now=now, new_id_fn=new_id_fn)
-    memory_events = propose_memory_candidate(
-        db,
-        source_session_id=source_session.id,
-        actor_id="system",
-        evidence_text=f"{case.title}\n{case.summary}\n{memory['value']}",
-        subject_key=memory["subject_key"],
-        predicate=memory["predicate"],
-        assertion_type=memory["assertion_type"],
-        value=memory["value"],
-        confidence=decision.confidence,
-        scope_key=f"proactive:{case.id}",
-        valid_from=now,
-        valid_to=None,
-        extraction_model=judgment.model,
-        extraction_prompt_version=PROACTIVE_POLICY_VERSION,
-        now_fn=lambda: now,
-        new_id_fn=new_id_fn,
-        proactive_case_id=case.id,
-    )
-    emit_memory_events(
-        db,
-        events=memory_events,
-        entry_path="proactive",
-        actor_id="system",
-        scope_key=f"proactive:{case.id}",
-        now=now,
-        new_id_fn=new_id_fn,
-    )
-    assertion_id: str | None = None
-    for memory_event in memory_events:
-        payload = memory_event.get("payload")
-        if (
-            memory_event.get("event_type") == "evt.memory.candidate_proposed"
-            and isinstance(payload, dict)
-            and isinstance(payload.get("assertion_id"), str)
-        ):
-            assertion_id = payload["assertion_id"]
-            break
-    if assertion_id is None:
-        return
+    operations = 0
+    try:
+        output = run_rememberer(
+            session_factory=session_factory,
+            settings=settings,
+            now_fn=lambda: now,
+            new_id_fn=new_id_fn,
+            trigger="note",
+            note=f"{case.title}\n{case.summary}\n{note}",
+        )
+        operations = len(output.operations)
+    except Exception:
+        pass
     _add_case_event(
         db,
         case_id=case.id,
         event_type="resolved",
-        payload={
-            "memory_candidate_assertion_id": assertion_id,
-            "memory_events": memory_events,
-        },
+        payload={"memory_operation_count": operations},
         now=now,
         new_id_fn=new_id_fn,
     )
@@ -2423,62 +2216,6 @@ def _create_action_plan(
         db,
         task_type="proactive_action_execution_due",
         payload={"action_plan_id": plan.id},
-        now=now,
-        new_id_fn=new_id_fn,
-    )
-
-
-def _record_proactive_action_trace(
-    db: Session,
-    *,
-    plan: ProactiveActionPlanRecord,
-    stored_execution: ProactiveActionExecutionRecord,
-    now: datetime,
-    new_id_fn: Callable[[str], str],
-) -> None:
-    # record_action_trace's no-attempt branch always inserts a fresh trace, and a
-    # re-runnable worker re-enters the late phases for an already-terminal
-    # execution; skip if this plan's execution trace was already recorded.
-    existing_trace = db.scalar(
-        select(MemoryActionTraceRecord)
-        .where(
-            MemoryActionTraceRecord.scope_key == f"proactive:{plan.case_id}",
-            MemoryActionTraceRecord.trace_type == "execution",
-            MemoryActionTraceRecord.result_refs["action_plan_id"].astext == plan.id,
-        )
-        .limit(1)
-    )
-    if existing_trace is not None:
-        return
-    trace_session = _active_or_new_session(db, now=now, new_id_fn=new_id_fn)
-    _, trace_events = record_action_trace(
-        db,
-        action_attempt=None,
-        scope_key=f"proactive:{plan.case_id}",
-        primary_evidence_id=None,
-        source_turn_id=None,
-        trace_type="execution",
-        now=now,
-        new_id_fn=new_id_fn,
-        session_id=trace_session.id,
-        capability_id=plan.action_type,
-        outcome=stored_execution.status,
-        result_refs={
-            "action_plan_id": plan.id,
-            "case_id": plan.case_id,
-            "target": plan.target,
-            "risk_tier": plan.risk_tier,
-            "execution_status": stored_execution.status,
-            "execution_error": stored_execution.error,
-        },
-        evidence_text=f"proactive action {plan.action_type} for case {plan.case_id}",
-    )
-    emit_memory_events(
-        db,
-        events=trace_events,
-        entry_path="proactive",
-        actor_id="system",
-        scope_key=f"proactive:{plan.case_id}",
         now=now,
         new_id_fn=new_id_fn,
     )
@@ -2671,13 +2408,6 @@ def process_proactive_action_execution_due(
                     now=now,
                     new_id_fn=new_id_fn,
                 )
-                _record_proactive_action_trace(
-                    db,
-                    plan=plan,
-                    stored_execution=stored_execution,
-                    now=now,
-                    new_id_fn=new_id_fn,
-                )
         return
 
     with session_factory() as db:
@@ -2714,13 +2444,6 @@ def process_proactive_action_execution_due(
                 case_id=plan.case_id,
                 event_type="action_executed",
                 payload={"action_plan_id": plan.id, "status": stored_execution.status},
-                now=now,
-                new_id_fn=new_id_fn,
-            )
-            _record_proactive_action_trace(
-                db,
-                plan=plan,
-                stored_execution=stored_execution,
                 now=now,
                 new_id_fn=new_id_fn,
             )

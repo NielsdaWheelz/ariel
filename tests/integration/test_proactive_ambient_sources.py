@@ -21,9 +21,6 @@ from ariel.persistence import (
     DiscordMessageRecord,
     GoogleConnectorRecord,
     JobRecord,
-    MemoryAssertionRecord,
-    MemoryEntityRecord,
-    MemoryEvidenceRecord,
     ProactiveCaseRecord,
     ProactiveObservationRecord,
     SessionRecord,
@@ -32,13 +29,15 @@ from ariel.persistence import (
 from ariel.proactivity import process_ambient_interpretation_due
 
 
+# The durable ambient source types ambient interpretation gathers. Memory is
+# not among them: the memory cutover removed memory from ambient interpretation
+# -- recall belongs to proactive deliberation downstream, not high-volume triage.
 EXPECTED_SOURCE_TYPES = {
     "approval_request",
     "capture",
     "discord_message",
     "google_connector",
     "job",
-    "memory_assertion",
 }
 
 
@@ -407,66 +406,6 @@ def _seed_ambient_sources(db: Session, *, now: datetime, new_id: IdFactory) -> s
             expires_at=now + timedelta(minutes=30),
             decision_reason=None,
             decided_at=None,
-            created_at=now,
-            updated_at=now,
-        )
-    )
-    db.flush()
-
-    evidence_id = new_id("mev")
-    entity_id = new_id("men")
-    assertion_id = new_id("mas")
-    db.add(
-        MemoryEvidenceRecord(
-            id=evidence_id,
-            source_turn_id=turn_id,
-            source_session_id=session_id,
-            actor_id="usr_owner",
-            content_class="user_message",
-            trust_boundary="trusted_user",
-            lifecycle_state="available",
-            source_uri=None,
-            source_artifact_id=None,
-            source_text="Remind me when Orion launch review status changes.",
-            evidence_snippet="Orion launch review status changes",
-            redaction_posture="none",
-            metadata_json={},
-            created_at=now,
-            updated_at=now,
-        )
-    )
-    db.add(
-        MemoryEntityRecord(
-            id=entity_id,
-            entity_type="project",
-            entity_key="project:orion",
-            display_name="Orion",
-            summary=None,
-            metadata_json={},
-            created_at=now,
-            updated_at=now,
-        )
-    )
-    db.flush()
-    db.add(
-        MemoryAssertionRecord(
-            id=assertion_id,
-            subject_entity_id=entity_id,
-            subject_key="project:orion",
-            predicate="commitment.monitor_status",
-            scope_key="project:orion",
-            object_value={"value": "Watch launch review status changes."},
-            assertion_type="commitment",
-            is_multi_valued=False,
-            scope={},
-            lifecycle_state="active",
-            confidence=0.9,
-            valid_from=None,
-            valid_to=None,
-            superseded_by_assertion_id=None,
-            extraction_model="model.memory-fixture",
-            extraction_prompt_version="memory-v1",
-            last_verified_at=now,
             created_at=now,
             updated_at=now,
         )

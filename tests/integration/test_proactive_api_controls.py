@@ -578,12 +578,25 @@ def test_automatic_next_time_feedback_creates_autonomy_request_learning_record(
         assert feedback.json()["feedback"]["feedback_type"] == "automatic_next_time"
         feedback_id = feedback.json()["feedback"]["id"]
 
-        assert process_one_task(
-            session_factory=_session_factory(client),
-            settings=cast(Any, AppSettings)(_env_file=None),
-            worker_id="worker-proactive-api",
-            model_adapter=StaticAdapter(),
-        )
+        # process_one_task does one unit of work per call; the worker's
+        # periodic-enqueue pass also self-gates a memory_sweep task, so the
+        # queue is drained until the feedback-learning task completes.
+        for _ in range(6):
+            process_one_task(
+                session_factory=_session_factory(client),
+                settings=cast(Any, AppSettings)(_env_file=None),
+                worker_id="worker-proactive-api",
+                model_adapter=StaticAdapter(),
+            )
+            with _session_factory(client)() as db:
+                feedback_status = db.execute(
+                    text(
+                        "SELECT status FROM background_tasks "
+                        "WHERE task_type = 'proactive_feedback_learning_due'"
+                    )
+                ).scalar_one()
+            if feedback_status == "completed":
+                break
 
         with _session_factory(client)() as db:
             with db.begin():
@@ -611,7 +624,10 @@ def test_automatic_next_time_feedback_creates_autonomy_request_learning_record(
                 assert record["parse_status"] == "parsed"
                 assert record["validation_status"] == "valid"
                 task_status = db.execute(
-                    text("SELECT status FROM background_tasks ORDER BY created_at DESC LIMIT 1")
+                    text(
+                        "SELECT status FROM background_tasks "
+                        "WHERE task_type = 'proactive_feedback_learning_due'"
+                    )
                 ).scalar_one()
                 assert task_status == "completed"
 
@@ -636,7 +652,12 @@ def test_all_feedback_types_are_processed_by_ai_feedback_learner(postgres_url: s
                 json={"feedback_type": feedback_type, "note": f"note {feedback_type}"},
             )
             assert feedback.status_code == 200
-            assert process_one_task(
+
+        # process_one_task does one unit of work per call; the worker's
+        # periodic-enqueue pass also self-gates a memory_sweep task, so the
+        # queue is drained until every feedback task has been processed.
+        for _ in range(len(feedback_types) + 4):
+            process_one_task(
                 session_factory=_session_factory(client),
                 settings=cast(Any, AppSettings)(_env_file=None),
                 worker_id="worker-proactive-feedback",

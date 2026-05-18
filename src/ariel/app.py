@@ -55,48 +55,12 @@ from ariel.google_connector import (
     GoogleConnectorRuntime,
 )
 from ariel.memory import (
-    AIJudgmentFailure,
-    MEMORY_CONTEXT_SCHEMA_VERSION,
-    MEMORY_CONTINUITY_PROMPT_VERSION,
-    MEMORY_CURATION_PROMPT_VERSION,
-    MEMORY_PROJECTION_VERSION,
-    MemoryStaleReasonRequiredError,
-    MemoryValueKindError,
-    approve_candidate,
-    build_memory_context,
-    consolidate_memory,
-    context_text,
-    correct_assertion,
-    count_context_tokens,
-    create_relationship,
-    delete_assertion,
-    edit_candidate,
-    emit_memory_events,
-    enqueue_consolidation_job,
-    export_memory,
-    import_memory_candidates,
-    list_memory,
-    list_memory_events,
-    mark_assertion_stale,
-    merge_candidates,
-    privacy_delete_assertion,
-    propose_memory_candidate,
-    record_action_trace,
-    record_reasoning_trace,
-    record_rotation_context_block,
-    record_turn_memory_evidence,
-    redact_evidence,
-    reject_candidate,
-    retry_projection_job,
-    resolve_conflict,
-    resolve_memory_policy,
-    retract_assertion,
-    run_memory_eval,
-    search_memory,
-    set_assertion_priority,
-    set_memory_scope_binding,
-    set_never_remember_rule,
-    validate_continuity_compaction_payload,
+    enqueue_memory_remember,
+    list_active_facts,
+    read_profile,
+    render_profile,
+    render_recalled_facts,
+    run_retriever,
 )
 from ariel.persistence import (
     ActionAttemptRecord,
@@ -114,11 +78,7 @@ from ariel.persistence import (
     GoogleConnectorRecord,
     JobEventRecord,
     JobRecord,
-    MemoryAssertionRecord,
-    MemoryContextBlockRecord,
-    MemoryEvidenceRecord,
-    MemoryConflictSetRecord,
-    MemoryVersionRecord,
+    MemoryFactRecord,
     NotificationRecord,
     ProactiveFeedbackRecord,
     ProactiveActionExecutionRecord,
@@ -128,7 +88,6 @@ from ariel.persistence import (
     ProactiveDecisionRecord,
     ProactiveLearningRecord,
     ProactiveObservationRecord,
-    ProjectStateSnapshotRecord,
     ProviderEvidenceRecord,
     ProviderEventRecord,
     ProviderWriteReceiptRecord,
@@ -186,9 +145,6 @@ from ariel.response_contracts import (
     build_surface_email_action_response,
     build_surface_email_thread_watch_list_response,
     build_surface_email_thread_watch_response,
-    build_surface_memory_event_list_response,
-    build_surface_memory_response,
-    build_surface_memory_search_response,
     build_surface_message_response,
     build_surface_provider_event_list_response,
     build_surface_proactive_action_list_response,
@@ -295,7 +251,9 @@ _ALLOWED_ROTATION_REASONS = {
 _CONTEXT_SECTION_ORDER = (
     "policy_system_instructions",
     "recent_active_session_turns",
-    "memory_context",
+    "profile",
+    "session_digest",
+    "recalled_memory",
     "open_commitments_and_jobs",
     "relevant_artifacts_and_observations",
 )
@@ -438,39 +396,6 @@ class MessageRequest(BaseModel):
         return value
 
 
-class SessionMemoryModeRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    memory_mode: Literal["normal", "temporary", "no_memory"]
-
-
-class MemoryScopeModeRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    scope_type: Literal["user", "project", "repo", "thread", "proactive_case"]
-    scope_key: str = Field(min_length=1, max_length=200)
-    memory_mode: Literal["normal", "temporary", "no_memory"]
-    reason: str | None = Field(default=None, max_length=500)
-    expires_at: datetime | None = Field(default=None)
-
-    @field_validator("scope_key")
-    @classmethod
-    def _scope_key_must_not_be_blank(cls, value: str) -> str:
-        normalized = " ".join(value.strip().split())
-        if not normalized:
-            raise ValueError("scope key must not be blank")
-        return normalized
-
-    @field_validator("expires_at")
-    @classmethod
-    def _expires_at_must_be_timezone_aware(cls, value: datetime | None) -> datetime | None:
-        if value is None:
-            return None
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("expires_at must include a timezone")
-        return value
-
-
 class WorkCommitmentSnoozeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -522,191 +447,6 @@ class WorkCommitmentEditRequest(BaseModel):
         ):
             raise ValueError("due_start must be before or equal to due_end")
         return self
-
-
-class MemoryCorrectionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    value: str = Field(min_length=1, max_length=500)
-
-    @field_validator("value")
-    @classmethod
-    def _value_must_not_be_blank(cls, value: str) -> str:
-        normalized = " ".join(value.strip().split())
-        if not normalized:
-            raise ValueError("value must not be blank")
-        return normalized
-
-
-class MemoryRejectRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    reason: str | None = Field(default=None, max_length=500)
-
-
-class MemoryMergeCandidatesRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    assertion_ids: list[str] = Field(min_length=2, max_length=20)
-
-    @field_validator("assertion_ids")
-    @classmethod
-    def _assertion_ids_must_not_be_blank(cls, value: list[str]) -> list[str]:
-        normalized = [" ".join(item.strip().split()) for item in value]
-        if any(not item for item in normalized):
-            raise ValueError("assertion ids must not be blank")
-        return normalized
-
-
-class MemoryReasonRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    reason: str | None = Field(default=None, max_length=500)
-
-
-class MemoryNeverRememberRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    scope_key: str = Field(default="global", min_length=1, max_length=200)
-    pattern: str = Field(min_length=1, max_length=500)
-    reason: str | None = Field(default=None, max_length=500)
-
-    @field_validator("scope_key", "pattern")
-    @classmethod
-    def _never_remember_text_must_not_be_blank(cls, value: str) -> str:
-        normalized = " ".join(value.strip().split())
-        if not normalized:
-            raise ValueError("never-remember fields must not be blank")
-        return normalized
-
-
-class MemoryExportRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    scope_key: str = Field(default="global", min_length=1, max_length=200)
-
-
-class MemoryImportRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    candidates: list[MemoryCandidateRequest] = Field(default_factory=list, max_length=50)
-
-
-class MemoryEvalCaseRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    case_id: str | None = Field(default=None, min_length=1, max_length=64)
-    query: str = Field(min_length=1, max_length=1000)
-    expected: str | None = Field(default=None, max_length=1000)
-    expected_memory_ids: list[str] = Field(default_factory=list, max_length=50)
-    forbidden_memory_ids: list[str] = Field(default_factory=list, max_length=50)
-    expected_kinds: list[str] = Field(default_factory=list, max_length=20)
-    forbidden_texts: list[str] = Field(default_factory=list, max_length=20)
-    expect_policy_blocked: bool = False
-    notes: str | None = Field(default=None, max_length=500)
-
-    @field_validator(
-        "query",
-        "case_id",
-        "expected",
-        "notes",
-        mode="after",
-    )
-    @classmethod
-    def _optional_eval_text_must_not_be_blank(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        normalized = " ".join(value.strip().split())
-        if not normalized:
-            raise ValueError("memory eval text fields must not be blank")
-        return normalized
-
-    @field_validator(
-        "expected_memory_ids",
-        "forbidden_memory_ids",
-        "expected_kinds",
-        "forbidden_texts",
-    )
-    @classmethod
-    def _eval_lists_must_not_contain_blank_text(cls, value: list[str]) -> list[str]:
-        normalized = [" ".join(item.strip().split()) for item in value]
-        if any(not item for item in normalized):
-            raise ValueError("memory eval list entries must not be blank")
-        return normalized
-
-
-class MemoryEvalRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    eval_name: str = Field(default="memory eval", min_length=1, max_length=200)
-    cases: list[MemoryEvalCaseRequest] = Field(default_factory=list, max_length=100)
-
-
-class MemoryConflictResolutionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    assertion_id: str = Field(min_length=1, max_length=32)
-
-
-class MemoryCandidateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    subject_key: str = Field(min_length=1, max_length=200)
-    predicate: str = Field(min_length=1, max_length=200)
-    assertion_type: Literal[
-        "fact",
-        "profile",
-        "preference",
-        "commitment",
-        "decision",
-        "project_state",
-        "procedure",
-        "domain_concept",
-        "negative",
-    ]
-    value: str = Field(min_length=1, max_length=700)
-    evidence_text: str = Field(min_length=1, max_length=12_000)
-    confidence: float = Field(ge=0.0, le=1.0)
-    scope_key: str = Field(default="global", min_length=1, max_length=200)
-    valid_from: datetime | None = None
-    valid_to: datetime | None = None
-
-    @field_validator("subject_key", "predicate", "value", "evidence_text", "scope_key")
-    @classmethod
-    def _memory_text_must_not_be_blank(cls, value: str) -> str:
-        normalized = " ".join(value.strip().split())
-        if not normalized:
-            raise ValueError("memory text fields must not be blank")
-        return normalized
-
-    @model_validator(mode="after")
-    def _valid_interval_must_be_right_open(self) -> MemoryCandidateRequest:
-        if (
-            self.valid_from is not None
-            and self.valid_to is not None
-            and self.valid_from >= self.valid_to
-        ):
-            raise ValueError("valid_from must be before valid_to")
-        return self
-
-
-class MemoryRelationshipRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    source_entity_id: str = Field(min_length=1, max_length=32)
-    target_entity_id: str = Field(min_length=1, max_length=32)
-    relationship_type: str = Field(min_length=1, max_length=64)
-    evidence_id: str = Field(min_length=1, max_length=32)
-    scope_key: str = Field(default="global", min_length=1, max_length=200)
-    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
-
-    @field_validator("relationship_type", "scope_key")
-    @classmethod
-    def _relationship_text_must_not_be_blank(cls, value: str) -> str:
-        normalized = " ".join(value.strip().split())
-        if not normalized:
-            raise ValueError("relationship fields must not be blank")
-        return normalized
 
 
 class ApprovalDecisionRequest(BaseModel):
@@ -876,17 +616,6 @@ class ModelAdapter(Protocol):
     ) -> dict[str, Any]: ...
 
 
-class ContextCompactionAdapter(Protocol):
-    def compact(
-        self,
-        *,
-        context_bundle: dict[str, Any],
-        user_message: str,
-        estimated_context_tokens: int,
-        max_context_tokens: int,
-    ) -> dict[str, Any] | None: ...
-
-
 class ModelAdapterError(Exception):
     def __init__(
         self,
@@ -1025,228 +754,6 @@ class OpenAIResponsesAdapter:
         }
 
 
-@dataclass(slots=True)
-class OpenAIContextCompactionAdapter:
-    api_key: str | None
-    model: str
-    timeout_seconds: float
-
-    def compact(
-        self,
-        *,
-        context_bundle: dict[str, Any],
-        user_message: str,
-        estimated_context_tokens: int,
-        max_context_tokens: int,
-    ) -> dict[str, Any] | None:
-        if estimated_context_tokens <= max_context_tokens:
-            return None
-        if not self.api_key:
-            raise ModelAdapterError(
-                safe_reason="context compaction requires model credentials",
-                status_code=503,
-                code="E_MODEL_CREDENTIALS",
-                message="model credentials are not configured",
-                retryable=False,
-            )
-
-        try:
-            response = httpx.post(
-                "https://api.openai.com/v1/responses",
-                headers={
-                    "authorization": f"Bearer {self.api_key}",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": self.model,
-                    "input": [
-                        {
-                            "role": "system",
-                            "content": (
-                                "Compact Ariel turn context for the master assistant. Return JSON only "
-                                "with keys summary, recent_active_session_turns, preserved_turn_refs, "
-                                "omitted_turn_refs, user_commitments, assistant_commitments, decisions, "
-                                "open_loops, tool_action_outcomes, unresolved_uncertainty, "
-                                "important_omissions, and confidence. Preserve exact turn_id values. "
-                                "Every source turn must appear exactly once in preserved_turn_refs or "
-                                "omitted_turn_refs with a reason. Keep unresolved commitments, decisions, "
-                                "tool outcomes, uncertainty, and omissions needed for the current user "
-                                "request. Do not answer the user."
-                            ),
-                        },
-                        {
-                            "role": "user",
-                            "content": json.dumps(
-                                {
-                                    "user_message": user_message,
-                                    "max_context_tokens": max_context_tokens,
-                                    "context_bundle": context_bundle,
-                                },
-                                sort_keys=True,
-                                separators=(",", ":"),
-                            ),
-                        },
-                    ],
-                    "store": False,
-                    "text": {"verbosity": "low"},
-                },
-                timeout=self.timeout_seconds,
-            )
-        except httpx.TimeoutException as exc:
-            raise ModelAdapterError(
-                safe_reason="context compaction model timed out",
-                status_code=502,
-                code="E_MODEL_FAILURE",
-                message="model provider request failed",
-                retryable=True,
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise ModelAdapterError(
-                safe_reason="context compaction model network request failed",
-                status_code=502,
-                code="E_MODEL_FAILURE",
-                message="model provider request failed",
-                retryable=True,
-            ) from exc
-        if response.status_code >= 400:
-            raise ModelAdapterError(
-                safe_reason=f"context compaction model returned HTTP {response.status_code}",
-                status_code=502,
-                code="E_MODEL_FAILURE",
-                message="model provider request failed",
-                retryable=True,
-            )
-        try:
-            response_payload = response.json()
-        except ValueError as exc:
-            raise ModelAdapterError(
-                safe_reason="context compaction provider returned invalid JSON",
-                status_code=502,
-                code="E_MODEL_FAILURE",
-                message="model provider request failed",
-                retryable=True,
-            ) from exc
-        provider_response_id = response_payload.get("id")
-        provider_response_id = (
-            provider_response_id if isinstance(provider_response_id, str) else None
-        )
-        compacted_text = _extract_responses_assistant_text(response_payload.get("output"))
-        try:
-            compacted_payload = json.loads(compacted_text)
-        except json.JSONDecodeError as exc:
-            raise ModelAdapterError(
-                safe_reason="context compaction model returned malformed JSON",
-                status_code=502,
-                code="E_AI_JUDGMENT_INVALID_JSON",
-                message="AI continuity compaction failed",
-                retryable=False,
-                provider_response_id=provider_response_id,
-                parse_status="invalid_json",
-                validation_status="invalid",
-            ) from exc
-        if not isinstance(compacted_payload, dict):
-            raise ModelAdapterError(
-                safe_reason="context compaction model returned non-object JSON",
-                status_code=502,
-                code="E_AI_JUDGMENT_SCHEMA",
-                message="AI continuity compaction failed",
-                retryable=False,
-                provider_response_id=provider_response_id,
-                parse_status="schema_invalid",
-                validation_status="invalid",
-            )
-        compacted_turns = compacted_payload.get("recent_active_session_turns")
-        summary = compacted_payload.get("summary")
-        if not isinstance(compacted_turns, list):
-            raise ModelAdapterError(
-                safe_reason="context compaction model omitted recent_active_session_turns",
-                status_code=502,
-                code="E_AI_JUDGMENT_SCHEMA",
-                message="AI continuity compaction failed",
-                retryable=False,
-                provider_response_id=provider_response_id,
-                parse_status="schema_invalid",
-                validation_status="invalid",
-            )
-        if not isinstance(summary, str) or not summary.strip():
-            raise ModelAdapterError(
-                safe_reason="context compaction model omitted summary",
-                status_code=502,
-                code="E_AI_JUDGMENT_SCHEMA",
-                message="AI continuity compaction failed",
-                retryable=False,
-                provider_response_id=provider_response_id,
-                parse_status="schema_invalid",
-                validation_status="invalid",
-            )
-        for turn in compacted_turns:
-            if not isinstance(turn, dict) or not isinstance(turn.get("turn_id"), str):
-                raise ModelAdapterError(
-                    safe_reason="context compaction model returned invalid turn entries",
-                    status_code=502,
-                    code="E_AI_JUDGMENT_SCHEMA",
-                    message="AI continuity compaction failed",
-                    retryable=False,
-                    provider_response_id=provider_response_id,
-                    parse_status="schema_invalid",
-                    validation_status="invalid",
-                )
-        source_turn_ids = [
-            turn["turn_id"]
-            for turn in context_bundle.get("recent_active_session_turns", [])
-            if isinstance(turn, dict) and isinstance(turn.get("turn_id"), str)
-        ]
-        try:
-            continuity = validate_continuity_compaction_payload(
-                compacted_payload,
-                source_turn_ids=source_turn_ids,
-                model=self.model,
-                provider_response_id=provider_response_id,
-            )
-        except AIJudgmentFailure as exc:
-            raise ModelAdapterError(
-                safe_reason=exc.safe_reason,
-                status_code=502,
-                code=exc.code,
-                message="AI continuity compaction failed",
-                retryable=exc.retryable,
-                provider_response_id=provider_response_id,
-                parse_status=exc.parse_status,
-                validation_status=exc.validation_status,
-            ) from exc
-        compacted_turn_ids = [
-            turn["turn_id"]
-            for turn in compacted_turns
-            if isinstance(turn, dict) and isinstance(turn.get("turn_id"), str)
-        ]
-        if set(compacted_turn_ids) != {ref["turn_id"] for ref in continuity["preserved_turn_refs"]}:
-            raise ModelAdapterError(
-                safe_reason="context compaction preserved turn refs do not match compacted turns",
-                status_code=502,
-                code="E_AI_JUDGMENT_VALIDATION",
-                message="AI continuity compaction failed",
-                retryable=False,
-                provider_response_id=provider_response_id,
-                parse_status="parsed",
-                validation_status="invalid",
-            )
-        compacted_bundle = dict(context_bundle)
-        compacted_bundle["recent_active_session_turns"] = compacted_turns
-        compacted_bundle["continuity_compaction"] = continuity
-        compacted_bundle["recent_window"] = {
-            "max_recent_turns": len(compacted_turns),
-            "included_turn_count": len(compacted_turns),
-            "omitted_turn_count": len(continuity["omitted_turn_refs"]),
-            "included_turn_ids": [
-                turn["turn_id"] for turn in compacted_turns if isinstance(turn, dict)
-            ],
-            "omitted_turns": continuity["omitted_turn_refs"],
-            "compacted_by": "ai_context_compaction",
-            "target_context_tokens": max_context_tokens,
-        }
-        return compacted_bundle
-
-
 def _build_responses_input_items(
     *,
     context_bundle: dict[str, Any],
@@ -1346,11 +853,27 @@ def _build_responses_input_items(
             }
         )
 
-    memory_context = context_bundle.get("memory_context")
-    if isinstance(memory_context, dict):
-        rendered_memory_context = context_text(memory_context)
-        if rendered_memory_context.strip():
-            input_items.append({"role": "system", "content": rendered_memory_context})
+    profile = context_bundle.get("profile")
+    rendered_profile = render_profile(profile) if isinstance(profile, str) else ""
+    if rendered_profile:
+        input_items.append({"role": "system", "content": rendered_profile})
+
+    session_digest = context_bundle.get("session_digest")
+    if isinstance(session_digest, str) and session_digest.strip():
+        input_items.append(
+            {
+                "role": "system",
+                "content": "session digest (working state of this conversation):\n"
+                + session_digest.strip(),
+            }
+        )
+
+    recalled_memory = context_bundle.get("recalled_memory")
+    rendered_recalled = (
+        render_recalled_facts(recalled_memory) if isinstance(recalled_memory, list) else ""
+    )
+    if rendered_recalled:
+        input_items.append({"role": "system", "content": rendered_recalled})
 
     open_commitments_and_jobs = context_bundle.get("open_commitments_and_jobs")
     if isinstance(open_commitments_and_jobs, dict):
@@ -1537,25 +1060,6 @@ def _discord_context_text(raw_context: Any) -> str | None:
     return "\n".join(lines)
 
 
-def _extract_responses_assistant_text(output_items: Any) -> str:
-    if not isinstance(output_items, list):
-        return ""
-    text_parts: list[str] = []
-    for output_item in output_items:
-        if not isinstance(output_item, dict) or output_item.get("type") != "message":
-            continue
-        content = output_item.get("content")
-        if not isinstance(content, list):
-            continue
-        for content_item in content:
-            if not isinstance(content_item, dict) or content_item.get("type") != "output_text":
-                continue
-            text = content_item.get("text")
-            if isinstance(text, str) and text:
-                text_parts.append(text)
-    return "".join(text_parts).strip()
-
-
 def _extract_responses_function_calls(output_items: Any) -> list[dict[str, Any]]:
     if not isinstance(output_items, list):
         return []
@@ -1564,6 +1068,11 @@ def _extract_responses_function_calls(output_items: Any) -> list[dict[str, Any]]
         if isinstance(output_item, dict) and output_item.get("type") == "function_call":
             calls.append(output_item)
     return calls
+
+
+def _count_context_tokens(text: str) -> int:
+    """Count whitespace-delimited words, the unit every context budget uses."""
+    return len(text.split())
 
 
 @dataclass(slots=True, frozen=True)
@@ -1584,21 +1093,21 @@ def _response_tokens_from_model_payload(
         output_tokens = usage_payload.get("output_tokens")
         if isinstance(output_tokens, int) and output_tokens >= 0:
             return output_tokens
-    return count_context_tokens(assistant_text)
+    return _count_context_tokens(assistant_text)
 
 
 def _estimate_context_tokens(*, context_bundle: dict[str, Any], user_message: str) -> int:
-    token_total = count_context_tokens(user_message)
+    token_total = _count_context_tokens(user_message)
 
     policy_system_instructions = context_bundle.get("policy_system_instructions")
     if isinstance(policy_system_instructions, list):
         for instruction in policy_system_instructions:
             if isinstance(instruction, str):
-                token_total += count_context_tokens(instruction)
+                token_total += _count_context_tokens(instruction)
 
     discord_context_text = _discord_context_text(context_bundle.get("discord_context"))
     if discord_context_text is not None:
-        token_total += count_context_tokens(discord_context_text)
+        token_total += _count_context_tokens(discord_context_text)
 
     discord_channel_recent_turns = context_bundle.get("discord_channel_recent_turns")
     if isinstance(discord_channel_recent_turns, list):
@@ -1607,10 +1116,10 @@ def _estimate_context_tokens(*, context_bundle: dict[str, Any], user_message: st
                 continue
             prior_user_message = prior_turn.get("user_message")
             if isinstance(prior_user_message, str):
-                token_total += count_context_tokens(prior_user_message)
+                token_total += _count_context_tokens(prior_user_message)
             prior_assistant_message = prior_turn.get("assistant_message")
             if isinstance(prior_assistant_message, str):
-                token_total += count_context_tokens(prior_assistant_message)
+                token_total += _count_context_tokens(prior_assistant_message)
 
     recent_active_session_turns = context_bundle.get("recent_active_session_turns")
     if isinstance(recent_active_session_turns, list):
@@ -1619,14 +1128,18 @@ def _estimate_context_tokens(*, context_bundle: dict[str, Any], user_message: st
                 continue
             prior_user_message = prior_turn.get("user_message")
             if isinstance(prior_user_message, str):
-                token_total += count_context_tokens(prior_user_message)
+                token_total += _count_context_tokens(prior_user_message)
             prior_assistant_message = prior_turn.get("assistant_message")
             if isinstance(prior_assistant_message, str):
-                token_total += count_context_tokens(prior_assistant_message)
+                token_total += _count_context_tokens(prior_assistant_message)
 
-    memory_context = context_bundle.get("memory_context")
-    if isinstance(memory_context, dict):
-        token_total += count_context_tokens(context_text(memory_context))
+    profile = context_bundle.get("profile")
+    if isinstance(profile, str):
+        token_total += _count_context_tokens(profile)
+
+    session_digest = context_bundle.get("session_digest")
+    if isinstance(session_digest, str):
+        token_total += _count_context_tokens(session_digest)
 
     open_commitments_and_jobs = context_bundle.get("open_commitments_and_jobs")
     if isinstance(open_commitments_and_jobs, dict):
@@ -1651,7 +1164,7 @@ def _estimate_context_tokens(*, context_bundle: dict[str, Any], user_message: st
                 ):
                     raw_value = commitment.get(key)
                     if isinstance(raw_value, str):
-                        token_total += count_context_tokens(raw_value)
+                        token_total += _count_context_tokens(raw_value)
 
         review_prompts_raw = open_commitments_and_jobs.get("commitment_review_prompts")
         if isinstance(review_prompts_raw, list):
@@ -1674,7 +1187,7 @@ def _estimate_context_tokens(*, context_bundle: dict[str, Any], user_message: st
                 ):
                     raw_value = commitment.get(key)
                     if isinstance(raw_value, str):
-                        token_total += count_context_tokens(raw_value)
+                        token_total += _count_context_tokens(raw_value)
 
         loops_raw = open_commitments_and_jobs.get("due_follow_up_loops")
         if isinstance(loops_raw, list):
@@ -1696,7 +1209,7 @@ def _estimate_context_tokens(*, context_bundle: dict[str, Any], user_message: st
                 ):
                     raw_value = loop.get(key)
                     if isinstance(raw_value, str):
-                        token_total += count_context_tokens(raw_value)
+                        token_total += _count_context_tokens(raw_value)
 
         jobs_raw = open_commitments_and_jobs.get("open_jobs")
         if isinstance(jobs_raw, list):
@@ -1706,7 +1219,7 @@ def _estimate_context_tokens(*, context_bundle: dict[str, Any], user_message: st
                 for key in ("id", "status", "title", "external_job_id", "summary"):
                     raw_value = job.get(key)
                     if isinstance(raw_value, str):
-                        token_total += count_context_tokens(raw_value)
+                        token_total += _count_context_tokens(raw_value)
 
     relevant_artifacts_and_observations = context_bundle.get("relevant_artifacts_and_observations")
     if isinstance(relevant_artifacts_and_observations, dict):
@@ -1718,7 +1231,7 @@ def _estimate_context_tokens(*, context_bundle: dict[str, Any], user_message: st
                 for key in ("title", "source"):
                     raw_value = artifact.get(key)
                     if isinstance(raw_value, str):
-                        token_total += count_context_tokens(raw_value)
+                        token_total += _count_context_tokens(raw_value)
 
     return token_total
 
@@ -2867,7 +2380,6 @@ def _rotate_active_session(
     reason: str,
     idempotency_key: str | None,
     actor_id: str,
-    settings: AppSettings,
     trigger_snapshot: dict[str, Any] | None = None,
 ) -> tuple[SessionRecord, SessionRotationRecord, bool]:
     if reason not in _ALLOWED_ROTATION_REASONS:
@@ -2926,39 +2438,19 @@ def _rotate_active_session(
     prior_session_id = active_session.id
     rotated_session_id = _new_id("ses")
     rotation_id = _new_id("rot")
-    prior_turns = db.scalars(
-        select(TurnRecord)
-        .where(TurnRecord.session_id == prior_session_id)
-        .order_by(TurnRecord.created_at.asc(), TurnRecord.id.asc())
-    ).all()
-    memory_allowed = resolve_memory_policy(
-        db,
-        operation="consolidate",
-        now=now,
-        session_id=prior_session_id,
-    ).allowed
-    if memory_allowed:
-        record_rotation_context_block(
-            db=db,
-            rotation_id=rotation_id,
-            prior_session_id=prior_session_id,
-            new_session_id=rotated_session_id,
-            rotation_reason=reason,
-            prior_turns=prior_turns,
-            settings=settings,
-            now_fn=_utcnow,
-            new_id_fn=_new_id,
-        )
 
     active_session.is_active = False
     active_session.lifecycle_state = "closed"
     active_session.updated_at = now
 
+    # Carry the conversation digest forward so continuity survives the rotation:
+    # a deterministic copy of state, not a judgment. The closing session's final
+    # turn still gets its normal post-turn rememberer, which evolves the digest.
     rotated_session = SessionRecord(
         id=rotated_session_id,
         is_active=True,
         lifecycle_state="active",
-        memory_mode=active_session.memory_mode,
+        digest=active_session.digest,
         rotated_from_session_id=prior_session_id,
         rotation_reason=reason,
         created_at=now,
@@ -2979,11 +2471,6 @@ def _rotate_active_session(
     )
     db.add(rotation_record)
     db.flush()
-
-    # Session rotation absorbs the closed session's memory: enqueue a hot-index
-    # consolidation for the global scope, gated by consolidate policy.
-    if memory_allowed:
-        enqueue_consolidation_job(db, scope_key="global", now=now, new_id_fn=_new_id)
 
     return rotated_session, rotation_record, False
 
@@ -3025,7 +2512,9 @@ def _build_turn_context_bundle(
     prior_turns: Sequence[TurnRecord],
     max_recent_turns: int,
     discord_context: dict[str, Any] | None,
-    memory_context: dict[str, Any],
+    profile: str,
+    session_digest: str | None,
+    recalled_memory: Sequence[MemoryFactRecord],
     open_commitments_and_jobs: dict[str, Any],
     relevant_artifacts_and_observations: dict[str, Any],
 ) -> dict[str, Any]:
@@ -3071,11 +2560,13 @@ def _build_turn_context_bundle(
     if discord_channel_recent_turns:
         section_order.insert(2, "discord_channel_recent_turns")
 
-    context_bundle = {
+    context_bundle: dict[str, Any] = {
         "section_order": section_order,
         "policy_system_instructions": list(_POLICY_SYSTEM_INSTRUCTIONS),
         "recent_active_session_turns": recent_active_session_turns,
-        "memory_context": dict(memory_context),
+        "profile": profile,
+        "session_digest": session_digest,
+        "recalled_memory": list(recalled_memory),
         "open_commitments_and_jobs": dict(open_commitments_and_jobs),
         "relevant_artifacts_and_observations": dict(relevant_artifacts_and_observations),
         "recent_window": {
@@ -3253,8 +2744,7 @@ def _eligible_internal_callable_capability_ids(
                 capability_ids.append(capability_id)
             continue
         if capability_id in MEMORY_CAPABILITY_IDS:
-            if capability_id != "cap.memory.eval":
-                capability_ids.append(capability_id)
+            capability_ids.append(capability_id)
             continue
         if capability_id == "cap.web.extract":
             if bindings.get("web_extract") is True:
@@ -3471,18 +2961,12 @@ def create_app(
     *,
     database_url: str | None = None,
     model_adapter: ModelAdapter | None = None,
-    context_compaction_adapter: ContextCompactionAdapter | None = None,
     sandbox: RunSandbox | None = None,
     reset_database: bool = False,
 ) -> FastAPI:
     settings = AppSettings()
     db_url = database_url or settings.database_url
     adapter = model_adapter or _build_default_model_adapter(settings)
-    compaction_adapter = context_compaction_adapter or OpenAIContextCompactionAdapter(
-        api_key=settings.openai_api_key,
-        model=settings.model_name,
-        timeout_seconds=settings.model_timeout_seconds,
-    )
     run_sandbox = sandbox if sandbox is not None else SandboxRuntime()
 
     engine = create_engine(
@@ -3509,14 +2993,12 @@ def create_app(
     app.state.engine = engine
     app.state.session_factory = session_factory
     app.state.model_adapter = adapter
-    app.state.context_compaction_adapter = compaction_adapter
     app.state.sandbox = run_sandbox
     app.state.bind_host = settings.bind_host
     app.state.bind_port = settings.bind_port
     app.state.local_auth_required = settings.local_auth_required
     app.state.local_auth_token = settings.local_auth_token
     app.state.max_recent_turns = settings.max_recent_turns
-    app.state.max_recalled_assertions = settings.max_recalled_assertions
     app.state.max_context_tokens = settings.max_context_tokens
     app.state.auto_rotate_max_turns = settings.auto_rotate_max_turns
     app.state.auto_rotate_max_age_seconds = settings.auto_rotate_max_age_seconds
@@ -3664,19 +3146,6 @@ def create_app(
                 details={"missing_tables": app.state.schema_missing_tables},
                 retryable=False,
             )
-
-    def _emit_http_memory_events(
-        db: Session, *, events: Sequence[dict[str, Any]], scope_key: str
-    ) -> None:
-        emit_memory_events(
-            db,
-            events=events,
-            entry_path="http",
-            actor_id=str(app.state.approval_actor_id),
-            scope_key=scope_key,
-            now=_utcnow(),
-            new_id_fn=_new_id,
-        )
 
     def _google_runtime() -> GoogleConnectorRuntime:
         return GoogleConnectorRuntime(
@@ -3902,59 +3371,18 @@ def create_app(
                 active_session = _get_or_create_active_session(db)
             return {"ok": True, "session": serialize_session(active_session)}
 
-    @app.put("/v1/sessions/{session_id}/memory-mode", response_model=None)
-    def put_session_memory_mode(
-        session_id: str,
-        payload: SessionMemoryModeRequest,
-    ) -> dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                session = db.scalar(
-                    select(SessionRecord).where(SessionRecord.id == session_id).limit(1)
-                )
-                if session is None:
-                    raise ApiError(
-                        status_code=404,
-                        code="E_SESSION_NOT_FOUND",
-                        message="session not found",
-                        details={"session_id": session_id},
-                        retryable=False,
-                    )
-                now = _utcnow()
-                session.memory_mode = payload.memory_mode
-                session.updated_at = now
-                return {"ok": True, "session": serialize_session(session)}
-
     @app.post("/v1/sessions/rotate", response_model=None)
     def rotate_active_session(request: Request) -> JSONResponse | dict[str, Any]:
         _ensure_schema_ready()
         idempotency_key = _normalize_idempotency_key(request.headers.get("Idempotency-Key"))
         with session_factory() as db:
             with db.begin():
-                try:
-                    rotated_session, rotation_record, idempotent_replay = _rotate_active_session(
-                        db,
-                        reason="user_initiated",
-                        idempotency_key=idempotency_key,
-                        actor_id=str(app.state.approval_actor_id),
-                        settings=settings,
-                    )
-                except AIJudgmentFailure as exc:
-                    return _error_response(
-                        ApiError(
-                            status_code=503 if exc.retryable else 422,
-                            code=exc.code,
-                            message="AI session continuity failed",
-                            details={
-                                "judgment_type": "continuity_compaction",
-                                "prompt_version": MEMORY_CONTINUITY_PROMPT_VERSION,
-                                "parse_status": exc.parse_status,
-                                "validation_status": exc.validation_status,
-                            },
-                            retryable=exc.retryable,
-                        )
-                    )
+                rotated_session, rotation_record, idempotent_replay = _rotate_active_session(
+                    db,
+                    reason="user_initiated",
+                    idempotency_key=idempotency_key,
+                    actor_id=str(app.state.approval_actor_id),
+                )
                 try:
                     return build_surface_rotation_response(
                         session=serialize_session(rotated_session),
@@ -4001,1246 +3429,32 @@ def create_app(
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
 
-    @app.get("/v1/memory", response_model=None)
-    def get_memory() -> JSONResponse | dict[str, Any]:
+    @app.get("/v1/memory/facts", response_model=None)
+    def get_memory_facts(limit: int = 200) -> dict[str, Any]:
+        # Operator inspection of the flat fact store. The model reaches memory
+        # only through the memory.recall / memory.remember syscalls; this read
+        # route is for humans, not a memory-mutation surface.
         _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 1000))
         with session_factory() as db:
             with db.begin():
-                payload = list_memory(db)
-                try:
-                    return build_surface_memory_response(**payload)
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.get("/v1/memory/search", response_model=None)
-    def get_memory_search(
-        q: str,
-        limit: int = 20,
-        scope_key: str | None = None,
-    ) -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        bounded_limit = max(1, min(limit, 100))
-        with session_factory() as db:
-            with db.begin():
-                active_session = _get_or_create_active_session(db)
-                results = search_memory(
-                    db,
-                    query=q,
-                    limit=bounded_limit,
-                    settings=settings,
-                    current_session_id=active_session.id,
-                    scope_key=scope_key,
-                    actor_id=str(app.state.approval_actor_id),
-                )
-                try:
-                    return build_surface_memory_search_response(
-                        schema_version=MEMORY_CONTEXT_SCHEMA_VERSION,
-                        results=results,
-                    )
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.get("/v1/memory/recall-diagnostics", response_model=None)
-    def get_memory_recall_diagnostics(
-        q: str,
-        limit: int = 20,
-        scope_key: str | None = None,
-    ) -> dict[str, Any]:
-        _ensure_schema_ready()
-        bounded_limit = max(1, min(limit, 100))
-        with session_factory() as db:
-            with db.begin():
-                active_session = _get_or_create_active_session(db)
-                memory_context, recall_event = build_memory_context(
-                    db,
-                    user_message=q,
-                    max_recalled_assertions=bounded_limit,
-                    settings=settings,
-                    current_session_id=active_session.id,
-                    scope_key=scope_key,
-                    actor_id=str(app.state.approval_actor_id),
-                )
+                facts = list_active_facts(db, limit=bounded_limit)
                 return {
                     "ok": True,
-                    "schema_version": memory_context.get("schema_version"),
-                    "recall_diagnostics": recall_event,
-                    "memory_policy": memory_context.get("memory_policy"),
-                    "projection_health": memory_context.get("projection_health"),
-                }
-
-    @app.post("/v1/memory/candidates", response_model=None)
-    def post_memory_candidate(payload: MemoryCandidateRequest) -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                active_session = _get_or_create_active_session(db)
-                try:
-                    candidate_events = propose_memory_candidate(
-                        db,
-                        source_session_id=active_session.id,
-                        actor_id=str(app.state.approval_actor_id),
-                        evidence_text=payload.evidence_text,
-                        subject_key=payload.subject_key,
-                        predicate=payload.predicate,
-                        assertion_type=payload.assertion_type,
-                        value=payload.value,
-                        confidence=payload.confidence,
-                        scope_key=payload.scope_key,
-                        valid_from=payload.valid_from,
-                        valid_to=payload.valid_to,
-                        extraction_model=None,
-                        extraction_prompt_version=None,
-                        now_fn=_utcnow,
-                        new_id_fn=_new_id,
-                    )
-                except MemoryValueKindError as exc:
-                    raise ApiError(
-                        status_code=422,
-                        code=MemoryValueKindError.code,
-                        message=str(exc),
-                        details={"predicate": payload.predicate},
-                        retryable=False,
-                    ) from exc
-                _emit_http_memory_events(db, events=candidate_events, scope_key=payload.scope_key)
-                memory_payload = list_memory(db)
-                try:
-                    return build_surface_memory_response(**memory_payload)
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.get("/v1/memory/candidates", response_model=None)
-    def get_memory_candidates() -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                payload = list_memory(db)
-                try:
-                    return build_surface_memory_response(
-                        schema_version=payload["schema_version"],
-                        active_assertions=[],
-                        candidates=payload["candidates"],
-                        conflicts=payload["conflicts"],
-                        project_state=[],
-                        evidence=[],
-                        procedures=[],
-                        projection_health=payload["projection_health"],
-                    )
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.get("/v1/memory/assertions/{assertion_id}", response_model=None)
-    def get_memory_assertion(assertion_id: str) -> dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                payload = list_memory(db)
-                for key in ("active_assertions", "candidates"):
-                    for assertion in payload[key]:
-                        if assertion["id"] == assertion_id:
-                            return {
-                                "ok": True,
-                                "schema_version": payload["schema_version"],
-                                "assertion": assertion,
-                            }
-                raise ApiError(
-                    status_code=404,
-                    code="E_MEMORY_ASSERTION_NOT_FOUND",
-                    message="memory assertion was not found",
-                    details={"assertion_id": assertion_id},
-                    retryable=False,
-                )
-
-    @app.get("/v1/memory/evidence/{evidence_id}", response_model=None)
-    def get_memory_evidence(evidence_id: str) -> dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                evidence = db.get(MemoryEvidenceRecord, evidence_id)
-                if evidence is None:
-                    raise ApiError(
-                        status_code=404,
-                        code="E_MEMORY_EVIDENCE_NOT_FOUND",
-                        message="memory evidence was not found",
-                        details={"evidence_id": evidence_id},
-                        retryable=False,
-                    )
-                return {
-                    "ok": True,
-                    "schema_version": MEMORY_CONTEXT_SCHEMA_VERSION,
-                    "evidence": {
-                        "id": evidence.id,
-                        "source_turn_id": evidence.source_turn_id,
-                        "source_session_id": evidence.source_session_id,
-                        "content_class": evidence.content_class,
-                        "trust_boundary": evidence.trust_boundary,
-                        "state": evidence.lifecycle_state,
-                        "snippet": evidence.evidence_snippet or redact_text(evidence.source_text),
-                        "redaction_posture": evidence.redaction_posture,
-                        "metadata": evidence.metadata_json,
-                        "created_at": to_rfc3339(evidence.created_at),
-                        "updated_at": to_rfc3339(evidence.updated_at),
-                    },
-                }
-
-    @app.get("/v1/memory/versions/{canonical_table}/{canonical_id}", response_model=None)
-    def get_memory_versions(canonical_table: str, canonical_id: str) -> dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                versions = db.scalars(
-                    select(MemoryVersionRecord)
-                    .where(
-                        MemoryVersionRecord.canonical_table == canonical_table,
-                        MemoryVersionRecord.canonical_id == canonical_id,
-                    )
-                    .order_by(MemoryVersionRecord.version.asc())
-                ).all()
-                if not versions:
-                    raise ApiError(
-                        status_code=404,
-                        code="E_MEMORY_VERSION_NOT_FOUND",
-                        message="memory versions were not found",
-                        details={"canonical_table": canonical_table, "canonical_id": canonical_id},
-                        retryable=False,
-                    )
-                return {
-                    "ok": True,
-                    "schema_version": MEMORY_CONTEXT_SCHEMA_VERSION,
-                    "versions": [
+                    "facts": [
                         {
-                            "id": version.id,
-                            "canonical_table": version.canonical_table,
-                            "canonical_id": version.canonical_id,
-                            "version": version.version,
-                            "change_type": version.change_type,
-                            "actor_id": version.actor_id,
-                            "reason": version.reason,
-                            "prior_state": version.prior_state,
-                            "new_state": version.new_state,
-                            "redaction_posture": version.redaction_posture,
-                            "projection_invalidation": version.projection_invalidation,
-                            "created_at": to_rfc3339(version.created_at),
+                            "id": fact.id,
+                            "content": fact.content,
+                            "status": fact.status,
+                            "created_at": to_rfc3339(fact.created_at),
+                            "updated_at": to_rfc3339(fact.updated_at),
+                            "last_recalled_at": to_rfc3339(fact.last_recalled_at)
+                            if fact.last_recalled_at is not None
+                            else None,
                         }
-                        for version in versions
+                        for fact in facts
                     ],
                 }
-
-    @app.get("/v1/memory/projection-health", response_model=None)
-    def get_memory_projection_health() -> dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                payload = list_memory(db)
-                return {
-                    "ok": True,
-                    "schema_version": payload["schema_version"],
-                    "projection_health": payload["projection_health"],
-                }
-
-    @app.get("/v1/memory/consolidations/{context_block_id}", response_model=None)
-    def get_memory_consolidation(context_block_id: str) -> dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                block = db.get(MemoryContextBlockRecord, context_block_id)
-                if block is None or block.block_type != "hot_index":
-                    raise ApiError(
-                        status_code=404,
-                        code="E_MEMORY_CONSOLIDATION_NOT_FOUND",
-                        message="memory consolidation result was not found",
-                        details={"context_block_id": context_block_id},
-                        retryable=False,
-                    )
-                return {
-                    "ok": True,
-                    "schema_version": MEMORY_CONTEXT_SCHEMA_VERSION,
-                    "consolidation": {
-                        "context_block_id": block.id,
-                        "scope_key": block.scope_key,
-                        "state": block.lifecycle_state,
-                        "content": json.loads(block.content),
-                        "source_assertion_ids": block.source_assertion_ids,
-                        "source_memory_versions": block.source_memory_versions,
-                        "source_projection_versions": block.source_projection_versions,
-                        "projection_version": block.projection_version,
-                        "updated_at": to_rfc3339(block.updated_at),
-                    },
-                }
-
-    @app.post("/v1/memory/candidates/{assertion_id}/edit", response_model=None)
-    def post_memory_candidate_edit(
-        assertion_id: str,
-        payload: MemoryCorrectionRequest,
-    ) -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                assertion = db.get(MemoryAssertionRecord, assertion_id)
-                if assertion is None:
-                    raise ApiError(
-                        status_code=404,
-                        code="E_MEMORY_ASSERTION_NOT_FOUND",
-                        message="memory candidate was not found",
-                        details={"assertion_id": assertion_id},
-                        retryable=False,
-                    )
-                events = edit_candidate(
-                    db,
-                    assertion_id=assertion_id,
-                    value=payload.value,
-                    actor_id=str(app.state.approval_actor_id),
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                )
-                if not events:
-                    raise ApiError(
-                        status_code=409,
-                        code="E_MEMORY_OPERATION_NOT_APPLICABLE",
-                        message="memory candidate cannot be edited",
-                        details={"assertion_id": assertion_id, "state": assertion.lifecycle_state},
-                        retryable=False,
-                    )
-                _emit_http_memory_events(db, events=events, scope_key=assertion.scope_key)
-                memory_payload = list_memory(db)
-                try:
-                    return build_surface_memory_response(**memory_payload)
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.post("/v1/memory/candidates/merge", response_model=None)
-    def post_memory_candidates_merge(
-        payload: MemoryMergeCandidatesRequest,
-    ) -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                merge_scope_key = ""
-                for index, assertion_id in enumerate(payload.assertion_ids):
-                    assertion = db.get(MemoryAssertionRecord, assertion_id)
-                    if assertion is None:
-                        raise ApiError(
-                            status_code=404,
-                            code="E_MEMORY_ASSERTION_NOT_FOUND",
-                            message="memory candidate was not found",
-                            details={"assertion_id": assertion_id},
-                            retryable=False,
-                        )
-                    if index == 0:
-                        merge_scope_key = assertion.scope_key
-                events = merge_candidates(
-                    db,
-                    assertion_ids=payload.assertion_ids,
-                    actor_id=str(app.state.approval_actor_id),
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                )
-                if not events:
-                    raise ApiError(
-                        status_code=409,
-                        code="E_MEMORY_OPERATION_NOT_APPLICABLE",
-                        message="memory candidates cannot be merged",
-                        details={"assertion_ids": payload.assertion_ids},
-                        retryable=False,
-                    )
-                _emit_http_memory_events(db, events=events, scope_key=merge_scope_key)
-                memory_payload = list_memory(db)
-                try:
-                    return build_surface_memory_response(**memory_payload)
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.post("/v1/memory/candidates/{assertion_id}/approve", response_model=None)
-    def post_memory_candidate_approve(assertion_id: str) -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                assertion = db.get(MemoryAssertionRecord, assertion_id)
-                if assertion is None:
-                    raise ApiError(
-                        status_code=404,
-                        code="E_MEMORY_ASSERTION_NOT_FOUND",
-                        message="memory candidate was not found",
-                        details={"assertion_id": assertion_id},
-                        retryable=False,
-                    )
-                events = approve_candidate(
-                    db,
-                    assertion_id=assertion_id,
-                    actor_id=str(app.state.approval_actor_id),
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                )
-                if not events:
-                    raise ApiError(
-                        status_code=409,
-                        code="E_MEMORY_OPERATION_NOT_APPLICABLE",
-                        message="memory candidate cannot be approved directly",
-                        details={"assertion_id": assertion_id, "state": assertion.lifecycle_state},
-                        retryable=False,
-                    )
-                _emit_http_memory_events(db, events=events, scope_key=assertion.scope_key)
-                payload = list_memory(db)
-                try:
-                    return build_surface_memory_response(**payload)
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.post("/v1/memory/candidates/{assertion_id}/reject", response_model=None)
-    def post_memory_candidate_reject(
-        assertion_id: str,
-        payload: MemoryRejectRequest | None = None,
-    ) -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                assertion = db.get(MemoryAssertionRecord, assertion_id)
-                if assertion is None:
-                    raise ApiError(
-                        status_code=404,
-                        code="E_MEMORY_ASSERTION_NOT_FOUND",
-                        message="memory candidate was not found",
-                        details={"assertion_id": assertion_id},
-                        retryable=False,
-                    )
-                events = reject_candidate(
-                    db,
-                    assertion_id=assertion_id,
-                    actor_id=str(app.state.approval_actor_id),
-                    reason=payload.reason if payload is not None else None,
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                )
-                if not events:
-                    raise ApiError(
-                        status_code=409,
-                        code="E_MEMORY_OPERATION_NOT_APPLICABLE",
-                        message="memory candidate cannot be rejected",
-                        details={"assertion_id": assertion_id, "state": assertion.lifecycle_state},
-                        retryable=False,
-                    )
-                _emit_http_memory_events(db, events=events, scope_key=assertion.scope_key)
-                memory_payload = list_memory(db)
-                try:
-                    return build_surface_memory_response(**memory_payload)
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.post("/v1/memory/assertions/{assertion_id}/correct", response_model=None)
-    def post_memory_assertion_correct(
-        assertion_id: str,
-        payload: MemoryCorrectionRequest,
-    ) -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                active_session = _get_or_create_active_session(db)
-                assertion = db.get(MemoryAssertionRecord, assertion_id)
-                if assertion is None:
-                    raise ApiError(
-                        status_code=404,
-                        code="E_MEMORY_ASSERTION_NOT_FOUND",
-                        message="memory assertion was not found",
-                        details={"assertion_id": assertion_id},
-                        retryable=False,
-                    )
-                events = correct_assertion(
-                    db,
-                    assertion_id=assertion_id,
-                    value=payload.value,
-                    source_session_id=active_session.id,
-                    actor_id=str(app.state.approval_actor_id),
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                )
-                if not events:
-                    raise ApiError(
-                        status_code=409,
-                        code="E_MEMORY_OPERATION_NOT_APPLICABLE",
-                        message="memory assertion cannot be corrected",
-                        details={"assertion_id": assertion_id, "state": assertion.lifecycle_state},
-                        retryable=False,
-                    )
-                _emit_http_memory_events(db, events=events, scope_key=assertion.scope_key)
-                memory_payload = list_memory(db)
-                try:
-                    return build_surface_memory_response(**memory_payload)
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.post("/v1/memory/assertions/{assertion_id}/retract", response_model=None)
-    def post_memory_assertion_retract(assertion_id: str) -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                assertion = db.get(MemoryAssertionRecord, assertion_id)
-                if assertion is None:
-                    raise ApiError(
-                        status_code=404,
-                        code="E_MEMORY_ASSERTION_NOT_FOUND",
-                        message="memory assertion was not found",
-                        details={"assertion_id": assertion_id},
-                        retryable=False,
-                    )
-                events = retract_assertion(
-                    db,
-                    assertion_id=assertion_id,
-                    actor_id=str(app.state.approval_actor_id),
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                )
-                if not events:
-                    raise ApiError(
-                        status_code=409,
-                        code="E_MEMORY_OPERATION_NOT_APPLICABLE",
-                        message="memory assertion cannot be retracted",
-                        details={"assertion_id": assertion_id, "state": assertion.lifecycle_state},
-                        retryable=False,
-                    )
-                _emit_http_memory_events(db, events=events, scope_key=assertion.scope_key)
-                payload = list_memory(db)
-                try:
-                    return build_surface_memory_response(**payload)
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.delete("/v1/memory/assertions/{assertion_id}", response_model=None)
-    def delete_memory_assertion(assertion_id: str) -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                assertion = db.get(MemoryAssertionRecord, assertion_id)
-                if assertion is None:
-                    raise ApiError(
-                        status_code=404,
-                        code="E_MEMORY_ASSERTION_NOT_FOUND",
-                        message="memory assertion was not found",
-                        details={"assertion_id": assertion_id},
-                        retryable=False,
-                    )
-                events = delete_assertion(
-                    db,
-                    assertion_id=assertion_id,
-                    actor_id=str(app.state.approval_actor_id),
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                )
-                if not events:
-                    raise ApiError(
-                        status_code=409,
-                        code="E_MEMORY_OPERATION_NOT_APPLICABLE",
-                        message="memory assertion cannot be deleted",
-                        details={"assertion_id": assertion_id, "state": assertion.lifecycle_state},
-                        retryable=False,
-                    )
-                _emit_http_memory_events(db, events=events, scope_key=assertion.scope_key)
-                payload = list_memory(db)
-                try:
-                    return build_surface_memory_response(**payload)
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.post("/v1/memory/assertions/{assertion_id}/privacy-delete", response_model=None)
-    def post_memory_assertion_privacy_delete(
-        assertion_id: str,
-        payload: MemoryReasonRequest | None = None,
-    ) -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                assertion = db.get(MemoryAssertionRecord, assertion_id)
-                if assertion is None:
-                    raise ApiError(
-                        status_code=404,
-                        code="E_MEMORY_ASSERTION_NOT_FOUND",
-                        message="memory assertion was not found",
-                        details={"assertion_id": assertion_id},
-                        retryable=False,
-                    )
-                events = privacy_delete_assertion(
-                    db,
-                    assertion_id=assertion_id,
-                    actor_id=str(app.state.approval_actor_id),
-                    reason=payload.reason if payload is not None else None,
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                )
-                if not events:
-                    raise ApiError(
-                        status_code=409,
-                        code="E_MEMORY_OPERATION_NOT_APPLICABLE",
-                        message="memory assertion cannot be privacy-deleted",
-                        details={"assertion_id": assertion_id, "state": assertion.lifecycle_state},
-                        retryable=False,
-                    )
-                _emit_http_memory_events(db, events=events, scope_key=assertion.scope_key)
-                memory_payload = list_memory(db)
-                try:
-                    return build_surface_memory_response(**memory_payload)
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.post("/v1/memory/evidence/{evidence_id}/redact", response_model=None)
-    def post_memory_evidence_redact(
-        evidence_id: str,
-        payload: MemoryReasonRequest | None = None,
-    ) -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                evidence = db.get(MemoryEvidenceRecord, evidence_id)
-                if evidence is None:
-                    raise ApiError(
-                        status_code=404,
-                        code="E_MEMORY_EVIDENCE_NOT_FOUND",
-                        message="memory evidence was not found",
-                        details={"evidence_id": evidence_id},
-                        retryable=False,
-                    )
-                events = redact_evidence(
-                    db,
-                    evidence_id=evidence_id,
-                    actor_id=str(app.state.approval_actor_id),
-                    reason=payload.reason if payload is not None else None,
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                )
-                if not events:
-                    raise ApiError(
-                        status_code=409,
-                        code="E_MEMORY_OPERATION_NOT_APPLICABLE",
-                        message="memory evidence cannot be redacted",
-                        details={"evidence_id": evidence_id, "state": evidence.lifecycle_state},
-                        retryable=False,
-                    )
-                _emit_http_memory_events(
-                    db, events=events, scope_key=f"session:{evidence.source_session_id}"
-                )
-                memory_payload = list_memory(db)
-                try:
-                    return build_surface_memory_response(**memory_payload)
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.post("/v1/memory/never-remember", response_model=None)
-    def post_memory_never_remember(
-        payload: MemoryNeverRememberRequest,
-    ) -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                rule = set_never_remember_rule(
-                    db,
-                    scope_key=payload.scope_key,
-                    pattern=payload.pattern,
-                    actor_id=str(app.state.approval_actor_id),
-                    reason=payload.reason,
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                )
-                if rule is None:
-                    raise ApiError(
-                        status_code=422,
-                        code="E_MEMORY_RULE_INVALID",
-                        message="never-remember rule is invalid",
-                        details={},
-                        retryable=False,
-                    )
-                memory_payload = list_memory(db)
-                try:
-                    return build_surface_memory_response(**memory_payload)
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.post("/v1/memory/assertions/{assertion_id}/prioritize", response_model=None)
-    def post_memory_assertion_prioritize(assertion_id: str) -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                assertion = db.get(MemoryAssertionRecord, assertion_id)
-                if assertion is None:
-                    raise ApiError(
-                        status_code=404,
-                        code="E_MEMORY_ASSERTION_NOT_FOUND",
-                        message="memory assertion was not found",
-                        details={"assertion_id": assertion_id},
-                        retryable=False,
-                    )
-                updated = set_assertion_priority(
-                    db,
-                    assertion_id=assertion_id,
-                    priority="pinned",
-                    actor_id=str(app.state.approval_actor_id),
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                )
-                if updated is None:
-                    raise ApiError(
-                        status_code=409,
-                        code="E_MEMORY_OPERATION_NOT_APPLICABLE",
-                        message="memory assertion cannot be prioritized",
-                        details={"assertion_id": assertion_id, "state": assertion.lifecycle_state},
-                        retryable=False,
-                    )
-                payload = list_memory(db)
-                try:
-                    return build_surface_memory_response(**payload)
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.post("/v1/memory/assertions/{assertion_id}/deprioritize", response_model=None)
-    def post_memory_assertion_deprioritize(assertion_id: str) -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                assertion = db.get(MemoryAssertionRecord, assertion_id)
-                if assertion is None:
-                    raise ApiError(
-                        status_code=404,
-                        code="E_MEMORY_ASSERTION_NOT_FOUND",
-                        message="memory assertion was not found",
-                        details={"assertion_id": assertion_id},
-                        retryable=False,
-                    )
-                updated = set_assertion_priority(
-                    db,
-                    assertion_id=assertion_id,
-                    priority="deprioritized",
-                    actor_id=str(app.state.approval_actor_id),
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                )
-                if updated is None:
-                    raise ApiError(
-                        status_code=409,
-                        code="E_MEMORY_OPERATION_NOT_APPLICABLE",
-                        message="memory assertion cannot be deprioritized",
-                        details={"assertion_id": assertion_id, "state": assertion.lifecycle_state},
-                        retryable=False,
-                    )
-                payload = list_memory(db)
-                try:
-                    return build_surface_memory_response(**payload)
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.post("/v1/memory/assertions/{assertion_id}/mark-stale", response_model=None)
-    def post_memory_assertion_mark_stale(
-        assertion_id: str,
-        payload: MemoryReasonRequest | None = None,
-    ) -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                assertion = db.get(MemoryAssertionRecord, assertion_id)
-                if assertion is None:
-                    raise ApiError(
-                        status_code=404,
-                        code="E_MEMORY_ASSERTION_NOT_FOUND",
-                        message="memory assertion was not found",
-                        details={"assertion_id": assertion_id},
-                        retryable=False,
-                    )
-                try:
-                    events = mark_assertion_stale(
-                        db,
-                        assertion_id=assertion_id,
-                        actor_id=str(app.state.approval_actor_id),
-                        reason=payload.reason if payload is not None else None,
-                        now_fn=_utcnow,
-                        new_id_fn=_new_id,
-                    )
-                except MemoryStaleReasonRequiredError as exc:
-                    raise ApiError(
-                        status_code=422,
-                        code=MemoryStaleReasonRequiredError.code,
-                        message=str(exc),
-                        details={"assertion_id": assertion_id},
-                        retryable=False,
-                    ) from exc
-                if not events:
-                    raise ApiError(
-                        status_code=409,
-                        code="E_MEMORY_OPERATION_NOT_APPLICABLE",
-                        message="memory assertion cannot be marked stale",
-                        details={"assertion_id": assertion_id, "state": assertion.lifecycle_state},
-                        retryable=False,
-                    )
-                _emit_http_memory_events(db, events=events, scope_key=assertion.scope_key)
-                memory_payload = list_memory(db)
-                try:
-                    return build_surface_memory_response(**memory_payload)
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.get("/v1/memory/conflicts/{conflict_set_id}", response_model=None)
-    def get_memory_conflict(conflict_set_id: str) -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                payload = list_memory(db)
-                conflict = [item for item in payload["conflicts"] if item["id"] == conflict_set_id]
-                if not conflict:
-                    raise ApiError(
-                        status_code=404,
-                        code="E_MEMORY_CONFLICT_NOT_FOUND",
-                        message="memory conflict was not found",
-                        details={"conflict_set_id": conflict_set_id},
-                        retryable=False,
-                    )
-                try:
-                    return build_surface_memory_response(
-                        schema_version=payload["schema_version"],
-                        active_assertions=[],
-                        candidates=[],
-                        conflicts=conflict,
-                        project_state=[],
-                        evidence=[],
-                        procedures=[],
-                        projection_health=payload["projection_health"],
-                    )
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.post("/v1/memory/conflicts/{conflict_set_id}/resolve", response_model=None)
-    def post_memory_conflict_resolve(
-        conflict_set_id: str,
-        payload: MemoryConflictResolutionRequest,
-    ) -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                conflict = db.get(MemoryConflictSetRecord, conflict_set_id)
-                assertion = db.get(MemoryAssertionRecord, payload.assertion_id)
-                if conflict is None:
-                    raise ApiError(
-                        status_code=404,
-                        code="E_MEMORY_CONFLICT_NOT_FOUND",
-                        message="memory conflict was not found",
-                        details={"conflict_set_id": conflict_set_id},
-                        retryable=False,
-                    )
-                if assertion is None:
-                    raise ApiError(
-                        status_code=404,
-                        code="E_MEMORY_ASSERTION_NOT_FOUND",
-                        message="memory assertion was not found",
-                        details={"assertion_id": payload.assertion_id},
-                        retryable=False,
-                    )
-                events = resolve_conflict(
-                    db,
-                    conflict_set_id=conflict_set_id,
-                    assertion_id=payload.assertion_id,
-                    actor_id=str(app.state.approval_actor_id),
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                )
-                if not events:
-                    raise ApiError(
-                        status_code=409,
-                        code="E_MEMORY_CONFLICT_NOT_APPLICABLE",
-                        message="memory conflict could not be resolved",
-                        details={
-                            "conflict_set_id": conflict_set_id,
-                            "assertion_id": payload.assertion_id,
-                        },
-                        retryable=False,
-                    )
-                _emit_http_memory_events(db, events=events, scope_key=conflict.scope_key)
-                memory_payload = list_memory(db)
-                try:
-                    return build_surface_memory_response(**memory_payload)
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.get("/v1/memory/project-state", response_model=None)
-    def get_memory_project_state() -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                payload = list_memory(db)
-                try:
-                    return build_surface_memory_response(
-                        schema_version=payload["schema_version"],
-                        active_assertions=[],
-                        candidates=[],
-                        conflicts=[],
-                        project_state=payload["project_state"],
-                        evidence=[],
-                        procedures=[],
-                        projection_health=payload["projection_health"],
-                    )
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.get("/v1/memory/topics", response_model=None)
-    def get_memory_topics() -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                payload = list_memory(db)
-                topic_context_blocks = [
-                    block for block in payload["context_blocks"] if block["block_type"] == "topic"
-                ]
-                try:
-                    return build_surface_memory_response(
-                        schema_version=payload["schema_version"],
-                        active_assertions=[],
-                        candidates=[],
-                        conflicts=[],
-                        project_state=[],
-                        evidence=[],
-                        procedures=[],
-                        topics=payload["topics"],
-                        context_blocks=topic_context_blocks,
-                        projection_health=payload["projection_health"],
-                    )
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.get("/v1/memory/hot-index", response_model=None)
-    def get_memory_hot_index() -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                payload = list_memory(db)
-                hot_index_blocks = [
-                    block
-                    for block in payload["context_blocks"]
-                    if block["block_type"] == "hot_index"
-                ]
-                try:
-                    return build_surface_memory_response(
-                        schema_version=payload["schema_version"],
-                        active_assertions=[],
-                        candidates=[],
-                        conflicts=[],
-                        project_state=[],
-                        evidence=[],
-                        procedures=[],
-                        context_blocks=hot_index_blocks,
-                        projection_health=payload["projection_health"],
-                    )
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.get("/v1/memory/action-traces", response_model=None)
-    def get_memory_action_traces() -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                payload = list_memory(db)
-                try:
-                    return build_surface_memory_response(
-                        schema_version=payload["schema_version"],
-                        active_assertions=[],
-                        candidates=[],
-                        conflicts=[],
-                        project_state=[],
-                        evidence=[],
-                        procedures=[],
-                        action_traces=payload["action_traces"],
-                        projection_health=payload["projection_health"],
-                    )
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.get("/v1/memory/deletions", response_model=None)
-    def get_memory_deletions() -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                payload = list_memory(db)
-                try:
-                    return build_surface_memory_response(
-                        schema_version=payload["schema_version"],
-                        active_assertions=[],
-                        candidates=[],
-                        conflicts=[],
-                        project_state=[],
-                        evidence=[],
-                        procedures=[],
-                        deletions=payload["deletions"],
-                        projection_health=payload["projection_health"],
-                    )
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.get("/v1/memory/scope-bindings", response_model=None)
-    def get_memory_scope_bindings() -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                payload = list_memory(db)
-                try:
-                    return build_surface_memory_response(
-                        schema_version=payload["schema_version"],
-                        active_assertions=[],
-                        candidates=[],
-                        conflicts=[],
-                        project_state=[],
-                        evidence=[],
-                        procedures=[],
-                        scope_bindings=payload["scope_bindings"],
-                        projection_health=payload["projection_health"],
-                    )
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.get("/v1/memory/events", response_model=None)
-    def get_memory_events(
-        scope_key: str | None = None,
-        event_type: str | None = None,
-        since: datetime | None = None,
-        until: datetime | None = None,
-        limit: int = 100,
-    ) -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        for bound_name, bound_value in (("since", since), ("until", until)):
-            if bound_value is not None and (
-                bound_value.tzinfo is None or bound_value.utcoffset() is None
-            ):
-                raise ApiError(
-                    status_code=422,
-                    code="E_VALIDATION",
-                    message=f"{bound_name} must include a timezone",
-                    details={"field": bound_name},
-                    retryable=False,
-                )
-        bounded_limit = max(1, min(limit, 200))
-        with session_factory() as db:
-            with db.begin():
-                events = list_memory_events(
-                    db,
-                    scope_key=scope_key,
-                    event_type=event_type,
-                    since=since.astimezone(UTC) if since is not None else None,
-                    until=until.astimezone(UTC) if until is not None else None,
-                    limit=bounded_limit,
-                )
-                try:
-                    return build_surface_memory_event_list_response(
-                        schema_version=MEMORY_CONTEXT_SCHEMA_VERSION,
-                        events=events,
-                    )
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.put("/v1/memory/scope-bindings", response_model=None)
-    def put_memory_scope_binding(
-        payload: MemoryScopeModeRequest,
-    ) -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                binding_events = set_memory_scope_binding(
-                    db,
-                    scope_type=payload.scope_type,
-                    scope_key=payload.scope_key,
-                    memory_mode=payload.memory_mode,
-                    actor_id=str(app.state.approval_actor_id),
-                    reason=payload.reason,
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                    expires_at=payload.expires_at,
-                )
-                if not binding_events:
-                    raise ApiError(
-                        status_code=422,
-                        code="E_MEMORY_SCOPE_MODE_INVALID",
-                        message="memory scope mode is invalid",
-                        details={},
-                        retryable=False,
-                    )
-                _emit_http_memory_events(db, events=binding_events, scope_key=payload.scope_key)
-                memory_payload = list_memory(db)
-                try:
-                    return build_surface_memory_response(
-                        schema_version=memory_payload["schema_version"],
-                        active_assertions=[],
-                        candidates=[],
-                        conflicts=[],
-                        project_state=[],
-                        evidence=[],
-                        procedures=[],
-                        scope_bindings=memory_payload["scope_bindings"],
-                        projection_health=memory_payload["projection_health"],
-                    )
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.post("/v1/memory/consolidate", response_model=None)
-    def post_memory_consolidate(payload: MemoryExportRequest) -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                active_session = _get_or_create_active_session(db)
-                consolidate_memory(
-                    db,
-                    scope_key=payload.scope_key,
-                    actor_id=str(app.state.approval_actor_id),
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                    source_session_id=active_session.id,
-                )
-                memory_payload = list_memory(db)
-                try:
-                    return build_surface_memory_response(**memory_payload)
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.post("/v1/memory/export", response_model=None)
-    def post_memory_export(payload: MemoryExportRequest) -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                active_session = _get_or_create_active_session(db)
-                export_memory(
-                    db,
-                    scope_key=payload.scope_key,
-                    actor_id=str(app.state.approval_actor_id),
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                    source_session_id=active_session.id,
-                )
-                memory_payload = list_memory(db)
-                try:
-                    return build_surface_memory_response(**memory_payload)
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.post("/v1/memory/import", response_model=None)
-    def post_memory_import(payload: MemoryImportRequest) -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        if not settings.memory_import_cutover_enabled:
-            raise ApiError(
-                status_code=403,
-                code="E_MEMORY_IMPORT_DISABLED",
-                message="memory import is available only during explicit cutover mode",
-                details={"setting": "ARIEL_MEMORY_IMPORT_CUTOVER_ENABLED"},
-                retryable=False,
-            )
-        with session_factory() as db:
-            with db.begin():
-                active_session = _get_or_create_active_session(db)
-                import_memory_candidates(
-                    db,
-                    source_session_id=active_session.id,
-                    actor_id=str(app.state.approval_actor_id),
-                    candidates=[candidate.model_dump() for candidate in payload.candidates],
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                    cutover_enabled=settings.memory_import_cutover_enabled,
-                )
-                memory_payload = list_memory(db)
-                try:
-                    return build_surface_memory_response(**memory_payload)
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.post("/v1/memory/evals", response_model=None)
-    def post_memory_eval(payload: MemoryEvalRequest) -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                active_session = _get_or_create_active_session(db)
-                run_memory_eval(
-                    db,
-                    eval_name=payload.eval_name,
-                    cases=[case.model_dump() for case in payload.cases],
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                    settings=settings,
-                    current_session_id=active_session.id,
-                )
-                memory_payload = list_memory(db)
-                try:
-                    return build_surface_memory_response(**memory_payload)
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.get("/v1/memory/evals/{eval_run_id}", response_model=None)
-    def get_memory_eval(eval_run_id: str) -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                payload = list_memory(db)
-                for run in payload["eval_runs"]:
-                    if run["id"] == eval_run_id:
-                        try:
-                            return build_surface_memory_response(
-                                schema_version=payload["schema_version"],
-                                active_assertions=[],
-                                candidates=[],
-                                conflicts=[],
-                                project_state=[],
-                                evidence=[],
-                                procedures=[],
-                                eval_runs=[run],
-                                projection_health=payload["projection_health"],
-                            )
-                        except ResponseContractViolation as exc:
-                            raise _response_contract_error(exc) from exc
-                raise ApiError(
-                    status_code=404,
-                    code="E_MEMORY_EVAL_NOT_FOUND",
-                    message="memory eval run was not found",
-                    details={"eval_run_id": eval_run_id},
-                    retryable=False,
-                )
-
-    @app.post("/v1/memory/projection-jobs/{job_id}/retry", response_model=None)
-    def post_memory_projection_job_retry(job_id: str) -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                retried_job = retry_projection_job(db, job_id=job_id, now_fn=_utcnow)
-                if retried_job is None:
-                    raise ApiError(
-                        status_code=404,
-                        code="E_MEMORY_PROJECTION_JOB_NOT_FOUND",
-                        message="memory projection job was not found",
-                        details={"job_id": job_id},
-                        retryable=False,
-                    )
-                memory_payload = list_memory(db)
-                try:
-                    return build_surface_memory_response(**memory_payload)
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.post("/v1/memory/relationships", response_model=None)
-    def post_memory_relationship(
-        payload: MemoryRelationshipRequest,
-    ) -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                relationship = create_relationship(
-                    db,
-                    source_entity_id=payload.source_entity_id,
-                    target_entity_id=payload.target_entity_id,
-                    relationship_type=payload.relationship_type,
-                    evidence_id=payload.evidence_id,
-                    scope_key=payload.scope_key,
-                    confidence=payload.confidence,
-                    actor_id=str(app.state.approval_actor_id),
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                )
-                if relationship is None:
-                    raise ApiError(
-                        status_code=404,
-                        code="E_MEMORY_RELATIONSHIP_TARGET_NOT_FOUND",
-                        message="memory relationship target not found",
-                        details={},
-                        retryable=False,
-                    )
-                memory_payload = list_memory(db)
-                try:
-                    return build_surface_memory_response(**memory_payload)
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
 
     @app.get("/v1/weather/default-location")
     def get_weather_default_location() -> dict[str, Any]:
@@ -5465,47 +3679,21 @@ def create_app(
             .where(TurnRecord.session_id == active_session.id)
             .order_by(TurnRecord.created_at.asc(), TurnRecord.id.asc())
         ).all()
-        pre_rotation_memory_context = {
-            "schema_version": MEMORY_CONTEXT_SCHEMA_VERSION,
-            "projection_version": MEMORY_PROJECTION_VERSION,
-            "hot_index": [],
-            "topic_index": [],
-            "pinned_core": [],
-            "project_state": [],
-            "commitments_and_decisions": [],
-            "semantic_assertions": [],
-            "episodic_evidence": [],
-            "procedural_memory": [],
-            "action_traces": [],
-            "conflicts": [],
-            "recall_window": {
-                "max_selected_memories": int(app.state.max_recalled_assertions),
-                "selected_memory_count": 0,
-                "memory_candidate_count": 0,
-                "omitted_memory_count": 0,
-                "selected_memory_ids": [],
-                "selected_memories": [],
-                "omitted_memories": [],
-                "candidate_memory_ids": [],
-                "curation_parse_status": "not_required_pre_rotation_estimate",
-            },
-            "projection_health": {
-                "projection_version": MEMORY_PROJECTION_VERSION,
-                "selected_assertion_count": 0,
-                "selected_memory_count": 0,
-            },
-        }
-        pre_rotation_open_commitments_and_jobs = _open_commitments_and_jobs_context(
-            db=db,
-            now=_utcnow(),
-            provider_account_id=_active_google_provider_account_id(db),
-        )
+        # Estimate context size for the rotation-pressure trigger. The retriever
+        # is a per-turn step, not part of this estimate, so recalled_memory is
+        # empty here; the profile and digest are the always-loaded documents.
         pre_rotation_context_bundle = _build_turn_context_bundle(
             prior_turns=prior_turns,
             max_recent_turns=int(app.state.max_recent_turns),
             discord_context=discord_context,
-            memory_context=pre_rotation_memory_context,
-            open_commitments_and_jobs=pre_rotation_open_commitments_and_jobs,
+            profile=read_profile(db),
+            session_digest=active_session.digest,
+            recalled_memory=[],
+            open_commitments_and_jobs=_open_commitments_and_jobs_context(
+                db=db,
+                now=_utcnow(),
+                provider_account_id=_active_google_provider_account_id(db),
+            ),
             relevant_artifacts_and_observations=_relevant_artifacts_and_observations_context(
                 db=db,
                 prior_turns=prior_turns,
@@ -5525,101 +3713,13 @@ def create_app(
             now=_utcnow(),
         )
         if auto_rotation_reason is not None:
-            try:
-                active_session, _, _ = _rotate_active_session(
-                    db,
-                    reason=auto_rotation_reason,
-                    idempotency_key=None,
-                    actor_id=str(app.state.approval_actor_id),
-                    settings=settings,
-                    trigger_snapshot=trigger_snapshot,
-                )
-            except AIJudgmentFailure as exc:
-                now_failed_rotation = _utcnow()
-                failed_turn = TurnRecord(
-                    id=_new_id("trn"),
-                    session_id=active_session.id,
-                    user_message=user_message,
-                    assistant_message=None,
-                    status="failed",
-                    created_at=now_failed_rotation,
-                    updated_at=now_failed_rotation,
-                )
-                db.add(failed_turn)
-                db.add(
-                    EventRecord(
-                        id=_new_id("evn"),
-                        session_id=active_session.id,
-                        turn_id=failed_turn.id,
-                        sequence=1,
-                        event_type="evt.turn.started",
-                        payload=jsonable_encoder(
-                            {"message": user_message, "discord": discord_context}
-                        ),
-                        created_at=now_failed_rotation,
-                    )
-                )
-                db.add(
-                    EventRecord(
-                        id=_new_id("evn"),
-                        session_id=active_session.id,
-                        turn_id=failed_turn.id,
-                        sequence=2,
-                        event_type="evt.ai_judgment.failed",
-                        payload=jsonable_encoder(
-                            {
-                                "judgment_type": "continuity_compaction",
-                                "failure_code": exc.code,
-                                "failure_reason": safe_failure_reason(
-                                    exc.safe_reason,
-                                    fallback=f"unexpected {exc.__class__.__name__}",
-                                ),
-                                "prompt_version": MEMORY_CONTINUITY_PROMPT_VERSION,
-                                "source_id": active_session.id,
-                                "parse_status": exc.parse_status,
-                                "validation_status": exc.validation_status,
-                                "retryable": exc.retryable,
-                            }
-                        ),
-                        created_at=now_failed_rotation,
-                    )
-                )
-                db.add(
-                    EventRecord(
-                        id=_new_id("evn"),
-                        session_id=active_session.id,
-                        turn_id=failed_turn.id,
-                        sequence=3,
-                        event_type="evt.turn.failed",
-                        payload=jsonable_encoder(
-                            {
-                                "failure_reason": "AI session continuity failed",
-                                "error_code": exc.code,
-                            }
-                        ),
-                        created_at=now_failed_rotation,
-                    )
-                )
-                active_session.updated_at = now_failed_rotation
-                db.flush()
-                failure = ApiError(
-                    status_code=503 if exc.retryable else 422,
-                    code=exc.code,
-                    message="AI session continuity failed",
-                    details={
-                        "session_id": active_session.id,
-                        "turn_id": failed_turn.id,
-                        "judgment_type": "continuity_compaction",
-                        "prompt_version": MEMORY_CONTINUITY_PROMPT_VERSION,
-                    },
-                    retryable=exc.retryable,
-                )
-                return TurnExecutionOutcome(
-                    turn_id=failed_turn.id,
-                    effective_session_id=active_session.id,
-                    status_code=failure.status_code,
-                    response_payload=_error_payload(failure),
-                )
+            active_session, _, _ = _rotate_active_session(
+                db,
+                reason=auto_rotation_reason,
+                idempotency_key=None,
+                actor_id=str(app.state.approval_actor_id),
+                trigger_snapshot=trigger_snapshot,
+            )
             prior_turns = db.scalars(
                 select(TurnRecord)
                 .where(TurnRecord.session_id == active_session.id)
@@ -5733,230 +3833,36 @@ def create_app(
             )
         add_event("evt.turn.started", {"message": user_message, "discord": discord_context})
 
+        # Pre-turn memory: the always-loaded profile and session digest, plus the
+        # retriever's verdict on which stored facts matter now. The retriever is
+        # a bounded AI subagent that audits its own ai_judgments row; it is
+        # non-fatal -- any failure leaves the turn alive on the profile and
+        # digest alone, so recall is never on the turn's critical-failure path.
+        memory_profile = read_profile(db)
+        session_digest = active_session.digest
         try:
-            memory_context, memory_recall_event_payload = build_memory_context(
-                db,
-                user_message=user_message,
-                max_recalled_assertions=int(app.state.max_recalled_assertions),
-                settings=settings,
-                current_session_id=effective_session_id,
-                thread_id=str(discord_context["thread_id"])
-                if isinstance(discord_context, dict)
-                and discord_context.get("thread_id") is not None
-                else None,
-                actor_id=str(app.state.approval_actor_id),
-            )
-        except AIJudgmentFailure as exc:
-            safe_reason = safe_failure_reason(
-                exc.safe_reason,
-                fallback=f"unexpected {exc.__class__.__name__}",
-            )
-            input_refs = {
-                "session_id": effective_session_id,
-                "turn_id": turn.id,
-                "candidate_memory_ids": [
-                    memory_id
-                    for memory_id in db.scalars(
-                        select(MemoryAssertionRecord.id)
-                        .where(MemoryAssertionRecord.lifecycle_state == "active")
-                        .order_by(MemoryAssertionRecord.updated_at.desc())
-                        .limit(max(50, int(app.state.max_recalled_assertions) * 8))
-                    ).all()
-                    if isinstance(memory_id, str)
-                ],
-            }
-            add_ai_judgment(
-                judgment_type="memory_curation",
+            recalled_facts: list[MemoryFactRecord] = run_retriever(
+                session_factory=app.state.session_factory,
+                query=user_message,
                 source_type="turn",
                 source_id=turn.id,
-                status="failed",
-                model=settings.model_name,
-                prompt_version=MEMORY_CURATION_PROMPT_VERSION,
-                provider_response_id=exc.provider_response_id,
-                input_summary="memory curation for turn",
-                input_refs=input_refs,
-                parse_status=exc.parse_status,
-                validation_status=exc.validation_status,
-                failure_code=exc.code,
-                failure_reason=safe_reason,
-            )
-            add_event(
-                "evt.ai_judgment.failed",
-                {
-                    "judgment_type": "memory_curation",
-                    "failure_code": exc.code,
-                    "failure_reason": safe_reason,
-                    "prompt_version": MEMORY_CURATION_PROMPT_VERSION,
-                    "source_id": turn.id,
-                    "input_refs": input_refs,
-                    "parse_status": exc.parse_status,
-                    "validation_status": exc.validation_status,
-                    "retryable": exc.retryable,
-                },
-            )
-            turn.status = "failed"
-            turn.updated_at = _utcnow()
-            add_event(
-                "evt.turn.failed",
-                {
-                    "failure_reason": "AI memory curation failed",
-                    "error_code": exc.code,
-                },
-            )
-            active_session.updated_at = _utcnow()
-            db.flush()
-            failure = ApiError(
-                status_code=502 if exc.retryable else 422,
-                code=exc.code,
-                message="AI memory curation failed",
-                details={
-                    "session_id": effective_session_id,
-                    "turn_id": turn.id,
-                    "judgment_type": "memory_curation",
-                    "prompt_version": MEMORY_CURATION_PROMPT_VERSION,
-                },
-                retryable=exc.retryable,
-            )
-            return TurnExecutionOutcome(
-                turn_id=turn.id,
-                effective_session_id=effective_session_id,
-                status_code=failure.status_code,
-                response_payload=_error_payload(failure),
+                settings=settings,
+                now_fn=_utcnow,
+                new_id_fn=_new_id,
             )
         except Exception as exc:
-            safe_reason = safe_failure_reason(
-                str(exc),
-                fallback=f"unexpected {exc.__class__.__name__}",
-            )
-            input_refs = {
-                "session_id": effective_session_id,
-                "turn_id": turn.id,
-                "candidate_memory_ids": [
-                    memory_id
-                    for memory_id in db.scalars(
-                        select(MemoryAssertionRecord.id)
-                        .where(MemoryAssertionRecord.lifecycle_state == "active")
-                        .order_by(MemoryAssertionRecord.updated_at.desc())
-                        .limit(max(50, int(app.state.max_recalled_assertions) * 8))
-                    ).all()
-                    if isinstance(memory_id, str)
-                ],
-            }
-            add_ai_judgment(
-                judgment_type="memory_curation",
-                source_type="turn",
-                source_id=turn.id,
-                status="failed",
-                model=settings.model_name,
-                prompt_version=MEMORY_CURATION_PROMPT_VERSION,
-                input_summary="memory curation for turn",
-                input_refs=input_refs,
-                parse_status="parsed",
-                validation_status="invalid",
-                failure_code="E_AI_JUDGMENT_SCHEMA",
-                failure_reason=safe_reason,
-            )
+            recalled_facts = []
             add_event(
-                "evt.ai_judgment.failed",
+                "evt.memory.recall_failed",
                 {
-                    "judgment_type": "memory_curation",
-                    "failure_code": "E_AI_JUDGMENT_SCHEMA",
-                    "failure_reason": safe_reason,
-                    "prompt_version": MEMORY_CURATION_PROMPT_VERSION,
-                    "source_id": turn.id,
-                    "input_refs": input_refs,
-                    "parse_status": "parsed",
-                    "validation_status": "invalid",
-                    "retryable": True,
-                },
-            )
-            turn.status = "failed"
-            turn.updated_at = _utcnow()
-            add_event(
-                "evt.turn.failed",
-                {
-                    "failure_reason": "AI memory curation failed",
-                    "error_code": "E_AI_JUDGMENT_SCHEMA",
-                },
-            )
-            active_session.updated_at = _utcnow()
-            db.flush()
-            failure = ApiError(
-                status_code=502,
-                code="E_AI_JUDGMENT_SCHEMA",
-                message="AI memory curation failed",
-                details={
-                    "session_id": effective_session_id,
                     "turn_id": turn.id,
-                    "judgment_type": "memory_curation",
-                    "prompt_version": MEMORY_CURATION_PROMPT_VERSION,
+                    "failure_reason": safe_failure_reason(
+                        getattr(exc, "safe_reason", str(exc)),
+                        fallback=f"unexpected {exc.__class__.__name__}",
+                    ),
                 },
-                retryable=True,
-            )
-            return TurnExecutionOutcome(
-                turn_id=turn.id,
-                effective_session_id=effective_session_id,
-                status_code=failure.status_code,
-                response_payload=_error_payload(failure),
             )
 
-        memory_curation_parse_status = memory_recall_event_payload.get("curation_parse_status")
-        if not isinstance(memory_curation_parse_status, str):
-            memory_curation_parse_status = "parsed"
-        memory_curation_provider_response_id = memory_recall_event_payload.get(
-            "curation_provider_response_id"
-        )
-        if not isinstance(memory_curation_provider_response_id, str):
-            memory_curation_provider_response_id = None
-        add_ai_judgment(
-            judgment_type="memory_curation",
-            source_type="turn",
-            source_id=turn.id,
-            status="succeeded",
-            model=memory_recall_event_payload.get("curation_model")
-            if isinstance(memory_recall_event_payload.get("curation_model"), str)
-            else settings.model_name,
-            prompt_version=MEMORY_CURATION_PROMPT_VERSION,
-            provider_response_id=memory_curation_provider_response_id,
-            input_summary="memory curation for turn",
-            input_refs={
-                "session_id": effective_session_id,
-                "turn_id": turn.id,
-                "candidate_memory_ids": memory_recall_event_payload.get("candidate_memory_ids", []),
-                "candidate_memories": memory_recall_event_payload.get("candidate_memories", []),
-            },
-            selected=memory_recall_event_payload.get("selected_memories")
-            if isinstance(memory_recall_event_payload.get("selected_memories"), list)
-            else [],
-            omitted=memory_recall_event_payload.get("omitted_memories")
-            if isinstance(memory_recall_event_payload.get("omitted_memories"), list)
-            else [],
-            output={"recall_window": memory_recall_event_payload},
-            rationale=memory_recall_event_payload.get("curation_rationale")
-            if isinstance(memory_recall_event_payload.get("curation_rationale"), str)
-            else None,
-            uncertainty=memory_recall_event_payload.get("curation_uncertainty")
-            if isinstance(memory_recall_event_payload.get("curation_uncertainty"), str)
-            else None,
-            confidence=(
-                float(memory_recall_event_payload["curation_confidence"])
-                if isinstance(memory_recall_event_payload.get("curation_confidence"), int | float)
-                else None
-            ),
-            parse_status=memory_curation_parse_status,
-            validation_status="valid",
-        )
-        add_event(
-            "evt.ai_judgment.completed",
-            {
-                "judgment_type": "memory_curation",
-                "prompt_version": MEMORY_CURATION_PROMPT_VERSION,
-                "source_id": turn.id,
-                "parse_status": memory_curation_parse_status,
-                "validation_status": "valid",
-                "provider_response_id": memory_curation_provider_response_id,
-            },
-        )
         open_commitments_and_jobs = _open_commitments_and_jobs_context(
             db=db,
             now=_utcnow(),
@@ -5966,7 +3872,9 @@ def create_app(
             prior_turns=prior_turns,
             max_recent_turns=int(app.state.max_recent_turns),
             discord_context=discord_context,
-            memory_context=memory_context,
+            profile=memory_profile,
+            session_digest=session_digest,
+            recalled_memory=recalled_facts,
             open_commitments_and_jobs=open_commitments_and_jobs,
             relevant_artifacts_and_observations=_relevant_artifacts_and_observations_context(
                 db=db,
@@ -5987,13 +3895,11 @@ def create_app(
             agency_configured=agency_configured,
             settings=settings,
         )
-        context_metadata = _context_bundle_audit_metadata(context_bundle)
-        if (
-            memory_recall_event_payload["selected_memory_count"]
-            or memory_recall_event_payload["memory_candidate_count"]
-            or memory_recall_event_payload["conflict_ids"]
-        ):
-            add_event("evt.memory.curated", memory_recall_event_payload)
+        if recalled_facts:
+            add_event(
+                "evt.memory.recalled",
+                {"turn_id": turn.id, "recalled_fact_ids": [fact.id for fact in recalled_facts]},
+            )
         applied_limits = _applied_turn_limits(app)
 
         def elapsed_turn_ms(started_at: float) -> int:
@@ -6047,9 +3953,6 @@ def create_app(
         model_failure: ApiError | None = None
         model_failure_reason: str | None = None
         assistant_response: dict[str, Any] | None = None
-        responses_input_items: list[dict[str, Any]] = []
-        responses_tools: list[dict[str, Any]] = []
-        allowed_capability_ids: list[str] = []
 
         def record_model_output_budget_failure(
             *,
@@ -6109,707 +4012,117 @@ def create_app(
                 retryable=True,
             )
 
-        context_tokens = _estimate_context_tokens(
-            context_bundle=context_bundle,
-            user_message=user_message,
-        )
-        try:
-            compacted_context_bundle = app.state.context_compaction_adapter.compact(
-                context_bundle=context_bundle,
-                user_message=user_message,
-                estimated_context_tokens=context_tokens,
-                max_context_tokens=int(app.state.max_context_tokens),
-            )
-        except ModelAdapterError as exc:
-            model_failure_reason = safe_failure_reason(
-                exc.safe_reason,
-                fallback=f"unexpected {exc.__class__.__name__}",
-            )
-            compaction_failure_code = (
-                exc.code if exc.code.startswith("E_AI_JUDGMENT_") else "E_AI_JUDGMENT_REQUIRED"
-            )
-            compaction_parse_status = (
-                exc.parse_status if isinstance(exc.parse_status, str) else "missing_output"
-            )
-            compaction_validation_status = (
-                exc.validation_status if isinstance(exc.validation_status, str) else "not_validated"
-            )
-            add_ai_judgment(
-                judgment_type="continuity_compaction",
-                source_type="turn",
-                source_id=turn.id,
-                status="failed",
-                model=getattr(app.state.context_compaction_adapter, "model", settings.model_name),
-                prompt_version=MEMORY_CONTINUITY_PROMPT_VERSION,
-                provider_response_id=exc.provider_response_id
-                if isinstance(exc.provider_response_id, str)
-                else None,
-                input_summary="context-pressure continuity compaction",
-                input_refs={
-                    "session_id": effective_session_id,
-                    "turn_id": turn.id,
-                    "estimated_context_tokens": context_tokens,
-                    "max_context_tokens": int(app.state.max_context_tokens),
-                    "source_turn_ids": [
-                        item["turn_id"]
-                        for item in context_bundle.get("recent_active_session_turns", [])
-                        if isinstance(item, dict) and isinstance(item.get("turn_id"), str)
-                    ],
-                },
-                parse_status=compaction_parse_status,
-                validation_status=compaction_validation_status,
-                failure_code=compaction_failure_code,
-                failure_reason=model_failure_reason,
-            )
-            add_event(
-                "evt.ai_judgment.failed",
-                {
-                    "judgment_type": "continuity_compaction",
-                    "code": compaction_failure_code,
-                    "failure_code": compaction_failure_code,
-                    "failure_reason": model_failure_reason,
-                    "prompt_version": MEMORY_CONTINUITY_PROMPT_VERSION,
-                    "source_id": turn.id,
-                    "parse_status": compaction_parse_status,
-                    "validation_status": compaction_validation_status,
-                    "retryable": exc.retryable,
-                },
-            )
-            model_failure = ApiError(
-                status_code=503 if exc.retryable else exc.status_code,
-                code=compaction_failure_code,
-                message="AI continuity compaction failed",
-                details={
-                    "session_id": effective_session_id,
-                    "turn_id": turn.id,
-                    "judgment_type": "continuity_compaction",
-                    "prompt_version": MEMORY_CONTINUITY_PROMPT_VERSION,
-                },
-                retryable=exc.retryable,
-            )
-            compacted_context_bundle = None
-        if isinstance(compacted_context_bundle, dict):
-            continuity = compacted_context_bundle.get("continuity_compaction")
-            if context_tokens > app.state.max_context_tokens and not isinstance(continuity, dict):
-                failure_reason = "context compaction did not return an AI continuity record"
-                add_ai_judgment(
-                    judgment_type="continuity_compaction",
-                    source_type="turn",
-                    source_id=turn.id,
-                    status="failed",
-                    model=getattr(
-                        app.state.context_compaction_adapter, "model", settings.model_name
-                    ),
-                    prompt_version=MEMORY_CONTINUITY_PROMPT_VERSION,
-                    input_summary="context-pressure continuity compaction",
-                    input_refs={
-                        "session_id": effective_session_id,
-                        "turn_id": turn.id,
-                        "estimated_context_tokens": context_tokens,
-                        "max_context_tokens": int(app.state.max_context_tokens),
-                    },
-                    parse_status="schema_invalid",
-                    validation_status="invalid",
-                    failure_code="E_AI_JUDGMENT_SCHEMA",
-                    failure_reason=failure_reason,
-                )
-                add_event(
-                    "evt.ai_judgment.failed",
-                    {
-                        "judgment_type": "continuity_compaction",
-                        "failure_code": "E_AI_JUDGMENT_SCHEMA",
-                        "failure_reason": failure_reason,
-                        "prompt_version": MEMORY_CONTINUITY_PROMPT_VERSION,
-                        "source_id": turn.id,
-                        "parse_status": "schema_invalid",
-                        "validation_status": "invalid",
-                    },
-                )
-                model_failure = ApiError(
-                    status_code=502,
-                    code="E_AI_JUDGMENT_SCHEMA",
-                    message="AI continuity compaction failed",
-                    details={
-                        "session_id": effective_session_id,
-                        "turn_id": turn.id,
-                        "judgment_type": "continuity_compaction",
-                        "prompt_version": MEMORY_CONTINUITY_PROMPT_VERSION,
-                    },
-                    retryable=False,
-                )
-                compacted_context_bundle = None
-                continuity = None
-            if isinstance(continuity, dict):
-                continuity_provider_response_id = continuity.get("provider_response_id")
-                if not isinstance(continuity_provider_response_id, str):
-                    continuity_provider_response_id = None
-                try:
-                    continuity = validate_continuity_compaction_payload(
-                        continuity,
-                        source_turn_ids=[
-                            item["turn_id"]
-                            for item in context_bundle.get("recent_active_session_turns", [])
-                            if isinstance(item, dict) and isinstance(item.get("turn_id"), str)
-                        ],
-                        model=getattr(
-                            app.state.context_compaction_adapter,
-                            "model",
-                            settings.model_name,
-                        ),
-                        provider_response_id=continuity_provider_response_id,
-                    )
-                except AIJudgmentFailure as exc:
-                    failure_reason = safe_failure_reason(
-                        exc.safe_reason,
-                        fallback=f"unexpected {exc.__class__.__name__}",
-                    )
-                    add_ai_judgment(
-                        judgment_type="continuity_compaction",
-                        source_type="turn",
-                        source_id=turn.id,
-                        status="failed",
-                        model=getattr(
-                            app.state.context_compaction_adapter,
-                            "model",
-                            settings.model_name,
-                        ),
-                        prompt_version=MEMORY_CONTINUITY_PROMPT_VERSION,
-                        provider_response_id=exc.provider_response_id,
-                        input_summary="context-pressure continuity compaction",
-                        input_refs={
-                            "session_id": effective_session_id,
-                            "turn_id": turn.id,
-                            "estimated_context_tokens": context_tokens,
-                            "max_context_tokens": int(app.state.max_context_tokens),
-                        },
-                        parse_status=exc.parse_status,
-                        validation_status=exc.validation_status,
-                        failure_code=exc.code,
-                        failure_reason=failure_reason,
-                    )
-                    add_event(
-                        "evt.ai_judgment.failed",
-                        {
-                            "judgment_type": "continuity_compaction",
-                            "failure_code": exc.code,
-                            "failure_reason": failure_reason,
-                            "prompt_version": MEMORY_CONTINUITY_PROMPT_VERSION,
-                            "source_id": turn.id,
-                            "parse_status": exc.parse_status,
-                            "validation_status": exc.validation_status,
-                        },
-                    )
-                    model_failure = ApiError(
-                        status_code=502,
-                        code=exc.code,
-                        message="AI continuity compaction failed",
-                        details={
-                            "session_id": effective_session_id,
-                            "turn_id": turn.id,
-                            "judgment_type": "continuity_compaction",
-                            "prompt_version": MEMORY_CONTINUITY_PROMPT_VERSION,
-                        },
-                        retryable=exc.retryable,
-                    )
-                    compacted_context_bundle = None
-                    continuity = None
-            if isinstance(continuity, dict):
-                source_turn_ids = continuity.get("source_turn_ids")
-                preserved_turn_refs = continuity.get("preserved_turn_refs")
-                omitted_turn_refs = continuity.get("omitted_turn_refs")
-                continuity_provider_response_id = continuity.get("provider_response_id")
-                if not isinstance(continuity_provider_response_id, str):
-                    continuity_provider_response_id = None
-                now_compaction = _utcnow()
-                db.add(
-                    ProjectStateSnapshotRecord(
-                        id=_new_id("pss"),
-                        project_key="session_continuity",
-                        summary=redact_text(str(continuity.get("summary") or ""))[:2000],
-                        state={
-                            "reason": "context_pressure",
-                            "session_id": effective_session_id,
-                            "turn_id": turn.id,
-                            "provider_response_id": continuity_provider_response_id,
-                            "source_turn_ids": source_turn_ids
-                            if isinstance(source_turn_ids, list)
-                            else [],
-                            "preserved_turn_refs": preserved_turn_refs
-                            if isinstance(preserved_turn_refs, list)
-                            else [],
-                            "omitted_turn_refs": omitted_turn_refs
-                            if isinstance(omitted_turn_refs, list)
-                            else [],
-                            "user_commitments": continuity.get("user_commitments")
-                            if isinstance(continuity.get("user_commitments"), list)
-                            else [],
-                            "assistant_commitments": continuity.get("assistant_commitments")
-                            if isinstance(continuity.get("assistant_commitments"), list)
-                            else [],
-                            "decisions": continuity.get("decisions")
-                            if isinstance(continuity.get("decisions"), list)
-                            else [],
-                            "open_loops": continuity.get("open_loops")
-                            if isinstance(continuity.get("open_loops"), list)
-                            else [],
-                            "unresolved_uncertainty": continuity.get("unresolved_uncertainty")
-                            if isinstance(continuity.get("unresolved_uncertainty"), list)
-                            else [],
-                            "important_omissions": continuity.get("important_omissions")
-                            if isinstance(continuity.get("important_omissions"), list)
-                            else [],
-                            "tool_action_outcomes": continuity.get("tool_action_outcomes")
-                            if isinstance(continuity.get("tool_action_outcomes"), list)
-                            else [],
-                            "confidence": continuity.get("confidence")
-                            if isinstance(continuity.get("confidence"), int | float)
-                            else None,
-                            "model": getattr(
-                                app.state.context_compaction_adapter,
-                                "model",
-                                settings.model_name,
-                            ),
-                            "prompt_version": MEMORY_CONTINUITY_PROMPT_VERSION,
-                            "parse_status": "parsed",
-                            "validation_status": "valid",
-                        },
-                        source_assertion_ids=[],
-                        source_episode_ids=[],
-                        source_evidence_ids=[],
-                        lifecycle_state="active",
-                        projection_version=MEMORY_PROJECTION_VERSION,
-                        created_at=now_compaction,
-                        updated_at=now_compaction,
-                    )
-                )
-                add_ai_judgment(
-                    judgment_type="continuity_compaction",
-                    source_type="turn",
-                    source_id=turn.id,
-                    status="succeeded",
-                    model=getattr(
-                        app.state.context_compaction_adapter, "model", settings.model_name
-                    ),
-                    prompt_version=MEMORY_CONTINUITY_PROMPT_VERSION,
-                    provider_response_id=continuity_provider_response_id,
-                    input_summary="context-pressure continuity compaction",
-                    input_refs={
-                        "session_id": effective_session_id,
-                        "turn_id": turn.id,
-                        "estimated_context_tokens": context_tokens,
-                        "max_context_tokens": int(app.state.max_context_tokens),
-                        "source_turn_ids": source_turn_ids
-                        if isinstance(source_turn_ids, list)
-                        else [],
-                    },
-                    selected=[
-                        item
-                        for item in compacted_context_bundle.get("recent_active_session_turns", [])
-                        if isinstance(item, dict)
-                    ],
-                    omitted=omitted_turn_refs if isinstance(omitted_turn_refs, list) else [],
-                    output={"continuity_compaction": continuity},
-                    rationale=continuity.get("summary")
-                    if isinstance(continuity.get("summary"), str)
-                    else None,
-                    parse_status="parsed",
-                    validation_status="valid",
-                )
-                add_event(
-                    "evt.ai_judgment.completed",
-                    {
-                        "judgment_type": "continuity_compaction",
-                        "source_turn_ids": source_turn_ids
-                        if isinstance(source_turn_ids, list)
-                        else [],
-                        "omitted_turn_count": len(omitted_turn_refs)
-                        if isinstance(omitted_turn_refs, list)
-                        else 0,
-                    },
-                )
-        if model_failure is None and isinstance(compacted_context_bundle, dict):
-            context_bundle = compacted_context_bundle
+        # The running context is the verbatim recent-turns window plus the
+        # session digest, so it is inherently bounded -- there is no
+        # summarization or compaction step.
         context_metadata = _context_bundle_audit_metadata(context_bundle)
-        if model_failure is None:
-            allowed_capability_ids = _eligible_internal_callable_capability_ids(
-                tool_surface_facts=tool_surface_facts,
-            )
-            context_bundle["tool_surface_facts"] = tool_surface_facts
-            eligible_internal_callables: list[str] = []
-            for capability_id in allowed_capability_ids:
-                callable_name = run_callable_name_for_capability_id(capability_id)
-                if callable_name is not None:
-                    eligible_internal_callables.append(callable_name)
-            context_bundle["eligible_internal_callables"] = sorted(eligible_internal_callables)
-            responses_tools = run_tool_definitions()
-        context_tokens = _estimate_context_tokens(
+        allowed_capability_ids = _eligible_internal_callable_capability_ids(
+            tool_surface_facts=tool_surface_facts,
+        )
+        context_bundle["tool_surface_facts"] = tool_surface_facts
+        eligible_internal_callables: list[str] = []
+        for capability_id in allowed_capability_ids:
+            callable_name = run_callable_name_for_capability_id(capability_id)
+            if callable_name is not None:
+                eligible_internal_callables.append(callable_name)
+        context_bundle["eligible_internal_callables"] = sorted(eligible_internal_callables)
+        responses_tools = run_tool_definitions()
+        responses_input_items = _build_responses_input_items(
             context_bundle=context_bundle,
             user_message=user_message,
         )
-        if model_failure is not None:
-            pass
-        elif context_tokens > app.state.max_context_tokens:
-            failure_reason = "context pressure requires AI continuity compaction"
-            add_ai_judgment(
-                judgment_type="continuity_compaction",
-                source_type="turn",
-                source_id=turn.id,
-                status="failed",
-                model=getattr(app.state.context_compaction_adapter, "model", settings.model_name),
-                prompt_version=MEMORY_CONTINUITY_PROMPT_VERSION,
-                input_summary="context-pressure continuity compaction",
-                input_refs={
-                    "session_id": effective_session_id,
-                    "turn_id": turn.id,
-                    "estimated_context_tokens": context_tokens,
-                    "max_context_tokens": int(app.state.max_context_tokens),
-                },
-                parse_status="missing_output",
-                validation_status="not_validated",
-                failure_code="E_AI_JUDGMENT_REQUIRED",
-                failure_reason=failure_reason,
-            )
-            add_event(
-                "evt.ai_judgment.failed",
-                {
-                    "judgment_type": "continuity_compaction",
-                    "failure_code": "E_AI_JUDGMENT_REQUIRED",
-                    "failure_reason": failure_reason,
-                    "prompt_version": MEMORY_CONTINUITY_PROMPT_VERSION,
-                    "source_id": turn.id,
-                    "parse_status": "missing_output",
-                    "validation_status": "not_validated",
-                },
-            )
-            model_failure = ApiError(
-                status_code=503,
-                code="E_AI_JUDGMENT_REQUIRED",
-                message="AI continuity compaction failed",
-                details={
-                    "session_id": effective_session_id,
-                    "turn_id": turn.id,
-                    "judgment_type": "continuity_compaction",
-                    "prompt_version": MEMORY_CONTINUITY_PROMPT_VERSION,
-                },
-                retryable=True,
-            )
-        else:
-            responses_input_items = _build_responses_input_items(
-                context_bundle=context_bundle,
-                user_message=user_message,
-            )
-            turn_started_at = time.perf_counter()
-            for attempt in range(1, app.state.max_model_attempts + 1):
-                if attempt > 1:
-                    elapsed_before_attempt_ms = elapsed_turn_ms(turn_started_at)
-                    if elapsed_before_attempt_ms > app.state.max_turn_wall_time_ms:
-                        bounded_failure = build_turn_limit_failure(
-                            budget="turn_wall_time_ms",
-                            unit="ms",
-                            measured=elapsed_before_attempt_ms,
-                            limit=app.state.max_turn_wall_time_ms,
-                        )
-                        break
+        turn_started_at = time.perf_counter()
+        for attempt in range(1, app.state.max_model_attempts + 1):
+            if attempt > 1:
+                elapsed_before_attempt_ms = elapsed_turn_ms(turn_started_at)
+                if elapsed_before_attempt_ms > app.state.max_turn_wall_time_ms:
+                    bounded_failure = build_turn_limit_failure(
+                        budget="turn_wall_time_ms",
+                        unit="ms",
+                        measured=elapsed_before_attempt_ms,
+                        limit=app.state.max_turn_wall_time_ms,
+                    )
+                    break
 
+            add_event(
+                "evt.model.started",
+                {
+                    "provider": app.state.model_adapter.provider,
+                    "model": app.state.model_adapter.model,
+                    "context": context_metadata,
+                    "attempt": attempt,
+                },
+            )
+            model_started_at = time.perf_counter()
+            try:
+                candidate_response = app.state.model_adapter.create_response(
+                    input_items=responses_input_items,
+                    tools=responses_tools,
+                    user_message=user_message,
+                    history=context_bundle["recent_active_session_turns"],
+                    context_bundle=context_bundle,
+                )
+                duration_ms = int((time.perf_counter() - model_started_at) * 1000)
                 add_event(
-                    "evt.model.started",
+                    "evt.model.completed",
                     {
-                        "provider": app.state.model_adapter.provider,
-                        "model": app.state.model_adapter.model,
-                        "context": context_metadata,
+                        "provider": candidate_response["provider"],
+                        "model": candidate_response["model"],
+                        "duration_ms": duration_ms,
+                        "usage": candidate_response.get("usage"),
+                        "provider_response_id": candidate_response.get("provider_response_id"),
                         "attempt": attempt,
                     },
                 )
-                model_started_at = time.perf_counter()
-                try:
-                    candidate_response = app.state.model_adapter.create_response(
-                        input_items=responses_input_items,
-                        tools=responses_tools,
-                        user_message=user_message,
-                        history=context_bundle["recent_active_session_turns"],
-                        context_bundle=context_bundle,
+
+                elapsed_after_model_ms = elapsed_turn_ms(turn_started_at)
+                if elapsed_after_model_ms > app.state.max_turn_wall_time_ms:
+                    bounded_failure = build_turn_limit_failure(
+                        budget="turn_wall_time_ms",
+                        unit="ms",
+                        measured=elapsed_after_model_ms,
+                        limit=app.state.max_turn_wall_time_ms,
                     )
-                    duration_ms = int((time.perf_counter() - model_started_at) * 1000)
-                    add_event(
-                        "evt.model.completed",
-                        {
-                            "provider": candidate_response["provider"],
-                            "model": candidate_response["model"],
-                            "duration_ms": duration_ms,
-                            "usage": candidate_response.get("usage"),
-                            "provider_response_id": candidate_response.get("provider_response_id"),
-                            "attempt": attempt,
+                    break
+
+                output_items = candidate_response.get("output")
+                if not isinstance(output_items, list):
+                    provider_response_id = candidate_response.get("provider_response_id")
+                    raise ModelAdapterError(
+                        safe_reason="model response missing Responses output items",
+                        status_code=502,
+                        code="E_MODEL_OUTPUT_SCHEMA",
+                        message="model response failed output contract",
+                        retryable=False,
+                        provider=candidate_response.get("provider")
+                        if isinstance(candidate_response.get("provider"), str)
+                        else app.state.model_adapter.provider,
+                        model=candidate_response.get("model")
+                        if isinstance(candidate_response.get("model"), str)
+                        else app.state.model_adapter.model,
+                        usage=candidate_response.get("usage")
+                        if isinstance(candidate_response.get("usage"), dict)
+                        else None,
+                        provider_response_id=provider_response_id
+                        if isinstance(provider_response_id, str)
+                        else None,
+                        parse_status="schema_invalid",
+                        validation_status="invalid",
+                        raw_output_shape={
+                            "output_type": type(output_items).__name__,
+                            "output_count": None,
+                            "text_present": False,
                         },
                     )
-
-                    elapsed_after_model_ms = elapsed_turn_ms(turn_started_at)
-                    if elapsed_after_model_ms > app.state.max_turn_wall_time_ms:
-                        bounded_failure = build_turn_limit_failure(
-                            budget="turn_wall_time_ms",
-                            unit="ms",
-                            measured=elapsed_after_model_ms,
-                            limit=app.state.max_turn_wall_time_ms,
-                        )
-                        break
-
-                    output_items = candidate_response.get("output")
-                    if not isinstance(output_items, list):
-                        provider_response_id = candidate_response.get("provider_response_id")
-                        raise ModelAdapterError(
-                            safe_reason="model response missing Responses output items",
-                            status_code=502,
-                            code="E_MODEL_OUTPUT_SCHEMA",
-                            message="model response failed output contract",
-                            retryable=False,
-                            provider=candidate_response.get("provider")
-                            if isinstance(candidate_response.get("provider"), str)
-                            else app.state.model_adapter.provider,
-                            model=candidate_response.get("model")
-                            if isinstance(candidate_response.get("model"), str)
-                            else app.state.model_adapter.model,
-                            usage=candidate_response.get("usage")
-                            if isinstance(candidate_response.get("usage"), dict)
-                            else None,
-                            provider_response_id=provider_response_id
-                            if isinstance(provider_response_id, str)
-                            else None,
-                            parse_status="schema_invalid",
-                            validation_status="invalid",
-                            raw_output_shape={
-                                "output_type": type(output_items).__name__,
-                                "output_count": None,
-                                "text_present": False,
-                            },
-                        )
-                    function_calls = _extract_responses_function_calls(output_items)
-                    run_source, run_protocol_error = parse_run_function_call(function_calls)
-                    if run_protocol_error is not None or run_source is None:
-                        provider_response_id = candidate_response.get("provider_response_id")
-                        add_ai_judgment(
-                            judgment_type="model_output",
-                            source_type="turn",
-                            source_id=turn.id,
-                            status="failed",
-                            model=candidate_response.get("model")
-                            if isinstance(candidate_response.get("model"), str)
-                            else app.state.model_adapter.model,
-                            prompt_version="model-output-v1",
-                            provider_response_id=provider_response_id
-                            if isinstance(provider_response_id, str)
-                            else None,
-                            input_summary="run protocol validation for model response",
-                            input_refs={
-                                "session_id": effective_session_id,
-                                "turn_id": turn.id,
-                                "attempt": attempt,
-                                "response_output": jsonable_encoder(output_items),
-                            },
-                            parse_status="parsed",
-                            validation_status="invalid",
-                            failure_code="E_AI_JUDGMENT_VALIDATION",
-                            failure_reason=run_protocol_error
-                            or "model failed the run tool protocol",
-                        )
-                        for output_item in output_items:
-                            if (
-                                isinstance(output_item, dict)
-                                and output_item.get("type") == "function_call"
-                            ):
-                                responses_input_items.append(jsonable_encoder(output_item))
-                        for function_call in function_calls:
-                            call_id = function_call.get("call_id")
-                            if not isinstance(call_id, str) or not call_id:
-                                continue
-                            responses_input_items.append(
-                                {
-                                    "type": "function_call_output",
-                                    "call_id": call_id,
-                                    "output": json.dumps(
-                                        {
-                                            "status": "failed",
-                                            "error": run_protocol_error
-                                            or "model failed the run tool protocol",
-                                        },
-                                        sort_keys=True,
-                                    ),
-                                }
-                            )
-                        responses_input_items.append(
-                            {
-                                "role": "system",
-                                "content": (
-                                    "model protocol failure: the user did not see that response. "
-                                    "Call exactly one tool named run with JSON arguments "
-                                    '{"source":"..."} where source is a Python program; emit '
-                                    "user-visible text from the program with "
-                                    "agent.emit_message."
-                                ),
-                            }
-                        )
-                        add_event(
-                            "evt.model.protocol_failed",
-                            {
-                                "reason": run_protocol_error,
-                                "attempt": attempt,
-                                "provider_response_id": candidate_response.get(
-                                    "provider_response_id"
-                                ),
-                            },
-                        )
-                        if attempt >= app.state.max_model_attempts:
-                            model_failure = record_model_output_budget_failure(
-                                attempt=attempt,
-                                provider_response_id=candidate_response.get("provider_response_id")
-                                if isinstance(candidate_response.get("provider_response_id"), str)
-                                else None,
-                                failure_reason=run_protocol_error
-                                or "model failed the run tool protocol",
-                            )
-                            model_failure_reason = "AI model failed the run tool protocol"
-                            break
-                        continue
-
-                    run_call_id = function_calls[0].get("call_id")
-                    run_call_id = run_call_id if isinstance(run_call_id, str) else ""
-                    run_program_result = execute_run_program(
-                        sandbox=app.state.sandbox,
-                        source=run_source,
-                        db=db,
-                        session_factory=session_factory,
-                        session_id=effective_session_id,
-                        turn=turn,
-                        # Capability syscalls from earlier programs in this turn
-                        # already consumed proposal indices; each one created
-                        # exactly one ActionAttemptRecord here. Offset by their
-                        # running count so proposal_index stays turn-unique.
-                        proposal_index_start=len(created_action_attempts),
-                        approval_ttl_seconds=int(app.state.approval_ttl_seconds),
-                        approval_actor_id=str(app.state.approval_actor_id),
-                        add_event=add_event,
-                        now_fn=_utcnow,
-                        new_id_fn=_new_id,
-                        runtime_provenance=runtime_provenance,
-                        google_runtime=_google_runtime(),
-                        execute_google_reads_outside_transaction=(
-                            execute_google_reads_outside_transaction
-                        ),
-                        agency_runtime=_agency_runtime(),
-                        attachment_runtime=app.state.attachment_runtime,
-                        allowed_capability_ids=set(allowed_capability_ids),
-                        settings=settings,
-                        memory_import_cutover_enabled=settings.memory_import_cutover_enabled,
-                    )
-                    # The syscall trace is the audit spine and is recorded whether
-                    # or not the program completed cleanly.
-                    created_action_attempts.extend(run_program_result.action_attempts)
-                    # Thread taint across programs in the same turn: a syscall
-                    # that returned untrusted-influenced content in this program
-                    # advanced its runtime provenance; merge that into the turn
-                    # baseline so the next program's syscalls are evaluated with
-                    # it. execute_run_program already threads taint within a
-                    # program; this closes the gap across programs.
-                    runtime_provenance = _merge_runtime_provenance(
-                        baseline=runtime_provenance,
-                        ingress=run_program_result.runtime_provenance,
-                    )
-                    if not run_program_result.program_ok:
-                        # Program Failure: the program did not complete cleanly, so
-                        # no proposal stands. Void any approval the failed program
-                        # staged so it never surfaces as a live pending action; the
-                        # action attempts stay as the audit trace.
-                        _void_failed_program_approvals(
-                            db=db,
-                            action_attempts=run_program_result.action_attempts,
-                            add_event=add_event,
-                        )
-                        program_errors = [
-                            error
-                            for error in [run_program_result.program_error]
-                            if error is not None
-                        ] + run_program_result.callback_errors
-                        provider_response_id = candidate_response.get("provider_response_id")
-                        add_ai_judgment(
-                            judgment_type="model_output",
-                            source_type="turn",
-                            source_id=turn.id,
-                            status="failed",
-                            model=candidate_response.get("model")
-                            if isinstance(candidate_response.get("model"), str)
-                            else app.state.model_adapter.model,
-                            prompt_version="model-output-v1",
-                            provider_response_id=provider_response_id
-                            if isinstance(provider_response_id, str)
-                            else None,
-                            input_summary="run program execution for model response",
-                            input_refs={
-                                "session_id": effective_session_id,
-                                "turn_id": turn.id,
-                                "attempt": attempt,
-                                "source": run_source,
-                            },
-                            parse_status="parsed",
-                            validation_status="invalid",
-                            failure_code="E_AI_JUDGMENT_VALIDATION",
-                            failure_reason=json.dumps(program_errors, sort_keys=True),
-                        )
-                        for output_item in output_items:
-                            if (
-                                isinstance(output_item, dict)
-                                and output_item.get("type") == "function_call"
-                            ):
-                                responses_input_items.append(jsonable_encoder(output_item))
-                        if run_call_id:
-                            responses_input_items.append(
-                                {
-                                    "type": "function_call_output",
-                                    "call_id": run_call_id,
-                                    "output": json.dumps(
-                                        {"status": "failed", "errors": program_errors},
-                                        sort_keys=True,
-                                    ),
-                                }
-                            )
-                        responses_input_items.append(
-                            {
-                                "role": "system",
-                                "content": (
-                                    "run program did not complete: "
-                                    + json.dumps(program_errors, sort_keys=True)
-                                    + ". No effects were committed and the user did not "
-                                    "see any output. Retry with exactly one run call whose "
-                                    "source is a Python program that completes cleanly and "
-                                    "emits user-visible text with agent.emit_message."
-                                ),
-                            }
-                        )
-                        add_event(
-                            "evt.run.validation_failed",
-                            {
-                                "errors": program_errors,
-                                "attempt": attempt,
-                                "provider_response_id": candidate_response.get(
-                                    "provider_response_id"
-                                ),
-                            },
-                        )
-                        if attempt >= app.state.max_model_attempts:
-                            model_failure = record_model_output_budget_failure(
-                                attempt=attempt,
-                                provider_response_id=candidate_response.get("provider_response_id")
-                                if isinstance(candidate_response.get("provider_response_id"), str)
-                                else None,
-                                failure_reason="run program did not complete cleanly",
-                            )
-                            model_failure_reason = "AI model produced an invalid run program"
-                            break
-                        continue
-
+                function_calls = _extract_responses_function_calls(output_items)
+                run_source, run_protocol_error = parse_run_function_call(function_calls)
+                if run_protocol_error is not None or run_source is None:
                     provider_response_id = candidate_response.get("provider_response_id")
                     add_ai_judgment(
                         judgment_type="model_output",
                         source_type="turn",
                         source_id=turn.id,
-                        status="succeeded",
+                        status="failed",
                         model=candidate_response.get("model")
                         if isinstance(candidate_response.get("model"), str)
                         else app.state.model_adapter.model,
@@ -6817,224 +4130,58 @@ def create_app(
                         provider_response_id=provider_response_id
                         if isinstance(provider_response_id, str)
                         else None,
-                        input_summary="executed run program for model response",
+                        input_summary="run protocol validation for model response",
                         input_refs={
                             "session_id": effective_session_id,
                             "turn_id": turn.id,
                             "attempt": attempt,
-                            "source": run_source,
                             "response_output": jsonable_encoder(output_items),
                         },
-                        output={
-                            "emitted_message": bool(run_program_result.emitted_message),
-                            "paused": run_program_result.paused,
-                            "emitted_value_count": len(run_program_result.emitted_values),
-                            "action_attempt_count": len(run_program_result.action_attempts),
-                        },
                         parse_status="parsed",
-                        validation_status="valid",
+                        validation_status="invalid",
+                        failure_code="E_AI_JUDGMENT_VALIDATION",
+                        failure_reason=run_protocol_error or "model failed the run tool protocol",
                     )
-
-                    # Retrieval syscalls in the program persisted citation
-                    # artifacts; surface them as the turn's response sources.
-                    assistant_sources = _turn_retrieval_sources(db=db, turn_id=turn.id)
-
-                    for index, emitted_value in enumerate(
-                        run_program_result.emitted_values, start=1
-                    ):
-                        encoded_value = json.dumps(
-                            jsonable_encoder(emitted_value),
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ).encode("utf-8")
-                        add_event(
-                            "evt.agent.value_emitted",
-                            {
-                                "index": index,
-                                "value_digest": hashlib.sha256(encoded_value).hexdigest(),
-                                "value_bytes": len(encoded_value),
-                                "attempt": attempt,
-                                "provider_response_id": candidate_response.get(
-                                    "provider_response_id"
-                                ),
-                            },
-                        )
-
-                    if run_program_result.emitted_message:
-                        # The program composed user-visible output. A program may
-                        # stage approval proposals and still emit a mechanical
-                        # confirmation; the emitted message is the turn answer.
-                        response_tokens = _response_tokens_from_model_payload(
-                            candidate_response,
-                            assistant_text=run_program_result.emitted_message,
-                        )
-                        if response_tokens > app.state.max_response_tokens:
-                            bounded_failure = build_turn_limit_failure(
-                                budget="response_tokens",
-                                unit="tokens",
-                                measured=response_tokens,
-                                limit=app.state.max_response_tokens,
-                            )
-                            break
-                        assistant_response = {
-                            **candidate_response,
-                            "assistant_text": run_program_result.emitted_message,
-                            "assistant_silent": False,
-                        }
-                        break
-
-                    if any(
-                        action_attempt.status == "awaiting_approval"
-                        for action_attempt in run_program_result.action_attempts
-                    ):
-                        # The program staged an approval proposal but did not emit
-                        # a message; surface a default approval prompt.
-                        approval_message = "approval required. review the pending action."
-                        response_tokens = _response_tokens_from_model_payload(
-                            candidate_response,
-                            assistant_text=approval_message,
-                        )
-                        if response_tokens > app.state.max_response_tokens:
-                            bounded_failure = build_turn_limit_failure(
-                                budget="response_tokens",
-                                unit="tokens",
-                                measured=response_tokens,
-                                limit=app.state.max_response_tokens,
-                            )
-                            break
-                        assistant_response = {
-                            **candidate_response,
-                            "assistant_text": approval_message,
-                            "assistant_silent": False,
-                        }
-                        break
-
-                    if run_program_result.emitted_values:
-                        # Internal structured data for a later turn: the model
-                        # reads the values and continues with another program.
-                        for output_item in output_items:
-                            if (
-                                isinstance(output_item, dict)
-                                and output_item.get("type") == "function_call"
-                            ):
-                                responses_input_items.append(jsonable_encoder(output_item))
-                        if run_call_id:
-                            responses_input_items.append(
-                                {
-                                    "type": "function_call_output",
-                                    "call_id": run_call_id,
-                                    "output": json.dumps(
-                                        {
-                                            "status": "completed",
-                                            "emitted_values": jsonable_encoder(
-                                                run_program_result.emitted_values
-                                            ),
-                                        },
-                                        sort_keys=True,
-                                    ),
-                                }
-                            )
+                    for output_item in output_items:
+                        if (
+                            isinstance(output_item, dict)
+                            and output_item.get("type") == "function_call"
+                        ):
+                            responses_input_items.append(jsonable_encoder(output_item))
+                    for function_call in function_calls:
+                        call_id = function_call.get("call_id")
+                        if not isinstance(call_id, str) or not call_id:
+                            continue
                         responses_input_items.append(
                             {
-                                "role": "system",
-                                "content": (
-                                    "run program emitted internal values. They are not "
-                                    "visible to the user. Continue with exactly one run call."
+                                "type": "function_call_output",
+                                "call_id": call_id,
+                                "output": json.dumps(
+                                    {
+                                        "status": "failed",
+                                        "error": run_protocol_error
+                                        or "model failed the run tool protocol",
+                                    },
+                                    sort_keys=True,
                                 ),
                             }
                         )
-                        if attempt >= app.state.max_model_attempts:
-                            model_failure = record_model_output_budget_failure(
-                                attempt=attempt,
-                                provider_response_id=candidate_response.get("provider_response_id")
-                                if isinstance(candidate_response.get("provider_response_id"), str)
-                                else None,
-                                failure_reason=(
-                                    "model emitted internal values but exhausted its attempt budget"
-                                ),
-                            )
-                            model_failure_reason = "AI model output exhausted its attempt budget"
-                            break
-                        continue
-
-                    if run_program_result.paused:
-                        assistant_response = {
-                            **candidate_response,
-                            "assistant_text": "",
-                            "assistant_silent": True,
-                        }
-                        break
-
-                    if run_program_result.action_attempts:
-                        # The program ran syscalls but emitted no user-visible
-                        # output and staged no approval; feed the audited syscall
-                        # trace back so the model can author the next program.
-                        for output_item in output_items:
-                            if (
-                                isinstance(output_item, dict)
-                                and output_item.get("type") == "function_call"
-                            ):
-                                responses_input_items.append(jsonable_encoder(output_item))
-                        action_attempt_summary = _run_program_action_attempt_summary(
-                            run_program_result.action_attempts
-                        )
-                        if run_call_id:
-                            responses_input_items.append(
-                                {
-                                    "type": "function_call_output",
-                                    "call_id": run_call_id,
-                                    "output": json.dumps(
-                                        {
-                                            "status": "completed",
-                                            "message_emitted": False,
-                                            "action_attempts": action_attempt_summary,
-                                        },
-                                        sort_keys=True,
-                                    ),
-                                }
-                            )
-                        responses_input_items.append(
-                            {
-                                "role": "system",
-                                "content": (
-                                    "run program syscall trace:\n"
-                                    + json.dumps(action_attempt_summary, sort_keys=True)
-                                    + "\nThe user saw no output. Continue with exactly one "
-                                    "run call that emits user-visible text with "
-                                    "agent.emit_message."
-                                ),
-                            }
-                        )
-                        if attempt >= app.state.max_model_attempts:
-                            model_failure = record_model_output_budget_failure(
-                                attempt=attempt,
-                                provider_response_id=candidate_response.get("provider_response_id")
-                                if isinstance(candidate_response.get("provider_response_id"), str)
-                                else None,
-                                failure_reason=(
-                                    "model exhausted its attempt budget before authoring "
-                                    "a final assistant response"
-                                ),
-                            )
-                            model_failure_reason = "AI model output exhausted its attempt budget"
-                            break
-                        continue
-
                     responses_input_items.append(
                         {
                             "role": "system",
                             "content": (
-                                "run program completed without user-visible output. Plain "
-                                "assistant text is audit-only and was not shown. Continue with "
-                                "exactly one run call whose program emits output through "
-                                "agent.emit_message or pauses with agent.pause_until_input."
+                                "model protocol failure: the user did not see that response. "
+                                "Call exactly one tool named run with JSON arguments "
+                                '{"source":"..."} where source is a Python program; emit '
+                                "user-visible text from the program with "
+                                "agent.emit_message."
                             ),
                         }
                     )
                     add_event(
                         "evt.model.protocol_failed",
                         {
-                            "reason": "run_completed_without_visible_output",
+                            "reason": run_protocol_error,
                             "attempt": attempt,
                             "provider_response_id": candidate_response.get("provider_response_id"),
                         },
@@ -7045,122 +4192,496 @@ def create_app(
                             provider_response_id=candidate_response.get("provider_response_id")
                             if isinstance(candidate_response.get("provider_response_id"), str)
                             else None,
-                            failure_reason="run completed without visible output",
+                            failure_reason=run_protocol_error
+                            or "model failed the run tool protocol",
                         )
-                        model_failure_reason = "AI model produced no visible run output"
+                        model_failure_reason = "AI model failed the run tool protocol"
                         break
                     continue
-                except Exception as exc:
-                    duration_ms = int((time.perf_counter() - model_started_at) * 1000)
-                    fallback_reason = f"unexpected {exc.__class__.__name__}"
-                    should_retry = False
-                    if isinstance(exc, ModelAdapterError):
-                        failure_reason = safe_failure_reason(
-                            exc.safe_reason,
-                            fallback=fallback_reason,
-                        )
-                        error_details = {
+
+                run_call_id = function_calls[0].get("call_id")
+                run_call_id = run_call_id if isinstance(run_call_id, str) else ""
+                run_program_result = execute_run_program(
+                    sandbox=app.state.sandbox,
+                    source=run_source,
+                    db=db,
+                    session_factory=session_factory,
+                    session_id=effective_session_id,
+                    turn=turn,
+                    # Capability syscalls from earlier programs in this turn
+                    # already consumed proposal indices; each one created
+                    # exactly one ActionAttemptRecord here. Offset by their
+                    # running count so proposal_index stays turn-unique.
+                    proposal_index_start=len(created_action_attempts),
+                    approval_ttl_seconds=int(app.state.approval_ttl_seconds),
+                    approval_actor_id=str(app.state.approval_actor_id),
+                    add_event=add_event,
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                    runtime_provenance=runtime_provenance,
+                    google_runtime=_google_runtime(),
+                    execute_google_reads_outside_transaction=(
+                        execute_google_reads_outside_transaction
+                    ),
+                    agency_runtime=_agency_runtime(),
+                    attachment_runtime=app.state.attachment_runtime,
+                    allowed_capability_ids=set(allowed_capability_ids),
+                    settings=settings,
+                )
+                # The syscall trace is the audit spine and is recorded whether
+                # or not the program completed cleanly.
+                created_action_attempts.extend(run_program_result.action_attempts)
+                # Thread taint across programs in the same turn: a syscall
+                # that returned untrusted-influenced content in this program
+                # advanced its runtime provenance; merge that into the turn
+                # baseline so the next program's syscalls are evaluated with
+                # it. execute_run_program already threads taint within a
+                # program; this closes the gap across programs.
+                runtime_provenance = _merge_runtime_provenance(
+                    baseline=runtime_provenance,
+                    ingress=run_program_result.runtime_provenance,
+                )
+                if not run_program_result.program_ok:
+                    # Program Failure: the program did not complete cleanly, so
+                    # no proposal stands. Void any approval the failed program
+                    # staged so it never surfaces as a live pending action; the
+                    # action attempts stay as the audit trace.
+                    _void_failed_program_approvals(
+                        db=db,
+                        action_attempts=run_program_result.action_attempts,
+                        add_event=add_event,
+                    )
+                    program_errors = [
+                        error for error in [run_program_result.program_error] if error is not None
+                    ] + run_program_result.callback_errors
+                    provider_response_id = candidate_response.get("provider_response_id")
+                    add_ai_judgment(
+                        judgment_type="model_output",
+                        source_type="turn",
+                        source_id=turn.id,
+                        status="failed",
+                        model=candidate_response.get("model")
+                        if isinstance(candidate_response.get("model"), str)
+                        else app.state.model_adapter.model,
+                        prompt_version="model-output-v1",
+                        provider_response_id=provider_response_id
+                        if isinstance(provider_response_id, str)
+                        else None,
+                        input_summary="run program execution for model response",
+                        input_refs={
                             "session_id": effective_session_id,
                             "turn_id": turn.id,
                             "attempt": attempt,
-                            "failure_code": exc.code,
-                        }
-                        if exc.parse_status is not None:
-                            error_details["parse_status"] = exc.parse_status
-                        if exc.validation_status is not None:
-                            error_details["validation_status"] = exc.validation_status
-                        if exc.provider is not None:
-                            error_details["provider"] = exc.provider
-                        if exc.model is not None:
-                            error_details["model"] = exc.model
-                        if exc.usage is not None:
-                            error_details["usage"] = exc.usage
-                        if exc.provider_response_id is not None:
-                            error_details["provider_response_id"] = exc.provider_response_id
-                        if exc.raw_output_shape is not None:
-                            error_details["response_output_shape"] = exc.raw_output_shape
-                        model_failure_candidate = ApiError(
-                            status_code=exc.status_code,
-                            code=exc.code,
-                            message=exc.message,
-                            details=error_details,
-                            retryable=exc.retryable,
-                        )
-                        should_retry = exc.retryable
-                    else:
-                        failure_reason = safe_failure_reason(
-                            str(exc),
-                            fallback=fallback_reason,
-                        )
-                        model_failure_candidate = ApiError(
-                            status_code=502,
-                            code="E_MODEL_FAILURE",
-                            message="model provider request failed",
-                            details={
-                                "session_id": effective_session_id,
-                                "turn_id": turn.id,
-                                "attempt": attempt,
-                            },
-                            retryable=True,
-                        )
-
-                    add_event(
-                        "evt.model.failed",
-                        {
-                            "provider": app.state.model_adapter.provider,
-                            "model": app.state.model_adapter.model,
-                            "duration_ms": duration_ms,
-                            "failure_reason": failure_reason,
-                            "attempt": attempt,
-                        }
-                        | (
-                            {
-                                "failure_code": exc.code,
-                                "parse_status": exc.parse_status,
-                                "validation_status": exc.validation_status,
-                                "provider": exc.provider or app.state.model_adapter.provider,
-                                "model": exc.model or app.state.model_adapter.model,
-                                "usage": exc.usage or {},
-                                "provider_response_id": exc.provider_response_id,
-                                "response_output_shape": exc.raw_output_shape or {},
-                            }
-                            if isinstance(exc, ModelAdapterError)
-                            else {}
-                        ),
+                            "source": run_source,
+                        },
+                        parse_status="parsed",
+                        validation_status="invalid",
+                        failure_code="E_AI_JUDGMENT_VALIDATION",
+                        failure_reason=json.dumps(program_errors, sort_keys=True),
                     )
-
-                    elapsed_after_failure_ms = elapsed_turn_ms(turn_started_at)
-                    if elapsed_after_failure_ms > app.state.max_turn_wall_time_ms:
-                        bounded_failure = build_turn_limit_failure(
-                            budget="turn_wall_time_ms",
-                            unit="ms",
-                            measured=elapsed_after_failure_ms,
-                            limit=app.state.max_turn_wall_time_ms,
+                    for output_item in output_items:
+                        if (
+                            isinstance(output_item, dict)
+                            and output_item.get("type") == "function_call"
+                        ):
+                            responses_input_items.append(jsonable_encoder(output_item))
+                    if run_call_id:
+                        responses_input_items.append(
+                            {
+                                "type": "function_call_output",
+                                "call_id": run_call_id,
+                                "output": json.dumps(
+                                    {"status": "failed", "errors": program_errors},
+                                    sort_keys=True,
+                                ),
+                            }
                         )
-                        break
-                    if should_retry and attempt < app.state.max_model_attempts:
-                        continue
-                    if should_retry and attempt >= app.state.max_model_attempts:
-                        provider_response_id = (
-                            exc.provider_response_id
-                            if isinstance(exc, ModelAdapterError)
-                            and isinstance(exc.provider_response_id, str)
-                            else None
-                        )
+                    responses_input_items.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "run program did not complete: "
+                                + json.dumps(program_errors, sort_keys=True)
+                                + ". No effects were committed and the user did not "
+                                "see any output. Retry with exactly one run call whose "
+                                "source is a Python program that completes cleanly and "
+                                "emits user-visible text with agent.emit_message."
+                            ),
+                        }
+                    )
+                    add_event(
+                        "evt.run.validation_failed",
+                        {
+                            "errors": program_errors,
+                            "attempt": attempt,
+                            "provider_response_id": candidate_response.get("provider_response_id"),
+                        },
+                    )
+                    if attempt >= app.state.max_model_attempts:
                         model_failure = record_model_output_budget_failure(
                             attempt=attempt,
-                            provider_response_id=provider_response_id,
+                            provider_response_id=candidate_response.get("provider_response_id")
+                            if isinstance(candidate_response.get("provider_response_id"), str)
+                            else None,
+                            failure_reason="run program did not complete cleanly",
+                        )
+                        model_failure_reason = "AI model produced an invalid run program"
+                        break
+                    continue
+
+                provider_response_id = candidate_response.get("provider_response_id")
+                add_ai_judgment(
+                    judgment_type="model_output",
+                    source_type="turn",
+                    source_id=turn.id,
+                    status="succeeded",
+                    model=candidate_response.get("model")
+                    if isinstance(candidate_response.get("model"), str)
+                    else app.state.model_adapter.model,
+                    prompt_version="model-output-v1",
+                    provider_response_id=provider_response_id
+                    if isinstance(provider_response_id, str)
+                    else None,
+                    input_summary="executed run program for model response",
+                    input_refs={
+                        "session_id": effective_session_id,
+                        "turn_id": turn.id,
+                        "attempt": attempt,
+                        "source": run_source,
+                        "response_output": jsonable_encoder(output_items),
+                    },
+                    output={
+                        "emitted_message": bool(run_program_result.emitted_message),
+                        "paused": run_program_result.paused,
+                        "emitted_value_count": len(run_program_result.emitted_values),
+                        "action_attempt_count": len(run_program_result.action_attempts),
+                    },
+                    parse_status="parsed",
+                    validation_status="valid",
+                )
+
+                # Retrieval syscalls in the program persisted citation
+                # artifacts; surface them as the turn's response sources.
+                assistant_sources = _turn_retrieval_sources(db=db, turn_id=turn.id)
+
+                for index, emitted_value in enumerate(run_program_result.emitted_values, start=1):
+                    encoded_value = json.dumps(
+                        jsonable_encoder(emitted_value),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    add_event(
+                        "evt.agent.value_emitted",
+                        {
+                            "index": index,
+                            "value_digest": hashlib.sha256(encoded_value).hexdigest(),
+                            "value_bytes": len(encoded_value),
+                            "attempt": attempt,
+                            "provider_response_id": candidate_response.get("provider_response_id"),
+                        },
+                    )
+
+                if run_program_result.emitted_message:
+                    # The program composed user-visible output. A program may
+                    # stage approval proposals and still emit a mechanical
+                    # confirmation; the emitted message is the turn answer.
+                    response_tokens = _response_tokens_from_model_payload(
+                        candidate_response,
+                        assistant_text=run_program_result.emitted_message,
+                    )
+                    if response_tokens > app.state.max_response_tokens:
+                        bounded_failure = build_turn_limit_failure(
+                            budget="response_tokens",
+                            unit="tokens",
+                            measured=response_tokens,
+                            limit=app.state.max_response_tokens,
+                        )
+                        break
+                    assistant_response = {
+                        **candidate_response,
+                        "assistant_text": run_program_result.emitted_message,
+                        "assistant_silent": False,
+                    }
+                    break
+
+                if any(
+                    action_attempt.status == "awaiting_approval"
+                    for action_attempt in run_program_result.action_attempts
+                ):
+                    # The program staged an approval proposal but did not emit
+                    # a message; surface a default approval prompt.
+                    approval_message = "approval required. review the pending action."
+                    response_tokens = _response_tokens_from_model_payload(
+                        candidate_response,
+                        assistant_text=approval_message,
+                    )
+                    if response_tokens > app.state.max_response_tokens:
+                        bounded_failure = build_turn_limit_failure(
+                            budget="response_tokens",
+                            unit="tokens",
+                            measured=response_tokens,
+                            limit=app.state.max_response_tokens,
+                        )
+                        break
+                    assistant_response = {
+                        **candidate_response,
+                        "assistant_text": approval_message,
+                        "assistant_silent": False,
+                    }
+                    break
+
+                if run_program_result.emitted_values:
+                    # Internal structured data for a later turn: the model
+                    # reads the values and continues with another program.
+                    for output_item in output_items:
+                        if (
+                            isinstance(output_item, dict)
+                            and output_item.get("type") == "function_call"
+                        ):
+                            responses_input_items.append(jsonable_encoder(output_item))
+                    if run_call_id:
+                        responses_input_items.append(
+                            {
+                                "type": "function_call_output",
+                                "call_id": run_call_id,
+                                "output": json.dumps(
+                                    {
+                                        "status": "completed",
+                                        "emitted_values": jsonable_encoder(
+                                            run_program_result.emitted_values
+                                        ),
+                                    },
+                                    sort_keys=True,
+                                ),
+                            }
+                        )
+                    responses_input_items.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "run program emitted internal values. They are not "
+                                "visible to the user. Continue with exactly one run call."
+                            ),
+                        }
+                    )
+                    if attempt >= app.state.max_model_attempts:
+                        model_failure = record_model_output_budget_failure(
+                            attempt=attempt,
+                            provider_response_id=candidate_response.get("provider_response_id")
+                            if isinstance(candidate_response.get("provider_response_id"), str)
+                            else None,
                             failure_reason=(
-                                "model exhausted its retry budget before authoring "
+                                "model emitted internal values but exhausted its attempt budget"
+                            ),
+                        )
+                        model_failure_reason = "AI model output exhausted its attempt budget"
+                        break
+                    continue
+
+                if run_program_result.paused:
+                    assistant_response = {
+                        **candidate_response,
+                        "assistant_text": "",
+                        "assistant_silent": True,
+                    }
+                    break
+
+                if run_program_result.action_attempts:
+                    # The program ran syscalls but emitted no user-visible
+                    # output and staged no approval; feed the audited syscall
+                    # trace back so the model can author the next program.
+                    for output_item in output_items:
+                        if (
+                            isinstance(output_item, dict)
+                            and output_item.get("type") == "function_call"
+                        ):
+                            responses_input_items.append(jsonable_encoder(output_item))
+                    action_attempt_summary = _run_program_action_attempt_summary(
+                        run_program_result.action_attempts
+                    )
+                    if run_call_id:
+                        responses_input_items.append(
+                            {
+                                "type": "function_call_output",
+                                "call_id": run_call_id,
+                                "output": json.dumps(
+                                    {
+                                        "status": "completed",
+                                        "message_emitted": False,
+                                        "action_attempts": action_attempt_summary,
+                                    },
+                                    sort_keys=True,
+                                ),
+                            }
+                        )
+                    responses_input_items.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "run program syscall trace:\n"
+                                + json.dumps(action_attempt_summary, sort_keys=True)
+                                + "\nThe user saw no output. Continue with exactly one "
+                                "run call that emits user-visible text with "
+                                "agent.emit_message."
+                            ),
+                        }
+                    )
+                    if attempt >= app.state.max_model_attempts:
+                        model_failure = record_model_output_budget_failure(
+                            attempt=attempt,
+                            provider_response_id=candidate_response.get("provider_response_id")
+                            if isinstance(candidate_response.get("provider_response_id"), str)
+                            else None,
+                            failure_reason=(
+                                "model exhausted its attempt budget before authoring "
                                 "a final assistant response"
                             ),
                         )
-                        model_failure_reason = failure_reason
+                        model_failure_reason = "AI model output exhausted its attempt budget"
                         break
+                    continue
 
-                    model_failure = model_failure_candidate
+                responses_input_items.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "run program completed without user-visible output. Plain "
+                            "assistant text is audit-only and was not shown. Continue with "
+                            "exactly one run call whose program emits output through "
+                            "agent.emit_message or pauses with agent.pause_until_input."
+                        ),
+                    }
+                )
+                add_event(
+                    "evt.model.protocol_failed",
+                    {
+                        "reason": "run_completed_without_visible_output",
+                        "attempt": attempt,
+                        "provider_response_id": candidate_response.get("provider_response_id"),
+                    },
+                )
+                if attempt >= app.state.max_model_attempts:
+                    model_failure = record_model_output_budget_failure(
+                        attempt=attempt,
+                        provider_response_id=candidate_response.get("provider_response_id")
+                        if isinstance(candidate_response.get("provider_response_id"), str)
+                        else None,
+                        failure_reason="run completed without visible output",
+                    )
+                    model_failure_reason = "AI model produced no visible run output"
+                    break
+                continue
+            except Exception as exc:
+                duration_ms = int((time.perf_counter() - model_started_at) * 1000)
+                fallback_reason = f"unexpected {exc.__class__.__name__}"
+                should_retry = False
+                if isinstance(exc, ModelAdapterError):
+                    failure_reason = safe_failure_reason(
+                        exc.safe_reason,
+                        fallback=fallback_reason,
+                    )
+                    error_details = {
+                        "session_id": effective_session_id,
+                        "turn_id": turn.id,
+                        "attempt": attempt,
+                        "failure_code": exc.code,
+                    }
+                    if exc.parse_status is not None:
+                        error_details["parse_status"] = exc.parse_status
+                    if exc.validation_status is not None:
+                        error_details["validation_status"] = exc.validation_status
+                    if exc.provider is not None:
+                        error_details["provider"] = exc.provider
+                    if exc.model is not None:
+                        error_details["model"] = exc.model
+                    if exc.usage is not None:
+                        error_details["usage"] = exc.usage
+                    if exc.provider_response_id is not None:
+                        error_details["provider_response_id"] = exc.provider_response_id
+                    if exc.raw_output_shape is not None:
+                        error_details["response_output_shape"] = exc.raw_output_shape
+                    model_failure_candidate = ApiError(
+                        status_code=exc.status_code,
+                        code=exc.code,
+                        message=exc.message,
+                        details=error_details,
+                        retryable=exc.retryable,
+                    )
+                    should_retry = exc.retryable
+                else:
+                    failure_reason = safe_failure_reason(
+                        str(exc),
+                        fallback=fallback_reason,
+                    )
+                    model_failure_candidate = ApiError(
+                        status_code=502,
+                        code="E_MODEL_FAILURE",
+                        message="model provider request failed",
+                        details={
+                            "session_id": effective_session_id,
+                            "turn_id": turn.id,
+                            "attempt": attempt,
+                        },
+                        retryable=True,
+                    )
+
+                add_event(
+                    "evt.model.failed",
+                    {
+                        "provider": app.state.model_adapter.provider,
+                        "model": app.state.model_adapter.model,
+                        "duration_ms": duration_ms,
+                        "failure_reason": failure_reason,
+                        "attempt": attempt,
+                    }
+                    | (
+                        {
+                            "failure_code": exc.code,
+                            "parse_status": exc.parse_status,
+                            "validation_status": exc.validation_status,
+                            "provider": exc.provider or app.state.model_adapter.provider,
+                            "model": exc.model or app.state.model_adapter.model,
+                            "usage": exc.usage or {},
+                            "provider_response_id": exc.provider_response_id,
+                            "response_output_shape": exc.raw_output_shape or {},
+                        }
+                        if isinstance(exc, ModelAdapterError)
+                        else {}
+                    ),
+                )
+
+                elapsed_after_failure_ms = elapsed_turn_ms(turn_started_at)
+                if elapsed_after_failure_ms > app.state.max_turn_wall_time_ms:
+                    bounded_failure = build_turn_limit_failure(
+                        budget="turn_wall_time_ms",
+                        unit="ms",
+                        measured=elapsed_after_failure_ms,
+                        limit=app.state.max_turn_wall_time_ms,
+                    )
+                    break
+                if should_retry and attempt < app.state.max_model_attempts:
+                    continue
+                if should_retry and attempt >= app.state.max_model_attempts:
+                    provider_response_id = (
+                        exc.provider_response_id
+                        if isinstance(exc, ModelAdapterError)
+                        and isinstance(exc.provider_response_id, str)
+                        else None
+                    )
+                    model_failure = record_model_output_budget_failure(
+                        attempt=attempt,
+                        provider_response_id=provider_response_id,
+                        failure_reason=(
+                            "model exhausted its retry budget before authoring "
+                            "a final assistant response"
+                        ),
+                    )
                     model_failure_reason = failure_reason
                     break
+
+                model_failure = model_failure_candidate
+                model_failure_reason = failure_reason
+                break
 
         if bounded_failure is not None:
             emit_turn_limit_failure(bounded_failure)
@@ -7194,107 +4715,18 @@ def create_app(
                 }
             assistant_message = assistant_response["assistant_text"]
             turn.assistant_message = assistant_message
-            memory_thread_id = (
-                str(discord_context["thread_id"])
-                if isinstance(discord_context, dict)
-                and discord_context.get("thread_id") is not None
-                else None
-            )
-            memory_write_policy = resolve_memory_policy(
+            # Post-turn memory: one rememberer task reviews the completed turn
+            # and maintains the fact store, the profile, and the session digest.
+            remember_task_id = enqueue_memory_remember(
                 db,
-                operation="write",
+                turn_id=turn.id,
                 now=_utcnow(),
-                session_id=effective_session_id,
-                thread_id=memory_thread_id,
+                new_id_fn=_new_id,
             )
-            if memory_write_policy.allowed:
-                memory_events, user_evidence_id = record_turn_memory_evidence(
-                    db,
-                    session_id=effective_session_id,
-                    source_turn_id=turn.id,
-                    user_message=user_message,
-                    assistant_message=assistant_message,
-                    actor_id=str(app.state.approval_actor_id),
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                    thread_id=memory_thread_id,
-                )
-                emit_memory_events(
-                    db,
-                    events=memory_events,
-                    entry_path="turn",
-                    actor_id=str(app.state.approval_actor_id),
-                    scope_key=f"session:{effective_session_id}",
-                    now=_utcnow(),
-                    new_id_fn=_new_id,
-                    source_turn_id=turn.id,
-                )
-                if user_evidence_id is not None:
-                    now_memory_trace = _utcnow()
-                    for action_attempt in created_action_attempts:
-                        record_action_trace(
-                            db,
-                            action_attempt=action_attempt,
-                            scope_key=f"session:{effective_session_id}",
-                            primary_evidence_id=user_evidence_id,
-                            source_turn_id=turn.id,
-                            trace_type=(
-                                "execution"
-                                if action_attempt.status in {"executing", "succeeded", "failed"}
-                                else "policy_decision"
-                            ),
-                            now=now_memory_trace,
-                            new_id_fn=_new_id,
-                        )
-                    if created_action_attempts:
-                        all_succeeded = all(
-                            attempt.status == "succeeded" for attempt in created_action_attempts
-                        )
-                        any_failed = any(
-                            attempt.status == "failed" for attempt in created_action_attempts
-                        )
-                        record_reasoning_trace(
-                            db,
-                            scope_key=f"session:{effective_session_id}",
-                            trace_type="successful_pattern" if all_succeeded else "diagnostic",
-                            task_summary=user_message,
-                            trace_summary=(
-                                "turn ran callables: "
-                                + ", ".join(
-                                    f"{attempt.capability_id} ({attempt.status})"
-                                    for attempt in created_action_attempts
-                                )
-                            ),
-                            outcome=(
-                                "succeeded"
-                                if all_succeeded
-                                else "failed"
-                                if any_failed
-                                else "unknown"
-                            ),
-                            primary_evidence_id=user_evidence_id,
-                            source_turn_id=turn.id,
-                            now=now_memory_trace,
-                            new_id_fn=_new_id,
-                        )
-                    task = enqueue_background_task(
-                        db,
-                        task_type="memory_extract_turn",
-                        payload={
-                            "session_id": effective_session_id,
-                            "turn_id": turn.id,
-                            "evidence_id": user_evidence_id,
-                        },
-                        now=_utcnow(),
-                    )
-                    add_event(
-                        "evt.memory.extraction_queued",
-                        {
-                            "task_id": task.id,
-                            "turn_id": turn.id,
-                            "evidence_id": user_evidence_id,
-                        },
-                    )
+            add_event(
+                "evt.memory.remember_queued",
+                {"task_id": remember_task_id, "turn_id": turn.id},
+            )
 
             turn.status = "completed"
             turn.updated_at = _utcnow()

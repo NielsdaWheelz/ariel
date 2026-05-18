@@ -7,7 +7,7 @@ from typing import Any
 
 import httpx
 import ulid
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from .action_runtime import (
@@ -28,8 +28,6 @@ from .persistence import (
     EmailThreadWatchRecord,
     JobEventRecord,
     JobRecord,
-    MemoryContextBlockRecord,
-    MemoryProjectionJobRecord,
     NotificationDeliveryRecord,
     NotificationRecord,
     SessionRecord,
@@ -37,15 +35,7 @@ from .persistence import (
     WorkFollowUpLoopRecord,
     to_rfc3339,
 )
-from .memory import (
-    consolidate_memory,
-    enqueue_consolidation_job,
-    process_memory_extract_turn,
-    process_memory_graph_projection_job,
-    process_memory_projection_job,
-    resolve_memory_policy,
-    scope_keys_for_policy,
-)
+from .memory import enqueue_due_memory_sweep, run_rememberer
 from .proactivity import (
     process_proactive_action_execution_due,
     process_proactive_deliberation_due,
@@ -270,38 +260,6 @@ def reap_stale_tasks(db: Session, *, now: datetime, heartbeat_timeout_seconds: i
     return len(stale_tasks) + len(recoverable_failed_tasks)
 
 
-def reap_stale_memory_projection_jobs(
-    db: Session,
-    *,
-    now: datetime,
-    heartbeat_timeout_seconds: int,
-) -> int:
-    stale_before = now - timedelta(seconds=heartbeat_timeout_seconds)
-    stale_jobs = db.scalars(
-        select(MemoryProjectionJobRecord)
-        .where(
-            MemoryProjectionJobRecord.lifecycle_state == "running",
-            func.coalesce(
-                MemoryProjectionJobRecord.last_heartbeat,
-                MemoryProjectionJobRecord.updated_at,
-            )
-            < stale_before,
-        )
-        .with_for_update(skip_locked=True)
-    ).all()
-    for job in stale_jobs:
-        job.lifecycle_state = "pending" if job.attempts < job.max_retries else "dead_letter"
-        job.error = "heartbeat timeout"
-        job.claimed_by = None
-        job.attempt_token = None
-        job.last_heartbeat = None
-        job.run_after = now
-        job.updated_at = now
-    if stale_jobs:
-        db.flush()
-    return len(stale_jobs)
-
-
 def enqueue_due_worker_owned_ambient_task(
     db: Session,
     *,
@@ -342,55 +300,6 @@ def enqueue_due_worker_owned_ambient_task(
         now=now,
         max_attempts=settings.proactive_worker_max_attempts,
     )
-
-
-def enqueue_due_memory_consolidation_jobs(
-    db: Session,
-    *,
-    settings: AppSettings,
-    now: datetime,
-) -> int:
-    """Scheduled consolidation cadence: enqueue a hot_index consolidation job for
-    every scope whose last hot_index block is older than
-    ARIEL_memory_consolidation_interval_seconds. A scope with no prior
-    consolidation is left to the backlog and rotation triggers. Each enqueue is
-    gated by consolidate policy; enqueue_consolidation_job dedupes per scope.
-    """
-    stale_before = now - timedelta(seconds=settings.memory_consolidation_interval_seconds)
-    fresh_scopes = set(
-        db.scalars(
-            select(MemoryContextBlockRecord.scope_key).where(
-                MemoryContextBlockRecord.block_type == "hot_index",
-                MemoryContextBlockRecord.lifecycle_state == "active",
-                MemoryContextBlockRecord.updated_at > stale_before,
-            )
-        ).all()
-    )
-    consolidated_scopes = set(
-        db.scalars(
-            select(MemoryContextBlockRecord.scope_key).where(
-                MemoryContextBlockRecord.block_type == "hot_index",
-                MemoryContextBlockRecord.lifecycle_state == "active",
-            )
-        ).all()
-    )
-    enqueued = 0
-    for scope_key in sorted(consolidated_scopes - fresh_scopes):
-        project_key, repo_key = scope_keys_for_policy(scope_key)
-        if not resolve_memory_policy(
-            db,
-            operation="consolidate",
-            now=now,
-            project_key=project_key,
-            repo_key=repo_key,
-        ).allowed:
-            continue
-        if (
-            enqueue_consolidation_job(db, scope_key=scope_key, now=now, new_id_fn=_new_id)
-            is not None
-        ):
-            enqueued += 1
-    return enqueued
 
 
 def enqueue_due_work_follow_up_evaluation_tasks(
@@ -464,105 +373,6 @@ def enqueue_due_work_follow_up_evaluation_tasks(
     return enqueued
 
 
-def process_memory_maintenance_job(
-    *,
-    session_factory: sessionmaker[Session],
-    now_fn: Callable[[], datetime],
-    new_id_fn: Callable[[str], str],
-    worker_id: str = "memory-worker",
-) -> bool:
-    with session_factory() as db:
-        with db.begin():
-            now = now_fn()
-            # ck_memory_projection_job_kind allows exactly embedding, graph, and
-            # hot_index; embedding and graph have their own workers, so the
-            # maintenance worker consumes only the hot_index consolidation kind.
-            job = db.scalar(
-                select(MemoryProjectionJobRecord)
-                .where(
-                    MemoryProjectionJobRecord.projection_kind == "hot_index",
-                    MemoryProjectionJobRecord.lifecycle_state == "pending",
-                    MemoryProjectionJobRecord.run_after <= now,
-                )
-                .order_by(
-                    MemoryProjectionJobRecord.run_after.asc(),
-                    MemoryProjectionJobRecord.created_at.asc(),
-                    MemoryProjectionJobRecord.id.asc(),
-                )
-                .limit(1)
-                .with_for_update(skip_locked=True)
-            )
-            if job is None:
-                return False
-            job.lifecycle_state = "running"
-            job.attempts += 1
-            job.claimed_by = worker_id
-            job.attempt_token = new_id_fn("mpa")
-            job.last_heartbeat = now
-            job.updated_at = now
-            job_id = job.id
-            attempt_token = str(job.attempt_token)
-            scope_key = job.target_id.strip()
-            if job.target_table != "memory_scopes":
-                job.lifecycle_state = "dead_letter"
-                job.error = (
-                    f"memory maintenance job target table must be memory_scopes: {job.target_table}"
-                )
-                job.claimed_by = None
-                job.attempt_token = None
-                job.last_heartbeat = None
-                job.run_after = now
-                job.updated_at = now
-                return True
-            if not scope_key:
-                job.lifecycle_state = "dead_letter"
-                job.error = "memory maintenance job missing target scope"
-                job.claimed_by = None
-                job.attempt_token = None
-                job.last_heartbeat = None
-                job.run_after = now
-                job.updated_at = now
-                return True
-
-    try:
-        with session_factory() as db:
-            with db.begin():
-                job = db.scalar(
-                    select(MemoryProjectionJobRecord)
-                    .where(
-                        MemoryProjectionJobRecord.id == job_id,
-                        MemoryProjectionJobRecord.lifecycle_state == "running",
-                        MemoryProjectionJobRecord.attempt_token == attempt_token,
-                    )
-                    .with_for_update()
-                )
-                if job is None:
-                    return True
-                consolidate_memory(
-                    db,
-                    scope_key=scope_key,
-                    actor_id=f"memory-worker:{job_id}",
-                    now_fn=now_fn,
-                    new_id_fn=new_id_fn,
-                )
-                now = now_fn()
-                job.lifecycle_state = "completed"
-                job.error = None
-                job.claimed_by = None
-                job.attempt_token = None
-                job.last_heartbeat = None
-                job.updated_at = now
-    except Exception as exc:
-        _mark_memory_projection_job_failed(
-            session_factory=session_factory,
-            job_id=job_id,
-            attempt_token=attempt_token,
-            error=safe_failure_reason(str(exc), fallback=f"unexpected {exc.__class__.__name__}"),
-            now_fn=now_fn,
-        )
-    return True
-
-
 def _google_runtime(settings: AppSettings) -> GoogleConnectorRuntime:
     return GoogleConnectorRuntime(
         oauth_client=DefaultGoogleOAuthClient(
@@ -611,11 +421,6 @@ def process_one_task(
                 now=now,
                 heartbeat_timeout_seconds=resolved_settings.worker_heartbeat_timeout_seconds,
             )
-            reap_stale_memory_projection_jobs(
-                db,
-                now=now,
-                heartbeat_timeout_seconds=resolved_settings.worker_heartbeat_timeout_seconds,
-            )
 
     if process_due_email_thread_watches(
         session_factory=session_factory,
@@ -633,32 +438,7 @@ def process_one_task(
                 now=now,
             )
             enqueue_due_worker_owned_ambient_task(db, settings=resolved_settings, now=now)
-            enqueue_due_memory_consolidation_jobs(db, settings=resolved_settings, now=now)
-
-    if process_memory_projection_job(
-        session_factory=session_factory,
-        settings=resolved_settings,
-        now_fn=_utcnow,
-        new_id_fn=_new_id,
-        worker_id=resolved_worker_id,
-    ):
-        return True
-
-    if process_memory_graph_projection_job(
-        session_factory=session_factory,
-        now_fn=_utcnow,
-        new_id_fn=_new_id,
-        worker_id=resolved_worker_id,
-    ):
-        return True
-
-    if process_memory_maintenance_job(
-        session_factory=session_factory,
-        now_fn=_utcnow,
-        new_id_fn=_new_id,
-        worker_id=resolved_worker_id,
-    ):
-        return True
+            enqueue_due_memory_sweep(db, settings=resolved_settings, now=now, new_id_fn=_new_id)
 
     with session_factory() as db:
         with db.begin():
@@ -738,7 +518,6 @@ def process_one_task(
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                     settings=resolved_settings,
-                    memory_import_cutover_enabled=resolved_settings.memory_import_cutover_enabled,
                 )
             case "provider_write_reconcile_due":
                 shape_error = _payload_text(task_payload, "shape_error")
@@ -778,13 +557,25 @@ def process_one_task(
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                 )
-            case "memory_extract_turn":
-                process_memory_extract_turn(
+            case "memory_remember":
+                turn_id = _payload_text(task_payload, "turn_id")
+                if turn_id is None:
+                    raise RuntimeError("memory_remember task missing turn_id")
+                run_rememberer(
                     session_factory=session_factory,
-                    task_payload=task_payload,
                     settings=resolved_settings,
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
+                    trigger="turn",
+                    turn_id=turn_id,
+                )
+            case "memory_sweep":
+                run_rememberer(
+                    session_factory=session_factory,
+                    settings=resolved_settings,
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                    trigger="sweep",
                 )
             case "ambient_interpretation_due":
                 process_ambient_interpretation_due(
@@ -937,41 +728,6 @@ def _mark_task_failed(
                 else now
             )
             task.updated_at = now
-
-
-def _mark_memory_projection_job_failed(
-    *,
-    session_factory: sessionmaker[Session],
-    job_id: str,
-    attempt_token: str,
-    error: str,
-    now_fn: Callable[[], datetime],
-) -> None:
-    with session_factory() as db:
-        with db.begin():
-            job = db.scalar(
-                select(MemoryProjectionJobRecord)
-                .where(
-                    MemoryProjectionJobRecord.id == job_id,
-                    MemoryProjectionJobRecord.lifecycle_state == "running",
-                    MemoryProjectionJobRecord.attempt_token == attempt_token,
-                )
-                .with_for_update()
-            )
-            if job is None:
-                return
-            now = now_fn()
-            job.lifecycle_state = "pending" if job.attempts < job.max_retries else "dead_letter"
-            job.error = error
-            job.claimed_by = None
-            job.attempt_token = None
-            job.last_heartbeat = None
-            job.run_after = (
-                now + timedelta(seconds=min(300, 2 ** max(job.attempts - 1, 0)))
-                if job.lifecycle_state == "pending"
-                else now
-            )
-            job.updated_at = now
 
 
 def _payload_text(payload: dict[str, Any], key: str) -> str | None:

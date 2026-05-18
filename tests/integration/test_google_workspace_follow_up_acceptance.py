@@ -663,7 +663,6 @@ def _seed_session_and_google_connector(
             id=session_id,
             is_active=True,
             lifecycle_state="active",
-            memory_mode="normal",
             rotated_from_session_id=None,
             rotation_reason=None,
             created_at=NOW,
@@ -1305,7 +1304,6 @@ def test_gmail_read_persists_provider_evidence_and_grounded_artifact(
                     id="ses_1",
                     is_active=True,
                     lifecycle_state="active",
-                    memory_mode="normal",
                     rotated_from_session_id=None,
                     rotation_reason=None,
                     created_at=NOW,
@@ -1415,7 +1413,6 @@ def test_gmail_thread_read_persists_provider_evidence_and_grounded_artifact(
                     id="ses_thread",
                     is_active=True,
                     lifecycle_state="active",
-                    memory_mode="normal",
                     rotated_from_session_id=None,
                     rotation_reason=None,
                     created_at=NOW,
@@ -1727,7 +1724,6 @@ def test_calendar_create_write_receipt_replays_and_blocks_idempotency_mismatch(
                             id="ses_calendar_write_replay",
                             is_active=True,
                             lifecycle_state="active",
-                            memory_mode="normal",
                             rotated_from_session_id=None,
                             rotation_reason=None,
                             created_at=NOW,
@@ -1898,7 +1894,6 @@ def test_inline_google_read_commits_action_attempt_before_provider_call(
                 id="ses_google_read_boundary",
                 is_active=True,
                 lifecycle_state="active",
-                memory_mode="normal",
                 rotated_from_session_id=None,
                 rotation_reason=None,
                 created_at=NOW,
@@ -3050,35 +3045,43 @@ def test_worker_dispatches_workspace_commitment_extraction_due(
                 )
             )
 
-    assert process_one_task(
-        session_factory=session_factory,
-        settings=cast(Any, AppSettings)(_env_file=None, proactive_worker_max_attempts=4),
-        worker_id="worker-extract",
-        model_adapter=FakeCommitmentAdapter(
-            json.dumps(
-                {
-                    "commitments": [
-                        {
-                            "kind": "commitment",
-                            "action_text": "Send the invoice",
-                            "action_category": "send",
-                            "owner": "user",
-                            "priority": "normal",
-                            "confidence": 0.9,
-                            "evidence_block_ids": ["peb_extract"],
-                            "due_expression": "2026-05-12",
-                            "review_required": False,
-                            "rationale": "The sender asks for the invoice.",
-                            "uncertainty": None,
-                        }
-                    ],
-                    "omitted": [],
-                    "rationale": "one clear commitment",
-                    "uncertainty": None,
-                }
-            )
-        ),
+    adapter = FakeCommitmentAdapter(
+        json.dumps(
+            {
+                "commitments": [
+                    {
+                        "kind": "commitment",
+                        "action_text": "Send the invoice",
+                        "action_category": "send",
+                        "owner": "user",
+                        "priority": "normal",
+                        "confidence": 0.9,
+                        "evidence_block_ids": ["peb_extract"],
+                        "due_expression": "2026-05-12",
+                        "review_required": False,
+                        "rationale": "The sender asks for the invoice.",
+                        "uncertainty": None,
+                    }
+                ],
+                "omitted": [],
+                "rationale": "one clear commitment",
+                "uncertainty": None,
+            }
+        )
     )
+    # process_one_task does one unit of work per call, and the worker's
+    # periodic-enqueue pass can self-gate a memory_sweep task that the first
+    # call consumes, so it is driven until the extraction task completes.
+    for _ in range(8):
+        process_one_task(
+            session_factory=session_factory,
+            settings=cast(Any, AppSettings)(_env_file=None, proactive_worker_max_attempts=4),
+            worker_id="worker-extract",
+            model_adapter=adapter,
+        )
+        with session_factory() as db:
+            if db.get(BackgroundTaskRecord, "tsk_extract").status == "completed":  # type: ignore[union-attr]
+                break
 
     with session_factory() as db:
         task = db.get(BackgroundTaskRecord, "tsk_extract")

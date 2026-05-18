@@ -78,7 +78,7 @@ def run_tool_definitions() -> list[dict[str, Any]]:
                 "handling, and the safe standard library (json, re, datetime, math). Every "
                 "effect is a typed syscall to a namespaced host callable -- "
                 "agent.emit_message for user-visible output, agent.emit_value for internal "
-                "data, and capability syscalls such as memory.search, email.search, or "
+                "data, and capability syscalls such as memory.recall, email.search, or "
                 "agency.run. A syscall returns its result into the program; an "
                 "approval-gated syscall returns a pending value and is not executed inline. "
                 "Call exactly one run tool with the program as the source string."
@@ -193,7 +193,6 @@ def execute_run_program(
     attachment_runtime: AttachmentContentRuntime | None,
     allowed_capability_ids: set[str],
     settings: AppSettings | None,
-    memory_import_cutover_enabled: bool,
 ) -> RunProgramResult:
     """Run one model-authored Python ``run`` program inside the sandbox.
 
@@ -314,7 +313,6 @@ def execute_run_program(
             attachment_runtime=attachment_runtime,
             allowed_capability_id_set=allowed_capability_ids,
             settings=settings,
-            memory_import_cutover_enabled=memory_import_cutover_enabled,
         )
         # Within-program taint: a syscall that returned untrusted-influenced
         # content taints every later syscall in this program, and contributes
