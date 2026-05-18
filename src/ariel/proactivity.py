@@ -1340,32 +1340,75 @@ def process_proactive_deliberation_due(
             if decision_type == "remember":
                 valid = valid and bool(evidence_refs) and _valid_remember_payload(remember_payload)
 
+            decision_id = new_id_fn("pdc")
+            effective_decision_type = decision_type if valid else "ignore"
+            decision_confidence = float(confidence) if isinstance(confidence, (int, float)) else 0.0
+            decision_rationale = (
+                rationale.strip() if isinstance(rationale, str) else "invalid decision"
+            )
+            model_output = (
+                {**raw_decision, "memory": remember_payload}
+                if decision_type == "remember"
+                else raw_decision
+            )
+            judgment = AIJudgmentRecord(
+                id=new_id_fn("ajg"),
+                judgment_type="proactive_deliberation",
+                source_type="proactive_case",
+                source_id=case.id,
+                status="succeeded" if valid else "failed",
+                model=_provider_value(response, "model", "unknown"),
+                prompt_version=PROACTIVE_POLICY_VERSION,
+                provider_response_id=_provider_response_id(response),
+                input_summary="proactive case deliberation",
+                input_refs={
+                    "case_id": case.id,
+                    "latest_observation_id": case.latest_observation_id,
+                },
+                selected=[
+                    {
+                        "decision_id": decision_id,
+                        "decision_type": effective_decision_type,
+                        "evidence_refs": evidence_refs,
+                        "tool_refs": tool_refs,
+                        "action_count": len(actions),
+                    }
+                ]
+                if valid
+                else [],
+                omitted=[],
+                output=model_output,
+                rationale=decision_rationale,
+                uncertainty=None,
+                confidence=decision_confidence,
+                parse_status="parsed",
+                validation_status="valid" if valid else "invalid",
+                failure_code=None if valid else "E_AI_JUDGMENT_SCHEMA",
+                failure_reason=None if valid else "model decision failed schema validation",
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(judgment)
+            db.flush()
             decision = ProactiveDecisionRecord(
-                id=new_id_fn("pdc"),
+                id=decision_id,
                 case_id=case.id,
                 context=context,
                 model_input=model_input,
                 omitted_context={},
                 context_taint=context_taint,
-                provider=str(response.get("provider") or "unknown"),
-                model=str(response.get("model") or "unknown"),
-                provider_response_id=_provider_response_id(response),
-                decision_type=decision_type if valid else "ignore",
+                ai_judgment_id=judgment.id,
+                decision_type=effective_decision_type,
                 status="proposed" if valid else "invalid",
-                confidence=float(confidence) if isinstance(confidence, (int, float)) else 0.0,
+                confidence=decision_confidence,
                 urgency=urgency if urgency in {"critical", "high", "normal", "low"} else "normal",
                 user_visible_message=message.strip() if isinstance(message, str) else None,
-                rationale=rationale.strip() if isinstance(rationale, str) else "invalid decision",
+                rationale=decision_rationale,
                 evidence_refs=evidence_refs,
                 tool_refs=[],
                 actions=actions,
                 follow_up=follow_up if isinstance(follow_up, dict) else None,
-                raw_model_output={
-                    **raw_decision,
-                    "memory": remember_payload,
-                }
-                if decision_type == "remember"
-                else raw_decision,
+                memory_payload=remember_payload if decision_type == "remember" else None,
                 policy_result=None if valid else "invalid_decision",
                 policy_version=None if valid else PROACTIVE_POLICY_VERSION,
                 action_plan_hash=(
@@ -1378,45 +1421,6 @@ def process_proactive_deliberation_due(
             db.add(decision)
             db.flush()
             case.last_decision_id = decision.id
-            db.add(
-                AIJudgmentRecord(
-                    id=new_id_fn("ajg"),
-                    judgment_type="proactive_deliberation",
-                    source_type="proactive_case",
-                    source_id=case.id,
-                    status="succeeded" if valid else "failed",
-                    model=_provider_value(response, "model", "unknown"),
-                    prompt_version=PROACTIVE_POLICY_VERSION,
-                    provider_response_id=_provider_response_id(response),
-                    input_summary="proactive case deliberation",
-                    input_refs={
-                        "case_id": case.id,
-                        "latest_observation_id": case.latest_observation_id,
-                    },
-                    selected=[
-                        {
-                            "decision_id": decision.id,
-                            "decision_type": decision.decision_type,
-                            "evidence_refs": evidence_refs,
-                            "tool_refs": tool_refs,
-                            "action_count": len(actions),
-                        }
-                    ]
-                    if valid
-                    else [],
-                    omitted=[],
-                    output=decision.raw_model_output,
-                    rationale=decision.rationale,
-                    uncertainty=None,
-                    confidence=decision.confidence,
-                    parse_status="parsed",
-                    validation_status="valid" if valid else "invalid",
-                    failure_code=None if valid else "E_AI_JUDGMENT_SCHEMA",
-                    failure_reason=None if valid else "model decision failed schema validation",
-                    created_at=now,
-                    updated_at=now,
-                )
-            )
             _add_case_event(
                 db,
                 case_id=case.id,
@@ -1663,6 +1667,39 @@ def _record_invalid_decision(
     now: datetime,
     new_id_fn: Callable[[str], str],
 ) -> None:
+    judgment = AIJudgmentRecord(
+        id=new_id_fn("ajg"),
+        judgment_type="proactive_deliberation",
+        source_type="proactive_case",
+        source_id=case.id,
+        status="failed",
+        model=_provider_value(response, "model", "unknown"),
+        prompt_version=PROACTIVE_POLICY_VERSION,
+        provider_response_id=_provider_response_id(response),
+        input_summary="proactive case deliberation",
+        input_refs={
+            "case_id": case.id,
+            "latest_observation_id": case.latest_observation_id,
+        },
+        selected=[],
+        omitted=[],
+        output=raw_model_output,
+        rationale=reason,
+        uncertainty=None,
+        confidence=0.0,
+        parse_status=parse_status,
+        validation_status="not_validated",
+        failure_code=(
+            "E_AI_JUDGMENT_INVALID_JSON"
+            if parse_status == "invalid_json"
+            else "E_AI_JUDGMENT_REQUIRED"
+        ),
+        failure_reason=reason,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(judgment)
+    db.flush()
     decision = ProactiveDecisionRecord(
         id=new_id_fn("pdc"),
         case_id=case.id,
@@ -1670,9 +1707,7 @@ def _record_invalid_decision(
         model_input=model_input,
         omitted_context={},
         context_taint=context_taint,
-        provider=_provider_value(response, "provider", "unknown"),
-        model=_provider_value(response, "model", "unknown"),
-        provider_response_id=_provider_response_id(response),
+        ai_judgment_id=judgment.id,
         decision_type="ignore",
         status="invalid",
         confidence=0.0,
@@ -1683,7 +1718,7 @@ def _record_invalid_decision(
         tool_refs=[],
         actions=[],
         follow_up=None,
-        raw_model_output=raw_model_output,
+        memory_payload=None,
         policy_result="invalid_decision",
         policy_version=PROACTIVE_POLICY_VERSION,
         action_plan_hash=_json_hash({"actions": []}),
@@ -1694,39 +1729,6 @@ def _record_invalid_decision(
     db.add(decision)
     db.flush()
     case.last_decision_id = decision.id
-    db.add(
-        AIJudgmentRecord(
-            id=new_id_fn("ajg"),
-            judgment_type="proactive_deliberation",
-            source_type="proactive_case",
-            source_id=case.id,
-            status="failed",
-            model=_provider_value(response, "model", "unknown"),
-            prompt_version=PROACTIVE_POLICY_VERSION,
-            provider_response_id=_provider_response_id(response),
-            input_summary="proactive case deliberation",
-            input_refs={
-                "case_id": case.id,
-                "latest_observation_id": case.latest_observation_id,
-            },
-            selected=[],
-            omitted=[],
-            output=raw_model_output,
-            rationale=reason,
-            uncertainty=None,
-            confidence=0.0,
-            parse_status=parse_status,
-            validation_status="not_validated",
-            failure_code=(
-                "E_AI_JUDGMENT_INVALID_JSON"
-                if parse_status == "invalid_json"
-                else "E_AI_JUDGMENT_REQUIRED"
-            ),
-            failure_reason=reason,
-            created_at=now,
-            updated_at=now,
-        )
-    )
     case.status = "failed"
     case.updated_at = now
     _add_case_event(
@@ -2265,10 +2267,13 @@ def _apply_remember_decision(
     now: datetime,
     new_id_fn: Callable[[str], str],
 ) -> None:
-    raw_memory = decision.raw_model_output.get("memory")
+    raw_memory = decision.memory_payload
     if not isinstance(raw_memory, dict):
         return
     memory = _normalized_remember_payload(raw_memory)
+    judgment = db.get(AIJudgmentRecord, decision.ai_judgment_id)
+    if judgment is None:
+        raise RuntimeError("proactive decision missing its ai_judgment record")
     source_session = _active_or_new_session(db, now=now, new_id_fn=new_id_fn)
     memory_events = propose_memory_candidate(
         db,
@@ -2283,7 +2288,7 @@ def _apply_remember_decision(
         scope_key=f"proactive:{case.id}",
         valid_from=now,
         valid_to=None,
-        extraction_model=decision.model,
+        extraction_model=judgment.model,
         extraction_prompt_version=PROACTIVE_POLICY_VERSION,
         now_fn=lambda: now,
         new_id_fn=new_id_fn,
@@ -4659,6 +4664,11 @@ def process_proactive_feedback_learning_due(
                 if case.last_decision_id is not None
                 else None
             )
+            decision_judgment = (
+                db.get(AIJudgmentRecord, decision.ai_judgment_id) if decision is not None else None
+            )
+            if decision is not None and decision_judgment is None:
+                raise RuntimeError("proactive decision missing its ai_judgment record")
             turns = db.scalars(
                 select(NotificationRecord)
                 .where(
@@ -4742,7 +4752,9 @@ def process_proactive_feedback_learning_due(
                     "tool_refs": decision.tool_refs,
                     "actions": decision.actions,
                     "follow_up": decision.follow_up,
-                    "raw_model_output": decision.raw_model_output,
+                    "model_output": decision_judgment.output
+                    if decision_judgment is not None
+                    else {},
                     "context": decision.context,
                     "omitted_context": decision.omitted_context,
                 },

@@ -11,6 +11,7 @@ from sqlalchemy import text
 from ariel.app import ModelAdapter, create_app
 from ariel.config import AppSettings
 from ariel.persistence import (
+    AIJudgmentRecord,
     AutonomyScopeRecord,
     NotificationRecord,
     ProactiveActionExecutionRecord,
@@ -278,6 +279,30 @@ def _seed_case(
                 created_at=now,
                 updated_at=now,
             )
+            judgment = AIJudgmentRecord(
+                id=f"ajg_{case_id}",
+                judgment_type="proactive_deliberation",
+                source_type="proactive_case",
+                source_id=case_id,
+                status="succeeded",
+                model="model.proactive-api-v1",
+                prompt_version="test-policy-v1",
+                provider_response_id="resp_proactive_api_decision",
+                input_summary="proactive case deliberation",
+                input_refs={"case_id": case_id},
+                selected=[],
+                omitted=[],
+                output={"decision": "speak_now"},
+                rationale="The job state was worth interrupting for.",
+                uncertainty=None,
+                confidence=0.83,
+                parse_status="parsed",
+                validation_status="valid",
+                failure_code=None,
+                failure_reason=None,
+                created_at=now,
+                updated_at=now,
+            )
             decision = ProactiveDecisionRecord(
                 id=f"pdc_{case_id}",
                 case_id=case_id,
@@ -285,9 +310,7 @@ def _seed_case(
                 model_input=[{"role": "system", "content": "Inspect this case."}],
                 omitted_context={},
                 context_taint={"status": "clean"},
-                provider="provider.proactive-api",
-                model="model.proactive-api-v1",
-                provider_response_id="resp_proactive_api_decision",
+                ai_judgment_id=judgment.id,
                 decision_type="speak_now",
                 status="validated",
                 confidence=0.83,
@@ -298,7 +321,7 @@ def _seed_case(
                 tool_refs=[],
                 actions=[],
                 follow_up=None,
-                raw_model_output={"decision": "speak_now"},
+                memory_payload=None,
                 policy_result="authorized",
                 policy_version="test-policy-v1",
                 action_plan_hash="hash_proactive_api_validation",
@@ -326,6 +349,8 @@ def _seed_case(
             db.add(observation)
             db.flush()
             db.add(proactive_case)
+            db.flush()
+            db.add(judgment)
             db.flush()
             db.add(decision)
             db.flush()
@@ -873,7 +898,8 @@ def test_autonomy_scope_enforces_target_recipient_and_payload_shape(
                         text(
                             "SELECT status, prompt_version, parse_status, validation_status "
                             "FROM ai_judgments WHERE source_id = 'case_allowed' "
-                            "AND judgment_type = 'proactive_deliberation'"
+                            "AND judgment_type = 'proactive_deliberation' "
+                            "ORDER BY created_at DESC LIMIT 1"
                         )
                     )
                     .mappings()
@@ -945,10 +971,10 @@ def test_autonomy_scope_enforces_target_recipient_and_payload_shape(
                     row["case_id"]: row["denial_reason"]
                     for row in db.execute(
                         text(
-                            "SELECT case_id, denial_reason FROM proactive_decisions "
-                            "WHERE case_id IN ("
+                            "SELECT DISTINCT ON (case_id) case_id, denial_reason "
+                            "FROM proactive_decisions WHERE case_id IN ("
                             "'case_bad_target', 'case_bad_recipient', 'case_bad_shape'"
-                            ") ORDER BY case_id"
+                            ") ORDER BY case_id, created_at DESC"
                         )
                     ).mappings()
                 }

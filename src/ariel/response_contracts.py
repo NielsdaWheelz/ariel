@@ -1335,9 +1335,7 @@ class SurfaceProactiveDecisionContract(BaseModel):
     model_input: list[dict[str, Any]]
     omitted_context: dict[str, Any]
     context_taint: dict[str, Any]
-    provider: str
-    model: str
-    provider_response_id: str | None
+    ai_judgment_id: str
     decision_type: Literal[
         "ignore",
         "remember",
@@ -1357,7 +1355,7 @@ class SurfaceProactiveDecisionContract(BaseModel):
     tool_refs: list[str]
     actions: list[dict[str, Any]]
     follow_up: dict[str, Any] | None
-    raw_model_output: dict[str, Any]
+    memory_payload: dict[str, Any] | None
     policy_result: (
         Literal[
             "authorized",

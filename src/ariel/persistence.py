@@ -3311,9 +3311,11 @@ class ProactiveDecisionRecord(Base):
     model_input: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
     omitted_context: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     context_taint: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    provider: Mapped[str] = mapped_column(String(64), nullable=False)
-    model: Mapped[str] = mapped_column(String(128), nullable=False)
-    provider_response_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    ai_judgment_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("ai_judgments.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
     decision_type: Mapped[str] = mapped_column(String(32), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     confidence: Mapped[float] = mapped_column(Float, nullable=False)
@@ -3324,7 +3326,9 @@ class ProactiveDecisionRecord(Base):
     tool_refs: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     actions: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
     follow_up: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
-    raw_model_output: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    # Remember-decision payload only. The full model output lives on the linked
+    # ai_judgments row (ai_judgment_id); _apply_remember_decision reads this column.
+    memory_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     # Policy-validation verdict: a deterministic rail's audit record. Written once by the
     # validation rail (proactivity._validate_and_apply_decision and the invalid-decision
     # paths); never mutated afterward and never written by model-output code.
@@ -4365,9 +4369,7 @@ def serialize_proactive_decision(decision: ProactiveDecisionRecord) -> dict[str,
         "model_input": redact_json_value(decision.model_input),
         "omitted_context": redact_json_value(decision.omitted_context),
         "context_taint": redact_json_value(decision.context_taint),
-        "provider": decision.provider,
-        "model": decision.model,
-        "provider_response_id": decision.provider_response_id,
+        "ai_judgment_id": decision.ai_judgment_id,
         "decision_type": decision.decision_type,
         "status": decision.status,
         "confidence": decision.confidence,
@@ -4382,7 +4384,7 @@ def serialize_proactive_decision(decision: ProactiveDecisionRecord) -> dict[str,
         "tool_refs": decision.tool_refs,
         "actions": redact_json_value(decision.actions),
         "follow_up": redact_json_value(decision.follow_up),
-        "raw_model_output": redact_json_value(decision.raw_model_output),
+        "memory_payload": redact_json_value(decision.memory_payload),
         "policy_result": decision.policy_result,
         "policy_version": decision.policy_version,
         "action_plan_hash": decision.action_plan_hash,

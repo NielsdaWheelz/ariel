@@ -342,9 +342,11 @@ def test_json_parse_failure_persists_invalid_decision_record(postgres_url: str) 
 
                 assert decision is not None
                 assert decision.status == "invalid"
-                assert decision.raw_model_output["parse_error"]
                 assert decision.policy_result == "invalid_decision"
-                assert decision.denial_reason == decision.raw_model_output["parse_error"]
+                judgment = db.get(AIJudgmentRecord, decision.ai_judgment_id)
+                assert judgment is not None
+                assert judgment.output["parse_error"]
+                assert decision.denial_reason == judgment.output["parse_error"]
                 assert case is not None
                 assert case.status == "failed"
 
