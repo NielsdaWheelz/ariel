@@ -1972,6 +1972,15 @@ class TurnExecutionOutcome:
     response_payload: dict[str, Any]
 
 
+@dataclass(slots=True, frozen=True)
+class WakeContext:
+    trigger_kind: Literal["user_message"]
+    prompt_text: str
+    discord_context: dict[str, Any] | None
+    attachment_sources: list[dict[str, Any]] | None
+    ingress_provenance: RuntimeProvenance | None
+
+
 def _open_jobs_context(*, db: Session) -> list[dict[str, Any]]:
     jobs = db.scalars(
         select(JobRecord)
@@ -3648,16 +3657,17 @@ def create_app(
                     )
             return {"ok": True, "connector": connector_payload}
 
-    def _execute_turn_for_session(
+    def _wake(
         *,
         db: Session,
         request_session_id: str,
-        user_message: str,
-        discord_context: dict[str, Any] | None,
-        discord_attachment_sources: list[dict[str, Any]] | None = None,
-        ingress_runtime_provenance: RuntimeProvenance | None = None,
+        wake_context: WakeContext,
         execute_google_reads_outside_transaction: bool = False,
     ) -> TurnExecutionOutcome:
+        user_message = wake_context.prompt_text
+        discord_context = wake_context.discord_context
+        discord_attachment_sources = wake_context.attachment_sources
+        ingress_runtime_provenance = wake_context.ingress_provenance
         active_session = db.scalar(
             select(SessionRecord)
             .where(
@@ -5020,12 +5030,16 @@ def create_app(
                         )
                     db.flush()
 
-                turn_outcome = _execute_turn_for_session(
+                turn_outcome = _wake(
                     db=db,
                     request_session_id=request_session_id,
-                    user_message=payload.message,
-                    discord_context=discord_context,
-                    discord_attachment_sources=discord_attachment_sources,
+                    wake_context=WakeContext(
+                        trigger_kind="user_message",
+                        prompt_text=payload.message,
+                        discord_context=discord_context,
+                        attachment_sources=discord_attachment_sources,
+                        ingress_provenance=None,
+                    ),
                     execute_google_reads_outside_transaction=True,
                 )
                 persist_idempotency_result(
@@ -5309,12 +5323,16 @@ def create_app(
                     if normalized_capture.kind == "shared_content"
                     else None
                 )
-                turn_outcome = _execute_turn_for_session(
+                turn_outcome = _wake(
                     db=db,
                     request_session_id=request_session_id,
-                    user_message=normalized_capture.normalized_turn_input,
-                    discord_context=None,
-                    ingress_runtime_provenance=capture_ingress_runtime_provenance,
+                    wake_context=WakeContext(
+                        trigger_kind="user_message",
+                        prompt_text=normalized_capture.normalized_turn_input,
+                        discord_context=None,
+                        attachment_sources=None,
+                        ingress_provenance=capture_ingress_runtime_provenance,
+                    ),
                 )
 
                 capture_record = CaptureRecord(
