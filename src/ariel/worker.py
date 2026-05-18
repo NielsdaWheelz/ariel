@@ -25,7 +25,6 @@ from .google_connector import (
 from .persistence import (
     AgencyEventRecord,
     BackgroundTaskRecord,
-    ConnectorSubscriptionRecord,
     EmailThreadWatchRecord,
     JobEventRecord,
     JobRecord,
@@ -772,12 +771,6 @@ def process_one_task(
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                 )
-            case "provider_subscription_renewal_due":
-                _process_provider_subscription_renewal_due(
-                    session_factory=session_factory,
-                    task_payload=task_payload,
-                    settings=resolved_settings,
-                )
             case "provider_sync_due":
                 process_provider_sync_due(
                     session_factory=session_factory,
@@ -988,44 +981,6 @@ def _payload_text(payload: dict[str, Any], key: str) -> str | None:
         return None
     normalized = value.strip()
     return normalized or None
-
-
-def _process_provider_subscription_renewal_due(
-    *,
-    session_factory: sessionmaker[Session],
-    task_payload: dict[str, Any],
-    settings: AppSettings,
-) -> None:
-    subscription_id = _payload_text(task_payload, "subscription_id")
-    if subscription_id is None:
-        raise RuntimeError("provider_subscription_renewal_due task missing subscription_id")
-    with session_factory() as db:
-        with db.begin():
-            subscription = db.scalar(
-                select(ConnectorSubscriptionRecord)
-                .where(ConnectorSubscriptionRecord.id == subscription_id)
-                .with_for_update()
-                .limit(1)
-            )
-            if subscription is None:
-                raise RuntimeError("connector subscription not found")
-            now = _utcnow()
-            subscription.status = "renewal_due"
-            subscription.renew_after = now
-            subscription.updated_at = now
-            enqueue_background_task(
-                db,
-                task_type="provider_sync_due",
-                payload={
-                    "provider": subscription.provider,
-                    "resource_type": subscription.resource_type,
-                    "resource_id": subscription.resource_id,
-                    "subscription_id": subscription.id,
-                    "reason": "subscription_renewal_due",
-                },
-                now=now,
-                max_attempts=settings.proactive_worker_max_attempts,
-            )
 
 
 def _job_status_for_event(event_type: str) -> str:

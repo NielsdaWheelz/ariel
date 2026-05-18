@@ -3569,8 +3569,6 @@ def process_workspace_commitment_extraction_due(
                     provider=evidence.provider,
                     provider_account_id=evidence.provider_account_id,
                     owner=candidate.owner.value,
-                    requester_person_id=None,
-                    counterparty_person_id=None,
                     thread_id=thread_id,
                     dedupe_digest=dedupe_digest,
                     action_text=candidate.action_text.strip(),

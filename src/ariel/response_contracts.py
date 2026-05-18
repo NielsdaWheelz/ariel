@@ -1105,24 +1105,6 @@ class SurfaceMemoryEventListResponseContract(BaseModel):
     events: list[SurfaceMemoryEventContract]
 
 
-class SurfaceConnectorSubscriptionContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    id: str
-    provider: Literal["google"]
-    resource_type: Literal["calendar", "gmail", "drive"]
-    resource_id: str
-    channel_id: str
-    provider_subscription_id: str | None
-    status: Literal["active", "renewal_due", "expired", "error", "revoked"]
-    expires_at: str | None
-    renew_after: str | None
-    last_error_code: str | None
-    last_error_at: str | None
-    created_at: str
-    updated_at: str
-
-
 class SurfaceSyncCursorContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1463,13 +1445,6 @@ class SurfaceProactiveActionExecutionContract(BaseModel):
     completed_at: str | None
     created_at: str
     updated_at: str
-
-
-class SurfaceConnectorSubscriptionListResponseContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    ok: bool
-    subscriptions: list[SurfaceConnectorSubscriptionContract]
 
 
 class SurfaceSyncCursorListResponseContract(BaseModel):
@@ -2247,17 +2222,6 @@ def build_surface_memory_event_list_response(*, schema_version: Any, events: Any
             "ok": True,
             "schema_version": schema_version,
             "events": events if isinstance(events, list) else [],
-        },
-    )
-
-
-def build_surface_connector_subscription_list_response(*, subscriptions: Any) -> dict[str, Any]:
-    return _validate_contract(
-        "surface_connector_subscription_list_response",
-        SurfaceConnectorSubscriptionListResponseContract,
-        {
-            "ok": True,
-            "subscriptions": subscriptions if isinstance(subscriptions, list) else [],
         },
     )
 

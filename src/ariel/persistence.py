@@ -2473,51 +2473,6 @@ class GoogleConnectorEventRecord(Base):
     connector: Mapped[GoogleConnectorRecord] = relationship(back_populates="events")
 
 
-class ConnectorSubscriptionRecord(Base):
-    __tablename__ = "connector_subscriptions"
-
-    id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    provider: Mapped[str] = mapped_column(String(32), nullable=False)
-    resource_type: Mapped[str] = mapped_column(String(32), nullable=False)
-    resource_id: Mapped[str] = mapped_column(String(128), nullable=False)
-    channel_id: Mapped[str] = mapped_column(String(128), nullable=False)
-    channel_token: Mapped[str | None] = mapped_column(Text, nullable=True)
-    provider_subscription_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    status: Mapped[str] = mapped_column(String(32), nullable=False)
-    expires_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True, index=True
-    )
-    renew_after: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True, index=True
-    )
-    last_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    last_error_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True, index=True
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, index=True
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, index=True
-    )
-
-    __table_args__ = (
-        UniqueConstraint(
-            "provider", "resource_type", "resource_id", name="uq_subscription_resource"
-        ),
-        CheckConstraint("provider IN ('google')", name="ck_connector_subscription_provider"),
-        CheckConstraint(
-            "resource_type IN ('calendar', 'gmail', 'drive')",
-            name="ck_connector_subscription_resource_type",
-        ),
-        CheckConstraint(
-            "status IN ('active', 'renewal_due', 'expired', 'error', 'revoked')",
-            name="ck_connector_subscription_status",
-        ),
-        Index("ix_connector_subscriptions_renewal", "status", "renew_after", "id"),
-    )
-
-
 class SyncCursorRecord(Base):
     __tablename__ = "sync_cursors"
 
@@ -2889,39 +2844,6 @@ class ProviderEvidenceBlockRecord(Base):
     )
 
 
-class WorkPersonRecord(Base):
-    __tablename__ = "work_people"
-
-    id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    provider: Mapped[str] = mapped_column(String(32), nullable=False)
-    provider_account_id: Mapped[str] = mapped_column(String(128), nullable=False)
-    email_address: Mapped[str] = mapped_column(Text, nullable=False)
-    display_name: Mapped[str | None] = mapped_column(Text, nullable=True)
-    relation: Mapped[str] = mapped_column(String(32), nullable=False)
-    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, index=True
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, index=True
-    )
-
-    __table_args__ = (
-        CheckConstraint("provider IN ('google')", name="ck_work_person_provider"),
-        CheckConstraint(
-            "relation IN ('user', 'counterparty', 'unknown')",
-            name="ck_work_person_relation",
-        ),
-        Index(
-            "ix_work_people_email_unique",
-            "provider",
-            "provider_account_id",
-            "email_address",
-            unique=True,
-        ),
-    )
-
-
 class WorkThreadRecord(Base):
     __tablename__ = "work_threads"
 
@@ -2975,18 +2897,6 @@ class WorkCommitmentRecord(Base):
     provider: Mapped[str] = mapped_column(String(32), nullable=False)
     provider_account_id: Mapped[str] = mapped_column(String(128), nullable=False)
     owner: Mapped[str] = mapped_column(String(32), nullable=False)
-    requester_person_id: Mapped[str | None] = mapped_column(
-        String(32),
-        ForeignKey("work_people.id", ondelete="RESTRICT"),
-        nullable=True,
-        index=True,
-    )
-    counterparty_person_id: Mapped[str | None] = mapped_column(
-        String(32),
-        ForeignKey("work_people.id", ondelete="RESTRICT"),
-        nullable=True,
-        index=True,
-    )
     thread_id: Mapped[str | None] = mapped_column(
         String(32),
         ForeignKey("work_threads.id", ondelete="RESTRICT"),
@@ -3842,7 +3752,7 @@ class BackgroundTaskRecord(Base):
             (
                 "task_type IN ('agency_event_received', 'deliver_discord_notification', "
                 "'expire_approvals', 'reap_stale_tasks', "
-                "'provider_subscription_renewal_due', 'provider_event_received', "
+                "'provider_event_received', "
                 "'provider_sync_due', 'memory_extract_turn', "
                 "'ambient_interpretation_due', 'proactive_deliberation_due', "
                 "'proactive_follow_up_due', 'proactive_feedback_learning_due', "
@@ -4250,26 +4160,6 @@ def serialize_job_event(event: JobEventRecord) -> dict[str, Any]:
     }
 
 
-def serialize_connector_subscription(subscription: ConnectorSubscriptionRecord) -> dict[str, Any]:
-    return {
-        "id": subscription.id,
-        "provider": subscription.provider,
-        "resource_type": subscription.resource_type,
-        "resource_id": subscription.resource_id,
-        "channel_id": subscription.channel_id,
-        "provider_subscription_id": subscription.provider_subscription_id,
-        "status": subscription.status,
-        "expires_at": to_rfc3339(subscription.expires_at) if subscription.expires_at else None,
-        "renew_after": to_rfc3339(subscription.renew_after) if subscription.renew_after else None,
-        "last_error_code": subscription.last_error_code,
-        "last_error_at": (
-            to_rfc3339(subscription.last_error_at) if subscription.last_error_at else None
-        ),
-        "created_at": to_rfc3339(subscription.created_at),
-        "updated_at": to_rfc3339(subscription.updated_at),
-    }
-
-
 def serialize_sync_cursor(cursor: SyncCursorRecord) -> dict[str, Any]:
     return {
         "id": cursor.id,
@@ -4492,8 +4382,6 @@ def serialize_work_commitment(commitment: WorkCommitmentRecord) -> dict[str, Any
         "provider": commitment.provider,
         "provider_account_id": redact_text(commitment.provider_account_id),
         "owner": commitment.owner,
-        "requester_person_id": commitment.requester_person_id,
-        "counterparty_person_id": commitment.counterparty_person_id,
         "thread_id": commitment.thread_id,
         "dedupe_digest": commitment.dedupe_digest,
         "action_text": redact_text(commitment.action_text),

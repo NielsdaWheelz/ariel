@@ -106,7 +106,6 @@ from ariel.persistence import (
     ArtifactRecord,
     BackgroundTaskRecord,
     CaptureRecord,
-    ConnectorSubscriptionRecord,
     EmailActionRecord,
     EmailThreadWatchRecord,
     EventRecord,
@@ -149,7 +148,6 @@ from ariel.persistence import (
     serialize_artifact,
     serialize_autonomy_scope,
     serialize_capture,
-    serialize_connector_subscription,
     serialize_action_attempt,
     serialize_email_action,
     serialize_email_thread_watch,
@@ -187,7 +185,6 @@ from ariel.response_contracts import (
     build_surface_approval_response,
     build_surface_capture_failure_response,
     build_surface_capture_success_response,
-    build_surface_connector_subscription_list_response,
     build_surface_email_action_list_response,
     build_surface_email_action_response,
     build_surface_email_thread_watch_list_response,
@@ -8343,79 +8340,6 @@ def create_app(
                         "task_id": task.id,
                     },
                 )
-
-    @app.get("/v1/connectors/{provider}/subscriptions")
-    def get_connector_subscriptions(
-        provider: Literal["google"],
-        resource_type: Literal["calendar", "gmail", "drive"] | None = None,
-        limit: int = 50,
-    ) -> dict[str, Any]:
-        _ensure_schema_ready()
-        bounded_limit = max(1, min(limit, 200))
-        with session_factory() as db:
-            with db.begin():
-                query = select(ConnectorSubscriptionRecord).where(
-                    ConnectorSubscriptionRecord.provider == provider
-                )
-                if resource_type is not None:
-                    query = query.where(ConnectorSubscriptionRecord.resource_type == resource_type)
-                subscriptions = db.scalars(
-                    query.order_by(
-                        ConnectorSubscriptionRecord.updated_at.desc(),
-                        ConnectorSubscriptionRecord.id.desc(),
-                    ).limit(bounded_limit)
-                ).all()
-                try:
-                    return build_surface_connector_subscription_list_response(
-                        subscriptions=[
-                            serialize_connector_subscription(subscription)
-                            for subscription in subscriptions
-                        ]
-                    )
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.post("/v1/connectors/{provider}/subscriptions/{subscription_id}/renew")
-    def renew_connector_subscription(
-        provider: Literal["google"],
-        subscription_id: str,
-    ) -> dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                subscription = db.scalar(
-                    select(ConnectorSubscriptionRecord)
-                    .where(
-                        ConnectorSubscriptionRecord.provider == provider,
-                        ConnectorSubscriptionRecord.id == subscription_id,
-                    )
-                    .with_for_update()
-                    .limit(1)
-                )
-                if subscription is None:
-                    raise ApiError(
-                        status_code=404,
-                        code="E_CONNECTOR_SUBSCRIPTION_NOT_FOUND",
-                        message="connector subscription not found",
-                        details={"subscription_id": subscription_id},
-                        retryable=False,
-                    )
-                now = _utcnow()
-                subscription.status = "renewal_due"
-                subscription.renew_after = now
-                subscription.updated_at = now
-                task = enqueue_background_task(
-                    db,
-                    task_type="provider_subscription_renewal_due",
-                    payload={"subscription_id": subscription.id},
-                    now=now,
-                    max_attempts=5,
-                )
-                return {
-                    "ok": True,
-                    "subscription": serialize_connector_subscription(subscription),
-                    "task_id": task.id,
-                }
 
     @app.get("/v1/connectors/{provider}/sync-cursors")
     def get_sync_cursors(

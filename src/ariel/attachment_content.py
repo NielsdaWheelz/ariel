@@ -337,49 +337,62 @@ class AttachmentContentRuntime:
             source.updated_at = retrieved_at
             db.flush()
 
-        extraction = _extract_attachment(
-            runtime=self,
-            content=content,
-            filename=source.filename,
-            mime_type=blob.sniffed_mime_type,
-            modality=modality,
-            intent=intent,
+        cached = db.scalar(
+            select(AttachmentExtractionRecord)
+            .where(
+                AttachmentExtractionRecord.blob_id == blob.id,
+                AttachmentExtractionRecord.extractor_version == _EXTRACTOR_VERSION,
+                AttachmentExtractionRecord.modality == modality,
+                AttachmentExtractionRecord.status == "succeeded",
+            )
+            .limit(1)
         )
-        blocks = extraction["blocks"]
-        status = "succeeded" if extraction["status"] == "ok" else "failed"
-        now = now_fn()
-        db.add(
-            AttachmentExtractionRecord(
-                id=new_id_fn("aex"),
-                source_id=source.id,
-                blob_id=blob.id,
+        if cached is not None:
+            blocks: list[dict[str, Any]] = cached.blocks
+        else:
+            extraction = _extract_attachment(
+                runtime=self,
+                content=content,
+                filename=source.filename,
+                mime_type=blob.sniffed_mime_type,
                 modality=modality,
-                extractor=extraction["extractor"],
-                extractor_version=_EXTRACTOR_VERSION,
-                status=status,
-                outcome=extraction["status"],
-                blocks=blocks if isinstance(blocks, list) else [],
-                citations=[],
-                provider_metadata=extraction["provider_metadata"],
-                created_at=now,
-                updated_at=now,
+                intent=intent,
             )
-        )
-        db.flush()
-
-        if extraction["status"] != "ok":
-            return ExecutionResult(
-                status="succeeded",
-                output=_failure_output(
-                    attachment_ref=attachment_ref,
-                    filename=source.filename,
-                    status=extraction["status"],
+            blocks = extraction["blocks"]
+            status = "succeeded" if extraction["status"] == "ok" else "failed"
+            now = now_fn()
+            db.add(
+                AttachmentExtractionRecord(
+                    id=new_id_fn("aex"),
+                    source_id=source.id,
+                    blob_id=blob.id,
                     modality=modality,
-                    retrieved_at=retrieved_at,
-                    source_label=_source_label(source),
-                ),
-                error=None,
+                    extractor=extraction["extractor"],
+                    extractor_version=_EXTRACTOR_VERSION,
+                    status=status,
+                    outcome=extraction["status"],
+                    blocks=blocks if isinstance(blocks, list) else [],
+                    citations=[],
+                    provider_metadata=extraction["provider_metadata"],
+                    created_at=now,
+                    updated_at=now,
+                )
             )
+            db.flush()
+
+            if extraction["status"] != "ok":
+                return ExecutionResult(
+                    status="succeeded",
+                    output=_failure_output(
+                        attachment_ref=attachment_ref,
+                        filename=source.filename,
+                        status=extraction["status"],
+                        modality=modality,
+                        retrieved_at=retrieved_at,
+                        source_label=_source_label(source),
+                    ),
+                    error=None,
+                )
 
         return ExecutionResult(
             status="succeeded",

@@ -11,7 +11,6 @@ from ariel.config import AppSettings
 from ariel.persistence import (
     ActionAttemptRecord,
     BackgroundTaskRecord,
-    ConnectorSubscriptionRecord,
     EmailThreadWatchRecord,
     SessionRecord,
     TurnRecord,
@@ -356,68 +355,3 @@ def test_legacy_task_type_dead_letters_without_retry(
             assert task.max_attempts == 5
             assert task.error == "unsupported task type: attention_ranking_due"
             assert task.run_after == now
-
-
-def test_subscription_renewal_task_enqueues_provider_sync_work(
-    session_factory: sessionmaker[Session],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    now = datetime(2026, 5, 1, 13, 0, tzinfo=UTC)
-    monkeypatch.setattr("ariel.worker._utcnow", lambda: now)
-    with session_factory() as db:
-        with db.begin():
-            db.add(
-                ConnectorSubscriptionRecord(
-                    id="sub_calendar_primary",
-                    provider="google",
-                    resource_type="calendar",
-                    resource_id="primary",
-                    channel_id="channel-1",
-                    channel_token=None,
-                    provider_subscription_id="provider-sub-1",
-                    status="active",
-                    expires_at=now + timedelta(days=1),
-                    renew_after=now,
-                    last_error_code=None,
-                    last_error_at=None,
-                    created_at=now - timedelta(days=1),
-                    updated_at=now - timedelta(days=1),
-                )
-            )
-            enqueue_background_task(
-                db,
-                task_type="provider_subscription_renewal_due",
-                payload={"subscription_id": "sub_calendar_primary"},
-                now=now,
-                max_attempts=5,
-            )
-
-    assert process_one_task(
-        session_factory=session_factory,
-        settings=cast(Any, AppSettings)(_env_file=None, proactive_worker_max_attempts=4),
-        worker_id="w1",
-    )
-
-    with session_factory() as db:
-        with db.begin():
-            subscription = db.get(ConnectorSubscriptionRecord, "sub_calendar_primary")
-            assert subscription is not None
-            assert subscription.status == "renewal_due"
-            assert subscription.renew_after == now
-            sync_task = db.scalar(
-                select(BackgroundTaskRecord)
-                .where(
-                    BackgroundTaskRecord.task_type == "provider_sync_due",
-                    BackgroundTaskRecord.status == "pending",
-                )
-                .limit(1)
-            )
-            assert sync_task is not None
-            assert sync_task.payload == {
-                "provider": "google",
-                "resource_type": "calendar",
-                "resource_id": "primary",
-                "subscription_id": "sub_calendar_primary",
-                "reason": "subscription_renewal_due",
-            }
-            assert sync_task.max_attempts == 4
