@@ -14,23 +14,16 @@ from ariel.discord_bot import (
     ArielDiscordReply,
     ArielDiscordError,
     ArielActionView,
-    ack_notification,
-    ack_proactive_case,
-    correct_proactive_case,
     decide_approval,
     DiscordBotConfigError,
     configured_discord_bot,
     create_discord_bot,
     format_discord_message,
     get_status,
-    inspect_proactive_case,
     list_jobs,
-    more_aggressive_proactive_pattern,
     record_capture,
     refresh_job,
-    stop_proactive_pattern,
     submit_discord_turn,
-    undo_proactive_case,
     _is_ariel_custom_id,
 )
 from tests.fake_sandbox import FakeSandboxRuntime
@@ -727,304 +720,6 @@ def test_refresh_job_fetches_job_and_events(monkeypatch: pytest.MonkeyPatch) -> 
     ]
 
 
-def test_ack_notification_posts_ack_and_returns_job_id(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fake_clients: list[FakeHttpClient] = []
-
-    def fake_client(*, timeout: float) -> FakeHttpClient:
-        assert timeout == 60.0
-        client = FakeHttpClient(
-            responses=[
-                httpx.Response(
-                    200,
-                    json={
-                        "ok": True,
-                        "notification": {
-                            "id": "ntf_123",
-                            "title": "Agency completed",
-                            "payload": {"job_id": "job_123"},
-                        },
-                    },
-                )
-            ]
-        )
-        fake_clients.append(client)
-        return client
-
-    monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
-
-    message, job_id = ack_notification(
-        ariel_base_url="http://127.0.0.1:8000",
-        notification_id="ntf_123",
-    )
-
-    assert message == "Notification acknowledged: Agency completed (ntf_123)"
-    assert job_id == "job_123"
-    assert fake_clients[0].calls == [
-        {
-            "method": "POST",
-            "url": "http://127.0.0.1:8000/v1/notifications/ntf_123/ack",
-            "headers": None,
-            "json": {},
-        }
-    ]
-
-
-def test_ack_proactive_case_posts_ack(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_clients: list[FakeHttpClient] = []
-
-    def fake_client(*, timeout: float) -> FakeHttpClient:
-        assert timeout == 60.0
-        client = FakeHttpClient(
-            responses=[
-                httpx.Response(
-                    200,
-                    json={
-                        "ok": True,
-                        "case": {
-                            "id": "case_123",
-                            "title": "Review inbox conflict",
-                        },
-                        "feedback": {"feedback_type": "ack"},
-                    },
-                )
-            ]
-        )
-        fake_clients.append(client)
-        return client
-
-    monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
-
-    message = ack_proactive_case(
-        ariel_base_url="http://127.0.0.1:8000",
-        case_id="case_123",
-    )
-
-    assert message == "Proactive case acknowledged: Review inbox conflict (case_123)"
-    assert fake_clients[0].calls == [
-        {
-            "method": "POST",
-            "url": "http://127.0.0.1:8000/v1/proactive/cases/case_123/ack",
-            "headers": None,
-            "json": {},
-        }
-    ]
-
-
-def test_correct_proactive_case_posts_correction(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_clients: list[FakeHttpClient] = []
-
-    def fake_client(*, timeout: float) -> FakeHttpClient:
-        assert timeout == 60.0
-        client = FakeHttpClient(
-            responses=[
-                httpx.Response(
-                    200,
-                    json={
-                        "ok": True,
-                        "case": {
-                            "id": "case_123",
-                            "title": "Review inbox conflict",
-                        },
-                        "feedback": {"feedback_type": "correct"},
-                    },
-                )
-            ]
-        )
-        fake_clients.append(client)
-        return client
-
-    monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
-
-    message = correct_proactive_case(
-        ariel_base_url="http://127.0.0.1:8000",
-        case_id="case_123",
-    )
-
-    assert message == "Proactive case marked incorrect: Review inbox conflict (case_123)"
-    assert fake_clients[0].calls == [
-        {
-            "method": "POST",
-            "url": "http://127.0.0.1:8000/v1/proactive/cases/case_123/correct",
-            "headers": None,
-            "json": {"feedback_type": "correct"},
-        }
-    ]
-
-
-def test_stop_proactive_pattern_posts_feedback(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_clients: list[FakeHttpClient] = []
-
-    def fake_client(*, timeout: float) -> FakeHttpClient:
-        assert timeout == 60.0
-        client = FakeHttpClient(
-            responses=[
-                httpx.Response(
-                    200,
-                    json={
-                        "ok": True,
-                        "case": {
-                            "id": "case_123",
-                            "title": "Review inbox conflict",
-                        },
-                        "feedback": {"feedback_type": "stop_pattern"},
-                    },
-                )
-            ]
-        )
-        fake_clients.append(client)
-        return client
-
-    monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
-
-    message = stop_proactive_pattern(
-        ariel_base_url="http://127.0.0.1:8000",
-        case_id="case_123",
-    )
-
-    assert message == "Proactive case muted pattern: Review inbox conflict (case_123)"
-    assert fake_clients[0].calls[0]["url"] == (
-        "http://127.0.0.1:8000/v1/proactive/cases/case_123/stop-pattern"
-    )
-    assert fake_clients[0].calls[0]["json"] == {}
-
-
-def test_more_aggressive_proactive_pattern_posts_feedback(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fake_clients: list[FakeHttpClient] = []
-
-    def fake_client(*, timeout: float) -> FakeHttpClient:
-        assert timeout == 60.0
-        client = FakeHttpClient(
-            responses=[
-                httpx.Response(
-                    200,
-                    json={
-                        "ok": True,
-                        "case": {
-                            "id": "case_123",
-                            "title": "Review inbox conflict",
-                        },
-                        "feedback": {"feedback_type": "more_aggressive"},
-                    },
-                )
-            ]
-        )
-        fake_clients.append(client)
-        return client
-
-    monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
-
-    message = more_aggressive_proactive_pattern(
-        ariel_base_url="http://127.0.0.1:8000",
-        case_id="case_123",
-    )
-
-    assert message == "Proactive case made more aggressive: Review inbox conflict (case_123)"
-    assert fake_clients[0].calls[0]["url"] == (
-        "http://127.0.0.1:8000/v1/proactive/cases/case_123/more-aggressive"
-    )
-    assert fake_clients[0].calls[0]["json"] == {}
-
-
-def test_inspect_proactive_case_fetches_why(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_clients: list[FakeHttpClient] = []
-
-    def fake_client(*, timeout: float) -> FakeHttpClient:
-        assert timeout == 60.0
-        client = FakeHttpClient(
-            responses=[
-                httpx.Response(
-                    200,
-                    json={
-                        "ok": True,
-                        "case": {
-                            "id": "case_123",
-                            "title": "Review inbox conflict",
-                        },
-                        "why": {
-                            "decision": {
-                                "decision_type": "speak_now",
-                                "urgency": "normal",
-                                "rationale": "The case was important enough to surface.",
-                            },
-                            "trigger": {"summary": "Inbox conflict detected."},
-                        },
-                    },
-                )
-            ]
-        )
-        fake_clients.append(client)
-        return client
-
-    monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
-
-    message = inspect_proactive_case(
-        ariel_base_url="http://127.0.0.1:8000",
-        case_id="case_123",
-    )
-
-    assert message == "\n".join(
-        [
-            "Proactive case inspected: Review inbox conflict (case_123)",
-            "Why: The case was important enough to surface.",
-            "Decision: speak_now urgency=normal",
-            "Trigger: Inbox conflict detected.",
-        ]
-    )
-    assert fake_clients[0].calls == [
-        {
-            "method": "GET",
-            "url": "http://127.0.0.1:8000/v1/proactive/cases/case_123/inspect-why",
-        }
-    ]
-
-
-def test_undo_proactive_case_posts_only_to_undo_endpoint(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fake_clients: list[FakeHttpClient] = []
-
-    def fake_client(*, timeout: float) -> FakeHttpClient:
-        assert timeout == 60.0
-        client = FakeHttpClient(
-            responses=[
-                httpx.Response(
-                    200,
-                    json={
-                        "ok": True,
-                        "case": {
-                            "id": "case_123",
-                            "title": "Review inbox conflict",
-                        },
-                        "undo": {"status": "requested"},
-                    },
-                )
-            ]
-        )
-        fake_clients.append(client)
-        return client
-
-    monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
-
-    message = undo_proactive_case(
-        ariel_base_url="http://127.0.0.1:8000",
-        case_id="case_123",
-    )
-
-    assert message == "Proactive case undo requested: Review inbox conflict (case_123)"
-    assert fake_clients[0].calls == [
-        {
-            "method": "POST",
-            "url": "http://127.0.0.1:8000/v1/proactive/cases/case_123/undo",
-            "headers": None,
-            "json": {},
-        }
-    ]
-
-
 def test_status_command_fetches_only_deterministic_ops_endpoints(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1052,16 +747,6 @@ def test_status_command_fetches_only_deterministic_ops_endpoints(
                         ],
                     },
                 ),
-                httpx.Response(
-                    200,
-                    json={
-                        "ok": True,
-                        "notifications": [
-                            {"id": "ntf_1", "status": "delivered", "title": "Review"},
-                            {"id": "ntf_2", "status": "acknowledged", "title": "Done"},
-                        ],
-                    },
-                ),
             ]
         )
         fake_clients.append(client)
@@ -1074,12 +759,10 @@ def test_status_command_fetches_only_deterministic_ops_endpoints(
     assert "Ariel status: ok" in message
     assert "Active session: ses_123 (active)" in message
     assert "Recent jobs: 2 total, 1 active" in message
-    assert "Notifications needing attention: 1" in message
     assert fake_clients[0].calls == [
         {"method": "GET", "url": "http://127.0.0.1:8000/v1/health"},
         {"method": "GET", "url": "http://127.0.0.1:8000/v1/sessions/active"},
         {"method": "GET", "url": "http://127.0.0.1:8000/v1/jobs?limit=5"},
-        {"method": "GET", "url": "http://127.0.0.1:8000/v1/notifications?limit=5"},
     ]
 
 
@@ -1226,54 +909,16 @@ def test_slash_capture_sends_ephemeral_deterministic_response(
     assert interaction.followup.messages[0]["ephemeral"] is True
 
 
-def test_action_view_uses_custom_ids_for_job_refresh_and_notification_ack() -> None:
+def test_action_view_uses_custom_id_for_job_refresh() -> None:
     view = ArielActionView(
         ariel_base_url="http://127.0.0.1:8000",
         job_id="job_123",
-        notification_id="ntf_123",
         allowed_user_id=3,
     )
 
     custom_ids = [cast(Any, item).custom_id for item in view.children]
     assert custom_ids == [
         "ariel:job:refresh:job_123",
-        "ariel:notification:ack:ntf_123",
-    ]
-
-
-def test_action_view_uses_custom_ids_for_proactive_case_actions() -> None:
-    view = ArielActionView(
-        ariel_base_url="http://127.0.0.1:8000",
-        proactive_case_id="case_123",
-        allowed_user_id=3,
-    )
-
-    custom_ids = [cast(Any, item).custom_id for item in view.children]
-    assert custom_ids == [
-        "ariel:proactive:ack:case_123",
-        "ariel:proactive:correct:case_123",
-        "ariel:proactive:stop:case_123",
-        "ariel:proactive:more:case_123",
-        "ariel:proactive:inspect:case_123",
-    ]
-
-
-def test_action_view_adds_proactive_undo_only_when_supported() -> None:
-    view = ArielActionView(
-        ariel_base_url="http://127.0.0.1:8000",
-        proactive_case_id="case_123",
-        proactive_can_undo=True,
-        allowed_user_id=3,
-    )
-
-    custom_ids = [cast(Any, item).custom_id for item in view.children]
-    assert custom_ids == [
-        "ariel:proactive:ack:case_123",
-        "ariel:proactive:correct:case_123",
-        "ariel:proactive:stop:case_123",
-        "ariel:proactive:more:case_123",
-        "ariel:proactive:inspect:case_123",
-        "ariel:proactive:undo:case_123",
     ]
 
 
@@ -1282,21 +927,14 @@ def test_action_view_adds_proactive_undo_only_when_supported() -> None:
     [
         "ariel:approval:approve:apr_123",
         "ariel:job:refresh:job_123",
-        "ariel:notification:ack:ntf_123",
-        "ariel:proactive:ack:case_123",
-        "ariel:proactive:correct:case_123",
-        "ariel:proactive:stop:case_123",
-        "ariel:proactive:more:case_123",
-        "ariel:proactive:inspect:case_123",
-        "ariel:proactive:undo:case_123",
     ],
 )
 def test_is_ariel_custom_id_recognizes_supported_action_prefixes(custom_id: str) -> None:
     assert _is_ariel_custom_id(custom_id) is True
 
 
-def test_is_ariel_custom_id_rejects_unknown_proactive_action() -> None:
-    assert _is_ariel_custom_id("ariel:proactive:snooze:case_123") is False
+def test_is_ariel_custom_id_rejects_unknown_action() -> None:
+    assert _is_ariel_custom_id("ariel:proactive:ack:case_123") is False
 
 
 def test_on_interaction_handles_approval_custom_id(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1337,83 +975,6 @@ def test_on_interaction_handles_approval_custom_id(monkeypatch: pytest.MonkeyPat
         }
     ]
     assert interaction.response.edits[0]["content"] == "Approval approved: apr_123"
-    assert interaction.response.edits[0]["view"] is None
-
-
-@pytest.mark.parametrize(
-    ("custom_id", "function_name", "expected_content"),
-    [
-        (
-            "ariel:proactive:ack:case_123",
-            "ack_proactive_case",
-            "Proactive case acknowledged: case_123",
-        ),
-        (
-            "ariel:proactive:correct:case_123",
-            "correct_proactive_case",
-            "Proactive case marked incorrect: case_123",
-        ),
-        (
-            "ariel:proactive:stop:case_123",
-            "stop_proactive_pattern",
-            "Proactive case muted pattern: case_123",
-        ),
-        (
-            "ariel:proactive:more:case_123",
-            "more_aggressive_proactive_pattern",
-            "Proactive case made more aggressive: case_123",
-        ),
-        (
-            "ariel:proactive:inspect:case_123",
-            "inspect_proactive_case",
-            "Proactive case inspected: case_123",
-        ),
-        (
-            "ariel:proactive:undo:case_123",
-            "undo_proactive_case",
-            "Proactive case undo requested: case_123",
-        ),
-    ],
-)
-def test_on_interaction_handles_proactive_case_custom_ids(
-    monkeypatch: pytest.MonkeyPatch,
-    custom_id: str,
-    function_name: str,
-    expected_content: str,
-) -> None:
-    calls: list[dict[str, Any]] = []
-
-    def fake_proactive_action(
-        *,
-        ariel_base_url: str,
-        ariel_auth_token: str | None = None,
-        case_id: str,
-    ) -> str:
-        calls.append(
-            {
-                "ariel_base_url": ariel_base_url,
-                "ariel_auth_token": ariel_auth_token,
-                "case_id": case_id,
-                "function_name": function_name,
-            }
-        )
-        return expected_content
-
-    monkeypatch.setattr(f"ariel.discord_bot.{function_name}", fake_proactive_action)
-    bot = _bot()
-    interaction = FakeInteraction(custom_id=custom_id, channel_id=88)
-
-    _send_interaction(bot, interaction)
-
-    assert calls == [
-        {
-            "ariel_base_url": "http://127.0.0.1:8000",
-            "ariel_auth_token": None,
-            "case_id": "case_123",
-            "function_name": function_name,
-        }
-    ]
-    assert interaction.response.edits[0]["content"] == expected_content
     assert interaction.response.edits[0]["view"] is None
 
 

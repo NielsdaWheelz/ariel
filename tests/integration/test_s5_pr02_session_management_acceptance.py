@@ -308,7 +308,6 @@ def test_s5_pr02_context_bundle_follows_constitution_section_order_and_includes_
         observations = bundle["relevant_artifacts_and_observations"]
         assert isinstance(observations, dict)
         assert isinstance(observations["artifacts"], list)
-        assert isinstance(observations["proactive_observations"], list)
 
 
 def test_s5_pr02_timeline_supports_after_cursor_for_incremental_sync(

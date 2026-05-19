@@ -24,13 +24,6 @@ class ArielDiscordError(Exception):
 
 _APPROVAL_CUSTOM_ID_PREFIX = "ariel:approval:"
 _JOB_REFRESH_CUSTOM_ID_PREFIX = "ariel:job:refresh:"
-_NOTIFICATION_ACK_CUSTOM_ID_PREFIX = "ariel:notification:ack:"
-_PROACTIVE_ACK_CUSTOM_ID_PREFIX = "ariel:proactive:ack:"
-_PROACTIVE_CORRECT_CUSTOM_ID_PREFIX = "ariel:proactive:correct:"
-_PROACTIVE_STOP_CUSTOM_ID_PREFIX = "ariel:proactive:stop:"
-_PROACTIVE_MORE_CUSTOM_ID_PREFIX = "ariel:proactive:more:"
-_PROACTIVE_INSPECT_CUSTOM_ID_PREFIX = "ariel:proactive:inspect:"
-_PROACTIVE_UNDO_CUSTOM_ID_PREFIX = "ariel:proactive:undo:"
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,24 +123,14 @@ def get_status(
         if jobs_response.status_code >= 400 or jobs_payload.get("ok") is not True:
             raise ArielDiscordError(_safe_ariel_error_message(jobs_payload))
 
-        notifications_response = client.get(
-            f"{ariel_base_url}/v1/notifications?limit=5",
-            headers=_auth_headers(ariel_auth_token),
-        )
-        notifications_payload = _json_response_payload(notifications_response)
-        if notifications_response.status_code >= 400 or notifications_payload.get("ok") is not True:
-            raise ArielDiscordError(_safe_ariel_error_message(notifications_payload))
-
     session = session_payload.get("session")
     if not isinstance(session, dict):
         raise ArielDiscordError("Ariel returned an invalid active session response.")
 
     jobs = jobs_payload.get("jobs")
-    notifications = notifications_payload.get("notifications")
     return _format_status_for_discord(
         session=session,
         jobs=jobs if isinstance(jobs, list) else [],
-        notifications=notifications if isinstance(notifications, list) else [],
     )
 
 
@@ -246,134 +229,6 @@ def refresh_job(
             raise ArielDiscordError(_safe_ariel_error_message(events_payload))
 
     return _format_job_response_for_discord(job_payload, events_payload)
-
-
-def ack_notification(
-    *,
-    ariel_base_url: str,
-    ariel_auth_token: str | None = None,
-    notification_id: str,
-) -> tuple[str, str | None]:
-    with httpx.Client(timeout=60.0) as client:
-        response = client.post(
-            f"{ariel_base_url}/v1/notifications/{notification_id}/ack",
-            headers=_auth_headers(ariel_auth_token),
-            json={},
-        )
-        payload = _json_response_payload(response)
-        if response.status_code >= 400 or payload.get("ok") is not True:
-            raise ArielDiscordError(_safe_ariel_error_message(payload))
-    notification = payload.get("notification")
-    if not isinstance(notification, dict):
-        raise ArielDiscordError("Ariel returned an invalid notification response.")
-    return _format_notification_ack_for_discord(notification), _notification_job_id(notification)
-
-
-def ack_proactive_case(
-    *,
-    ariel_base_url: str,
-    ariel_auth_token: str | None = None,
-    case_id: str,
-) -> str:
-    with httpx.Client(timeout=60.0) as client:
-        response = client.post(
-            f"{ariel_base_url}/v1/proactive/cases/{case_id}/ack",
-            headers=_auth_headers(ariel_auth_token),
-            json={},
-        )
-        payload = _json_response_payload(response)
-        if response.status_code >= 400 or payload.get("ok") is not True:
-            raise ArielDiscordError(_safe_ariel_error_message(payload))
-    return _format_proactive_case_action_for_discord(payload, action="acknowledged")
-
-
-def correct_proactive_case(
-    *,
-    ariel_base_url: str,
-    ariel_auth_token: str | None = None,
-    case_id: str,
-) -> str:
-    with httpx.Client(timeout=60.0) as client:
-        response = client.post(
-            f"{ariel_base_url}/v1/proactive/cases/{case_id}/correct",
-            headers=_auth_headers(ariel_auth_token),
-            json={"feedback_type": "correct"},
-        )
-        payload = _json_response_payload(response)
-        if response.status_code >= 400 or payload.get("ok") is not True:
-            raise ArielDiscordError(_safe_ariel_error_message(payload))
-    return _format_proactive_case_action_for_discord(payload, action="marked incorrect")
-
-
-def stop_proactive_pattern(
-    *,
-    ariel_base_url: str,
-    ariel_auth_token: str | None = None,
-    case_id: str,
-) -> str:
-    with httpx.Client(timeout=60.0) as client:
-        response = client.post(
-            f"{ariel_base_url}/v1/proactive/cases/{case_id}/stop-pattern",
-            headers=_auth_headers(ariel_auth_token),
-            json={},
-        )
-        payload = _json_response_payload(response)
-        if response.status_code >= 400 or payload.get("ok") is not True:
-            raise ArielDiscordError(_safe_ariel_error_message(payload))
-    return _format_proactive_case_action_for_discord(payload, action="muted pattern")
-
-
-def more_aggressive_proactive_pattern(
-    *,
-    ariel_base_url: str,
-    ariel_auth_token: str | None = None,
-    case_id: str,
-) -> str:
-    with httpx.Client(timeout=60.0) as client:
-        response = client.post(
-            f"{ariel_base_url}/v1/proactive/cases/{case_id}/more-aggressive",
-            headers=_auth_headers(ariel_auth_token),
-            json={},
-        )
-        payload = _json_response_payload(response)
-        if response.status_code >= 400 or payload.get("ok") is not True:
-            raise ArielDiscordError(_safe_ariel_error_message(payload))
-    return _format_proactive_case_action_for_discord(payload, action="made more aggressive")
-
-
-def inspect_proactive_case(
-    *,
-    ariel_base_url: str,
-    ariel_auth_token: str | None = None,
-    case_id: str,
-) -> str:
-    with httpx.Client(timeout=60.0) as client:
-        response = client.get(
-            f"{ariel_base_url}/v1/proactive/cases/{case_id}/inspect-why",
-            headers=_auth_headers(ariel_auth_token),
-        )
-        payload = _json_response_payload(response)
-        if response.status_code >= 400 or payload.get("ok") is not True:
-            raise ArielDiscordError(_safe_ariel_error_message(payload))
-    return _format_proactive_case_inspection_for_discord(payload)
-
-
-def undo_proactive_case(
-    *,
-    ariel_base_url: str,
-    ariel_auth_token: str | None = None,
-    case_id: str,
-) -> str:
-    with httpx.Client(timeout=60.0) as client:
-        response = client.post(
-            f"{ariel_base_url}/v1/proactive/cases/{case_id}/undo",
-            headers=_auth_headers(ariel_auth_token),
-            json={},
-        )
-        payload = _json_response_payload(response)
-        if response.status_code >= 400 or payload.get("ok") is not True:
-            raise ArielDiscordError(_safe_ariel_error_message(payload))
-    return _format_proactive_case_action_for_discord(payload, action="undo requested")
 
 
 class ArielDiscordBot(commands.Bot):
@@ -644,83 +499,6 @@ class ArielDiscordBot(commands.Bot):
                     allowed_user_id=self.ariel_user_id,
                 )
                 return
-        elif custom_id.startswith(_NOTIFICATION_ACK_CUSTOM_ID_PREFIX):
-            notification_id = custom_id.removeprefix(_NOTIFICATION_ACK_CUSTOM_ID_PREFIX)
-            if notification_id:
-                await _edit_with_notification_ack(
-                    interaction=interaction,
-                    ariel_base_url=self.ariel_base_url,
-                    ariel_auth_token=self.ariel_auth_token,
-                    notification_id=notification_id,
-                    allowed_user_id=self.ariel_user_id,
-                )
-                return
-        elif custom_id.startswith(_PROACTIVE_ACK_CUSTOM_ID_PREFIX):
-            case_id = custom_id.removeprefix(_PROACTIVE_ACK_CUSTOM_ID_PREFIX)
-            if case_id:
-                await _edit_with_proactive_case_action(
-                    interaction=interaction,
-                    ariel_base_url=self.ariel_base_url,
-                    ariel_auth_token=self.ariel_auth_token,
-                    case_id=case_id,
-                    action=ack_proactive_case,
-                )
-                return
-        elif custom_id.startswith(_PROACTIVE_CORRECT_CUSTOM_ID_PREFIX):
-            case_id = custom_id.removeprefix(_PROACTIVE_CORRECT_CUSTOM_ID_PREFIX)
-            if case_id:
-                await _edit_with_proactive_case_action(
-                    interaction=interaction,
-                    ariel_base_url=self.ariel_base_url,
-                    ariel_auth_token=self.ariel_auth_token,
-                    case_id=case_id,
-                    action=correct_proactive_case,
-                )
-                return
-        elif custom_id.startswith(_PROACTIVE_STOP_CUSTOM_ID_PREFIX):
-            case_id = custom_id.removeprefix(_PROACTIVE_STOP_CUSTOM_ID_PREFIX)
-            if case_id:
-                await _edit_with_proactive_case_action(
-                    interaction=interaction,
-                    ariel_base_url=self.ariel_base_url,
-                    ariel_auth_token=self.ariel_auth_token,
-                    case_id=case_id,
-                    action=stop_proactive_pattern,
-                )
-                return
-        elif custom_id.startswith(_PROACTIVE_MORE_CUSTOM_ID_PREFIX):
-            case_id = custom_id.removeprefix(_PROACTIVE_MORE_CUSTOM_ID_PREFIX)
-            if case_id:
-                await _edit_with_proactive_case_action(
-                    interaction=interaction,
-                    ariel_base_url=self.ariel_base_url,
-                    ariel_auth_token=self.ariel_auth_token,
-                    case_id=case_id,
-                    action=more_aggressive_proactive_pattern,
-                )
-                return
-        elif custom_id.startswith(_PROACTIVE_INSPECT_CUSTOM_ID_PREFIX):
-            case_id = custom_id.removeprefix(_PROACTIVE_INSPECT_CUSTOM_ID_PREFIX)
-            if case_id:
-                await _edit_with_proactive_case_action(
-                    interaction=interaction,
-                    ariel_base_url=self.ariel_base_url,
-                    ariel_auth_token=self.ariel_auth_token,
-                    case_id=case_id,
-                    action=inspect_proactive_case,
-                )
-                return
-        elif custom_id.startswith(_PROACTIVE_UNDO_CUSTOM_ID_PREFIX):
-            case_id = custom_id.removeprefix(_PROACTIVE_UNDO_CUSTOM_ID_PREFIX)
-            if case_id:
-                await _edit_with_proactive_case_action(
-                    interaction=interaction,
-                    ariel_base_url=self.ariel_base_url,
-                    ariel_auth_token=self.ariel_auth_token,
-                    case_id=case_id,
-                    action=undo_proactive_case,
-                )
-                return
         await interaction.response.send_message(
             "Ariel action failed: invalid Discord action id.",
             ephemeral=True,
@@ -927,67 +705,10 @@ def _format_job_response_for_discord(
     return "\n".join(lines)
 
 
-def _format_notification_ack_for_discord(notification: dict[str, Any]) -> str:
-    notification_id = notification.get("id")
-    title = notification.get("title")
-    if not isinstance(notification_id, str) or not isinstance(title, str):
-        raise ArielDiscordError("Ariel returned an invalid notification response.")
-    return f"Notification acknowledged: {title} ({notification_id})"
-
-
-def _format_proactive_case_action_for_discord(payload: dict[str, Any], *, action: str) -> str:
-    proactive_case = payload.get("case")
-    if not isinstance(proactive_case, dict):
-        raise ArielDiscordError("Ariel returned an invalid proactive case response.")
-    case_id = proactive_case.get("id")
-    if not isinstance(case_id, str) or not case_id:
-        raise ArielDiscordError("Ariel returned an invalid proactive case response.")
-    title = proactive_case.get("title")
-    if not isinstance(title, str) or not title.strip():
-        title = proactive_case.get("summary")
-    if isinstance(title, str) and title.strip():
-        return f"Proactive case {action}: {title.strip()} ({case_id})"
-    return f"Proactive case {action}: {case_id}"
-
-
-def _format_proactive_case_inspection_for_discord(payload: dict[str, Any]) -> str:
-    proactive_case = payload.get("case")
-    why = payload.get("why")
-    if not isinstance(proactive_case, dict) or not isinstance(why, dict):
-        raise ArielDiscordError("Ariel returned an invalid proactive inspection response.")
-    case_id = proactive_case.get("id")
-    if not isinstance(case_id, str) or not case_id:
-        raise ArielDiscordError("Ariel returned an invalid proactive inspection response.")
-    title = proactive_case.get("title")
-    lines = [
-        (
-            f"Proactive case inspected: {title.strip()} ({case_id})"
-            if isinstance(title, str) and title.strip()
-            else f"Proactive case inspected: {case_id}"
-        )
-    ]
-    decision = why.get("decision")
-    if isinstance(decision, dict):
-        rationale = decision.get("rationale")
-        if isinstance(rationale, str) and rationale.strip():
-            lines.append(f"Why: {rationale.strip()}")
-        decision_type = decision.get("decision_type")
-        urgency = decision.get("urgency")
-        if isinstance(decision_type, str) and isinstance(urgency, str):
-            lines.append(f"Decision: {decision_type} urgency={urgency}")
-    trigger = why.get("trigger")
-    if isinstance(trigger, dict):
-        summary = trigger.get("summary")
-        if isinstance(summary, str) and summary.strip():
-            lines.append(f"Trigger: {summary.strip()}")
-    return "\n".join(lines)
-
-
 def _format_status_for_discord(
     *,
     session: dict[str, Any],
     jobs: list[Any],
-    notifications: list[Any],
 ) -> str:
     session_id = session.get("id")
     session_state = session.get("lifecycle_state")
@@ -1001,19 +722,11 @@ def _format_status_for_discord(
         if job.get("status") in {"queued", "running", "waiting_approval"}:
             running_jobs += 1
 
-    pending_notifications = 0
-    for notification in notifications:
-        if not isinstance(notification, dict):
-            continue
-        if notification.get("status") in {"pending", "delivered", "failed"}:
-            pending_notifications += 1
-
     return "\n".join(
         [
             "Ariel status: ok",
             f"Active session: {session_id} ({session_state})",
             f"Recent jobs: {len(jobs)} total, {running_jobs} active",
-            f"Notifications needing attention: {pending_notifications}",
         ]
     )
 
@@ -1036,12 +749,6 @@ def _format_jobs_for_discord(jobs: list[Any]) -> str:
     return "\n".join(lines)
 
 
-def _notification_job_id(notification: dict[str, Any]) -> str | None:
-    payload = notification.get("payload")
-    job_id = payload.get("job_id") if isinstance(payload, dict) else None
-    return job_id if isinstance(job_id, str) and job_id else None
-
-
 def _approval_custom_id(decision: str, approval_ref: str) -> str:
     return f"{_APPROVAL_CUSTOM_ID_PREFIX}{decision}:{approval_ref}"
 
@@ -1050,46 +757,11 @@ def _job_refresh_custom_id(job_id: str) -> str:
     return f"{_JOB_REFRESH_CUSTOM_ID_PREFIX}{job_id}"
 
 
-def _notification_ack_custom_id(notification_id: str) -> str:
-    return f"{_NOTIFICATION_ACK_CUSTOM_ID_PREFIX}{notification_id}"
-
-
-def _proactive_ack_custom_id(case_id: str) -> str:
-    return f"{_PROACTIVE_ACK_CUSTOM_ID_PREFIX}{case_id}"
-
-
-def _proactive_correct_custom_id(case_id: str) -> str:
-    return f"{_PROACTIVE_CORRECT_CUSTOM_ID_PREFIX}{case_id}"
-
-
-def _proactive_stop_custom_id(case_id: str) -> str:
-    return f"{_PROACTIVE_STOP_CUSTOM_ID_PREFIX}{case_id}"
-
-
-def _proactive_more_custom_id(case_id: str) -> str:
-    return f"{_PROACTIVE_MORE_CUSTOM_ID_PREFIX}{case_id}"
-
-
-def _proactive_inspect_custom_id(case_id: str) -> str:
-    return f"{_PROACTIVE_INSPECT_CUSTOM_ID_PREFIX}{case_id}"
-
-
-def _proactive_undo_custom_id(case_id: str) -> str:
-    return f"{_PROACTIVE_UNDO_CUSTOM_ID_PREFIX}{case_id}"
-
-
 def _is_ariel_custom_id(custom_id: str) -> bool:
     return custom_id.startswith(
         (
             _APPROVAL_CUSTOM_ID_PREFIX,
             _JOB_REFRESH_CUSTOM_ID_PREFIX,
-            _NOTIFICATION_ACK_CUSTOM_ID_PREFIX,
-            _PROACTIVE_ACK_CUSTOM_ID_PREFIX,
-            _PROACTIVE_CORRECT_CUSTOM_ID_PREFIX,
-            _PROACTIVE_STOP_CUSTOM_ID_PREFIX,
-            _PROACTIVE_MORE_CUSTOM_ID_PREFIX,
-            _PROACTIVE_INSPECT_CUSTOM_ID_PREFIX,
-            _PROACTIVE_UNDO_CUSTOM_ID_PREFIX,
         )
     )
 
@@ -1219,68 +891,6 @@ async def _edit_with_job_refresh(
     )
 
 
-async def _edit_with_notification_ack(
-    *,
-    interaction: discord.Interaction,
-    ariel_base_url: str,
-    ariel_auth_token: str | None,
-    notification_id: str,
-    allowed_user_id: int | None,
-) -> None:
-    try:
-        content, job_id = await asyncio.to_thread(
-            ack_notification,
-            ariel_base_url=ariel_base_url,
-            ariel_auth_token=ariel_auth_token,
-            notification_id=notification_id,
-        )
-    except ArielDiscordError as exc:
-        content = f"Ariel request failed: {exc}"
-        job_id = None
-    except httpx.HTTPError:
-        content = "Ariel request failed: could not reach the local Ariel API."
-        job_id = None
-    await interaction.response.edit_message(
-        content=format_discord_message(content),
-        view=(
-            ArielActionView(
-                ariel_base_url=ariel_base_url,
-                job_id=job_id,
-                allowed_user_id=allowed_user_id,
-            )
-            if job_id is not None
-            else None
-        ),
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
-
-
-async def _edit_with_proactive_case_action(
-    *,
-    interaction: discord.Interaction,
-    ariel_base_url: str,
-    ariel_auth_token: str | None,
-    case_id: str,
-    action: Any,
-) -> None:
-    try:
-        content = await asyncio.to_thread(
-            action,
-            ariel_base_url=ariel_base_url,
-            ariel_auth_token=ariel_auth_token,
-            case_id=case_id,
-        )
-    except ArielDiscordError as exc:
-        content = f"Ariel request failed: {exc}"
-    except httpx.HTTPError:
-        content = "Ariel request failed: could not reach the local Ariel API."
-    await interaction.response.edit_message(
-        content=format_discord_message(content),
-        view=None,
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
-
-
 class ArielActionView(discord.ui.View):
     def __init__(
         self,
@@ -1288,9 +898,6 @@ class ArielActionView(discord.ui.View):
         ariel_base_url: str,
         approval_refs: list[str] | None = None,
         job_id: str | None = None,
-        notification_id: str | None = None,
-        proactive_case_id: str | None = None,
-        proactive_can_undo: bool = False,
         allowed_user_id: int | None = None,
     ) -> None:
         super().__init__(timeout=None)
@@ -1318,58 +925,6 @@ class ArielActionView(discord.ui.View):
                 custom_id=_job_refresh_custom_id(job_id),
             )
             self.add_item(refresh_button)
-
-        if notification_id is not None:
-            ack_button: discord.ui.Button[ArielActionView] = discord.ui.Button(
-                label="Acknowledge",
-                style=discord.ButtonStyle.primary,
-                custom_id=_notification_ack_custom_id(notification_id),
-            )
-            self.add_item(ack_button)
-
-        if proactive_case_id is not None:
-            proactive_ack_button: discord.ui.Button[ArielActionView] = discord.ui.Button(
-                label="Acknowledge",
-                style=discord.ButtonStyle.primary,
-                custom_id=_proactive_ack_custom_id(proactive_case_id),
-            )
-            self.add_item(proactive_ack_button)
-
-            correct_button: discord.ui.Button[ArielActionView] = discord.ui.Button(
-                label="Incorrect",
-                style=discord.ButtonStyle.secondary,
-                custom_id=_proactive_correct_custom_id(proactive_case_id),
-            )
-            self.add_item(correct_button)
-
-            stop_button: discord.ui.Button[ArielActionView] = discord.ui.Button(
-                label="Stop pattern",
-                style=discord.ButtonStyle.danger,
-                custom_id=_proactive_stop_custom_id(proactive_case_id),
-            )
-            self.add_item(stop_button)
-
-            more_button: discord.ui.Button[ArielActionView] = discord.ui.Button(
-                label="More",
-                style=discord.ButtonStyle.secondary,
-                custom_id=_proactive_more_custom_id(proactive_case_id),
-            )
-            self.add_item(more_button)
-
-            inspect_button: discord.ui.Button[ArielActionView] = discord.ui.Button(
-                label="Why?",
-                style=discord.ButtonStyle.secondary,
-                custom_id=_proactive_inspect_custom_id(proactive_case_id),
-            )
-            self.add_item(inspect_button)
-
-            if proactive_can_undo:
-                undo_button: discord.ui.Button[ArielActionView] = discord.ui.Button(
-                    label="Undo",
-                    style=discord.ButtonStyle.danger,
-                    custom_id=_proactive_undo_custom_id(proactive_case_id),
-                )
-                self.add_item(undo_button)
 
 
 def main() -> None:

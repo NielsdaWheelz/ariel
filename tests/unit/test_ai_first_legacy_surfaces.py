@@ -159,6 +159,22 @@ def test_old_proactive_attention_runtime_surfaces_are_absent() -> None:
 
 
 @pytest.mark.parametrize(
+    "route",
+    [
+        "/v1/proactive/",
+        "/v1/work/commitments",
+        "/v1/email/thread-watches",
+        "/v1/notifications",
+    ],
+)
+def test_old_proactive_api_and_client_routes_are_absent(route: str) -> None:
+    """The proactivity cutover deleted the proactive, work-commitment,
+    thread-watch, and notification API surface; no app route registers them
+    and the Discord client no longer calls them."""
+    _assert_absent(route, "src/ariel")
+
+
+@pytest.mark.parametrize(
     "pattern",
     [
         "ambient observation derivation",

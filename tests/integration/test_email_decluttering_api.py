@@ -10,7 +10,6 @@ from fastapi.testclient import TestClient
 from ariel.app import create_app
 from ariel.persistence import (
     ActionAttemptRecord,
-    EmailThreadWatchRecord,
     ProviderWriteReceiptRecord,
     SessionRecord,
     TurnRecord,
@@ -131,27 +130,6 @@ def test_email_state_inspection_endpoints_return_serialized_records(
                     updated_at=now,
                 )
             )
-            db.add(
-                EmailThreadWatchRecord(
-                    id="etw_api",
-                    provider="google",
-                    provider_account_id="con_google",
-                    provider_thread_id="thr_1",
-                    anchor_message_id="msg_1",
-                    condition="no_reply_by_deadline",
-                    deadline=now + timedelta(hours=1),
-                    note="wait for a reply",
-                    status="active",
-                    idempotency_key="email:watch:idem_1",
-                    created_by_action_attempt_id="aat_email_api",
-                    matched_message_id=None,
-                    matched_at=None,
-                    canceled_at=None,
-                    completed_at=None,
-                    created_at=now,
-                    updated_at=now,
-                )
-            )
 
     action_list = client.get(
         "/v1/email/actions",
@@ -170,22 +148,6 @@ def test_email_state_inspection_endpoints_return_serialized_records(
     assert action_detail.status_code == 200
     assert action_detail.json()["email_action"]["provider_message_ids"] == ["msg_1"]
 
-    watch_list = client.get(
-        "/v1/email/thread-watches",
-        params={"provider_account_id": "con_google", "status": "active"},
-    )
-    assert watch_list.status_code == 200
-    watch_payload = watch_list.json()
-    assert watch_payload["ok"] is True
-    assert [watch["id"] for watch in watch_payload["email_thread_watches"]] == ["etw_api"]
-
-    watch_detail = client.get(
-        "/v1/email/thread-watches/etw_api",
-        params={"provider_account_id": "con_google"},
-    )
-    assert watch_detail.status_code == 200
-    assert watch_detail.json()["email_thread_watch"]["condition"] == "no_reply_by_deadline"
-
     wrong_account = client.get(
         "/v1/email/actions/ema_api",
         params={"provider_account_id": "other_google_account"},
@@ -198,10 +160,3 @@ def test_email_state_inspection_endpoints_return_serialized_records(
     )
     assert missing_action.status_code == 404
     assert missing_action.json()["error"]["code"] == "E_EMAIL_ACTION_NOT_FOUND"
-
-    missing_watch = client.get(
-        "/v1/email/thread-watches/etw_missing",
-        params={"provider_account_id": "con_google"},
-    )
-    assert missing_watch.status_code == 404
-    assert missing_watch.json()["error"]["code"] == "E_EMAIL_THREAD_WATCH_NOT_FOUND"
