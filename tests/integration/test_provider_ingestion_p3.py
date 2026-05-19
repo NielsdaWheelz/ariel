@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from ariel.app import ModelAdapter, create_app
+from tests.integration.responses_helpers import empty_recall_response, is_retriever_call
 from ariel.config import AppSettings
 from ariel.google_connector import (
     GOOGLE_CONNECTOR_ID,
@@ -146,7 +147,17 @@ class ConnectOAuthClient:
 
 @dataclass
 class _NoCallAdapter:
-    def create_response(self, **_: Any) -> dict[str, Any]:
+    provider: str = "provider.test"
+    model: str = "model.test"
+
+    def create_response(
+        self,
+        *,
+        input_items: list[dict[str, Any]],
+        **_: Any,
+    ) -> dict[str, Any]:
+        if is_retriever_call(input_items):
+            return empty_recall_response(provider=self.provider, model=self.model)
         raise AssertionError("model should not be called in this test")
 
 

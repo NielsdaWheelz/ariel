@@ -42,7 +42,11 @@ from ariel.persistence import (
 from ariel.research_runtime import ResearchFinding, render_finding
 from ariel.worker import _agent_wake_context, process_one_task
 from tests.fake_sandbox import FakeSandboxRuntime
-from tests.integration.responses_helpers import run_function_calls
+from tests.integration.responses_helpers import (
+    empty_recall_response,
+    is_retriever_call,
+    run_function_calls,
+)
 
 NOW = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
 
@@ -267,6 +271,8 @@ class _ResearchRunAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
+        if is_retriever_call(input_items):
+            return empty_recall_response(provider=self.provider, model=self.model)
         del tools, user_message, history, context_bundle
         self.snapshots.append(list(input_items))
         call_index = len(self.snapshots)
@@ -530,6 +536,8 @@ def test_worker_completion_wake_renders_finding_into_main_agent_context(
             history: list[dict[str, Any]],
             context_bundle: dict[str, Any],
         ) -> dict[str, Any]:
+            if is_retriever_call(input_items):
+                return empty_recall_response(provider=self.provider, model=self.model)
             del tools, user_message, history, context_bundle
             self.snapshots.append(list(input_items))
             source = "agent.emit_message(text='Here is what the research found.')\n"

@@ -21,7 +21,7 @@ from typing import Any, cast
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, inspect, select, text
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 from sqlalchemy.orm import Session, sessionmaker
 
 from ariel.agent_loop import run_agent_loop
@@ -46,9 +46,7 @@ def _new_id(prefix: str) -> str:
 NOW = datetime(2026, 5, 19, 12, 0, tzinfo=UTC)
 
 # Canned retriever program: emits a finding immediately.
-_RETRIEVER_PROGRAM = (
-    "agent.emit_finding(summary='no memories',claims=[],gaps=[],sources=[],status='complete')\n"
-)
+_RETRIEVER_PROGRAM = "agent.emit_finding(summary='no memories',claims=[],gaps=[],sources=[])\n"
 
 # Canned main-agent program: emits a message.
 _EMIT_MSG = "agent.emit_message(text='hello')\n"
@@ -227,7 +225,10 @@ def test_schema_memory_log_append_only_update_raises(
     with session_factory() as db:
         with db.begin():
             db.add(row)
-    with pytest.raises((IntegrityError, OperationalError), match="memory_log is append-only"):
+    with pytest.raises(
+        (IntegrityError, OperationalError, ProgrammingError),
+        match="memory_log is append-only",
+    ):
         with session_factory() as db:
             with db.begin():
                 db.execute(text("UPDATE memory_log SET content='x' WHERE id=:id"), {"id": row.id})
@@ -251,7 +252,10 @@ def test_schema_memory_log_append_only_delete_raises(
     with session_factory() as db:
         with db.begin():
             db.add(row)
-    with pytest.raises((IntegrityError, OperationalError), match="memory_log is append-only"):
+    with pytest.raises(
+        (IntegrityError, OperationalError, ProgrammingError),
+        match="memory_log is append-only",
+    ):
         with session_factory() as db:
             with db.begin():
                 db.execute(text("DELETE FROM memory_log WHERE id=:id"), {"id": row.id})
@@ -439,8 +443,8 @@ def test_retired_task_types_rejected_by_check_constraint(
                     db.execute(
                         text(
                             "INSERT INTO background_tasks"
-                            " (id,task_type,payload,status,attempts,run_after,created_at,updated_at)"
-                            " VALUES (:id,:tt,'{}','pending',0,now(),now(),now())"
+                            " (id,task_type,payload,attempts,run_after,created_at,updated_at)"
+                            " VALUES (:id,:tt,'{}',0,now(),now(),now())"
                         ),
                         {"id": _new_id("bgt"), "tt": bad},
                     )
@@ -573,7 +577,10 @@ def test_memory_log_append_only_via_sqlalchemy_session(
             db.add(row)
         row_id = row.id
 
-    with pytest.raises((IntegrityError, OperationalError), match="memory_log is append-only"):
+    with pytest.raises(
+        (IntegrityError, OperationalError, ProgrammingError),
+        match="memory_log is append-only",
+    ):
         with session_factory() as db:
             with db.begin():
                 db.execute(

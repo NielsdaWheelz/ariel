@@ -12,6 +12,8 @@ from sqlalchemy import text
 
 from ariel.app import ModelAdapter, ModelAdapterError, create_app
 from tests.integration.responses_helpers import (
+    empty_recall_response,
+    is_retriever_call,
     post_message_and_drain,
     responses_message,
     responses_run_message,
@@ -48,6 +50,8 @@ class DeterministicModelAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
+        if is_retriever_call(input_items):
+            return empty_recall_response(provider=self.provider, model=self.model)
         del tools, history, context_bundle
         if self.fail:
             raise RuntimeError("simulated provider failure")
@@ -77,6 +81,8 @@ class NoVisibleResponseAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
+        if is_retriever_call(input_items):
+            return empty_recall_response(provider=self.provider, model=self.model)
         del tools, history, user_message
         self.input_items.append(input_items)
         self.context_bundles.append(context_bundle)
@@ -108,6 +114,8 @@ class CapturingAttachmentAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
+        if is_retriever_call(input_items):
+            return empty_recall_response(provider=self.provider, model=self.model)
         del tools, history
         self.input_items.append(input_items)
         self.context_bundles.append(context_bundle)
@@ -136,6 +144,8 @@ class AttachmentReadAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
+        if is_retriever_call(input_items):
+            return empty_recall_response(provider=self.provider, model=self.model)
         del tools, user_message, history
         if context_bundle.get("origin") == "tool_result_interpretation":
             interpreter_input = json.loads(
@@ -215,6 +225,8 @@ class ContextWindowDecisionAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
+        if is_retriever_call(input_items):
+            return empty_recall_response(provider=self.provider, model=self.model)
         del tools, history
         self.context_bundles.append(context_bundle)
 
@@ -275,6 +287,8 @@ class MutatingContextAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
+        if is_retriever_call(input_items):
+            return empty_recall_response(provider=self.provider, model=self.model)
         del tools, user_message, history
         section_order = context_bundle.get("section_order")
         if isinstance(section_order, list):
@@ -977,6 +991,8 @@ class SecretLeakingFailureAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
+        if is_retriever_call(input_items):
+            return empty_recall_response(provider=self.provider, model=self.model)
         del tools, user_message, history, context_bundle
         raise RuntimeError(f"provider rejected credential {self.secret_value}")
 
@@ -995,6 +1011,8 @@ class NonSecretFailureAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
+        if is_retriever_call(input_items):
+            return empty_recall_response(provider=self.provider, model=self.model)
         del tools, user_message, history, context_bundle
         raise RuntimeError("token limit exceeded for this request")
 
@@ -1112,6 +1130,8 @@ class LongResponseAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
+        if is_retriever_call(input_items):
+            return empty_recall_response(provider=self.provider, model=self.model)
         del tools, user_message, history, context_bundle
         assistant_text = " ".join(["long"] * self.response_token_count)
         return responses_run_message(
@@ -1139,6 +1159,8 @@ class UsageDrivenResponseAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
+        if is_retriever_call(input_items):
+            return empty_recall_response(provider=self.provider, model=self.model)
         del tools, user_message, history, context_bundle
         return responses_run_message(
             assistant_text="ok",
@@ -1165,6 +1187,8 @@ class RetryableFailureAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
+        if is_retriever_call(input_items):
+            return empty_recall_response(provider=self.provider, model=self.model)
         del tools, user_message, history, context_bundle
         self.attempts += 1
         raise ModelAdapterError(
@@ -1362,6 +1386,8 @@ def test_pr02_stuck_detection_ends_turn_gracefully(
             history: list[dict[str, Any]],
             context_bundle: dict[str, Any],
         ) -> dict[str, Any]:
+            if is_retriever_call(input_items):
+                return empty_recall_response(provider=self.provider, model=self.model)
             del tools, user_message, history, context_bundle, input_items
             # A program that only calls emit_value (loop continues with same
             # source every time — triggers stuck-detection on round 2).

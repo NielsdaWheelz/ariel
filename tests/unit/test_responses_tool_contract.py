@@ -79,7 +79,7 @@ def test_run_callable_aliases_are_unique_and_deliberate() -> None:
         assert capability_id_for_run_callable(alias) == capability_id
 
     assert capability_id_for_run_callable("discord.no_response") is None
-    assert capability_id_for_run_callable("memory.search") is None
+    assert capability_id_for_run_callable("memory.forget_all") is None
 
 
 def test_internal_callable_eligibility_is_default_deny() -> None:

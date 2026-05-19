@@ -28,6 +28,7 @@ without creating a cycle.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from collections.abc import Callable
@@ -711,6 +712,20 @@ def run_agent_loop(
         round_start = len(responses_input_items)
 
         if run_program_result.emitted_values:
+            # Surface one evt.agent.value_emitted event per value (digest only,
+            # not the value itself — values stay internal feedback).
+            for index, value in enumerate(run_program_result.emitted_values):
+                encoded = json.dumps(value, sort_keys=True).encode()
+                add_event(
+                    "evt.agent.value_emitted",
+                    {
+                        "index": index,
+                        "value_digest": hashlib.sha256(encoded).hexdigest(),
+                        "value_bytes": len(encoded),
+                        "model_call_count": model_call_count,
+                        "provider_response_id": candidate_response.get("provider_response_id"),
+                    },
+                )
             # Emit_value round: evict the previous emit_value round's items so
             # only the most recent round's values are in context.
             if last_emit_value_tail is not None:

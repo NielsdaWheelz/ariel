@@ -14,6 +14,8 @@ import ariel.action_runtime as action_runtime_module
 import ariel.policy_engine as policy_engine_module
 from ariel.app import ModelAdapter, create_app
 from tests.integration.responses_helpers import (
+    empty_recall_response,
+    is_retriever_call,
     post_message_and_drain,
     responses_message,
     responses_with_run_calls,
@@ -42,6 +44,8 @@ class ActionRunAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
+        if is_retriever_call(input_items):
+            return empty_recall_response(provider=self.provider, model=self.model)
         del tools, history
         if context_bundle.get("origin") == "tool_result_interpretation":
             interpreter_input = context_bundle.get("tool_result_interpreter_input")

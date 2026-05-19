@@ -22,6 +22,8 @@ from ariel.persistence import (
 from ariel.policy_engine import evaluate_proposal
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.responses_helpers import (
+    empty_recall_response,
+    is_retriever_call,
     post_message_and_drain,
     responses_message,
     responses_run_message,
@@ -138,6 +140,8 @@ class CapturingRunAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
+        if is_retriever_call(input_items):
+            return empty_recall_response(provider=self.provider, model=self.model)
         del user_message, history, context_bundle
         self.tools_seen.append(tools)
         self.input_items_seen.append(input_items)
@@ -440,6 +444,8 @@ def test_emit_value_eviction_discards_prior_round(postgres_url: str) -> None:
             history: list[dict[str, Any]],
             context_bundle: dict[str, Any],
         ) -> dict[str, Any]:
+            if is_retriever_call(input_items):
+                return empty_recall_response(provider=self.provider, model=self.model)
             del tools, user_message, history, context_bundle
             self.snapshots.append(list(input_items))
             return self.responses.pop(0)

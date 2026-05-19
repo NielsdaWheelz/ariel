@@ -21,7 +21,12 @@ from ariel.persistence import (
 )
 from ariel.worker import process_one_task
 from tests.fake_sandbox import FakeSandboxRuntime
-from tests.integration.responses_helpers import responses_run_message, run_function_calls
+from tests.integration.responses_helpers import (
+    empty_recall_response,
+    is_retriever_call,
+    responses_run_message,
+    run_function_calls,
+)
 
 NOW = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
 
@@ -235,6 +240,8 @@ class _WakeAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
+        if is_retriever_call(input_items):
+            return empty_recall_response(provider=self.provider, model=self.model)
         del input_items, tools, history, context_bundle
         self.user_messages_seen.append(user_message)
         return responses_run_message(

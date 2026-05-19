@@ -13,7 +13,11 @@ import pytest
 from sqlalchemy import text
 
 from ariel.app import ModelAdapter, create_app
-from tests.integration.responses_helpers import responses_run_message
+from tests.integration.responses_helpers import (
+    empty_recall_response,
+    is_retriever_call,
+    responses_run_message,
+)
 from ariel.config import AppSettings
 from ariel.persistence import enqueue_background_task
 from ariel.worker import process_one_task
@@ -34,6 +38,8 @@ class DurableWorkflowAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
+        if is_retriever_call(input_items):
+            return empty_recall_response(provider=self.provider, model=self.model)
         del input_items, tools, history, context_bundle
         return responses_run_message(
             assistant_text=f"assistant::{user_message}",

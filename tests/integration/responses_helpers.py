@@ -269,6 +269,46 @@ def responses_with_run_calls(
     }
 
 
+def is_retriever_call(input_items: list[dict[str, Any]]) -> bool:
+    """Detects the retriever's pre-turn investigation loop by its system prompt."""
+    for item in input_items:
+        if item.get("role") == "system" and "Ariel's memory retriever" in str(
+            item.get("content", "")
+        ):
+            return True
+    return False
+
+
+def empty_recall_response(
+    *,
+    provider: str,
+    model: str,
+    provider_response_id: str | None = None,
+) -> dict[str, Any]:
+    """A retriever-loop response that emits an empty recall_v1 finding immediately.
+
+    Lets tests' canned-response queues stay focused on the main agent.
+    """
+    rid = provider_response_id or "resp_retriever_empty"
+    program = 'agent.emit_finding({"summary": "", "claims": [], "gaps": [], "sources": []})'
+    return {
+        "provider": provider,
+        "model": model,
+        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        "provider_response_id": rid,
+        "output": [
+            {
+                "type": "function_call",
+                "id": f"fc_{rid}",
+                "call_id": f"call_{rid}",
+                "name": "run",
+                "arguments": __import__("json").dumps({"source": program}, sort_keys=True),
+                "status": "completed",
+            }
+        ],
+    }
+
+
 def process_queued_action_execution(client: TestClient, approval_payload: dict[str, Any]) -> bool:
     action_attempt_id = approval_payload.get("action_attempt_id")
     if not isinstance(action_attempt_id, str):

@@ -28,6 +28,8 @@ from ariel.persistence import SessionRecord
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.responses_helpers import (
     drain_task,
+    empty_recall_response,
+    is_retriever_call,
     post_message_and_drain,
     responses_run_message,
     responses_with_run_calls,
@@ -53,6 +55,8 @@ class SessionManagementProbeAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
+        if is_retriever_call(input_items):
+            return empty_recall_response(provider=self.provider, model=self.model)
         assert [tool.get("name") for tool in tools] == ["run"]
         with self._lock:
             self.context_bundles.append(copy.deepcopy(context_bundle))

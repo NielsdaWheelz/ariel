@@ -157,6 +157,57 @@ _CONTEXT_SECTION_ORDER: tuple[str, ...] = (
 
 _MAX_ARTIFACTS_IN_CONTEXT = 8
 
+_CONTEXT_AUDIT_SCHEMA_VERSION = "1.0"
+
+
+def _make_empty_context_meta() -> dict[str, Any]:
+    """Return a zero-valued context-metadata dict valid against the surface contract."""
+    return {
+        "schema_version": _CONTEXT_AUDIT_SCHEMA_VERSION,
+        "section_order": [],
+        "policy_instruction_count": 0,
+        "current_turn_id": None,
+        "recent_window": {
+            "max_recent_turns": 0,
+            "included_turn_count": 0,
+            "omitted_turn_count": 0,
+            "included_turn_ids": [],
+        },
+    }
+
+
+def _context_bundle_audit_metadata(context_bundle: dict[str, Any]) -> dict[str, Any]:
+    """Extract auditable context metadata from the turn's context_bundle."""
+    section_order_raw = context_bundle.get("section_order")
+    section_order = (
+        [s for s in section_order_raw if isinstance(s, str)]
+        if isinstance(section_order_raw, list)
+        else []
+    )
+    policy_raw = context_bundle.get("policy_system_instructions")
+    policy_count = (
+        len([s for s in policy_raw if isinstance(s, str)]) if isinstance(policy_raw, list) else 0
+    )
+    current_turn_raw = context_bundle.get("current_turn")
+    current_turn_id: str | None = (
+        current_turn_raw.get("turn_id")
+        if isinstance(current_turn_raw, dict) and isinstance(current_turn_raw.get("turn_id"), str)
+        else None
+    )
+    return {
+        "schema_version": _CONTEXT_AUDIT_SCHEMA_VERSION,
+        "section_order": section_order,
+        "policy_instruction_count": policy_count,
+        "current_turn_id": current_turn_id,
+        "recent_window": {
+            "max_recent_turns": 0,
+            "included_turn_count": 0,
+            "omitted_turn_count": 0,
+            "included_turn_ids": [],
+        },
+    }
+
+
 _POLICY_SYSTEM_INSTRUCTIONS = (
     "You are Ariel, a private assistant for one active user session.",
     "If user intent is clear, answer directly in this turn.",
@@ -2029,8 +2080,14 @@ def _wake(
     created_events: list[EventRecord] = []
     assistant_sources: list[dict[str, Any]] = []
 
+    # Mutable cell: populated after context_bundle is built; pre-turn retriever
+    # rounds get the empty sentinel (still contract-valid).
+    _context_meta: list[dict[str, Any]] = [_make_empty_context_meta()]
+
     def add_event(event_type: str, payload_data: dict[str, Any]) -> None:
         nonlocal sequence
+        if event_type == "evt.model.started":
+            payload_data = {**payload_data, "context": _context_meta[0]}
         sequence += 1
         event = EventRecord(
             id=_new_id("evn"),
@@ -2128,6 +2185,7 @@ def _wake(
         "turn_id": turn.id,
         "user_instruction_ref": f"turn:{turn.id}",
     }
+    _context_meta[0] = _context_bundle_audit_metadata(context_bundle)
     agency_configured = (
         bool(str(runtime.settings.agency_allowed_repo_roots).strip())
         and Path(runtime.settings.agency_socket_path).exists()
