@@ -10,8 +10,8 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 
 from ariel.config import AppSettings
-from ariel.persistence import JobRecord, NotificationRecord
-from ariel.worker import enqueue_background_task, process_one_task
+from ariel.persistence import JobRecord, NotificationRecord, enqueue_background_task
+from ariel.worker import process_one_task
 
 
 @dataclass

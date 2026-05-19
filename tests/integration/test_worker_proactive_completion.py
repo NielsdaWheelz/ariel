@@ -14,8 +14,9 @@ from ariel.persistence import (
     EmailThreadWatchRecord,
     SessionRecord,
     TurnRecord,
+    enqueue_background_task,
 )
-from ariel.worker import enqueue_background_task, process_one_task
+from ariel.worker import process_one_task
 
 
 def test_worker_marks_due_email_thread_watches_without_ambient_bridge(

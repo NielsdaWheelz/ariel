@@ -4,6 +4,7 @@ import hashlib
 from datetime import UTC, datetime
 from typing import Any
 
+import ulid
 from pgvector.sqlalchemy import Vector  # type: ignore[import-untyped]
 from sqlalchemy import (
     Boolean,
@@ -16,11 +17,12 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    select,
     text,
     UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, Session
 
 from ariel.redaction import redact_json_value, redact_text
 
@@ -30,6 +32,10 @@ MEMORY_EMBEDDING_DIMENSIONS = 1536
 
 def to_rfc3339(timestamp: datetime) -> str:
     return timestamp.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _new_id(prefix: str) -> str:
+    return f"{prefix}_{ulid.new().str.lower()}"
 
 
 class Base(DeclarativeBase):
@@ -2570,6 +2576,76 @@ def serialize_event(event: EventRecord) -> dict[str, Any]:
         "payload": event.payload,
         "created_at": to_rfc3339(event.created_at),
     }
+
+
+def enqueue_background_task(
+    db: Session,
+    *,
+    task_type: str,
+    payload: dict[str, Any],
+    now: datetime,
+    max_attempts: int = 3,
+    idempotency_key: str | None = None,
+) -> BackgroundTaskRecord:
+    if idempotency_key is not None:
+        existing_task = db.scalar(
+            select(BackgroundTaskRecord)
+            .where(BackgroundTaskRecord.idempotency_key == idempotency_key)
+            .limit(1)
+        )
+        if existing_task is not None:
+            return existing_task
+    work_follow_up_loop_id = None
+    work_follow_up_loop_version = None
+    work_follow_up_scheduled_for = None
+    provider_write_receipt_id = None
+    if task_type == "work_follow_up_evaluate_due":
+        loop_id = payload.get("loop_id")
+        loop_version = payload.get("loop_version")
+        scheduled_for = payload.get("scheduled_for")
+        if not isinstance(loop_id, str) or not isinstance(loop_version, int):
+            raise RuntimeError("work_follow_up_evaluate_due task payload invalid")
+        if not isinstance(scheduled_for, str):
+            raise RuntimeError("work_follow_up_evaluate_due task scheduled_for missing")
+        work_follow_up_loop_id = loop_id
+        work_follow_up_loop_version = loop_version
+        work_follow_up_scheduled_for = datetime.fromisoformat(scheduled_for.replace("Z", "+00:00"))
+    if task_type == "provider_write_reconcile_due":
+        receipt_id = payload.get("provider_write_receipt_id")
+        if not isinstance(receipt_id, str) or not receipt_id:
+            raise RuntimeError("provider_write_reconcile_due task payload invalid")
+        provider_write_receipt_id = receipt_id
+    task = BackgroundTaskRecord(
+        id=_new_id("tsk"),
+        task_type=task_type,
+        idempotency_key=idempotency_key,
+        work_follow_up_loop_id=work_follow_up_loop_id,
+        work_follow_up_loop_version=work_follow_up_loop_version,
+        work_follow_up_scheduled_for=work_follow_up_scheduled_for,
+        provider_write_receipt_id=provider_write_receipt_id,
+        payload=payload,
+        status="pending",
+        attempts=0,
+        max_attempts=max_attempts,
+        error=None,
+        claimed_by=None,
+        run_after=now,
+        last_heartbeat=None,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(task)
+    db.flush()
+    return task
+
+
+def _work_follow_up_task_idempotency_key(
+    *,
+    loop_id: str,
+    loop_version: int,
+    scheduled_for: str,
+) -> str:
+    return f"work_follow_up_evaluate_due:{loop_id}:{loop_version}:{scheduled_for}"
 
 
 def serialize_background_task(task: BackgroundTaskRecord) -> dict[str, Any]:

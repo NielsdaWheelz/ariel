@@ -20,6 +20,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from sqlalchemy import (
+    Engine,
     and_,
     create_engine,
     func,
@@ -54,6 +55,8 @@ from ariel.google_connector import (
     GOOGLE_CONNECTOR_ID,
     GoogleConnectorError,
     GoogleConnectorRuntime,
+    GoogleOAuthClient,
+    GoogleWorkspaceProvider,
 )
 from ariel.memory import (
     enqueue_memory_remember,
@@ -102,6 +105,7 @@ from ariel.persistence import (
     WorkCommitmentSourceRecord,
     WorkFollowUpEventRecord,
     WorkFollowUpLoopRecord,
+    enqueue_background_task,
     serialize_agency_event,
     serialize_artifact,
     serialize_autonomy_scope,
@@ -169,7 +173,6 @@ from ariel.run_runtime import (
 )
 from ariel.sandbox_runtime import RunSandbox, SandboxRuntime
 from ariel.weather_state import get_weather_default_location_state, set_weather_default_location
-from ariel.worker import enqueue_background_task
 from ariel.workspace_reasoning import CommitmentState, validate_lifecycle_transition
 
 
@@ -1256,13 +1259,13 @@ def _turn_limit_message(violation: TurnLimitViolation) -> str:
     return "this turn stopped because a configured turn budget was exhausted."
 
 
-def _applied_turn_limits(app: FastAPI) -> dict[str, int]:
+def _applied_turn_limits(settings: AppSettings) -> dict[str, int]:
     return {
-        "max_recent_turns": int(app.state.max_recent_turns),
-        "max_context_tokens": int(app.state.max_context_tokens),
-        "max_response_tokens": int(app.state.max_response_tokens),
-        "max_model_attempts": int(app.state.max_model_attempts),
-        "max_turn_wall_time_ms": int(app.state.max_turn_wall_time_ms),
+        "max_recent_turns": int(settings.max_recent_turns),
+        "max_context_tokens": int(settings.max_context_tokens),
+        "max_response_tokens": int(settings.max_response_tokens),
+        "max_model_attempts": int(settings.max_model_attempts),
+        "max_turn_wall_time_ms": int(settings.max_turn_wall_time_ms),
     }
 
 
@@ -1979,6 +1982,15 @@ class WakeContext:
     discord_context: dict[str, Any] | None
     attachment_sources: list[dict[str, Any]] | None
     ingress_provenance: RuntimeProvenance | None
+
+
+@dataclass(slots=True, frozen=True)
+class Runtime:
+    settings: AppSettings
+    model_adapter: ModelAdapter
+    sandbox: RunSandbox
+    attachment_runtime: AttachmentContentRuntime
+    session_factory: sessionmaker[Session]
 
 
 def _open_jobs_context(*, db: Session) -> list[dict[str, Any]]:
@@ -2967,13 +2979,12 @@ def _get_or_create_active_session(db: Session) -> SessionRecord:
     return active_session
 
 
-def create_app(
+def build_runtime(
     *,
     database_url: str | None = None,
     model_adapter: ModelAdapter | None = None,
     sandbox: RunSandbox | None = None,
-    reset_database: bool = False,
-) -> FastAPI:
+) -> tuple[Runtime, Engine]:
     settings = AppSettings()
     db_url = database_url or settings.database_url
     adapter = model_adapter or _build_default_model_adapter(settings)
@@ -2986,6 +2997,1221 @@ def create_app(
         isolation_level="SERIALIZABLE",
     )
     session_factory = sessionmaker(bind=engine, future=True, expire_on_commit=False)
+    attachment_runtime = AttachmentContentRuntime(
+        blob_store_path=settings.attachment_blob_store_path,
+        max_bytes=settings.attachment_max_bytes,
+        fetch_timeout_seconds=settings.attachment_fetch_timeout_seconds,
+        handle_ttl_seconds=settings.attachment_handle_ttl_seconds,
+        scanner_mode=settings.attachment_scanner_mode,
+        openai_api_key=settings.openai_api_key,
+        openai_model=settings.attachment_openai_model,
+        openai_audio_model=settings.attachment_openai_audio_model,
+        openai_timeout_seconds=settings.attachment_openai_timeout_seconds,
+        encryption_secret=settings.connector_encryption_secret,
+        encryption_key_version=settings.connector_encryption_key_version,
+        encryption_keys=settings.connector_encryption_keys,
+    )
+    runtime = Runtime(
+        settings=settings,
+        model_adapter=adapter,
+        sandbox=run_sandbox,
+        attachment_runtime=attachment_runtime,
+        session_factory=session_factory,
+    )
+    return runtime, engine
+
+
+def build_google_runtime(
+    settings: AppSettings,
+    *,
+    oauth_client: GoogleOAuthClient | None = None,
+    workspace_provider: GoogleWorkspaceProvider | None = None,
+) -> GoogleConnectorRuntime:
+    return GoogleConnectorRuntime(
+        oauth_client=oauth_client
+        or DefaultGoogleOAuthClient(
+            client_id=settings.google_oauth_client_id,
+            client_secret=settings.google_oauth_client_secret,
+            timeout_seconds=settings.google_oauth_timeout_seconds,
+        ),
+        workspace_provider=workspace_provider or DefaultGoogleWorkspaceProvider(),
+        redirect_uri=settings.google_oauth_redirect_uri,
+        oauth_state_ttl_seconds=settings.google_oauth_state_ttl_seconds,
+        encryption_secret=settings.connector_encryption_secret,
+        encryption_key_version=settings.connector_encryption_key_version,
+        encryption_keys=settings.connector_encryption_keys,
+    )
+
+
+def build_agency_runtime(settings: AppSettings) -> AgencyRuntime:
+    return AgencyRuntime(
+        client=AgencyDaemonClient(
+            socket_path=settings.agency_socket_path,
+            timeout_seconds=settings.agency_timeout_seconds,
+        ),
+        allowed_repo_roots=tuple(
+            root.strip() for root in settings.agency_allowed_repo_roots.split(",") if root.strip()
+        ),
+        default_base_branch=settings.agency_default_base_branch,
+        default_runner=settings.agency_default_runner,
+    )
+
+
+def _wake(
+    *,
+    runtime: Runtime,
+    google_runtime: GoogleConnectorRuntime,
+    db: Session,
+    request_session_id: str,
+    wake_context: WakeContext,
+    execute_google_reads_outside_transaction: bool = False,
+) -> TurnExecutionOutcome:
+    user_message = wake_context.prompt_text
+    discord_context = wake_context.discord_context
+    discord_attachment_sources = wake_context.attachment_sources
+    ingress_runtime_provenance = wake_context.ingress_provenance
+    active_session = db.scalar(
+        select(SessionRecord)
+        .where(
+            SessionRecord.id == request_session_id,
+            SessionRecord.is_active.is_(True),
+        )
+        .limit(1)
+    )
+    if active_session is None:
+        raise ApiError(
+            status_code=404,
+            code="E_SESSION_NOT_FOUND",
+            message="active session not found",
+            details={"session_id": request_session_id},
+            retryable=False,
+        )
+
+    prior_turns = db.scalars(
+        select(TurnRecord)
+        .where(TurnRecord.session_id == active_session.id)
+        .order_by(TurnRecord.created_at.asc(), TurnRecord.id.asc())
+    ).all()
+    # Estimate context size for the rotation-pressure trigger. The retriever
+    # is a per-turn step, not part of this estimate, so recalled_memory is
+    # empty here; the profile and digest are the always-loaded documents.
+    pre_rotation_context_bundle = _build_turn_context_bundle(
+        prior_turns=prior_turns,
+        max_recent_turns=int(runtime.settings.max_recent_turns),
+        discord_context=discord_context,
+        profile=read_profile(db),
+        session_digest=active_session.digest,
+        recalled_memory=[],
+        open_commitments_and_jobs=_open_commitments_and_jobs_context(
+            db=db,
+            now=_utcnow(),
+            provider_account_id=_active_google_provider_account_id(db),
+        ),
+        relevant_artifacts_and_observations=_relevant_artifacts_and_observations_context(
+            db=db,
+            prior_turns=prior_turns,
+        ),
+    )
+    estimated_context_tokens = _estimate_context_tokens(
+        context_bundle=pre_rotation_context_bundle,
+        user_message=user_message,
+    )
+    auto_rotation_reason, trigger_snapshot = _auto_rotation_reason(
+        session_created_at=active_session.created_at,
+        prior_turn_count=len(prior_turns),
+        estimated_context_tokens=estimated_context_tokens,
+        max_turns=int(runtime.settings.auto_rotate_max_turns),
+        max_age_seconds=int(runtime.settings.auto_rotate_max_age_seconds),
+        max_context_pressure_tokens=int(runtime.settings.auto_rotate_context_pressure_tokens),
+        now=_utcnow(),
+    )
+    if auto_rotation_reason is not None:
+        active_session, _, _ = _rotate_active_session(
+            db,
+            reason=auto_rotation_reason,
+            idempotency_key=None,
+            actor_id=str(runtime.settings.approval_actor_id),
+            trigger_snapshot=trigger_snapshot,
+        )
+        prior_turns = db.scalars(
+            select(TurnRecord)
+            .where(TurnRecord.session_id == active_session.id)
+            .order_by(TurnRecord.created_at.asc(), TurnRecord.id.asc())
+        ).all()
+
+    effective_session_id = active_session.id
+    runtime_provenance = _runtime_provenance_for_turn(
+        db=db,
+        prior_turns=prior_turns,
+        max_recent_turns=int(runtime.settings.max_recent_turns),
+    )
+    runtime_provenance = _merge_runtime_provenance(
+        baseline=runtime_provenance,
+        ingress=ingress_runtime_provenance,
+    )
+    now = _utcnow()
+    turn = TurnRecord(
+        id=_new_id("trn"),
+        session_id=effective_session_id,
+        user_message=user_message,
+        assistant_message=None,
+        status="in_progress",
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(turn)
+    db.flush()
+
+    sequence = 0
+    created_events: list[EventRecord] = []
+    created_action_attempts: list[ActionAttemptRecord] = []
+    assistant_sources: list[dict[str, Any]] = []
+
+    def add_event(event_type: str, payload_data: dict[str, Any]) -> None:
+        nonlocal sequence
+        sequence += 1
+        event = EventRecord(
+            id=_new_id("evn"),
+            session_id=effective_session_id,
+            turn_id=turn.id,
+            sequence=sequence,
+            event_type=event_type,
+            payload=jsonable_encoder(payload_data),
+            created_at=_utcnow(),
+        )
+        db.add(event)
+        created_events.append(event)
+
+    def add_ai_judgment(
+        *,
+        judgment_type: str,
+        source_type: str,
+        source_id: str,
+        status: str,
+        model: str | None,
+        prompt_version: str,
+        provider_response_id: str | None = None,
+        input_summary: str,
+        input_refs: dict[str, Any],
+        selected: list[dict[str, Any]] | None = None,
+        omitted: list[dict[str, Any]] | None = None,
+        output: dict[str, Any] | None = None,
+        rationale: str | None = None,
+        uncertainty: str | None = None,
+        confidence: float | None = None,
+        parse_status: str,
+        validation_status: str,
+        failure_code: str | None = None,
+        failure_reason: str | None = None,
+    ) -> str:
+        now_judgment = _utcnow()
+        judgment_id = _new_id("ajg")
+        db.add(
+            AIJudgmentRecord(
+                id=judgment_id,
+                judgment_type=judgment_type,
+                source_type=source_type,
+                source_id=source_id,
+                status=status,
+                model=model,
+                prompt_version=prompt_version,
+                provider_response_id=provider_response_id,
+                input_summary=input_summary,
+                input_refs=jsonable_encoder(input_refs),
+                selected=jsonable_encoder(selected or []),
+                omitted=jsonable_encoder(omitted or []),
+                output=jsonable_encoder(output or {}),
+                rationale=rationale,
+                uncertainty=uncertainty,
+                confidence=confidence,
+                parse_status=parse_status,
+                validation_status=validation_status,
+                failure_code=failure_code,
+                failure_reason=failure_reason,
+                created_at=now_judgment,
+                updated_at=now_judgment,
+            )
+        )
+        return judgment_id
+
+    if discord_context is not None and discord_attachment_sources:
+        runtime.attachment_runtime.record_discord_sources(
+            db=db,
+            session_id=effective_session_id,
+            turn_id=turn.id,
+            discord_context=discord_context,
+            attachment_sources=discord_attachment_sources,
+            now_fn=_utcnow,
+            new_id_fn=_new_id,
+        )
+    add_event("evt.turn.started", {"message": user_message, "discord": discord_context})
+
+    # Pre-turn memory: the always-loaded profile and session digest, plus the
+    # retriever's verdict on which stored facts matter now. The retriever is
+    # a bounded AI subagent that audits its own ai_judgments row; it is
+    # non-fatal -- any failure leaves the turn alive on the profile and
+    # digest alone, so recall is never on the turn's critical-failure path.
+    memory_profile = read_profile(db)
+    session_digest = active_session.digest
+    try:
+        recalled_facts: list[MemoryFactRecord] = run_retriever(
+            session_factory=runtime.session_factory,
+            query=user_message,
+            source_type="turn",
+            source_id=turn.id,
+            settings=runtime.settings,
+            now_fn=_utcnow,
+            new_id_fn=_new_id,
+        )
+    except Exception as exc:
+        recalled_facts = []
+        add_event(
+            "evt.memory.recall_failed",
+            {
+                "turn_id": turn.id,
+                "failure_reason": safe_failure_reason(
+                    getattr(exc, "safe_reason", str(exc)),
+                    fallback=f"unexpected {exc.__class__.__name__}",
+                ),
+            },
+        )
+
+    open_commitments_and_jobs = _open_commitments_and_jobs_context(
+        db=db,
+        now=_utcnow(),
+        provider_account_id=_active_google_provider_account_id(db),
+    )
+    context_bundle = _build_turn_context_bundle(
+        prior_turns=prior_turns,
+        max_recent_turns=int(runtime.settings.max_recent_turns),
+        discord_context=discord_context,
+        profile=memory_profile,
+        session_digest=session_digest,
+        recalled_memory=recalled_facts,
+        open_commitments_and_jobs=open_commitments_and_jobs,
+        relevant_artifacts_and_observations=_relevant_artifacts_and_observations_context(
+            db=db,
+            prior_turns=prior_turns,
+        ),
+    )
+    context_bundle["current_turn"] = {
+        "turn_id": turn.id,
+        "user_instruction_ref": f"turn:{turn.id}",
+    }
+    agency_configured = (
+        bool(str(runtime.settings.agency_allowed_repo_roots).strip())
+        and Path(runtime.settings.agency_socket_path).exists()
+    )
+    tool_surface_facts = _tool_surface_facts(
+        db=db,
+        context_bundle=context_bundle,
+        agency_configured=agency_configured,
+        settings=runtime.settings,
+    )
+    if recalled_facts:
+        add_event(
+            "evt.memory.recalled",
+            {"turn_id": turn.id, "recalled_fact_ids": [fact.id for fact in recalled_facts]},
+        )
+    applied_limits = _applied_turn_limits(runtime.settings)
+
+    def elapsed_turn_ms(started_at: float) -> int:
+        return int((time.perf_counter() - started_at) * 1000)
+
+    def build_turn_limit_failure(
+        *,
+        budget: str,
+        unit: str,
+        measured: int,
+        limit: int,
+    ) -> ApiError:
+        return _build_turn_limit_error(
+            session_id=effective_session_id,
+            turn_id=turn.id,
+            violation=TurnLimitViolation(
+                budget=budget,
+                unit=unit,
+                measured=measured,
+                limit=limit,
+            ),
+            applied_limits=applied_limits,
+        )
+
+    def emit_turn_limit_failure(failure: ApiError) -> None:
+        raw_limit = failure.details.get("limit")
+        limit_details = raw_limit if isinstance(raw_limit, dict) else {}
+        add_event(
+            "evt.assistant.emitted",
+            {
+                "message": failure.message,
+                "bounded_failure": {
+                    "code": failure.code,
+                    "limit": limit_details,
+                },
+            },
+        )
+        turn.assistant_message = failure.message
+        turn.status = "failed"
+        turn.updated_at = _utcnow()
+        add_event(
+            "evt.turn.failed",
+            {
+                "failure_reason": failure.message,
+                "error_code": failure.code,
+                "limit": limit_details,
+            },
+        )
+
+    bounded_failure: ApiError | None = None
+    model_failure: ApiError | None = None
+    model_failure_reason: str | None = None
+    assistant_response: dict[str, Any] | None = None
+
+    def record_model_output_budget_failure(
+        *,
+        attempt: int,
+        provider_response_id: str | None,
+        failure_reason: str,
+    ) -> ApiError:
+        prompt_version = "model-output-v1"
+        add_ai_judgment(
+            judgment_type="model_output",
+            source_type="turn",
+            source_id=turn.id,
+            status="failed",
+            model=runtime.model_adapter.model,
+            prompt_version=prompt_version,
+            provider_response_id=provider_response_id,
+            input_summary="final model-authored assistant output for turn",
+            input_refs={
+                "session_id": effective_session_id,
+                "turn_id": turn.id,
+                "attempt": attempt,
+                "max_model_attempts": int(runtime.settings.max_model_attempts),
+            },
+            parse_status="missing_output",
+            validation_status="not_validated",
+            failure_code="E_AI_JUDGMENT_BUDGET",
+            failure_reason=failure_reason,
+        )
+        add_event(
+            "evt.ai_judgment.failed",
+            {
+                "judgment_type": "model_output",
+                "failure_code": "E_AI_JUDGMENT_BUDGET",
+                "failure_reason": failure_reason,
+                "prompt_version": prompt_version,
+                "source_id": turn.id,
+                "parse_status": "missing_output",
+                "validation_status": "not_validated",
+                "provider_response_id": provider_response_id,
+                "attempt": attempt,
+                "max_model_attempts": int(runtime.settings.max_model_attempts),
+            },
+        )
+        return ApiError(
+            status_code=429,
+            code="E_AI_JUDGMENT_BUDGET",
+            message="AI model output failed",
+            details={
+                "session_id": effective_session_id,
+                "turn_id": turn.id,
+                "judgment_type": "model_output",
+                "prompt_version": prompt_version,
+                "attempt": attempt,
+                "max_model_attempts": int(runtime.settings.max_model_attempts),
+                "provider_response_id": provider_response_id,
+            },
+            retryable=True,
+        )
+
+    # The running context is the verbatim recent-turns window plus the
+    # session digest, so it is inherently bounded -- there is no
+    # summarization or compaction step.
+    context_metadata = _context_bundle_audit_metadata(context_bundle)
+    allowed_capability_ids = _eligible_internal_callable_capability_ids(
+        tool_surface_facts=tool_surface_facts,
+    )
+    context_bundle["tool_surface_facts"] = tool_surface_facts
+    eligible_internal_callables: list[str] = []
+    for capability_id in allowed_capability_ids:
+        callable_name = run_callable_name_for_capability_id(capability_id)
+        if callable_name is not None:
+            eligible_internal_callables.append(callable_name)
+    context_bundle["eligible_internal_callables"] = sorted(eligible_internal_callables)
+    responses_tools = run_tool_definitions()
+    responses_input_items = _build_responses_input_items(
+        context_bundle=context_bundle,
+        user_message=user_message,
+    )
+    turn_started_at = time.perf_counter()
+    for attempt in range(1, runtime.settings.max_model_attempts + 1):
+        if attempt > 1:
+            elapsed_before_attempt_ms = elapsed_turn_ms(turn_started_at)
+            if elapsed_before_attempt_ms > runtime.settings.max_turn_wall_time_ms:
+                bounded_failure = build_turn_limit_failure(
+                    budget="turn_wall_time_ms",
+                    unit="ms",
+                    measured=elapsed_before_attempt_ms,
+                    limit=runtime.settings.max_turn_wall_time_ms,
+                )
+                break
+
+        add_event(
+            "evt.model.started",
+            {
+                "provider": runtime.model_adapter.provider,
+                "model": runtime.model_adapter.model,
+                "context": context_metadata,
+                "attempt": attempt,
+            },
+        )
+        model_started_at = time.perf_counter()
+        try:
+            candidate_response = runtime.model_adapter.create_response(
+                input_items=responses_input_items,
+                tools=responses_tools,
+                user_message=user_message,
+                history=context_bundle["recent_active_session_turns"],
+                context_bundle=context_bundle,
+            )
+            duration_ms = int((time.perf_counter() - model_started_at) * 1000)
+            add_event(
+                "evt.model.completed",
+                {
+                    "provider": candidate_response["provider"],
+                    "model": candidate_response["model"],
+                    "duration_ms": duration_ms,
+                    "usage": candidate_response.get("usage"),
+                    "provider_response_id": candidate_response.get("provider_response_id"),
+                    "attempt": attempt,
+                },
+            )
+
+            elapsed_after_model_ms = elapsed_turn_ms(turn_started_at)
+            if elapsed_after_model_ms > runtime.settings.max_turn_wall_time_ms:
+                bounded_failure = build_turn_limit_failure(
+                    budget="turn_wall_time_ms",
+                    unit="ms",
+                    measured=elapsed_after_model_ms,
+                    limit=runtime.settings.max_turn_wall_time_ms,
+                )
+                break
+
+            output_items = candidate_response.get("output")
+            if not isinstance(output_items, list):
+                provider_response_id = candidate_response.get("provider_response_id")
+                raise ModelAdapterError(
+                    safe_reason="model response missing Responses output items",
+                    status_code=502,
+                    code="E_MODEL_OUTPUT_SCHEMA",
+                    message="model response failed output contract",
+                    retryable=False,
+                    provider=candidate_response.get("provider")
+                    if isinstance(candidate_response.get("provider"), str)
+                    else runtime.model_adapter.provider,
+                    model=candidate_response.get("model")
+                    if isinstance(candidate_response.get("model"), str)
+                    else runtime.model_adapter.model,
+                    usage=candidate_response.get("usage")
+                    if isinstance(candidate_response.get("usage"), dict)
+                    else None,
+                    provider_response_id=provider_response_id
+                    if isinstance(provider_response_id, str)
+                    else None,
+                    parse_status="schema_invalid",
+                    validation_status="invalid",
+                    raw_output_shape={
+                        "output_type": type(output_items).__name__,
+                        "output_count": None,
+                        "text_present": False,
+                    },
+                )
+            function_calls = _extract_responses_function_calls(output_items)
+            run_source, run_protocol_error = parse_run_function_call(function_calls)
+            if run_protocol_error is not None or run_source is None:
+                provider_response_id = candidate_response.get("provider_response_id")
+                add_ai_judgment(
+                    judgment_type="model_output",
+                    source_type="turn",
+                    source_id=turn.id,
+                    status="failed",
+                    model=candidate_response.get("model")
+                    if isinstance(candidate_response.get("model"), str)
+                    else runtime.model_adapter.model,
+                    prompt_version="model-output-v1",
+                    provider_response_id=provider_response_id
+                    if isinstance(provider_response_id, str)
+                    else None,
+                    input_summary="run protocol validation for model response",
+                    input_refs={
+                        "session_id": effective_session_id,
+                        "turn_id": turn.id,
+                        "attempt": attempt,
+                        "response_output": jsonable_encoder(output_items),
+                    },
+                    parse_status="parsed",
+                    validation_status="invalid",
+                    failure_code="E_AI_JUDGMENT_VALIDATION",
+                    failure_reason=run_protocol_error or "model failed the run tool protocol",
+                )
+                for output_item in output_items:
+                    if isinstance(output_item, dict) and output_item.get("type") == "function_call":
+                        responses_input_items.append(jsonable_encoder(output_item))
+                for function_call in function_calls:
+                    call_id = function_call.get("call_id")
+                    if not isinstance(call_id, str) or not call_id:
+                        continue
+                    responses_input_items.append(
+                        {
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": json.dumps(
+                                {
+                                    "status": "failed",
+                                    "error": run_protocol_error
+                                    or "model failed the run tool protocol",
+                                },
+                                sort_keys=True,
+                            ),
+                        }
+                    )
+                responses_input_items.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "model protocol failure: the user did not see that response. "
+                            "Call exactly one tool named run with JSON arguments "
+                            '{"source":"..."} where source is a Python program; emit '
+                            "user-visible text from the program with "
+                            "agent.emit_message."
+                        ),
+                    }
+                )
+                add_event(
+                    "evt.model.protocol_failed",
+                    {
+                        "reason": run_protocol_error,
+                        "attempt": attempt,
+                        "provider_response_id": candidate_response.get("provider_response_id"),
+                    },
+                )
+                if attempt >= runtime.settings.max_model_attempts:
+                    model_failure = record_model_output_budget_failure(
+                        attempt=attempt,
+                        provider_response_id=candidate_response.get("provider_response_id")
+                        if isinstance(candidate_response.get("provider_response_id"), str)
+                        else None,
+                        failure_reason=run_protocol_error or "model failed the run tool protocol",
+                    )
+                    model_failure_reason = "AI model failed the run tool protocol"
+                    break
+                continue
+
+            run_call_id = function_calls[0].get("call_id")
+            run_call_id = run_call_id if isinstance(run_call_id, str) else ""
+            run_program_result = execute_run_program(
+                sandbox=runtime.sandbox,
+                source=run_source,
+                db=db,
+                session_factory=runtime.session_factory,
+                session_id=effective_session_id,
+                turn=turn,
+                # Capability syscalls from earlier programs in this turn
+                # already consumed proposal indices; each one created
+                # exactly one ActionAttemptRecord here. Offset by their
+                # running count so proposal_index stays turn-unique.
+                proposal_index_start=len(created_action_attempts),
+                approval_ttl_seconds=int(runtime.settings.approval_ttl_seconds),
+                approval_actor_id=str(runtime.settings.approval_actor_id),
+                add_event=add_event,
+                now_fn=_utcnow,
+                new_id_fn=_new_id,
+                runtime_provenance=runtime_provenance,
+                google_runtime=google_runtime,
+                execute_google_reads_outside_transaction=(execute_google_reads_outside_transaction),
+                agency_runtime=build_agency_runtime(runtime.settings),
+                attachment_runtime=runtime.attachment_runtime,
+                allowed_capability_ids=set(allowed_capability_ids),
+                settings=runtime.settings,
+            )
+            # The syscall trace is the audit spine and is recorded whether
+            # or not the program completed cleanly.
+            created_action_attempts.extend(run_program_result.action_attempts)
+            # Thread taint across programs in the same turn: a syscall
+            # that returned untrusted-influenced content in this program
+            # advanced its runtime provenance; merge that into the turn
+            # baseline so the next program's syscalls are evaluated with
+            # it. execute_run_program already threads taint within a
+            # program; this closes the gap across programs.
+            runtime_provenance = _merge_runtime_provenance(
+                baseline=runtime_provenance,
+                ingress=run_program_result.runtime_provenance,
+            )
+            if not run_program_result.program_ok:
+                # Program Failure: the program did not complete cleanly, so
+                # no proposal stands. Void any approval the failed program
+                # staged so it never surfaces as a live pending action; the
+                # action attempts stay as the audit trace.
+                _void_failed_program_approvals(
+                    db=db,
+                    action_attempts=run_program_result.action_attempts,
+                    add_event=add_event,
+                )
+                program_errors = [
+                    error for error in [run_program_result.program_error] if error is not None
+                ] + run_program_result.callback_errors
+                provider_response_id = candidate_response.get("provider_response_id")
+                add_ai_judgment(
+                    judgment_type="model_output",
+                    source_type="turn",
+                    source_id=turn.id,
+                    status="failed",
+                    model=candidate_response.get("model")
+                    if isinstance(candidate_response.get("model"), str)
+                    else runtime.model_adapter.model,
+                    prompt_version="model-output-v1",
+                    provider_response_id=provider_response_id
+                    if isinstance(provider_response_id, str)
+                    else None,
+                    input_summary="run program execution for model response",
+                    input_refs={
+                        "session_id": effective_session_id,
+                        "turn_id": turn.id,
+                        "attempt": attempt,
+                        "source": run_source,
+                    },
+                    parse_status="parsed",
+                    validation_status="invalid",
+                    failure_code="E_AI_JUDGMENT_VALIDATION",
+                    failure_reason=json.dumps(program_errors, sort_keys=True),
+                )
+                for output_item in output_items:
+                    if isinstance(output_item, dict) and output_item.get("type") == "function_call":
+                        responses_input_items.append(jsonable_encoder(output_item))
+                if run_call_id:
+                    responses_input_items.append(
+                        {
+                            "type": "function_call_output",
+                            "call_id": run_call_id,
+                            "output": json.dumps(
+                                {"status": "failed", "errors": program_errors},
+                                sort_keys=True,
+                            ),
+                        }
+                    )
+                responses_input_items.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "run program did not complete: "
+                            + json.dumps(program_errors, sort_keys=True)
+                            + ". No effects were committed and the user did not "
+                            "see any output. Retry with exactly one run call whose "
+                            "source is a Python program that completes cleanly and "
+                            "emits user-visible text with agent.emit_message."
+                        ),
+                    }
+                )
+                add_event(
+                    "evt.run.validation_failed",
+                    {
+                        "errors": program_errors,
+                        "attempt": attempt,
+                        "provider_response_id": candidate_response.get("provider_response_id"),
+                    },
+                )
+                if attempt >= runtime.settings.max_model_attempts:
+                    model_failure = record_model_output_budget_failure(
+                        attempt=attempt,
+                        provider_response_id=candidate_response.get("provider_response_id")
+                        if isinstance(candidate_response.get("provider_response_id"), str)
+                        else None,
+                        failure_reason="run program did not complete cleanly",
+                    )
+                    model_failure_reason = "AI model produced an invalid run program"
+                    break
+                continue
+
+            provider_response_id = candidate_response.get("provider_response_id")
+            add_ai_judgment(
+                judgment_type="model_output",
+                source_type="turn",
+                source_id=turn.id,
+                status="succeeded",
+                model=candidate_response.get("model")
+                if isinstance(candidate_response.get("model"), str)
+                else runtime.model_adapter.model,
+                prompt_version="model-output-v1",
+                provider_response_id=provider_response_id
+                if isinstance(provider_response_id, str)
+                else None,
+                input_summary="executed run program for model response",
+                input_refs={
+                    "session_id": effective_session_id,
+                    "turn_id": turn.id,
+                    "attempt": attempt,
+                    "source": run_source,
+                    "response_output": jsonable_encoder(output_items),
+                },
+                output={
+                    "emitted_message": bool(run_program_result.emitted_message),
+                    "paused": run_program_result.paused,
+                    "emitted_value_count": len(run_program_result.emitted_values),
+                    "action_attempt_count": len(run_program_result.action_attempts),
+                },
+                parse_status="parsed",
+                validation_status="valid",
+            )
+
+            # Retrieval syscalls in the program persisted citation
+            # artifacts; surface them as the turn's response sources.
+            assistant_sources = _turn_retrieval_sources(db=db, turn_id=turn.id)
+
+            for index, emitted_value in enumerate(run_program_result.emitted_values, start=1):
+                encoded_value = json.dumps(
+                    jsonable_encoder(emitted_value),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                add_event(
+                    "evt.agent.value_emitted",
+                    {
+                        "index": index,
+                        "value_digest": hashlib.sha256(encoded_value).hexdigest(),
+                        "value_bytes": len(encoded_value),
+                        "attempt": attempt,
+                        "provider_response_id": candidate_response.get("provider_response_id"),
+                    },
+                )
+
+            if run_program_result.emitted_message:
+                # The program composed user-visible output. A program may
+                # stage approval proposals and still emit a mechanical
+                # confirmation; the emitted message is the turn answer.
+                response_tokens = _response_tokens_from_model_payload(
+                    candidate_response,
+                    assistant_text=run_program_result.emitted_message,
+                )
+                if response_tokens > runtime.settings.max_response_tokens:
+                    bounded_failure = build_turn_limit_failure(
+                        budget="response_tokens",
+                        unit="tokens",
+                        measured=response_tokens,
+                        limit=runtime.settings.max_response_tokens,
+                    )
+                    break
+                assistant_response = {
+                    **candidate_response,
+                    "assistant_text": run_program_result.emitted_message,
+                    "assistant_silent": False,
+                }
+                break
+
+            if any(
+                action_attempt.status == "awaiting_approval"
+                for action_attempt in run_program_result.action_attempts
+            ):
+                # The program staged an approval proposal but did not emit
+                # a message; surface a default approval prompt.
+                approval_message = "approval required. review the pending action."
+                response_tokens = _response_tokens_from_model_payload(
+                    candidate_response,
+                    assistant_text=approval_message,
+                )
+                if response_tokens > runtime.settings.max_response_tokens:
+                    bounded_failure = build_turn_limit_failure(
+                        budget="response_tokens",
+                        unit="tokens",
+                        measured=response_tokens,
+                        limit=runtime.settings.max_response_tokens,
+                    )
+                    break
+                assistant_response = {
+                    **candidate_response,
+                    "assistant_text": approval_message,
+                    "assistant_silent": False,
+                }
+                break
+
+            if run_program_result.emitted_values:
+                # Internal structured data for a later turn: the model
+                # reads the values and continues with another program.
+                for output_item in output_items:
+                    if isinstance(output_item, dict) and output_item.get("type") == "function_call":
+                        responses_input_items.append(jsonable_encoder(output_item))
+                if run_call_id:
+                    responses_input_items.append(
+                        {
+                            "type": "function_call_output",
+                            "call_id": run_call_id,
+                            "output": json.dumps(
+                                {
+                                    "status": "completed",
+                                    "emitted_values": jsonable_encoder(
+                                        run_program_result.emitted_values
+                                    ),
+                                },
+                                sort_keys=True,
+                            ),
+                        }
+                    )
+                responses_input_items.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "run program emitted internal values. They are not "
+                            "visible to the user. Continue with exactly one run call."
+                        ),
+                    }
+                )
+                if attempt >= runtime.settings.max_model_attempts:
+                    model_failure = record_model_output_budget_failure(
+                        attempt=attempt,
+                        provider_response_id=candidate_response.get("provider_response_id")
+                        if isinstance(candidate_response.get("provider_response_id"), str)
+                        else None,
+                        failure_reason=(
+                            "model emitted internal values but exhausted its attempt budget"
+                        ),
+                    )
+                    model_failure_reason = "AI model output exhausted its attempt budget"
+                    break
+                continue
+
+            if run_program_result.paused:
+                assistant_response = {
+                    **candidate_response,
+                    "assistant_text": "",
+                    "assistant_silent": True,
+                }
+                break
+
+            if run_program_result.action_attempts:
+                # The program ran syscalls but emitted no user-visible
+                # output and staged no approval; feed the audited syscall
+                # trace back so the model can author the next program.
+                for output_item in output_items:
+                    if isinstance(output_item, dict) and output_item.get("type") == "function_call":
+                        responses_input_items.append(jsonable_encoder(output_item))
+                action_attempt_summary = _run_program_action_attempt_summary(
+                    run_program_result.action_attempts
+                )
+                if run_call_id:
+                    responses_input_items.append(
+                        {
+                            "type": "function_call_output",
+                            "call_id": run_call_id,
+                            "output": json.dumps(
+                                {
+                                    "status": "completed",
+                                    "message_emitted": False,
+                                    "action_attempts": action_attempt_summary,
+                                },
+                                sort_keys=True,
+                            ),
+                        }
+                    )
+                responses_input_items.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "run program syscall trace:\n"
+                            + json.dumps(action_attempt_summary, sort_keys=True)
+                            + "\nThe user saw no output. Continue with exactly one "
+                            "run call that emits user-visible text with "
+                            "agent.emit_message."
+                        ),
+                    }
+                )
+                if attempt >= runtime.settings.max_model_attempts:
+                    model_failure = record_model_output_budget_failure(
+                        attempt=attempt,
+                        provider_response_id=candidate_response.get("provider_response_id")
+                        if isinstance(candidate_response.get("provider_response_id"), str)
+                        else None,
+                        failure_reason=(
+                            "model exhausted its attempt budget before authoring "
+                            "a final assistant response"
+                        ),
+                    )
+                    model_failure_reason = "AI model output exhausted its attempt budget"
+                    break
+                continue
+
+            responses_input_items.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "run program completed without user-visible output. Plain "
+                        "assistant text is audit-only and was not shown. Continue with "
+                        "exactly one run call whose program emits output through "
+                        "agent.emit_message or pauses with agent.pause_until_input."
+                    ),
+                }
+            )
+            add_event(
+                "evt.model.protocol_failed",
+                {
+                    "reason": "run_completed_without_visible_output",
+                    "attempt": attempt,
+                    "provider_response_id": candidate_response.get("provider_response_id"),
+                },
+            )
+            if attempt >= runtime.settings.max_model_attempts:
+                model_failure = record_model_output_budget_failure(
+                    attempt=attempt,
+                    provider_response_id=candidate_response.get("provider_response_id")
+                    if isinstance(candidate_response.get("provider_response_id"), str)
+                    else None,
+                    failure_reason="run completed without visible output",
+                )
+                model_failure_reason = "AI model produced no visible run output"
+                break
+            continue
+        except Exception as exc:
+            duration_ms = int((time.perf_counter() - model_started_at) * 1000)
+            fallback_reason = f"unexpected {exc.__class__.__name__}"
+            should_retry = False
+            if isinstance(exc, ModelAdapterError):
+                failure_reason = safe_failure_reason(
+                    exc.safe_reason,
+                    fallback=fallback_reason,
+                )
+                error_details = {
+                    "session_id": effective_session_id,
+                    "turn_id": turn.id,
+                    "attempt": attempt,
+                    "failure_code": exc.code,
+                }
+                if exc.parse_status is not None:
+                    error_details["parse_status"] = exc.parse_status
+                if exc.validation_status is not None:
+                    error_details["validation_status"] = exc.validation_status
+                if exc.provider is not None:
+                    error_details["provider"] = exc.provider
+                if exc.model is not None:
+                    error_details["model"] = exc.model
+                if exc.usage is not None:
+                    error_details["usage"] = exc.usage
+                if exc.provider_response_id is not None:
+                    error_details["provider_response_id"] = exc.provider_response_id
+                if exc.raw_output_shape is not None:
+                    error_details["response_output_shape"] = exc.raw_output_shape
+                model_failure_candidate = ApiError(
+                    status_code=exc.status_code,
+                    code=exc.code,
+                    message=exc.message,
+                    details=error_details,
+                    retryable=exc.retryable,
+                )
+                should_retry = exc.retryable
+            else:
+                failure_reason = safe_failure_reason(
+                    str(exc),
+                    fallback=fallback_reason,
+                )
+                model_failure_candidate = ApiError(
+                    status_code=502,
+                    code="E_MODEL_FAILURE",
+                    message="model provider request failed",
+                    details={
+                        "session_id": effective_session_id,
+                        "turn_id": turn.id,
+                        "attempt": attempt,
+                    },
+                    retryable=True,
+                )
+
+            add_event(
+                "evt.model.failed",
+                {
+                    "provider": runtime.model_adapter.provider,
+                    "model": runtime.model_adapter.model,
+                    "duration_ms": duration_ms,
+                    "failure_reason": failure_reason,
+                    "attempt": attempt,
+                }
+                | (
+                    {
+                        "failure_code": exc.code,
+                        "parse_status": exc.parse_status,
+                        "validation_status": exc.validation_status,
+                        "provider": exc.provider or runtime.model_adapter.provider,
+                        "model": exc.model or runtime.model_adapter.model,
+                        "usage": exc.usage or {},
+                        "provider_response_id": exc.provider_response_id,
+                        "response_output_shape": exc.raw_output_shape or {},
+                    }
+                    if isinstance(exc, ModelAdapterError)
+                    else {}
+                ),
+            )
+
+            elapsed_after_failure_ms = elapsed_turn_ms(turn_started_at)
+            if elapsed_after_failure_ms > runtime.settings.max_turn_wall_time_ms:
+                bounded_failure = build_turn_limit_failure(
+                    budget="turn_wall_time_ms",
+                    unit="ms",
+                    measured=elapsed_after_failure_ms,
+                    limit=runtime.settings.max_turn_wall_time_ms,
+                )
+                break
+            if should_retry and attempt < runtime.settings.max_model_attempts:
+                continue
+            if should_retry and attempt >= runtime.settings.max_model_attempts:
+                provider_response_id = (
+                    exc.provider_response_id
+                    if isinstance(exc, ModelAdapterError)
+                    and isinstance(exc.provider_response_id, str)
+                    else None
+                )
+                model_failure = record_model_output_budget_failure(
+                    attempt=attempt,
+                    provider_response_id=provider_response_id,
+                    failure_reason=(
+                        "model exhausted its retry budget before authoring "
+                        "a final assistant response"
+                    ),
+                )
+                model_failure_reason = failure_reason
+                break
+
+            model_failure = model_failure_candidate
+            model_failure_reason = failure_reason
+            break
+
+    if bounded_failure is not None:
+        emit_turn_limit_failure(bounded_failure)
+    elif model_failure is not None:
+        turn.status = "failed"
+        turn.updated_at = _utcnow()
+        add_event(
+            "evt.turn.failed",
+            {"failure_reason": model_failure_reason or "model provider request failed"},
+        )
+    else:
+        assert assistant_response is not None
+        current_turn_id = db.scalar(
+            select(TurnRecord.id)
+            .where(TurnRecord.session_id == effective_session_id)
+            .order_by(TurnRecord.created_at.desc(), TurnRecord.id.desc())
+            .limit(1)
+        )
+        if current_turn_id != turn.id:
+            add_event(
+                "evt.agent.output_not_applied",
+                {
+                    "reason": "stale_turn",
+                    "current_turn_id": current_turn_id,
+                },
+            )
+            assistant_response = {
+                **assistant_response,
+                "assistant_text": "",
+                "assistant_silent": True,
+            }
+        assistant_message = assistant_response["assistant_text"]
+        turn.assistant_message = assistant_message
+        # Post-turn memory: one rememberer task reviews the completed turn
+        # and maintains the fact store, the profile, and the session digest.
+        remember_task_id = enqueue_memory_remember(
+            db,
+            turn_id=turn.id,
+            now=_utcnow(),
+            new_id_fn=_new_id,
+        )
+        add_event(
+            "evt.memory.remember_queued",
+            {"task_id": remember_task_id, "turn_id": turn.id},
+        )
+
+        turn.status = "completed"
+        turn.updated_at = _utcnow()
+        add_event("evt.assistant.emitted", {"message": assistant_message})
+        add_event("evt.turn.completed", {})
+
+    active_session.updated_at = _utcnow()
+    db.flush()
+
+    if bounded_failure is not None:
+        return TurnExecutionOutcome(
+            turn_id=turn.id,
+            effective_session_id=effective_session_id,
+            status_code=bounded_failure.status_code,
+            response_payload=_error_payload(bounded_failure),
+        )
+    if model_failure is not None:
+        return TurnExecutionOutcome(
+            turn_id=turn.id,
+            effective_session_id=effective_session_id,
+            status_code=model_failure.status_code,
+            response_payload=_error_payload(model_failure),
+        )
+
+    assert assistant_response is not None
+    approvals_by_attempt_id = (
+        {
+            approval.action_attempt_id: approval
+            for approval in db.scalars(
+                select(ApprovalRequestRecord).where(
+                    ApprovalRequestRecord.action_attempt_id.in_(
+                        [attempt.id for attempt in created_action_attempts]
+                    )
+                )
+            ).all()
+        }
+        if created_action_attempts
+        else {}
+    )
+    serialized_action_attempts = [
+        serialize_action_attempt(
+            action_attempt,
+            approval=approvals_by_attempt_id.get(action_attempt.id),
+        )
+        for action_attempt in created_action_attempts
+    ]
+    raw_session = serialize_session(active_session)
+    raw_turn = serialize_turn(
+        turn,
+        events=created_events,
+        action_attempts=serialized_action_attempts,
+    )
+    try:
+        response_payload = build_surface_message_response(
+            session=raw_session,
+            turn=raw_turn,
+            assistant_message=turn.assistant_message,
+            assistant_sources=assistant_sources,
+            assistant_silent=bool(assistant_response.get("assistant_silent")),
+        )
+    except ResponseContractViolation as exc:
+        raise _response_contract_error(exc) from exc
+    return TurnExecutionOutcome(
+        turn_id=turn.id,
+        effective_session_id=effective_session_id,
+        status_code=200,
+        response_payload=response_payload,
+    )
+
+
+def create_app(
+    *,
+    database_url: str | None = None,
+    model_adapter: ModelAdapter | None = None,
+    sandbox: RunSandbox | None = None,
+    reset_database: bool = False,
+) -> FastAPI:
+    runtime, engine = build_runtime(
+        database_url=database_url,
+        model_adapter=model_adapter,
+        sandbox=sandbox,
+    )
+    settings = runtime.settings
+    db_url = database_url or settings.database_url
+    adapter = runtime.model_adapter
+    run_sandbox = runtime.sandbox
+    session_factory = runtime.session_factory
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -3000,6 +4226,7 @@ def create_app(
             engine.dispose()
 
     app = FastAPI(title="Ariel Slice 0", lifespan=lifespan)
+    app.state.runtime = runtime
     app.state.engine = engine
     app.state.session_factory = session_factory
     app.state.model_adapter = adapter
@@ -3024,20 +4251,7 @@ def create_app(
     app.state.connector_encryption_secret = settings.connector_encryption_secret
     app.state.connector_encryption_key_version = settings.connector_encryption_key_version
     app.state.connector_encryption_keys = settings.connector_encryption_keys
-    app.state.attachment_runtime = AttachmentContentRuntime(
-        blob_store_path=settings.attachment_blob_store_path,
-        max_bytes=settings.attachment_max_bytes,
-        fetch_timeout_seconds=settings.attachment_fetch_timeout_seconds,
-        handle_ttl_seconds=settings.attachment_handle_ttl_seconds,
-        scanner_mode=settings.attachment_scanner_mode,
-        openai_api_key=settings.openai_api_key,
-        openai_model=settings.attachment_openai_model,
-        openai_audio_model=settings.attachment_openai_audio_model,
-        openai_timeout_seconds=settings.attachment_openai_timeout_seconds,
-        encryption_secret=settings.connector_encryption_secret,
-        encryption_key_version=settings.connector_encryption_key_version,
-        encryption_keys=settings.connector_encryption_keys,
-    )
+    app.state.attachment_runtime = runtime.attachment_runtime
     app.state.agency_socket_path = settings.agency_socket_path
     app.state.agency_allowed_repo_roots = settings.agency_allowed_repo_roots
     app.state.agency_default_base_branch = settings.agency_default_base_branch
@@ -3158,34 +4372,12 @@ def create_app(
             )
 
     def _google_runtime() -> GoogleConnectorRuntime:
-        return GoogleConnectorRuntime(
+        # The OAuth client and workspace provider are app.state collaborators so
+        # tests can inject fakes; settings supplies the rest.
+        return build_google_runtime(
+            settings,
             oauth_client=app.state.google_oauth_client,
             workspace_provider=app.state.google_workspace_provider,
-            redirect_uri=str(app.state.google_oauth_redirect_uri),
-            oauth_state_ttl_seconds=int(app.state.google_oauth_state_ttl_seconds),
-            encryption_secret=str(app.state.connector_encryption_secret),
-            encryption_key_version=str(app.state.connector_encryption_key_version),
-            encryption_keys=(
-                str(app.state.connector_encryption_keys)
-                if app.state.connector_encryption_keys is not None
-                else None
-            ),
-        )
-
-    def _agency_runtime() -> AgencyRuntime:
-        allowed_roots = tuple(
-            root.strip()
-            for root in str(app.state.agency_allowed_repo_roots).split(",")
-            if root.strip()
-        )
-        return AgencyRuntime(
-            client=AgencyDaemonClient(
-                socket_path=str(app.state.agency_socket_path),
-                timeout_seconds=float(app.state.agency_timeout_seconds),
-            ),
-            allowed_repo_roots=allowed_roots,
-            default_base_branch=str(app.state.agency_default_base_branch),
-            default_runner=str(app.state.agency_default_runner),
         )
 
     @app.get("/v1/health", response_model=None)
@@ -3657,1156 +4849,6 @@ def create_app(
                     )
             return {"ok": True, "connector": connector_payload}
 
-    def _wake(
-        *,
-        db: Session,
-        request_session_id: str,
-        wake_context: WakeContext,
-        execute_google_reads_outside_transaction: bool = False,
-    ) -> TurnExecutionOutcome:
-        user_message = wake_context.prompt_text
-        discord_context = wake_context.discord_context
-        discord_attachment_sources = wake_context.attachment_sources
-        ingress_runtime_provenance = wake_context.ingress_provenance
-        active_session = db.scalar(
-            select(SessionRecord)
-            .where(
-                SessionRecord.id == request_session_id,
-                SessionRecord.is_active.is_(True),
-            )
-            .limit(1)
-        )
-        if active_session is None:
-            raise ApiError(
-                status_code=404,
-                code="E_SESSION_NOT_FOUND",
-                message="active session not found",
-                details={"session_id": request_session_id},
-                retryable=False,
-            )
-
-        prior_turns = db.scalars(
-            select(TurnRecord)
-            .where(TurnRecord.session_id == active_session.id)
-            .order_by(TurnRecord.created_at.asc(), TurnRecord.id.asc())
-        ).all()
-        # Estimate context size for the rotation-pressure trigger. The retriever
-        # is a per-turn step, not part of this estimate, so recalled_memory is
-        # empty here; the profile and digest are the always-loaded documents.
-        pre_rotation_context_bundle = _build_turn_context_bundle(
-            prior_turns=prior_turns,
-            max_recent_turns=int(app.state.max_recent_turns),
-            discord_context=discord_context,
-            profile=read_profile(db),
-            session_digest=active_session.digest,
-            recalled_memory=[],
-            open_commitments_and_jobs=_open_commitments_and_jobs_context(
-                db=db,
-                now=_utcnow(),
-                provider_account_id=_active_google_provider_account_id(db),
-            ),
-            relevant_artifacts_and_observations=_relevant_artifacts_and_observations_context(
-                db=db,
-                prior_turns=prior_turns,
-            ),
-        )
-        estimated_context_tokens = _estimate_context_tokens(
-            context_bundle=pre_rotation_context_bundle,
-            user_message=user_message,
-        )
-        auto_rotation_reason, trigger_snapshot = _auto_rotation_reason(
-            session_created_at=active_session.created_at,
-            prior_turn_count=len(prior_turns),
-            estimated_context_tokens=estimated_context_tokens,
-            max_turns=int(app.state.auto_rotate_max_turns),
-            max_age_seconds=int(app.state.auto_rotate_max_age_seconds),
-            max_context_pressure_tokens=int(app.state.auto_rotate_context_pressure_tokens),
-            now=_utcnow(),
-        )
-        if auto_rotation_reason is not None:
-            active_session, _, _ = _rotate_active_session(
-                db,
-                reason=auto_rotation_reason,
-                idempotency_key=None,
-                actor_id=str(app.state.approval_actor_id),
-                trigger_snapshot=trigger_snapshot,
-            )
-            prior_turns = db.scalars(
-                select(TurnRecord)
-                .where(TurnRecord.session_id == active_session.id)
-                .order_by(TurnRecord.created_at.asc(), TurnRecord.id.asc())
-            ).all()
-
-        effective_session_id = active_session.id
-        runtime_provenance = _runtime_provenance_for_turn(
-            db=db,
-            prior_turns=prior_turns,
-            max_recent_turns=int(app.state.max_recent_turns),
-        )
-        runtime_provenance = _merge_runtime_provenance(
-            baseline=runtime_provenance,
-            ingress=ingress_runtime_provenance,
-        )
-        now = _utcnow()
-        turn = TurnRecord(
-            id=_new_id("trn"),
-            session_id=effective_session_id,
-            user_message=user_message,
-            assistant_message=None,
-            status="in_progress",
-            created_at=now,
-            updated_at=now,
-        )
-        db.add(turn)
-        db.flush()
-
-        sequence = 0
-        created_events: list[EventRecord] = []
-        created_action_attempts: list[ActionAttemptRecord] = []
-        assistant_sources: list[dict[str, Any]] = []
-
-        def add_event(event_type: str, payload_data: dict[str, Any]) -> None:
-            nonlocal sequence
-            sequence += 1
-            event = EventRecord(
-                id=_new_id("evn"),
-                session_id=effective_session_id,
-                turn_id=turn.id,
-                sequence=sequence,
-                event_type=event_type,
-                payload=jsonable_encoder(payload_data),
-                created_at=_utcnow(),
-            )
-            db.add(event)
-            created_events.append(event)
-
-        def add_ai_judgment(
-            *,
-            judgment_type: str,
-            source_type: str,
-            source_id: str,
-            status: str,
-            model: str | None,
-            prompt_version: str,
-            provider_response_id: str | None = None,
-            input_summary: str,
-            input_refs: dict[str, Any],
-            selected: list[dict[str, Any]] | None = None,
-            omitted: list[dict[str, Any]] | None = None,
-            output: dict[str, Any] | None = None,
-            rationale: str | None = None,
-            uncertainty: str | None = None,
-            confidence: float | None = None,
-            parse_status: str,
-            validation_status: str,
-            failure_code: str | None = None,
-            failure_reason: str | None = None,
-        ) -> str:
-            now_judgment = _utcnow()
-            judgment_id = _new_id("ajg")
-            db.add(
-                AIJudgmentRecord(
-                    id=judgment_id,
-                    judgment_type=judgment_type,
-                    source_type=source_type,
-                    source_id=source_id,
-                    status=status,
-                    model=model,
-                    prompt_version=prompt_version,
-                    provider_response_id=provider_response_id,
-                    input_summary=input_summary,
-                    input_refs=jsonable_encoder(input_refs),
-                    selected=jsonable_encoder(selected or []),
-                    omitted=jsonable_encoder(omitted or []),
-                    output=jsonable_encoder(output or {}),
-                    rationale=rationale,
-                    uncertainty=uncertainty,
-                    confidence=confidence,
-                    parse_status=parse_status,
-                    validation_status=validation_status,
-                    failure_code=failure_code,
-                    failure_reason=failure_reason,
-                    created_at=now_judgment,
-                    updated_at=now_judgment,
-                )
-            )
-            return judgment_id
-
-        if discord_context is not None and discord_attachment_sources:
-            app.state.attachment_runtime.record_discord_sources(
-                db=db,
-                session_id=effective_session_id,
-                turn_id=turn.id,
-                discord_context=discord_context,
-                attachment_sources=discord_attachment_sources,
-                now_fn=_utcnow,
-                new_id_fn=_new_id,
-            )
-        add_event("evt.turn.started", {"message": user_message, "discord": discord_context})
-
-        # Pre-turn memory: the always-loaded profile and session digest, plus the
-        # retriever's verdict on which stored facts matter now. The retriever is
-        # a bounded AI subagent that audits its own ai_judgments row; it is
-        # non-fatal -- any failure leaves the turn alive on the profile and
-        # digest alone, so recall is never on the turn's critical-failure path.
-        memory_profile = read_profile(db)
-        session_digest = active_session.digest
-        try:
-            recalled_facts: list[MemoryFactRecord] = run_retriever(
-                session_factory=app.state.session_factory,
-                query=user_message,
-                source_type="turn",
-                source_id=turn.id,
-                settings=settings,
-                now_fn=_utcnow,
-                new_id_fn=_new_id,
-            )
-        except Exception as exc:
-            recalled_facts = []
-            add_event(
-                "evt.memory.recall_failed",
-                {
-                    "turn_id": turn.id,
-                    "failure_reason": safe_failure_reason(
-                        getattr(exc, "safe_reason", str(exc)),
-                        fallback=f"unexpected {exc.__class__.__name__}",
-                    ),
-                },
-            )
-
-        open_commitments_and_jobs = _open_commitments_and_jobs_context(
-            db=db,
-            now=_utcnow(),
-            provider_account_id=_active_google_provider_account_id(db),
-        )
-        context_bundle = _build_turn_context_bundle(
-            prior_turns=prior_turns,
-            max_recent_turns=int(app.state.max_recent_turns),
-            discord_context=discord_context,
-            profile=memory_profile,
-            session_digest=session_digest,
-            recalled_memory=recalled_facts,
-            open_commitments_and_jobs=open_commitments_and_jobs,
-            relevant_artifacts_and_observations=_relevant_artifacts_and_observations_context(
-                db=db,
-                prior_turns=prior_turns,
-            ),
-        )
-        context_bundle["current_turn"] = {
-            "turn_id": turn.id,
-            "user_instruction_ref": f"turn:{turn.id}",
-        }
-        agency_configured = (
-            bool(str(app.state.agency_allowed_repo_roots).strip())
-            and Path(settings.agency_socket_path).exists()
-        )
-        tool_surface_facts = _tool_surface_facts(
-            db=db,
-            context_bundle=context_bundle,
-            agency_configured=agency_configured,
-            settings=settings,
-        )
-        if recalled_facts:
-            add_event(
-                "evt.memory.recalled",
-                {"turn_id": turn.id, "recalled_fact_ids": [fact.id for fact in recalled_facts]},
-            )
-        applied_limits = _applied_turn_limits(app)
-
-        def elapsed_turn_ms(started_at: float) -> int:
-            return int((time.perf_counter() - started_at) * 1000)
-
-        def build_turn_limit_failure(
-            *,
-            budget: str,
-            unit: str,
-            measured: int,
-            limit: int,
-        ) -> ApiError:
-            return _build_turn_limit_error(
-                session_id=effective_session_id,
-                turn_id=turn.id,
-                violation=TurnLimitViolation(
-                    budget=budget,
-                    unit=unit,
-                    measured=measured,
-                    limit=limit,
-                ),
-                applied_limits=applied_limits,
-            )
-
-        def emit_turn_limit_failure(failure: ApiError) -> None:
-            raw_limit = failure.details.get("limit")
-            limit_details = raw_limit if isinstance(raw_limit, dict) else {}
-            add_event(
-                "evt.assistant.emitted",
-                {
-                    "message": failure.message,
-                    "bounded_failure": {
-                        "code": failure.code,
-                        "limit": limit_details,
-                    },
-                },
-            )
-            turn.assistant_message = failure.message
-            turn.status = "failed"
-            turn.updated_at = _utcnow()
-            add_event(
-                "evt.turn.failed",
-                {
-                    "failure_reason": failure.message,
-                    "error_code": failure.code,
-                    "limit": limit_details,
-                },
-            )
-
-        bounded_failure: ApiError | None = None
-        model_failure: ApiError | None = None
-        model_failure_reason: str | None = None
-        assistant_response: dict[str, Any] | None = None
-
-        def record_model_output_budget_failure(
-            *,
-            attempt: int,
-            provider_response_id: str | None,
-            failure_reason: str,
-        ) -> ApiError:
-            prompt_version = "model-output-v1"
-            add_ai_judgment(
-                judgment_type="model_output",
-                source_type="turn",
-                source_id=turn.id,
-                status="failed",
-                model=app.state.model_adapter.model,
-                prompt_version=prompt_version,
-                provider_response_id=provider_response_id,
-                input_summary="final model-authored assistant output for turn",
-                input_refs={
-                    "session_id": effective_session_id,
-                    "turn_id": turn.id,
-                    "attempt": attempt,
-                    "max_model_attempts": int(app.state.max_model_attempts),
-                },
-                parse_status="missing_output",
-                validation_status="not_validated",
-                failure_code="E_AI_JUDGMENT_BUDGET",
-                failure_reason=failure_reason,
-            )
-            add_event(
-                "evt.ai_judgment.failed",
-                {
-                    "judgment_type": "model_output",
-                    "failure_code": "E_AI_JUDGMENT_BUDGET",
-                    "failure_reason": failure_reason,
-                    "prompt_version": prompt_version,
-                    "source_id": turn.id,
-                    "parse_status": "missing_output",
-                    "validation_status": "not_validated",
-                    "provider_response_id": provider_response_id,
-                    "attempt": attempt,
-                    "max_model_attempts": int(app.state.max_model_attempts),
-                },
-            )
-            return ApiError(
-                status_code=429,
-                code="E_AI_JUDGMENT_BUDGET",
-                message="AI model output failed",
-                details={
-                    "session_id": effective_session_id,
-                    "turn_id": turn.id,
-                    "judgment_type": "model_output",
-                    "prompt_version": prompt_version,
-                    "attempt": attempt,
-                    "max_model_attempts": int(app.state.max_model_attempts),
-                    "provider_response_id": provider_response_id,
-                },
-                retryable=True,
-            )
-
-        # The running context is the verbatim recent-turns window plus the
-        # session digest, so it is inherently bounded -- there is no
-        # summarization or compaction step.
-        context_metadata = _context_bundle_audit_metadata(context_bundle)
-        allowed_capability_ids = _eligible_internal_callable_capability_ids(
-            tool_surface_facts=tool_surface_facts,
-        )
-        context_bundle["tool_surface_facts"] = tool_surface_facts
-        eligible_internal_callables: list[str] = []
-        for capability_id in allowed_capability_ids:
-            callable_name = run_callable_name_for_capability_id(capability_id)
-            if callable_name is not None:
-                eligible_internal_callables.append(callable_name)
-        context_bundle["eligible_internal_callables"] = sorted(eligible_internal_callables)
-        responses_tools = run_tool_definitions()
-        responses_input_items = _build_responses_input_items(
-            context_bundle=context_bundle,
-            user_message=user_message,
-        )
-        turn_started_at = time.perf_counter()
-        for attempt in range(1, app.state.max_model_attempts + 1):
-            if attempt > 1:
-                elapsed_before_attempt_ms = elapsed_turn_ms(turn_started_at)
-                if elapsed_before_attempt_ms > app.state.max_turn_wall_time_ms:
-                    bounded_failure = build_turn_limit_failure(
-                        budget="turn_wall_time_ms",
-                        unit="ms",
-                        measured=elapsed_before_attempt_ms,
-                        limit=app.state.max_turn_wall_time_ms,
-                    )
-                    break
-
-            add_event(
-                "evt.model.started",
-                {
-                    "provider": app.state.model_adapter.provider,
-                    "model": app.state.model_adapter.model,
-                    "context": context_metadata,
-                    "attempt": attempt,
-                },
-            )
-            model_started_at = time.perf_counter()
-            try:
-                candidate_response = app.state.model_adapter.create_response(
-                    input_items=responses_input_items,
-                    tools=responses_tools,
-                    user_message=user_message,
-                    history=context_bundle["recent_active_session_turns"],
-                    context_bundle=context_bundle,
-                )
-                duration_ms = int((time.perf_counter() - model_started_at) * 1000)
-                add_event(
-                    "evt.model.completed",
-                    {
-                        "provider": candidate_response["provider"],
-                        "model": candidate_response["model"],
-                        "duration_ms": duration_ms,
-                        "usage": candidate_response.get("usage"),
-                        "provider_response_id": candidate_response.get("provider_response_id"),
-                        "attempt": attempt,
-                    },
-                )
-
-                elapsed_after_model_ms = elapsed_turn_ms(turn_started_at)
-                if elapsed_after_model_ms > app.state.max_turn_wall_time_ms:
-                    bounded_failure = build_turn_limit_failure(
-                        budget="turn_wall_time_ms",
-                        unit="ms",
-                        measured=elapsed_after_model_ms,
-                        limit=app.state.max_turn_wall_time_ms,
-                    )
-                    break
-
-                output_items = candidate_response.get("output")
-                if not isinstance(output_items, list):
-                    provider_response_id = candidate_response.get("provider_response_id")
-                    raise ModelAdapterError(
-                        safe_reason="model response missing Responses output items",
-                        status_code=502,
-                        code="E_MODEL_OUTPUT_SCHEMA",
-                        message="model response failed output contract",
-                        retryable=False,
-                        provider=candidate_response.get("provider")
-                        if isinstance(candidate_response.get("provider"), str)
-                        else app.state.model_adapter.provider,
-                        model=candidate_response.get("model")
-                        if isinstance(candidate_response.get("model"), str)
-                        else app.state.model_adapter.model,
-                        usage=candidate_response.get("usage")
-                        if isinstance(candidate_response.get("usage"), dict)
-                        else None,
-                        provider_response_id=provider_response_id
-                        if isinstance(provider_response_id, str)
-                        else None,
-                        parse_status="schema_invalid",
-                        validation_status="invalid",
-                        raw_output_shape={
-                            "output_type": type(output_items).__name__,
-                            "output_count": None,
-                            "text_present": False,
-                        },
-                    )
-                function_calls = _extract_responses_function_calls(output_items)
-                run_source, run_protocol_error = parse_run_function_call(function_calls)
-                if run_protocol_error is not None or run_source is None:
-                    provider_response_id = candidate_response.get("provider_response_id")
-                    add_ai_judgment(
-                        judgment_type="model_output",
-                        source_type="turn",
-                        source_id=turn.id,
-                        status="failed",
-                        model=candidate_response.get("model")
-                        if isinstance(candidate_response.get("model"), str)
-                        else app.state.model_adapter.model,
-                        prompt_version="model-output-v1",
-                        provider_response_id=provider_response_id
-                        if isinstance(provider_response_id, str)
-                        else None,
-                        input_summary="run protocol validation for model response",
-                        input_refs={
-                            "session_id": effective_session_id,
-                            "turn_id": turn.id,
-                            "attempt": attempt,
-                            "response_output": jsonable_encoder(output_items),
-                        },
-                        parse_status="parsed",
-                        validation_status="invalid",
-                        failure_code="E_AI_JUDGMENT_VALIDATION",
-                        failure_reason=run_protocol_error or "model failed the run tool protocol",
-                    )
-                    for output_item in output_items:
-                        if (
-                            isinstance(output_item, dict)
-                            and output_item.get("type") == "function_call"
-                        ):
-                            responses_input_items.append(jsonable_encoder(output_item))
-                    for function_call in function_calls:
-                        call_id = function_call.get("call_id")
-                        if not isinstance(call_id, str) or not call_id:
-                            continue
-                        responses_input_items.append(
-                            {
-                                "type": "function_call_output",
-                                "call_id": call_id,
-                                "output": json.dumps(
-                                    {
-                                        "status": "failed",
-                                        "error": run_protocol_error
-                                        or "model failed the run tool protocol",
-                                    },
-                                    sort_keys=True,
-                                ),
-                            }
-                        )
-                    responses_input_items.append(
-                        {
-                            "role": "system",
-                            "content": (
-                                "model protocol failure: the user did not see that response. "
-                                "Call exactly one tool named run with JSON arguments "
-                                '{"source":"..."} where source is a Python program; emit '
-                                "user-visible text from the program with "
-                                "agent.emit_message."
-                            ),
-                        }
-                    )
-                    add_event(
-                        "evt.model.protocol_failed",
-                        {
-                            "reason": run_protocol_error,
-                            "attempt": attempt,
-                            "provider_response_id": candidate_response.get("provider_response_id"),
-                        },
-                    )
-                    if attempt >= app.state.max_model_attempts:
-                        model_failure = record_model_output_budget_failure(
-                            attempt=attempt,
-                            provider_response_id=candidate_response.get("provider_response_id")
-                            if isinstance(candidate_response.get("provider_response_id"), str)
-                            else None,
-                            failure_reason=run_protocol_error
-                            or "model failed the run tool protocol",
-                        )
-                        model_failure_reason = "AI model failed the run tool protocol"
-                        break
-                    continue
-
-                run_call_id = function_calls[0].get("call_id")
-                run_call_id = run_call_id if isinstance(run_call_id, str) else ""
-                run_program_result = execute_run_program(
-                    sandbox=app.state.sandbox,
-                    source=run_source,
-                    db=db,
-                    session_factory=session_factory,
-                    session_id=effective_session_id,
-                    turn=turn,
-                    # Capability syscalls from earlier programs in this turn
-                    # already consumed proposal indices; each one created
-                    # exactly one ActionAttemptRecord here. Offset by their
-                    # running count so proposal_index stays turn-unique.
-                    proposal_index_start=len(created_action_attempts),
-                    approval_ttl_seconds=int(app.state.approval_ttl_seconds),
-                    approval_actor_id=str(app.state.approval_actor_id),
-                    add_event=add_event,
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                    runtime_provenance=runtime_provenance,
-                    google_runtime=_google_runtime(),
-                    execute_google_reads_outside_transaction=(
-                        execute_google_reads_outside_transaction
-                    ),
-                    agency_runtime=_agency_runtime(),
-                    attachment_runtime=app.state.attachment_runtime,
-                    allowed_capability_ids=set(allowed_capability_ids),
-                    settings=settings,
-                )
-                # The syscall trace is the audit spine and is recorded whether
-                # or not the program completed cleanly.
-                created_action_attempts.extend(run_program_result.action_attempts)
-                # Thread taint across programs in the same turn: a syscall
-                # that returned untrusted-influenced content in this program
-                # advanced its runtime provenance; merge that into the turn
-                # baseline so the next program's syscalls are evaluated with
-                # it. execute_run_program already threads taint within a
-                # program; this closes the gap across programs.
-                runtime_provenance = _merge_runtime_provenance(
-                    baseline=runtime_provenance,
-                    ingress=run_program_result.runtime_provenance,
-                )
-                if not run_program_result.program_ok:
-                    # Program Failure: the program did not complete cleanly, so
-                    # no proposal stands. Void any approval the failed program
-                    # staged so it never surfaces as a live pending action; the
-                    # action attempts stay as the audit trace.
-                    _void_failed_program_approvals(
-                        db=db,
-                        action_attempts=run_program_result.action_attempts,
-                        add_event=add_event,
-                    )
-                    program_errors = [
-                        error for error in [run_program_result.program_error] if error is not None
-                    ] + run_program_result.callback_errors
-                    provider_response_id = candidate_response.get("provider_response_id")
-                    add_ai_judgment(
-                        judgment_type="model_output",
-                        source_type="turn",
-                        source_id=turn.id,
-                        status="failed",
-                        model=candidate_response.get("model")
-                        if isinstance(candidate_response.get("model"), str)
-                        else app.state.model_adapter.model,
-                        prompt_version="model-output-v1",
-                        provider_response_id=provider_response_id
-                        if isinstance(provider_response_id, str)
-                        else None,
-                        input_summary="run program execution for model response",
-                        input_refs={
-                            "session_id": effective_session_id,
-                            "turn_id": turn.id,
-                            "attempt": attempt,
-                            "source": run_source,
-                        },
-                        parse_status="parsed",
-                        validation_status="invalid",
-                        failure_code="E_AI_JUDGMENT_VALIDATION",
-                        failure_reason=json.dumps(program_errors, sort_keys=True),
-                    )
-                    for output_item in output_items:
-                        if (
-                            isinstance(output_item, dict)
-                            and output_item.get("type") == "function_call"
-                        ):
-                            responses_input_items.append(jsonable_encoder(output_item))
-                    if run_call_id:
-                        responses_input_items.append(
-                            {
-                                "type": "function_call_output",
-                                "call_id": run_call_id,
-                                "output": json.dumps(
-                                    {"status": "failed", "errors": program_errors},
-                                    sort_keys=True,
-                                ),
-                            }
-                        )
-                    responses_input_items.append(
-                        {
-                            "role": "system",
-                            "content": (
-                                "run program did not complete: "
-                                + json.dumps(program_errors, sort_keys=True)
-                                + ". No effects were committed and the user did not "
-                                "see any output. Retry with exactly one run call whose "
-                                "source is a Python program that completes cleanly and "
-                                "emits user-visible text with agent.emit_message."
-                            ),
-                        }
-                    )
-                    add_event(
-                        "evt.run.validation_failed",
-                        {
-                            "errors": program_errors,
-                            "attempt": attempt,
-                            "provider_response_id": candidate_response.get("provider_response_id"),
-                        },
-                    )
-                    if attempt >= app.state.max_model_attempts:
-                        model_failure = record_model_output_budget_failure(
-                            attempt=attempt,
-                            provider_response_id=candidate_response.get("provider_response_id")
-                            if isinstance(candidate_response.get("provider_response_id"), str)
-                            else None,
-                            failure_reason="run program did not complete cleanly",
-                        )
-                        model_failure_reason = "AI model produced an invalid run program"
-                        break
-                    continue
-
-                provider_response_id = candidate_response.get("provider_response_id")
-                add_ai_judgment(
-                    judgment_type="model_output",
-                    source_type="turn",
-                    source_id=turn.id,
-                    status="succeeded",
-                    model=candidate_response.get("model")
-                    if isinstance(candidate_response.get("model"), str)
-                    else app.state.model_adapter.model,
-                    prompt_version="model-output-v1",
-                    provider_response_id=provider_response_id
-                    if isinstance(provider_response_id, str)
-                    else None,
-                    input_summary="executed run program for model response",
-                    input_refs={
-                        "session_id": effective_session_id,
-                        "turn_id": turn.id,
-                        "attempt": attempt,
-                        "source": run_source,
-                        "response_output": jsonable_encoder(output_items),
-                    },
-                    output={
-                        "emitted_message": bool(run_program_result.emitted_message),
-                        "paused": run_program_result.paused,
-                        "emitted_value_count": len(run_program_result.emitted_values),
-                        "action_attempt_count": len(run_program_result.action_attempts),
-                    },
-                    parse_status="parsed",
-                    validation_status="valid",
-                )
-
-                # Retrieval syscalls in the program persisted citation
-                # artifacts; surface them as the turn's response sources.
-                assistant_sources = _turn_retrieval_sources(db=db, turn_id=turn.id)
-
-                for index, emitted_value in enumerate(run_program_result.emitted_values, start=1):
-                    encoded_value = json.dumps(
-                        jsonable_encoder(emitted_value),
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ).encode("utf-8")
-                    add_event(
-                        "evt.agent.value_emitted",
-                        {
-                            "index": index,
-                            "value_digest": hashlib.sha256(encoded_value).hexdigest(),
-                            "value_bytes": len(encoded_value),
-                            "attempt": attempt,
-                            "provider_response_id": candidate_response.get("provider_response_id"),
-                        },
-                    )
-
-                if run_program_result.emitted_message:
-                    # The program composed user-visible output. A program may
-                    # stage approval proposals and still emit a mechanical
-                    # confirmation; the emitted message is the turn answer.
-                    response_tokens = _response_tokens_from_model_payload(
-                        candidate_response,
-                        assistant_text=run_program_result.emitted_message,
-                    )
-                    if response_tokens > app.state.max_response_tokens:
-                        bounded_failure = build_turn_limit_failure(
-                            budget="response_tokens",
-                            unit="tokens",
-                            measured=response_tokens,
-                            limit=app.state.max_response_tokens,
-                        )
-                        break
-                    assistant_response = {
-                        **candidate_response,
-                        "assistant_text": run_program_result.emitted_message,
-                        "assistant_silent": False,
-                    }
-                    break
-
-                if any(
-                    action_attempt.status == "awaiting_approval"
-                    for action_attempt in run_program_result.action_attempts
-                ):
-                    # The program staged an approval proposal but did not emit
-                    # a message; surface a default approval prompt.
-                    approval_message = "approval required. review the pending action."
-                    response_tokens = _response_tokens_from_model_payload(
-                        candidate_response,
-                        assistant_text=approval_message,
-                    )
-                    if response_tokens > app.state.max_response_tokens:
-                        bounded_failure = build_turn_limit_failure(
-                            budget="response_tokens",
-                            unit="tokens",
-                            measured=response_tokens,
-                            limit=app.state.max_response_tokens,
-                        )
-                        break
-                    assistant_response = {
-                        **candidate_response,
-                        "assistant_text": approval_message,
-                        "assistant_silent": False,
-                    }
-                    break
-
-                if run_program_result.emitted_values:
-                    # Internal structured data for a later turn: the model
-                    # reads the values and continues with another program.
-                    for output_item in output_items:
-                        if (
-                            isinstance(output_item, dict)
-                            and output_item.get("type") == "function_call"
-                        ):
-                            responses_input_items.append(jsonable_encoder(output_item))
-                    if run_call_id:
-                        responses_input_items.append(
-                            {
-                                "type": "function_call_output",
-                                "call_id": run_call_id,
-                                "output": json.dumps(
-                                    {
-                                        "status": "completed",
-                                        "emitted_values": jsonable_encoder(
-                                            run_program_result.emitted_values
-                                        ),
-                                    },
-                                    sort_keys=True,
-                                ),
-                            }
-                        )
-                    responses_input_items.append(
-                        {
-                            "role": "system",
-                            "content": (
-                                "run program emitted internal values. They are not "
-                                "visible to the user. Continue with exactly one run call."
-                            ),
-                        }
-                    )
-                    if attempt >= app.state.max_model_attempts:
-                        model_failure = record_model_output_budget_failure(
-                            attempt=attempt,
-                            provider_response_id=candidate_response.get("provider_response_id")
-                            if isinstance(candidate_response.get("provider_response_id"), str)
-                            else None,
-                            failure_reason=(
-                                "model emitted internal values but exhausted its attempt budget"
-                            ),
-                        )
-                        model_failure_reason = "AI model output exhausted its attempt budget"
-                        break
-                    continue
-
-                if run_program_result.paused:
-                    assistant_response = {
-                        **candidate_response,
-                        "assistant_text": "",
-                        "assistant_silent": True,
-                    }
-                    break
-
-                if run_program_result.action_attempts:
-                    # The program ran syscalls but emitted no user-visible
-                    # output and staged no approval; feed the audited syscall
-                    # trace back so the model can author the next program.
-                    for output_item in output_items:
-                        if (
-                            isinstance(output_item, dict)
-                            and output_item.get("type") == "function_call"
-                        ):
-                            responses_input_items.append(jsonable_encoder(output_item))
-                    action_attempt_summary = _run_program_action_attempt_summary(
-                        run_program_result.action_attempts
-                    )
-                    if run_call_id:
-                        responses_input_items.append(
-                            {
-                                "type": "function_call_output",
-                                "call_id": run_call_id,
-                                "output": json.dumps(
-                                    {
-                                        "status": "completed",
-                                        "message_emitted": False,
-                                        "action_attempts": action_attempt_summary,
-                                    },
-                                    sort_keys=True,
-                                ),
-                            }
-                        )
-                    responses_input_items.append(
-                        {
-                            "role": "system",
-                            "content": (
-                                "run program syscall trace:\n"
-                                + json.dumps(action_attempt_summary, sort_keys=True)
-                                + "\nThe user saw no output. Continue with exactly one "
-                                "run call that emits user-visible text with "
-                                "agent.emit_message."
-                            ),
-                        }
-                    )
-                    if attempt >= app.state.max_model_attempts:
-                        model_failure = record_model_output_budget_failure(
-                            attempt=attempt,
-                            provider_response_id=candidate_response.get("provider_response_id")
-                            if isinstance(candidate_response.get("provider_response_id"), str)
-                            else None,
-                            failure_reason=(
-                                "model exhausted its attempt budget before authoring "
-                                "a final assistant response"
-                            ),
-                        )
-                        model_failure_reason = "AI model output exhausted its attempt budget"
-                        break
-                    continue
-
-                responses_input_items.append(
-                    {
-                        "role": "system",
-                        "content": (
-                            "run program completed without user-visible output. Plain "
-                            "assistant text is audit-only and was not shown. Continue with "
-                            "exactly one run call whose program emits output through "
-                            "agent.emit_message or pauses with agent.pause_until_input."
-                        ),
-                    }
-                )
-                add_event(
-                    "evt.model.protocol_failed",
-                    {
-                        "reason": "run_completed_without_visible_output",
-                        "attempt": attempt,
-                        "provider_response_id": candidate_response.get("provider_response_id"),
-                    },
-                )
-                if attempt >= app.state.max_model_attempts:
-                    model_failure = record_model_output_budget_failure(
-                        attempt=attempt,
-                        provider_response_id=candidate_response.get("provider_response_id")
-                        if isinstance(candidate_response.get("provider_response_id"), str)
-                        else None,
-                        failure_reason="run completed without visible output",
-                    )
-                    model_failure_reason = "AI model produced no visible run output"
-                    break
-                continue
-            except Exception as exc:
-                duration_ms = int((time.perf_counter() - model_started_at) * 1000)
-                fallback_reason = f"unexpected {exc.__class__.__name__}"
-                should_retry = False
-                if isinstance(exc, ModelAdapterError):
-                    failure_reason = safe_failure_reason(
-                        exc.safe_reason,
-                        fallback=fallback_reason,
-                    )
-                    error_details = {
-                        "session_id": effective_session_id,
-                        "turn_id": turn.id,
-                        "attempt": attempt,
-                        "failure_code": exc.code,
-                    }
-                    if exc.parse_status is not None:
-                        error_details["parse_status"] = exc.parse_status
-                    if exc.validation_status is not None:
-                        error_details["validation_status"] = exc.validation_status
-                    if exc.provider is not None:
-                        error_details["provider"] = exc.provider
-                    if exc.model is not None:
-                        error_details["model"] = exc.model
-                    if exc.usage is not None:
-                        error_details["usage"] = exc.usage
-                    if exc.provider_response_id is not None:
-                        error_details["provider_response_id"] = exc.provider_response_id
-                    if exc.raw_output_shape is not None:
-                        error_details["response_output_shape"] = exc.raw_output_shape
-                    model_failure_candidate = ApiError(
-                        status_code=exc.status_code,
-                        code=exc.code,
-                        message=exc.message,
-                        details=error_details,
-                        retryable=exc.retryable,
-                    )
-                    should_retry = exc.retryable
-                else:
-                    failure_reason = safe_failure_reason(
-                        str(exc),
-                        fallback=fallback_reason,
-                    )
-                    model_failure_candidate = ApiError(
-                        status_code=502,
-                        code="E_MODEL_FAILURE",
-                        message="model provider request failed",
-                        details={
-                            "session_id": effective_session_id,
-                            "turn_id": turn.id,
-                            "attempt": attempt,
-                        },
-                        retryable=True,
-                    )
-
-                add_event(
-                    "evt.model.failed",
-                    {
-                        "provider": app.state.model_adapter.provider,
-                        "model": app.state.model_adapter.model,
-                        "duration_ms": duration_ms,
-                        "failure_reason": failure_reason,
-                        "attempt": attempt,
-                    }
-                    | (
-                        {
-                            "failure_code": exc.code,
-                            "parse_status": exc.parse_status,
-                            "validation_status": exc.validation_status,
-                            "provider": exc.provider or app.state.model_adapter.provider,
-                            "model": exc.model or app.state.model_adapter.model,
-                            "usage": exc.usage or {},
-                            "provider_response_id": exc.provider_response_id,
-                            "response_output_shape": exc.raw_output_shape or {},
-                        }
-                        if isinstance(exc, ModelAdapterError)
-                        else {}
-                    ),
-                )
-
-                elapsed_after_failure_ms = elapsed_turn_ms(turn_started_at)
-                if elapsed_after_failure_ms > app.state.max_turn_wall_time_ms:
-                    bounded_failure = build_turn_limit_failure(
-                        budget="turn_wall_time_ms",
-                        unit="ms",
-                        measured=elapsed_after_failure_ms,
-                        limit=app.state.max_turn_wall_time_ms,
-                    )
-                    break
-                if should_retry and attempt < app.state.max_model_attempts:
-                    continue
-                if should_retry and attempt >= app.state.max_model_attempts:
-                    provider_response_id = (
-                        exc.provider_response_id
-                        if isinstance(exc, ModelAdapterError)
-                        and isinstance(exc.provider_response_id, str)
-                        else None
-                    )
-                    model_failure = record_model_output_budget_failure(
-                        attempt=attempt,
-                        provider_response_id=provider_response_id,
-                        failure_reason=(
-                            "model exhausted its retry budget before authoring "
-                            "a final assistant response"
-                        ),
-                    )
-                    model_failure_reason = failure_reason
-                    break
-
-                model_failure = model_failure_candidate
-                model_failure_reason = failure_reason
-                break
-
-        if bounded_failure is not None:
-            emit_turn_limit_failure(bounded_failure)
-        elif model_failure is not None:
-            turn.status = "failed"
-            turn.updated_at = _utcnow()
-            add_event(
-                "evt.turn.failed",
-                {"failure_reason": model_failure_reason or "model provider request failed"},
-            )
-        else:
-            assert assistant_response is not None
-            current_turn_id = db.scalar(
-                select(TurnRecord.id)
-                .where(TurnRecord.session_id == effective_session_id)
-                .order_by(TurnRecord.created_at.desc(), TurnRecord.id.desc())
-                .limit(1)
-            )
-            if current_turn_id != turn.id:
-                add_event(
-                    "evt.agent.output_not_applied",
-                    {
-                        "reason": "stale_turn",
-                        "current_turn_id": current_turn_id,
-                    },
-                )
-                assistant_response = {
-                    **assistant_response,
-                    "assistant_text": "",
-                    "assistant_silent": True,
-                }
-            assistant_message = assistant_response["assistant_text"]
-            turn.assistant_message = assistant_message
-            # Post-turn memory: one rememberer task reviews the completed turn
-            # and maintains the fact store, the profile, and the session digest.
-            remember_task_id = enqueue_memory_remember(
-                db,
-                turn_id=turn.id,
-                now=_utcnow(),
-                new_id_fn=_new_id,
-            )
-            add_event(
-                "evt.memory.remember_queued",
-                {"task_id": remember_task_id, "turn_id": turn.id},
-            )
-
-            turn.status = "completed"
-            turn.updated_at = _utcnow()
-            add_event("evt.assistant.emitted", {"message": assistant_message})
-            add_event("evt.turn.completed", {})
-
-        active_session.updated_at = _utcnow()
-        db.flush()
-
-        if bounded_failure is not None:
-            return TurnExecutionOutcome(
-                turn_id=turn.id,
-                effective_session_id=effective_session_id,
-                status_code=bounded_failure.status_code,
-                response_payload=_error_payload(bounded_failure),
-            )
-        if model_failure is not None:
-            return TurnExecutionOutcome(
-                turn_id=turn.id,
-                effective_session_id=effective_session_id,
-                status_code=model_failure.status_code,
-                response_payload=_error_payload(model_failure),
-            )
-
-        assert assistant_response is not None
-        approvals_by_attempt_id = (
-            {
-                approval.action_attempt_id: approval
-                for approval in db.scalars(
-                    select(ApprovalRequestRecord).where(
-                        ApprovalRequestRecord.action_attempt_id.in_(
-                            [attempt.id for attempt in created_action_attempts]
-                        )
-                    )
-                ).all()
-            }
-            if created_action_attempts
-            else {}
-        )
-        serialized_action_attempts = [
-            serialize_action_attempt(
-                action_attempt,
-                approval=approvals_by_attempt_id.get(action_attempt.id),
-            )
-            for action_attempt in created_action_attempts
-        ]
-        raw_session = serialize_session(active_session)
-        raw_turn = serialize_turn(
-            turn,
-            events=created_events,
-            action_attempts=serialized_action_attempts,
-        )
-        try:
-            response_payload = build_surface_message_response(
-                session=raw_session,
-                turn=raw_turn,
-                assistant_message=turn.assistant_message,
-                assistant_sources=assistant_sources,
-                assistant_silent=bool(assistant_response.get("assistant_silent")),
-            )
-        except ResponseContractViolation as exc:
-            raise _response_contract_error(exc) from exc
-        return TurnExecutionOutcome(
-            turn_id=turn.id,
-            effective_session_id=effective_session_id,
-            status_code=200,
-            response_payload=response_payload,
-        )
-
     @app.post("/v1/sessions/{session_id}/message", response_model=None)
     def post_message(
         session_id: str,
@@ -5031,6 +5073,8 @@ def create_app(
                     db.flush()
 
                 turn_outcome = _wake(
+                    runtime=app.state.runtime,
+                    google_runtime=_google_runtime(),
                     db=db,
                     request_session_id=request_session_id,
                     wake_context=WakeContext(
@@ -5324,6 +5368,8 @@ def create_app(
                     else None
                 )
                 turn_outcome = _wake(
+                    runtime=app.state.runtime,
+                    google_runtime=_google_runtime(),
                     db=db,
                     request_session_id=request_session_id,
                     wake_context=WakeContext(

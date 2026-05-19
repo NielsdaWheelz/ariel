@@ -15,10 +15,9 @@ from sqlalchemy import text
 from ariel.app import ModelAdapter, create_app
 from tests.integration.responses_helpers import responses_message, responses_run_message
 from ariel.config import AppSettings
-from ariel.persistence import JobRecord
+from ariel.persistence import JobRecord, enqueue_background_task
 from ariel.worker import (
     claim_next_task,
-    enqueue_background_task,
     process_one_task,
     reap_stale_tasks,
 )

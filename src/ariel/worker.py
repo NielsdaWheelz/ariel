@@ -7,7 +7,7 @@ from typing import Any
 
 import httpx
 import ulid
-from sqlalchemy import create_engine, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from .action_runtime import (
@@ -15,13 +15,8 @@ from .action_runtime import (
     process_provider_write_reconcile_due,
     reconcile_expired_approvals_for_session,
 )
-from .agency_daemon import AgencyDaemonClient, AgencyRuntime
+from .app import Runtime, build_agency_runtime, build_google_runtime, build_runtime
 from .config import AppSettings
-from .google_connector import (
-    DefaultGoogleOAuthClient,
-    DefaultGoogleWorkspaceProvider,
-    GoogleConnectorRuntime,
-)
 from .persistence import (
     AgencyEventRecord,
     BackgroundTaskRecord,
@@ -33,6 +28,8 @@ from .persistence import (
     SessionRecord,
     SyncCursorRecord,
     WorkFollowUpLoopRecord,
+    _work_follow_up_task_idempotency_key,
+    enqueue_background_task,
     to_rfc3339,
 )
 from .leave_by import process_leave_by_evaluate_due, process_leave_by_scan_due
@@ -128,76 +125,6 @@ def process_due_email_thread_watches(
                     watch.status = "failed"
                 watch.updated_at = now
             return len(watches)
-
-
-def enqueue_background_task(
-    db: Session,
-    *,
-    task_type: str,
-    payload: dict[str, Any],
-    now: datetime,
-    max_attempts: int = 3,
-    idempotency_key: str | None = None,
-) -> BackgroundTaskRecord:
-    if idempotency_key is not None:
-        existing_task = db.scalar(
-            select(BackgroundTaskRecord)
-            .where(BackgroundTaskRecord.idempotency_key == idempotency_key)
-            .limit(1)
-        )
-        if existing_task is not None:
-            return existing_task
-    work_follow_up_loop_id = None
-    work_follow_up_loop_version = None
-    work_follow_up_scheduled_for = None
-    provider_write_receipt_id = None
-    if task_type == "work_follow_up_evaluate_due":
-        loop_id = payload.get("loop_id")
-        loop_version = payload.get("loop_version")
-        scheduled_for = payload.get("scheduled_for")
-        if not isinstance(loop_id, str) or not isinstance(loop_version, int):
-            raise RuntimeError("work_follow_up_evaluate_due task payload invalid")
-        if not isinstance(scheduled_for, str):
-            raise RuntimeError("work_follow_up_evaluate_due task scheduled_for missing")
-        work_follow_up_loop_id = loop_id
-        work_follow_up_loop_version = loop_version
-        work_follow_up_scheduled_for = datetime.fromisoformat(scheduled_for.replace("Z", "+00:00"))
-    if task_type == "provider_write_reconcile_due":
-        receipt_id = payload.get("provider_write_receipt_id")
-        if not isinstance(receipt_id, str) or not receipt_id:
-            raise RuntimeError("provider_write_reconcile_due task payload invalid")
-        provider_write_receipt_id = receipt_id
-    task = BackgroundTaskRecord(
-        id=_new_id("tsk"),
-        task_type=task_type,
-        idempotency_key=idempotency_key,
-        work_follow_up_loop_id=work_follow_up_loop_id,
-        work_follow_up_loop_version=work_follow_up_loop_version,
-        work_follow_up_scheduled_for=work_follow_up_scheduled_for,
-        provider_write_receipt_id=provider_write_receipt_id,
-        payload=payload,
-        status="pending",
-        attempts=0,
-        max_attempts=max_attempts,
-        error=None,
-        claimed_by=None,
-        run_after=now,
-        last_heartbeat=None,
-        created_at=now,
-        updated_at=now,
-    )
-    db.add(task)
-    db.flush()
-    return task
-
-
-def _work_follow_up_task_idempotency_key(
-    *,
-    loop_id: str,
-    loop_version: int,
-    scheduled_for: str,
-) -> str:
-    return f"work_follow_up_evaluate_due:{loop_id}:{loop_version}:{scheduled_for}"
 
 
 def claim_next_task(db: Session, *, worker_id: str, now: datetime) -> BackgroundTaskRecord | None:
@@ -407,42 +334,13 @@ def enqueue_due_work_follow_up_evaluation_tasks(
     return enqueued
 
 
-def _google_runtime(settings: AppSettings) -> GoogleConnectorRuntime:
-    return GoogleConnectorRuntime(
-        oauth_client=DefaultGoogleOAuthClient(
-            client_id=settings.google_oauth_client_id,
-            client_secret=settings.google_oauth_client_secret,
-            timeout_seconds=settings.google_oauth_timeout_seconds,
-        ),
-        workspace_provider=DefaultGoogleWorkspaceProvider(),
-        redirect_uri=settings.google_oauth_redirect_uri,
-        oauth_state_ttl_seconds=settings.google_oauth_state_ttl_seconds,
-        encryption_secret=settings.connector_encryption_secret,
-        encryption_key_version=settings.connector_encryption_key_version,
-        encryption_keys=settings.connector_encryption_keys,
-    )
-
-
-def _agency_runtime(settings: AppSettings) -> AgencyRuntime:
-    return AgencyRuntime(
-        client=AgencyDaemonClient(
-            socket_path=settings.agency_socket_path,
-            timeout_seconds=settings.agency_timeout_seconds,
-        ),
-        allowed_repo_roots=tuple(
-            root.strip() for root in settings.agency_allowed_repo_roots.split(",") if root.strip()
-        ),
-        default_base_branch=settings.agency_default_base_branch,
-        default_runner=settings.agency_default_runner,
-    )
-
-
 def process_one_task(
     *,
     session_factory: sessionmaker[Session],
     settings: AppSettings | None = None,
     worker_id: str | None = None,
     model_adapter: Any | None = None,
+    runtime: Runtime | None = None,
 ) -> bool:
     resolved_settings = settings or AppSettings()
     resolved_worker_id = worker_id or f"worker-{ulid.new().str.lower()}"
@@ -548,8 +446,8 @@ def process_one_task(
                 process_action_execution_task(
                     session_factory=session_factory,
                     action_attempt_id=action_attempt_id,
-                    google_runtime=_google_runtime(resolved_settings),
-                    agency_runtime=_agency_runtime(resolved_settings),
+                    google_runtime=build_google_runtime(resolved_settings),
+                    agency_runtime=build_agency_runtime(resolved_settings),
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                     settings=resolved_settings,
@@ -561,7 +459,7 @@ def process_one_task(
                 process_provider_write_reconcile_due(
                     session_factory=session_factory,
                     task_payload=task_payload,
-                    agency_runtime=_agency_runtime(resolved_settings),
+                    agency_runtime=build_agency_runtime(resolved_settings),
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                 )
@@ -671,7 +569,7 @@ def process_one_task(
                 process_proactive_action_execution_due(
                     session_factory=session_factory,
                     task_payload=task_payload,
-                    google_runtime=_google_runtime(resolved_settings),
+                    google_runtime=build_google_runtime(resolved_settings),
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                 )
@@ -722,35 +620,24 @@ def process_one_task(
     return True
 
 
-def run_worker(
-    *,
-    session_factory: sessionmaker[Session],
-    settings: AppSettings | None = None,
-) -> None:
-    resolved_settings = settings or AppSettings()
+def run_worker(*, runtime: Runtime) -> None:
     while True:
         processed = process_one_task(
-            session_factory=session_factory,
-            settings=resolved_settings,
+            session_factory=runtime.session_factory,
+            settings=runtime.settings,
+            runtime=runtime,
         )
         if not processed:
-            time.sleep(resolved_settings.worker_poll_seconds)
+            time.sleep(runtime.settings.worker_poll_seconds)
 
 
 def main() -> None:
-    settings = AppSettings()
-    engine = create_engine(
-        settings.database_url,
-        future=True,
-        pool_pre_ping=True,
-        isolation_level="SERIALIZABLE",
-    )
+    runtime, engine = build_runtime()
     try:
-        run_worker(
-            session_factory=sessionmaker(bind=engine, future=True, expire_on_commit=False),
-            settings=settings,
-        )
+        runtime.sandbox.start()
+        run_worker(runtime=runtime)
     finally:
+        runtime.sandbox.close()
         engine.dispose()
 
 
