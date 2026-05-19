@@ -25,14 +25,17 @@ from .app import (
     build_runtime,
 )
 from .config import AppSettings
+from .google_connector import GOOGLE_CONNECTOR_ID
 from .persistence import (
     AgencyEventRecord,
     BackgroundTaskRecord,
     EmailThreadWatchRecord,
+    GoogleConnectorRecord,
     JobEventRecord,
     JobRecord,
     NotificationDeliveryRecord,
     NotificationRecord,
+    ProviderWatchChannelRecord,
     SessionRecord,
     SyncCursorRecord,
     WorkFollowUpLoopRecord,
@@ -271,6 +274,41 @@ def enqueue_due_worker_owned_leave_by_scan_task(
     )
 
 
+_PROVIDER_WATCH_RENEW_INTERVAL_SECONDS = 6 * 3600
+
+
+def seed_provider_maintenance_tasks(
+    db: Session,
+    *,
+    settings: AppSettings,
+    now: datetime,
+) -> None:
+    # Ensure exactly one recurring task of each provider-maintenance type
+    # exists. Once a row is seeded the worker's recurrence path re-enqueues
+    # it; this seeder only fills a gap when no row of the type is present.
+    plans = (
+        ("provider_watch_renew_due", _PROVIDER_WATCH_RENEW_INTERVAL_SECONDS),
+        ("provider_reconcile_sync_due", settings.provider_reconcile_sync_interval_seconds),
+    )
+    for task_type, recurrence_seconds in plans:
+        existing_id = db.scalar(
+            select(BackgroundTaskRecord.id)
+            .where(BackgroundTaskRecord.task_type == task_type)
+            .with_for_update(skip_locked=True)
+            .limit(1)
+        )
+        if existing_id is not None:
+            continue
+        enqueue_background_task(
+            db,
+            task_type=task_type,
+            payload={"origin": "worker_provider_maintenance"},
+            now=now,
+            max_attempts=settings.proactive_worker_max_attempts,
+            recurrence_seconds=recurrence_seconds,
+        )
+
+
 def enqueue_due_work_follow_up_evaluation_tasks(
     db: Session,
     *,
@@ -342,6 +380,93 @@ def enqueue_due_work_follow_up_evaluation_tasks(
     return enqueued
 
 
+_PROVIDER_WATCH_RENEW_LEAD_SECONDS = 24 * 3600
+
+
+def process_provider_watch_renew_due(
+    *,
+    session_factory: sessionmaker[Session],
+    settings: AppSettings,
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> None:
+    # Re-arm any push channel approaching expiry. register_provider_watches
+    # is idempotent and absorbs per-watch failures, so renewing all eligible
+    # watches once a near-expiry row exists is the whole handler.
+    now = now_fn()
+    runtime = build_google_runtime(settings)
+    with session_factory() as db:
+        with db.begin():
+            renew_horizon = now + timedelta(seconds=_PROVIDER_WATCH_RENEW_LEAD_SECONDS)
+            near_expiry_id = db.scalar(
+                select(ProviderWatchChannelRecord.id)
+                .where(
+                    ProviderWatchChannelRecord.status == "active",
+                    ProviderWatchChannelRecord.expires_at <= renew_horizon,
+                )
+                .limit(1)
+            )
+            if near_expiry_id is None:
+                return
+            connector = db.scalar(
+                select(GoogleConnectorRecord)
+                .where(GoogleConnectorRecord.id == GOOGLE_CONNECTOR_ID)
+                .limit(1)
+            )
+            if connector is None or connector.status != "connected":
+                return
+            access_token = runtime.access_token_for_background_sync(
+                db=db,
+                now_fn=now_fn,
+                new_id_fn=new_id_fn,
+            )
+            runtime.register_provider_watches(
+                db=db,
+                access_token=access_token,
+                granted_scopes=list(connector.granted_scopes),
+                account_subject=connector.account_subject or connector.id,
+                now_fn=now_fn,
+                new_id_fn=new_id_fn,
+            )
+
+
+def process_provider_reconcile_sync_due(
+    *,
+    session_factory: sessionmaker[Session],
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> None:
+    # The poll baseline: enqueue a provider_sync_due for every cursor of a
+    # connected connector, independent of whether push is delivering.
+    now = now_fn()
+    with session_factory() as db:
+        with db.begin():
+            connector = db.scalar(
+                select(GoogleConnectorRecord)
+                .where(GoogleConnectorRecord.id == GOOGLE_CONNECTOR_ID)
+                .limit(1)
+            )
+            if connector is None or connector.status != "connected":
+                return
+            cursors = db.scalars(
+                select(SyncCursorRecord)
+                .where(SyncCursorRecord.provider == "google")
+                .order_by(SyncCursorRecord.id.asc())
+            ).all()
+            for cursor in cursors:
+                enqueue_background_task(
+                    db,
+                    task_type="provider_sync_due",
+                    payload={
+                        "provider": "google",
+                        "resource_type": cursor.resource_type,
+                        "resource_id": cursor.resource_id,
+                    },
+                    now=now,
+                    max_attempts=5,
+                )
+
+
 def process_one_task(
     *,
     session_factory: sessionmaker[Session],
@@ -380,6 +505,7 @@ def process_one_task(
             enqueue_due_worker_owned_ambient_task(db, settings=resolved_settings, now=now)
             enqueue_due_worker_owned_leave_by_scan_task(db, settings=resolved_settings, now=now)
             enqueue_due_memory_sweep(db, settings=resolved_settings, now=now, new_id_fn=_new_id)
+            seed_provider_maintenance_tasks(db, settings=resolved_settings, now=now)
 
     with session_factory() as db:
         with db.begin():
@@ -616,6 +742,19 @@ def process_one_task(
                     task_payload=task_payload,
                     settings=resolved_settings,
                     model_adapter=model_adapter,
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+            case "provider_watch_renew_due":
+                process_provider_watch_renew_due(
+                    session_factory=session_factory,
+                    settings=resolved_settings,
+                    now_fn=_utcnow,
+                    new_id_fn=_new_id,
+                )
+            case "provider_reconcile_sync_due":
+                process_provider_reconcile_sync_due(
+                    session_factory=session_factory,
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                 )

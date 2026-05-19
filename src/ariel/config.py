@@ -58,6 +58,9 @@ class AppSettings(BaseSettings):
     google_oauth_state_ttl_seconds: int = 600
     google_oauth_timeout_seconds: float = 10.0
     google_provider_event_token: str | None = None
+    google_pubsub_topic: str | None = None
+    google_provider_event_url: str | None = None
+    provider_reconcile_sync_interval_seconds: int = 3600
     connector_encryption_secret: str = "dev-local-connector-secret"
     connector_encryption_key_version: str = "v1"
     connector_encryption_keys: str | None = None
@@ -145,6 +148,8 @@ class AppSettings(BaseSettings):
         "weather_production_api_key",
         "weather_default_location",
         "home_address",
+        "google_pubsub_topic",
+        "google_provider_event_url",
         mode="before",
     )
     @classmethod
@@ -459,6 +464,7 @@ class AppSettings(BaseSettings):
         "proactive_ambient_interval_seconds",
         "proactive_worker_max_attempts",
         "proactive_deliberation_tool_rounds",
+        "provider_reconcile_sync_interval_seconds",
     )
     @classmethod
     def _positive_int_settings_must_be_positive(cls, value: int) -> int:

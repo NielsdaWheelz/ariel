@@ -34,6 +34,7 @@ REQUIRED_TABLES: Final[tuple[str, ...]] = (
     "google_oauth_states",
     "google_connector_events",
     "sync_cursors",
+    "provider_watch_channels",
     "provider_events",
     "sync_runs",
     "discord_messages",
@@ -200,6 +201,11 @@ REQUIRED_CONSTRAINTS: Final[dict[str, tuple[str, ...]]] = {
         "ck_provider_evidence_block_index",
         "ck_provider_evidence_block_kind",
     ),
+    "provider_watch_channels": (
+        "ck_provider_watch_channels_provider",
+        "ck_provider_watch_channels_resource_type",
+        "ck_provider_watch_channels_status",
+    ),
     "background_tasks": (
         "ck_background_task_type",
         "ck_background_task_status",
@@ -304,12 +310,18 @@ REQUIRED_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
         "ck_action_private_payload_kind": ("'google_provider_write_input'",),
         "ck_action_private_payload_digest": ("length", "payload_digest", "64"),
     },
+    "provider_watch_channels": {
+        "ck_provider_watch_channels_resource_type": ("'gmail'", "'calendar'"),
+        "ck_provider_watch_channels_status": ("'active'", "'expired'", "'failed'"),
+    },
     "background_tasks": {
         "ck_background_task_type": (
             "'workspace_commitment_extraction_due'",
             "'work_follow_up_evaluate_due'",
             "'provider_write_reconcile_due'",
             "'agent_wake'",
+            "'provider_watch_renew_due'",
+            "'provider_reconcile_sync_due'",
         ),
         "ck_background_task_status": ("'pending'", "'dead_letter'"),
         "ck_background_task_work_follow_up_shape": (

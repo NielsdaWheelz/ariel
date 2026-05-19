@@ -22,6 +22,7 @@ from ariel.persistence import (
     GoogleConnectorEventRecord,
     GoogleConnectorRecord,
     GoogleOAuthStateRecord,
+    ProviderWatchChannelRecord,
     to_rfc3339,
 )
 from ariel.google_workspace_normalization import (
@@ -102,6 +103,9 @@ _AUTH_FAILURE_RECOVERY: dict[TypedAuthFailureClass, str] = {
 }
 
 _GOOGLE_TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
+# Google Calendar push channels expire after at most ~7 days; request a 6-day
+# TTL so the worker re-arms before Google drops the channel.
+_CALENDAR_WATCH_TTL_SECONDS = 6 * 24 * 3600
 _MAX_GOOGLE_RESULTS = 5
 _GMAIL_BATCH_MODIFY_LIMIT = 1000
 _MAX_CALENDAR_RESPONSE_BYTES = 262144
@@ -376,6 +380,35 @@ class GoogleWorkspaceProvider(Protocol):
         normalized_input: dict[str, Any],
     ) -> dict[str, Any]: ...
 
+    def gmail_register_watch(
+        self,
+        *,
+        access_token: str,
+        topic_name: str,
+        label_ids: list[str] | None = None,
+    ) -> dict[str, Any]: ...
+
+    def gmail_stop_watch(self, *, access_token: str) -> None: ...
+
+    def calendar_register_watch(
+        self,
+        *,
+        access_token: str,
+        calendar_id: str,
+        channel_id: str,
+        channel_token: str,
+        address: str,
+        ttl_seconds: int | None = None,
+    ) -> dict[str, Any]: ...
+
+    def calendar_stop_watch(
+        self,
+        *,
+        access_token: str,
+        channel_id: str,
+        provider_resource_id: str,
+    ) -> None: ...
+
 
 @dataclass(slots=True, frozen=True)
 class DefaultGoogleOAuthClient:
@@ -621,6 +654,8 @@ class DefaultGoogleWorkspaceProvider:
                 raise RuntimeError(f"google_upstream_{status_code}")
             if status_code == 404:
                 raise RuntimeError("resource_not_found")
+            if status_code == 410:
+                raise RuntimeError("sync_token_invalid")
             if status_code >= 400:
                 raise RuntimeError(f"google_request_failed:{status_code}")
             if allow_empty_response and (status_code in {204, 205} or not response.content):
@@ -676,6 +711,8 @@ class DefaultGoogleWorkspaceProvider:
                 raise RuntimeError(f"google_upstream_{status_code}")
             if status_code == 404:
                 raise RuntimeError("resource_not_found")
+            if status_code == 410:
+                raise RuntimeError("sync_token_invalid")
             if status_code >= 400:
                 raise RuntimeError(f"google_request_failed:{status_code}")
             return response.text
@@ -2649,6 +2686,103 @@ class DefaultGoogleWorkspaceProvider:
             "permission_id": permission_id,
         }
 
+    def gmail_register_watch(
+        self,
+        *,
+        access_token: str,
+        topic_name: str,
+        label_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        json_payload: dict[str, Any] = {"topicName": topic_name}
+        if label_ids:
+            json_payload["labelIds"] = label_ids
+        payload = self._request_json(
+            method="POST",
+            url=f"{self.gmail_api_base_url}/users/me/watch",
+            access_token=access_token,
+            json_payload=json_payload,
+        )
+        history_id = _payload_text_value(payload, "historyId")
+        expiration = _parse_google_expiration_millis(payload.get("expiration"))
+        if history_id is None or expiration is None:
+            raise RuntimeError("provider_result_unknown")
+        return {"historyId": history_id, "expiration": expiration}
+
+    def gmail_stop_watch(self, *, access_token: str) -> None:
+        self._request_json(
+            method="POST",
+            url=f"{self.gmail_api_base_url}/users/me/stop",
+            access_token=access_token,
+            allow_empty_response=True,
+        )
+
+    def calendar_register_watch(
+        self,
+        *,
+        access_token: str,
+        calendar_id: str,
+        channel_id: str,
+        channel_token: str,
+        address: str,
+        ttl_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        json_payload: dict[str, Any] = {
+            "id": channel_id,
+            "type": "web_hook",
+            "address": address,
+            "token": channel_token,
+        }
+        if ttl_seconds is not None and ttl_seconds > 0:
+            json_payload["params"] = {"ttl": str(ttl_seconds)}
+        payload = self._request_json(
+            method="POST",
+            url=(
+                f"{self.calendar_api_base_url}/calendars/{quote(calendar_id, safe='')}/events/watch"
+            ),
+            access_token=access_token,
+            json_payload=json_payload,
+        )
+        provider_resource_id = _payload_text_value(payload, "resourceId")
+        expiration = _parse_google_expiration_millis(payload.get("expiration"))
+        if provider_resource_id is None or expiration is None:
+            raise RuntimeError("provider_result_unknown")
+        return {"resourceId": provider_resource_id, "expiration": expiration}
+
+    def calendar_stop_watch(
+        self,
+        *,
+        access_token: str,
+        channel_id: str,
+        provider_resource_id: str,
+    ) -> None:
+        self._request_json(
+            method="POST",
+            url=f"{self.calendar_api_base_url}/channels/stop",
+            access_token=access_token,
+            json_payload={"id": channel_id, "resourceId": provider_resource_id},
+            allow_empty_response=True,
+        )
+
+
+def _parse_google_expiration_millis(value: Any) -> datetime | None:
+    if not isinstance(value, (str, int)):
+        return None
+    try:
+        millis = int(value)
+    except ValueError:
+        return None
+    if millis <= 0:
+        return None
+    return datetime.fromtimestamp(millis / 1000, tz=UTC)
+
+
+def _payload_text_value(payload: dict[str, Any], key: str) -> str | None:
+    value = payload.get(key)
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
 
 def _gmail_string_list(raw_value: Any, *, require_non_empty: bool) -> list[str]:
     if not isinstance(raw_value, list):
@@ -4346,6 +4480,8 @@ class GoogleConnectorRuntime:
     encryption_secret: str
     encryption_key_version: str
     encryption_keys: str | None = None
+    pubsub_topic: str | None = None
+    provider_event_url: str | None = None
 
     def _connector_for_update(
         self,
@@ -4806,6 +4942,32 @@ class GoogleConnectorRuntime:
             now_fn=now_fn,
             new_id_fn=new_id_fn,
         )
+
+        # Arm the Gmail and Calendar push channels. Non-fatal: a failure here
+        # leaves the connector connected — the reconcile poll is the backstop.
+        try:
+            self.register_provider_watches(
+                db=db,
+                access_token=access_token_raw.strip(),
+                granted_scopes=granted_scopes,
+                account_subject=connector.account_subject or connector.id,
+                now_fn=now_fn,
+                new_id_fn=new_id_fn,
+            )
+        except Exception as exc:
+            _append_connector_event(
+                db=db,
+                connector_id=connector.id,
+                event_type="evt.connector.google.watch.registration_failed",
+                payload_data={
+                    **_connector_event_payload(connector, scopes=granted_scopes),
+                    "failure_reason": safe_failure_reason(
+                        str(exc), fallback=f"unexpected {exc.__class__.__name__}"
+                    ),
+                },
+                now_fn=now_fn,
+                new_id_fn=new_id_fn,
+            )
         return _connector_payload(connector)
 
     def disconnect(
@@ -4861,6 +5023,174 @@ class GoogleConnectorRuntime:
             new_id_fn=new_id_fn,
         )
         return _connector_payload(connector)
+
+    def register_provider_watches(
+        self,
+        *,
+        db: Session,
+        access_token: str,
+        granted_scopes: list[str],
+        account_subject: str,
+        now_fn: Callable[[], datetime],
+        new_id_fn: Callable[[str], str],
+    ) -> None:
+        # Re-arm the Gmail and Calendar push channels and persist their
+        # identity. Each provider call is non-fatal: a failure records an
+        # error on the channel row and leaves the reconcile poll as the
+        # backstop. Safe to call repeatedly — rows are replaced in place.
+        scopes = set(_normalize_scope_list(granted_scopes))
+        now = now_fn()
+        if self.pubsub_topic is not None and GOOGLE_GMAIL_READ_SCOPE in scopes:
+            try:
+                result = self.workspace_provider.gmail_register_watch(
+                    access_token=access_token,
+                    topic_name=self.pubsub_topic,
+                )
+            except Exception as exc:
+                self._record_watch_failure(
+                    db=db,
+                    resource_type="gmail",
+                    resource_id=account_subject,
+                    error=safe_failure_reason(
+                        str(exc), fallback=f"unexpected {exc.__class__.__name__}"
+                    ),
+                    now=now,
+                )
+            else:
+                history_id = result.get("historyId")
+                expiration = result.get("expiration")
+                if isinstance(history_id, str) and isinstance(expiration, datetime):
+                    self._upsert_watch_channel(
+                        db=db,
+                        resource_type="gmail",
+                        resource_id=account_subject,
+                        channel_id=None,
+                        channel_token=None,
+                        provider_resource_id=None,
+                        cursor_seed=history_id,
+                        expires_at=expiration,
+                        now=now,
+                        new_id_fn=new_id_fn,
+                    )
+        if self.provider_event_url is not None and GOOGLE_CALENDAR_READ_SCOPE in scopes:
+            channel_id = new_id_fn("wch")
+            channel_token = secrets.token_urlsafe(24)
+            try:
+                result = self.workspace_provider.calendar_register_watch(
+                    access_token=access_token,
+                    calendar_id="primary",
+                    channel_id=channel_id,
+                    channel_token=channel_token,
+                    address=self.provider_event_url,
+                    ttl_seconds=_CALENDAR_WATCH_TTL_SECONDS,
+                )
+            except Exception as exc:
+                self._record_watch_failure(
+                    db=db,
+                    resource_type="calendar",
+                    resource_id="primary",
+                    error=safe_failure_reason(
+                        str(exc), fallback=f"unexpected {exc.__class__.__name__}"
+                    ),
+                    now=now,
+                )
+            else:
+                provider_resource_id = result.get("resourceId")
+                expiration = result.get("expiration")
+                if isinstance(provider_resource_id, str) and isinstance(expiration, datetime):
+                    self._upsert_watch_channel(
+                        db=db,
+                        resource_type="calendar",
+                        resource_id="primary",
+                        channel_id=channel_id,
+                        channel_token=channel_token,
+                        provider_resource_id=provider_resource_id,
+                        cursor_seed=None,
+                        expires_at=expiration,
+                        now=now,
+                        new_id_fn=new_id_fn,
+                    )
+
+    def _upsert_watch_channel(
+        self,
+        *,
+        db: Session,
+        resource_type: str,
+        resource_id: str,
+        channel_id: str | None,
+        channel_token: str | None,
+        provider_resource_id: str | None,
+        cursor_seed: str | None,
+        expires_at: datetime,
+        now: datetime,
+        new_id_fn: Callable[[str], str],
+    ) -> None:
+        existing = db.scalar(
+            select(ProviderWatchChannelRecord)
+            .where(
+                ProviderWatchChannelRecord.provider == GOOGLE_PROVIDER,
+                ProviderWatchChannelRecord.resource_type == resource_type,
+                ProviderWatchChannelRecord.resource_id == resource_id,
+            )
+            .with_for_update()
+            .limit(1)
+        )
+        if existing is None:
+            db.add(
+                ProviderWatchChannelRecord(
+                    id=new_id_fn("wch"),
+                    provider=GOOGLE_PROVIDER,
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    channel_id=channel_id,
+                    channel_token=channel_token,
+                    provider_resource_id=provider_resource_id,
+                    cursor_seed=cursor_seed,
+                    status="active",
+                    expires_at=expires_at,
+                    last_error_code=None,
+                    last_error_at=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            db.flush()
+            return
+        existing.channel_id = channel_id
+        existing.channel_token = channel_token
+        existing.provider_resource_id = provider_resource_id
+        existing.cursor_seed = cursor_seed
+        existing.status = "active"
+        existing.expires_at = expires_at
+        existing.last_error_code = None
+        existing.last_error_at = None
+        existing.updated_at = now
+
+    def _record_watch_failure(
+        self,
+        *,
+        db: Session,
+        resource_type: str,
+        resource_id: str,
+        error: str,
+        now: datetime,
+    ) -> None:
+        existing = db.scalar(
+            select(ProviderWatchChannelRecord)
+            .where(
+                ProviderWatchChannelRecord.provider == GOOGLE_PROVIDER,
+                ProviderWatchChannelRecord.resource_type == resource_type,
+                ProviderWatchChannelRecord.resource_id == resource_id,
+            )
+            .with_for_update()
+            .limit(1)
+        )
+        if existing is None:
+            return
+        existing.status = "failed"
+        existing.last_error_code = error[:64]
+        existing.last_error_at = now
+        existing.updated_at = now
 
     def list_events(
         self,

@@ -515,8 +515,13 @@ def test_gmail_sync_hydrates_added_messages_into_body_evidence(
     assert block.block_kind == "body"
     assert block.text == "Please send the launch checklist by Friday at 5pm."
     assert block.digest == "d" * 64
-    assert [task.task_type for task in tasks] == ["workspace_commitment_extraction_due"]
-    assert tasks[0].payload == {"evidence_id": evidence.id}
+    extraction_tasks = [
+        task for task in tasks if task.task_type == "workspace_commitment_extraction_due"
+    ]
+    wake_tasks = [task for task in tasks if task.task_type == "agent_wake"]
+    assert [task.payload for task in extraction_tasks] == [{"evidence_id": evidence.id}]
+    # The synced message also wakes the agent (P3 push+poll convergence).
+    assert len(wake_tasks) == 1
 
 
 def test_gmail_sync_invalid_cursor_fails_closed_without_provider_call(

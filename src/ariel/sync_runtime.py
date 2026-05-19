@@ -29,6 +29,7 @@ from ariel.persistence import (
     ProviderEventRecord,
     SyncCursorRecord,
     SyncRunRecord,
+    enqueue_background_task,
     to_rfc3339,
 )
 
@@ -299,6 +300,8 @@ def process_provider_sync_due(
         encryption_secret=settings.connector_encryption_secret,
         encryption_key_version=settings.connector_encryption_key_version,
         encryption_keys=settings.connector_encryption_keys,
+        pubsub_topic=settings.google_pubsub_topic,
+        provider_event_url=settings.google_provider_event_url,
     )
 
     outputs: list[dict[str, Any]] = []
@@ -386,13 +389,29 @@ def process_provider_sync_due(
                     if page_token is None:
                         break
     except Exception as exc:
+        error = str(exc)
+        if _is_stale_cursor_error(resource_type=resource_type, error=error):
+            # A stale delta cursor — Gmail 404 or Calendar 410. Clear the
+            # cursor and re-enqueue a full sync; the next run bootstraps.
+            _handle_stale_cursor(
+                session_factory=session_factory,
+                provider_event_id=provider_event_id,
+                sync_run_id=sync_run_id,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                error=error,
+                now=now_fn(),
+                new_id_fn=new_id_fn,
+            )
+            _release_provider_sync_lock(lock_db, lock_id)
+            return
         _mark_sync_failed(
             session_factory=session_factory,
             provider_event_id=provider_event_id,
             sync_run_id=sync_run_id,
             resource_type=resource_type,
             resource_id=resource_id,
-            error=str(exc),
+            error=error,
             now=now_fn(),
         )
         _release_provider_sync_lock(lock_db, lock_id)
@@ -636,6 +655,15 @@ def process_provider_sync_due(
                 if event is not None:
                     event.status = "processed"
                     event.processed_at = now
+                # New or changed provider data wakes the agent: the single
+                # convergence point for both the push and poll paths.
+                if item_count > 0:
+                    enqueue_background_task(
+                        db,
+                        task_type="agent_wake",
+                        payload={"note": _provider_sync_wake_note(resource_type, item_count)},
+                        now=now,
+                    )
     except Exception:
         _release_provider_sync_lock(lock_db, lock_id)
         raise
@@ -1334,6 +1362,75 @@ def _sync_drive_change(
     return False
 
 
+def _is_stale_cursor_error(*, resource_type: str, error: str) -> bool:
+    if resource_type == "gmail" and error == "resource_not_found":
+        return True
+    if resource_type == "calendar" and error == "sync_token_invalid":
+        return True
+    return False
+
+
+def _handle_stale_cursor(
+    *,
+    session_factory: sessionmaker[Session],
+    provider_event_id: str | None,
+    sync_run_id: str,
+    resource_type: str,
+    resource_id: str,
+    error: str,
+    now: datetime,
+    new_id_fn: Callable[[str], str],
+) -> None:
+    with session_factory() as db:
+        with db.begin():
+            run = db.get(SyncRunRecord, sync_run_id)
+            if run is not None:
+                run.status = "failed"
+                run.error = error
+                run.completed_at = now
+            cursor = db.scalar(
+                select(SyncCursorRecord)
+                .where(
+                    SyncCursorRecord.provider == "google",
+                    SyncCursorRecord.resource_type == resource_type,
+                    SyncCursorRecord.resource_id == resource_id,
+                )
+                .with_for_update()
+                .limit(1)
+            )
+            if cursor is not None:
+                cursor.cursor_value = None
+                cursor.status = "ready"
+                cursor.last_error_code = error[:64]
+                cursor.last_error_at = now
+                cursor.updated_at = now
+            if provider_event_id is not None:
+                event = db.get(ProviderEventRecord, provider_event_id)
+                if event is not None:
+                    event.status = "failed"
+                    event.error = error
+            db.add(
+                BackgroundTaskRecord(
+                    id=new_id_fn("tsk"),
+                    task_type="provider_sync_due",
+                    payload={
+                        "provider": "google",
+                        "resource_type": resource_type,
+                        "resource_id": resource_id,
+                    },
+                    status="pending",
+                    attempts=0,
+                    max_attempts=5,
+                    error=None,
+                    claimed_by=None,
+                    run_after=now,
+                    last_heartbeat=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
+
 def _mark_sync_failed(
     *,
     session_factory: sessionmaker[Session],
@@ -1364,10 +1461,12 @@ def _mark_sync_failed(
             )
             if cursor is not None:
                 if run is None or cursor.cursor_value == cursor_before:
+                    # A Gmail 404 (resource_not_found) is recoverable: it is
+                    # handled upstream by clearing the cursor for a full
+                    # resync, so only an unbootstrappable mailbox is invalid.
                     cursor.status = (
                         "invalid"
-                        if resource_type == "gmail"
-                        and error in {"resource_not_found", "gmail_sync_cursor_missing"}
+                        if resource_type == "gmail" and error == "gmail_sync_cursor_missing"
                         else "error"
                     )
                     cursor.last_error_code = error[:64]
@@ -1378,6 +1477,17 @@ def _mark_sync_failed(
                 if event is not None:
                     event.status = "failed"
                     event.error = error
+
+
+def _provider_sync_wake_note(resource_type: str, item_count: int) -> str:
+    label = {"gmail": "Gmail", "calendar": "Calendar", "drive": "Drive"}.get(
+        resource_type, resource_type
+    )
+    noun = "item" if item_count == 1 else "items"
+    return (
+        f"A Google {label} sync found {item_count} new or changed {noun}. "
+        "Review the new activity and decide whether anything matters."
+    )
 
 
 def _payload_text(payload: dict[str, Any], key: str) -> str | None:

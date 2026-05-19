@@ -3044,6 +3044,8 @@ def build_google_runtime(
         encryption_secret=settings.connector_encryption_secret,
         encryption_key_version=settings.connector_encryption_key_version,
         encryption_keys=settings.connector_encryption_keys,
+        pubsub_topic=settings.google_pubsub_topic,
+        provider_event_url=settings.google_provider_event_url,
     )
 
 

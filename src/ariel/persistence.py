@@ -1035,6 +1035,52 @@ class SyncCursorRecord(Base):
     )
 
 
+class ProviderWatchChannelRecord(Base):
+    __tablename__ = "provider_watch_channels"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    resource_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    resource_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    channel_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    channel_token: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    provider_resource_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    cursor_seed: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    last_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_error_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "resource_type",
+            "resource_id",
+            name="uq_provider_watch_channel_resource",
+        ),
+        CheckConstraint(
+            "provider IN ('google')",
+            name="ck_provider_watch_channels_provider",
+        ),
+        CheckConstraint(
+            "resource_type IN ('gmail', 'calendar')",
+            name="ck_provider_watch_channels_resource_type",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'expired', 'failed')",
+            name="ck_provider_watch_channels_status",
+        ),
+    )
+
+
 class ProviderEventRecord(Base):
     __tablename__ = "provider_events"
 
@@ -2204,7 +2250,8 @@ class BackgroundTaskRecord(Base):
                 "'google_object_hydration_due', 'provider_evidence_extraction_due', "
                 "'workspace_commitment_extraction_due', 'work_follow_up_evaluate_due', "
                 "'provider_write_reconcile_due', 'leave_by_scan_due', "
-                "'leave_by_evaluate_due', 'agent_wake')"
+                "'leave_by_evaluate_due', 'agent_wake', 'provider_watch_renew_due', "
+                "'provider_reconcile_sync_due')"
             ),
             name="ck_background_task_type",
         ),
