@@ -1,13 +1,7 @@
 """S5 PR02 session-management acceptance tests.
 
-The memory cutover removed the continuity-compaction machinery these tests once
-also covered -- the ``OpenAIContextCompactionAdapter``,
-``validate_continuity_compaction_payload``, and the rotation continuity
-curator. Session rotation now enqueues a ``memory_remember`` task that writes
-the carry-forward digest; there is no inline continuity curation and no
-compaction adapter. What remains here is pure session management: message
-idempotency, auto-rotation thresholds, the event-timeline cursor, the turn
-lock, and the context-bundle constitution.
+Pure session management: message idempotency, auto-rotation thresholds, the
+event-timeline cursor, the turn lock, and the context-bundle constitution.
 
 The agent-loop cutover (P1) made ``post_message`` async: it enqueues a
 ``user_message`` background task and returns ``202 {"status": "accepted",
@@ -175,7 +169,6 @@ def test_s5_pr02_idempotency_replay_survives_auto_rotation_when_retrying_new_ses
 ) -> None:
     monkeypatch.setenv("ARIEL_AUTO_ROTATE_MAX_TURNS", "1")
     monkeypatch.setenv("ARIEL_AUTO_ROTATE_MAX_AGE_SECONDS", "999999")
-    monkeypatch.setenv("ARIEL_AUTO_ROTATE_CONTEXT_PRESSURE_TOKENS", "999999")
     adapter = SessionManagementProbeAdapter()
     with _build_client(postgres_url, adapter, reset_database=True) as client:
         initial_session_id = _session_id(client)
@@ -230,7 +223,6 @@ def test_s5_pr02_rotation_follows_turn_count_threshold_with_typed_reason(
 ) -> None:
     monkeypatch.setenv("ARIEL_AUTO_ROTATE_MAX_TURNS", "1")
     monkeypatch.setenv("ARIEL_AUTO_ROTATE_MAX_AGE_SECONDS", "999999")
-    monkeypatch.setenv("ARIEL_AUTO_ROTATE_CONTEXT_PRESSURE_TOKENS", "999999")
     adapter = SessionManagementProbeAdapter()
 
     with _build_client(postgres_url, adapter, reset_database=True) as client:
@@ -271,43 +263,6 @@ def test_s5_pr02_rotation_follows_turn_count_threshold_with_typed_reason(
             assert active_new is not None
             assert active_new.lifecycle_state == "active"
             assert active_new.is_active is True
-
-
-def test_s5_pr02_context_bundle_follows_constitution_section_order_and_includes_required_sections(
-    postgres_url: str,
-) -> None:
-    """The turn context bundle follows the constitution's section order. After
-    the memory cutover the memory sections are the always-loaded ``profile``,
-    the per-session ``session_digest``, and the retriever's ``recalled_memory``
-    -- replacing the old deterministic ``memory_context`` block."""
-
-    adapter = SessionManagementProbeAdapter()
-    with _build_client(postgres_url, adapter, reset_database=True) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="what is still open?")
-
-        bundle = adapter.context_bundles[-1]
-        assert bundle["section_order"] == [
-            "policy_system_instructions",
-            "recent_active_session_turns",
-            "profile",
-            "session_digest",
-            "recalled_memory",
-            "open_commitments_and_jobs",
-            "relevant_artifacts_and_observations",
-        ]
-
-        assert isinstance(bundle["profile"], str)
-        assert bundle["session_digest"] is None or isinstance(bundle["session_digest"], str)
-        assert isinstance(bundle["recalled_memory"], list)
-
-        commitments_jobs = bundle["open_commitments_and_jobs"]
-        assert isinstance(commitments_jobs, dict)
-        assert isinstance(commitments_jobs["open_jobs"], list)
-
-        observations = bundle["relevant_artifacts_and_observations"]
-        assert isinstance(observations, dict)
-        assert isinstance(observations["artifacts"], list)
 
 
 def test_s5_pr02_timeline_supports_after_cursor_for_incremental_sync(

@@ -14,8 +14,7 @@ This directory contains docs owned by specific infrastructure modules or feature
   concrete Google Workspace reasoning completion plan
 - [maps.md](maps.md): maps read vertical — directions and nearby-place capabilities
 - [maps-expansion-cutover.md](maps-expansion-cutover.md): hard-cutover spec — multi-stop routing and alternative routes
-- [memory.md](memory.md): memory subsystem — fact store, profile and digest, retriever and rememberer
-- [memory-cutover.md](memory-cutover.md): memory subsystem hard-cutover record
+- [memory.md](memory.md): memory subsystem — two-layer substrate (raw log + curated notes), agentic recall, and the rememberer
 - [proactivity.md](proactivity.md): proactivity — the agent loop reached by non-human triggers, the scheduler, and provider ingestion
 - [proactivity-cutover.md](proactivity-cutover.md): proactivity crystallization hard-cutover record
 - [transport.md](transport.md): transport lifecycle ownership

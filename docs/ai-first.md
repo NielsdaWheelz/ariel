@@ -122,16 +122,19 @@ failure envelopes that stop the turn.
 
 ## Memory
 
-Memory is a flat fact store plus two AI-maintained documents — the profile and
-the per-session digest. Storage is canonical in Ariel-owned persistence; every
-memory judgment is AI-owned.
+Memory is a two-layer substrate: an append-only raw log (`memory_log`) that
+captures every event immutably, and an editable curated layer (`memory_notes`)
+of agent-authored notes. Storage is canonical in Ariel-owned persistence; every
+memory judgment is the model's.
 
-Two subagents own that judgment: the retriever decides which facts matter for
-the current wake; the rememberer decides what to write and keeps the profile and
-digest current. Deterministic code stores facts and the two documents, gathers
-candidate facts, injects the profile and digest into context, runs the
-subagents, and writes audit records. No extraction, curation, conflict,
-projection, or review machinery exists. See [modules/memory.md](modules/memory.md).
+Three loop configurations operate on the substrate: the retriever reconstructs
+the working context agentically on every wake; the rememberer writes the curated
+layer on agent demand (`encode`) and on a consolidation schedule (`dream`); the
+researcher treats `memories` as one of its investigation domains. Deterministic
+code stores the substrate, maintains the embedding and keyword index, exposes the
+search and read primitives, propagates taint, and writes audit rows. It never
+ranks, scores, summarises, or makes any memory judgment. See
+[modules/memory.md](modules/memory.md).
 
 ## Research
 

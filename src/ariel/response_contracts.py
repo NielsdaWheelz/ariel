@@ -26,7 +26,6 @@ SurfaceEventType = Literal[
     "evt.turn.started",
     "evt.memory.recalled",
     "evt.memory.recall_failed",
-    "evt.memory.remember_queued",
     "evt.ai_judgment.failed",
     "evt.ai_judgment.completed",
     "evt.assistant.emitted",
@@ -168,13 +167,6 @@ class SurfaceEventMemoryRecallFailedPayloadContract(BaseModel):
 
     turn_id: str
     failure_reason: str
-
-
-class SurfaceEventMemoryRememberQueuedPayloadContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    task_id: str
-    turn_id: str
 
 
 class SurfaceEventAssistantEmittedPayloadContract(BaseModel):
@@ -905,12 +897,6 @@ def _project_surface_event_payload(
             SurfaceEventMemoryRecallFailedPayloadContract,
             payload,
         )
-    if event_type == "evt.memory.remember_queued":
-        return _validate_contract(
-            "surface_event_payload.evt.memory.remember_queued",
-            SurfaceEventMemoryRememberQueuedPayloadContract,
-            payload,
-        )
     if event_type.startswith("evt.ai_judgment."):
         return _validate_contract(
             f"surface_event_payload.{event_type}",
@@ -1343,6 +1329,76 @@ def build_surface_discord_message_event_list_response(
             "ok": True,
             "discord_message_id": discord_message_id,
             "events": events if isinstance(events, list) else [],
+        },
+    )
+
+
+class SurfaceMemoryLogItemContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    created_at: str
+    kind: Literal[
+        "user_message",
+        "agent_round",
+        "assistant_message",
+        "tool_observation",
+        "proactive_trigger",
+        "note_create",
+        "note_edit",
+        "note_delete",
+        "recall",
+        "research_finding",
+    ]
+    content: str
+    session_id: str | None
+    turn_id: str | None
+    taint: Literal["clean", "tainted"]
+    source_ref: str | None
+
+
+class SurfaceMemoryLogListResponseContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    log: list[SurfaceMemoryLogItemContract]
+
+
+class SurfaceMemoryNoteItemContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    content: str
+    created_at: str
+    updated_at: str
+    taint: Literal["clean", "tainted"]
+
+
+class SurfaceMemoryNoteListResponseContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    notes: list[SurfaceMemoryNoteItemContract]
+
+
+def build_surface_memory_log_list_response(*, log: Any) -> dict[str, Any]:
+    return _validate_contract(
+        "surface_memory_log_list_response",
+        SurfaceMemoryLogListResponseContract,
+        {
+            "ok": True,
+            "log": log if isinstance(log, list) else [],
+        },
+    )
+
+
+def build_surface_memory_note_list_response(*, notes: Any) -> dict[str, Any]:
+    return _validate_contract(
+        "surface_memory_note_list_response",
+        SurfaceMemoryNoteListResponseContract,
+        {
+            "ok": True,
+            "notes": notes if isinstance(notes, list) else [],
         },
     )
 

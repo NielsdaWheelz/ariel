@@ -77,6 +77,8 @@ from ariel.persistence import (
     GoogleConnectorRecord,
     JobEventRecord,
     JobRecord,
+    MemoryLogRecord,
+    MemoryNoteRecord,
     ProviderEventRecord,
     ProviderWriteReceiptRecord,
     SessionRecord,
@@ -110,6 +112,8 @@ from ariel.response_contracts import (
     build_surface_discord_message_list_response,
     build_surface_email_action_list_response,
     build_surface_email_action_response,
+    build_surface_memory_log_list_response,
+    build_surface_memory_note_list_response,
     build_surface_message_response,
     build_surface_provider_event_list_response,
     build_surface_rotation_list_response,
@@ -4039,6 +4043,101 @@ def create_app(
                     )
                 try:
                     return build_surface_artifact_response(artifact=serialize_artifact(artifact))
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/memory/log")
+    def get_memory_log(
+        before: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 500))
+        before_dt: datetime | None = None
+        if before is not None:
+            try:
+                before_dt = datetime.fromisoformat(before)
+            except ValueError:
+                raise ApiError(
+                    status_code=422,
+                    code="E_INVALID_PARAM",
+                    message="'before' must be a valid RFC 3339 datetime string",
+                    details={"before": before},
+                    retryable=False,
+                )
+        with session_factory() as db:
+            with db.begin():
+                query = select(MemoryLogRecord)
+                if before_dt is not None:
+                    query = query.where(MemoryLogRecord.created_at < before_dt)
+                rows = db.scalars(
+                    query.order_by(
+                        MemoryLogRecord.created_at.desc(),
+                        MemoryLogRecord.id.desc(),
+                    ).limit(bounded_limit)
+                ).all()
+                try:
+                    return build_surface_memory_log_list_response(
+                        log=[
+                            {
+                                "id": row.id,
+                                "created_at": to_rfc3339(row.created_at),
+                                "kind": row.kind,
+                                "content": row.content,
+                                "session_id": row.session_id,
+                                "turn_id": row.turn_id,
+                                "taint": row.taint,
+                                "source_ref": row.source_ref,
+                            }
+                            for row in rows
+                        ]
+                    )
+                except ResponseContractViolation as exc:
+                    raise _response_contract_error(exc) from exc
+
+    @app.get("/v1/memory/notes")
+    def get_memory_notes(
+        before_updated_at: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        _ensure_schema_ready()
+        bounded_limit = max(1, min(limit, 500))
+        before_dt: datetime | None = None
+        if before_updated_at is not None:
+            try:
+                before_dt = datetime.fromisoformat(before_updated_at)
+            except ValueError:
+                raise ApiError(
+                    status_code=422,
+                    code="E_INVALID_PARAM",
+                    message="'before_updated_at' must be a valid RFC 3339 datetime string",
+                    details={"before_updated_at": before_updated_at},
+                    retryable=False,
+                )
+        with session_factory() as db:
+            with db.begin():
+                query = select(MemoryNoteRecord)
+                if before_dt is not None:
+                    query = query.where(MemoryNoteRecord.updated_at < before_dt)
+                rows = db.scalars(
+                    query.order_by(
+                        MemoryNoteRecord.updated_at.desc(),
+                        MemoryNoteRecord.id.desc(),
+                    ).limit(bounded_limit)
+                ).all()
+                try:
+                    return build_surface_memory_note_list_response(
+                        notes=[
+                            {
+                                "id": row.id,
+                                "content": row.content,
+                                "created_at": to_rfc3339(row.created_at),
+                                "updated_at": to_rfc3339(row.updated_at),
+                                "taint": row.taint,
+                            }
+                            for row in rows
+                        ]
+                    )
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
 

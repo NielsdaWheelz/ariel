@@ -13,7 +13,12 @@ import ariel.memory as memory
 import ariel.run_runtime as run_runtime_module
 from ariel.action_runtime import RuntimeProvenance
 from ariel.app import ModelAdapter, create_app
-from ariel.persistence import ActionAttemptRecord, AIJudgmentRecord, TurnRecord
+from ariel.persistence import (
+    ActionAttemptRecord,
+    AIJudgmentRecord,
+    BackgroundTaskRecord,
+    TurnRecord,
+)
 from ariel.policy_engine import evaluate_proposal
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.responses_helpers import (
@@ -555,13 +560,13 @@ def test_taint_threads_across_two_programs_in_one_turn(
 
     Program 1 does an inline recall whose result is untrusted-influenced, then
     emits a value -- which ends the program and continues the turn. Program 2
-    runs a side-effecting ``memory.remember`` syscall. Because the run-program
-    path threads each program's taint delta onto the turn baseline, program 2's
-    syscall is evaluated with that taint: it receives a tainted
-    ``runtime_provenance`` and real policy escalates it on the taint path --
-    ``memory.remember`` is ``allow_inline`` with a ``write_reversible`` impact,
-    so on clean provenance it runs inline, but a tainted side effect escalates
-    it to ``taint_escalated_requires_approval``.
+    runs a ``memory.remember`` syscall. Because the run-program path threads
+    each program's taint delta onto the turn baseline, program 2's syscall is
+    evaluated with that taint: it receives a tainted ``runtime_provenance``
+    and real policy escalates it on the taint path -- ``memory.remember`` is
+    ``allow_inline`` with a ``write_reversible`` impact, so on clean
+    provenance it runs inline, but a tainted side effect escalates it to
+    ``taint_escalated_requires_approval``.
 
     ``process_one_call`` is stubbed -- as in the within-program taint test --
     so the app-side cross-program taint merge is what is exercised; the stub
@@ -650,6 +655,49 @@ def test_taint_threads_across_two_programs_in_one_turn(
     # path because of the threaded taint -- the taint-escalation reason, not a
     # plain approval, proves the cross-program taint reached it.
     assert policy_decisions == [("requires_approval", "taint_escalated_requires_approval")]
+
+
+def test_memory_remember_enqueues_background_task(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``memory.remember`` fire-and-forgets: it enqueues a ``memory_encode``
+    background task and returns ``{"status": "queued", "encode_id": <id>}``.
+    The rememberer does NOT run inline; only the DB row is written this turn.
+    """
+    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
+
+    program = (
+        "result = memory.remember(note='the user prefers tea')\n"
+        "agent.emit_message(text='status:' + result['status'])\n"
+    )
+    adapter = CapturingRunAdapter(
+        responses=[
+            _program_response(
+                source=program,
+                provider="provider.single-run",
+                model="model.single-run-v1",
+                provider_response_id="resp_remember_enqueue",
+            )
+        ]
+    )
+    with _build_client(postgres_url, adapter) as client:
+        session_id = _session_id(client)
+        turn = post_message_and_drain(client, session_id, message="remember tea preference")
+
+    assert turn.assistant_message == "status:queued"
+
+    engine = create_engine(postgres_url, future=True)
+    factory = sessionmaker(bind=engine, future=True, expire_on_commit=False)
+    with factory() as db:
+        tasks = db.scalars(
+            select(BackgroundTaskRecord).where(BackgroundTaskRecord.task_type == "memory_encode")
+        ).all()
+
+    assert len(tasks) == 1
+    task = tasks[0]
+    assert task.payload["note"] == "the user prefers tea"
+    assert task.payload["session_id"] == session_id
 
 
 def test_two_programs_with_capability_syscalls_get_distinct_proposal_index(
