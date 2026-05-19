@@ -45,6 +45,7 @@ from ariel.capability_registry import (
     MAPS_CAPABILITY_IDS,
     MEMORY_CAPABILITY_IDS,
     PROACTIVE_CAPABILITY_IDS,
+    RESEARCH_CAPABILITY_IDS,
     get_capability,
     internal_callable_capability_ids,
     run_callable_name_for_capability_id,
@@ -1525,7 +1526,7 @@ class TurnExecutionOutcome:
 
 @dataclass(slots=True, frozen=True)
 class WakeContext:
-    trigger_kind: Literal["user_message", "scheduled_task"]
+    trigger_kind: Literal["user_message", "scheduled_task", "research_completion"]
     prompt_text: str
     discord_context: dict[str, Any] | None
     attachment_sources: list[dict[str, Any]] | None
@@ -1941,6 +1942,12 @@ def _eligible_internal_callable_capability_ids(
             capability_ids.append(capability_id)
             continue
         if capability_id in PROACTIVE_CAPABILITY_IDS:
+            capability_ids.append(capability_id)
+            continue
+        if capability_id in RESEARCH_CAPABILITY_IDS:
+            # research.investigate dispatches a read-only research run; the
+            # syscall itself reaches nothing, so it is always eligible. The
+            # research run's own mode capabilities carry their provider gating.
             capability_ids.append(capability_id)
             continue
         if capability_id == "cap.web.extract":

@@ -58,6 +58,19 @@ EMAIL_MUTATION_CAPABILITY_IDS = {
 MEMORY_CAPABILITY_IDS = {"cap.memory.recall", "cap.memory.remember"}
 PROACTIVE_CAPABILITY_IDS = {"cap.proactive.schedule"}
 MAPS_CAPABILITY_IDS = {"cap.maps.directions", "cap.maps.search_places"}
+RESEARCH_CAPABILITY_IDS = {"cap.research.investigate"}
+RESEARCH_WEB_CAPABILITY_IDS: frozenset[str] = frozenset(
+    {"cap.search.web", "cap.search.news", "cap.web.extract"}
+)
+RESEARCH_PERSONAL_CAPABILITY_IDS: frozenset[str] = frozenset(
+    {
+        "cap.email.search",
+        "cap.email.read",
+        "cap.drive.search",
+        "cap.drive.read",
+        "cap.calendar.list",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1051,6 +1064,30 @@ def _validate_proactive_schedule_input(
     if when is None:
         return None, "schema_invalid"
     return {"when": when, "note": normalized_note}, None
+
+
+_RESEARCH_INVESTIGATE_MAX_QUESTION_LENGTH = 4000
+_RESEARCH_INVESTIGATE_ALLOWED_MODES = {"web", "personal"}
+
+
+def _validate_research_investigate_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {"question", "mode"}:
+        return None, "schema_invalid"
+    question = raw_input.get("question")
+    if not isinstance(question, str):
+        return None, "schema_invalid"
+    normalized_question = question.strip()
+    if (
+        not normalized_question
+        or len(normalized_question) > _RESEARCH_INVESTIGATE_MAX_QUESTION_LENGTH
+    ):
+        return None, "schema_invalid"
+    mode = raw_input.get("mode")
+    if not isinstance(mode, str) or mode not in _RESEARCH_INVESTIGATE_ALLOWED_MODES:
+        return None, "schema_invalid"
+    return {"question": normalized_question, "mode": mode}, None
 
 
 def _normalize_optional_text(value: Any, *, max_length: int) -> str | None:
@@ -3558,6 +3595,21 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         validate_input=_validate_proactive_schedule_input,
         execute=None,
     ),
+    "cap.research.investigate": CapabilityDefinition(
+        capability_id="cap.research.investigate",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "research_investigate_v1",
+            "output_schema": "research_task_start_v1",
+            "idempotency": "action_attempt_id",
+            "execution_mode": "background_task_enqueue",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_research_investigate_input,
+        execute=None,
+    ),
 }
 
 
@@ -3640,6 +3692,7 @@ _RUN_CALLABLE_ALIASES = {
     "memory.recall": "cap.memory.recall",
     "memory.remember": "cap.memory.remember",
     "proactive.schedule": "cap.proactive.schedule",
+    "research.investigate": "cap.research.investigate",
     "search.news": "cap.search.news",
     "search.web": "cap.search.web",
     "weather.forecast": "cap.weather.forecast",

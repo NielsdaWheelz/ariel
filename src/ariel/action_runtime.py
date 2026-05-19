@@ -23,6 +23,7 @@ from ariel.capability_registry import (
     MAPS_CAPABILITY_IDS,
     MEMORY_CAPABILITY_IDS,
     PROACTIVE_CAPABILITY_IDS,
+    RESEARCH_CAPABILITY_IDS,
     canonical_action_payload,
     capability_contract_hash,
     get_capability,
@@ -670,6 +671,35 @@ def _execute_proactive_capability(
         run_after=run_after,
     )
     return {"status": "scheduled", "task_id": task.id, "run_after": to_rfc3339(run_after)}
+
+
+def _execute_research_capability(
+    *,
+    db: Session,
+    capability_id: str,
+    normalized_input: dict[str, Any],
+    session_id: str,
+    now_fn: Callable[[], datetime],
+) -> dict[str, Any]:
+    """Run one research syscall. ``cap.research.investigate`` writes an immediate
+    ``research_run`` row to ``background_tasks``: ``payload`` carries the AI-authored
+    ``question``, the ``mode`` whitelist selector, and the originating ``session_id``
+    the completion wake returns to. The run-callable returns the task identity so
+    the main agent can acknowledge the dispatch and end its turn; the research run
+    itself executes in the worker."""
+    if capability_id != "cap.research.investigate":
+        raise RuntimeError("unknown_research_capability")
+    task = enqueue_background_task(
+        db,
+        task_type="research_run",
+        payload={
+            "question": str(normalized_input["question"]),
+            "mode": str(normalized_input["mode"]),
+            "session_id": session_id,
+        },
+        now=now_fn(),
+    )
+    return {"status": "queued", "research_id": task.id}
 
 
 def approval_execution_failure_message(error: str) -> str:
@@ -2559,6 +2589,7 @@ def process_one_call(
     is_attachment_capability_call = capability_id in ATTACHMENT_CAPABILITY_IDS
     is_memory_capability_call = capability_id in MEMORY_CAPABILITY_IDS
     is_proactive_capability_call = capability_id in PROACTIVE_CAPABILITY_IDS
+    is_research_capability_call = capability_id in RESEARCH_CAPABILITY_IDS
     is_retrieval_call = capability_id in _GROUNDED_RETRIEVAL_CAPABILITIES
     is_weather_forecast_call = capability_id == "cap.weather.forecast"
     if is_retrieval_call:
@@ -3195,6 +3226,34 @@ def process_one_call(
             execution_result = ExecutionResult(
                 status="succeeded",
                 output=proactive_output,
+                error=None,
+            )
+    elif is_research_capability_call:
+        # The investigate syscall is a read capability that executes inline: it
+        # writes one immediate research_run row to the caller's transaction and
+        # returns the research task identity into the program. The research run
+        # itself executes in the worker.
+        try:
+            research_output = _execute_research_capability(
+                db=db,
+                capability_id=capability_id,
+                normalized_input=evaluation.normalized_input,
+                session_id=session_id,
+                now_fn=now_fn,
+            )
+        except Exception as exc:  # noqa: BLE001
+            execution_result = ExecutionResult(
+                status="failed",
+                output=None,
+                error=safe_failure_reason(
+                    str(exc),
+                    fallback=f"unexpected {exc.__class__.__name__}",
+                ),
+            )
+        else:
+            execution_result = ExecutionResult(
+                status="succeeded",
+                output=research_output,
                 error=None,
             )
     else:

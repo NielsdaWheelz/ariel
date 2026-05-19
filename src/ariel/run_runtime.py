@@ -32,6 +32,9 @@ _AGENT_EMIT_VALUE = "agent.emit_value"
 _AGENT_PAUSE_UNTIL_INPUT = "agent.pause_until_input"
 _AGENT_SYSCALL_NAMES = (_AGENT_EMIT_MESSAGE, _AGENT_EMIT_VALUE, _AGENT_PAUSE_UNTIL_INPUT)
 
+# Research-run terminal output syscall — eligible only in a research run.
+_RESEARCH_FINDING = "research.finding"
+
 # Host-side per-turn scratch store syscalls — always eligible, not capabilities.
 _SCRATCH_SET = "scratch.set"
 _SCRATCH_GET = "scratch.get"
@@ -44,6 +47,7 @@ _SCRATCH_MAX_TOTAL_BYTES = 4 * 1024 * 1024  # 4 MiB total
 
 _MAX_EMITTED_VALUES = 10
 _MAX_EMITTED_VALUE_BYTES = 12000
+_MAX_RESEARCH_FINDING_BYTES = 64000
 
 
 @dataclass(slots=True, frozen=True)
@@ -66,10 +70,10 @@ class RunProgramResult:
     ``program_ok`` is the sandbox ``ProgramResult.ok``: ``False`` means the
     program did not complete cleanly. Per the cutover's "Program Failure", a
     program that does not complete cleanly surfaces no proposals, so on failure
-    ``emitted_message``/``emitted_values``/``paused`` are scrubbed here and the
-    staged ``ApprovalRequestRecord`` rows the syscalls wrote are left for the
-    caller's transaction to roll back. ``action_attempts`` is still the syscall
-    trace — the audit spine — and is returned regardless.
+    ``emitted_message``/``emitted_values``/``emitted_finding``/``paused`` are
+    scrubbed here and the staged ``ApprovalRequestRecord`` rows the syscalls
+    wrote are left for the caller's transaction to roll back. ``action_attempts``
+    is still the syscall trace — the audit spine — and is returned regardless.
 
     ``runtime_provenance`` is this program's taint delta: a tainted
     ``RuntimeProvenance`` carrying the evidence its syscalls produced, or
@@ -78,10 +82,15 @@ class RunProgramResult:
     evaluated with that taint. It is returned regardless of ``program_ok``: an
     inline read that tainted the program already returned its result and stands
     even if a later syscall raised.
+
+    ``emitted_finding`` is set only when the program was run with
+    ``is_research_run=True`` and the program called ``research.finding``; it is
+    ``None`` in main-agent runs and on ``program_ok=False``.
     """
 
     emitted_message: str
     emitted_values: list[Any]
+    emitted_finding: dict[str, Any] | None
     paused: bool
     action_attempts: list[ActionAttemptRecord]
     program_ok: bool
@@ -146,16 +155,23 @@ def parse_run_function_call(
     return source, None
 
 
-def _eligible_syscall_names(allowed_capability_ids: set[str]) -> tuple[str, ...]:
+def _eligible_syscall_names(
+    allowed_capability_ids: set[str], *, is_research_run: bool = False
+) -> tuple[str, ...]:
     """The syscall callables the program may call this turn.
 
     The three ``agent.*`` output syscalls, the two ``scratch.*`` store syscalls
     (always eligible — host-side, not capabilities), plus the run-callable name
     of every allowed capability id. A capability with no run-callable alias is
     dropped: it cannot be named in a program.
+
+    ``research.finding`` is added only when ``is_research_run=True``; it must
+    never appear in a main-agent turn's eligible set.
     """
 
     names: set[str] = set(_AGENT_SYSCALL_NAMES) | set(_SCRATCH_SYSCALL_NAMES)
+    if is_research_run:
+        names.add(_RESEARCH_FINDING)
     for capability_id in allowed_capability_ids:
         run_callable_name = run_callable_name_for_capability_id(capability_id)
         if run_callable_name is not None:
@@ -213,6 +229,7 @@ def execute_run_program(
     allowed_capability_ids: set[str],
     settings: AppSettings | None,
     scratch: dict[str, ScratchEntry],
+    is_research_run: bool = False,
 ) -> RunProgramResult:
     """Run one model-authored Python ``run`` program inside the sandbox.
 
@@ -236,10 +253,11 @@ def execute_run_program(
     """
 
     ctx = _FunctionCallProcessingContext()
-    syscall_names = _eligible_syscall_names(allowed_capability_ids)
+    syscall_names = _eligible_syscall_names(allowed_capability_ids, is_research_run=is_research_run)
 
     emitted_message = ""
     emitted_values: list[Any] = []
+    emitted_finding: dict[str, Any] | None = None
     paused = False
     callback_errors: list[str] = []
     # Boxed so the callback closure can advance taint between syscalls.
@@ -253,7 +271,7 @@ def execute_run_program(
     call_index = 0
 
     def syscall_callback(name: str, syscall_input: dict[str, Any]) -> tuple[bool, Any]:
-        nonlocal emitted_message, emitted_values, paused, call_index
+        nonlocal emitted_message, emitted_values, emitted_finding, paused, call_index
 
         if name == _AGENT_EMIT_MESSAGE:
             text = syscall_input.get("text")
@@ -343,6 +361,35 @@ def execute_run_program(
                 program_taint_evidence.extend(entry.provenance.evidence)
             return True, entry.value
 
+        if name == _RESEARCH_FINDING:
+            # research.finding is the research run's terminal output. It is only
+            # eligible (present in syscall_names) when is_research_run=True; if
+            # somehow reached in a main-agent run it falls through to the
+            # unknown-callable path below.
+            summary = syscall_input.get("summary")
+            claims = syscall_input.get("claims")
+            gaps = syscall_input.get("gaps")
+            sources = syscall_input.get("sources")
+            if (
+                set(syscall_input.keys()) != {"summary", "claims", "gaps", "sources"}
+                or not isinstance(summary, str)
+                or not isinstance(claims, list)
+                or not isinstance(gaps, list)
+                or not isinstance(sources, list)
+            ):
+                callback_errors.append("research_finding_schema_invalid")
+                return False, "research_finding_schema_invalid"
+            try:
+                encoded = json.dumps(syscall_input, sort_keys=True)
+            except TypeError:
+                callback_errors.append("research_finding_schema_invalid")
+                return False, "research_finding_schema_invalid"
+            if len(encoded.encode("utf-8")) > _MAX_RESEARCH_FINDING_BYTES:
+                callback_errors.append("research_finding_too_large")
+                return False, "research_finding_too_large"
+            emitted_finding = syscall_input
+            return True, None
+
         capability_id = capability_id_for_run_callable(name)
         if capability_id is None:
             callback_errors.append(f"{name}: unknown_callable")
@@ -420,6 +467,7 @@ def execute_run_program(
         return RunProgramResult(
             emitted_message="",
             emitted_values=[],
+            emitted_finding=None,
             paused=False,
             action_attempts=ctx.created_action_attempts,
             program_ok=False,
@@ -431,6 +479,7 @@ def execute_run_program(
     return RunProgramResult(
         emitted_message=emitted_message,
         emitted_values=emitted_values,
+        emitted_finding=emitted_finding,
         paused=paused,
         action_attempts=ctx.created_action_attempts,
         program_ok=True,

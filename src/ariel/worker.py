@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from .action_runtime import (
+    RuntimeProvenance,
     process_action_execution_task,
     process_provider_write_reconcile_due,
     reconcile_expired_approvals_for_session,
@@ -41,6 +42,7 @@ from .persistence import (
 )
 from .memory import enqueue_due_memory_sweep, run_rememberer
 from .redaction import safe_failure_reason
+from .research_runtime import ResearchFinding, render_finding, run_research
 from .sync_runtime import (
     process_provider_event_received,
     process_provider_sync_due,
@@ -361,28 +363,26 @@ def process_one_task(
                     task_payload=task_payload,
                 )
             case "agent_wake":
-                note = _payload_text(task_payload, "note")
-                if note is None:
-                    raise RuntimeError("agent_wake task missing note")
                 if runtime is None:
                     raise RuntimeError("agent_wake task requires a configured runtime")
+                research_session_id, wake_context = _agent_wake_context(task_payload)
                 with session_factory() as db:
-                    session = _get_or_create_active_session(db)
+                    # A research-completion wake targets the session that
+                    # dispatched the run; a plain note wake uses the active one.
+                    request_session_id = research_session_id or _get_or_create_active_session(db).id
                     outcome = _wake(
                         runtime=runtime,
                         db=db,
-                        request_session_id=session.id,
-                        wake_context=WakeContext(
-                            trigger_kind="scheduled_task",
-                            prompt_text=note,
-                            discord_context=None,
-                            attachment_sources=None,
-                            ingress_provenance=None,
-                        ),
+                        request_session_id=request_session_id,
+                        wake_context=wake_context,
                         google_runtime=build_google_runtime(runtime.settings),
                     )
                     db.commit()
                 _deliver_to_discord(outcome=outcome, settings=runtime.settings)
+            case "research_run":
+                if runtime is None:
+                    raise RuntimeError("research_run task requires a configured runtime")
+                _process_research_run(runtime=runtime, task_payload=task_payload)
             case "user_message":
                 if runtime is None:
                     raise RuntimeError("user_message task requires a configured runtime")
@@ -562,6 +562,136 @@ def _payload_text(payload: dict[str, Any], key: str) -> str | None:
         return None
     normalized = value.strip()
     return normalized or None
+
+
+def _parse_research_finding(raw: dict[str, Any]) -> ResearchFinding:
+    """Reconstruct a ``ResearchFinding`` from a completion ``agent_wake`` payload.
+
+    Raises ``RuntimeError`` on any bad shape so the worker's task-failure path
+    marks the row failed — mirroring the validate-inside-the-arm style of
+    ``case "user_message":``."""
+    question = raw.get("question")
+    mode = raw.get("mode")
+    status = raw.get("status")
+    summary = raw.get("summary")
+    claims = raw.get("claims")
+    gaps = raw.get("gaps")
+    sources = raw.get("sources")
+    if (
+        not isinstance(question, str)
+        or not isinstance(mode, str)
+        or not isinstance(status, str)
+        or not isinstance(summary, str)
+        or not isinstance(claims, list)
+        or not isinstance(gaps, list)
+        or not isinstance(sources, list)
+    ):
+        raise RuntimeError("agent_wake research_finding payload invalid")
+    return ResearchFinding(
+        question=question,
+        mode=mode,
+        status=status,
+        summary=summary,
+        claims=claims,
+        gaps=gaps,
+        sources=sources,
+    )
+
+
+def _agent_wake_context(task_payload: dict[str, Any]) -> tuple[str | None, WakeContext]:
+    """Build the ``WakeContext`` for an ``agent_wake`` task.
+
+    Two shapes reach this arm. A research-completion wake carries a
+    ``research_finding`` object and the ``session_id`` that dispatched the run:
+    the finding is rendered into the prompt as a clearly-attributed block and the
+    wake is carried with tainted ``ingress_provenance`` — the finding's text is
+    model-authored over untrusted content, so a prompt-injected finding cannot
+    authorize an unapproved action. A plain wake carries a ``note`` and keeps the
+    untainted ``scheduled_task`` path unchanged. Returns the target session id
+    (the carried session for a research completion, ``None`` for a plain note —
+    the caller resolves the active session) and the context."""
+    raw_finding = task_payload.get("research_finding")
+    if isinstance(raw_finding, dict):
+        finding = _parse_research_finding(raw_finding)
+        session_id = _payload_text(task_payload, "session_id")
+        if session_id is None:
+            raise RuntimeError("agent_wake research_finding task missing session_id")
+        return session_id, WakeContext(
+            trigger_kind="research_completion",
+            prompt_text=render_finding(finding),
+            discord_context=None,
+            attachment_sources=None,
+            ingress_provenance=RuntimeProvenance(
+                status="tainted",
+                evidence=(
+                    {
+                        "kind": "research_finding_in_context",
+                        "research_mode": finding.mode,
+                        "research_status": finding.status,
+                    },
+                ),
+            ),
+        )
+    note = _payload_text(task_payload, "note")
+    if note is None:
+        raise RuntimeError("agent_wake task missing note")
+    return None, WakeContext(
+        trigger_kind="scheduled_task",
+        prompt_text=note,
+        discord_context=None,
+        attachment_sources=None,
+        ingress_provenance=None,
+    )
+
+
+def _process_research_run(*, runtime: Runtime, task_payload: dict[str, Any]) -> None:
+    """Run one ``research_run`` task: drive ``run_research`` in the worker, then
+    enqueue a completion ``agent_wake`` carrying the finding back to the session
+    that dispatched the run.
+
+    ``question``, ``mode``, and ``session_id`` are validated inside the arm —
+    a bad shape raises so the task-failure path marks the row failed, mirroring
+    ``case "user_message":``. ``run_research`` records the run as a
+    ``kind="research"`` ``TurnRecord`` and never raises; its typed
+    ``ResearchFinding`` becomes the completion wake's payload."""
+    question = _payload_text(task_payload, "question")
+    mode = _payload_text(task_payload, "mode")
+    session_id = _payload_text(task_payload, "session_id")
+    if question is None or mode is None or session_id is None:
+        raise RuntimeError("research_run task payload invalid")
+
+    with runtime.session_factory() as db:
+        finding = run_research(
+            sandbox=runtime.sandbox,
+            db=db,
+            session_factory=runtime.session_factory,
+            settings=runtime.settings,
+            model_adapter=runtime.model_adapter,
+            google_runtime=build_google_runtime(runtime.settings),
+            session_id=session_id,
+            question=question,
+            mode=mode,
+        )
+
+    with runtime.session_factory() as db:
+        with db.begin():
+            enqueue_background_task(
+                db,
+                task_type="agent_wake",
+                payload={
+                    "research_finding": {
+                        "question": finding.question,
+                        "mode": finding.mode,
+                        "status": finding.status,
+                        "summary": finding.summary,
+                        "claims": finding.claims,
+                        "gaps": finding.gaps,
+                        "sources": finding.sources,
+                    },
+                    "session_id": session_id,
+                },
+                now=_utcnow(),
+            )
 
 
 def _job_status_for_event(event_type: str) -> str:

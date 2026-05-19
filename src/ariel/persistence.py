@@ -157,6 +157,7 @@ class TurnRecord(Base):
     user_message: Mapped[str] = mapped_column(Text, nullable=False)
     assistant_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False, server_default="agent_turn")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )
@@ -170,6 +171,10 @@ class TurnRecord(Base):
         CheckConstraint(
             "status IN ('in_progress', 'completed', 'failed')",
             name="ck_turn_status",
+        ),
+        CheckConstraint(
+            "kind IN ('agent_turn', 'research')",
+            name="ck_turn_kind",
         ),
     )
 
@@ -1409,7 +1414,7 @@ class BackgroundTaskRecord(Base):
                 "'memory_sweep', 'execute_action_attempt', 'google_object_hydration_due', "
                 "'provider_evidence_extraction_due', 'provider_write_reconcile_due', "
                 "'agent_wake', 'provider_watch_renew_due', 'provider_reconcile_sync_due', "
-                "'user_message')"
+                "'user_message', 'research_run')"
             ),
             name="ck_background_task_type",
         ),
