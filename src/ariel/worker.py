@@ -26,7 +26,7 @@ from .app import (
     build_google_runtime,
     build_runtime,
 )
-from .capability_registry import capability_action_label
+from .capability_registry import REMEMBERER_CAPABILITY_IDS, capability_action_label
 from .config import AppSettings
 from .google_connector import GOOGLE_CONNECTOR_ID
 from .persistence import (
@@ -40,7 +40,7 @@ from .persistence import (
     SyncCursorRecord,
     enqueue_background_task,
 )
-from .memory import enqueue_due_memory_sweep, run_rememberer
+from .memory import enqueue_due_memory_dream, run_rememberer
 from .redaction import safe_failure_reason
 from .research_runtime import ResearchFinding, render_finding, run_research
 from .sync_runtime import (
@@ -322,7 +322,7 @@ def process_one_task(
     with session_factory() as db:
         with db.begin():
             now = _utcnow()
-            enqueue_due_memory_sweep(db, settings=resolved_settings, now=now)
+            enqueue_due_memory_dream(db, settings=resolved_settings, now=now)
             seed_provider_maintenance_tasks(db, settings=resolved_settings, now=now)
 
     with session_factory() as db:
@@ -452,26 +452,56 @@ def process_one_task(
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                 )
-            case "memory_remember":
-                turn_id = _payload_text(task_payload, "turn_id")
-                if turn_id is None:
-                    raise RuntimeError("memory_remember task missing turn_id")
-                run_rememberer(
-                    session_factory=session_factory,
-                    settings=resolved_settings,
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                    trigger="turn",
-                    turn_id=turn_id,
-                )
-            case "memory_sweep":
-                run_rememberer(
-                    session_factory=session_factory,
-                    settings=resolved_settings,
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                    trigger="sweep",
-                )
+            case "memory_encode":
+                if runtime is None:
+                    raise RuntimeError("memory_encode task requires a configured runtime")
+                note = _payload_text(task_payload, "note")
+                if not note:
+                    raise RuntimeError("memory_encode task missing note")
+                session_id = _payload_text(task_payload, "session_id")
+                with runtime.session_factory() as db:
+                    run_rememberer(
+                        trigger="encode",
+                        sandbox=runtime.sandbox,
+                        db=db,
+                        session_factory=runtime.session_factory,
+                        session_id=session_id,
+                        settings=runtime.settings,
+                        model_adapter=runtime.model_adapter,
+                        google_runtime=build_google_runtime(runtime.settings),
+                        agency_runtime=None,
+                        attachment_runtime=None,
+                        note=note,
+                        allowed_capability_ids=REMEMBERER_CAPABILITY_IDS,
+                        approval_ttl_seconds=int(runtime.settings.approval_ttl_seconds),
+                        approval_actor_id=str(runtime.settings.approval_actor_id),
+                        add_event=lambda *_args, **_kwargs: None,
+                        now_fn=_utcnow,
+                        new_id_fn=_new_id,
+                    )
+            case "memory_dream":
+                if runtime is None:
+                    raise RuntimeError("memory_dream task requires a configured runtime")
+                with runtime.session_factory() as db:
+                    run_rememberer(
+                        trigger="dream",
+                        sandbox=runtime.sandbox,
+                        db=db,
+                        session_factory=runtime.session_factory,
+                        session_id=None,
+                        settings=runtime.settings,
+                        model_adapter=runtime.model_adapter,
+                        google_runtime=build_google_runtime(runtime.settings),
+                        agency_runtime=None,
+                        attachment_runtime=None,
+                        note=None,
+                        allowed_capability_ids=REMEMBERER_CAPABILITY_IDS,
+                        approval_ttl_seconds=int(runtime.settings.approval_ttl_seconds),
+                        approval_actor_id=str(runtime.settings.approval_actor_id),
+                        add_event=lambda *_args, **_kwargs: None,
+                        now_fn=_utcnow,
+                        new_id_fn=_new_id,
+                    )
             case "provider_watch_renew_due":
                 process_provider_watch_renew_due(
                     session_factory=session_factory,
