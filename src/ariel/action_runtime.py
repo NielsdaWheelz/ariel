@@ -53,7 +53,6 @@ from ariel.persistence import (
     ApprovalRequestRecord,
     ArtifactRecord,
     BackgroundTaskRecord,
-    EmailThreadWatchRecord,
     GoogleConnectorRecord,
     GoogleProviderObjectRecord,
     ProviderEvidenceBlockRecord,
@@ -68,10 +67,6 @@ from ariel.redaction import safe_failure_reason
 from ariel.weather_state import resolve_weather_location
 
 _SIDE_EFFECT_EXECUTION_LOCK_ID = 24_310_002
-_EMAIL_THREAD_WATCH_CAPABILITY_IDS = {
-    "cap.email.thread_watch.create",
-    "cap.email.thread_watch.cancel",
-}
 _EMAIL_TRANSIENT_PROVIDER_ERRORS = {
     "google_upstream_429",
     "google_upstream_500",
@@ -339,16 +334,6 @@ def _full_action_input_payload(
     if expected_hash != action_attempt.payload_hash:
         return None, "private_action_payload_hash_mismatch"
     return full_payload, None
-
-
-def _email_idempotency_key(
-    *,
-    capability_id: str,
-    provider_account_id: str,
-    client_key: str,
-) -> str:
-    raw = f"{capability_id}\x1fgoogle\x1f{provider_account_id}\x1f{client_key}"
-    return "email:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _email_provider_error_is_retryable(error: str) -> bool:
@@ -2974,79 +2959,6 @@ def process_one_call(
             ctx.retrieval_errors.append(preflight_error)
         return
 
-    if capability_id == "cap.email.thread_watch.list":
-        provider_account_id = _current_google_provider_account_id(db)
-        if provider_account_id is None:
-            action_attempt.execution_output = None
-            action_attempt.execution_error = "google_account_identity_missing"
-            action_attempt.status = "failed"
-            action_attempt.updated_at = now_fn()
-            ctx.blocked_reasons.append(f"{capability_id}: google_account_identity_missing")
-            if call_id:
-                ctx.function_call_outputs.append(
-                    _response_function_call_output(
-                        call_id=call_id,
-                        payload={
-                            "status": "failed",
-                            "capability_id": capability_id,
-                            "error": "google_account_identity_missing",
-                        },
-                    )
-                )
-            add_event(
-                "evt.action.execution.failed",
-                {
-                    "action_attempt_id": action_attempt.id,
-                    "error": "google_account_identity_missing",
-                },
-            )
-            return
-        watches = db.scalars(
-            select(EmailThreadWatchRecord)
-            .where(
-                EmailThreadWatchRecord.provider == "google",
-                EmailThreadWatchRecord.provider_account_id == provider_account_id,
-                EmailThreadWatchRecord.status == "active",
-            )
-            .order_by(EmailThreadWatchRecord.deadline.asc(), EmailThreadWatchRecord.id.asc())
-            .limit(100)
-        ).all()
-        output = {
-            "status": "listed",
-            "watches": [
-                {
-                    "watch_id": watch.id,
-                    "provider_thread_id": watch.provider_thread_id,
-                    "anchor_message_id": watch.anchor_message_id,
-                    "condition": watch.condition,
-                    "deadline": to_rfc3339(watch.deadline),
-                    "note": watch.note,
-                    "status": watch.status,
-                }
-                for watch in watches
-            ],
-        }
-        action_attempt.execution_output = output
-        action_attempt.execution_error = None
-        action_attempt.status = "succeeded"
-        action_attempt.updated_at = now_fn()
-        ctx.inline_results.append({"capability_id": capability_id, "output": output})
-        if call_id:
-            ctx.function_call_outputs.append(
-                _response_function_call_output(
-                    call_id=call_id,
-                    payload={"status": "succeeded", "capability_id": capability_id, **output},
-                )
-            )
-        add_event(
-            "evt.action.execution.succeeded",
-            {
-                "action_attempt_id": action_attempt.id,
-                "output": output,
-            },
-        )
-        return
-
     # Memory and proactive syscalls are write_reversible but execute inline:
     # each runs host-side and returns its result (recalled facts, a remember
     # summary, a scheduled task) into the program, so they skip the durable
@@ -3935,7 +3847,6 @@ def process_action_execution_task(
         | None
     ) = None
     local_call: tuple[CapabilityDefinition, dict[str, Any], str] | None = None
-    thread_watch_result: dict[str, Any] | None = None
     execution_result: ExecutionResult | GoogleCapabilityExecutionResult | None = None
     retryable_provider_error: str | None = None
     provider_write_failure_payload: dict[str, Any] | None = None
@@ -4191,10 +4102,7 @@ def process_action_execution_task(
                         new_id_fn=new_id_fn,
                     )
                     return True
-                elif (
-                    action_attempt.capability_id not in EMAIL_MUTATION_CAPABILITY_IDS
-                    and action_attempt.capability_id not in _EMAIL_THREAD_WATCH_CAPABILITY_IDS
-                ):
+                elif action_attempt.capability_id not in EMAIL_MUTATION_CAPABILITY_IDS:
                     _fail_action_execution(
                         db=db,
                         action_attempt=action_attempt,
@@ -4299,212 +4207,6 @@ def process_action_execution_task(
                     payload_data={
                         "action_attempt_id": action_attempt.id,
                         "output": memory_output,
-                    },
-                    now_fn=now_fn,
-                    new_id_fn=new_id_fn,
-                )
-                return True
-
-            if action_attempt.capability_id in _EMAIL_THREAD_WATCH_CAPABILITY_IDS:
-                now = now_fn()
-                if action_attempt.capability_id == "cap.email.thread_watch.create":
-                    if google_runtime is None:
-                        _fail_action_execution(
-                            db=db,
-                            action_attempt=action_attempt,
-                            error="google_runtime_not_bound",
-                            now_fn=now_fn,
-                            new_id_fn=new_id_fn,
-                        )
-                        return True
-                    _, _, prepared_provider_account_id, access_failure = (
-                        google_runtime.prepare_capability_access_without_refresh(
-                            db=db,
-                            capability_id=action_attempt.capability_id,
-                            now_fn=now_fn,
-                        )
-                    )
-                    if access_failure is not None:
-                        _fail_action_execution(
-                            db=db,
-                            action_attempt=action_attempt,
-                            error=(
-                                access_failure.auth_failure.failure_class
-                                if access_failure.auth_failure is not None
-                                else (access_failure.error or "google_access_failed")
-                            ),
-                            now_fn=now_fn,
-                            new_id_fn=new_id_fn,
-                        )
-                        return True
-                    provider_account_id = prepared_provider_account_id
-                    if provider_account_id is None:
-                        _fail_action_execution(
-                            db=db,
-                            action_attempt=action_attempt,
-                            error="google_account_identity_missing",
-                            now_fn=now_fn,
-                            new_id_fn=new_id_fn,
-                        )
-                        return True
-                    _acquire_email_advisory_lock(
-                        db,
-                        "email_thread_watch",
-                        "google",
-                        provider_account_id,
-                        str(normalized_input["provider_thread_id"]),
-                    )
-                    idempotency_key = _email_idempotency_key(
-                        capability_id=action_attempt.capability_id,
-                        provider_account_id=provider_account_id,
-                        client_key=str(normalized_input["idempotency_key"]),
-                    )
-                    watch = db.scalar(
-                        select(EmailThreadWatchRecord)
-                        .where(EmailThreadWatchRecord.idempotency_key == idempotency_key)
-                        .with_for_update()
-                        .limit(1)
-                    )
-                    if watch is None:
-                        watch = EmailThreadWatchRecord(
-                            id=new_id_fn("etw"),
-                            provider="google",
-                            provider_account_id=provider_account_id,
-                            provider_thread_id=str(normalized_input["provider_thread_id"]),
-                            anchor_message_id=str(normalized_input["anchor_message_id"]),
-                            condition=str(normalized_input["condition"]),
-                            deadline=datetime.fromisoformat(
-                                str(normalized_input["deadline"]).replace("Z", "+00:00")
-                            ),
-                            note=str(normalized_input["note"]),
-                            status="active",
-                            idempotency_key=idempotency_key,
-                            cancel_idempotency_key=None,
-                            created_by_action_attempt_id=action_attempt.id,
-                            matched_message_id=None,
-                            matched_at=None,
-                            canceled_at=None,
-                            completed_at=None,
-                            created_at=now,
-                            updated_at=now,
-                        )
-                        db.add(watch)
-                        db.flush()
-                    elif (
-                        watch.provider_thread_id != str(normalized_input["provider_thread_id"])
-                        or watch.anchor_message_id != str(normalized_input["anchor_message_id"])
-                        or watch.condition != str(normalized_input["condition"])
-                        or to_rfc3339(watch.deadline) != str(normalized_input["deadline"])
-                        or watch.note != str(normalized_input["note"])
-                    ):
-                        _fail_action_execution(
-                            db=db,
-                            action_attempt=action_attempt,
-                            error="idempotency_key_input_mismatch",
-                            now_fn=now_fn,
-                            new_id_fn=new_id_fn,
-                        )
-                        return True
-                    thread_watch_result = {
-                        "status": watch.status,
-                        "watch_id": watch.id,
-                        "provider_thread_id": watch.provider_thread_id,
-                        "anchor_message_id": watch.anchor_message_id,
-                        "condition": watch.condition,
-                        "deadline": to_rfc3339(watch.deadline),
-                        "note": watch.note,
-                    }
-                else:
-                    provider_account_id = _current_google_provider_account_id(db)
-                    if provider_account_id is None:
-                        _fail_action_execution(
-                            db=db,
-                            action_attempt=action_attempt,
-                            error="google_account_identity_missing",
-                            now_fn=now_fn,
-                            new_id_fn=new_id_fn,
-                        )
-                        return True
-                    watch = db.scalar(
-                        select(EmailThreadWatchRecord)
-                        .where(
-                            EmailThreadWatchRecord.id == normalized_input["watch_id"],
-                            EmailThreadWatchRecord.provider == "google",
-                            EmailThreadWatchRecord.provider_account_id == provider_account_id,
-                        )
-                        .with_for_update()
-                        .limit(1)
-                    )
-                    if watch is None:
-                        _fail_action_execution(
-                            db=db,
-                            action_attempt=action_attempt,
-                            error="thread_watch_not_found",
-                            now_fn=now_fn,
-                            new_id_fn=new_id_fn,
-                        )
-                        return True
-                    _acquire_email_advisory_lock(
-                        db,
-                        "email_thread_watch",
-                        watch.provider,
-                        watch.provider_account_id,
-                        watch.provider_thread_id,
-                    )
-                    cancel_idempotency_key = _email_idempotency_key(
-                        capability_id=action_attempt.capability_id,
-                        provider_account_id=watch.provider_account_id,
-                        client_key=str(normalized_input["idempotency_key"]),
-                    )
-                    existing_cancel = db.scalar(
-                        select(EmailThreadWatchRecord)
-                        .where(
-                            EmailThreadWatchRecord.cancel_idempotency_key == cancel_idempotency_key
-                        )
-                        .with_for_update()
-                        .limit(1)
-                    )
-                    if existing_cancel is not None and existing_cancel.id != watch.id:
-                        _fail_action_execution(
-                            db=db,
-                            action_attempt=action_attempt,
-                            error="idempotency_key_input_mismatch",
-                            now_fn=now_fn,
-                            new_id_fn=new_id_fn,
-                        )
-                        return True
-                    if watch.status == "canceled":
-                        if watch.cancel_idempotency_key != cancel_idempotency_key:
-                            _fail_action_execution(
-                                db=db,
-                                action_attempt=action_attempt,
-                                error="idempotency_key_input_mismatch",
-                                now_fn=now_fn,
-                                new_id_fn=new_id_fn,
-                            )
-                            return True
-                    elif watch.status == "active":
-                        watch.status = "canceled"
-                        watch.canceled_at = now
-                        watch.cancel_idempotency_key = cancel_idempotency_key
-                        watch.updated_at = now
-                    thread_watch_result = {
-                        "status": watch.status,
-                        "watch_id": watch.id,
-                        "provider_thread_id": watch.provider_thread_id,
-                        "condition": watch.condition,
-                    }
-                action_attempt.status = "succeeded"
-                action_attempt.execution_output = thread_watch_result
-                action_attempt.execution_error = None
-                action_attempt.updated_at = now
-                _append_action_execution_event(
-                    db=db,
-                    action_attempt=action_attempt,
-                    event_type="evt.action.execution.succeeded",
-                    payload_data={
-                        "action_attempt_id": action_attempt.id,
-                        "output": thread_watch_result,
                     },
                     now_fn=now_fn,
                     new_id_fn=new_id_fn,

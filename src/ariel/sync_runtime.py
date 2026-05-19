@@ -20,7 +20,6 @@ from ariel.google_connector import (
 )
 from ariel.google_workspace_normalization import normalize_calendar_event
 from ariel.persistence import (
-    EmailThreadWatchRecord,
     GoogleConnectorRecord,
     GoogleProviderObjectRecord,
     ProviderEvidenceBlockRecord,
@@ -1207,38 +1206,6 @@ def _sync_gmail_history(
                     existing_evidence.updated_at = now
                     if labels_changed or key in {"labelsAdded", "labelsRemoved"}:
                         existing_evidence.extraction_status = "pending"
-            if key == "messagesAdded" and thread_id is not None:
-                watches = db.scalars(
-                    select(EmailThreadWatchRecord)
-                    .where(
-                        EmailThreadWatchRecord.provider == "google",
-                        EmailThreadWatchRecord.provider_account_id == provider_account_id,
-                        EmailThreadWatchRecord.provider_thread_id == thread_id,
-                        EmailThreadWatchRecord.status == "active",
-                    )
-                    .with_for_update()
-                ).all()
-                for watch in watches:
-                    if message_id == watch.anchor_message_id:
-                        continue
-                    if (
-                        watch.condition == "no_reply_by_deadline"
-                        and message_received_at >= watch.deadline
-                    ):
-                        watch.status = "due"
-                    elif (
-                        watch.condition == "any_reply_arrives"
-                        and message_received_at >= watch.deadline
-                    ):
-                        watch.status = "failed"
-                        watch.updated_at = now
-                        continue
-                    else:
-                        watch.status = "completed"
-                        watch.matched_message_id = message_id
-                        watch.matched_at = message_received_at
-                        watch.completed_at = now
-                    watch.updated_at = now
     return item_count, observation_count
 
 

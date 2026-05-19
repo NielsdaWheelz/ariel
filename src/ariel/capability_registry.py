@@ -980,74 +980,6 @@ def _validate_email_undo_input(
     return {"undo_token": undo_token, **authority}, None
 
 
-_EMAIL_THREAD_WATCH_CONDITIONS = (
-    "no_reply_by_deadline",
-    "any_reply_arrives",
-)
-
-
-def _validate_email_thread_watch_create_input(
-    raw_input: dict[str, Any],
-) -> tuple[dict[str, Any] | None, str | None]:
-    if set(raw_input.keys()) != {
-        "provider_thread_id",
-        "anchor_message_id",
-        "condition",
-        "deadline",
-        "note",
-        "idempotency_key",
-    }:
-        return None, "schema_invalid"
-    provider_thread_id = _normalize_optional_text(
-        raw_input.get("provider_thread_id"), max_length=256
-    )
-    anchor_message_id = _normalize_optional_text(raw_input.get("anchor_message_id"), max_length=256)
-    condition_raw = raw_input.get("condition")
-    if not isinstance(condition_raw, str):
-        return None, "schema_invalid"
-    condition = condition_raw.strip().lower()
-    deadline = _normalize_rfc3339_like(raw_input.get("deadline"))
-    note = _normalize_optional_text(raw_input.get("note"), max_length=2000)
-    idempotency_key = _normalize_optional_text(raw_input.get("idempotency_key"), max_length=128)
-    if (
-        provider_thread_id is None
-        or anchor_message_id is None
-        or condition not in _EMAIL_THREAD_WATCH_CONDITIONS
-        or deadline is None
-        or note is None
-        or idempotency_key is None
-    ):
-        return None, "schema_invalid"
-    return {
-        "provider_thread_id": provider_thread_id,
-        "anchor_message_id": anchor_message_id,
-        "condition": condition,
-        "deadline": deadline,
-        "note": note,
-        "idempotency_key": idempotency_key,
-    }, None
-
-
-def _validate_email_thread_watch_cancel_input(
-    raw_input: dict[str, Any],
-) -> tuple[dict[str, Any] | None, str | None]:
-    if set(raw_input.keys()) != {"watch_id", "idempotency_key"}:
-        return None, "schema_invalid"
-    watch_id = _normalize_optional_text(raw_input.get("watch_id"), max_length=128)
-    idempotency_key = _normalize_optional_text(raw_input.get("idempotency_key"), max_length=128)
-    if watch_id is None or idempotency_key is None:
-        return None, "schema_invalid"
-    return {"watch_id": watch_id, "idempotency_key": idempotency_key}, None
-
-
-def _validate_email_thread_watch_list_input(
-    raw_input: dict[str, Any],
-) -> tuple[dict[str, Any] | None, str | None]:
-    if raw_input:
-        return None, "schema_invalid"
-    return {}, None
-
-
 _WEATHER_ALLOWED_TIMEFRAMES = {"now", "today", "tomorrow", "next_24h"}
 
 
@@ -2700,31 +2632,6 @@ def _declare_google_email_undo_egress_intent(
     ]
 
 
-def _declare_google_email_thread_watch_create_egress_intent(
-    input_payload: dict[str, Any],
-) -> list[dict[str, Any]]:
-    provider_thread_id = input_payload["provider_thread_id"]
-    anchor_message_id = input_payload["anchor_message_id"]
-    return [
-        {
-            "destination": (
-                f"https://gmail.googleapis.com/gmail/v1/users/me/threads/{provider_thread_id}"
-            ),
-            "payload": {
-                "provider_thread_id": provider_thread_id,
-                "condition": input_payload["condition"],
-                "deadline": input_payload["deadline"],
-            },
-        },
-        {
-            "destination": (
-                f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{anchor_message_id}"
-            ),
-            "payload": {"anchor_message_id": anchor_message_id},
-        },
-    ]
-
-
 def _declare_google_drive_search_egress_intent(
     input_payload: dict[str, Any],
 ) -> list[dict[str, Any]]:
@@ -3445,54 +3352,6 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         execute=None,
         declare_egress_intent=_declare_google_email_undo_egress_intent,
     ),
-    "cap.email.thread_watch.create": CapabilityDefinition(
-        capability_id="cap.email.thread_watch.create",
-        version="1.0",
-        impact_level="write_reversible",
-        policy_decision="requires_approval",
-        contract_metadata={
-            "input_schema": "email_thread_watch_create_v1",
-            "output_schema": "email_thread_watch_create_result_v1",
-            "idempotency": "client_key",
-            "required_scopes": [_GOOGLE_GMAIL_READ_SCOPE],
-            "execution_mode": "local_durable_workflow",
-            "deadline": "required",
-        },
-        allowed_egress_destinations=_GOOGLE_GMAIL_ALLOWED_EGRESS_DESTINATIONS,
-        validate_input=_validate_email_thread_watch_create_input,
-        execute=None,
-        declare_egress_intent=_declare_google_email_thread_watch_create_egress_intent,
-    ),
-    "cap.email.thread_watch.cancel": CapabilityDefinition(
-        capability_id="cap.email.thread_watch.cancel",
-        version="1.0",
-        impact_level="write_reversible",
-        policy_decision="allow_inline",
-        contract_metadata={
-            "input_schema": "email_thread_watch_cancel_v1",
-            "output_schema": "email_thread_watch_cancel_result_v1",
-            "idempotency": "client_key",
-            "execution_mode": "local_runtime_only",
-        },
-        allowed_egress_destinations=(),
-        validate_input=_validate_email_thread_watch_cancel_input,
-        execute=None,
-    ),
-    "cap.email.thread_watch.list": CapabilityDefinition(
-        capability_id="cap.email.thread_watch.list",
-        version="1.0",
-        impact_level="read",
-        policy_decision="allow_inline",
-        contract_metadata={
-            "input_schema": "email_thread_watch_list_v1",
-            "output_schema": "email_thread_watch_list_result_v1",
-            "idempotency": "deterministic_read",
-            "execution_mode": "local_runtime_only",
-        },
-        allowed_egress_destinations=(),
-        validate_input=_validate_email_thread_watch_list_input,
-        execute=None,
-    ),
     "cap.drive.share": CapabilityDefinition(
         capability_id="cap.drive.share",
         version="1.0",
@@ -3728,8 +3587,6 @@ _ACTION_LABELS_BY_CAPABILITY_ID = {
     "cap.email.draft": "Draft email",
     "cap.email.labels.modify": "Update email labels",
     "cap.email.send": "Send email",
-    "cap.email.thread_watch.cancel": "Cancel email watch",
-    "cap.email.thread_watch.create": "Create email watch",
     "cap.email.trash": "Move email to trash",
     "cap.email.undo": "Undo email change",
 }
@@ -3776,9 +3633,6 @@ _RUN_CALLABLE_ALIASES = {
     "email.read": "cap.email.read",
     "email.search": "cap.email.search",
     "email.send": "cap.email.send",
-    "email.thread_watch.cancel": "cap.email.thread_watch.cancel",
-    "email.thread_watch.create": "cap.email.thread_watch.create",
-    "email.thread_watch.list": "cap.email.thread_watch.list",
     "email.trash": "cap.email.trash",
     "email.undo": "cap.email.undo",
     "maps.directions": "cap.maps.directions",

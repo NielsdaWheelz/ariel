@@ -51,7 +51,6 @@ GOOGLE_READ_CAPABILITY_SCOPES: dict[str, set[str]] = {
     "cap.calendar.propose_slots": {GOOGLE_CALENDAR_READ_SCOPE},
     "cap.email.search": {GOOGLE_GMAIL_READ_SCOPE},
     "cap.email.read": {GOOGLE_GMAIL_READ_SCOPE},
-    "cap.email.thread_watch.create": {GOOGLE_GMAIL_READ_SCOPE},
     "cap.drive.search": {GOOGLE_DRIVE_METADATA_READ_SCOPE},
     "cap.drive.read": {GOOGLE_DRIVE_READ_SCOPE},
 }

@@ -42,29 +42,11 @@ REQUIRED_TABLES: Final[tuple[str, ...]] = (
     "google_provider_objects",
     "provider_evidence",
     "provider_evidence_blocks",
-    "work_threads",
-    "work_commitments",
-    "work_commitment_sources",
-    "work_follow_up_loops",
-    "work_follow_up_events",
     "provider_write_receipts",
-    "proactive_observations",
-    "proactive_cases",
-    "proactive_case_events",
-    "proactive_decisions",
-    "proactive_action_plans",
-    "proactive_action_executions",
-    "autonomy_scopes",
-    "proactive_feedback",
-    "proactive_learning_records",
     "background_tasks",
     "agency_events",
     "jobs",
     "job_events",
-    "notifications",
-    "notification_deliveries",
-    "leave_by_reminders",
-    "email_thread_watches",
 )
 
 REQUIRED_COLUMNS: Final[dict[str, tuple[str, ...]]] = {
@@ -154,7 +136,6 @@ REQUIRED_COLUMNS: Final[dict[str, tuple[str, ...]]] = {
         "payload_enc",
         "encryption_key_version",
     ),
-    "work_commitments": ("dedupe_digest",),
     "memory_facts": (
         "content",
         "status",
@@ -227,18 +208,6 @@ REQUIRED_CONSTRAINTS: Final[dict[str, tuple[str, ...]]] = {
         "ck_action_private_payload_kind",
         "ck_action_private_payload_digest",
     ),
-    "work_commitments": (
-        "ck_work_commitment_lifecycle_state",
-        "ck_work_commitment_review_state",
-        "ck_work_commitment_due_interval",
-    ),
-    "work_follow_up_loops": (
-        "ck_work_follow_up_loop_owner",
-        "ck_work_follow_up_loop_kind",
-        "ck_work_follow_up_loop_state",
-        "ck_work_follow_up_loop_version",
-    ),
-    "work_follow_up_events": ("ck_work_follow_up_event_type",),
     "memory_facts": ("ck_memory_fact_status",),
 }
 
@@ -327,24 +296,6 @@ REQUIRED_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
         ),
         "ck_background_task_attempts_nonnegative": ("attempts", ">=", "0"),
     },
-    "work_commitments": {
-        "ck_work_commitment_lifecycle_state": ("'waiting_on_user'", "'superseded'"),
-        "ck_work_commitment_review_state": ("'review_required'", "'rejected'"),
-        "ck_work_commitment_due_interval": ("due_start", "<", "due_end"),
-    },
-    "work_follow_up_loops": {
-        "ck_work_follow_up_loop_owner": ("commitment_id IS NOT NULL", "thread_id IS NULL"),
-        "ck_work_follow_up_loop_kind": (
-            "'due_date'",
-            "'waiting_for_reply'",
-            "'needs_user_reply'",
-        ),
-        "ck_work_follow_up_loop_state": ("'suppressed'", "'deleted'"),
-        "ck_work_follow_up_loop_version": ("version", ">", "0"),
-    },
-    "work_follow_up_events": {
-        "ck_work_follow_up_event_type": ("'notified'", "'stale_noop'", "'suppressed'"),
-    },
     "memory_facts": {
         "ck_memory_fact_status": ("'active'", "'forgotten'"),
     },
@@ -393,8 +344,6 @@ REQUIRED_INDEXES: Final[dict[str, tuple[str, ...]]] = {
         "ix_provider_evidence_source",
     ),
     "provider_evidence_blocks": ("ix_provider_evidence_blocks_unique",),
-    "work_commitments": ("ix_work_commitments_active_source_unique",),
-    "work_follow_up_loops": ("ix_work_follow_up_loops_due",),
     "provider_write_receipts": (
         "ix_provider_write_receipts_idempotency_unique",
         "ix_provider_write_receipts_attempt_idempotency_unique",
@@ -420,7 +369,6 @@ REQUIRED_UNIQUE_INDEXES: Final[dict[str, tuple[str, ...]]] = {
     ),
     "provider_evidence": ("ix_provider_evidence_identity_digest_unique",),
     "provider_evidence_blocks": ("ix_provider_evidence_blocks_unique",),
-    "work_commitments": ("ix_work_commitments_active_source_unique",),
     "provider_write_receipts": (
         "ix_provider_write_receipts_idempotency_unique",
         "ix_provider_write_receipts_attempt_idempotency_unique",
@@ -441,9 +389,6 @@ REQUIRED_INDEX_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
     "google_provider_objects": {
         "ix_google_provider_object_identity_unique": ("calendar_event", "<>"),
         "ix_google_provider_objects_calendar_event_identity_unique": ("calendar_event", "="),
-    },
-    "work_commitments": {
-        "ix_work_commitments_active_source_unique": ("active",),
     },
     "provider_write_receipts": {
         "ix_provider_write_receipts_idempotency_unique": ("idempotency_key IS NOT NULL",),
@@ -494,16 +439,6 @@ REQUIRED_INDEX_COLUMNS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
     },
     "provider_evidence_blocks": {
         "ix_provider_evidence_blocks_unique": ("evidence_id", "block_index"),
-    },
-    "work_commitments": {
-        "ix_work_commitments_active_source_unique": (
-            "provider",
-            "provider_account_id",
-            "dedupe_digest",
-        ),
-    },
-    "work_follow_up_loops": {
-        "ix_work_follow_up_loops_due": ("state", "next_check_at", "id"),
     },
     "provider_write_receipts": {
         "ix_provider_write_receipts_idempotency_unique": (

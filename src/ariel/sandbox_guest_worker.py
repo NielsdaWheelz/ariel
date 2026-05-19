@@ -213,7 +213,7 @@ def _build_syscall_namespace(
 ) -> dict[str, Any]:
     """Expose ``email.search`` style callables as namespace objects in globals.
 
-    Syscall names are dotted (``email.search``, ``email.thread_watch.cancel``);
+    Syscall names are dotted (``email.search``, ``email.labels.modify``);
     each intermediate segment is a nested ``SimpleNamespace`` and the final
     segment is the syscall function. ``SimpleNamespace`` holds plain functions as
     attributes without binding them as methods.

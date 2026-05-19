@@ -36,7 +36,7 @@ def _build_namespaces(
     """Build the dotted syscall callables wired to the callback.
 
     Mirrors the guest worker: each dotted syscall name (``email.search``,
-    ``email.thread_watch.cancel``) becomes a plain function reached through
+    ``email.labels.modify``) becomes a plain function reached through
     nested ``SimpleNamespace`` objects; calling it round-trips through
     ``syscall_callback`` and either returns the value or raises ``_SyscallError``.
     """

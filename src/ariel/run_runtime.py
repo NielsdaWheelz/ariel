@@ -150,13 +150,8 @@ def _capability_syscall_value(function_call_output: dict[str, Any]) -> tuple[boo
     payload = json.loads(function_call_output["output"])
     status = payload.get("status")
     if status == "succeeded":
-        # Most capabilities nest the result under "output"; thread_watch.list
-        # spreads it inline alongside status/capability_id. Handle both.
-        if "output" in payload:
-            return True, payload["output"]
-        return True, {
-            key: value for key, value in payload.items() if key not in {"status", "capability_id"}
-        }
+        # A succeeded capability call nests its result under "output".
+        return True, payload["output"]
     if status == "approval_required":
         return True, {
             "status": "approval_required",

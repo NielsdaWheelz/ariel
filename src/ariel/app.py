@@ -1973,10 +1973,6 @@ def _eligible_internal_callable_capability_ids(
             if google_connected and required_google_scopes.issubset(granted_scopes):
                 capability_ids.append(capability_id)
             continue
-        if capability_id in {"cap.email.thread_watch.cancel", "cap.email.thread_watch.list"}:
-            if google_connected:
-                capability_ids.append(capability_id)
-            continue
         if capability_id.startswith("cap.agency."):
             if bindings.get("agency") is True:
                 capability_ids.append(capability_id)

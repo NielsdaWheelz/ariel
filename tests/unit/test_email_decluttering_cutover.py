@@ -6,7 +6,6 @@ from ariel.capability_registry import (
 from ariel.google_connector import (
     GOOGLE_CAPABILITY_SCOPES,
     GOOGLE_GMAIL_MODIFY_SCOPE,
-    GOOGLE_GMAIL_READ_SCOPE,
 )
 from ariel.run_runtime import run_tool_definitions
 
@@ -19,9 +18,6 @@ FINAL_EMAIL_CAPABILITY_IDS = {
     "cap.email.trash",
     "cap.email.labels.modify",
     "cap.email.undo",
-    "cap.email.thread_watch.create",
-    "cap.email.thread_watch.cancel",
-    "cap.email.thread_watch.list",
 }
 BROAD_GMAIL_SCOPE = "https://mail.google.com/"
 
@@ -68,10 +64,7 @@ def test_email_capabilities_do_not_request_broad_gmail_scope() -> None:
         capability = get_capability(capability_id)
         assert capability is not None
         assert BROAD_GMAIL_SCOPE not in capability.contract_metadata.get("required_scopes", [])
-        if capability_id in {"cap.email.thread_watch.cancel", "cap.email.thread_watch.list"}:
-            assert capability.allowed_egress_destinations == ()
-        else:
-            assert capability.allowed_egress_destinations == ("gmail.googleapis.com",)
+        assert capability.allowed_egress_destinations == ("gmail.googleapis.com",)
 
     for scopes in GOOGLE_CAPABILITY_SCOPES.values():
         assert BROAD_GMAIL_SCOPE not in scopes
@@ -153,59 +146,3 @@ def test_email_label_modify_contract_is_single_primary_shape() -> None:
             "user_instruction_ref": "turn:turn_1",
         }
     ) == (None, "schema_invalid")
-
-
-def test_email_thread_watch_contract_only_exposes_implemented_conditions() -> None:
-    capability = get_capability("cap.email.thread_watch.create")
-    assert capability is not None
-
-    normalized, error = capability.validate_input(
-        {
-            "provider_thread_id": "thr-1",
-            "anchor_message_id": "msg-1",
-            "condition": "any_reply_arrives",
-            "deadline": "2026-05-08T12:00:00Z",
-            "note": "waiting on this thread",
-            "idempotency_key": "watch-1",
-        }
-    )
-
-    assert error is None
-    assert normalized == {
-        "provider_thread_id": "thr-1",
-        "anchor_message_id": "msg-1",
-        "condition": "any_reply_arrives",
-        "deadline": "2026-05-08T12:00:00Z",
-        "note": "waiting on this thread",
-        "idempotency_key": "watch-1",
-    }
-    assert capability.validate_input(
-        {
-            "provider_thread_id": "thr-1",
-            "anchor_message_id": "msg-1",
-            "condition": "matching_reply_arrives",
-            "deadline": "2026-05-08T12:00:00Z",
-            "note": "waiting on this thread",
-            "idempotency_key": "watch-1",
-        }
-    ) == (None, "schema_invalid")
-
-
-def test_email_thread_watch_scopes_and_local_only_capabilities() -> None:
-    create = get_capability("cap.email.thread_watch.create")
-    cancel = get_capability("cap.email.thread_watch.cancel")
-    list_watches = get_capability("cap.email.thread_watch.list")
-    assert create is not None
-    assert cancel is not None
-    assert list_watches is not None
-
-    assert create.contract_metadata["execution_mode"] == "local_durable_workflow"
-    assert create.contract_metadata["required_scopes"] == [GOOGLE_GMAIL_READ_SCOPE]
-    assert GOOGLE_CAPABILITY_SCOPES["cap.email.thread_watch.create"] == {GOOGLE_GMAIL_READ_SCOPE}
-
-    for capability in (cancel, list_watches):
-        assert capability.contract_metadata["execution_mode"] == "local_runtime_only"
-        assert "required_scopes" not in capability.contract_metadata
-        assert capability.allowed_egress_destinations == ()
-        assert capability.declare_egress_intent is None
-        assert capability.capability_id not in GOOGLE_CAPABILITY_SCOPES

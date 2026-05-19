@@ -12,7 +12,6 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from ariel.action_runtime import (
-    RuntimeProvenance,
     process_action_execution_task,
 )
 from ariel.capability_registry import (
@@ -31,7 +30,6 @@ from ariel.persistence import (
     ActionAttemptRecord,
     ActionPrivatePayloadRecord,
     BackgroundTaskRecord,
-    EmailThreadWatchRecord,
     EventRecord,
     GoogleConnectorRecord,
     ProviderWriteReceiptRecord,
@@ -39,21 +37,10 @@ from ariel.persistence import (
     TurnRecord,
     serialize_action_attempt,
 )
-from tests.integration.responses_helpers import run_function_calls
 
 
 NOW = datetime(2026, 5, 8, 12, 0, tzinfo=UTC)
 PROVIDER_ACCOUNT_ID = "acct_google"
-
-
-def _email_idempotency_key(
-    *,
-    capability_id: str,
-    provider_account_id: str,
-    client_key: str,
-) -> str:
-    raw = f"{capability_id}\x1fgoogle\x1f{provider_account_id}\x1f{client_key}"
-    return "email:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _provider_write_idempotency_key(
@@ -984,222 +971,3 @@ def test_email_undo_marks_prior_receipt_undone_on_the_single_ledger(
         assert undo_receipt.status == "succeeded"
         assert undo_receipt.undo_token_hash is None
         assert undo_receipt.id != prior_receipt_id
-
-
-def test_email_thread_watch_list_is_scoped_to_current_google_account(
-    session_factory: sessionmaker[Session],
-) -> None:
-    _seed_google_connector(session_factory)
-    _seed_action_attempt(
-        session_factory,
-        action_attempt_id="act_watch_seed",
-        capability_id="cap.email.thread_watch.create",
-        proposed_input={
-            "provider_thread_id": "thr_owner",
-            "anchor_message_id": "msg_owner",
-            "condition": "no_reply_by_deadline",
-            "deadline": "2026-05-08T12:00:00Z",
-            "note": "seed watch",
-            "idempotency_key": "watch-seed",
-        },
-        proposal_index=1,
-    )
-    with session_factory() as db:
-        with db.begin():
-            db.add(
-                TurnRecord(
-                    id="turn_watch_list",
-                    session_id="ses_email",
-                    user_message="list watches",
-                    assistant_message=None,
-                    status="in_progress",
-                    created_at=NOW,
-                    updated_at=NOW,
-                )
-            )
-            for watch_id, account_id, thread_id in [
-                ("etw_owner", PROVIDER_ACCOUNT_ID, "thr_owner"),
-                ("etw_other", "other_google_account", "thr_other"),
-            ]:
-                db.add(
-                    EmailThreadWatchRecord(
-                        id=watch_id,
-                        provider="google",
-                        provider_account_id=account_id,
-                        provider_thread_id=thread_id,
-                        anchor_message_id=f"msg_{watch_id}",
-                        condition="no_reply_by_deadline",
-                        deadline=NOW,
-                        note="watch thread",
-                        status="active",
-                        idempotency_key=f"watch-{watch_id}",
-                        cancel_idempotency_key=None,
-                        created_by_action_attempt_id="act_watch_seed",
-                        matched_message_id=None,
-                        matched_at=None,
-                        canceled_at=None,
-                        completed_at=None,
-                        created_at=NOW,
-                        updated_at=NOW,
-                    )
-                )
-
-    events: list[tuple[str, dict[str, Any]]] = []
-    with session_factory() as db:
-        with db.begin():
-            turn = db.get(TurnRecord, "turn_watch_list")
-            assert turn is not None
-            result = run_function_calls(
-                db=db,
-                session_id="ses_email",
-                turn=turn,
-                function_calls_raw=[
-                    {
-                        "call_id": "call_watch_list",
-                        "capability_id": "cap.email.thread_watch.list",
-                        "input": {},
-                        "influenced_by_untrusted_content": False,
-                    }
-                ],
-                approval_ttl_seconds=300,
-                approval_actor_id="usr_email",
-                add_event=lambda event_type, payload: events.append((event_type, payload)),
-                now_fn=lambda: NOW,
-                new_id_fn=lambda prefix: f"{prefix}_watch_list",
-                runtime_provenance=RuntimeProvenance(status="clean"),
-                allowed_capability_ids=["cap.email.thread_watch.list"],
-            )
-
-    assert len(result.function_call_outputs) == 1
-    payload = json.loads(result.function_call_outputs[0]["output"])
-    assert [watch["watch_id"] for watch in payload["watches"]] == ["etw_owner"]
-
-
-def test_email_thread_watch_cancel_enforces_cancel_idempotency_key(
-    session_factory: sessionmaker[Session],
-) -> None:
-    _seed_google_connector(session_factory)
-    _seed_action_attempt(
-        session_factory,
-        action_attempt_id="act_cancel",
-        capability_id="cap.email.thread_watch.cancel",
-        proposed_input={"watch_id": "etw_cancel", "idempotency_key": "cancel-1"},
-        proposal_index=1,
-    )
-    _seed_action_attempt(
-        session_factory,
-        action_attempt_id="act_cancel_conflict",
-        capability_id="cap.email.thread_watch.cancel",
-        proposed_input={"watch_id": "etw_cancel", "idempotency_key": "cancel-2"},
-        proposal_index=2,
-    )
-    with session_factory() as db:
-        with db.begin():
-            db.add(
-                EmailThreadWatchRecord(
-                    id="etw_cancel",
-                    provider="google",
-                    provider_account_id=PROVIDER_ACCOUNT_ID,
-                    provider_thread_id="thr_cancel",
-                    anchor_message_id="msg_anchor",
-                    condition="no_reply_by_deadline",
-                    deadline=NOW,
-                    note="cancel me",
-                    status="active",
-                    idempotency_key="watch-cancel",
-                    cancel_idempotency_key=None,
-                    created_by_action_attempt_id="act_cancel",
-                    matched_message_id=None,
-                    matched_at=None,
-                    canceled_at=None,
-                    completed_at=None,
-                    created_at=NOW,
-                    updated_at=NOW,
-                )
-            )
-
-    assert process_action_execution_task(
-        session_factory=session_factory,
-        action_attempt_id="act_cancel",
-        google_runtime=None,
-        agency_runtime=None,
-        now_fn=lambda: NOW,
-        new_id_fn=lambda prefix: f"{prefix}_cancel",
-    )
-    assert process_action_execution_task(
-        session_factory=session_factory,
-        action_attempt_id="act_cancel_conflict",
-        google_runtime=None,
-        agency_runtime=None,
-        now_fn=lambda: NOW,
-        new_id_fn=lambda prefix: f"{prefix}_cancel_conflict",
-    )
-
-    with session_factory() as db:
-        watch = db.get(EmailThreadWatchRecord, "etw_cancel")
-        assert watch is not None
-        assert watch.status == "canceled"
-        assert watch.cancel_idempotency_key == _email_idempotency_key(
-            capability_id="cap.email.thread_watch.cancel",
-            provider_account_id=PROVIDER_ACCOUNT_ID,
-            client_key="cancel-1",
-        )
-        conflict = db.get(ActionAttemptRecord, "act_cancel_conflict")
-        assert conflict is not None
-        assert conflict.status == "failed"
-        assert conflict.execution_error == "idempotency_key_input_mismatch"
-
-
-def test_email_thread_watch_cancel_denies_cross_account_watch_id(
-    session_factory: sessionmaker[Session],
-) -> None:
-    _seed_google_connector(session_factory)
-    _seed_action_attempt(
-        session_factory,
-        action_attempt_id="act_cancel_other",
-        capability_id="cap.email.thread_watch.cancel",
-        proposed_input={"watch_id": "etw_other", "idempotency_key": "cancel-other"},
-        proposal_index=1,
-    )
-    with session_factory() as db:
-        with db.begin():
-            db.add(
-                EmailThreadWatchRecord(
-                    id="etw_other",
-                    provider="google",
-                    provider_account_id="other_google_account",
-                    provider_thread_id="thr_other",
-                    anchor_message_id="msg_anchor",
-                    condition="no_reply_by_deadline",
-                    deadline=NOW,
-                    note="not this account",
-                    status="active",
-                    idempotency_key="watch-other",
-                    cancel_idempotency_key=None,
-                    created_by_action_attempt_id="act_cancel_other",
-                    matched_message_id=None,
-                    matched_at=None,
-                    canceled_at=None,
-                    completed_at=None,
-                    created_at=NOW,
-                    updated_at=NOW,
-                )
-            )
-
-    assert process_action_execution_task(
-        session_factory=session_factory,
-        action_attempt_id="act_cancel_other",
-        google_runtime=None,
-        agency_runtime=None,
-        now_fn=lambda: NOW,
-        new_id_fn=lambda prefix: f"{prefix}_cancel_other",
-    )
-
-    with session_factory() as db:
-        action_attempt = db.get(ActionAttemptRecord, "act_cancel_other")
-        watch = db.get(EmailThreadWatchRecord, "etw_other")
-        assert action_attempt is not None
-        assert action_attempt.status == "failed"
-        assert action_attempt.execution_error == "thread_watch_not_found"
-        assert watch is not None
-        assert watch.status == "active"
