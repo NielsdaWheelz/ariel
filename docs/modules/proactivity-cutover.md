@@ -92,20 +92,28 @@ it happens.
 
 ### One scheduler
 
-`background_tasks` is the only queue. Every row is a future agent wake:
-`id`, `run_after`, `payload`, `recurrence`, `attempts`, `created_at`.
+`background_tasks` is the one durable task queue. It is shared infrastructure:
+besides agent wakes it carries the memory rememberer and sweep, durable action
+execution, approval expiry, and agency and provider ingestion tasks. The
+cutover simplifies it; it does not make it proactivity-exclusive.
 
-`payload` is AI-authored prose — the agent's note to its future self, any detail
-it wants, no schema; the same kind of artifact as a memory fact. `run_after` is
-the wake time. `recurrence`, when set, re-enqueues the row after each fire.
-`attempts` bounds retry, so a wake that fails — the model API down at fire time
-— backs off rather than hot-looping or vanishing.
+A row is `id`, `run_after`, `task_type`, `payload`, `recurrence`, `attempts`,
+`created_at`. `task_type` is the discriminator the worker dispatches on. An
+agent wake is a `task_type` `agent_wake` row whose `payload` carries the
+AI-authored note — the agent's message to its future self, no schema, the same
+kind of artifact as a memory fact. `run_after` is the wake time; `recurrence`,
+when set, re-enqueues the row after each fire; `attempts` bounds retry so a
+wake that fails — the model API down at fire time — backs off rather than
+hot-looping or vanishing.
 
-The single-threaded worker takes the earliest due row, invokes the loop, then
-deletes the row (one-shot) or re-enqueues it (recurrence). A row is deleted only
-on success; a crash mid-wake leaves it to retry. Effects that must not repeat
-carry an idempotency key in the capability layer. There is no claim protocol,
-heartbeat, dead-letter, or stale-task reaper.
+The single-threaded worker takes the earliest due row, dispatches by
+`task_type` (`agent_wake` invokes the loop; the surviving non-proactive types
+keep their handlers), then deletes the row (one-shot) or re-enqueues it
+(recurrence). A row is deleted only on success; a crash mid-wake leaves it to
+retry. Effects that must not repeat carry an idempotency key in the capability
+layer. P4 drops the proactivity-specific columns and the
+claim/heartbeat/dead-letter/reaper machinery; at single-worker scale "a row
+exists" is the only pending state needed.
 
 Provider sync and `watch` renewal are recurring maintenance the worker performs
 from connector state. They are plumbing, not agent wakes, and not a second
@@ -172,13 +180,15 @@ the trigger that already exists.
 
 ### P2 — The scheduler
 
-Reshape `background_tasks` to the six-column form; drop the heartbeat,
-dead-letter, stale-task-reaper, and type-specific columns. Rewrite the worker:
-take the earliest due row, invoke the P1 entrypoint with `payload` as
-wake-context, then delete or re-enqueue by `recurrence`, backing off on failure
-within `attempts`. Add the `schedule` syscall and its `cap.proactive.schedule`
-capability. After P2, a due task wakes the agent and the agent can schedule a
-future wake.
+Additive — the old engine keeps running. Lift `_wake` to a module-level
+entrypoint and extract a `build_runtime` helper so the worker can construct the
+runtime and invoke `_wake`. Add the `recurrence` column and the `agent_wake`
+task type to `background_tasks`. Add a worker dispatch arm for `agent_wake`
+that builds a wake-context from the row's `payload` and calls `_wake`, with
+recurrence and `attempts` backoff. Add the `schedule` syscall and its
+`cap.proactive.schedule` capability. After P2 a due `agent_wake` task wakes the
+agent and the agent can schedule a future wake; the proactivity-specific
+columns and the claim/heartbeat machinery still stand and are removed in P4.
 
 ### P3 — Provider ingestion: push and poll
 
@@ -202,6 +212,12 @@ With every trigger routed through the unified entrypoint, delete the old engine:
 - Drop 18 tables: the 8 `proactive_*` tables, `autonomy_scopes`, the 5 `work_*`
   tables, `leave_by_reminders`, `notifications`, `notification_deliveries`, and
   `email_thread_watches`.
+- Reshape `background_tasks`: drop the proactivity-specific columns
+  (`work_follow_up_loop_id/_version/_scheduled_for`) and the proactive task
+  types from the CHECK enum; remove the claim protocol — `status`,
+  `claimed_by`, `last_heartbeat`, `max_attempts`, `error`, the stale-task
+  reaper, and the dead-letter state — leaving `id`, `run_after`, `task_type`,
+  `payload`, `recurrence`, `attempts`, `created_at`.
 - Delete the proactive feedback endpoints, the `cap.email.thread_watch.*`
   capabilities, and the work-commitment API.
 - Audit the capability registry: every high-impact, irreversible, or
@@ -221,11 +237,12 @@ queue and relocate it out of `docs/modules/`. Fix the stale endpoints in
 
 ## Data Model End State
 
-The proactivity-owned schema is one table:
+Proactivity adds no table of its own. Its scheduler is `background_tasks` — the
+existing shared durable queue, simplified:
 
 | Table | Role |
 |---|---|
-| `background_tasks` | The one queue and timer. `id`, `run_after`, `payload`, `recurrence`, `attempts`, `created_at`. |
+| `background_tasks` | The one durable task queue, shared across subsystems. After the cutover: `id`, `run_after`, `task_type`, `payload`, `recurrence`, `attempts`, `created_at`. |
 
 Unchanged and not proactivity-owned: `provider_evidence` and
 `provider_evidence_blocks` (the mail/calendar data substrate), `ai_judgments`
@@ -260,7 +277,9 @@ Dropped (18): `proactive_observations`, `proactive_cases`,
   one shared agent-loop entrypoint.
 - A proactive wake has the same `run` tool and memory as a user turn and may end
   without emitting.
-- `background_tasks` is the only proactivity table, in the six-column form.
+- `background_tasks` keeps one `task_type` discriminator and gains a
+  `recurrence` column; its proactivity-specific columns and the
+  claim/heartbeat/dead-letter machinery are gone.
 - `proactivity.py`, `attention_ranking.py`, `workspace_reasoning.py`, and
   `leave_by.py` are deleted; the 18 tables are dropped.
 - The `run` program has a `schedule` syscall; the agent can set, see, and cancel
