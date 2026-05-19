@@ -50,7 +50,7 @@ from .run_runtime import (
     execute_run_program,
     parse_run_function_call,
 )
-from .sandbox_runtime import SandboxRuntime
+from .sandbox_runtime import RunSandbox
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +220,7 @@ class LoopResult:
 def run_agent_loop(
     cfg: LoopConfig,
     *,
-    sandbox: SandboxRuntime,
+    sandbox: RunSandbox,
     db: Session,
     session_factory: sessionmaker[Session],
     session_id: str,
@@ -241,7 +241,7 @@ def run_agent_loop(
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
     runtime_provenance: RuntimeProvenance | None,
-    google_runtime: GoogleConnectorRuntime,
+    google_runtime: GoogleConnectorRuntime | None,
     execute_google_reads_outside_transaction: bool,
     agency_runtime: AgencyRuntime | None,
     attachment_runtime: AttachmentContentRuntime | None,

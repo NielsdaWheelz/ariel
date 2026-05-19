@@ -383,7 +383,9 @@ class SurfaceEventProviderWriteReceiptReconciledPayloadContract(BaseModel):
 class SurfaceEventAIJudgmentPayloadContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    judgment_type: Literal["memory_recall", "memory_remember", "model_output"]
+    judgment_type: Literal[
+        "memory_recall", "memory_encode", "memory_dream", "model_output", "research"
+    ]
     parse_status: (
         Literal[
             "parsed",

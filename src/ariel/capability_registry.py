@@ -1118,10 +1118,11 @@ def _validate_memory_search_input(
     else:
         return None, "schema_invalid"
     kinds_raw = raw_input.get("kinds")
+    kinds: list[str] | None = None
     if kinds_raw is None:
-        kinds = None
+        pass
     elif isinstance(kinds_raw, list):
-        kinds: list[str] | None = []
+        kinds = []
         for k in kinds_raw:
             if not isinstance(k, str) or k not in _MEMORY_LOG_KINDS:
                 return None, "schema_invalid"

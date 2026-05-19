@@ -47,7 +47,7 @@ if TYPE_CHECKING:
     from .app import ModelAdapter
     from .attachment_content import AttachmentContentRuntime
     from .google_connector import GoogleConnectorRuntime
-    from .sandbox_runtime import SandboxRuntime
+    from .sandbox_runtime import RunSandbox
 
 from .agent_loop import LoopConfig, LoopResult, run_agent_loop
 from .response_contracts import validate_memory_recall_v1
@@ -305,13 +305,14 @@ def edit_note(
     note.updated_at = now
     db.flush()
 
+    note_taint: Literal["clean", "tainted"] = "tainted" if note.taint == "tainted" else "clean"
     append_log_event(
         db,
         kind="note_edit",
         content=content,
         session_id=None,
         turn_id=None,
-        taint=note.taint,
+        taint=note_taint,
         source_ref=note.id,
         settings=settings,
         now=now,
@@ -333,7 +334,7 @@ def delete_note(
     if note is None:
         raise RuntimeError(f"delete_note: note {note_id!r} does not exist")
 
-    taint = note.taint
+    note_taint: Literal["clean", "tainted"] = "tainted" if note.taint == "tainted" else "clean"
     db.delete(note)
     db.flush()
 
@@ -343,7 +344,7 @@ def delete_note(
         content=note_id,
         session_id=None,
         turn_id=None,
-        taint=taint,
+        taint=note_taint,
         source_ref=note_id,
         settings=settings,
         now=now,
@@ -426,16 +427,16 @@ def search_memory(
     if "note" in layers:
         tsquery = func.websearch_to_tsquery("english", query)
         note_stmt = select(MemoryNoteRecord).where(MemoryNoteRecord.search_vector.op("@@")(tsquery))
-        for row in db.scalars(
+        for note_row in db.scalars(
             note_stmt.order_by(MemoryNoteRecord.created_at.desc()).limit(limit)
         ).all():
-            hits[row.id] = {
-                "id": row.id,
+            hits[note_row.id] = {
+                "id": note_row.id,
                 "layer": "note",
                 "kind": None,
-                "created_at": to_rfc3339(row.created_at),
-                "snippet": row.content[:200],
-                "taint": row.taint,
+                "created_at": to_rfc3339(note_row.created_at),
+                "snippet": note_row.content[:200],
+                "taint": note_row.taint,
             }
 
         has_note_embeddings = db.scalar(
@@ -443,20 +444,20 @@ def search_memory(
         )
         if query_embedding is not None and has_note_embeddings is not None:
             distance = MemoryNoteRecord.embedding.cosine_distance(query_embedding)
-            for row in db.scalars(
+            for note_row in db.scalars(
                 select(MemoryNoteRecord)
                 .where(MemoryNoteRecord.embedding.is_not(None))
                 .order_by(distance.asc())
                 .limit(limit)
             ).all():
-                if row.id not in hits:
-                    hits[row.id] = {
-                        "id": row.id,
+                if note_row.id not in hits:
+                    hits[note_row.id] = {
+                        "id": note_row.id,
                         "layer": "note",
                         "kind": None,
-                        "created_at": to_rfc3339(row.created_at),
-                        "snippet": row.content[:200],
-                        "taint": row.taint,
+                        "created_at": to_rfc3339(note_row.created_at),
+                        "snippet": note_row.content[:200],
+                        "taint": note_row.taint,
                     }
 
     return sorted(hits.values(), key=lambda h: h["created_at"], reverse=True)[:limit]
@@ -482,14 +483,14 @@ def _utcnow() -> datetime:
 
 def run_retriever(
     *,
-    sandbox: SandboxRuntime,
+    sandbox: RunSandbox,
     db: Session,
     session_factory: sessionmaker[Session],
     session_id: str,
     turn: TurnRecord,
     settings: AppSettings,
     model_adapter: ModelAdapter,
-    google_runtime: GoogleConnectorRuntime,
+    google_runtime: GoogleConnectorRuntime | None,
     agency_runtime: AgencyRuntime | None,
     attachment_runtime: AttachmentContentRuntime | None,
     query: str,
@@ -612,13 +613,13 @@ def run_retriever(
 def run_rememberer(
     *,
     trigger: Literal["encode", "dream"],
-    sandbox: SandboxRuntime,
+    sandbox: RunSandbox,
     db: Session,
     session_factory: sessionmaker[Session],
     session_id: str | None,
     settings: AppSettings,
     model_adapter: ModelAdapter,
-    google_runtime: GoogleConnectorRuntime,
+    google_runtime: GoogleConnectorRuntime | None,
     agency_runtime: None,
     attachment_runtime: None,
     note: str | None,

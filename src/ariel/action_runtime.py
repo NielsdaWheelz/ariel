@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from ariel.app import ModelAdapter
-    from ariel.sandbox_runtime import SandboxRuntime
+    from ariel.sandbox_runtime import RunSandbox
 
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy import select, text
@@ -624,7 +624,7 @@ def _execute_memory_capability(
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
     settings: AppSettings | None = None,
-    sandbox: SandboxRuntime | None = None,
+    sandbox: RunSandbox | None = None,
     model_adapter: ModelAdapter | None = None,
     google_runtime: GoogleConnectorRuntime | None = None,
     agency_runtime: Any | None = None,
@@ -2679,7 +2679,7 @@ def process_one_call(
     attachment_runtime: AttachmentContentRuntime | None,
     allowed_capability_id_set: set[str],
     settings: AppSettings | None,
-    sandbox: SandboxRuntime | None = None,
+    sandbox: RunSandbox | None = None,
     model_adapter: ModelAdapter | None = None,
 ) -> None:
     function_call_payload = function_call_raw if isinstance(function_call_raw, dict) else {}

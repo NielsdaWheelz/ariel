@@ -44,7 +44,9 @@ class AIJudgmentFailure(RuntimeError):
 def record_ai_judgment(
     db: Session,
     *,
-    judgment_type: Literal["memory_recall", "memory_remember", "model_output"],
+    judgment_type: Literal[
+        "memory_recall", "memory_encode", "memory_dream", "model_output", "research"
+    ],
     source_type: str,
     source_id: str,
     model: str | None,
