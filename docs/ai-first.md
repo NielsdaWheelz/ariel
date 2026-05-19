@@ -133,6 +133,21 @@ candidate facts, injects the profile and digest into context, runs the
 subagents, and writes audit records. No extraction, curation, conflict,
 projection, or review machinery exists. See [modules/memory.md](modules/memory.md).
 
+## Research
+
+Read-only investigation is a third named subagent: the research subagent. The
+main agent dispatches it with the `research.investigate` syscall; it runs the
+same agent loop in a read-only configuration, in one of two mutually exclusive
+modes (web XOR personal), and returns a typed, tainted `research_finding_v1`.
+The main agent owns synthesis; the research subagent owns breadth-first,
+read-heavy, independent investigation whose context is discarded once the
+finding returns.
+
+Deterministic code owns only rails: the `background_tasks` queue, the
+mode-capability whitelists, taint propagation on the finding, and the
+`requires_approval` routing that any tainted-finding-motivated action must pass
+through. See [modules/agent-loop.md](modules/agent-loop.md).
+
 ## Proactivity
 
 Proactive behavior follows the same rule.

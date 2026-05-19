@@ -74,10 +74,10 @@ non-human trigger. One agent-loop entrypoint, `_wake`, serves every trigger; a
 proactive wake is a normal turn with the same `run` tool and the same memory as
 a user message, and may end without emitting.
 
-Four triggers wake the agent: a user message, a provider push event (a Gmail or
+Five triggers wake the agent: a user message, a provider push event (a Gmail or
 Calendar `watch` callback, an Agency job event), a poll result (the periodic
-provider reconcile sync finding new data), and a due scheduled task. A Google
-connector error also enqueues a wake.
+provider reconcile sync finding new data), a due scheduled task, and a research
+run completion. A Google connector error also enqueues a wake.
 
 `background_tasks` is the one durable queue. The single-threaded worker takes
 the earliest due row, dispatches by `task_type`, and deletes the row on success
@@ -380,9 +380,9 @@ grounded provenance contracts:
 - mixed turns containing `web.extract` plus non-retrieval proposals keep retrieval-grounded
   assistant messaging while preserving structured lifecycle inspectability for all proposals.
 
-## slice-8 quick capture surface (`post /v1/captures`)
+## slice-8 quick capture surface (`post /v1/captures/record`)
 
-slice-8 adds first-class quick capture ingress for bounded text, url, and shared-content payloads:
+slice-8 adds first-class quick capture ingress for bounded text, url, and shared-content payloads via `POST /v1/captures/record`. (`/v1/captures` was removed in the agent-loop cutover; only `/v1/captures/record` remains.)
 
 - request shape:
   - `kind="text"` requires `text`
@@ -598,8 +598,9 @@ run Discord in a second shell:
 make run-discord
 ```
 
-run the durable worker in another shell to drain `background_tasks` — scheduled
-agent wakes, provider ingestion, the memory rememberer, and Agency events:
+run the durable worker in another shell to drain `background_tasks` — user
+message turns, scheduled agent wakes, research runs, provider ingestion, the
+memory rememberer, and Agency events:
 
 ```bash
 make run-worker
@@ -623,7 +624,7 @@ connection-string values (`user/password/database/port`) can be any values you w
 
 explicit shell env vars still override `.env.local` when set.
 
-slice-1 turn budgets are runtime-configurable:
+turn and session settings are runtime-configurable:
 
 - `ARIEL_MAX_RECENT_TURNS` (default `12`) bounds how many prior turns are included in the deterministic turn context bundle.
 - `ARIEL_MAX_CONTEXT_TOKENS` (default `6000`) bounds estimated prompt/context tokens for a turn.
@@ -631,14 +632,11 @@ slice-1 turn budgets are runtime-configurable:
 - `ARIEL_AUTO_ROTATE_MAX_AGE_SECONDS` (default `172800`) rotates on turn boundary when session age meets/exceeds threshold.
 - `ARIEL_AUTO_ROTATE_CONTEXT_PRESSURE_TOKENS` (default `5400`) rotates on turn boundary when estimated context pressure meets/exceeds threshold.
 - `ARIEL_MAX_RESPONSE_TOKENS` (default `700`) bounds assistant completion tokens per turn.
-- `ARIEL_MAX_MODEL_ATTEMPTS` (default `2`) bounds retryable model attempts per turn.
-- `ARIEL_MAX_TURN_WALL_TIME_MS` (default `20000`) bounds total turn processing wall time.
+- `ARIEL_MAIN_TURN_BUDGET_SECONDS` — wall-clock budget for a main-agent turn; the model is told its remaining budget each round.
+- `ARIEL_RESEARCH_RUN_BUDGET_SECONDS` — wall-clock budget for a research subagent run.
+- `ARIEL_AGENT_LOOP_MAX_MODEL_CALLS` — paranoid backstop on model calls per loop; not the primary control.
 - `ARIEL_APPROVAL_TTL_SECONDS` (default `900`) sets approval expiry window for approval-gated actions.
 - `ARIEL_APPROVAL_ACTOR_ID` (default `user.local`) sets the expected actor for approval-bound actions.
-
-when a configured turn budget is exhausted, `POST /v1/sessions/{session_id}/message` returns HTTP `429` with
-`E_TURN_LIMIT_REACHED` and structured limit details (`budget`, `unit`, `limit`, `measured`, `applied_limits`).
-turn event chains remain auditable and include explicit bounded-failure emission before terminal `evt.turn.failed`.
 
 if migrations are missing, `/v1/*` endpoints return `E_SCHEMA_NOT_READY` (503) until schema is upgraded.
 

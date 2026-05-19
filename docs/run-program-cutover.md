@@ -122,8 +122,10 @@ These are replacement targets, not compatibility promises.
     output are persisted; approval-required actions are surfaced to the user.
 
 A turn may run several programs: the answer model can run a program, observe its
-emitted values, and run another, within the model-call budget. The sandbox
-boundary is per program execution, not per turn.
+emitted values, and run another, bounded by the wall-clock budget
+(`main_turn_budget_seconds`) and the model-call backstop
+(`agent_loop_max_model_calls`). The sandbox boundary is per program execution,
+not per turn.
 
 ### The `run` Source — a Python Program
 
@@ -266,8 +268,11 @@ runtime, no skills store, and no skill-loading syscall.
 
 ### Proactivity
 
-Proactive deliberation receives no `run` program and no tools. This is unchanged
-from `north-star-cutover.md`.
+A proactive wake receives the same `run` tool and runs the same agent loop as a
+user turn. This is the unified-loop model established by the proactivity
+crystallization (see [modules/proactivity-cutover.md](modules/proactivity-cutover.md))
+and confirmed by the agent-loop cutover. The earlier statement that "proactive
+deliberation receives no `run` program and no tools" is superseded.
 
 ## Key Decisions
 
@@ -468,7 +473,6 @@ The cutover is complete only when all are true:
 - A syscall after a same-turn untrusted read is evaluated with that taint.
 - The terminal subsystem is fully removed; no `terminal.*` syscall or capability
   exists.
-- Proactive deliberation receives no program and no tools.
 - Tests prove the flat-JSON path and the in-process path are absent.
 - Host-side tests run against the mocked sandbox boundary; a real-sandbox suite
   runs under `runsc`.

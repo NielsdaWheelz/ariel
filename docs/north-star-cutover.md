@@ -152,17 +152,19 @@ relevance score. Fields and docs must not imply otherwise.
 
 ### Runtime Flow
 
-Normal user turn:
+Normal user turn (as of the agent-loop cutover — turns are async and
+worker-run; the HTTP ingress enqueues and returns 202):
 
-1. Ingest Discord/API message.
-2. Build bounded context and eligibility facts.
+1. Discord/API message arrives; the ingress endpoint enqueues a
+   `user_message` task on `background_tasks` and returns 202.
+2. The worker takes the task, builds bounded context and eligibility facts.
 3. Build the single strict `run` Responses tool.
 4. Run answer model.
 5. Validate exactly one `run` call and feed back protocol failures.
 6. Execute the run source through internal host operations.
 7. Process internal capability calls through policy, approval, execution, audit, and result
    interpretation.
-8. Produce final Discord/API response.
+8. The worker delivers the emitted message to the user's Discord channel.
 9. Extract memory/procedural candidates as separate audited AI judgments.
 
 Proactive wake:

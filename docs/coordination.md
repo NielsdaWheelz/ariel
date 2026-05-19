@@ -127,7 +127,12 @@ CREATE TABLE background_tasks (
 ```
 
 - **Enqueue**: insert a row. `run_after` is when it becomes due; `task_type` is
-  the discriminator the worker dispatches on.
+  the discriminator the worker dispatches on. Current task types:
+  `agent_wake`, `user_message`, `research_run`, `execute_action_attempt`,
+  `expire_approvals`, `provider_event_received`, `provider_sync_due`,
+  `provider_write_reconcile_due`, `provider_watch_renew_due`,
+  `provider_reconcile_sync_due`, `agency_event_received`, `memory_remember`,
+  `memory_sweep`.
 - **Dequeue**: select the earliest due row ordered by `(run_after, created_at,
   id)`. No `SELECT ... FOR UPDATE SKIP LOCKED` — there is no second worker to
   race.

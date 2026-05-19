@@ -6,6 +6,7 @@ This directory contains docs owned by specific infrastructure modules or feature
 
 ## Docs
 
+- [agent-loop.md](agent-loop.md): agent loop — async worker-run turns, the long adaptive loop, the scratch store, the research subagent, delivery
 - [attachments.md](attachments.md): attachment content hard cutover
 - [google-workspace-reasoning-cutover.md](google-workspace-reasoning-cutover.md): Gmail,
   Calendar, commitment, due-date, and follow-up reasoning hard cutover

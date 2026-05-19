@@ -25,10 +25,10 @@ There is one agent-loop entrypoint, `_wake`, a module-level function in
 assembles memory and eligibility context, runs the answer model with the `run`
 tool, executes the program, and emits any output.
 
-A `WakeContext` carries `trigger_kind` (`user_message` or `scheduled_task`),
-`prompt_text`, `discord_context`, `attachment_sources`, and
-`ingress_provenance`. The trigger kind is the only thing that distinguishes a
-proactive wake from a user turn.
+A `WakeContext` carries `trigger_kind` (`user_message`, `scheduled_task`, or
+`research_completion`), `prompt_text`, `discord_context`, `attachment_sources`,
+and `ingress_provenance`. The trigger kind is the only thing that distinguishes
+a proactive wake from a user turn.
 
 A proactive wake is a normal turn. It receives the same `run` tool and the same
 memory faculties — the retriever and rememberer run as on any turn. A wake may
@@ -37,7 +37,7 @@ Every wake is recorded as a session turn.
 
 ## Triggers
 
-Four triggers wake the agent, all through `_wake`:
+Five triggers wake the agent, all through `_wake`:
 
 - **A user message** — Discord or API.
 - **A provider push event** — a Gmail or Calendar `watch` callback, or an
@@ -46,6 +46,10 @@ Four triggers wake the agent, all through `_wake`:
 - **A poll result** — the periodic provider reconcile sync finds new or changed
   data and enqueues a wake.
 - **A due scheduled task** — an `agent_wake` row whose `run_after` has arrived.
+- **A research completion** — when a `research_run` task finishes, the worker
+  enqueues an `agent_wake` carrying the typed `research_finding_v1`. The main
+  agent wakes with `trigger_kind = research_completion`, reads the finding
+  (carried with tainted provenance), and answers the user.
 
 A Google connector error also enqueues a wake, so the user learns of a broken
 connector. There is no periodic sweep of internal tables for candidates; each
@@ -108,9 +112,14 @@ data each enqueue an `agent_wake`.
 
 ## Delivery
 
-A proactive wake emits to Discord through `agent.emit_message`, exactly like a
-user turn. There is one delivery path. There is no `notifications` table:
-Discord is the record of what was sent, and every wake is a session turn.
+Every turn — user reply, proactive wake, research completion — is delivered by
+the same worker-side path. After a turn commits, the worker posts the emitted
+message to the user's Discord channel over the Discord REST API
+(`discord_channel_id`, `discord_bot_token`,
+`discord_notification_timeout_seconds`). A wake that originates from a Discord
+message posts as a reply to it; a wake without one posts to the default channel.
+A wake that ends without emitting is not delivered. There is no `notifications`
+table: Discord is the record of what was sent, and every wake is a session turn.
 
 ## Autonomous action
 
@@ -135,12 +144,14 @@ denies; it cannot act irreversibly on its own.
   no table of its own beyond `provider_watch_channels`.
 - The worker takes the earliest due row and deletes it on success. There is no
   claim protocol, heartbeat, dead-letter state, or reaper.
-- The agent's only scheduling surface is `proactive.schedule`. No other code
-  path writes `agent_wake` rows on the agent's behalf.
+- The agent's scheduling surface is `proactive.schedule`. The one other code
+  path that writes `agent_wake` rows is the research-run completion handler,
+  which enqueues the finding wake on behalf of the system — not the agent.
 - Recurrence is the agent re-scheduling itself; the syscall takes a one-shot
   timestamp.
-- Delivery is one code path, `agent.emit_message`. There is no `notifications`
-  table and no proactivity-specific delivery, audit, or feedback table.
+- Delivery is one code path: the worker posts the emitted message to Discord
+  after the turn commits. There is no `notifications` table and no
+  proactivity-specific delivery, audit, or feedback table.
 - Per-capability `requires_approval` is the autonomous-action boundary. There
   is no `autonomy_scopes` table or standing-grant system.
 - Commitment tracking, work follow-ups, leave-by, and email thread-watching are

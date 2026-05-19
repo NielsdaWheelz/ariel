@@ -36,6 +36,9 @@ This directory is the canonical home for repository documentation.
 - [run-program-cutover.md](run-program-cutover.md): hard cutover from the
   flat-JSON `run` call list to a sandboxed Python `run` program with typed
   syscall host functions
+- [agent-loop-cutover.md](agent-loop-cutover.md): hard cutover — async
+  worker-run turns, the long adaptive loop, the scratch store, and the research
+  subagent
 - [simplicity.md](simplicity.md): fewer code paths, no speculative surface
 - [function-parameters.md](function-parameters.md): parameter conventions
 - [control-flow.md](control-flow.md): exhaustive branching and race-safety
