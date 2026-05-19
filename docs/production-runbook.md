@@ -177,10 +177,7 @@ Required worker settings:
 
 ```sh
 ARIEL_WORKER_POLL_SECONDS=1.0
-ARIEL_WORKER_HEARTBEAT_TIMEOUT_SECONDS=300
-ARIEL_PROACTIVE_AMBIENT_INTERVAL_SECONDS=60
-ARIEL_PROACTIVE_WORKER_MAX_ATTEMPTS=5
-ARIEL_PROACTIVE_DELIBERATION_TOOL_ROUNDS=2
+ARIEL_PROVIDER_RECONCILE_SYNC_INTERVAL_SECONDS=3600
 ```
 
 Required provider callback settings when Google provider ingress is enabled:
@@ -189,23 +186,22 @@ Required provider callback settings when Google provider ingress is enabled:
 ARIEL_GOOGLE_PROVIDER_EVENT_TOKEN=<shared-google-callback-token>
 ```
 
-The same `ariel-worker` service owns provider event sync, ambient interpretation,
-model and subagent deliberation, policy validation, proactive turn delivery,
-autonomous action execution, AI feedback learning, follow-ups, approval expiry,
-Agency event ingestion, and Discord notification delivery. There is no separate
-scheduler process. The worker orchestrates AI judgment while deterministic code
-enforces validation, replay, idempotency, policy, audit, and recovery. Ambient
-interpretation is worker-owned and runs on
-`ARIEL_PROACTIVE_AMBIENT_INTERVAL_SECONDS` or source-event tasks. No public replay
-route owns normal sensing. `ARIEL_PROACTIVE_DELIBERATION_TOOL_ROUNDS` is retained
-only as a denial-round limit when the model emits unadvertised function calls.
-The proactive model is not given tools; it must return a structured decision or
-fail closed.
+The single-threaded `ariel-worker` service drains the one `background_tasks`
+queue: scheduled agent wakes, provider push and poll ingestion, the memory
+rememberer and sweep, durable action execution, approval expiry, and Agency
+event ingestion. There is no separate scheduler process. The worker takes the
+earliest due row, dispatches by `task_type`, and on success deletes the row or
+re-arms it when it recurs; a failed task backs off within its `attempts` budget
+(cap 5). There is no claim protocol, heartbeat, dead-letter state, or stale-task
+reaper — a row existing and due is the only pending state.
 
-Configured ambient source families are workspace item events, Google connector
-health, captures, jobs, approval requests, and reviewed memory assertions.
-Location/travel, local or browser activity, repository, CI, and incident streams
-are absent in this deployment.
+Proactivity is not a separate engine. A provider push, a poll result that finds
+new data, a due scheduled task, and a Google connector error each enqueue an
+`agent_wake` row; the worker dispatches it to the same agent loop that serves a
+user message. `ARIEL_PROVIDER_RECONCILE_SYNC_INTERVAL_SECONDS` (default 3600)
+sets the reconcile-poll cadence, the push-independent baseline. The worker
+re-arms each Gmail and Calendar `watch` before it expires. See
+[modules/proactivity.md](modules/proactivity.md).
 
 Set provider keys only for enabled capabilities:
 
@@ -224,20 +220,18 @@ Restrict `ARIEL_MAPS_API_KEY` in the Google Cloud console to the Routes API, Pla
 (New), and Geocoding API, and to this deployment's egress IP address. An unrestricted Maps
 key is a direct billing liability if it leaks.
 
-Optional leave-by reminder settings:
+Optional home-address setting:
 
 ```sh
 ARIEL_HOME_ADDRESS=<street address>
-ARIEL_LEAVE_BY_SCAN_INTERVAL_SECONDS=1800.0
 ```
 
-The leave-by subsystem watches the calendar for upcoming located events and sends a
-traffic-aware "leave by HH:MM" Discord notification near departure. The worker scans
-every `ARIEL_LEAVE_BY_SCAN_INTERVAL_SECONDS` (default 1800). `ARIEL_HOME_ADDRESS` is
-the trip origin when no preceding located calendar event resolves one; with it unset,
-leave-by-from-home trips are skipped. The subsystem is inert unless `ARIEL_MAPS_API_KEY`
-is set and the Google connector is connected with the calendar read scope — with either
-absent, the scan opens no reminders. See [modules/leave-by.md](modules/leave-by.md).
+`ARIEL_HOME_ADDRESS` is an optional maps origin fallback used when no preceding
+located calendar event resolves a trip origin; with it unset, those trips are
+skipped. There is no leave-by subsystem: a "leave by HH:MM" reminder is now an
+ordinary agent behavior — the agent uses calendar access, the maps capability,
+and `proactive.schedule` on a normal wake. See
+[modules/proactivity.md](modules/proactivity.md).
 
 ## Services
 
@@ -310,36 +304,24 @@ make verify
 
 ## Health Checks
 
-Inspect proactive state through the typed API:
+Inspect provider ingestion and the durable timeline through the typed API:
 
 ```sh
 export ARIEL_LOCAL_AUTH_TOKEN=<local-api-token>
-curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" http://127.0.0.1:8000/v1/connectors/google/subscriptions
+curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" http://127.0.0.1:8000/v1/connectors/google
 curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" http://127.0.0.1:8000/v1/connectors/google/sync-cursors
 curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" http://127.0.0.1:8000/v1/provider-events
 curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" http://127.0.0.1:8000/v1/sync-runs
-curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" http://127.0.0.1:8000/v1/workspace-items
-curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" http://127.0.0.1:8000/v1/proactive/observations
-curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" http://127.0.0.1:8000/v1/proactive/cases
-curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" http://127.0.0.1:8000/v1/proactive/turns
-curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" http://127.0.0.1:8000/v1/proactive/autonomy-scopes
-curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" http://127.0.0.1:8000/v1/proactive/learning-records
+curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" http://127.0.0.1:8000/v1/discord-messages
 ```
 
-Inspect one proactive case end to end:
+A proactive wake leaves no proactive-specific record: it is a session turn like
+any other. Inspect a wake's output and the messages it sent through the normal
+session and timeline routes (`/v1/sessions/{session_id}/events`); a scheduled
+wake is an `agent_wake` row on `background_tasks` until it fires.
 
-```sh
-case_id=<case-id>
-curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" "http://127.0.0.1:8000/v1/proactive/cases/${case_id}"
-curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" "http://127.0.0.1:8000/v1/proactive/cases/${case_id}/events"
-curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" "http://127.0.0.1:8000/v1/proactive/cases/${case_id}/context-snapshots"
-curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" "http://127.0.0.1:8000/v1/proactive/cases/${case_id}/decisions"
-curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" "http://127.0.0.1:8000/v1/proactive/cases/${case_id}/validations"
-curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" "http://127.0.0.1:8000/v1/proactive/cases/${case_id}/actions"
-```
-
-Force sync when replaying or diagnosing a specific source. Provider ingestion
-queues ambient interpretation for each durable source event.
+Force sync when replaying or diagnosing a specific source. A sync that finds new
+data enqueues an `agent_wake` row.
 
 ```sh
 curl -X POST -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" 'http://127.0.0.1:8000/v1/connectors/google/sync?resource_type=calendar&resource_id=primary'
@@ -439,13 +421,15 @@ OpenAI:
 - Confirm Responses calls use `store: false`.
 - Do not persist raw reasoning items during incident capture.
 
-Proactive worker:
+Worker:
 
-- Confirm `ariel-worker` is running before treating ambient sensing as healthy.
-- `failed` proactive tasks with attempts remaining are recovered to `pending` by the
-  worker and retried under their existing `max_attempts` budget.
-- Use `dead_letter` only when the retry budget is exhausted or an operator intentionally
-  stops a task.
+- Confirm `ariel-worker` is running before treating provider ingestion and
+  scheduled wakes as healthy.
+- A failed `background_tasks` row stays in place with `attempts` incremented and
+  `run_after` pushed out for backoff; the worker retries it on a later pass.
+- On `attempts` exhaustion (cap 5) a one-shot row is deleted and a recurring row
+  is re-armed to its next occurrence. There is no dead-letter state and no
+  reaper; an operator stops a task by deleting its row.
 
 ## Acceptance Criteria
 

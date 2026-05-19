@@ -17,6 +17,7 @@ This directory is the canonical home for repository documentation.
 - [correctness.md](correctness.md): abnormality classification and system invariants
 - [operation-types.md](operation-types.md): operation complexity, idempotency, and transaction boundaries
 - [concurrency.md](concurrency.md): linearization and concurrent execution
+- [coordination.md](coordination.md): PostgreSQL-native coordination — advisory locks, idempotency, and the background-task queue
 - [mutation-ordering.md](mutation-ordering.md): ordering mutations across systems and module boundaries
 
 ### Data and types

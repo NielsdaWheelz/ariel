@@ -28,10 +28,9 @@ AI owns judgment-shaped work:
 - deciding which memories are relevant
 - deciding whether something is worth remembering
 - deciding which tools or sources to inspect
-- interpreting provider events and ambient observations
+- deciding what a non-human trigger means and whether it warrants acting
 - synthesizing final user-facing text
 - compacting context and continuity
-- interpreting feedback into future behavior
 - choosing whether to ask, wait, ignore, speak, remember, or act
 - proposing exact action plans inside available authority
 
@@ -47,7 +46,7 @@ Deterministic code owns rails:
 - parsing values whose malformedness is locally knowable
 - authentication and authorization
 - policy, taint, provenance, and trust boundaries
-- autonomy scopes and hard safety blocks
+- capability approval gating and hard safety blocks
 - idempotency, dedupe, replay, and recovery
 - transactions, locks, migrations, and persistence
 - egress allowlists and side-effect boundaries
@@ -72,9 +71,6 @@ Subagents are used for:
 - run-source choice and evidence source selection
 - tool-result interpretation
 - final answer synthesis from evidence
-- ambient event interpretation
-- proactive case deliberation
-- feedback learning
 - context compaction and continuity summaries
 
 The master assistant sees subagent outputs, provenance, confidence, omissions,
@@ -141,10 +137,18 @@ projection, or review machinery exists. See [modules/memory.md](modules/memory.m
 
 Proactive behavior follows the same rule.
 
-Ambient observers produce observations. The model decides whether an observation
-matters, whether to inspect more context, whether to interrupt, whether to wait,
-whether to remember, and whether to act. Policy validation remains the side-effect
-authorization boundary.
+Proactivity is not a subsystem. It is the main agent loop reached by non-human
+triggers — a provider push, a poll result, a due scheduled task — plus one
+durable scheduler. Every trigger wakes the same agent loop that serves a user
+message, with the same memory and the same `run` tool.
+
+The model decides, on every wake, whether the event matters, whether to inspect
+more context, whether to interrupt, whether to wait, whether to remember,
+whether to act, and when to look again. A wake may end without emitting.
+Deterministic code owns only rails: the durable queue, ingress normalization,
+provider auth, capability policy, approval, and delivery. Per-capability
+`requires_approval` policy remains the side-effect authorization boundary. See
+[modules/proactivity.md](modules/proactivity.md).
 
 ## Testing
 

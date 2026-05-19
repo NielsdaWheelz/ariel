@@ -174,6 +174,57 @@ def test_old_proactive_api_and_client_routes_are_absent(route: str) -> None:
     _assert_absent(route, "src/ariel")
 
 
+# Surfaces the proactivity crystallization deleted. They legitimately survive in
+# the cutover *records* (``proactivity-cutover.md`` describes what it removes),
+# so this guards only the standing product docs, not ``docs/modules`` wholesale.
+LEGACY_PROACTIVE_DOC_SURFACE_PATHS = (
+    "README.md",
+    "docs/ai-first.md",
+    "docs/north-star-cutover.md",
+    "docs/production-runbook.md",
+    "docs/modules/proactivity.md",
+    "docs/modules/memory.md",
+)
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        # Deleted proactive HTTP surface.
+        "/v1/proactive/",
+        "/v1/proactive/observations",
+        "/v1/proactive/cases",
+        "/v1/proactive/turns",
+        "/v1/proactive/autonomy-scopes",
+        "/v1/proactive/learning-records",
+        # Deleted ambient/case pipeline vocabulary.
+        "ambient interpretation",
+        "proactive deliberation",
+        "proactive case",
+        "ambient observation",
+        "proactive observation",
+        # Deleted tables and standing-grant surface. The standing docs refer to
+        # the dropped autonomy table only as ``autonomy_scopes``, in negations;
+        # the prose form below catches a reintroduction without tripping that.
+        "autonomy scope",
+        "leave_by_reminders",
+        "notification_deliveries",
+        "email_thread_watches",
+        # Deleted simplified-queue machinery. ``dead-letter`` (hyphen) appears
+        # in negations describing the queue's absence of it; the identifier form
+        # below is what a regression would reintroduce.
+        "dead_letter",
+    ],
+)
+def test_standing_docs_do_not_describe_the_deleted_proactive_pipeline(
+    pattern: str,
+) -> None:
+    """The proactivity crystallization replaced the ambient/case pipeline with
+    one unified agent loop and simplified ``background_tasks``. The standing
+    product docs must describe only that end state."""
+    _assert_absent_except_this_test(pattern, *LEGACY_PROACTIVE_DOC_SURFACE_PATHS)
+
+
 @pytest.mark.parametrize(
     "pattern",
     [

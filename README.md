@@ -67,59 +67,39 @@ audited pause and sends no visible assistant text.
 `/ariel` and `/ask` are gone. `/status`, `/jobs`, and `/capture` are
 deterministic operational commands only and do not route free-form prompts to the model.
 
-## proactive AI deliberation
+## proactivity
 
-The durable worker owns provider event sync, ambient interpretation, model deliberation,
-policy validation, proactive turn delivery, autonomous action execution, feedback
-learning, and follow-ups. It queues `ambient_interpretation_due` on
-`ARIEL_PROACTIVE_AMBIENT_INTERVAL_SECONDS`. Provider deltas, Discord ambient workspace
-events, and internal state create durable source records; AI ambient interpretation
-selects which records become proactive observations. Observations open or update cases;
-cases assemble context and ask the model whether to ignore, remember, wait, speak, ask,
-act, or speak and act.
+Proactivity is not a separate engine — it is the main agent loop reached by a
+non-human trigger. One agent-loop entrypoint, `_wake`, serves every trigger; a
+proactive wake is a normal turn with the same `run` tool and the same memory as
+a user message, and may end without emitting.
 
-Configured ambient source families are workspace item events, Google connector health,
-captures, jobs, approval requests, and memory writes. Location/travel,
-local or browser activity, repository, CI, and incident streams are absent until each is
-implemented end to end.
+Four triggers wake the agent: a user message, a provider push event (a Gmail or
+Calendar `watch` callback, an Agency job event), a poll result (the periodic
+provider reconcile sync finding new data), and a due scheduled task. A Google
+connector error also enqueues a wake.
 
-Discord renders proactive turns and correction controls. It does not decide whether
-Ariel should speak or act. Autonomous actions require an active autonomy scope and
-record policy validation plus execution receipts.
+`background_tasks` is the one durable queue. The single-threaded worker takes
+the earliest due row, dispatches by `task_type`, and deletes the row on success
+or re-arms it when it recurs; there is no claim protocol, dead-letter state, or
+reaper. A scheduled wake is a `task_type='agent_wake'` row carrying the
+AI-authored note. The agent's whole scheduling surface is one syscall,
+`proactive.schedule(when, note)`, which writes one `agent_wake` row.
 
-Worker task names:
+A proactive wake delivers to Discord through `agent.emit_message`, exactly like
+a user turn — there is no `notifications` table. Autonomous action is gated by
+per-capability `requires_approval` policy, not an autonomy-scope table.
 
-- `ambient_interpretation_due`
-- `proactive_deliberation_due`
-- `proactive_follow_up_due`
-- `proactive_feedback_learning_due`
-- `proactive_action_execution_due`
-- `deliver_discord_notification`
+Provider ingestion routes:
 
-Core inspection and mutation routes:
-
-- `POST /v1/providers/google/events`
-- `GET /v1/connectors/google/subscriptions`
+- `POST /v1/providers/google/events` — the Gmail/Calendar push callback
 - `GET /v1/connectors/google/sync-cursors`
 - `POST /v1/connectors/google/sync`
 - `GET /v1/provider-events`
 - `GET /v1/sync-runs`
-- `GET /v1/workspace-items`
-- `GET /v1/proactive/observations`
-- `GET /v1/proactive/cases`
-- `GET /v1/proactive/cases/{case_id}`
-- `GET /v1/proactive/cases/{case_id}/events`
-- `GET /v1/proactive/cases/{case_id}/context-snapshots`
-- `GET /v1/proactive/cases/{case_id}/decisions`
-- `GET /v1/proactive/cases/{case_id}/validations`
-- `GET /v1/proactive/cases/{case_id}/actions`
-- `POST /v1/proactive/cases/{case_id}/deliberate`
-- `POST /v1/proactive/cases/{case_id}/ack|correct|stop-pattern|more-aggressive|feedback`
-- `GET /v1/proactive/turns`
-- `GET /v1/proactive/autonomy-scopes`
-- `POST /v1/proactive/autonomy-scopes`
-- `DELETE /v1/proactive/autonomy-scopes/{scope_id}`
-- `GET /v1/proactive/learning-records`
+- `GET /v1/discord-messages`
+
+See `docs/modules/proactivity.md` for the full model.
 
 ## verification gates
 
@@ -618,19 +598,22 @@ run Discord in a second shell:
 make run-discord
 ```
 
-run the durable worker in another shell when Agency events or notifications are enabled:
+run the durable worker in another shell to drain `background_tasks` — scheduled
+agent wakes, provider ingestion, the memory rememberer, and Agency events:
 
 ```bash
 make run-worker
 ```
 
-proactive worker settings:
+worker settings:
 
-- `ARIEL_PROACTIVE_AMBIENT_INTERVAL_SECONDS` (default `60`) controls how often the worker queues ambient interpretation.
-- `ARIEL_PROACTIVE_WORKER_MAX_ATTEMPTS` (default `5`) is the retry budget for worker-owned ambient and provider-renewal follow-up tasks.
-- `ARIEL_PROACTIVE_DELIBERATION_TOOL_ROUNDS` (default `2`) bounds denial
-  rounds when proactive deliberation emits unadvertised function calls. The
-  proactive model is not given tools.
+- `ARIEL_WORKER_POLL_SECONDS` (default `1.0`) is the idle poll interval when no
+  `background_tasks` row is due.
+- `ARIEL_PROVIDER_RECONCILE_SYNC_INTERVAL_SECONDS` (default `3600`) sets the
+  reconcile-poll cadence, the push-independent provider-sync baseline.
+
+A failed task backs off within an `attempts` budget (cap 5); there is no claim
+protocol, dead-letter state, or reaper.
 
 connection-string values (`user/password/database/port`) can be any values you want, as long as:
 

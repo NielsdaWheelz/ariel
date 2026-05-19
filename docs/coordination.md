@@ -106,74 +106,66 @@ if account.provision_status == "pending":
 
 ### Task Queue Pattern
 
-Use a PostgreSQL-backed task queue (or arq/Celery) for work that must survive process restarts.
-
-- Enqueue: insert a row into a tasks table.
-- Dequeue: `SELECT ... FOR UPDATE SKIP LOCKED` to claim work without blocking.
-- Completion: update status to `completed` and commit.
-- Failure: update status to `failed` with error details.
+`background_tasks` is the one durable task queue for work that must survive
+process restarts. A single-threaded worker drains it. Because there is exactly
+one worker, the queue carries no claim protocol: a row existing and due is the
+only pending state.
 
 ```sql
 CREATE TABLE background_tasks (
-    id          TEXT PRIMARY KEY,  -- prefixed ULID
-    task_type   TEXT NOT NULL,
-    payload     JSONB NOT NULL,
-    status      TEXT NOT NULL DEFAULT 'pending',
-    attempts    INT NOT NULL DEFAULT 0,
-    max_retries INT NOT NULL DEFAULT 3,
-    error       TEXT,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    run_after   TIMESTAMPTZ NOT NULL DEFAULT now()
+    id                        TEXT PRIMARY KEY,  -- prefixed ULID
+    task_type                 TEXT NOT NULL,
+    idempotency_key           TEXT,
+    provider_write_receipt_id TEXT,
+    payload                   JSONB NOT NULL,
+    attempts                  INT NOT NULL DEFAULT 0,
+    recurrence_seconds        INT,
+    run_after                 TIMESTAMPTZ NOT NULL,
+    created_at                TIMESTAMPTZ NOT NULL,
+    updated_at                TIMESTAMPTZ NOT NULL
 );
 ```
 
-Claim work:
+- **Enqueue**: insert a row. `run_after` is when it becomes due; `task_type` is
+  the discriminator the worker dispatches on.
+- **Dequeue**: select the earliest due row ordered by `(run_after, created_at,
+  id)`. No `SELECT ... FOR UPDATE SKIP LOCKED` — there is no second worker to
+  race.
+- **Success**: a one-shot row is deleted; a recurring row (`recurrence_seconds`
+  set) is re-armed in place to `now + recurrence_seconds` with `attempts` reset.
+- **Failure**: the row is left in place with `attempts` incremented and
+  `run_after` pushed out for backoff.
 
 ```python
-async with session.begin():
-    task = (await session.execute(
-        select(BackgroundTask)
-        .where(BackgroundTask.status == "pending", BackgroundTask.run_after <= func.now())
-        .order_by(BackgroundTask.created_at)
-        .limit(1)
-        .with_for_update(skip_locked=True)
-    )).scalar_one_or_none()
-
-    if task:
-        task.status = "running"
-        task.attempts += 1
-```
-
-## Dead Letter / Retry
-
-- Tasks that exceed `max_retries` move to `dead_letter` status.
-- Dead letters are operational containment and debugging, not application control flow.
-- Log the error, payload, and attempt history for diagnosis.
-- Dead letters can be retried manually (update status back to `pending`).
-- Use exponential backoff for retries: `run_after = now() + interval * 2^attempts`.
-- Prune completed and expired dead-letter rows on a schedule.
-
-## Liveness Detection
-
-For long-running tasks, use a heartbeat column:
-
-- The worker updates `last_heartbeat` periodically.
-- A reaper process marks tasks as `failed` if `last_heartbeat` exceeds a threshold.
-- This prevents stuck tasks from blocking the queue.
-
-```python
-# Worker heartbeat
-task.last_heartbeat = func.now()
-await session.commit()
-
-# Reaper query
-await session.execute(
-    update(BackgroundTask)
-    .where(
-        BackgroundTask.status == "running",
-        BackgroundTask.last_heartbeat < func.now() - text("INTERVAL '5 minutes'"),
+task = db.scalar(
+    select(BackgroundTask)
+    .where(BackgroundTask.run_after <= now)
+    .order_by(
+        BackgroundTask.run_after.asc(),
+        BackgroundTask.created_at.asc(),
+        BackgroundTask.id.asc(),
     )
-    .values(status="pending", error="heartbeat timeout")
+    .limit(1)
 )
 ```
+
+There is no `status` column, no claim, no `dead_letter` state, and no row
+lifecycle beyond "exists" and "deleted". A row is deleted only on success, so a
+crash mid-task leaves the row to be retried on the next pass.
+
+### Retry
+
+- A failed task increments `attempts` and is retried after exponential backoff:
+  `run_after = now + min(300, 2 ** (attempts - 1))` seconds.
+- `attempts` is capped (currently 5). On exhaustion a one-shot task is abandoned
+  (the row is deleted) and a recurring task is re-armed to its next occurrence.
+- There is no dead-letter table. An effect that must not repeat carries an
+  idempotency key in the capability layer, not a queue-level lifecycle.
+
+### Liveness
+
+There is no heartbeat column and no reaper. With a single-threaded worker and
+no claim protocol, a task cannot be "stuck running" in another process: the
+worker either completes a task and removes or re-arms its row, or crashes and
+leaves the row due for the next pass. Liveness is the worker process being up,
+supervised by systemd.

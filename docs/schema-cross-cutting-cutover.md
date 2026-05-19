@@ -48,7 +48,7 @@ suite to green, and tests the migration up and down.
 PostgreSQL `SELECT … FOR UPDATE SKIP LOCKED` durable work queue — built twice
 with renamed columns and a duplicated reaper. Both carry `attempts`, a retry
 cap, `error`, `claimed_by`, `run_after`, `last_heartbeat`, and the identical
-`pending/running/completed/failed/dead_letter` lifecycle. `docs/modules/coordination.md`
+`pending/running/completed/failed/dead_letter` lifecycle. `docs/coordination.md`
 documents exactly one queue pattern, named `background_tasks`. `jobs` is **not**
 a queue (it mirrors external Agency state, has no claim columns) — it stays
 separate.

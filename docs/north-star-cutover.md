@@ -45,7 +45,7 @@ The Discord product presents user actions in plain language:
 - archive, label, trash, or undo email changes
 - create a calendar event
 - remember a preference or procedure
-- acknowledge or give feedback on proactive behavior
+- reply to a message Ariel sent on its own initiative
 
 Discord never exposes internal capability IDs such as `cap.email.send` in normal
 copy. Capability IDs remain visible only in API payloads, logs, audit records,
@@ -66,8 +66,8 @@ operations. Internal capability calls still pass through policy, approval,
 idempotency, audit, and receipts before execution.
 
 Deterministic code may filter eligibility by hard facts: connector availability,
-attachment presence, policy, runtime binding, source surface, proactive case
-type, trust boundary, and environment configuration. Deterministic code must not
+attachment presence, policy, runtime binding, source surface, trigger kind,
+trust boundary, and environment configuration. Deterministic code must not
 perform semantic intent classification to choose tools or direct work.
 
 ### Coding Work
@@ -98,7 +98,7 @@ structured tools only where their boundary is justified.
 Justified structured tools include:
 
 - OAuth-backed Google reads and writes
-- email send, archive, trash, label mutation, undo, draft, and thread watch
+- email send, archive, trash, label mutation, undo, and draft
 - calendar event creation
 - Drive sharing
 - Discord attachment reading and extraction
@@ -113,27 +113,31 @@ environment or a skill.
 
 ### Proactivity
 
-Proactive deliberation gets no model tools until a concrete source-scoped need
-earns one.
+Proactivity is the main agent loop reached by a non-human trigger, not a
+separate cognition path. A proactive wake is a normal turn: it receives the
+same single `run` tool and the same memory as a user message.
 
 Rules:
 
-- Read-only is necessary but not sufficient.
-- Most proactive cases get no tools.
-- Any future proactive read tool must be source-scoped and justified by a current
-  case, not added speculatively.
-- Unadvertised proactive function calls are denied and audited.
-- Proactivity never receives shell-like authority.
-- Proactive writes must pass autonomy scope validation and action policy.
+- Every trigger — a user message, a provider push, a poll result, a due
+  scheduled task — invokes one shared agent-loop entrypoint.
+- A proactive wake writes a `run` program like any turn; it does not get a
+  bespoke decision contract.
+- Proactivity never receives shell-like authority beyond what `run` already
+  rails.
+- A proactive wake's writes pass the same per-capability `requires_approval`
+  policy as a user turn's; there is no separate autonomy-scope check.
+- A proactive wake delivers through `agent.emit_message`, the same path a user
+  turn uses. There is no duplicate `remember` surface and no bespoke
+  `send_discord_message` action path outside the capability system.
 
-Proactive model contracts use one shape for memory updates and one shape for
-actions. There is no duplicate `remember` surface and no bespoke
-`send_discord_message` action path outside the capability/action system.
+See [modules/proactivity.md](modules/proactivity.md).
 
 ### Memory And Skills
 
-Memory relevance, extraction, continuity, feedback learning, and procedure
-selection are AI judgments.
+Memory relevance, extraction, continuity, and procedure selection are AI
+judgments. A correction to proactive behavior is an ordinary memory write, not
+a feedback-learning subsystem.
 
 Repeated workflows become reviewed procedural memory or skills. New structured
 tools are forbidden for workflow knowledge alone.
@@ -161,15 +165,17 @@ Normal user turn:
 8. Produce final Discord/API response.
 9. Extract memory/procedural candidates as separate audited AI judgments.
 
-Proactive case:
+Proactive wake:
 
-1. Ingest ambient observation.
-2. Build case and context snapshot.
-3. Run deliberation model with no tools.
-4. Validate decision shape.
-5. Apply memory, notify, wait, observe, or propose action.
-6. Validate action against autonomy scope and policy.
-7. Queue side effects and feedback loops.
+1. A non-human trigger fires — a provider push, a poll result, or a due
+   scheduled task — and enqueues a wake.
+2. The worker dispatches the `agent_wake` row to the shared agent-loop
+   entrypoint.
+3. The entrypoint runs the normal turn: bounded context, the single `run`
+   tool, the answer model, program execution.
+4. Internal capability calls pass through policy, approval, execution, and
+   audit, exactly as on a user turn.
+5. The wake emits through `agent.emit_message`, or ends without emitting.
 
 Agency coding job:
 
@@ -191,16 +197,17 @@ Current module ownership:
 
 - `src/ariel/capability_registry.py`: internal capability contracts, schemas, and
   callable metadata.
-- `src/ariel/app.py`: FastAPI composition, local auth, and normal turn
-  orchestration.
+- `src/ariel/app.py`: FastAPI composition, local auth, and the `_wake`
+  agent-loop entrypoint that serves every trigger.
 - `src/ariel/action_runtime.py`: proposal intake, policy, approval lifecycle,
   execution orchestration, and side-effect receipts.
 - `src/ariel/agency_daemon.py`: Agency daemon client, sandbox policy persistence,
   and PR request handling.
-- `src/ariel/proactivity.py`: ambient interpretation, no-tool deliberation,
-  action validation, and feedback learning.
-- `src/ariel/memory.py`: evidence lifecycle, AI curation, candidate memory, and
-  procedure promotion.
+- `src/ariel/worker.py`: the single-threaded `background_tasks` worker —
+  scheduled-wake dispatch, provider push/poll ingestion, and shared background
+  tasks.
+- `src/ariel/memory.py`: the fact store, the profile and digest documents, and
+  the retriever and rememberer subagents.
 - `src/ariel/discord_bot.py`: Discord presentation and deterministic operator
   commands.
 
@@ -235,7 +242,6 @@ Normal answer turns expose only `run`. Internal callable eligibility excludes:
 - provider-unbound capabilities
 - capabilities blocked by current policy
 - capabilities whose required source artifact is absent
-- proactive-disallowed writes
 - Agency capabilities when no Agency repo root/runtime is configured
 
 Test-only capabilities must never be callable from `run`.
@@ -317,15 +323,15 @@ routing layers to make this checklist look tidy.
 - The answer model must call `run` exactly once.
 - Plain assistant text is protocol feedback only, not user-visible output.
 - Runtime execution denies unadvertised internal function calls before action attempts exist.
-- Proactive deliberation receives no tools; unadvertised calls are denied and
-  audited.
+- A proactive wake runs the normal `run` turn; it has no separate tool surface
+  or decision contract.
 - Google capabilities execute only through the Google runtime, never local stubs.
 - Agency PR land/sync uses durable provider-write receipts and daemon
   idempotency request IDs.
 - Local authority routes require bearer auth outside provider-owned callbacks.
 - Discord copy uses user-facing action labels.
 - Tests cover absence of broad model tool exposure, local auth, Agency policy
-  metadata, proactive tool denial, and strict run protocol validation.
+  metadata, the unified proactive wake path, and strict run protocol validation.
 
 ## Acceptance Criteria
 
@@ -339,7 +345,8 @@ The cutover is complete only when all of these are true:
 - The selected-tool strategy pass is absent from normal turns.
 - User-visible output goes through `agent.emit_message`.
 - Deterministic filtering is limited to hard eligibility rails.
-- Proactive deliberation has no model tools.
+- A proactive wake reaches the same `_wake` entrypoint and `run` tool as a user
+  turn.
 - Coding work routes through Agency, not new granular repo tools.
 - Agency runs record sandbox and egress policy metadata.
 - Authority-bearing local API routes are authenticated.
@@ -360,7 +367,8 @@ The cutover is complete only when all of these are true:
 - Do not add new structured tools for coding workflows that Agency can perform.
 - Do not build a generic MCP/API catalog for hypothetical future workflows.
 - Do not use deterministic keyword classifiers as product judgment.
-- Do not let proactive ambient flows gain shell authority.
+- Do not give a proactive wake authority beyond what the `run` sandbox rails
+  for a user turn.
 - Do not rely on prompt instructions as a security boundary.
 - Do not treat phases as runtime modes.
 
@@ -376,8 +384,10 @@ The cutover is complete only when all of these are true:
   cutover tests first and remove fixture capabilities from production imports.
 - Product copy can leak implementation. Mitigation: user-facing action-label
   registry is separate from capability IDs.
-- Memory procedures can become unauthorized autonomy. Mitigation: procedures
-  store behavior preferences; autonomy scopes remain explicit and approved.
+- A proactive wake can act on its own initiative on tainted input. Mitigation:
+  every high-impact, irreversible, or externally-visible capability is
+  `requires_approval`, so an autonomous action the user has not seen cannot run
+  irreversibly. See [modules/proactivity.md](modules/proactivity.md).
 
 ## Source Findings
 
@@ -398,9 +408,10 @@ This spec is based on the May 2026 code survey of:
 The implemented cutover must stay guarded against regressions in these areas:
 
 - normal turns receiving the full response tool catalog
-- proactive deliberation receiving model tools
+- a proactive wake gaining a tool surface separate from the normal `run` turn
 - test-only framework capabilities leaking into production model tool surfaces
 - Agency PR requests losing receipt-derived idempotency IDs
 - authority-bearing local routes bypassing bearer auth
 - Discord copy exposing internal capability IDs
-- proactive memory or Discord output reintroducing duplicate action shapes
+- a proactive wake reintroducing a duplicate action or `remember` shape outside
+  the capability system

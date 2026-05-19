@@ -49,7 +49,10 @@ Phase 1 (this doc)  ->  Tier 0  ->  Phase 2 memory  ->  Phase 3 proactive  ->  P
 Tier 0 has no dependencies and can land at any time. Phases 2-4 each produce
 their own cutover doc, approved before any code. Phase 4 follows the subsystem
 phases because Phase 2's outcome for `memory_events` and `memory_projection_jobs`
-determines the cross-cutting event-log and job-queue designs.
+determines the cross-cutting event-log and job-queue designs. Phases 2 and 3
+were since overtaken — the memory and proactivity crystallizations replaced
+those subsystems wholesale rather than consolidating their tables; see the
+notes on each phase below.
 
 ### Tier 0 - Dead schema
 
@@ -95,16 +98,12 @@ No deep-dive required. One or two small PRs.
 
 ### Phase 3 - Proactive subsystem
 
-11 `proactive_*` tables to roughly 8. Produces
-`docs/modules/proactive-consolidation-cutover.md`. Candidate moves:
-
-- Fold `proactive_context_snapshots` and `proactive_policy_validations` into
-  `proactive_decisions`.
-- Merge `proactive_turns` into `notifications` - same concept, written in one
-  transaction.
-- Resolve `ai_judgments` vs. `proactive_decisions` ownership of the AI-call
-  record.
-- Fold `proactive_feedback` into proactive case events.
+**Superseded.** This phase planned to consolidate 11 `proactive_*` tables to
+roughly 8. The proactivity crystallization
+([modules/proactivity-cutover.md](modules/proactivity-cutover.md)) overtook it:
+it deleted the proactive pipeline outright and dropped all 18 proactive-cluster
+tables, so there is no proactive table cluster left to consolidate. The Phase 3
+cutover doc is retired with its subject.
 
 ### Phase 4 - Cross-cutting
 

@@ -62,12 +62,10 @@ The main agent never touches `memory_facts`, `memory_profile`, or
 
 ## Wakes
 
-- Human, API, and capture turns inject the profile and the session digest, and
-  run the retriever as a pre-turn step.
-- Proactive deliberation injects the profile and runs the retriever; it is
-  case-scoped, so it gets no digest.
-- Ambient interpretation gets no retriever — it is high-volume triage; any
-  case it promotes is deliberated downstream, where recall runs.
+- Every wake — a human, API, or capture turn, and a proactive wake from a
+  non-human trigger — injects the profile and the session digest and runs the
+  retriever as a pre-turn step. A proactive wake is a normal turn
+  ([proactivity.md](proactivity.md)); memory treats it no differently.
 
 The rememberer runs as a background task after every turn, on session rotation
 (writing a carry-forward digest), on a periodic sweep, and on demand via

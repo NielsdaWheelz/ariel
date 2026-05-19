@@ -74,7 +74,8 @@ workspace-machine executor, or billing.
 - Do not give the program network access or a writable root filesystem.
 - Do not expose capabilities as direct model tools. The model tool surface stays
   exactly `run`.
-- Do not give proactive deliberation a program or a tool.
+- Do not give a proactive wake a tool surface other than `run`. A proactive
+  wake runs the same `run` program as a user turn.
 - Do not build a separate skills system or a skill-loading syscall. Repeated
   workflows live in procedural memory.
 - Do not add capabilities, syscalls, or program features speculatively.
