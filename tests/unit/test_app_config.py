@@ -76,8 +76,8 @@ def test_slice1_turn_budget_defaults_are_configured(monkeypatch: pytest.MonkeyPa
     monkeypatch.delenv("ARIEL_AUTO_ROTATE_MAX_AGE_SECONDS", raising=False)
     monkeypatch.delenv("ARIEL_AUTO_ROTATE_CONTEXT_PRESSURE_TOKENS", raising=False)
     monkeypatch.delenv("ARIEL_MAX_RESPONSE_TOKENS", raising=False)
-    monkeypatch.delenv("ARIEL_MAX_MODEL_ATTEMPTS", raising=False)
-    monkeypatch.delenv("ARIEL_MAX_TURN_WALL_TIME_MS", raising=False)
+    monkeypatch.delenv("ARIEL_MAIN_TURN_BUDGET_SECONDS", raising=False)
+    monkeypatch.delenv("ARIEL_AGENT_LOOP_MAX_MODEL_CALLS", raising=False)
     monkeypatch.delenv("ARIEL_APPROVAL_TTL_SECONDS", raising=False)
     monkeypatch.delenv("ARIEL_APPROVAL_ACTOR_ID", raising=False)
 
@@ -89,8 +89,8 @@ def test_slice1_turn_budget_defaults_are_configured(monkeypatch: pytest.MonkeyPa
     assert settings.auto_rotate_max_age_seconds == 172800
     assert settings.auto_rotate_context_pressure_tokens == 5400
     assert settings.max_response_tokens == 700
-    assert settings.max_model_attempts == 2
-    assert settings.max_turn_wall_time_ms == 20000
+    assert settings.main_turn_budget_seconds == 180.0
+    assert settings.agent_loop_max_model_calls == 50
     assert settings.approval_ttl_seconds == 900
     assert settings.approval_actor_id == "user.local"
 
@@ -156,8 +156,8 @@ def test_turn_budget_env_overrides_are_loaded(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("ARIEL_AUTO_ROTATE_MAX_AGE_SECONDS", "2222")
     monkeypatch.setenv("ARIEL_AUTO_ROTATE_CONTEXT_PRESSURE_TOKENS", "3333")
     monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "321")
-    monkeypatch.setenv("ARIEL_MAX_MODEL_ATTEMPTS", "4")
-    monkeypatch.setenv("ARIEL_MAX_TURN_WALL_TIME_MS", "15000")
+    monkeypatch.setenv("ARIEL_MAIN_TURN_BUDGET_SECONDS", "300.0")
+    monkeypatch.setenv("ARIEL_AGENT_LOOP_MAX_MODEL_CALLS", "100")
     monkeypatch.setenv("ARIEL_APPROVAL_TTL_SECONDS", "1200")
     monkeypatch.setenv("ARIEL_APPROVAL_ACTOR_ID", "user.integration")
 
@@ -168,8 +168,8 @@ def test_turn_budget_env_overrides_are_loaded(monkeypatch: pytest.MonkeyPatch) -
     assert settings.auto_rotate_max_age_seconds == 2222
     assert settings.auto_rotate_context_pressure_tokens == 3333
     assert settings.max_response_tokens == 321
-    assert settings.max_model_attempts == 4
-    assert settings.max_turn_wall_time_ms == 15000
+    assert settings.main_turn_budget_seconds == 300.0
+    assert settings.agent_loop_max_model_calls == 100
     assert settings.approval_ttl_seconds == 1200
     assert settings.approval_actor_id == "user.integration"
 
@@ -203,8 +203,8 @@ def test_memory_embedding_dimensions_must_match_schema(monkeypatch: pytest.Monke
         ("ARIEL_AUTO_ROTATE_MAX_AGE_SECONDS", "0"),
         ("ARIEL_AUTO_ROTATE_CONTEXT_PRESSURE_TOKENS", "0"),
         ("ARIEL_MAX_RESPONSE_TOKENS", "0"),
-        ("ARIEL_MAX_MODEL_ATTEMPTS", "0"),
-        ("ARIEL_MAX_TURN_WALL_TIME_MS", "0"),
+        ("ARIEL_MAIN_TURN_BUDGET_SECONDS", "0"),
+        ("ARIEL_AGENT_LOOP_MAX_MODEL_CALLS", "0"),
         ("ARIEL_APPROVAL_TTL_SECONDS", "0"),
     ],
 )

@@ -48,8 +48,8 @@ class AppSettings(BaseSettings):
     auto_rotate_max_age_seconds: int = 172800
     auto_rotate_context_pressure_tokens: int = 5400
     max_response_tokens: int = 700
-    max_model_attempts: int = 2
-    max_turn_wall_time_ms: int = 20000
+    main_turn_budget_seconds: float = 180.0
+    agent_loop_max_model_calls: int = 50
     approval_ttl_seconds: int = 900
     approval_actor_id: str = "user.local"
     google_oauth_client_id: str | None = None
@@ -310,18 +310,18 @@ class AppSettings(BaseSettings):
             raise ValueError("max_response_tokens must be >= 1")
         return value
 
-    @field_validator("max_model_attempts")
+    @field_validator("main_turn_budget_seconds")
     @classmethod
-    def _max_model_attempts_must_be_positive(cls, value: int) -> int:
-        if value < 1:
-            raise ValueError("max_model_attempts must be >= 1")
+    def _main_turn_budget_seconds_must_be_positive(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("main_turn_budget_seconds must be > 0")
         return value
 
-    @field_validator("max_turn_wall_time_ms")
+    @field_validator("agent_loop_max_model_calls")
     @classmethod
-    def _max_turn_wall_time_ms_must_be_positive(cls, value: int) -> int:
+    def _agent_loop_max_model_calls_must_be_positive(cls, value: int) -> int:
         if value < 1:
-            raise ValueError("max_turn_wall_time_ms must be >= 1")
+            raise ValueError("agent_loop_max_model_calls must be >= 1")
         return value
 
     @field_validator("approval_ttl_seconds")

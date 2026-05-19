@@ -6,28 +6,28 @@ from ariel.response_contracts import _project_surface_event_payload
 def test_single_run_protocol_events_are_surfaceable() -> None:
     assert _project_surface_event_payload(
         "evt.model.protocol_failed",
-        {"reason": "run_protocol_requires_run_tool", "attempt": 1},
+        {"reason": "run_protocol_requires_run_tool", "model_call_count": 1},
     ) == {
         "reason": "run_protocol_requires_run_tool",
-        "attempt": 1,
+        "model_call_count": 1,
         "provider_response_id": None,
     }
     assert _project_surface_event_payload(
         "evt.run.validation_failed",
-        {"errors": ["run_source_invalid_json"], "attempt": 1},
+        {"errors": ["run_source_invalid_json"], "model_call_count": 1},
     ) == {
         "errors": ["run_source_invalid_json"],
-        "attempt": 1,
+        "model_call_count": 1,
         "provider_response_id": None,
     }
     assert _project_surface_event_payload(
         "evt.agent.value_emitted",
-        {"index": 1, "value_digest": "0" * 64, "value_bytes": 13, "attempt": 1},
+        {"index": 1, "value_digest": "0" * 64, "value_bytes": 13, "model_call_count": 1},
     ) == {
         "index": 1,
         "value_digest": "0" * 64,
         "value_bytes": 13,
-        "attempt": 1,
+        "model_call_count": 1,
         "provider_response_id": None,
     }
     assert _project_surface_event_payload(

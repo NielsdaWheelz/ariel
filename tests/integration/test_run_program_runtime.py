@@ -159,6 +159,7 @@ def _execute(
         attachment_runtime=None,
         allowed_capability_ids=allowed_capability_ids,
         settings=settings,
+        scratch={},
     )
 
 

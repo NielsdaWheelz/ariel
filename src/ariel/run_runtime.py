@@ -32,8 +32,31 @@ _AGENT_EMIT_VALUE = "agent.emit_value"
 _AGENT_PAUSE_UNTIL_INPUT = "agent.pause_until_input"
 _AGENT_SYSCALL_NAMES = (_AGENT_EMIT_MESSAGE, _AGENT_EMIT_VALUE, _AGENT_PAUSE_UNTIL_INPUT)
 
+# Host-side per-turn scratch store syscalls — always eligible, not capabilities.
+_SCRATCH_SET = "scratch.set"
+_SCRATCH_GET = "scratch.get"
+_SCRATCH_SYSCALL_NAMES = (_SCRATCH_SET, _SCRATCH_GET)
+
+# Scratch store bounds.
+_SCRATCH_MAX_ENTRIES = 64
+_SCRATCH_MAX_VALUE_BYTES = 512 * 1024  # 512 KiB per value
+_SCRATCH_MAX_TOTAL_BYTES = 4 * 1024 * 1024  # 4 MiB total
+
 _MAX_EMITTED_VALUES = 10
 _MAX_EMITTED_VALUE_BYTES = 12000
+
+
+@dataclass(slots=True, frozen=True)
+class ScratchEntry:
+    """One entry in the host-side per-turn scratch store.
+
+    ``value`` is the stored value (JSON-encodable).  ``provenance`` is the
+    taint of the program that called ``scratch.set``; ``scratch.get`` re-applies
+    it so untrusted data carried across programs stays tainted.
+    """
+
+    value: Any
+    provenance: RuntimeProvenance | None
 
 
 @dataclass(slots=True)
@@ -126,12 +149,13 @@ def parse_run_function_call(
 def _eligible_syscall_names(allowed_capability_ids: set[str]) -> tuple[str, ...]:
     """The syscall callables the program may call this turn.
 
-    The three ``agent.*`` output syscalls plus the run-callable name of every
-    allowed capability id. A capability with no run-callable alias is dropped:
-    it cannot be named in a program.
+    The three ``agent.*`` output syscalls, the two ``scratch.*`` store syscalls
+    (always eligible — host-side, not capabilities), plus the run-callable name
+    of every allowed capability id. A capability with no run-callable alias is
+    dropped: it cannot be named in a program.
     """
 
-    names: set[str] = set(_AGENT_SYSCALL_NAMES)
+    names: set[str] = set(_AGENT_SYSCALL_NAMES) | set(_SCRATCH_SYSCALL_NAMES)
     for capability_id in allowed_capability_ids:
         run_callable_name = run_callable_name_for_capability_id(capability_id)
         if run_callable_name is not None:
@@ -188,6 +212,7 @@ def execute_run_program(
     attachment_runtime: AttachmentContentRuntime | None,
     allowed_capability_ids: set[str],
     settings: AppSettings | None,
+    scratch: dict[str, ScratchEntry],
 ) -> RunProgramResult:
     """Run one model-authored Python ``run`` program inside the sandbox.
 
@@ -270,6 +295,53 @@ def execute_run_program(
                 return False, "agent_pause_until_input_schema_invalid"
             paused = True
             return True, None
+
+        if name == _SCRATCH_SET:
+            if set(syscall_input.keys()) != {"key", "value"}:
+                callback_errors.append("scratch_set_schema_invalid")
+                return False, "scratch_set_schema_invalid"
+            key = syscall_input["key"]
+            value = syscall_input["value"]
+            if not isinstance(key, str) or not key:
+                callback_errors.append("scratch_key_invalid")
+                return False, "scratch_key_invalid"
+            try:
+                value_bytes = json.dumps(value, sort_keys=True).encode("utf-8")
+            except TypeError:
+                callback_errors.append("scratch_value_too_large")
+                return False, "scratch_value_too_large"
+            if len(value_bytes) > _SCRATCH_MAX_VALUE_BYTES:
+                callback_errors.append("scratch_value_too_large")
+                return False, "scratch_value_too_large"
+            current_total = sum(
+                len(json.dumps(e.value, sort_keys=True).encode("utf-8"))
+                for e in scratch.values()
+                if e.value is not None
+            )
+            if key not in scratch and len(scratch) >= _SCRATCH_MAX_ENTRIES:
+                callback_errors.append("scratch_store_full")
+                return False, "scratch_store_full"
+            projected = current_total + len(value_bytes)
+            if key in scratch:
+                projected -= len(json.dumps(scratch[key].value, sort_keys=True).encode("utf-8"))
+            if projected > _SCRATCH_MAX_TOTAL_BYTES:
+                callback_errors.append("scratch_store_full")
+                return False, "scratch_store_full"
+            scratch[key] = ScratchEntry(value=value, provenance=current_provenance[0])
+            return True, None
+
+        if name == _SCRATCH_GET:
+            if set(syscall_input.keys()) != {"key"}:
+                callback_errors.append("scratch_get_schema_invalid")
+                return False, "scratch_get_schema_invalid"
+            key = syscall_input["key"]
+            if not isinstance(key, str) or key not in scratch:
+                return False, "scratch_key_missing"
+            entry = scratch[key]
+            if entry.provenance is not None and entry.provenance.status == "tainted":
+                current_provenance[0] = entry.provenance
+                program_taint_evidence.extend(entry.provenance.evidence)
+            return True, entry.value
 
         capability_id = capability_id_for_run_callable(name)
         if capability_id is None:

@@ -123,6 +123,7 @@ from ariel.response_contracts import (
     build_surface_timeline_response,
 )
 from ariel.run_runtime import (
+    ScratchEntry,
     execute_run_program,
     parse_run_function_call,
     run_tool_definitions,
@@ -840,21 +841,16 @@ def _turn_limit_message(violation: TurnLimitViolation) -> str:
             "this turn stopped because the response budget was exhausted. "
             "please narrow the request so i can answer within the response budget."
         )
-    if violation.budget == "turn_wall_time_ms":
-        return (
-            "this turn stopped because the turn time budget was exhausted. "
-            "please split the request into smaller steps so i can complete it."
-        )
     return "this turn stopped because a configured turn budget was exhausted."
 
 
-def _applied_turn_limits(settings: AppSettings) -> dict[str, int]:
+def _applied_turn_limits(settings: AppSettings) -> dict[str, Any]:
     return {
         "max_recent_turns": int(settings.max_recent_turns),
         "max_context_tokens": int(settings.max_context_tokens),
         "max_response_tokens": int(settings.max_response_tokens),
-        "max_model_attempts": int(settings.max_model_attempts),
-        "max_turn_wall_time_ms": int(settings.max_turn_wall_time_ms),
+        "main_turn_budget_seconds": float(settings.main_turn_budget_seconds),
+        "agent_loop_max_model_calls": int(settings.agent_loop_max_model_calls),
     }
 
 
@@ -863,7 +859,7 @@ def _build_turn_limit_error(
     session_id: str,
     turn_id: str,
     violation: TurnLimitViolation,
-    applied_limits: dict[str, int],
+    applied_limits: dict[str, Any],
 ) -> ApiError:
     return ApiError(
         status_code=429,
@@ -2436,9 +2432,6 @@ def _wake(
         )
     applied_limits = _applied_turn_limits(runtime.settings)
 
-    def elapsed_turn_ms(started_at: float) -> int:
-        return int((time.perf_counter() - started_at) * 1000)
-
     def build_turn_limit_failure(
         *,
         budget: str,
@@ -2488,70 +2481,6 @@ def _wake(
     model_failure_reason: str | None = None
     assistant_response: dict[str, Any] | None = None
 
-    def record_model_output_budget_failure(
-        *,
-        attempt: int,
-        provider_response_id: str | None,
-        failure_reason: str,
-    ) -> ApiError:
-        prompt_version = "model-output-v1"
-        record_ai_judgment(
-            db,
-            judgment_type="model_output",
-            source_type="turn",
-            source_id=turn.id,
-            model=runtime.model_adapter.model,
-            prompt_version=prompt_version,
-            provider_response_id=provider_response_id,
-            input_summary="final model-authored assistant output for turn",
-            input_refs={
-                "session_id": effective_session_id,
-                "turn_id": turn.id,
-                "attempt": attempt,
-                "max_model_attempts": int(runtime.settings.max_model_attempts),
-            },
-            output={},
-            now=_utcnow(),
-            new_id=_new_id,
-            failure=AIJudgmentFailure(
-                code="E_AI_JUDGMENT_BUDGET",
-                safe_reason=failure_reason,
-                retryable=False,
-                parse_status="missing_output",
-                validation_status="not_validated",
-            ),
-        )
-        add_event(
-            "evt.ai_judgment.failed",
-            {
-                "judgment_type": "model_output",
-                "failure_code": "E_AI_JUDGMENT_BUDGET",
-                "failure_reason": failure_reason,
-                "prompt_version": prompt_version,
-                "source_id": turn.id,
-                "parse_status": "missing_output",
-                "validation_status": "not_validated",
-                "provider_response_id": provider_response_id,
-                "attempt": attempt,
-                "max_model_attempts": int(runtime.settings.max_model_attempts),
-            },
-        )
-        return ApiError(
-            status_code=429,
-            code="E_AI_JUDGMENT_BUDGET",
-            message="AI model output failed",
-            details={
-                "session_id": effective_session_id,
-                "turn_id": turn.id,
-                "judgment_type": "model_output",
-                "prompt_version": prompt_version,
-                "attempt": attempt,
-                "max_model_attempts": int(runtime.settings.max_model_attempts),
-                "provider_response_id": provider_response_id,
-            },
-            retryable=True,
-        )
-
     # The running context is the verbatim recent-turns window plus the
     # session digest, so it is inherently bounded -- there is no
     # summarization or compaction step.
@@ -2571,26 +2500,57 @@ def _wake(
         context_bundle=context_bundle,
         user_message=user_message,
     )
+    scratch: dict[str, ScratchEntry] = {}
     turn_started_at = time.perf_counter()
-    for attempt in range(1, runtime.settings.max_model_attempts + 1):
-        if attempt > 1:
-            elapsed_before_attempt_ms = elapsed_turn_ms(turn_started_at)
-            if elapsed_before_attempt_ms > runtime.settings.max_turn_wall_time_ms:
-                bounded_failure = build_turn_limit_failure(
-                    budget="turn_wall_time_ms",
-                    unit="ms",
-                    measured=elapsed_before_attempt_ms,
-                    limit=runtime.settings.max_turn_wall_time_ms,
-                )
-                break
+    # Index of the budget-signal item in responses_input_items; updated each
+    # round so only one copy accumulates (None before the first round appends it).
+    budget_item_index: int | None = None
+    # Tail index of the items appended by the most recent emit_value round;
+    # truncate to it before the next emit_value round so only the latest is kept.
+    last_emit_value_tail: int | None = None
+    # Source of the immediately preceding round's run program for stuck-detection.
+    prev_run_source: str | None = None
+    model_call_count = 0
+    exhausted_response: dict[str, Any] = {
+        "provider": runtime.model_adapter.provider,
+        "model": runtime.model_adapter.model,
+        "assistant_text": "I wasn't able to finish that within the time available.",
+        "assistant_silent": False,
+    }
+    while True:
+        # --- Budget and backstop checks (before the model call) ---
+        elapsed_s = time.perf_counter() - turn_started_at
+        if elapsed_s > runtime.settings.main_turn_budget_seconds:
+            # Graceful budget exhaustion: emit a plain assistant message and
+            # end as a normal completed turn; do NOT raise a 429.
+            assistant_response = exhausted_response
+            break
+        if model_call_count > runtime.settings.agent_loop_max_model_calls:
+            # Backstop: same graceful path.
+            assistant_response = exhausted_response
+            break
 
+        # Remaining-budget signal: replace the previous round's item in-place
+        # so only one line accumulates.
+        remaining_s = max(0.0, runtime.settings.main_turn_budget_seconds - elapsed_s)
+        budget_line: dict[str, Any] = {
+            "role": "system",
+            "content": f"remaining budget: {remaining_s:.0f}s",
+        }
+        if budget_item_index is None:
+            responses_input_items.append(budget_line)
+            budget_item_index = len(responses_input_items) - 1
+        else:
+            responses_input_items[budget_item_index] = budget_line
+
+        model_call_count += 1
         add_event(
             "evt.model.started",
             {
                 "provider": runtime.model_adapter.provider,
                 "model": runtime.model_adapter.model,
                 "context": context_metadata,
-                "attempt": attempt,
+                "model_call_count": model_call_count,
             },
         )
         model_started_at = time.perf_counter()
@@ -2611,19 +2571,9 @@ def _wake(
                     "duration_ms": duration_ms,
                     "usage": candidate_response.get("usage"),
                     "provider_response_id": candidate_response.get("provider_response_id"),
-                    "attempt": attempt,
+                    "model_call_count": model_call_count,
                 },
             )
-
-            elapsed_after_model_ms = elapsed_turn_ms(turn_started_at)
-            if elapsed_after_model_ms > runtime.settings.max_turn_wall_time_ms:
-                bounded_failure = build_turn_limit_failure(
-                    budget="turn_wall_time_ms",
-                    unit="ms",
-                    measured=elapsed_after_model_ms,
-                    limit=runtime.settings.max_turn_wall_time_ms,
-                )
-                break
 
             output_items = candidate_response.get("output")
             if not isinstance(output_items, list):
@@ -2674,7 +2624,7 @@ def _wake(
                     input_refs={
                         "session_id": effective_session_id,
                         "turn_id": turn.id,
-                        "attempt": attempt,
+                        "model_call_count": model_call_count,
                         "response_output": output_items,
                     },
                     output={},
@@ -2725,21 +2675,18 @@ def _wake(
                     "evt.model.protocol_failed",
                     {
                         "reason": run_protocol_error,
-                        "attempt": attempt,
+                        "model_call_count": model_call_count,
                         "provider_response_id": candidate_response.get("provider_response_id"),
                     },
                 )
-                if attempt >= runtime.settings.max_model_attempts:
-                    model_failure = record_model_output_budget_failure(
-                        attempt=attempt,
-                        provider_response_id=candidate_response.get("provider_response_id")
-                        if isinstance(candidate_response.get("provider_response_id"), str)
-                        else None,
-                        failure_reason=run_protocol_error or "model failed the run tool protocol",
-                    )
-                    model_failure_reason = "AI model failed the run tool protocol"
-                    break
                 continue
+
+            # Stuck-detection: if the model emits a source byte-identical to
+            # the immediately preceding round's source, the loop is cycling.
+            if run_source == prev_run_source:
+                assistant_response = exhausted_response
+                break
+            prev_run_source = run_source
 
             run_call_id = function_calls[0].get("call_id")
             run_call_id = run_call_id if isinstance(run_call_id, str) else ""
@@ -2767,6 +2714,7 @@ def _wake(
                 attachment_runtime=runtime.attachment_runtime,
                 allowed_capability_ids=set(allowed_capability_ids),
                 settings=runtime.settings,
+                scratch=scratch,
             )
             # The syscall trace is the audit spine and is recorded whether
             # or not the program completed cleanly.
@@ -2811,7 +2759,7 @@ def _wake(
                     input_refs={
                         "session_id": effective_session_id,
                         "turn_id": turn.id,
-                        "attempt": attempt,
+                        "model_call_count": model_call_count,
                         "source": run_source,
                     },
                     output={},
@@ -2856,21 +2804,11 @@ def _wake(
                     "evt.run.validation_failed",
                     {
                         "errors": program_errors,
-                        "attempt": attempt,
+                        "model_call_count": model_call_count,
                         "provider_response_id": candidate_response.get("provider_response_id"),
                     },
                 )
                 db.commit()
-                if attempt >= runtime.settings.max_model_attempts:
-                    model_failure = record_model_output_budget_failure(
-                        attempt=attempt,
-                        provider_response_id=candidate_response.get("provider_response_id")
-                        if isinstance(candidate_response.get("provider_response_id"), str)
-                        else None,
-                        failure_reason="run program did not complete cleanly",
-                    )
-                    model_failure_reason = "AI model produced an invalid run program"
-                    break
                 continue
 
             provider_response_id = candidate_response.get("provider_response_id")
@@ -2890,7 +2828,7 @@ def _wake(
                 input_refs={
                     "session_id": effective_session_id,
                     "turn_id": turn.id,
-                    "attempt": attempt,
+                    "model_call_count": model_call_count,
                     "source": run_source,
                     "response_output": output_items,
                 },
@@ -2920,7 +2858,7 @@ def _wake(
                         "index": index,
                         "value_digest": hashlib.sha256(encoded_value).hexdigest(),
                         "value_bytes": len(encoded_value),
-                        "attempt": attempt,
+                        "model_call_count": model_call_count,
                         "provider_response_id": candidate_response.get("provider_response_id"),
                     },
                 )
@@ -2980,8 +2918,15 @@ def _wake(
                 break
 
             if run_program_result.emitted_values:
-                # Internal structured data for a later turn: the model
-                # reads the values and continues with another program.
+                # Internal structured data for a later round: the model reads
+                # the values and continues with another program. Evict the
+                # previous emit_value round's items from responses_input_items
+                # so only the most recent round's values are in context.
+                if last_emit_value_tail is not None:
+                    del responses_input_items[last_emit_value_tail:]
+                # Record the tail before appending this round's items so the
+                # next round's del truncates back to before these items.
+                last_emit_value_tail = len(responses_input_items)
                 for output_item in output_items:
                     if isinstance(output_item, dict) and output_item.get("type") == "function_call":
                         responses_input_items.append(jsonable_encoder(output_item))
@@ -3010,18 +2955,6 @@ def _wake(
                         ),
                     }
                 )
-                if attempt >= runtime.settings.max_model_attempts:
-                    model_failure = record_model_output_budget_failure(
-                        attempt=attempt,
-                        provider_response_id=candidate_response.get("provider_response_id")
-                        if isinstance(candidate_response.get("provider_response_id"), str)
-                        else None,
-                        failure_reason=(
-                            "model emitted internal values but exhausted its attempt budget"
-                        ),
-                    )
-                    model_failure_reason = "AI model output exhausted its attempt budget"
-                    break
                 continue
 
             if run_program_result.paused:
@@ -3069,19 +3002,6 @@ def _wake(
                         ),
                     }
                 )
-                if attempt >= runtime.settings.max_model_attempts:
-                    model_failure = record_model_output_budget_failure(
-                        attempt=attempt,
-                        provider_response_id=candidate_response.get("provider_response_id")
-                        if isinstance(candidate_response.get("provider_response_id"), str)
-                        else None,
-                        failure_reason=(
-                            "model exhausted its attempt budget before authoring "
-                            "a final assistant response"
-                        ),
-                    )
-                    model_failure_reason = "AI model output exhausted its attempt budget"
-                    break
                 continue
 
             responses_input_items.append(
@@ -3099,20 +3019,10 @@ def _wake(
                 "evt.model.protocol_failed",
                 {
                     "reason": "run_completed_without_visible_output",
-                    "attempt": attempt,
+                    "model_call_count": model_call_count,
                     "provider_response_id": candidate_response.get("provider_response_id"),
                 },
             )
-            if attempt >= runtime.settings.max_model_attempts:
-                model_failure = record_model_output_budget_failure(
-                    attempt=attempt,
-                    provider_response_id=candidate_response.get("provider_response_id")
-                    if isinstance(candidate_response.get("provider_response_id"), str)
-                    else None,
-                    failure_reason="run completed without visible output",
-                )
-                model_failure_reason = "AI model produced no visible run output"
-                break
             continue
         except Exception as exc:
             duration_ms = int((time.perf_counter() - model_started_at) * 1000)
@@ -3126,7 +3036,7 @@ def _wake(
                 error_details = {
                     "session_id": effective_session_id,
                     "turn_id": turn.id,
-                    "attempt": attempt,
+                    "model_call_count": model_call_count,
                     "failure_code": exc.code,
                 }
                 if exc.parse_status is not None:
@@ -3163,7 +3073,7 @@ def _wake(
                     details={
                         "session_id": effective_session_id,
                         "turn_id": turn.id,
-                        "attempt": attempt,
+                        "model_call_count": model_call_count,
                     },
                     retryable=True,
                 )
@@ -3175,7 +3085,7 @@ def _wake(
                     "model": runtime.model_adapter.model,
                     "duration_ms": duration_ms,
                     "failure_reason": failure_reason,
-                    "attempt": attempt,
+                    "model_call_count": model_call_count,
                 }
                 | (
                     {
@@ -3193,34 +3103,8 @@ def _wake(
                 ),
             )
 
-            elapsed_after_failure_ms = elapsed_turn_ms(turn_started_at)
-            if elapsed_after_failure_ms > runtime.settings.max_turn_wall_time_ms:
-                bounded_failure = build_turn_limit_failure(
-                    budget="turn_wall_time_ms",
-                    unit="ms",
-                    measured=elapsed_after_failure_ms,
-                    limit=runtime.settings.max_turn_wall_time_ms,
-                )
-                break
-            if should_retry and attempt < runtime.settings.max_model_attempts:
+            if should_retry:
                 continue
-            if should_retry and attempt >= runtime.settings.max_model_attempts:
-                provider_response_id = (
-                    exc.provider_response_id
-                    if isinstance(exc, ModelAdapterError)
-                    and isinstance(exc.provider_response_id, str)
-                    else None
-                )
-                model_failure = record_model_output_budget_failure(
-                    attempt=attempt,
-                    provider_response_id=provider_response_id,
-                    failure_reason=(
-                        "model exhausted its retry budget before authoring "
-                        "a final assistant response"
-                    ),
-                )
-                model_failure_reason = failure_reason
-                break
 
             model_failure = model_failure_candidate
             model_failure_reason = failure_reason
@@ -3385,8 +3269,8 @@ def create_app(
     app.state.auto_rotate_max_age_seconds = settings.auto_rotate_max_age_seconds
     app.state.auto_rotate_context_pressure_tokens = settings.auto_rotate_context_pressure_tokens
     app.state.max_response_tokens = settings.max_response_tokens
-    app.state.max_model_attempts = settings.max_model_attempts
-    app.state.max_turn_wall_time_ms = settings.max_turn_wall_time_ms
+    app.state.main_turn_budget_seconds = settings.main_turn_budget_seconds
+    app.state.agent_loop_max_model_calls = settings.agent_loop_max_model_calls
     app.state.approval_ttl_seconds = settings.approval_ttl_seconds
     app.state.approval_actor_id = settings.approval_actor_id
     app.state.google_oauth_redirect_uri = settings.google_oauth_redirect_uri

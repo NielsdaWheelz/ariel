@@ -409,6 +409,87 @@ def test_emit_value_is_internal_feedback_with_digest_surface(postgres_url: str) 
     assert value_feedback[0]["emitted_values"] == [{"answer": 42}]
 
 
+def test_emit_value_eviction_discards_prior_round(postgres_url: str) -> None:
+    """Two emit_value rounds in one turn: the second round evicts the first.
+
+    After the second emit_value round, the input_items passed to the model on
+    the third call must NOT contain any value from the first round; only the
+    second round's emitted value should remain in context.
+    """
+
+    @dataclass
+    class SnapshotAdapter:
+        """Captures a shallow copy of input_items on each call."""
+
+        provider: str = "provider.eviction"
+        model: str = "model.eviction-v1"
+        responses: list[dict[str, Any]] = field(default_factory=list)
+        snapshots: list[list[dict[str, Any]]] = field(default_factory=list)
+
+        def create_response(
+            self,
+            *,
+            input_items: list[dict[str, Any]],
+            tools: list[dict[str, Any]],
+            user_message: str,
+            history: list[dict[str, Any]],
+            context_bundle: dict[str, Any],
+        ) -> dict[str, Any]:
+            del tools, user_message, history, context_bundle
+            self.snapshots.append(list(input_items))
+            return self.responses.pop(0)
+
+    adapter = SnapshotAdapter(
+        responses=[
+            # Round 1: emit value {"round": 1} — loop continues.
+            _program_response(
+                source="agent.emit_value(value={'round': 1})\n",
+                provider="provider.eviction",
+                model="model.eviction-v1",
+                provider_response_id="resp_evict_r1",
+            ),
+            # Round 2: emit value {"round": 2} — loop continues, round 1 evicted.
+            _program_response(
+                source="agent.emit_value(value={'round': 2})\n",
+                provider="provider.eviction",
+                model="model.eviction-v1",
+                provider_response_id="resp_evict_r2",
+            ),
+            # Round 3: emit a message to end the turn.
+            responses_run_message(
+                assistant_text="done",
+                provider="provider.eviction",
+                model="model.eviction-v1",
+                provider_response_id="resp_evict_final",
+            ),
+        ]
+    )
+    with _build_client(postgres_url, adapter) as client:
+        session_id = _session_id(client)
+        turn = post_message_and_drain(client, session_id, message="two rounds")
+
+    assert turn.assistant_message == "done"
+    assert len(adapter.snapshots) == 3
+
+    # Parse the function_call_output items from the third snapshot: their
+    # ``output`` field is a JSON string (not an embedded object), so
+    # asserting on json.dumps(snapshot) would double-escape the quotes
+    # and a naive '"round": 2' substring check would silently fail.
+    third_fco_outputs = [
+        json.loads(item["output"])
+        for item in adapter.snapshots[2]
+        if item.get("type") == "function_call_output"
+    ]
+    all_emitted = [val for fco in third_fco_outputs for val in fco.get("emitted_values", [])]
+
+    # The third call must NOT contain round 1's emitted value (evicted).
+    assert {"round": 1} not in all_emitted, (
+        "round 1 emitted value was not evicted: still present in 3rd call input_items"
+    )
+    # The third call must still contain round 2's emitted value.
+    assert {"round": 2} in all_emitted, "round 2 emitted value missing from 3rd call input_items"
+
+
 def test_program_composes_a_mechanical_answer_in_one_turn(postgres_url: str) -> None:
     """A program may use control flow to compose a mechanical emit_message in
     the same turn -- the program-model relaxation of the flat-list rule."""

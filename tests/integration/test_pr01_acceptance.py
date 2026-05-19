@@ -1253,97 +1253,66 @@ def test_pr02_response_budget_uses_reported_output_tokens_when_present(
         assert limit_details["limit"] == 5
 
 
-def test_pr02_model_attempt_budget_exhaustion_uses_ai_judgment_budget_error(
+def test_pr02_model_call_backstop_exhaustion_ends_gracefully(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Backstop exhaustion (agent_loop_max_model_calls) ends as a graceful
+    status-200 completed turn, not a 429 error.
+
+    With agent_loop_max_model_calls=2 and a retryable-failure adapter, the loop
+    makes exactly 2 model calls, retrying both times, then the backstop check
+    fires on the 3rd iteration (model_call_count=2 > 2 is False, but after the
+    2nd call model_call_count=2 which on the next loop top becomes >2 when we
+    set it to 3 — actually model_call_count > max fires at model_call_count=2
+    only when max=1). Use max=1 so the backstop fires after exactly 1 call.
+    """
     monkeypatch.setenv("ARIEL_MAX_CONTEXT_TOKENS", "20000")
     monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "20000")
-    monkeypatch.setenv("ARIEL_MAX_MODEL_ATTEMPTS", "2")
+    monkeypatch.setenv("ARIEL_AGENT_LOOP_MAX_MODEL_CALLS", "1")
+    # Generous wall-clock budget so backstop fires first.
+    monkeypatch.setenv("ARIEL_MAIN_TURN_BUDGET_SECONDS", "300.0")
     adapter = RetryableFailureAdapter()
     with _build_client(postgres_url, adapter) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        turn = post_message_and_drain(client, session_id, message="trigger model attempt budget")
-        assert turn.status == "failed"
+        turn = post_message_and_drain(client, session_id, message="trigger model call backstop")
+        # Graceful exhaustion: completed turn, not failed.
+        assert turn.status == "completed"
+        assert turn.assistant_message == "I wasn't able to finish that within the time available."
 
         timeline = _timeline(client, session_id)
         turn_data = timeline["turns"][0]
-        assert turn_data["status"] == "failed"
-        events = turn_data["events"]
-        assert len([event for event in events if event["event_type"] == "evt.model.started"]) == 2
-        assert len([event for event in events if event["event_type"] == "evt.model.failed"]) == 2
-        event_types = [event["event_type"] for event in events]
-        assert event_types[-2:] == ["evt.ai_judgment.failed", "evt.turn.failed"]
-        assert "evt.assistant.emitted" not in event_types
-        model_output_failure = next(
-            event for event in events if event["payload"].get("judgment_type") == "model_output"
-        )
-        assert model_output_failure["payload"]["failure_code"] == "E_AI_JUDGMENT_BUDGET"
+        assert turn_data["status"] == "completed"
         assert not any(saved_turn["status"] == "in_progress" for saved_turn in timeline["turns"])
-
-        ai_judgment_failed = next(
-            event for event in events if event["event_type"] == "evt.ai_judgment.failed"
-        )
-        assert ai_judgment_failed["payload"]["judgment_type"] == "model_output"
-        assert ai_judgment_failed["payload"]["attempt"] == 2
-        assert ai_judgment_failed["payload"]["max_model_attempts"] == 2
-
-
-def test_pr02_wall_time_budget_takes_precedence_if_multiple_limits_exhaust(
-    postgres_url: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("ARIEL_MAX_CONTEXT_TOKENS", "20000")
-    monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "20000")
-    monkeypatch.setenv("ARIEL_MAX_MODEL_ATTEMPTS", "1")
-    monkeypatch.setenv("ARIEL_MAX_TURN_WALL_TIME_MS", "20")
-
-    counter = {"seconds": 0.0}
-
-    def fake_perf_counter() -> float:
-        counter["seconds"] += 0.03
-        return counter["seconds"]
-
-    monkeypatch.setattr("ariel.app.time.perf_counter", fake_perf_counter)
-
-    adapter = RetryableFailureAdapter()
-    with _build_client(postgres_url, adapter) as client:
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        turn = post_message_and_drain(client, session_id, message="trigger competing limits")
-        assert turn.status == "failed"
-
-        timeline = _timeline(client, session_id)
-        turn_data = timeline["turns"][0]
-        assert turn_data["status"] == "failed"
         event_types = [event["event_type"] for event in turn_data["events"]]
-        assert event_types == [
-            "evt.turn.started",
-            "evt.memory.recall_failed",
-            "evt.model.started",
-            "evt.model.failed",
-            "evt.assistant.emitted",
-            "evt.turn.failed",
-        ]
-        turn_failed = next(
-            event for event in turn_data["events"] if event["event_type"] == "evt.turn.failed"
-        )
-        limit_details = turn_failed["payload"]["limit"]
-        assert limit_details["budget"] == "turn_wall_time_ms"
-        assert limit_details["measured"] > limit_details["limit"]
+        assert "evt.turn.failed" not in event_types
+        assert "evt.turn.completed" in event_types
+        assert "evt.assistant.emitted" in event_types
 
 
-def test_pr02_wall_time_budget_exhaustion_is_bounded_and_auditable(
+def test_pr02_turn_budget_exhaustion_ends_gracefully(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Wall-clock budget exhaustion (main_turn_budget_seconds) ends as a
+    graceful status-200 completed turn, not a 429 error.
+
+    With a fake perf_counter that advances quickly and a tiny budget, the budget
+    check fires before (or just after) the first model call and the loop ends
+    with the exhausted message.
+    """
     monkeypatch.setenv("ARIEL_MAX_CONTEXT_TOKENS", "20000")
     monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "20000")
-    monkeypatch.setenv("ARIEL_MAX_TURN_WALL_TIME_MS", "20")
+    # Tiny budget: 0.001s — the fake clock advances 0.1s per call, so the
+    # budget check fires on the first loop iteration.
+    monkeypatch.setenv("ARIEL_MAIN_TURN_BUDGET_SECONDS", "0.001")
+    # High backstop so budget fires first.
+    monkeypatch.setenv("ARIEL_AGENT_LOOP_MAX_MODEL_CALLS", "100")
 
     counter = {"seconds": 0.0}
 
     def fake_perf_counter() -> float:
-        counter["seconds"] += 0.03
+        counter["seconds"] += 0.1
         return counter["seconds"]
 
     monkeypatch.setattr("ariel.app.time.perf_counter", fake_perf_counter)
@@ -1351,21 +1320,71 @@ def test_pr02_wall_time_budget_exhaustion_is_bounded_and_auditable(
     adapter = DeterministicModelAdapter()
     with _build_client(postgres_url, adapter) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        turn = post_message_and_drain(client, session_id, message="trigger wall-time budget")
-        assert turn.status == "failed"
+        turn = post_message_and_drain(client, session_id, message="trigger turn budget")
+        # Graceful exhaustion: completed turn, not failed.
+        assert turn.status == "completed"
+        assert turn.assistant_message == "I wasn't able to finish that within the time available."
 
         timeline = _timeline(client, session_id)
         turn_data = timeline["turns"][0]
-        event_types = [event["event_type"] for event in turn_data["events"]]
-        assert event_types[-2:] == ["evt.assistant.emitted", "evt.turn.failed"]
-        assert turn_data["status"] == "failed"
+        assert turn_data["status"] == "completed"
         assert not any(saved_turn["status"] == "in_progress" for saved_turn in timeline["turns"])
+        event_types = [event["event_type"] for event in turn_data["events"]]
+        assert "evt.turn.failed" not in event_types
+        assert "evt.turn.completed" in event_types
 
-        turn_failed = next(
-            event for event in turn_data["events"] if event["event_type"] == "evt.turn.failed"
-        )
-        limit_details = turn_failed["payload"]["limit"]
-        assert limit_details["budget"] == "turn_wall_time_ms"
-        assert limit_details["unit"] == "ms"
-        assert limit_details["limit"] == 20
-        assert limit_details["measured"] > 20
+
+def test_pr02_stuck_detection_ends_turn_gracefully(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stuck-detection (identical run source on consecutive rounds) ends as a
+    graceful status-200 completed turn, not a 429 error.
+    """
+    monkeypatch.setenv("ARIEL_MAX_CONTEXT_TOKENS", "20000")
+    monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "20000")
+    monkeypatch.setenv("ARIEL_MAIN_TURN_BUDGET_SECONDS", "300.0")
+    monkeypatch.setenv("ARIEL_AGENT_LOOP_MAX_MODEL_CALLS", "100")
+
+    # An adapter that always returns a run program that emits a value
+    # (so the loop continues) but always with the same source — triggering
+    # stuck-detection on the second round.
+    class StuckAdapter:
+        provider: str = "provider.stuck"
+        model: str = "model.stuck-v1"
+
+        def create_response(
+            self,
+            *,
+            input_items: list[dict[str, Any]],
+            tools: list[dict[str, Any]],
+            user_message: str,
+            history: list[dict[str, Any]],
+            context_bundle: dict[str, Any],
+        ) -> dict[str, Any]:
+            del tools, user_message, history, context_bundle, input_items
+            # A program that only calls emit_value (loop continues with same
+            # source every time — triggers stuck-detection on round 2).
+            return responses_with_run_calls(
+                assistant_text="",
+                calls=[{"name": "agent.emit_value", "input": {"value": {"x": 1}}}],
+                provider=self.provider,
+                model=self.model,
+                provider_response_id="resp_stuck_123",
+                input_tokens=1,
+                output_tokens=1,
+            )
+
+    adapter = StuckAdapter()
+    with _build_client(postgres_url, adapter) as client:
+        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
+        turn = post_message_and_drain(client, session_id, message="trigger stuck detection")
+        assert turn.status == "completed"
+        assert turn.assistant_message == "I wasn't able to finish that within the time available."
+
+        timeline = _timeline(client, session_id)
+        turn_data = timeline["turns"][0]
+        assert turn_data["status"] == "completed"
+        event_types = [event["event_type"] for event in turn_data["events"]]
+        assert "evt.turn.failed" not in event_types
+        assert "evt.turn.completed" in event_types

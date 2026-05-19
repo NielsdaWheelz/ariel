@@ -70,8 +70,8 @@ class SurfaceAppliedTurnLimitsContract(BaseModel):
     max_recent_turns: int
     max_context_tokens: int
     max_response_tokens: int
-    max_model_attempts: int
-    max_turn_wall_time_ms: int
+    main_turn_budget_seconds: float
+    agent_loop_max_model_calls: int
 
 
 class SurfaceBoundedFailureContract(BaseModel):
@@ -202,7 +202,7 @@ class SurfaceEventModelStartedPayloadContract(BaseModel):
     provider: str
     model: str
     context: SurfaceContextMetadataContract
-    attempt: int
+    model_call_count: int
 
 
 class SurfaceEventModelCompletedPayloadContract(BaseModel):
@@ -213,7 +213,7 @@ class SurfaceEventModelCompletedPayloadContract(BaseModel):
     duration_ms: int
     usage: SurfaceModelUsageContract | None = None
     provider_response_id: str | None = None
-    attempt: int
+    model_call_count: int
 
 
 class SurfaceEventModelFailedPayloadContract(BaseModel):
@@ -223,7 +223,7 @@ class SurfaceEventModelFailedPayloadContract(BaseModel):
     model: str
     duration_ms: int
     failure_reason: str
-    attempt: int
+    model_call_count: int
     failure_code: str | None = None
     parse_status: str | None = None
     validation_status: Literal["valid", "invalid", "not_validated"] | None = None
@@ -236,7 +236,7 @@ class SurfaceEventModelProtocolFailedPayloadContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reason: str
-    attempt: int
+    model_call_count: int
     provider_response_id: str | None = None
 
 
@@ -244,7 +244,7 @@ class SurfaceEventRunValidationFailedPayloadContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     errors: list[str]
-    attempt: int
+    model_call_count: int
     provider_response_id: str | None = None
 
 
@@ -254,7 +254,7 @@ class SurfaceEventAgentValueEmittedPayloadContract(BaseModel):
     index: int
     value_digest: str
     value_bytes: int
-    attempt: int
+    model_call_count: int
     provider_response_id: str | None = None
 
 
@@ -419,8 +419,8 @@ class SurfaceEventAIJudgmentPayloadContract(BaseModel):
     provider_response_id: str | None = None
     response_output_shape: dict[str, Any] | None = None
     reason_codes: list[str] | None = None
-    attempt: int | None = None
-    max_model_attempts: int | None = None
+    model_call_count: int | None = None
+    agent_loop_max_model_calls: int | None = None
     omitted_turn_count: int | None = None
     eligible_capability_count: int | None = None
 
