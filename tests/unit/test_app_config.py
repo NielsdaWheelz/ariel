@@ -243,7 +243,6 @@ def test_discord_settings_default_to_disabled(monkeypatch: pytest.MonkeyPatch) -
     assert settings.agency_event_secret is None
     assert settings.agency_event_max_skew_seconds == 300
     assert settings.worker_poll_seconds == 1.0
-    assert settings.worker_heartbeat_timeout_seconds == 300
 
 
 def test_discord_settings_load_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -256,7 +255,6 @@ def test_discord_settings_load_from_env(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setenv("ARIEL_AGENCY_EVENT_SECRET", "agency-secret")
     monkeypatch.setenv("ARIEL_AGENCY_EVENT_MAX_SKEW_SECONDS", "120")
     monkeypatch.setenv("ARIEL_WORKER_POLL_SECONDS", "0.25")
-    monkeypatch.setenv("ARIEL_WORKER_HEARTBEAT_TIMEOUT_SECONDS", "45")
 
     settings = _app_settings_without_env_files()
     assert settings.discord_bot_token == "discord-token"
@@ -268,7 +266,6 @@ def test_discord_settings_load_from_env(monkeypatch: pytest.MonkeyPatch) -> None
     assert settings.agency_event_secret == "agency-secret"
     assert settings.agency_event_max_skew_seconds == 120
     assert settings.worker_poll_seconds == 0.25
-    assert settings.worker_heartbeat_timeout_seconds == 45
 
 
 def test_provider_runtime_settings_default_to_production_values() -> None:
@@ -405,7 +402,6 @@ def test_discord_base_url_must_be_http_url(monkeypatch: pytest.MonkeyPatch) -> N
         "ARIEL_DISCORD_NOTIFICATION_TIMEOUT_SECONDS",
         "ARIEL_WORKER_POLL_SECONDS",
         "ARIEL_AGENCY_EVENT_MAX_SKEW_SECONDS",
-        "ARIEL_WORKER_HEARTBEAT_TIMEOUT_SECONDS",
     ],
 )
 def test_worker_and_agency_numeric_settings_reject_non_positive_values(

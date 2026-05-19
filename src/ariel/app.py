@@ -169,8 +169,8 @@ _POLICY_SYSTEM_INSTRUCTIONS = (
     "If user intent is ambiguous or conflicting, ask for the missing details instead of guessing.",
     "If the user asks about details not present in this context, state uncertainty and ask for recovery details.",
     (
-        "For Google write actions, cite exactly one authority: source_evidence_id, "
-        "commitment_id, or user_instruction_ref. Use user_instruction_ref=turn:<turn_id> "
+        "For Google write actions, cite exactly one authority: source_evidence_id "
+        "or user_instruction_ref. Use user_instruction_ref=turn:<turn_id> "
         "only for an explicit user instruction shown in the turn-id context."
     ),
     "If the right Discord behavior is to listen without a visible reply, call agent.pause_until_input.",
@@ -3336,7 +3336,6 @@ def _wake(
             db,
             turn_id=turn.id,
             now=_utcnow(),
-            new_id_fn=_new_id,
         )
         add_event(
             "evt.memory.remember_queued",
@@ -3756,7 +3755,6 @@ def create_app(
                     task_type="agency_event_received",
                     payload={"agency_event_id": agency_event.id},
                     now=now,
-                    max_attempts=5,
                 )
                 return JSONResponse(
                     status_code=202,
@@ -5014,7 +5012,6 @@ def create_app(
                     task_type="provider_event_received",
                     payload={"provider_event_id": provider_event.id},
                     now=now,
-                    max_attempts=5,
                 )
                 return JSONResponse(
                     status_code=202,
@@ -5071,7 +5068,6 @@ def create_app(
                         "resource_id": resource_id.strip() or "primary",
                     },
                     now=now,
-                    max_attempts=5,
                 )
                 return {"ok": True, "task_id": task.id}
 

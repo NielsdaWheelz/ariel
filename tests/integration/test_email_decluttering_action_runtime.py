@@ -176,7 +176,7 @@ def _seed_action_attempt(
         "cap.email.undo",
     } and not any(
         isinstance(full_input.get(key), str) and full_input[key]
-        for key in ("source_evidence_id", "commitment_id", "user_instruction_ref")
+        for key in ("source_evidence_id", "user_instruction_ref")
     ):
         full_input["user_instruction_ref"] = "turn:turn_email"
     stored_input = dict(full_input)

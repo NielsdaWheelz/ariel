@@ -117,11 +117,10 @@ REQUIRED_COLUMNS: Final[dict[str, tuple[str, ...]]] = {
     ),
     "background_tasks": (
         "idempotency_key",
-        "work_follow_up_loop_id",
-        "work_follow_up_loop_version",
-        "work_follow_up_scheduled_for",
         "provider_write_receipt_id",
+        "attempts",
         "recurrence_seconds",
+        "run_after",
     ),
     "provider_write_receipts": (
         "provider",
@@ -208,9 +207,8 @@ REQUIRED_CONSTRAINTS: Final[dict[str, tuple[str, ...]]] = {
     ),
     "background_tasks": (
         "ck_background_task_type",
-        "ck_background_task_status",
-        "ck_background_task_work_follow_up_shape",
         "ck_background_task_provider_write_reconcile_shape",
+        "ck_background_task_attempts_nonnegative",
     ),
     "provider_write_receipts": (
         "ck_provider_write_receipt_provider",
@@ -316,22 +314,18 @@ REQUIRED_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
     },
     "background_tasks": {
         "ck_background_task_type": (
-            "'workspace_commitment_extraction_due'",
-            "'work_follow_up_evaluate_due'",
-            "'provider_write_reconcile_due'",
             "'agent_wake'",
+            "'provider_write_reconcile_due'",
             "'provider_watch_renew_due'",
             "'provider_reconcile_sync_due'",
-        ),
-        "ck_background_task_status": ("'pending'", "'dead_letter'"),
-        "ck_background_task_work_follow_up_shape": (
-            "work_follow_up_loop_id IS NOT NULL",
-            "work_follow_up_scheduled_for IS NOT NULL",
+            "'memory_remember'",
+            "'memory_sweep'",
         ),
         "ck_background_task_provider_write_reconcile_shape": (
             "provider_write_reconcile_due",
             "provider_write_receipt_id IS NOT NULL",
         ),
+        "ck_background_task_attempts_nonnegative": ("attempts", ">=", "0"),
     },
     "work_commitments": {
         "ck_work_commitment_lifecycle_state": ("'waiting_on_user'", "'superseded'"),
@@ -384,8 +378,8 @@ REQUIRED_INDEXES: Final[dict[str, tuple[str, ...]]] = {
     ),
     "background_tasks": (
         "ix_background_tasks_idempotency_key_unique",
-        "ix_background_tasks_work_follow_up_unique",
         "ix_background_tasks_provider_write_reconcile_unique",
+        "ix_background_tasks_run_after",
     ),
     "google_provider_objects": (
         "ix_google_provider_object_identity_unique",
@@ -418,7 +412,6 @@ REQUIRED_UNIQUE_INDEXES: Final[dict[str, tuple[str, ...]]] = {
     ),
     "background_tasks": (
         "ix_background_tasks_idempotency_key_unique",
-        "ix_background_tasks_work_follow_up_unique",
         "ix_background_tasks_provider_write_reconcile_unique",
     ),
     "google_provider_objects": (
@@ -443,7 +436,6 @@ REQUIRED_INDEX_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
     },
     "background_tasks": {
         "ix_background_tasks_idempotency_key_unique": ("idempotency_key IS NOT NULL",),
-        "ix_background_tasks_work_follow_up_unique": ("work_follow_up_evaluate_due",),
         "ix_background_tasks_provider_write_reconcile_unique": ("provider_write_reconcile_due",),
     },
     "google_provider_objects": {
@@ -472,12 +464,8 @@ REQUIRED_INDEX_COLUMNS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
     },
     "background_tasks": {
         "ix_background_tasks_idempotency_key_unique": ("idempotency_key",),
-        "ix_background_tasks_work_follow_up_unique": (
-            "work_follow_up_loop_id",
-            "work_follow_up_loop_version",
-            "work_follow_up_scheduled_for",
-        ),
         "ix_background_tasks_provider_write_reconcile_unique": ("provider_write_receipt_id",),
+        "ix_background_tasks_run_after": ("run_after",),
     },
     "google_provider_objects": {
         "ix_google_provider_object_identity_unique": (

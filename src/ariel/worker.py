@@ -48,6 +48,12 @@ class UnsupportedTaskType(RuntimeError):
     pass
 
 
+# A failing task retries up to this many times. A recurring task that exhausts
+# its retries is re-armed to its next occurrence rather than dropped; a one-shot
+# is deleted.
+MAX_TASK_ATTEMPTS = 5
+
+
 def _utcnow() -> datetime:
     return datetime.now(tz=UTC)
 
@@ -56,52 +62,19 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}_{ulid.new().str.lower()}"
 
 
-def claim_next_task(db: Session, *, worker_id: str, now: datetime) -> BackgroundTaskRecord | None:
-    task = db.scalar(
+def select_next_task(db: Session, *, now: datetime) -> BackgroundTaskRecord | None:
+    # The single-threaded worker takes the earliest due row. There is no claim
+    # protocol: "a row exists and is due" is the only pending state.
+    return db.scalar(
         select(BackgroundTaskRecord)
-        .where(
-            BackgroundTaskRecord.status == "pending",
-            BackgroundTaskRecord.run_after <= now,
-        )
+        .where(BackgroundTaskRecord.run_after <= now)
         .order_by(
             BackgroundTaskRecord.run_after.asc(),
             BackgroundTaskRecord.created_at.asc(),
             BackgroundTaskRecord.id.asc(),
         )
         .limit(1)
-        .with_for_update(skip_locked=True)
     )
-    if task is None:
-        return None
-    task.status = "running"
-    task.attempts += 1
-    task.claimed_by = worker_id
-    task.last_heartbeat = now
-    task.updated_at = now
-    db.flush()
-    return task
-
-
-def reap_stale_tasks(db: Session, *, now: datetime, heartbeat_timeout_seconds: int) -> int:
-    stale_before = now - timedelta(seconds=heartbeat_timeout_seconds)
-    stale_tasks = db.scalars(
-        select(BackgroundTaskRecord)
-        .where(
-            BackgroundTaskRecord.status == "running",
-            BackgroundTaskRecord.last_heartbeat < stale_before,
-        )
-        .with_for_update(skip_locked=True)
-    ).all()
-    for task in stale_tasks:
-        task.status = "pending" if task.attempts < task.max_attempts else "dead_letter"
-        task.error = "heartbeat timeout"
-        task.claimed_by = None
-        task.last_heartbeat = None
-        task.run_after = now
-        task.updated_at = now
-    if stale_tasks:
-        db.flush()
-    return len(stale_tasks)
 
 
 _PROVIDER_WATCH_RENEW_INTERVAL_SECONDS = 6 * 3600
@@ -241,7 +214,6 @@ def process_provider_reconcile_sync_due(
                         "resource_id": cursor.resource_id,
                     },
                     now=now,
-                    max_attempts=5,
                 )
 
 
@@ -249,31 +221,20 @@ def process_one_task(
     *,
     session_factory: sessionmaker[Session],
     settings: AppSettings | None = None,
-    worker_id: str | None = None,
     model_adapter: Any | None = None,
     runtime: Runtime | None = None,
 ) -> bool:
     resolved_settings = settings or AppSettings()
-    resolved_worker_id = worker_id or f"worker-{ulid.new().str.lower()}"
 
     with session_factory() as db:
         with db.begin():
             now = _utcnow()
-            reap_stale_tasks(
-                db,
-                now=now,
-                heartbeat_timeout_seconds=resolved_settings.worker_heartbeat_timeout_seconds,
-            )
-
-    with session_factory() as db:
-        with db.begin():
-            now = _utcnow()
-            enqueue_due_memory_sweep(db, settings=resolved_settings, now=now, new_id_fn=_new_id)
+            enqueue_due_memory_sweep(db, settings=resolved_settings, now=now)
             seed_provider_maintenance_tasks(db, settings=resolved_settings, now=now)
 
     with session_factory() as db:
         with db.begin():
-            task = claim_next_task(db, worker_id=resolved_worker_id, now=_utcnow())
+            task = select_next_task(db, now=_utcnow())
             if task is None:
                 return False
             task_id = task.id
@@ -356,22 +317,11 @@ def process_one_task(
                 )
             case "expire_approvals":
                 _expire_approvals(session_factory=session_factory, task_payload=task_payload)
-            case "reap_stale_tasks":
-                with session_factory() as db:
-                    with db.begin():
-                        reap_stale_tasks(
-                            db,
-                            now=_utcnow(),
-                            heartbeat_timeout_seconds=(
-                                resolved_settings.worker_heartbeat_timeout_seconds
-                            ),
-                        )
             case "provider_event_received":
                 process_provider_event_received(
                     session_factory=session_factory,
                     task_payload=task_payload,
                     now_fn=_utcnow,
-                    new_id_fn=_new_id,
                 )
             case "provider_sync_due":
                 process_provider_sync_due(
@@ -416,44 +366,26 @@ def process_one_task(
                 )
             case _:
                 raise UnsupportedTaskType(f"unsupported task type: {task_type}")
-    except UnsupportedTaskType as exc:
-        _mark_task_failed(
-            session_factory=session_factory,
-            task_id=task_id,
-            error=safe_failure_reason(str(exc), fallback="unsupported task type"),
-            retry=False,
-        )
+    except UnsupportedTaskType:
+        _mark_task_failed(session_factory=session_factory, task_id=task_id)
         return True
-    except Exception as exc:
-        _mark_task_failed(
-            session_factory=session_factory,
-            task_id=task_id,
-            error=safe_failure_reason(str(exc), fallback=f"unexpected {exc.__class__.__name__}"),
-        )
+    except Exception:
+        _mark_task_failed(session_factory=session_factory, task_id=task_id)
         return True
 
     with session_factory() as db:
         with db.begin():
             task = db.get(BackgroundTaskRecord, task_id)
             if task is not None:
-                now = _utcnow()
-                task.status = "completed"
-                task.error = None
-                task.claimed_by = None
-                task.last_heartbeat = None
-                task.updated_at = now
-                # A recurring task re-enqueues itself: the next occurrence is a
-                # fresh row with the same type, payload, and recurrence, due one
-                # interval after this completion.
+                # A recurring task is re-armed in place to its next occurrence;
+                # a one-shot is deleted. A row is deleted only on success.
                 if task.recurrence_seconds is not None:
-                    enqueue_background_task(
-                        db,
-                        task_type=task.task_type,
-                        payload=dict(task.payload) if isinstance(task.payload, dict) else {},
-                        now=now,
-                        run_after=now + timedelta(seconds=task.recurrence_seconds),
-                        recurrence_seconds=task.recurrence_seconds,
-                    )
+                    now = _utcnow()
+                    task.run_after = now + timedelta(seconds=task.recurrence_seconds)
+                    task.attempts = 0
+                    task.updated_at = now
+                else:
+                    db.delete(task)
     return True
 
 
@@ -482,8 +414,6 @@ def _mark_task_failed(
     *,
     session_factory: sessionmaker[Session],
     task_id: str,
-    error: str,
-    retry: bool = True,
 ) -> None:
     with session_factory() as db:
         with db.begin():
@@ -491,18 +421,18 @@ def _mark_task_failed(
             if task is None:
                 return
             now = _utcnow()
-            task.status = (
-                "pending" if retry and task.attempts < task.max_attempts else "dead_letter"
-            )
-            task.error = error
-            task.claimed_by = None
-            task.last_heartbeat = None
-            task.run_after = (
-                now + timedelta(seconds=min(300, 2 ** max(task.attempts - 1, 0)))
-                if task.status == "pending"
-                else now
-            )
+            task.attempts += 1
             task.updated_at = now
+            if task.attempts >= MAX_TASK_ATTEMPTS:
+                # A recurring maintenance task is never permanently lost: it is
+                # re-armed to its next occurrence. A one-shot gives up.
+                if task.recurrence_seconds is not None:
+                    task.run_after = now + timedelta(seconds=task.recurrence_seconds)
+                    task.attempts = 0
+                else:
+                    db.delete(task)
+                return
+            task.run_after = now + timedelta(seconds=min(300, 2 ** (task.attempts - 1)))
 
 
 def _payload_text(payload: dict[str, Any], key: str) -> str | None:

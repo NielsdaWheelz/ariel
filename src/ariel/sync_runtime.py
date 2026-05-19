@@ -20,7 +20,6 @@ from ariel.google_connector import (
 )
 from ariel.google_workspace_normalization import normalize_calendar_event
 from ariel.persistence import (
-    BackgroundTaskRecord,
     EmailThreadWatchRecord,
     GoogleConnectorRecord,
     GoogleProviderObjectRecord,
@@ -86,7 +85,6 @@ def process_provider_event_received(
     session_factory: sessionmaker[Session],
     task_payload: dict[str, Any],
     now_fn: Callable[[], datetime],
-    new_id_fn: Callable[[str], str],
 ) -> None:
     provider_event_id = _payload_text(task_payload, "provider_event_id")
     if provider_event_id is None:
@@ -105,26 +103,16 @@ def process_provider_event_received(
             if event.status != "accepted":
                 return
             now = now_fn()
-            db.add(
-                BackgroundTaskRecord(
-                    id=new_id_fn("tsk"),
-                    task_type="provider_sync_due",
-                    payload={
-                        "provider_event_id": event.id,
-                        "provider": event.provider,
-                        "resource_type": event.resource_type,
-                        "resource_id": event.resource_id,
-                    },
-                    status="pending",
-                    attempts=0,
-                    max_attempts=5,
-                    error=None,
-                    claimed_by=None,
-                    run_after=now,
-                    last_heartbeat=None,
-                    created_at=now,
-                    updated_at=now,
-                )
+            enqueue_background_task(
+                db,
+                task_type="provider_sync_due",
+                payload={
+                    "provider_event_id": event.id,
+                    "provider": event.provider,
+                    "resource_type": event.resource_type,
+                    "resource_id": event.resource_id,
+                },
+                now=now,
             )
 
 
@@ -365,7 +353,6 @@ def process_provider_sync_due(
                 resource_id=resource_id,
                 error=error,
                 now=now_fn(),
-                new_id_fn=new_id_fn,
             )
             _release_provider_sync_lock(lock_db, lock_id)
             return
@@ -1297,7 +1284,6 @@ def _handle_stale_cursor(
     resource_id: str,
     error: str,
     now: datetime,
-    new_id_fn: Callable[[str], str],
 ) -> None:
     with session_factory() as db:
         with db.begin():
@@ -1327,25 +1313,15 @@ def _handle_stale_cursor(
                 if event is not None:
                     event.status = "failed"
                     event.error = error
-            db.add(
-                BackgroundTaskRecord(
-                    id=new_id_fn("tsk"),
-                    task_type="provider_sync_due",
-                    payload={
-                        "provider": "google",
-                        "resource_type": resource_type,
-                        "resource_id": resource_id,
-                    },
-                    status="pending",
-                    attempts=0,
-                    max_attempts=5,
-                    error=None,
-                    claimed_by=None,
-                    run_after=now,
-                    last_heartbeat=None,
-                    created_at=now,
-                    updated_at=now,
-                )
+            enqueue_background_task(
+                db,
+                task_type="provider_sync_due",
+                payload={
+                    "provider": "google",
+                    "resource_type": resource_type,
+                    "resource_id": resource_id,
+                },
+                now=now,
             )
 
 

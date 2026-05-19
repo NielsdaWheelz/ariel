@@ -135,7 +135,7 @@ def test_schedule_syscall_writes_an_agent_wake_background_task(
         assert task.payload == {"note": "check whether the PR landed"}
         assert task.run_after == datetime(2026, 6, 2, 9, 0, tzinfo=UTC)
         assert task.recurrence_seconds is None
-        assert task.status == "pending"
+        assert task.attempts == 0
         # The syscall is inline: it never produced an execute_action_attempt row.
         execute_tasks = db.scalars(
             select(BackgroundTaskRecord).where(
@@ -279,18 +279,17 @@ def test_worker_agent_wake_arm_invokes_wake_for_a_due_task(
         assert process_one_task(
             session_factory=session_factory,
             settings=runtime.settings,
-            worker_id="w-wake",
             runtime=runtime,
         )
 
     assert adapter.user_messages_seen == ["follow up on the deploy"]
     with session_factory() as db:
         with db.begin():
+            # A one-shot task is deleted on success: no agent_wake row remains.
             wake_tasks = db.scalars(
                 select(BackgroundTaskRecord).where(BackgroundTaskRecord.task_type == "agent_wake")
             ).all()
-            assert len(wake_tasks) == 1
-            assert wake_tasks[0].status == "completed"
+            assert wake_tasks == []
             # _wake recorded the scheduled wake as a session turn carrying the
             # note as the turn's user_message.
             turn = db.scalar(

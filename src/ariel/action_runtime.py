@@ -60,7 +60,6 @@ from ariel.persistence import (
     ProviderEvidenceRecord,
     ProviderWriteReceiptRecord,
     TurnRecord,
-    WorkCommitmentRecord,
     enqueue_background_task,
     to_rfc3339,
 )
@@ -195,26 +194,13 @@ def _enqueue_action_execution_task(
     db: Session,
     action_attempt: ActionAttemptRecord,
     now_fn: Callable[[], datetime],
-    new_id_fn: Callable[[str], str],
 ) -> BackgroundTaskRecord:
-    now = now_fn()
-    task = BackgroundTaskRecord(
-        id=new_id_fn("tsk"),
+    return enqueue_background_task(
+        db,
         task_type="execute_action_attempt",
         payload={"action_attempt_id": action_attempt.id},
-        status="pending",
-        attempts=0,
-        max_attempts=3,
-        error=None,
-        claimed_by=None,
-        run_after=now,
-        last_heartbeat=None,
-        created_at=now,
-        updated_at=now,
+        now=now_fn(),
     )
-    db.add(task)
-    db.flush()
-    return task
 
 
 def _email_hash(value: str) -> str:
@@ -1866,7 +1852,7 @@ def _provider_write_authority_payload(
 ) -> tuple[dict[str, Any] | None, str | None]:
     input_payload = normalized_input if isinstance(normalized_input, dict) else {}
     authority: dict[str, str] = {}
-    for key in ("source_evidence_id", "commitment_id", "user_instruction_ref"):
+    for key in ("source_evidence_id", "user_instruction_ref"):
         value = input_payload.get(key)
         if isinstance(value, str) and value.strip():
             authority[key] = value.strip()
@@ -1895,29 +1881,6 @@ def _provider_write_authority_payload(
         )
         if target_error is not None:
             return None, target_error
-
-    commitment_id = authority.get("commitment_id")
-    if commitment_id is not None:
-        commitment_exists = db.scalar(
-            select(WorkCommitmentRecord.id)
-            .where(
-                WorkCommitmentRecord.id == commitment_id,
-                WorkCommitmentRecord.provider == "google",
-                WorkCommitmentRecord.provider_account_id == provider_account_id,
-                WorkCommitmentRecord.lifecycle_state.in_(
-                    (
-                        "active",
-                        "waiting_on_user",
-                        "waiting_on_counterparty",
-                        "scheduled",
-                        "snoozed",
-                    )
-                ),
-            )
-            .limit(1)
-        )
-        if commitment_exists is None:
-            return None, "provider_commitment_not_live"
 
     user_instruction_ref = authority.get("user_instruction_ref")
     instruction_turn_id = None
@@ -2027,7 +1990,7 @@ def _record_provider_write_receipt(
         response_payload=response_payload,
     )
     if provider == "google" and authority_payload is not None:
-        for key in ("source_evidence_id", "commitment_id", "user_instruction_ref"):
+        for key in ("source_evidence_id", "user_instruction_ref"):
             value = authority_payload.get(key)
             if isinstance(value, str):
                 provider_object_ids[key] = value
@@ -2267,37 +2230,17 @@ def _append_provider_write_reconcile_unavailable_event(
 ) -> None:
     now = now_fn()
     idempotency_key = f"provider_write_reconcile:{receipt.id}"
-    reconcile_task = db.scalar(
-        select(BackgroundTaskRecord)
-        .where(BackgroundTaskRecord.idempotency_key == idempotency_key)
-        .limit(1)
+    reconcile_task = enqueue_background_task(
+        db,
+        task_type="provider_write_reconcile_due",
+        idempotency_key=idempotency_key,
+        payload={
+            "provider_write_receipt_id": receipt.id,
+            "action_attempt_id": action_attempt.id,
+            "receipt_response_digest": receipt.response_digest,
+        },
+        now=now,
     )
-    if reconcile_task is None:
-        reconcile_task = BackgroundTaskRecord(
-            id=new_id_fn("tsk"),
-            task_type="provider_write_reconcile_due",
-            idempotency_key=idempotency_key,
-            work_follow_up_loop_id=None,
-            work_follow_up_loop_version=None,
-            work_follow_up_scheduled_for=None,
-            provider_write_receipt_id=receipt.id,
-            payload={
-                "provider_write_receipt_id": receipt.id,
-                "action_attempt_id": action_attempt.id,
-                "receipt_response_digest": receipt.response_digest,
-            },
-            status="pending",
-            attempts=0,
-            max_attempts=3,
-            error=None,
-            claimed_by=None,
-            run_after=now,
-            last_heartbeat=None,
-            created_at=now,
-            updated_at=now,
-        )
-        db.add(reconcile_task)
-        db.flush()
     _append_action_execution_event(
         db=db,
         action_attempt=action_attempt,
@@ -3117,7 +3060,6 @@ def process_one_call(
             db=db,
             action_attempt=action_attempt,
             now_fn=now_fn,
-            new_id_fn=new_id_fn,
         )
         add_event(
             "evt.action.execution.started",
@@ -3939,7 +3881,6 @@ def resolve_approval_decision(
                         db=db,
                         action_attempt=action_attempt,
                         now_fn=now_fn,
-                        new_id_fn=new_id_fn,
                     )
                     add_approval_event(
                         "evt.action.execution.started",

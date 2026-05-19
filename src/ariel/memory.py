@@ -44,6 +44,7 @@ from .persistence import (
     MemoryProfileRecord,
     SessionRecord,
     TurnRecord,
+    enqueue_background_task,
 )
 from .redaction import redact_text
 
@@ -997,40 +998,17 @@ def enqueue_memory_remember(
     *,
     turn_id: str,
     now: datetime,
-    new_id_fn: Callable[[str], str],
 ) -> str:
     """Enqueue a ``memory_remember`` background task for a completed turn (or a
     closing session's final turn). Idempotent per turn: a second enqueue for the
     same turn returns the existing task. Returns the task id."""
-    idempotency_key = f"memory_remember:{turn_id}"
-    existing = db.scalar(
-        select(BackgroundTaskRecord)
-        .where(BackgroundTaskRecord.idempotency_key == idempotency_key)
-        .limit(1)
-    )
-    if existing is not None:
-        return existing.id
-    task = BackgroundTaskRecord(
-        id=new_id_fn("tsk"),
+    task = enqueue_background_task(
+        db,
         task_type="memory_remember",
-        idempotency_key=idempotency_key,
-        work_follow_up_loop_id=None,
-        work_follow_up_loop_version=None,
-        work_follow_up_scheduled_for=None,
-        provider_write_receipt_id=None,
+        idempotency_key=f"memory_remember:{turn_id}",
         payload={"turn_id": turn_id},
-        status="pending",
-        attempts=0,
-        max_attempts=3,
-        error=None,
-        claimed_by=None,
-        run_after=now,
-        last_heartbeat=None,
-        created_at=now,
-        updated_at=now,
+        now=now,
     )
-    db.add(task)
-    db.flush()
     return task.id
 
 
@@ -1039,7 +1017,6 @@ def enqueue_due_memory_sweep(
     *,
     settings: AppSettings,
     now: datetime,
-    new_id_fn: Callable[[str], str],
 ) -> str | None:
     """Self-gating periodic sweep enqueuer: enqueue one ``memory_sweep`` task
     when the last sweep is older than the configured interval, otherwise enqueue
@@ -1056,25 +1033,5 @@ def enqueue_due_memory_sweep(
     )
     if recent_sweep is not None:
         return None
-    task = BackgroundTaskRecord(
-        id=new_id_fn("tsk"),
-        task_type="memory_sweep",
-        idempotency_key=None,
-        work_follow_up_loop_id=None,
-        work_follow_up_loop_version=None,
-        work_follow_up_scheduled_for=None,
-        provider_write_receipt_id=None,
-        payload={},
-        status="pending",
-        attempts=0,
-        max_attempts=3,
-        error=None,
-        claimed_by=None,
-        run_after=now,
-        last_heartbeat=None,
-        created_at=now,
-        updated_at=now,
-    )
-    db.add(task)
-    db.flush()
+    task = enqueue_background_task(db, task_type="memory_sweep", payload={}, now=now)
     return task.id

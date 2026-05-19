@@ -5,7 +5,7 @@ import hmac
 import json
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any, cast
 
 from fastapi.testclient import TestClient
@@ -16,11 +16,7 @@ from ariel.app import ModelAdapter, create_app
 from tests.integration.responses_helpers import responses_run_message
 from ariel.config import AppSettings
 from ariel.persistence import enqueue_background_task
-from ariel.worker import (
-    claim_next_task,
-    process_one_task,
-    reap_stale_tasks,
-)
+from ariel.worker import process_one_task
 from tests.fake_sandbox import FakeSandboxRuntime
 
 
@@ -103,53 +99,6 @@ def _signed_agency_body(
             "X-Ariel-Agency-Signature": f"sha256={signature}",
         },
     )
-
-
-def test_background_tasks_claim_retry_and_reap_are_durable_and_worker_safe(
-    postgres_url: str,
-) -> None:
-    now = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
-    adapter = DurableWorkflowAdapter()
-    with _build_client(postgres_url, adapter) as client:
-        with _session_factory(client)() as db:
-            with db.begin():
-                first = enqueue_background_task(
-                    db,
-                    task_type="reap_stale_tasks",
-                    payload={},
-                    now=now,
-                )
-                enqueue_background_task(
-                    db,
-                    task_type="reap_stale_tasks",
-                    payload={},
-                    now=now + timedelta(minutes=20),
-                )
-
-            with db.begin():
-                claimed = claim_next_task(db, worker_id="worker-a", now=now)
-                assert claimed is not None
-                assert claimed.id == first.id
-                assert claimed.status == "running"
-                assert claimed.attempts == 1
-                assert claim_next_task(db, worker_id="worker-b", now=now) is None
-
-            with db.begin():
-                assert (
-                    reap_stale_tasks(
-                        db, now=now + timedelta(minutes=10), heartbeat_timeout_seconds=60
-                    )
-                    == 1
-                )
-
-            with db.begin():
-                retried = claim_next_task(db, worker_id="worker-c", now=now + timedelta(minutes=10))
-                assert retried is not None
-                assert retried.id == first.id
-                assert retried.status == "running"
-                assert retried.attempts == 2
-
-        assert _count_rows(client, "background_tasks") == 2
 
 
 def test_agency_event_ingress_is_signed_idempotent_and_rejects_conflicts(
@@ -238,15 +187,16 @@ def test_google_provider_event_ingress_is_token_bound_deduped_and_conflict_safe(
         assert process_one_task(
             session_factory=_session_factory(client),
             settings=settings,
-            worker_id="worker-provider",
         )
         with _session_factory(client)() as db:
             with db.begin():
+                # The provider_event_received task is deleted on success; the
+                # remaining task is the agent wake's provider_sync_due, set
+                # apart from the seeded recurring maintenance tasks.
                 task_type = db.execute(
                     text(
                         "SELECT task_type FROM background_tasks "
-                        "WHERE status = 'pending' "
-                        "AND task_type NOT IN ('memory_sweep', "
+                        "WHERE task_type NOT IN ('memory_sweep', "
                         "'provider_watch_renew_due', 'provider_reconcile_sync_due') "
                         "ORDER BY created_at DESC LIMIT 1"
                     )
@@ -304,7 +254,6 @@ def test_google_calendar_sync_persists_provider_evidence_without_ambient_case(
         assert process_one_task(
             session_factory=_session_factory(client),
             settings=settings,
-            worker_id="worker-sync",
         )
         sync_runs = client.get("/v1/sync-runs")
         assert sync_runs.status_code == 200
@@ -340,7 +289,6 @@ def test_google_calendar_sync_persists_provider_evidence_without_ambient_case(
                     db.execute(
                         text(
                             "SELECT task_type, payload FROM background_tasks "
-                            "WHERE status = 'pending' "
                             "ORDER BY created_at ASC"
                         )
                     )

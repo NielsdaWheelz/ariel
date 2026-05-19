@@ -105,7 +105,6 @@ class AppSettings(BaseSettings):
     weather_dev_timeout_seconds: float = 8.0
     weather_default_location: str | None = None
     worker_poll_seconds: float = 1.0
-    worker_heartbeat_timeout_seconds: int = 300
 
     @field_validator("bind_host")
     @classmethod
@@ -455,7 +454,6 @@ class AppSettings(BaseSettings):
         "attachment_max_bytes",
         "attachment_handle_ttl_seconds",
         "agency_event_max_skew_seconds",
-        "worker_heartbeat_timeout_seconds",
         "provider_reconcile_sync_interval_seconds",
     )
     @classmethod

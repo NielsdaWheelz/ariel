@@ -39,7 +39,12 @@ from ariel.capability_registry import (
     run_callable_name_for_capability_id,
 )
 from ariel.config import AppSettings
-from ariel.persistence import AIJudgmentRecord, BackgroundTaskRecord, SessionRecord
+from ariel.persistence import (
+    AIJudgmentRecord,
+    BackgroundTaskRecord,
+    SessionRecord,
+    enqueue_background_task,
+)
 from ariel.worker import process_one_task
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.responses_helpers import responses_with_run_calls
@@ -803,52 +808,34 @@ def test_memory_sweep_forgets_stale_facts_and_deletes_long_forgotten_rows(
         # Enqueue the periodic sweep task.
         with _session_factory(client)() as db:
             with db.begin():
-                db.add(
-                    BackgroundTaskRecord(
-                        id=_new_id("tsk"),
-                        task_type="memory_sweep",
-                        idempotency_key=None,
-                        work_follow_up_loop_id=None,
-                        work_follow_up_loop_version=None,
-                        work_follow_up_scheduled_for=None,
-                        provider_write_receipt_id=None,
-                        payload={},
-                        status="pending",
-                        attempts=0,
-                        max_attempts=3,
-                        error=None,
-                        claimed_by=None,
-                        run_after=old,
-                        last_heartbeat=None,
-                        created_at=old,
-                        updated_at=old,
-                    )
+                enqueue_background_task(
+                    db,
+                    task_type="memory_sweep",
+                    payload={},
+                    now=old,
+                    run_after=old,
                 )
 
         # ``process_one_task`` does one unit of work per call, and a periodic
         # enqueuer pass can consume the first unit, so it is driven until the
-        # ``memory_sweep`` task reaches ``completed`` (the loop is capped).
+        # sweep's effect lands: the stale active fact is forgotten (the loop is
+        # capped). A one-shot task is deleted on success, so the row's absence
+        # is not a stable signal — the periodic enqueuer re-creates one.
+        fresh_status: str | None = None
         for _ in range(12):
             process_one_task(
                 session_factory=_session_factory(client),
                 settings=_settings(openai_api_key="test-key"),
-                worker_id="worker-memory-sweep",
             )
             with _session_factory(client)() as db:
-                sweep_done = db.scalar(
-                    select(BackgroundTaskRecord.status).where(
-                        BackgroundTaskRecord.task_type == "memory_sweep"
-                    )
-                )
-            if sweep_done == "completed":
+                fresh_status = db.execute(
+                    text("SELECT status FROM memory_facts WHERE id = :id"),
+                    {"id": fresh_id},
+                ).scalar_one_or_none()
+            if fresh_status == "forgotten":
                 break
-        assert sweep_done == "completed"
 
         with _session_factory(client)() as db:
-            fresh_status = db.execute(
-                text("SELECT status FROM memory_facts WHERE id = :id"),
-                {"id": fresh_id},
-            ).scalar_one_or_none()
             stale_row = db.execute(
                 text("SELECT id FROM memory_facts WHERE id = :id"),
                 {"id": stale_id},

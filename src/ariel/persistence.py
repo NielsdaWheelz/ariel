@@ -2199,18 +2199,6 @@ class BackgroundTaskRecord(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     task_type: Mapped[str] = mapped_column(String(64), nullable=False)
     idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
-    work_follow_up_loop_id: Mapped[str | None] = mapped_column(
-        String(32),
-        ForeignKey("work_follow_up_loops.id", ondelete="RESTRICT"),
-        nullable=True,
-        index=True,
-    )
-    work_follow_up_loop_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    work_follow_up_scheduled_for: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
-        nullable=True,
-        index=True,
-    )
     provider_write_receipt_id: Mapped[str | None] = mapped_column(
         String(32),
         ForeignKey("provider_write_receipts.id", ondelete="RESTRICT"),
@@ -2218,18 +2206,9 @@ class BackgroundTaskRecord(Base):
         index=True,
     )
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
-    error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    claimed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
     recurrence_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     run_after: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
-    last_heartbeat: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
-        nullable=True,
-        index=True,
-    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )
@@ -2240,36 +2219,13 @@ class BackgroundTaskRecord(Base):
     __table_args__ = (
         CheckConstraint(
             (
-                "task_type IN ('agency_event_received', 'deliver_discord_notification', "
-                "'expire_approvals', 'reap_stale_tasks', "
-                "'provider_event_received', "
-                "'provider_sync_due', 'memory_remember', 'memory_sweep', "
-                "'ambient_interpretation_due', 'proactive_deliberation_due', "
-                "'proactive_follow_up_due', 'proactive_feedback_learning_due', "
-                "'proactive_action_execution_due', 'execute_action_attempt', "
-                "'google_object_hydration_due', 'provider_evidence_extraction_due', "
-                "'workspace_commitment_extraction_due', 'work_follow_up_evaluate_due', "
-                "'provider_write_reconcile_due', 'leave_by_scan_due', "
-                "'leave_by_evaluate_due', 'agent_wake', 'provider_watch_renew_due', "
-                "'provider_reconcile_sync_due')"
+                "task_type IN ('agency_event_received', 'expire_approvals', "
+                "'provider_event_received', 'provider_sync_due', 'memory_remember', "
+                "'memory_sweep', 'execute_action_attempt', 'google_object_hydration_due', "
+                "'provider_evidence_extraction_due', 'provider_write_reconcile_due', "
+                "'agent_wake', 'provider_watch_renew_due', 'provider_reconcile_sync_due')"
             ),
             name="ck_background_task_type",
-        ),
-        CheckConstraint(
-            "status IN ('pending', 'running', 'completed', 'failed', 'dead_letter')",
-            name="ck_background_task_status",
-        ),
-        CheckConstraint(
-            "(task_type = 'work_follow_up_evaluate_due' "
-            "AND work_follow_up_loop_id IS NOT NULL "
-            "AND work_follow_up_loop_version IS NOT NULL "
-            "AND work_follow_up_loop_version > 0 "
-            "AND work_follow_up_scheduled_for IS NOT NULL) OR "
-            "(task_type != 'work_follow_up_evaluate_due' "
-            "AND work_follow_up_loop_id IS NULL "
-            "AND work_follow_up_loop_version IS NULL "
-            "AND work_follow_up_scheduled_for IS NULL)",
-            name="ck_background_task_work_follow_up_shape",
         ),
         CheckConstraint(
             "(task_type = 'provider_write_reconcile_due' "
@@ -2279,26 +2235,11 @@ class BackgroundTaskRecord(Base):
             name="ck_background_task_provider_write_reconcile_shape",
         ),
         CheckConstraint("attempts >= 0", name="ck_background_task_attempts_nonnegative"),
-        CheckConstraint("max_attempts > 0", name="ck_background_task_max_attempts_positive"),
-        Index(
-            "ix_background_tasks_claimable",
-            "status",
-            "run_after",
-            "created_at",
-        ),
         Index(
             "ix_background_tasks_idempotency_key_unique",
             "idempotency_key",
             unique=True,
             postgresql_where=(idempotency_key.is_not(None)),
-        ),
-        Index(
-            "ix_background_tasks_work_follow_up_unique",
-            "work_follow_up_loop_id",
-            "work_follow_up_loop_version",
-            "work_follow_up_scheduled_for",
-            unique=True,
-            postgresql_where=(task_type == "work_follow_up_evaluate_due"),
         ),
         Index(
             "ix_background_tasks_provider_write_reconcile_unique",
@@ -2632,7 +2573,6 @@ def enqueue_background_task(
     task_type: str,
     payload: dict[str, Any],
     now: datetime,
-    max_attempts: int = 3,
     idempotency_key: str | None = None,
     run_after: datetime | None = None,
     recurrence_seconds: int | None = None,
@@ -2645,21 +2585,7 @@ def enqueue_background_task(
         )
         if existing_task is not None:
             return existing_task
-    work_follow_up_loop_id = None
-    work_follow_up_loop_version = None
-    work_follow_up_scheduled_for = None
     provider_write_receipt_id = None
-    if task_type == "work_follow_up_evaluate_due":
-        loop_id = payload.get("loop_id")
-        loop_version = payload.get("loop_version")
-        scheduled_for = payload.get("scheduled_for")
-        if not isinstance(loop_id, str) or not isinstance(loop_version, int):
-            raise RuntimeError("work_follow_up_evaluate_due task payload invalid")
-        if not isinstance(scheduled_for, str):
-            raise RuntimeError("work_follow_up_evaluate_due task scheduled_for missing")
-        work_follow_up_loop_id = loop_id
-        work_follow_up_loop_version = loop_version
-        work_follow_up_scheduled_for = datetime.fromisoformat(scheduled_for.replace("Z", "+00:00"))
     if task_type == "provider_write_reconcile_due":
         receipt_id = payload.get("provider_write_receipt_id")
         if not isinstance(receipt_id, str) or not receipt_id:
@@ -2669,19 +2595,11 @@ def enqueue_background_task(
         id=_new_id("tsk"),
         task_type=task_type,
         idempotency_key=idempotency_key,
-        work_follow_up_loop_id=work_follow_up_loop_id,
-        work_follow_up_loop_version=work_follow_up_loop_version,
-        work_follow_up_scheduled_for=work_follow_up_scheduled_for,
         provider_write_receipt_id=provider_write_receipt_id,
         payload=payload,
-        status="pending",
         attempts=0,
-        max_attempts=max_attempts,
-        error=None,
-        claimed_by=None,
         recurrence_seconds=recurrence_seconds,
         run_after=run_after if run_after is not None else now,
-        last_heartbeat=None,
         created_at=now,
         updated_at=now,
     )
@@ -2690,30 +2608,14 @@ def enqueue_background_task(
     return task
 
 
-def _work_follow_up_task_idempotency_key(
-    *,
-    loop_id: str,
-    loop_version: int,
-    scheduled_for: str,
-) -> str:
-    return f"work_follow_up_evaluate_due:{loop_id}:{loop_version}:{scheduled_for}"
-
-
 def serialize_background_task(task: BackgroundTaskRecord) -> dict[str, Any]:
     return {
         "id": task.id,
         "task_type": task.task_type,
         "payload": redact_json_value(task.payload),
-        "status": task.status,
         "attempts": task.attempts,
-        "max_attempts": task.max_attempts,
-        "error": redact_text(task.error) if task.error is not None else None,
-        "claimed_by": task.claimed_by,
         "recurrence_seconds": task.recurrence_seconds,
         "run_after": to_rfc3339(task.run_after),
-        "last_heartbeat": (
-            to_rfc3339(task.last_heartbeat) if task.last_heartbeat is not None else None
-        ),
         "created_at": to_rfc3339(task.created_at),
         "updated_at": to_rfc3339(task.updated_at),
     }

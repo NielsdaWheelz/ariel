@@ -535,20 +535,13 @@ def _normalize_provider_write_authority(
     if idempotency_key is None:
         return None, "schema_invalid"
     authority: dict[str, str] = {"idempotency_key": idempotency_key}
-    for key in ("source_evidence_id", "commitment_id", "user_instruction_ref"):
+    for key in ("source_evidence_id", "user_instruction_ref"):
         value = _normalize_optional_text(raw_input.get(key), max_length=256)
         if raw_input.get(key) is not None and value is None:
             return None, "schema_invalid"
         if value is not None:
             authority[key] = value
-    if (
-        sum(
-            1
-            for key in ("source_evidence_id", "commitment_id", "user_instruction_ref")
-            if key in authority
-        )
-        != 1
-    ):
+    if sum(1 for key in ("source_evidence_id", "user_instruction_ref") if key in authority) != 1:
         return None, "schema_invalid"
     return authority, None
 
@@ -563,7 +556,6 @@ def _validate_drive_share_input(
             "role",
             "idempotency_key",
             "source_evidence_id",
-            "commitment_id",
             "user_instruction_ref",
         }
     ):
@@ -612,7 +604,6 @@ def _validate_calendar_create_event_input(
             "attendees",
             "idempotency_key",
             "source_evidence_id",
-            "commitment_id",
             "user_instruction_ref",
         }
     ):
@@ -697,7 +688,6 @@ def _validate_calendar_update_event_input(
             "attendees",
             "idempotency_key",
             "source_evidence_id",
-            "commitment_id",
             "user_instruction_ref",
         }
     ):
@@ -768,7 +758,6 @@ def _validate_calendar_update_event_input(
             "calendar_id",
             "idempotency_key",
             "source_evidence_id",
-            "commitment_id",
             "user_instruction_ref",
         }
     ):
@@ -787,7 +776,6 @@ def _validate_calendar_respond_to_event_input(
             "response_status",
             "idempotency_key",
             "source_evidence_id",
-            "commitment_id",
             "user_instruction_ref",
         }
     ):
@@ -831,7 +819,6 @@ def _validate_email_composition_input(
             "body",
             "idempotency_key",
             "source_evidence_id",
-            "commitment_id",
             "user_instruction_ref",
         }
     ):
@@ -925,7 +912,6 @@ def _validate_email_message_batch_mutation_input(
             "message_ids",
             "idempotency_key",
             "source_evidence_id",
-            "commitment_id",
             "user_instruction_ref",
         }
     ):
@@ -949,7 +935,6 @@ def _validate_email_labels_modify_input(
             "remove_labels",
             "idempotency_key",
             "source_evidence_id",
-            "commitment_id",
             "user_instruction_ref",
         }
     ):
@@ -982,7 +967,6 @@ def _validate_email_undo_input(
             "undo_token",
             "idempotency_key",
             "source_evidence_id",
-            "commitment_id",
             "user_instruction_ref",
         }
     ):
@@ -2563,7 +2547,7 @@ def _declare_google_calendar_create_event_egress_intent(
         "end_time": input_payload["end_time"],
         "idempotency_key": input_payload["idempotency_key"],
     }
-    for key in ("source_evidence_id", "commitment_id", "user_instruction_ref"):
+    for key in ("source_evidence_id", "user_instruction_ref"):
         if key in input_payload:
             payload[key] = input_payload[key]
     if isinstance(input_payload.get("description"), str):
@@ -2593,7 +2577,7 @@ def _declare_google_calendar_update_event_egress_intent(
         "event_id": input_payload["event_id"],
         "idempotency_key": input_payload["idempotency_key"],
     }
-    for key in ("source_evidence_id", "commitment_id", "user_instruction_ref"):
+    for key in ("source_evidence_id", "user_instruction_ref"):
         if key in input_payload:
             payload[key] = input_payload[key]
     for key in ("title", "start_time", "end_time", "description", "location", "attendees"):
@@ -2625,7 +2609,6 @@ def _declare_google_calendar_respond_to_event_egress_intent(
                 "response_status": input_payload["response_status"],
                 "idempotency_key": input_payload["idempotency_key"],
                 "source_evidence_id": input_payload.get("source_evidence_id"),
-                "commitment_id": input_payload.get("commitment_id"),
                 "user_instruction_ref": input_payload.get("user_instruction_ref"),
             },
         }
@@ -2773,7 +2756,7 @@ def _declare_google_drive_share_egress_intent(
         "role": input_payload["role"],
         "idempotency_key": input_payload["idempotency_key"],
     }
-    for key in ("source_evidence_id", "commitment_id", "user_instruction_ref"):
+    for key in ("source_evidence_id", "user_instruction_ref"):
         if key in input_payload:
             payload[key] = input_payload[key]
     return [

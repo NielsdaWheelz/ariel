@@ -167,7 +167,7 @@ def test_google_calendar_capability_validators_reject_inverted_windows() -> None
             "attendee_email": "User@Example.com",
             "response_status": "accepted",
             "idempotency_key": "cal-rsvp-1",
-            "commitment_id": "wkc_1",
+            "source_evidence_id": "pev_1",
         }
     )
     assert response_error is None
@@ -384,7 +384,7 @@ def test_default_workspace_provider_calendar_update_and_rsvp_patch_google_event(
             "attendee_email": "user@example.com",
             "response_status": "accepted",
             "idempotency_key": "cal-rsvp-1",
-            "commitment_id": "wkc_1",
+            "source_evidence_id": "pev_1",
         },
     )
 
