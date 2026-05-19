@@ -56,6 +56,7 @@ EMAIL_MUTATION_CAPABILITY_IDS = {
     "cap.email.undo",
 }
 MEMORY_CAPABILITY_IDS = {"cap.memory.recall", "cap.memory.remember"}
+PROACTIVE_CAPABILITY_IDS = {"cap.proactive.schedule"}
 MAPS_CAPABILITY_IDS = {"cap.maps.directions", "cap.maps.search_places"}
 
 
@@ -1117,6 +1118,23 @@ def _validate_memory_remember_input(
     raw_input: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
     return _validate_exact_text_input(raw_input, field_name="note", max_length=12_000)
+
+
+def _validate_proactive_schedule_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {"when", "note"}:
+        return None, "schema_invalid"
+    note = raw_input.get("note")
+    if not isinstance(note, str):
+        return None, "schema_invalid"
+    normalized_note = note.strip()
+    if not normalized_note or len(normalized_note) > 12_000:
+        return None, "schema_invalid"
+    when = _normalize_rfc3339_like(raw_input.get("when"))
+    if when is None:
+        return None, "schema_invalid"
+    return {"when": when, "note": normalized_note}, None
 
 
 def _normalize_optional_text(value: Any, *, max_length: int) -> str | None:
@@ -3683,6 +3701,21 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         validate_input=_validate_memory_remember_input,
         execute=None,
     ),
+    "cap.proactive.schedule": CapabilityDefinition(
+        capability_id="cap.proactive.schedule",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "proactive_schedule_v1",
+            "output_schema": "proactive_schedule_result_v1",
+            "idempotency": "action_attempt_id",
+            "execution_mode": "scheduler_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_proactive_schedule_input,
+        execute=None,
+    ),
 }
 
 
@@ -3769,6 +3802,7 @@ _RUN_CALLABLE_ALIASES = {
     "maps.search_places": "cap.maps.search_places",
     "memory.recall": "cap.memory.recall",
     "memory.remember": "cap.memory.remember",
+    "proactive.schedule": "cap.proactive.schedule",
     "search.news": "cap.search.news",
     "search.web": "cap.search.web",
     "weather.forecast": "cap.weather.forecast",

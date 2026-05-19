@@ -43,6 +43,7 @@ from ariel.capability_registry import (
     EMAIL_MUTATION_CAPABILITY_IDS,
     MAPS_CAPABILITY_IDS,
     MEMORY_CAPABILITY_IDS,
+    PROACTIVE_CAPABILITY_IDS,
     get_capability,
     internal_callable_capability_ids,
     run_callable_name_for_capability_id,
@@ -1977,7 +1978,7 @@ class TurnExecutionOutcome:
 
 @dataclass(slots=True, frozen=True)
 class WakeContext:
-    trigger_kind: Literal["user_message"]
+    trigger_kind: Literal["user_message", "scheduled_task"]
     prompt_text: str
     discord_context: dict[str, Any] | None
     attachment_sources: list[dict[str, Any]] | None
@@ -2766,6 +2767,9 @@ def _eligible_internal_callable_capability_ids(
                 capability_ids.append(capability_id)
             continue
         if capability_id in MEMORY_CAPABILITY_IDS:
+            capability_ids.append(capability_id)
+            continue
+        if capability_id in PROACTIVE_CAPABILITY_IDS:
             capability_ids.append(capability_id)
             continue
         if capability_id == "cap.web.extract":

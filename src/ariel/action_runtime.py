@@ -22,6 +22,7 @@ from ariel.capability_registry import (
     EMAIL_MUTATION_CAPABILITY_IDS,
     MAPS_CAPABILITY_IDS,
     MEMORY_CAPABILITY_IDS,
+    PROACTIVE_CAPABILITY_IDS,
     canonical_action_payload,
     capability_contract_hash,
     get_capability,
@@ -60,6 +61,7 @@ from ariel.persistence import (
     ProviderWriteReceiptRecord,
     TurnRecord,
     WorkCommitmentRecord,
+    enqueue_background_task,
     to_rfc3339,
 )
 from ariel.policy_engine import evaluate_proposal
@@ -671,6 +673,32 @@ def _execute_memory_capability(
             "digest_updated": output.digest is not None,
         }
     raise RuntimeError("unknown_memory_capability")
+
+
+def _execute_proactive_capability(
+    *,
+    db: Session,
+    capability_id: str,
+    normalized_input: dict[str, Any],
+    now_fn: Callable[[], datetime],
+) -> dict[str, Any]:
+    """Run one proactive syscall. ``cap.proactive.schedule`` writes a one-shot
+    ``agent_wake`` row to ``background_tasks``: ``run_after`` is the requested
+    wake time and ``payload`` carries the AI-authored note the future wake
+    receives as its prompt. The agent's whole scheduling surface is this one
+    syscall; it never touches the queue directly."""
+    if capability_id != "cap.proactive.schedule":
+        raise RuntimeError("unknown_proactive_capability")
+    when = str(normalized_input["when"])
+    run_after = datetime.fromisoformat(when.replace("Z", "+00:00"))
+    task = enqueue_background_task(
+        db,
+        task_type="agent_wake",
+        payload={"note": str(normalized_input["note"])},
+        now=now_fn(),
+        run_after=run_after,
+    )
+    return {"status": "scheduled", "task_id": task.id, "run_after": to_rfc3339(run_after)}
 
 
 def approval_execution_failure_message(error: str) -> str:
@@ -2659,6 +2687,7 @@ def process_one_call(
     is_discord_capability_call = capability_id in DISCORD_CAPABILITY_IDS
     is_attachment_capability_call = capability_id in ATTACHMENT_CAPABILITY_IDS
     is_memory_capability_call = capability_id in MEMORY_CAPABILITY_IDS
+    is_proactive_capability_call = capability_id in PROACTIVE_CAPABILITY_IDS
     is_retrieval_call = capability_id in _GROUNDED_RETRIEVAL_CAPABILITIES
     is_weather_forecast_call = capability_id == "cap.weather.forecast"
     if is_retrieval_call:
@@ -3132,10 +3161,15 @@ def process_one_call(
         )
         return
 
-    # Memory syscalls are write_reversible but execute inline: each runs a
-    # subagent host-side and returns its result (recalled facts, a remember
-    # summary) into the program, so they skip the durable execution queue.
-    if evaluation.capability.impact_level != "read" and not is_memory_capability_call:
+    # Memory and proactive syscalls are write_reversible but execute inline:
+    # each runs host-side and returns its result (recalled facts, a remember
+    # summary, a scheduled task) into the program, so they skip the durable
+    # execution queue.
+    if (
+        evaluation.capability.impact_level != "read"
+        and not is_memory_capability_call
+        and not is_proactive_capability_call
+    ):
         task = _enqueue_action_execution_task(
             db=db,
             action_attempt=action_attempt,
@@ -3339,6 +3373,31 @@ def process_one_call(
             execution_result = ExecutionResult(
                 status="succeeded",
                 output=memory_output,
+                error=None,
+            )
+    elif is_proactive_capability_call:
+        # The schedule syscall writes one agent_wake row to the caller's
+        # transaction and returns the task identity into the program.
+        try:
+            proactive_output = _execute_proactive_capability(
+                db=db,
+                capability_id=capability_id,
+                normalized_input=evaluation.normalized_input,
+                now_fn=now_fn,
+            )
+        except Exception as exc:  # noqa: BLE001
+            execution_result = ExecutionResult(
+                status="failed",
+                output=None,
+                error=safe_failure_reason(
+                    str(exc),
+                    fallback=f"unexpected {exc.__class__.__name__}",
+                ),
+            )
+        else:
+            execution_result = ExecutionResult(
+                status="succeeded",
+                output=proactive_output,
                 error=None,
             )
     else:

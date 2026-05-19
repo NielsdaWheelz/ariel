@@ -2177,6 +2177,7 @@ class BackgroundTaskRecord(Base):
     max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     claimed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    recurrence_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     run_after: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     last_heartbeat: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
@@ -2203,7 +2204,7 @@ class BackgroundTaskRecord(Base):
                 "'google_object_hydration_due', 'provider_evidence_extraction_due', "
                 "'workspace_commitment_extraction_due', 'work_follow_up_evaluate_due', "
                 "'provider_write_reconcile_due', 'leave_by_scan_due', "
-                "'leave_by_evaluate_due')"
+                "'leave_by_evaluate_due', 'agent_wake')"
             ),
             name="ck_background_task_type",
         ),
@@ -2586,6 +2587,8 @@ def enqueue_background_task(
     now: datetime,
     max_attempts: int = 3,
     idempotency_key: str | None = None,
+    run_after: datetime | None = None,
+    recurrence_seconds: int | None = None,
 ) -> BackgroundTaskRecord:
     if idempotency_key is not None:
         existing_task = db.scalar(
@@ -2629,7 +2632,8 @@ def enqueue_background_task(
         max_attempts=max_attempts,
         error=None,
         claimed_by=None,
-        run_after=now,
+        recurrence_seconds=recurrence_seconds,
+        run_after=run_after if run_after is not None else now,
         last_heartbeat=None,
         created_at=now,
         updated_at=now,
@@ -2658,6 +2662,7 @@ def serialize_background_task(task: BackgroundTaskRecord) -> dict[str, Any]:
         "max_attempts": task.max_attempts,
         "error": redact_text(task.error) if task.error is not None else None,
         "claimed_by": task.claimed_by,
+        "recurrence_seconds": task.recurrence_seconds,
         "run_after": to_rfc3339(task.run_after),
         "last_heartbeat": (
             to_rfc3339(task.last_heartbeat) if task.last_heartbeat is not None else None

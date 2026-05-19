@@ -120,6 +120,7 @@ REQUIRED_COLUMNS: Final[dict[str, tuple[str, ...]]] = {
         "work_follow_up_loop_version",
         "work_follow_up_scheduled_for",
         "provider_write_receipt_id",
+        "recurrence_seconds",
     ),
     "provider_write_receipts": (
         "provider",
@@ -308,6 +309,7 @@ REQUIRED_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
             "'workspace_commitment_extraction_due'",
             "'work_follow_up_evaluate_due'",
             "'provider_write_reconcile_due'",
+            "'agent_wake'",
         ),
         "ck_background_task_status": ("'pending'", "'dead_letter'"),
         "ck_background_task_work_follow_up_shape": (

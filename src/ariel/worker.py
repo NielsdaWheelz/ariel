@@ -15,7 +15,15 @@ from .action_runtime import (
     process_provider_write_reconcile_due,
     reconcile_expired_approvals_for_session,
 )
-from .app import Runtime, build_agency_runtime, build_google_runtime, build_runtime
+from .app import (
+    Runtime,
+    WakeContext,
+    _get_or_create_active_session,
+    _wake,
+    build_agency_runtime,
+    build_google_runtime,
+    build_runtime,
+)
 from .config import AppSettings
 from .persistence import (
     AgencyEventRecord,
@@ -439,6 +447,28 @@ def process_one_task(
                     task_payload=task_payload,
                     settings=resolved_settings,
                 )
+            case "agent_wake":
+                note = _payload_text(task_payload, "note")
+                if note is None:
+                    raise RuntimeError("agent_wake task missing note")
+                if runtime is None:
+                    raise RuntimeError("agent_wake task requires a configured runtime")
+                with session_factory() as db:
+                    session = _get_or_create_active_session(db)
+                    _wake(
+                        runtime=runtime,
+                        db=db,
+                        request_session_id=session.id,
+                        wake_context=WakeContext(
+                            trigger_kind="scheduled_task",
+                            prompt_text=note,
+                            discord_context=None,
+                            attachment_sources=None,
+                            ingress_provenance=None,
+                        ),
+                        google_runtime=build_google_runtime(runtime.settings),
+                    )
+                    db.commit()
             case "execute_action_attempt":
                 action_attempt_id = _payload_text(task_payload, "action_attempt_id")
                 if action_attempt_id is None:
@@ -617,6 +647,18 @@ def process_one_task(
                 task.claimed_by = None
                 task.last_heartbeat = None
                 task.updated_at = now
+                # A recurring task re-enqueues itself: the next occurrence is a
+                # fresh row with the same type, payload, and recurrence, due one
+                # interval after this completion.
+                if task.recurrence_seconds is not None:
+                    enqueue_background_task(
+                        db,
+                        task_type=task.task_type,
+                        payload=dict(task.payload) if isinstance(task.payload, dict) else {},
+                        now=now,
+                        run_after=now + timedelta(seconds=task.recurrence_seconds),
+                        recurrence_seconds=task.recurrence_seconds,
+                    )
     return True
 
 
