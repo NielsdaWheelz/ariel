@@ -9,9 +9,10 @@ from fastapi.testclient import TestClient
 import pytest
 
 from ariel.app import ModelAdapter, create_app
-from ariel.google_connector import GOOGLE_CONNECTOR_ID
+from ariel.google_connector import GOOGLE_CONNECTOR_ID, GoogleWorkspaceProvider
 from ariel.persistence import GoogleConnectorRecord
 from tests.integration.responses_helpers import (
+    post_message_and_drain,
     process_queued_action_execution,
     responses_with_run_calls,
 )
@@ -393,15 +394,38 @@ def _bind_google_fakes(
     oauth_client: FakeGoogleOAuthClient,
     workspace_provider: FakeGoogleWorkspaceProvider,
 ) -> None:
+    import ariel.worker as _worker_module
+    from ariel.app import build_google_runtime as _orig_build_google_runtime
+
     app_state = cast(Any, client.app).state
     app_state.google_oauth_client = oauth_client
     app_state.google_workspace_provider = workspace_provider
+
+    def _worker_build_google_runtime(settings: Any, **kw: Any) -> Any:
+        return _orig_build_google_runtime(
+            settings,
+            oauth_client=kw.pop("oauth_client", None) or oauth_client,
+            workspace_provider=cast(
+                GoogleWorkspaceProvider, kw.pop("workspace_provider", None) or workspace_provider
+            ),
+            **kw,
+        )
+
+    _worker_module.build_google_runtime = _worker_build_google_runtime
 
 
 def _session_id(client: TestClient) -> str:
     active = client.get("/v1/sessions/active")
     assert active.status_code == 200
     return active.json()["session"]["id"]
+
+
+def _turn_data(client: TestClient, session_id: str) -> dict[str, Any]:
+    resp = client.get(f"/v1/sessions/{session_id}/events")
+    assert resp.status_code == 200
+    turns = resp.json()["turns"]
+    assert turns, "no turns in timeline"
+    return turns[-1]
 
 
 def _surface_attempt(turn_payload: dict[str, Any], *, proposal_index: int = 1) -> dict[str, Any]:
@@ -514,26 +538,25 @@ def test_s4_pr03_blocking_auth_failures_remap_readiness_to_reconnect_required(
         _connect_google(client, code=connect_code)
         session_id = _session_id(client)
 
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message", json={"message": "draft follow-up"}
-        )
-        assert sent.status_code == 200
-        turn = sent.json()["turn"]
-        if expected_failure == "consent_required" and turn["surface_action_lifecycle"] == []:
+        turn = post_message_and_drain(client, session_id, message="draft follow-up")
+        turn_data = _turn_data(client, session_id)
+
+        if expected_failure == "consent_required" and turn_data["surface_action_lifecycle"] == []:
             assert all(
-                event["event_type"] != "evt.action.execution.started" for event in turn["events"]
+                event["event_type"] != "evt.action.execution.started"
+                for event in turn_data["events"]
             )
             connector = client.get("/v1/connectors/google")
             assert connector.status_code == 200
             assert connector.json()["connector"]["readiness"] == "connected"
             return
 
-        attempt = _surface_attempt(turn)
+        attempt = _surface_attempt(turn_data)
         assert attempt["approval"]["status"] == "pending"
         approved = client.post(
             "/v1/approvals",
             json={
-                "approval_ref": _approval_ref(turn),
+                "approval_ref": _approval_ref(turn_data),
                 "decision": "approve",
                 "actor_id": "user.local",
             },
@@ -552,6 +575,8 @@ def test_s4_pr03_blocking_auth_failures_remap_readiness_to_reconnect_required(
         connector_payload = connector.json()["connector"]
         assert connector_payload["readiness"] == "reconnect_required"
         assert connector_payload["last_error_code"] == expected_failure
+
+        del turn
 
 
 def test_s4_pr03_transient_auth_failures_do_not_remap_connected_readiness(
@@ -584,9 +609,9 @@ def test_s4_pr03_transient_auth_failures_do_not_remap_connected_readiness(
         _connect_google(client, code="connect-read-expired")
         session_id = _session_id(client)
 
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "search inbox"})
-        assert sent.status_code == 200
-        attempt = _surface_attempt(sent.json()["turn"])
+        post_message_and_drain(client, session_id, message="search inbox")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"
         assert attempt["execution"]["error"] == "token_expired"
 
@@ -662,17 +687,14 @@ def test_s4_pr03_reconnect_required_persists_until_successful_reconnect(
         _connect_google(client, code="connect-compose")
         session_id = _session_id(client)
 
-        first = client.post(
-            f"/v1/sessions/{session_id}/message", json={"message": "draft follow-up"}
-        )
-        assert first.status_code == 200
-        first_turn = first.json()["turn"]
-        first_attempt = _surface_attempt(first_turn)
+        post_message_and_drain(client, session_id, message="draft follow-up")
+        first_turn_data = _turn_data(client, session_id)
+        first_attempt = _surface_attempt(first_turn_data)
         assert first_attempt["approval"]["status"] == "pending"
         first_approved = client.post(
             "/v1/approvals",
             json={
-                "approval_ref": _approval_ref(first_turn),
+                "approval_ref": _approval_ref(first_turn_data),
                 "decision": "approve",
                 "actor_id": "user.local",
             },
@@ -689,12 +711,9 @@ def test_s4_pr03_reconnect_required_persists_until_successful_reconnect(
         assert blocked_status.status_code == 200
         assert blocked_status.json()["connector"]["readiness"] == "reconnect_required"
 
-        successful_read = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "show schedule"},
-        )
-        assert successful_read.status_code == 200
-        successful_attempt = _surface_attempt(successful_read.json()["turn"])
+        post_message_and_drain(client, session_id, message="show schedule")
+        successful_turn_data = _turn_data(client, session_id)
+        successful_attempt = _surface_attempt(successful_turn_data)
         assert successful_attempt["execution"]["status"] == "succeeded"
 
         still_blocked_status = client.get("/v1/connectors/google")
@@ -775,18 +794,14 @@ def test_s4_pr03_blocking_readiness_state_is_not_downgraded_by_later_transient_f
         _connect_google(client, code="connect-compose")
         session_id = _session_id(client)
 
-        blocking_failure = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "draft follow-up"},
-        )
-        assert blocking_failure.status_code == 200
-        blocking_turn = blocking_failure.json()["turn"]
-        blocking_attempt = _surface_attempt(blocking_turn)
+        post_message_and_drain(client, session_id, message="draft follow-up")
+        blocking_turn_data = _turn_data(client, session_id)
+        blocking_attempt = _surface_attempt(blocking_turn_data)
         assert blocking_attempt["approval"]["status"] == "pending"
         blocking_approved = client.post(
             "/v1/approvals",
             json={
-                "approval_ref": _approval_ref(blocking_turn),
+                "approval_ref": _approval_ref(blocking_turn_data),
                 "decision": "approve",
                 "actor_id": "user.local",
             },
@@ -805,12 +820,9 @@ def test_s4_pr03_blocking_readiness_state_is_not_downgraded_by_later_transient_f
                 assert connector is not None
                 connector.access_token_expires_at = datetime.now(tz=UTC) - timedelta(minutes=1)
 
-        transient_failure = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "show schedule"},
-        )
-        assert transient_failure.status_code == 200
-        transient_attempt = _surface_attempt(transient_failure.json()["turn"])
+        post_message_and_drain(client, session_id, message="show schedule")
+        transient_turn_data = _turn_data(client, session_id)
+        transient_attempt = _surface_attempt(transient_turn_data)
         assert transient_attempt["execution"]["error"] == "token_expired"
 
         connector = client.get("/v1/connectors/google")
@@ -886,16 +898,12 @@ def test_s4_pr03_attendee_reconnect_intent_requests_freebusy_and_closes_fallback
         _connect_google(client, code="connect-no-freebusy")
         session_id = _session_id(client)
 
-        before_reconnect = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "plan team sync"},
-        )
-        assert before_reconnect.status_code == 200
-        before_payload = before_reconnect.json()
-        before_attempt = _surface_attempt(before_payload["turn"])
+        post_message_and_drain(client, session_id, message="plan team sync")
+        before_turn_data = _turn_data(client, session_id)
+        before_attempt = _surface_attempt(before_turn_data)
         assert before_attempt["execution"]["status"] == "succeeded"
         assert before_attempt["execution"]["output"]["partial"] is True
-        before_message = before_payload["assistant"]["message"].lower()
+        before_message = before_turn_data["assistant_message"].lower()
         assert "user-calendar-only" in before_message or "your calendar only" in before_message
         assert "reconnect" in before_message
 
@@ -933,15 +941,11 @@ def test_s4_pr03_attendee_reconnect_intent_requests_freebusy_and_closes_fallback
             "The selected time works for all attendees."
         )
 
-        after_reconnect = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "plan team sync"},
-        )
-        assert after_reconnect.status_code == 200
-        after_payload = after_reconnect.json()
-        after_attempt = _surface_attempt(after_payload["turn"])
+        post_message_and_drain(client, session_id, message="plan team sync")
+        after_turn_data = _turn_data(client, session_id)
+        after_attempt = _surface_attempt(after_turn_data)
         assert after_attempt["execution"]["status"] == "succeeded"
         assert after_attempt["execution"]["output"]["partial"] is False
-        after_message = after_payload["assistant"]["message"].lower()
+        after_message = after_turn_data["assistant_message"].lower()
         assert "works for all attendees" in after_message
         assert "user-calendar-only" not in after_message

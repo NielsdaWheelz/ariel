@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import asynccontextmanager
 import hmac
 import hashlib
 import json
@@ -87,7 +87,6 @@ from ariel.persistence import (
     SessionRotationRecord,
     SyncCursorRecord,
     SyncRunRecord,
-    TurnIdempotencyRecord,
     TurnRecord,
     enqueue_background_task,
     serialize_agency_event,
@@ -111,8 +110,6 @@ from ariel.response_contracts import (
     ResponseContractViolation,
     build_surface_artifact_response,
     build_surface_approval_response,
-    build_surface_capture_failure_response,
-    build_surface_capture_success_response,
     build_surface_discord_message_event_list_response,
     build_surface_discord_message_list_response,
     build_surface_email_action_list_response,
@@ -956,30 +953,12 @@ def _response_contract_error(contract_error: ResponseContractViolation) -> ApiEr
     )
 
 
-def _session_turn_lock_id(session_id: str) -> int:
-    digest = hashlib.sha256(f"turn-lock:{session_id}".encode("utf-8")).digest()
-    lock_value = int.from_bytes(digest[:8], byteorder="big", signed=False)
-    if lock_value >= 2**63:
-        lock_value -= 2**64
-    return lock_value
-
-
 def _capture_idempotency_lock_id(idempotency_key: str) -> int:
     digest = hashlib.sha256(f"capture-idempotency:{idempotency_key}".encode("utf-8")).digest()
     lock_value = int.from_bytes(digest[:8], byteorder="big", signed=False)
     if lock_value >= 2**63:
         lock_value -= 2**64
     return lock_value
-
-
-def _acquire_session_turn_lock(db: Session, *, session_id: str) -> None:
-    bind = db.get_bind()
-    if bind is None or bind.dialect.name != "postgresql":
-        return
-    db.execute(
-        text("SELECT pg_advisory_xact_lock(:lock_id)"),
-        {"lock_id": _session_turn_lock_id(session_id)},
-    )
 
 
 def _acquire_capture_idempotency_lock(db: Session, *, idempotency_key: str) -> None:
@@ -1007,25 +986,6 @@ def _normalize_idempotency_key(raw_key: str | None) -> str | None:
             retryable=False,
         )
     return normalized
-
-
-def _message_idempotency_request_hash(
-    *,
-    request_session_id: str,
-    message: str,
-    discord_context: dict[str, Any] | None,
-) -> str:
-    encoded = json.dumps(
-        {
-            "request_session_id": request_session_id,
-            "message": message,
-            "discord": discord_context,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _capture_request_hash(*, canonical_payload: dict[str, Any]) -> str:
@@ -2900,6 +2860,7 @@ def _wake(
                         "provider_response_id": candidate_response.get("provider_response_id"),
                     },
                 )
+                db.commit()
                 if attempt >= runtime.settings.max_model_attempts:
                     model_failure = record_model_output_budget_failure(
                         attempt=attempt,
@@ -2963,6 +2924,11 @@ def _wake(
                         "provider_response_id": candidate_response.get("provider_response_id"),
                     },
                 )
+
+            # Per-program commit: durably record each clean program's effects
+            # (action attempts, events, artifacts) before continuing or ending
+            # the turn. The syscall trace is already durable at this point.
+            db.commit()
 
             if run_program_result.emitted_message:
                 # The program composed user-visible output. A program may
@@ -3310,7 +3276,7 @@ def _wake(
         add_event("evt.turn.completed", {})
 
     active_session.updated_at = _utcnow()
-    db.flush()
+    db.commit()
 
     if bounded_failure is not None:
         return TurnExecutionOutcome(
@@ -4052,48 +4018,25 @@ def create_app(
         normalized_idempotency_key = _normalize_idempotency_key(
             request.headers.get("Idempotency-Key")
         )
-        request_hash = (
-            _message_idempotency_request_hash(
-                request_session_id=request_session_id,
-                message=payload.message,
-                discord_context=discord_context,
-            )
-            if normalized_idempotency_key is not None
-            else None
-        )
 
         with session_factory() as db:
-            # This turn path commits explicitly so inline Google reads can commit the
-            # proposed action before making a provider request.
-            with nullcontext():
-                _acquire_session_turn_lock(db, session_id=request_session_id)
-
-                existing_idempotency = (
-                    db.scalar(
-                        select(TurnIdempotencyRecord)
-                        .where(
-                            TurnIdempotencyRecord.session_id == request_session_id,
-                            TurnIdempotencyRecord.idempotency_key == normalized_idempotency_key,
-                        )
-                        .limit(1)
+            with db.begin():
+                # Validate that the target session exists before enqueuing.
+                active_session_check = db.scalar(
+                    select(SessionRecord)
+                    .where(
+                        SessionRecord.id == request_session_id,
+                        SessionRecord.is_active.is_(True),
                     )
-                    if normalized_idempotency_key is not None
-                    else None
+                    .limit(1)
                 )
-                if existing_idempotency is not None:
-                    if existing_idempotency.request_hash != request_hash:
-                        raise ApiError(
-                            status_code=409,
-                            code="E_IDEMPOTENCY_KEY_REUSED",
-                            message="idempotency key reused with different request payload",
-                            details={"session_id": request_session_id},
-                            retryable=False,
-                        )
-                    if existing_idempotency.status_code == 200:
-                        return existing_idempotency.response_payload
-                    return JSONResponse(
-                        status_code=existing_idempotency.status_code,
-                        content=existing_idempotency.response_payload,
+                if active_session_check is None:
+                    raise ApiError(
+                        status_code=404,
+                        code="E_SESSION_NOT_FOUND",
+                        message="active session not found",
+                        details={"session_id": request_session_id},
+                        retryable=False,
                     )
 
                 if discord_context is not None:
@@ -4184,85 +4127,24 @@ def create_app(
                         db.add(discord_event)
                         db.flush()
 
-                def persist_idempotency_result(
-                    *,
-                    turn_id: str,
-                    effective_session_id: str,
-                    status_code: int,
-                    response_payload: dict[str, Any],
-                ) -> None:
-                    if normalized_idempotency_key is None:
-                        return
-                    now = _utcnow()
-                    target_session_ids = [request_session_id]
-                    if effective_session_id != request_session_id:
-                        target_session_ids.append(effective_session_id)
-
-                    for target_session_id in target_session_ids:
-                        target_hash = _message_idempotency_request_hash(
-                            request_session_id=target_session_id,
-                            message=payload.message,
-                            discord_context=discord_context,
-                        )
-                        existing_for_target = db.scalar(
-                            select(TurnIdempotencyRecord)
-                            .where(
-                                TurnIdempotencyRecord.session_id == target_session_id,
-                                TurnIdempotencyRecord.idempotency_key == normalized_idempotency_key,
-                            )
-                            .limit(1)
-                        )
-                        if existing_for_target is not None:
-                            if existing_for_target.request_hash != target_hash:
-                                raise ApiError(
-                                    status_code=409,
-                                    code="E_IDEMPOTENCY_KEY_REUSED",
-                                    message="idempotency key reused with different request payload",
-                                    details={"session_id": target_session_id},
-                                    retryable=False,
-                                )
-                            continue
-                        db.add(
-                            TurnIdempotencyRecord(
-                                id=_new_id("idk"),
-                                session_id=target_session_id,
-                                idempotency_key=normalized_idempotency_key,
-                                request_hash=target_hash,
-                                turn_id=turn_id,
-                                status_code=status_code,
-                                response_payload=response_payload,
-                                created_at=now,
-                                updated_at=now,
-                            )
-                        )
-                    db.flush()
-
-                turn_outcome = _wake(
-                    runtime=app.state.runtime,
-                    google_runtime=_google_runtime(),
-                    db=db,
-                    request_session_id=request_session_id,
-                    wake_context=WakeContext(
-                        trigger_kind="user_message",
-                        prompt_text=payload.message,
-                        discord_context=discord_context,
-                        attachment_sources=discord_attachment_sources,
-                        ingress_provenance=None,
-                    ),
-                    execute_google_reads_outside_transaction=True,
+                now = _utcnow()
+                task = enqueue_background_task(
+                    db,
+                    task_type="user_message",
+                    payload={
+                        "session_id": request_session_id,
+                        "message": payload.message,
+                        "discord_context": discord_context,
+                        "attachment_sources": discord_attachment_sources
+                        if discord_attachment_sources
+                        else None,
+                    },
+                    now=now,
+                    idempotency_key=normalized_idempotency_key,
                 )
-                persist_idempotency_result(
-                    turn_id=turn_outcome.turn_id,
-                    effective_session_id=turn_outcome.effective_session_id,
-                    status_code=turn_outcome.status_code,
-                    response_payload=turn_outcome.response_payload,
-                )
-                db.commit()
-                if turn_outcome.status_code == 200:
-                    return turn_outcome.response_payload
                 return JSONResponse(
-                    status_code=turn_outcome.status_code,
-                    content=turn_outcome.response_payload,
+                    status_code=202,
+                    content={"status": "accepted", "task_id": task.id},
                 )
 
     @app.post("/v1/captures/record", response_model=None)
@@ -4327,7 +4209,6 @@ def create_app(
 
                 now = _utcnow()
                 active_session = _get_or_create_active_session(db)
-                _acquire_session_turn_lock(db, session_id=active_session.id)
                 turn = TurnRecord(
                     id=_new_id("trn"),
                     session_id=active_session.id,
@@ -4397,228 +4278,6 @@ def create_app(
                 capture_record.updated_at = _utcnow()
                 db.flush()
                 return response_payload
-
-    @app.post("/v1/captures", response_model=None)
-    def post_capture(
-        request: Request,
-        payload: Any = Body(...),
-    ) -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        normalized_idempotency_key = _normalize_idempotency_key(
-            request.headers.get("Idempotency-Key")
-        )
-
-        ingest_error: ApiError | None = None
-        normalized_capture: NormalizedCaptureEnvelope | None = None
-        request_hash: str
-        capture_kind_for_failure = "unknown"
-        payload_for_storage: dict[str, Any]
-        if isinstance(payload, dict):
-            payload_for_storage = dict(payload)
-            raw_kind = payload_for_storage.get("kind")
-            if isinstance(raw_kind, str):
-                candidate_kind = raw_kind.strip().lower()
-                if candidate_kind in _CAPTURE_ALLOWED_KINDS:
-                    capture_kind_for_failure = candidate_kind
-
-            try:
-                normalized_capture = _normalize_capture_envelope(payload_for_storage)
-                request_hash = _capture_request_hash(
-                    canonical_payload=normalized_capture.canonical_payload,
-                )
-            except ApiError as exc:
-                ingest_error = exc
-                request_hash = _capture_request_hash(
-                    canonical_payload={"invalid_capture_payload": payload_for_storage},
-                )
-        else:
-            payload_for_storage = {"raw_payload": payload}
-            ingest_error = _capture_ingest_error(
-                status_code=422,
-                code="E_CAPTURE_PAYLOAD_INVALID",
-                message="capture payload is invalid",
-                details={
-                    "field": "payload",
-                    "hint": "capture payload must be a JSON object",
-                },
-            )
-            request_hash = _capture_request_hash(
-                canonical_payload={"invalid_capture_payload": payload_for_storage},
-            )
-
-        with session_factory() as db:
-            with db.begin():
-                if normalized_idempotency_key is not None:
-                    _acquire_capture_idempotency_lock(
-                        db,
-                        idempotency_key=normalized_idempotency_key,
-                    )
-                existing_capture = (
-                    db.scalar(
-                        select(CaptureRecord)
-                        .where(CaptureRecord.idempotency_key == normalized_idempotency_key)
-                        .limit(1)
-                    )
-                    if normalized_idempotency_key is not None
-                    else None
-                )
-                if existing_capture is not None:
-                    if existing_capture.request_hash != request_hash:
-                        raise ApiError(
-                            status_code=409,
-                            code="E_IDEMPOTENCY_KEY_REUSED",
-                            message="idempotency key reused with different request payload",
-                            details={"capture_id": existing_capture.id},
-                            retryable=False,
-                        )
-                    if existing_capture.status_code == 200:
-                        return existing_capture.response_payload
-                    return JSONResponse(
-                        status_code=existing_capture.status_code,
-                        content=existing_capture.response_payload,
-                    )
-
-                now = _utcnow()
-                if ingest_error is not None:
-                    capture_record = CaptureRecord(
-                        id=_new_id("cpt"),
-                        capture_kind=capture_kind_for_failure,
-                        idempotency_key=normalized_idempotency_key,
-                        request_hash=request_hash,
-                        original_payload=payload_for_storage,
-                        normalized_turn_input=None,
-                        effective_session_id=None,
-                        turn_id=None,
-                        terminal_state="ingest_failed",
-                        ingest_error_code=ingest_error.code,
-                        ingest_error_message=ingest_error.message,
-                        ingest_error_details=ingest_error.details,
-                        ingest_error_retryable=ingest_error.retryable,
-                        status_code=ingest_error.status_code,
-                        response_payload={},
-                        created_at=now,
-                        updated_at=now,
-                    )
-                    db.add(capture_record)
-                    db.flush()
-                    try:
-                        failure_payload = build_surface_capture_failure_response(
-                            capture=serialize_capture(capture_record),
-                            error={
-                                "code": ingest_error.code,
-                                "message": ingest_error.message,
-                                "details": ingest_error.details,
-                                "retryable": ingest_error.retryable,
-                            },
-                        )
-                    except ResponseContractViolation as exc:
-                        raise _response_contract_error(exc) from exc
-                    capture_record.response_payload = failure_payload
-                    capture_record.updated_at = _utcnow()
-                    db.flush()
-                    return JSONResponse(
-                        status_code=ingest_error.status_code, content=failure_payload
-                    )
-
-                assert normalized_capture is not None
-                active_session = _get_or_create_active_session(db)
-                request_session_id = active_session.id
-                _acquire_session_turn_lock(db, session_id=request_session_id)
-                capture_ingress_runtime_provenance = (
-                    RuntimeProvenance(
-                        status="tainted",
-                        evidence=({"kind": "capture_shared_content_ingress"},),
-                    )
-                    if normalized_capture.kind == "shared_content"
-                    else None
-                )
-                turn_outcome = _wake(
-                    runtime=app.state.runtime,
-                    google_runtime=_google_runtime(),
-                    db=db,
-                    request_session_id=request_session_id,
-                    wake_context=WakeContext(
-                        trigger_kind="user_message",
-                        prompt_text=normalized_capture.normalized_turn_input,
-                        discord_context=None,
-                        attachment_sources=None,
-                        ingress_provenance=capture_ingress_runtime_provenance,
-                    ),
-                )
-
-                capture_record = CaptureRecord(
-                    id=_new_id("cpt"),
-                    capture_kind=normalized_capture.kind,
-                    idempotency_key=normalized_idempotency_key,
-                    request_hash=request_hash,
-                    original_payload=normalized_capture.original_payload,
-                    normalized_turn_input=normalized_capture.normalized_turn_input,
-                    effective_session_id=turn_outcome.effective_session_id,
-                    turn_id=turn_outcome.turn_id,
-                    terminal_state="turn_created",
-                    ingest_error_code=None,
-                    ingest_error_message=None,
-                    ingest_error_details=None,
-                    ingest_error_retryable=None,
-                    status_code=turn_outcome.status_code,
-                    response_payload={},
-                    created_at=now,
-                    updated_at=now,
-                )
-                db.add(capture_record)
-                db.flush()
-
-                if turn_outcome.status_code == 200:
-                    session_payload = turn_outcome.response_payload.get("session")
-                    turn_payload = turn_outcome.response_payload.get("turn")
-                    assistant_payload = turn_outcome.response_payload.get("assistant")
-                    assistant_message = (
-                        assistant_payload.get("message")
-                        if isinstance(assistant_payload, dict)
-                        else None
-                    )
-                    assistant_sources = (
-                        assistant_payload.get("sources")
-                        if isinstance(assistant_payload, dict)
-                        else None
-                    )
-                    try:
-                        capture_response = build_surface_capture_success_response(
-                            capture=serialize_capture(capture_record),
-                            session=session_payload,
-                            turn=turn_payload,
-                            assistant_message=assistant_message,
-                            assistant_sources=assistant_sources,
-                        )
-                    except ResponseContractViolation as exc:
-                        raise _response_contract_error(exc) from exc
-                    capture_record.response_payload = capture_response
-                    capture_record.updated_at = _utcnow()
-                    db.flush()
-                    return capture_response
-
-                error_payload = turn_outcome.response_payload.get("error")
-                if not isinstance(error_payload, dict):
-                    error_payload = {
-                        "code": "E_INTERNAL",
-                        "message": "internal server error",
-                        "details": {"reason": "capture turn response missing typed error envelope"},
-                        "retryable": False,
-                    }
-                try:
-                    capture_failure_response = build_surface_capture_failure_response(
-                        capture=serialize_capture(capture_record),
-                        error=error_payload,
-                    )
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-                capture_record.response_payload = capture_failure_response
-                capture_record.updated_at = _utcnow()
-                db.flush()
-                return JSONResponse(
-                    status_code=turn_outcome.status_code,
-                    content=capture_failure_response,
-                )
 
     @app.post("/v1/approvals", response_model=None)
     def post_approval_decision(

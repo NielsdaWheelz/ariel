@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
 import logging
 from typing import Any
 
@@ -10,8 +9,9 @@ from discord import app_commands
 from discord.ext import commands
 import httpx
 
-from .capability_registry import capability_action_label
 from .config import AppSettings
+
+_log = logging.getLogger(__name__)
 
 
 class DiscordBotConfigError(Exception):
@@ -24,13 +24,6 @@ class ArielDiscordError(Exception):
 
 _APPROVAL_CUSTOM_ID_PREFIX = "ariel:approval:"
 _JOB_REFRESH_CUSTOM_ID_PREFIX = "ariel:job:refresh:"
-
-
-@dataclass(frozen=True, slots=True)
-class ArielDiscordReply:
-    content: str
-    view: discord.ui.View | None = None
-    silent: bool = False
 
 
 def format_discord_message(message: str) -> str:
@@ -57,9 +50,8 @@ def submit_discord_turn(
     ariel_auth_token: str | None = None,
     prompt: str,
     discord_message_id: int,
-    allowed_user_id: int | None = None,
     discord_context: dict[str, Any] | None = None,
-) -> ArielDiscordReply:
+) -> None:
     with httpx.Client(timeout=60.0) as client:
         session_response = client.get(
             f"{ariel_base_url}/v1/sessions/active",
@@ -85,15 +77,10 @@ def submit_discord_turn(
             ),
             json=request_payload,
         )
-        message_payload = _json_response_payload(message_response)
-        if message_response.status_code >= 400 or message_payload.get("ok") is not True:
-            raise ArielDiscordError(_safe_ariel_error_message(message_payload))
-
-        return _message_reply_for_discord(
-            payload=message_payload,
-            ariel_base_url=ariel_base_url,
-            allowed_user_id=allowed_user_id,
-        )
+        if message_response.status_code >= 400:
+            raise ArielDiscordError(
+                _safe_ariel_error_message(_json_response_payload(message_response))
+            )
 
 
 def get_status(
@@ -400,29 +387,11 @@ class ArielDiscordBot(commands.Bot):
 
         discord_context = _discord_context_for_message(message, bot_user_id=bot_user_id)
 
-        async with message.channel.typing():
-            reply = await self._submit_ambient_turn(
-                prompt=prompt,
-                discord_message_id=message.id,
-                discord_context=discord_context,
-            )
-
-        if reply.silent:
-            return
-
-        if reply.view is None:
-            await message.reply(
-                format_discord_message(reply.content),
-                mention_author=False,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-        else:
-            await message.reply(
-                format_discord_message(reply.content),
-                mention_author=False,
-                allowed_mentions=discord.AllowedMentions.none(),
-                view=reply.view,
-            )
+        await self._submit_ambient_turn(
+            prompt=prompt,
+            discord_message_id=message.id,
+            discord_context=discord_context,
+        )
 
     async def _submit_ambient_turn(
         self,
@@ -430,23 +399,20 @@ class ArielDiscordBot(commands.Bot):
         prompt: str,
         discord_message_id: int,
         discord_context: dict[str, Any] | None = None,
-    ) -> ArielDiscordReply:
+    ) -> None:
         try:
-            return await asyncio.to_thread(
+            await asyncio.to_thread(
                 submit_discord_turn,
                 ariel_base_url=self.ariel_base_url,
                 ariel_auth_token=self.ariel_auth_token,
                 prompt=prompt,
                 discord_message_id=discord_message_id,
-                allowed_user_id=self.ariel_user_id,
                 discord_context=discord_context,
             )
         except ArielDiscordError as exc:
-            return ArielDiscordReply(content=f"Ariel request failed: {exc}")
-        except httpx.HTTPError:
-            return ArielDiscordReply(
-                content="Ariel request failed: could not reach the local Ariel API."
-            )
+            _log.error("discord turn submit failed: %s", exc)
+        except httpx.HTTPError as exc:
+            _log.error("discord turn submit failed: could not reach Ariel API: %s", exc)
 
     async def _run_discord_ops_command(
         self,
@@ -570,41 +536,6 @@ def _safe_ariel_error_message(payload: dict[str, Any]) -> str:
     return "Ariel API request failed."
 
 
-def _message_reply_for_discord(
-    *,
-    payload: dict[str, Any],
-    ariel_base_url: str,
-    allowed_user_id: int | None = None,
-) -> ArielDiscordReply:
-    assistant = payload.get("assistant")
-    if isinstance(assistant, dict) and assistant.get("silent") is True:
-        return ArielDiscordReply(content="", silent=True)
-    content = _format_message_response_for_discord(payload)
-    pending_approvals = _pending_approval_refs(payload)
-    if not pending_approvals:
-        return ArielDiscordReply(content=content)
-    return ArielDiscordReply(
-        content=content,
-        view=ArielActionView(
-            ariel_base_url=ariel_base_url,
-            approval_refs=pending_approvals,
-            allowed_user_id=allowed_user_id,
-        ),
-    )
-
-
-def _format_message_response_for_discord(payload: dict[str, Any]) -> str:
-    assistant = payload.get("assistant")
-    assistant_message = assistant.get("message") if isinstance(assistant, dict) else None
-    if not isinstance(assistant_message, str):
-        raise ArielDiscordError("Ariel returned an invalid assistant response.")
-
-    pending_approvals = _pending_approval_lines(payload)
-    if not pending_approvals:
-        return assistant_message
-    return "\n".join([assistant_message, "", *pending_approvals])
-
-
 def _format_approval_response_for_discord(payload: dict[str, Any]) -> str:
     approval = payload.get("approval")
     approval_status = approval.get("status") if isinstance(approval, dict) else None
@@ -620,55 +551,6 @@ def _format_approval_response_for_discord(payload: dict[str, Any]) -> str:
     if not lines:
         raise ArielDiscordError("Ariel returned an invalid approval response.")
     return "\n".join(lines)
-
-
-def _pending_approval_lines(payload: dict[str, Any]) -> list[str]:
-    lines: list[str] = []
-    for pending in _pending_approval_items(payload):
-        expires_at = pending.get("expires_at")
-        suffix = f" expires_at={expires_at}" if isinstance(expires_at, str) else ""
-        lines.append(
-            f"Approval pending ({pending['action_label']}): {pending['approval_ref']}{suffix}. "
-            "Use the buttons below."
-        )
-    return lines
-
-
-def _pending_approval_refs(payload: dict[str, Any]) -> list[str]:
-    return [item["approval_ref"] for item in _pending_approval_items(payload)]
-
-
-def _pending_approval_items(payload: dict[str, Any]) -> list[dict[str, str]]:
-    turn = payload.get("turn")
-    lifecycle = turn.get("surface_action_lifecycle") if isinstance(turn, dict) else None
-    if not isinstance(lifecycle, list):
-        return []
-
-    items: list[dict[str, str]] = []
-    for item in lifecycle:
-        if not isinstance(item, dict):
-            continue
-        approval = item.get("approval")
-        if not isinstance(approval, dict) or approval.get("status") != "pending":
-            continue
-        approval_ref = approval.get("reference")
-        if not isinstance(approval_ref, str) or not approval_ref:
-            continue
-        proposal = item.get("proposal")
-        action_label = "Action"
-        if isinstance(proposal, dict):
-            capability_id_raw = proposal.get("capability_id")
-            if isinstance(capability_id_raw, str):
-                action_label = capability_action_label(capability_id_raw)
-        pending: dict[str, str] = {
-            "approval_ref": approval_ref,
-            "action_label": action_label,
-        }
-        expires_at = approval.get("expires_at")
-        if isinstance(expires_at, str):
-            pending["expires_at"] = expires_at
-        items.append(pending)
-    return items
 
 
 def _format_job_response_for_discord(

@@ -47,7 +47,7 @@ from ariel.persistence import (
 )
 from ariel.worker import process_one_task
 from tests.fake_sandbox import FakeSandboxRuntime
-from tests.integration.responses_helpers import responses_with_run_calls
+from tests.integration.responses_helpers import post_message_and_drain, responses_with_run_calls
 
 
 _id_counter = count(1)
@@ -305,15 +305,6 @@ def _active_session_id(client: TestClient) -> str:
     response = client.get("/v1/sessions/active")
     assert response.status_code == 200
     return response.json()["session"]["id"]
-
-
-def _send_turn(client: TestClient, session_id: str, message: str) -> dict[str, Any]:
-    response = client.post(
-        f"/v1/sessions/{session_id}/message",
-        json={"message": message},
-    )
-    assert response.status_code == 200, response.text
-    return response.json()
 
 
 def _insert_active_session(db: Session) -> str:
@@ -582,7 +573,7 @@ def test_retriever_surfaces_a_fact_it_judged_relevant(
         # Step 2: the pre-turn retriever selects that fact by id. The retriever
         # contract is {"facts": ["<fact_id>", ...]} -- a flat list of ids.
         _fake_subagent(monkeypatch, retriever={"facts": [fact_id]})
-        _send_turn(client, session_id, "how do I take my coffee?")
+        post_message_and_drain(client, session_id, message="how do I take my coffee?")
 
         # The retriever's selected facts render into the model's ``input_items``
         # as the ``recalled memory`` system message -- the same place the
@@ -629,7 +620,7 @@ def test_turn_injects_profile_and_session_digest(
                 assert session is not None
                 session.digest = "The conversation is debugging a flaky deploy pipeline."
 
-        _send_turn(client, session_id, "where were we?")
+        post_message_and_drain(client, session_id, message="where were we?")
 
         rendered = json.dumps(adapter.context_bundles[-1]) + json.dumps(adapter.input_items[-1])
         assert "staff engineer who prefers terse answers" in rendered
@@ -661,9 +652,9 @@ def test_retriever_failure_does_not_fail_the_turn(
                     {"content": "The user prefers concise replies."},
                 )
 
-        payload = _send_turn(client, session_id, "anything at all")
+        turn = post_message_and_drain(client, session_id, message="anything at all")
         # The turn completed despite the failed retriever call.
-        assert payload["assistant"]["message"]
+        assert turn.assistant_message
 
         with _session_factory(client)() as db:
             failed_recall = db.scalar(
@@ -695,7 +686,7 @@ def test_turn_enqueues_a_memory_remember_task(
     adapter = RunProgramAdapter()
     with _build_client(postgres_url, cast(ModelAdapter, adapter), monkeypatch) as client:
         session_id = _active_session_id(client)
-        _send_turn(client, session_id, "remember I like espresso")
+        post_message_and_drain(client, session_id, message="remember I like espresso")
 
         with _session_factory(client)() as db:
             remember_tasks = db.scalars(

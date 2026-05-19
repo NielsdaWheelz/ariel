@@ -9,11 +9,14 @@ import pytest
 from sqlalchemy import select
 
 from ariel.app import ModelAdapter, create_app
-from ariel.persistence import ProviderWriteReceiptRecord
+from ariel.google_connector import GoogleWorkspaceProvider
+from ariel.persistence import ArtifactRecord, ProviderWriteReceiptRecord
 from tests.integration.responses_helpers import (
+    post_message_and_drain,
     process_queued_action_execution,
     responses_with_run_calls,
 )
+from ariel.persistence import to_rfc3339
 from tests.fake_sandbox import FakeSandboxRuntime
 
 
@@ -483,15 +486,38 @@ def _bind_google_fakes(
     oauth_client: FakeGoogleOAuthClient,
     workspace_provider: FakeGoogleWorkspaceProvider,
 ) -> None:
+    import ariel.worker as _worker_module
+    from ariel.app import build_google_runtime as _orig_build_google_runtime
+
     app_state = cast(Any, client.app).state
     app_state.google_oauth_client = oauth_client
     app_state.google_workspace_provider = workspace_provider
+
+    def _worker_build_google_runtime(settings: Any, **kw: Any) -> Any:
+        return _orig_build_google_runtime(
+            settings,
+            oauth_client=kw.pop("oauth_client", None) or oauth_client,
+            workspace_provider=cast(
+                GoogleWorkspaceProvider, kw.pop("workspace_provider", None) or workspace_provider
+            ),
+            **kw,
+        )
+
+    _worker_module.build_google_runtime = _worker_build_google_runtime
 
 
 def _session_id(client: TestClient) -> str:
     active = client.get("/v1/sessions/active")
     assert active.status_code == 200
     return active.json()["session"]["id"]
+
+
+def _turn_data(client: TestClient, session_id: str) -> dict[str, Any]:
+    resp = client.get(f"/v1/sessions/{session_id}/events")
+    assert resp.status_code == 200
+    turns = resp.json()["turns"]
+    assert turns, "no turns in timeline"
+    return turns[-1]
 
 
 def _surface_attempt(turn_payload: dict[str, Any], *, proposal_index: int = 1) -> dict[str, Any]:
@@ -514,6 +540,36 @@ def _approval_ref(turn_payload: dict[str, Any], *, proposal_index: int = 1) -> s
 
 def _event_types(turn_payload: dict[str, Any]) -> list[str]:
     return [event["event_type"] for event in turn_payload["events"]]
+
+
+def _turn_sources(client: TestClient, turn_id: str) -> list[dict[str, Any]]:
+    """Return retrieval-provenance sources for a turn by querying the DB directly.
+
+    Sources are ArtifactRecord rows with artifact_type == "retrieval_provenance";
+    they are not embedded in the events timeline.
+    """
+    session_factory = cast(Any, client.app).state.session_factory
+    with session_factory() as db:
+        artifacts = db.scalars(
+            select(ArtifactRecord)
+            .where(
+                ArtifactRecord.turn_id == turn_id,
+                ArtifactRecord.artifact_type == "retrieval_provenance",
+            )
+            .order_by(ArtifactRecord.created_at.asc(), ArtifactRecord.id.asc())
+        ).all()
+    return [
+        {
+            "artifact_id": artifact.id,
+            "title": artifact.title,
+            "source": artifact.source,
+            "retrieved_at": to_rfc3339(artifact.retrieved_at),
+            "published_at": (
+                to_rfc3339(artifact.published_at) if artifact.published_at is not None else None
+            ),
+        }
+        for artifact in artifacts
+    ]
 
 
 def _connect_google(client: TestClient, *, code: str) -> dict[str, Any]:
@@ -567,12 +623,9 @@ def test_s6_pr01_drive_search_and_read_execute_inline_with_retrieval_citations(
         _connect_google(client, code="connect-drive-read")
         session_id = _session_id(client)
 
-        search = client.post(
-            f"/v1/sessions/{session_id}/message", json={"message": "find launch plan"}
-        )
-        assert search.status_code == 200
-        search_payload = search.json()
-        search_attempt = _surface_attempt(search_payload["turn"])
+        post_message_and_drain(client, session_id, message="find launch plan")
+        search_turn_data = _turn_data(client, session_id)
+        search_attempt = _surface_attempt(search_turn_data)
         assert search_attempt["proposal"]["capability_id"] == "cap.drive.search"
         assert search_attempt["policy"]["decision"] == "allow_inline"
         assert search_attempt["approval"]["status"] == "not_requested"
@@ -581,15 +634,12 @@ def test_s6_pr01_drive_search_and_read_execute_inline_with_retrieval_citations(
         assert isinstance(search_output["results"], list)
         assert search_output["results"][0]["title"] == "Q3 Launch Plan"
         assert "mime_type=" in search_output["results"][0]["snippet"]
-        assert "[1]" in search_payload["assistant"]["message"]
-        assert len(search_payload["assistant"]["sources"]) == 1
+        assert "[1]" in search_turn_data["assistant_message"]
+        assert len(_turn_sources(client, search_turn_data["id"])) == 1
 
-        read = client.post(
-            f"/v1/sessions/{session_id}/message", json={"message": "read launch plan"}
-        )
-        assert read.status_code == 200
-        read_payload = read.json()
-        read_attempt = _surface_attempt(read_payload["turn"])
+        post_message_and_drain(client, session_id, message="read launch plan")
+        read_turn_data = _turn_data(client, session_id)
+        read_attempt = _surface_attempt(read_turn_data)
         assert read_attempt["proposal"]["capability_id"] == "cap.drive.read"
         assert read_attempt["policy"]["decision"] == "allow_inline"
         assert read_attempt["approval"]["status"] == "not_requested"
@@ -599,9 +649,10 @@ def test_s6_pr01_drive_search_and_read_execute_inline_with_retrieval_citations(
         assert "launch plan excerpt" in read_output["content_excerpt"]
         assert read_output["truncated"] is False
         assert len(read_output["content_excerpt"]) <= 2000
-        assert "[1]" in read_payload["assistant"]["message"]
-        assert len(read_payload["assistant"]["sources"]) == 1
-        assert "drive.google.com" in read_payload["assistant"]["sources"][0]["source"]
+        assert "[1]" in read_turn_data["assistant_message"]
+        read_sources = _turn_sources(client, read_turn_data["id"])
+        assert len(read_sources) == 1
+        assert "drive.google.com" in read_sources[0]["source"]
 
 
 @pytest.mark.parametrize(
@@ -656,16 +707,15 @@ def test_s6_pr01_drive_read_typed_outcomes_are_explicit_and_recoverable(
         _connect_google(client, code="connect-drive-read")
         session_id = _session_id(client)
 
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": message})
-        assert sent.status_code == 200
-        payload = sent.json()
-        attempt = _surface_attempt(payload["turn"])
+        post_message_and_drain(client, session_id, message=message)
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "succeeded"
         output = attempt["execution"]["output"]
         assert output["read_outcome"]["status"] == expected_status
         assert expected_hint in output["read_outcome"]["recovery"].lower()
-        assert expected_hint in payload["assistant"]["message"].lower()
-        assert len(payload["assistant"]["sources"]) == 1
+        assert expected_hint in turn_data["assistant_message"].lower()
+        assert len(_turn_sources(client, turn_data["id"])) == 1
 
 
 def test_s6_pr01_drive_reconnect_intent_is_capability_scoped_and_least_privilege(
@@ -774,18 +824,15 @@ def test_s6_pr01_drive_share_is_approval_gated_exact_payload_and_exactly_once(
         _connect_google(client, code="connect-drive-share")
         session_id = _session_id(client)
 
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message", json={"message": "share launch plan"}
-        )
-        assert sent.status_code == 200
-        turn = sent.json()["turn"]
-        attempt = _surface_attempt(turn)
+        post_message_and_drain(client, session_id, message="share launch plan")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
         assert attempt["proposal"]["capability_id"] == "cap.drive.share"
         assert attempt["policy"]["decision"] == "requires_approval"
         assert attempt["approval"]["status"] == "pending"
-        assert "evt.action.execution.started" not in _event_types(turn)
+        assert "evt.action.execution.started" not in _event_types(turn_data)
 
-        approval_ref = _approval_ref(turn)
+        approval_ref = _approval_ref(turn_data)
         approved = client.post(
             "/v1/approvals",
             json={"approval_ref": approval_ref, "decision": "approve", "actor_id": "user.local"},
@@ -889,15 +936,12 @@ def test_s6_pr01_drive_share_denial_blocks_the_provider_write(
         _connect_google(client, code="connect-drive-share")
         session_id = _session_id(client)
 
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message", json={"message": "share launch plan"}
-        )
-        assert sent.status_code == 200
-        turn = sent.json()["turn"]
-        attempt = _surface_attempt(turn)
+        post_message_and_drain(client, session_id, message="share launch plan")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
         assert attempt["policy"]["decision"] == "requires_approval"
 
-        approval_ref = _approval_ref(turn)
+        approval_ref = _approval_ref(turn_data)
         denied = client.post(
             "/v1/approvals",
             json={"approval_ref": approval_ref, "decision": "deny", "actor_id": "user.local"},
@@ -989,30 +1033,24 @@ def test_s6_pr01_drive_auth_scope_failures_are_typed_and_recoverable(
             _connect_google(client, code=connect_code)
         session_id = _session_id(client)
 
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message", json={"message": "read planning doc"}
-        )
-        assert sent.status_code == 200
-        payload = sent.json()
+        post_message_and_drain(client, session_id, message="read planning doc")
+        turn_data = _turn_data(client, session_id)
 
-        rendered_message = payload["assistant"]["message"].lower()
+        rendered_message = turn_data["assistant_message"].lower()
         assert expected_class in rendered_message
         if expected_class == "not_connected":
             assert "connect" in rendered_message
-            assert payload["turn"]["surface_action_lifecycle"] == []
+            assert turn_data["surface_action_lifecycle"] == []
             assert all(
                 event["event_type"] != "evt.action.execution.failed"
-                for event in payload["turn"]["events"]
+                for event in turn_data["events"]
             )
             return
-        if (
-            expected_class == "consent_required"
-            and payload["turn"]["surface_action_lifecycle"] == []
-        ):
+        if expected_class == "consent_required" and turn_data["surface_action_lifecycle"] == []:
             assert "reconnect" in rendered_message
             assert all(
                 event["event_type"] != "evt.action.execution.started"
-                for event in payload["turn"]["events"]
+                for event in turn_data["events"]
             )
             return
         if expected_class in {"consent_required", "scope_missing", "access_revoked"}:
@@ -1021,7 +1059,7 @@ def test_s6_pr01_drive_auth_scope_failures_are_typed_and_recoverable(
             assert "retry" in rendered_message
             assert "reconnect" in rendered_message
 
-        attempt = _surface_attempt(payload["turn"])
+        attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"
         assert attempt["execution"]["error"] == expected_class
 
@@ -1075,15 +1113,12 @@ def test_s6_pr01_drive_provider_failures_are_typed_and_recoverable(
         _connect_google(client, code="connect-drive-search")
         session_id = _session_id(client)
 
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message", json={"message": "find risk register"}
-        )
-        assert sent.status_code == 200
-        payload = sent.json()
-        attempt = _surface_attempt(payload["turn"])
+        post_message_and_drain(client, session_id, message="find risk register")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"
         assert attempt["execution"]["error"] == expected_class
 
-        message = payload["assistant"]["message"].lower()
+        message = turn_data["assistant_message"].lower()
         assert expected_class in message
         assert expected_hint in message

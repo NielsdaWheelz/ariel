@@ -4,19 +4,26 @@ import copy
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, cast
 
 from fastapi.testclient import TestClient
 import pytest
+from sqlalchemy import select
 
 import ariel.action_runtime as action_runtime_module
 import ariel.policy_engine as policy_engine_module
 from ariel.app import ModelAdapter, create_app
-from tests.integration.responses_helpers import responses_message, responses_with_run_calls
+from tests.integration.responses_helpers import (
+    post_message_and_drain,
+    responses_message,
+    responses_with_run_calls,
+)
 from ariel.capability_registry import (
     CapabilityDefinition,
     get_capability as registry_get_capability,
 )
+from ariel.persistence import ArtifactRecord
+from ariel.persistence import to_rfc3339
 from tests.fake_sandbox import FakeSandboxRuntime
 
 
@@ -119,13 +126,47 @@ def _session_id(client: TestClient) -> str:
     return active.json()["session"]["id"]
 
 
-def _surface_attempt(turn_payload: dict[str, Any], *, proposal_index: int = 1) -> dict[str, Any]:
-    lifecycle = turn_payload.get("surface_action_lifecycle")
+def _turn_data(client: TestClient, session_id: str) -> dict[str, Any]:
+    resp = client.get(f"/v1/sessions/{session_id}/events")
+    assert resp.status_code == 200
+    turns = resp.json()["turns"]
+    assert turns, "no turns in timeline"
+    return turns[-1]
+
+
+def _surface_attempt(turn_data: dict[str, Any], *, proposal_index: int = 1) -> dict[str, Any]:
+    lifecycle = turn_data.get("surface_action_lifecycle")
     assert isinstance(lifecycle, list)
     assert len(lifecycle) >= proposal_index
     item = lifecycle[proposal_index - 1]
     assert isinstance(item, dict)
     return item
+
+
+def _turn_sources(client: TestClient, turn_id: str) -> list[dict[str, Any]]:
+    """Return retrieval-provenance sources for a turn by querying the DB directly."""
+    session_factory = cast(Any, client.app).state.session_factory
+    with session_factory() as db:
+        artifacts = db.scalars(
+            select(ArtifactRecord)
+            .where(
+                ArtifactRecord.turn_id == turn_id,
+                ArtifactRecord.artifact_type == "retrieval_provenance",
+            )
+            .order_by(ArtifactRecord.created_at.asc(), ArtifactRecord.id.asc())
+        ).all()
+    return [
+        {
+            "artifact_id": artifact.id,
+            "title": artifact.title,
+            "source": artifact.source,
+            "retrieved_at": to_rfc3339(artifact.retrieved_at),
+            "published_at": (
+                to_rfc3339(artifact.published_at) if artifact.published_at is not None else None
+            ),
+        }
+        for artifact in artifacts
+    ]
 
 
 def _patch_capability_lookup(
@@ -195,15 +236,13 @@ def test_s3_pr02_news_results_have_sources_citations_and_allowlisted_read_lifecy
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "news update"})
-        assert sent.status_code == 200
-        payload = sent.json()
+        post_message_and_drain(client, session_id, message="news update")
+        turn_data = _turn_data(client, session_id)
 
-        assert payload["ok"] is True
-        assert "[1]" in payload["assistant"]["message"]
-        assert "[2]" in payload["assistant"]["message"]
+        assert "[1]" in turn_data["assistant_message"]
+        assert "[2]" in turn_data["assistant_message"]
 
-        sources = payload["assistant"]["sources"]
+        sources = _turn_sources(client, turn_data["id"])
         assert isinstance(sources, list)
         assert len(sources) == 2
         for source in sources:
@@ -211,7 +250,7 @@ def test_s3_pr02_news_results_have_sources_citations_and_allowlisted_read_lifecy
             _assert_source_contract(source)
             assert source["published_at"] is not None
 
-        attempt = _surface_attempt(payload["turn"])
+        attempt = _surface_attempt(turn_data)
         assert attempt["proposal"]["capability_id"] == "cap.search.news"
         assert attempt["policy"]["decision"] == "allow_inline"
         assert attempt["execution"]["status"] == "succeeded"
@@ -267,14 +306,12 @@ def test_s3_pr02_news_egress_fails_closed_before_execute(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message", json={"message": "news egress deny"}
-        )
-        assert sent.status_code == 200
-        payload = sent.json()
-        assert "egress_destination_denied" in payload["assistant"]["message"]
+        post_message_and_drain(client, session_id, message="news egress deny")
+        turn_data = _turn_data(client, session_id)
 
-        attempt = _surface_attempt(payload["turn"])
+        assert "egress_destination_denied" in turn_data["assistant_message"]
+
+        attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"
         assert "egress_destination_denied" in (attempt["execution"]["error"] or "")
         assert capability_execute_attempts == 0
@@ -321,15 +358,15 @@ def test_s3_pr02_news_recency_discloses_stale_and_ambiguous_timing(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "news recency"})
-        assert sent.status_code == 200
-        payload = sent.json()
-        message = payload["assistant"]["message"].lower()
+        post_message_and_drain(client, session_id, message="news recency")
+        turn_data = _turn_data(client, session_id)
+
+        message = turn_data["assistant_message"].lower()
         assert "freshness" in message
         assert "stale" in message
         assert "missing" in message or "ambiguous" in message
 
-        sources = payload["assistant"]["sources"]
+        sources = _turn_sources(client, turn_data["id"])
         assert len(sources) == 2
         assert any(source["published_at"] is None for source in sources)
 
@@ -381,24 +418,22 @@ def test_s3_pr02_weather_explicit_location_wins_and_response_contains_location_t
         assert set_default.status_code == 200
 
         session_id = _session_id(client)
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message", json={"message": "weather explicit"}
-        )
-        assert sent.status_code == 200
-        payload = sent.json()
+        post_message_and_drain(client, session_id, message="weather explicit")
+        turn_data = _turn_data(client, session_id)
 
         assert len(captured_inputs) == 1
         assert captured_inputs[0]["location"] == "Tokyo, JP"
         assert captured_inputs[0]["timeframe"] == "tomorrow"
 
-        message = payload["assistant"]["message"].lower()
+        message = turn_data["assistant_message"].lower()
         assert "tokyo" in message
         assert "tomorrow" in message
         assert "2026-03-03t13:00:00z" in message
-        assert "[1]" in payload["assistant"]["message"]
+        assert "[1]" in turn_data["assistant_message"]
 
-        assert len(payload["assistant"]["sources"]) == 1
-        attempt = _surface_attempt(payload["turn"])
+        sources = _turn_sources(client, turn_data["id"])
+        assert len(sources) == 1
+        attempt = _surface_attempt(turn_data)
         assert attempt["proposal"]["capability_id"] == "cap.weather.forecast"
         assert attempt["policy"]["decision"] == "allow_inline"
         assert attempt["execution"]["status"] == "succeeded"
@@ -461,10 +496,7 @@ def test_s3_pr02_weather_default_location_is_canonical_state_with_env_bootstrap_
         assert read_after_env_change.json()["default_location"] == "Portland, OR"
 
         session_id = _session_id(client)
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message", json={"message": "weather default"}
-        )
-        assert sent.status_code == 200
+        post_message_and_drain(client, session_id, message="weather default")
         assert len(captured_inputs) == 1
         assert captured_inputs[0]["location"] == "Portland, OR"
 
@@ -507,18 +539,15 @@ def test_s3_pr02_weather_without_resolvable_location_asks_clarification_instead_
         assert default_read.json()["default_location"] is None
 
         session_id = _session_id(client)
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "weather missing location"},
-        )
-        assert sent.status_code == 200
-        payload = sent.json()
-        message = payload["assistant"]["message"].lower()
+        post_message_and_drain(client, session_id, message="weather missing location")
+        turn_data = _turn_data(client, session_id)
+
+        message = turn_data["assistant_message"].lower()
         assert "location" in message
         assert "city" in message or "where" in message
-        assert payload["assistant"]["sources"] == []
+        assert _turn_sources(client, turn_data["id"]) == []
 
-        attempt = _surface_attempt(payload["turn"])
+        attempt = _surface_attempt(turn_data)
         assert attempt["proposal"]["capability_id"] == "cap.weather.forecast"
         assert attempt["execution"]["status"] in {"failed", "not_executed"}
 
@@ -547,17 +576,15 @@ def test_s3_pr02_weather_upstream_failure_is_explicit_and_recoverable(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message", json={"message": "weather timeout"}
-        )
-        assert sent.status_code == 200
-        payload = sent.json()
-        message = payload["assistant"]["message"].lower()
+        post_message_and_drain(client, session_id, message="weather timeout")
+        turn_data = _turn_data(client, session_id)
+
+        message = turn_data["assistant_message"].lower()
         assert "uncertain" in message
         assert "retry" in message
-        assert payload["assistant"]["sources"] == []
+        assert _turn_sources(client, turn_data["id"]) == []
 
-        attempt = _surface_attempt(payload["turn"])
+        attempt = _surface_attempt(turn_data)
         assert attempt["proposal"]["capability_id"] == "cap.weather.forecast"
         assert attempt["execution"]["status"] == "failed"
         assert "weather provider timed out" in (attempt["execution"]["error"] or "")
@@ -603,15 +630,13 @@ def test_s3_pr02_weather_egress_fails_closed_before_execute(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message", json={"message": "weather egress deny"}
-        )
-        assert sent.status_code == 200
-        payload = sent.json()
-        assert "egress_destination_denied" in payload["assistant"]["message"]
-        assert payload["assistant"]["sources"] == []
+        post_message_and_drain(client, session_id, message="weather egress deny")
+        turn_data = _turn_data(client, session_id)
 
-        attempt = _surface_attempt(payload["turn"])
+        assert "egress_destination_denied" in turn_data["assistant_message"]
+        assert _turn_sources(client, turn_data["id"]) == []
+
+        attempt = _surface_attempt(turn_data)
         assert attempt["proposal"]["capability_id"] == "cap.weather.forecast"
         assert attempt["execution"]["status"] == "failed"
         assert "egress_destination_denied" in (attempt["execution"]["error"] or "")

@@ -9,8 +9,13 @@ from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import text
 
-from ariel.app import ModelAdapter, create_app
-from tests.integration.responses_helpers import responses_message, responses_with_run_calls
+from ariel.app import ModelAdapter, build_google_runtime, create_app
+from ariel.google_connector import GoogleWorkspaceProvider
+from tests.integration.responses_helpers import (
+    post_message_and_drain,
+    responses_message,
+    responses_with_run_calls,
+)
 from tests.fake_sandbox import FakeSandboxRuntime
 
 
@@ -468,8 +473,16 @@ def _session_id(client: TestClient) -> str:
     return active.json()["session"]["id"]
 
 
-def _surface_attempt(turn_payload: dict[str, Any], *, proposal_index: int = 1) -> dict[str, Any]:
-    lifecycle = turn_payload.get("surface_action_lifecycle")
+def _turn_data(client: TestClient, session_id: str) -> dict[str, Any]:
+    resp = client.get(f"/v1/sessions/{session_id}/events")
+    assert resp.status_code == 200
+    turns = resp.json()["turns"]
+    assert turns, "no turns in timeline"
+    return turns[-1]
+
+
+def _surface_attempt(turn_data: dict[str, Any], *, proposal_index: int = 1) -> dict[str, Any]:
+    lifecycle = turn_data.get("surface_action_lifecycle")
     assert isinstance(lifecycle, list)
     assert len(lifecycle) >= proposal_index
     item = lifecycle[proposal_index - 1]
@@ -672,6 +685,7 @@ def test_s4_pr01_connector_state_is_durable_and_token_material_is_not_persisted_
 
 def test_s4_pr01_calendar_and_email_read_caps_execute_allowlisted_without_approval(
     postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     adapter = ActionProposalAdapter(
         run_calls_by_message={
@@ -721,26 +735,34 @@ def test_s4_pr01_calendar_and_email_read_caps_execute_allowlisted_without_approv
             )
         }
     )
+    workspace_provider = FakeGoogleWorkspaceProvider()
+    monkeypatch.setattr(
+        "ariel.worker.build_google_runtime",
+        lambda settings: build_google_runtime(
+            settings,
+            oauth_client=oauth_client,
+            workspace_provider=cast(GoogleWorkspaceProvider, workspace_provider),
+        ),
+    )
     with _build_client(postgres_url, adapter) as client:
         _bind_google_fakes(
             client,
             oauth_client=oauth_client,
-            workspace_provider=FakeGoogleWorkspaceProvider(),
+            workspace_provider=workspace_provider,
         )
         _connect_google(client, code="connect-read-scopes")
 
         session_id = _session_id(client)
         for message in ("show schedule", "propose slots", "search inbox", "open inbox item"):
-            sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": message})
-            assert sent.status_code == 200
-            payload = sent.json()
+            post_message_and_drain(client, session_id, message=message)
+            turn_data = _turn_data(client, session_id)
 
-            attempt = _surface_attempt(payload["turn"])
+            attempt = _surface_attempt(turn_data)
             assert attempt["policy"]["decision"] == "allow_inline"
             assert attempt["approval"]["status"] == "not_requested"
             assert attempt["execution"]["status"] == "succeeded"
 
-            rendered_message = payload["assistant"]["message"].lower()
+            rendered_message = turn_data["assistant_message"].lower()
             assert "approval required" not in rendered_message
             if message == "show schedule":
                 assert "schedule" in rendered_message
@@ -755,6 +777,7 @@ def test_s4_pr01_calendar_and_email_read_caps_execute_allowlisted_without_approv
 
 def test_s4_pr01_attendee_slot_fallback_is_explicit_and_recoverable_without_freebusy_scope(
     postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     adapter = ActionProposalAdapter(
         run_calls_by_message={
@@ -793,24 +816,33 @@ def test_s4_pr01_attendee_slot_fallback_is_explicit_and_recoverable_without_free
             )
         }
     )
+    workspace_provider = FakeGoogleWorkspaceProvider()
+    monkeypatch.setattr(
+        "ariel.worker.build_google_runtime",
+        lambda settings: build_google_runtime(
+            settings,
+            oauth_client=oauth_client,
+            workspace_provider=cast(GoogleWorkspaceProvider, workspace_provider),
+        ),
+    )
     with _build_client(postgres_url, adapter) as client:
         _bind_google_fakes(
             client,
             oauth_client=oauth_client,
-            workspace_provider=FakeGoogleWorkspaceProvider(),
+            workspace_provider=workspace_provider,
         )
         _connect_google(client, code="connect-no-freebusy")
 
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "plan team sync"})
-        assert sent.status_code == 200
-        payload = sent.json()
-        rendered_message = payload["assistant"]["message"].lower()
+        post_message_and_drain(client, session_id, message="plan team sync")
+        turn_data = _turn_data(client, session_id)
+
+        rendered_message = turn_data["assistant_message"].lower()
         assert "attendee" in rendered_message
         assert "user-calendar-only" in rendered_message or "your calendar only" in rendered_message
         assert "reconnect" in rendered_message
 
-        attempt = _surface_attempt(payload["turn"])
+        attempt = _surface_attempt(turn_data)
         assert attempt["policy"]["decision"] == "allow_inline"
         assert attempt["execution"]["status"] == "succeeded"
 
@@ -827,6 +859,7 @@ def test_s4_pr01_attendee_slot_fallback_is_explicit_and_recoverable_without_free
 )
 def test_s4_pr01_typed_auth_scope_failures_are_deterministic_and_recoverable(
     postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
     case_name: str,
     connect_code: str | None,
     refresh_mode: str,
@@ -870,6 +903,14 @@ def test_s4_pr01_typed_auth_scope_failures_are_deterministic_and_recoverable(
     workspace_provider = FakeGoogleWorkspaceProvider(
         fail_scope_missing_for={scope_missing_capability} if scope_missing_capability else set()
     )
+    monkeypatch.setattr(
+        "ariel.worker.build_google_runtime",
+        lambda settings: build_google_runtime(
+            settings,
+            oauth_client=oauth_client,
+            workspace_provider=cast(GoogleWorkspaceProvider, workspace_provider),
+        ),
+    )
     with _build_client(postgres_url, adapter) as client:
         _bind_google_fakes(
             client,
@@ -880,10 +921,10 @@ def test_s4_pr01_typed_auth_scope_failures_are_deterministic_and_recoverable(
             _connect_google(client, code=connect_code)
 
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "read emails"})
-        assert sent.status_code == 200
-        payload = sent.json()
-        rendered_message = payload["assistant"]["message"].lower()
+        post_message_and_drain(client, session_id, message="read emails")
+        turn_data = _turn_data(client, session_id)
+
+        rendered_message = turn_data["assistant_message"].lower()
         assert expected_class in rendered_message
         if expected_class == "not_connected":
             assert "connect" in rendered_message
@@ -894,31 +935,28 @@ def test_s4_pr01_typed_auth_scope_failures_are_deterministic_and_recoverable(
             assert "reconnect" in rendered_message
 
         if expected_class == "not_connected":
-            assert payload["turn"]["surface_action_lifecycle"] == []
+            assert turn_data["surface_action_lifecycle"] == []
             assert all(
                 event["event_type"] != "evt.action.execution.failed"
-                for event in payload["turn"]["events"]
+                for event in turn_data["events"]
             )
             return
-        if (
-            expected_class == "consent_required"
-            and payload["turn"]["surface_action_lifecycle"] == []
-        ):
+        if expected_class == "consent_required" and turn_data["surface_action_lifecycle"] == []:
             assert "reconnect" in rendered_message
             assert all(
                 event["event_type"] != "evt.action.execution.started"
-                for event in payload["turn"]["events"]
+                for event in turn_data["events"]
             )
             return
 
-        attempt = _surface_attempt(payload["turn"])
+        attempt = _surface_attempt(turn_data)
         assert attempt["policy"]["decision"] == "allow_inline"
         assert attempt["execution"]["status"] == "failed"
         assert attempt["execution"]["error"] == expected_class
 
         failed_event_payload = next(
             event["payload"]
-            for event in payload["turn"]["events"]
+            for event in turn_data["events"]
             if event["event_type"] == "evt.action.execution.failed"
         )
         assert failed_event_payload["error"] == expected_class

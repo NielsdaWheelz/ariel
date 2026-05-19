@@ -4,19 +4,25 @@ import copy
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlparse
 
 from fastapi.testclient import TestClient
 import httpx
 import pytest
+from sqlalchemy import select
 
 import ariel.action_runtime as action_runtime_module
 import ariel.capability_registry as capability_registry_module
 import ariel.policy_engine as policy_engine_module
 from ariel.app import ModelAdapter, create_app
-from tests.integration.responses_helpers import responses_message, responses_with_run_calls
+from tests.integration.responses_helpers import (
+    post_message_and_drain,
+    responses_message,
+    responses_with_run_calls,
+)
 from ariel.capability_registry import CapabilityDefinition
+from ariel.persistence import ArtifactRecord
 from tests.fake_sandbox import FakeSandboxRuntime
 
 
@@ -128,8 +134,17 @@ def _session_id(client: TestClient) -> str:
     return active.json()["session"]["id"]
 
 
-def _surface_attempt(turn_payload: dict[str, Any], *, proposal_index: int = 1) -> dict[str, Any]:
-    lifecycle = turn_payload.get("surface_action_lifecycle")
+def _turn_data(client: TestClient, session_id: str) -> dict[str, Any]:
+    """Fetch the latest turn from the events timeline."""
+    resp = client.get(f"/v1/sessions/{session_id}/events")
+    assert resp.status_code == 200
+    turns = resp.json()["turns"]
+    assert turns, "no turns in timeline"
+    return turns[-1]
+
+
+def _surface_attempt(turn_data: dict[str, Any], *, proposal_index: int = 1) -> dict[str, Any]:
+    lifecycle = turn_data.get("surface_action_lifecycle")
     assert isinstance(lifecycle, list)
     assert len(lifecycle) >= proposal_index
     item = lifecycle[proposal_index - 1]
@@ -137,8 +152,8 @@ def _surface_attempt(turn_payload: dict[str, Any], *, proposal_index: int = 1) -
     return item
 
 
-def _event_types(turn_payload: dict[str, Any]) -> list[str]:
-    return [event["event_type"] for event in turn_payload["events"]]
+def _event_types(turn_data: dict[str, Any]) -> list[str]:
+    return [event["event_type"] for event in turn_data["events"]]
 
 
 def _assert_source_contract(source: dict[str, Any]) -> None:
@@ -149,6 +164,38 @@ def _assert_source_contract(source: dict[str, Any]) -> None:
     assert isinstance(source["source"], str)
     assert isinstance(source["retrieved_at"], str)
     assert source["published_at"] is None or isinstance(source["published_at"], str)
+
+
+def _turn_sources(client: TestClient, turn_id: str) -> list[dict[str, Any]]:
+    """Return retrieval-provenance sources for a turn by querying the DB directly.
+
+    The async turn path does not embed sources in evt.assistant.emitted; they
+    live as ArtifactRecord rows and are read back here for source assertions.
+    """
+    from ariel.persistence import to_rfc3339
+
+    session_factory = cast(Any, client.app).state.session_factory
+    with session_factory() as db:
+        artifacts = db.scalars(
+            select(ArtifactRecord)
+            .where(
+                ArtifactRecord.turn_id == turn_id,
+                ArtifactRecord.artifact_type == "retrieval_provenance",
+            )
+            .order_by(ArtifactRecord.created_at.asc(), ArtifactRecord.id.asc())
+        ).all()
+    return [
+        {
+            "artifact_id": artifact.id,
+            "title": artifact.title,
+            "source": artifact.source,
+            "retrieved_at": to_rfc3339(artifact.retrieved_at),
+            "published_at": (
+                to_rfc3339(artifact.published_at) if artifact.published_at is not None else None
+            ),
+        }
+        for artifact in artifacts
+    ]
 
 
 def _patch_capability_lookup(
@@ -259,13 +306,10 @@ def test_s6_pr02_maps_directions_executes_against_routes_api_with_citations(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message", json={"message": "route to airport"}
-        )
-        assert sent.status_code == 200
-        payload = sent.json()
+        post_message_and_drain(client, session_id, message="route to airport")
+        turn_data = _turn_data(client, session_id)
 
-        attempt = _surface_attempt(payload["turn"])
+        attempt = _surface_attempt(turn_data)
         assert attempt["proposal"]["capability_id"] == "cap.maps.directions"
         assert attempt["policy"]["decision"] == "allow_inline"
         assert attempt["approval"]["status"] == "not_requested"
@@ -300,7 +344,6 @@ def test_s6_pr02_maps_directions_executes_against_routes_api_with_citations(
         assert routes_body["destination"] == {"address": "SEA Airport, Seattle, WA"}
         assert routes_body["travelMode"] == "DRIVE"
         assert routes_body["routingPreference"] == "TRAFFIC_AWARE"
-        # A no-waypoint query requests alternatives and carries no intermediates.
         assert routes_body["computeAlternativeRoutes"] is True
         assert "intermediates" not in routes_body
         assert "optimizeWaypointOrder" not in routes_body
@@ -312,13 +355,17 @@ def test_s6_pr02_maps_directions_executes_against_routes_api_with_citations(
             "routes.optimizedIntermediateWaypointIndex"
         )
 
-        assert "[1]" in payload["assistant"]["message"]
-        assert len(payload["assistant"]["sources"]) == 1
-        _assert_source_contract(payload["assistant"]["sources"][0])
+        assistant_message = turn_data["assistant_message"]
+        assert "[1]" in assistant_message
 
-        event_types = _event_types(payload["turn"])
-        assert "evt.action.execution.started" in event_types
-        assert "evt.action.execution.succeeded" in event_types
+        # Sources are retrieval_provenance artifacts in the DB.
+        sources = _turn_sources(client, turn_data["id"])
+        assert len(sources) == 1
+        _assert_source_contract(sources[0])
+
+        event_type_list = _event_types(turn_data)
+        assert "evt.action.execution.started" in event_type_list
+        assert "evt.action.execution.succeeded" in event_type_list
 
 
 def test_s6_pr02_maps_search_places_executes_against_places_api_with_metadata(
@@ -372,13 +419,10 @@ def test_s6_pr02_maps_search_places_executes_against_places_api_with_metadata(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message", json={"message": "find nearby coffee"}
-        )
-        assert sent.status_code == 200
-        payload = sent.json()
+        post_message_and_drain(client, session_id, message="find nearby coffee")
+        turn_data = _turn_data(client, session_id)
 
-        attempt = _surface_attempt(payload["turn"])
+        attempt = _surface_attempt(turn_data)
         assert attempt["proposal"]["capability_id"] == "cap.maps.search_places"
         assert attempt["policy"]["decision"] == "allow_inline"
         assert attempt["execution"]["status"] == "succeeded"
@@ -388,8 +432,6 @@ def test_s6_pr02_maps_search_places_executes_against_places_api_with_metadata(
         first = output["results"][0]
         assert first["title"] == "Blue Bottle Coffee"
         assert first["source"] == "https://maps.google.com/?cid=1"
-        # Place facts are structured fields the model reads directly; the snippet
-        # carries the human-readable address for the citation.
         assert first["snippet"] == "300 1st Ave, Seattle, WA"
         assert first["address"] == "300 1st Ave, Seattle, WA"
         assert first["rating"] == 4.6
@@ -399,12 +441,10 @@ def test_s6_pr02_maps_search_places_executes_against_places_api_with_metadata(
         assert isinstance(first["distance_meters"], int)
         assert output["results"][1]["open_now"] is False
 
-        # Geocoding leg: an address-only GET carrying the api key as a query param.
         assert calls[0]["url"] == "https://maps.googleapis.com/maps/api/geocode/json"
         assert calls[0]["method"] == "GET"
         assert calls[0]["params"]["address"] == "Downtown Seattle, WA"
         assert calls[0]["params"]["key"] == "test-maps-key"
-        # Places leg: a text-search POST with a field mask and a circular location bias.
         assert calls[1]["url"] == "https://places.googleapis.com/v1/places:searchText"
         assert calls[1]["method"] == "POST"
         places_body = calls[1]["json"]
@@ -418,8 +458,9 @@ def test_s6_pr02_maps_search_places_executes_against_places_api_with_metadata(
         assert "places.displayName" in places_headers["x-goog-fieldmask"]
         assert "places.rating" in places_headers["x-goog-fieldmask"]
 
-        assert "[1]" in payload["assistant"]["message"]
-        assert len(payload["assistant"]["sources"]) >= 1
+        assert "[1]" in turn_data["assistant_message"]
+        # Sources are retrieval_provenance artifacts in the DB.
+        assert len(_turn_sources(client, turn_data["id"])) >= 1
 
 
 def test_s6_pr02_maps_search_places_enforces_radius_with_haversine_filter(
@@ -466,13 +507,10 @@ def test_s6_pr02_maps_search_places_enforces_radius_with_haversine_filter(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message", json={"message": "radius filtered coffee"}
-        )
-        assert sent.status_code == 200
-        payload = sent.json()
+        post_message_and_drain(client, session_id, message="radius filtered coffee")
+        turn_data = _turn_data(client, session_id)
 
-        attempt = _surface_attempt(payload["turn"])
+        attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "succeeded"
         output = attempt["execution"]["output"]
         assert [result["title"] for result in output["results"]] == ["Near Cafe"]
@@ -511,20 +549,16 @@ def test_s6_pr02_maps_directions_missing_required_route_fields_asks_explicit_cla
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "missing route field"},
-        )
-        assert sent.status_code == 200
-        payload = sent.json()
-        attempt = _surface_attempt(payload["turn"])
+        post_message_and_drain(client, session_id, message="missing route field")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"
         assert attempt["execution"]["error"] == expected_error
-        message = payload["assistant"]["message"].lower()
+        message = turn_data["assistant_message"].lower()
         assert expected_hint in message
         assert "infer" in message
         assert "location" in message
-        assert payload["assistant"]["sources"] == []
+        assert _turn_sources(client, turn_data["id"]) == []
 
 
 def test_s6_pr02_maps_search_places_missing_location_context_asks_explicit_clarification(
@@ -539,20 +573,16 @@ def test_s6_pr02_maps_search_places_missing_location_context_asks_explicit_clari
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "missing places location"},
-        )
-        assert sent.status_code == 200
-        payload = sent.json()
-        attempt = _surface_attempt(payload["turn"])
+        post_message_and_drain(client, session_id, message="missing places location")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"
         assert attempt["execution"]["error"] == "maps_location_context_required"
-        message = payload["assistant"]["message"].lower()
+        message = turn_data["assistant_message"].lower()
         assert "location" in message
         assert "nearby" in message or "context" in message
         assert "infer" in message
-        assert payload["assistant"]["sources"] == []
+        assert _turn_sources(client, turn_data["id"]) == []
 
 
 def test_s6_pr02_maps_capability_not_offered_when_api_key_missing(
@@ -580,16 +610,11 @@ def test_s6_pr02_maps_capability_not_offered_when_api_key_missing(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "maps without key"},
-        )
-        assert sent.status_code == 200
-        payload = sent.json()
-        assert payload["turn"]["surface_action_lifecycle"] == []
+        post_message_and_drain(client, session_id, message="maps without key")
+        turn_data = _turn_data(client, session_id)
+        assert turn_data["surface_action_lifecycle"] == []
         assert all(
-            event["event_type"] != "evt.action.execution.started"
-            for event in payload["turn"]["events"]
+            event["event_type"] != "evt.action.execution.started" for event in turn_data["events"]
         )
 
 
@@ -673,16 +698,12 @@ def test_s6_pr02_maps_provider_failures_are_typed_and_recoverable(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "maps runtime failure"},
-        )
-        assert sent.status_code == 200
-        payload = sent.json()
-        attempt = _surface_attempt(payload["turn"])
+        post_message_and_drain(client, session_id, message="maps runtime failure")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"
         assert attempt["execution"]["error"] == expected_error
-        rendered_message = payload["assistant"]["message"].lower()
+        rendered_message = turn_data["assistant_message"].lower()
         assert expected_error in rendered_message
         assert expected_hint in rendered_message
 
@@ -730,15 +751,12 @@ def test_s6_pr02_maps_egress_preflight_remains_fail_closed_before_execution(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message", json={"message": "maps egress deny"}
-        )
-        assert sent.status_code == 200
-        payload = sent.json()
-        attempt = _surface_attempt(payload["turn"])
+        post_message_and_drain(client, session_id, message="maps egress deny")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"
         assert "egress_destination_denied" in (attempt["execution"]["error"] or "")
-        message = payload["assistant"]["message"].lower()
+        message = turn_data["assistant_message"].lower()
         assert "maps runtime failure" in message
         assert "allowlist" in message
         assert execute_attempts == 0
@@ -777,16 +795,13 @@ def test_s6_pr02_maps_retrieval_isolation_from_google_connector_readiness(
         assert connector_status.json()["connector"]["readiness"] == "not_connected"
 
         session_id = _session_id(client)
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "maps while google disconnected"},
-        )
-        assert sent.status_code == 200
-        payload = sent.json()
-        attempt = _surface_attempt(payload["turn"])
+        post_message_and_drain(client, session_id, message="maps while google disconnected")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "succeeded"
-        assert "google connector auth failure" not in payload["assistant"]["message"].lower()
-        assert len(payload["assistant"]["sources"]) == 1
+        assert "google connector auth failure" not in turn_data["assistant_message"].lower()
+        # Sources are retrieval_provenance artifacts in the DB.
+        assert len(_turn_sources(client, turn_data["id"])) == 1
 
 
 def test_s6_pr02_maps_outputs_remain_normalized_for_mixed_retrieval_turns(
@@ -842,18 +857,16 @@ def test_s6_pr02_maps_outputs_remain_normalized_for_mixed_retrieval_turns(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message", json={"message": "mixed retrieval"}
-        )
-        assert sent.status_code == 200
-        payload = sent.json()
-        message = payload["assistant"]["message"]
+        post_message_and_drain(client, session_id, message="mixed retrieval")
+        turn_data = _turn_data(client, session_id)
+        message = turn_data["assistant_message"]
         assert "[1]" in message
         assert "[2]" in message
-        assert len(payload["assistant"]["sources"]) == 2
+        # Sources are retrieval_provenance artifacts in the DB.
+        assert len(_turn_sources(client, turn_data["id"])) == 2
 
-        first_attempt = _surface_attempt(payload["turn"], proposal_index=1)
-        second_attempt = _surface_attempt(payload["turn"], proposal_index=2)
+        first_attempt = _surface_attempt(turn_data, proposal_index=1)
+        second_attempt = _surface_attempt(turn_data, proposal_index=2)
         assert first_attempt["proposal"]["capability_id"] == "cap.maps.directions"
         assert second_attempt["proposal"]["capability_id"] == "cap.search.web"
         assert first_attempt["execution"]["status"] == "succeeded"
@@ -892,9 +905,9 @@ def test_s6_pr02_maps_directions_walking_mode_omits_traffic_routing_preference(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "walk there"})
-        assert sent.status_code == 200
-        attempt = _surface_attempt(sent.json()["turn"])
+        post_message_and_drain(client, session_id, message="walk there")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "succeeded"
         routes_body = calls[0]["json"]
         assert routes_body["travelMode"] == "WALK"
@@ -934,9 +947,9 @@ def test_s6_pr02_maps_directions_reports_uncertainty_when_no_route(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "no route"})
-        assert sent.status_code == 200
-        attempt = _surface_attempt(sent.json()["turn"])
+        post_message_and_drain(client, session_id, message="no route")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "succeeded"
         output = attempt["execution"]["output"]
         assert output["uncertainty"] == "insufficient_evidence"
@@ -990,11 +1003,9 @@ def test_s6_pr02_maps_directions_multi_stop_routes_a_single_legged_trip(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message", json={"message": "plan my errands"}
-        )
-        assert sent.status_code == 200
-        attempt = _surface_attempt(sent.json()["turn"])
+        post_message_and_drain(client, session_id, message="plan my errands")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "succeeded"
         output = attempt["execution"]["output"]
         assert output["waypoints"] == ["Cleaner, Seattle, WA", "Grocery, Seattle, WA"]
@@ -1019,7 +1030,6 @@ def test_s6_pr02_maps_directions_multi_stop_routes_a_single_legged_trip(
             {"address": "Cleaner, Seattle, WA"},
             {"address": "Grocery, Seattle, WA"},
         ]
-        # Waypoint requests and alternatives are mutually exclusive on the Routes API.
         assert "computeAlternativeRoutes" not in routes_body
         assert "optimizeWaypointOrder" not in routes_body
 
@@ -1041,7 +1051,6 @@ def test_s6_pr02_maps_directions_optimize_order_reports_googles_chosen_stop_orde
                         "duration": "1860s",
                         "staticDuration": "1800s",
                         "description": "Optimized loop",
-                        # Google visits the second supplied waypoint first.
                         "optimizedIntermediateWaypointIndex": [1, 0],
                         "legs": [
                             {"distanceMeters": 3000, "duration": "500s", "staticDuration": "480s"},
@@ -1072,14 +1081,11 @@ def test_s6_pr02_maps_directions_optimize_order_reports_googles_chosen_stop_orde
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message", json={"message": "best errand order"}
-        )
-        assert sent.status_code == 200
-        attempt = _surface_attempt(sent.json()["turn"])
+        post_message_and_drain(client, session_id, message="best errand order")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "succeeded"
         route = attempt["execution"]["output"]["routes"][0]
-        # The reorder swaps the two supplied waypoints between origin and destination.
         assert route["stops"] == [
             "Home, Seattle, WA",
             "Grocery, Seattle, WA",
@@ -1153,18 +1159,16 @@ def test_s6_pr02_maps_directions_returns_alternative_routes_for_plain_query(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "route options"})
-        assert sent.status_code == 200
-        attempt = _surface_attempt(sent.json()["turn"])
+        post_message_and_drain(client, session_id, message="route options")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "succeeded"
         output = attempt["execution"]["output"]
         assert len(output["routes"]) == 2
-        # routes[0] is Google's recommended route; the rest are alternatives.
         assert output["routes"][0]["description"] == "I-5 N"
         assert output["routes"][0]["duration_seconds"] == 1200
         assert output["routes"][1]["description"] == "I-405 N"
         assert output["routes"][1]["duration_seconds"] == 1440
-        # One citation per route.
         assert len(output["results"]) == 2
         assert calls[0]["json"]["computeAlternativeRoutes"] is True
 
@@ -1204,9 +1208,9 @@ def test_s6_pr02_maps_directions_caps_alternatives_at_three_routes(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "many routes"})
-        assert sent.status_code == 200
-        attempt = _surface_attempt(sent.json()["turn"])
+        post_message_and_drain(client, session_id, message="many routes")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "succeeded"
         output = attempt["execution"]["output"]
         assert len(output["routes"]) == 3
@@ -1242,9 +1246,9 @@ def test_s6_pr02_maps_search_places_reports_uncertainty_when_no_places(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "no places"})
-        assert sent.status_code == 200
-        attempt = _surface_attempt(sent.json()["turn"])
+        post_message_and_drain(client, session_id, message="no places")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "succeeded"
         output = attempt["execution"]["output"]
         assert output["uncertainty"] == "insufficient_evidence"
@@ -1277,9 +1281,9 @@ def test_s6_pr02_maps_search_places_unresolvable_location_asks_clarification(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "vague place"})
-        assert sent.status_code == 200
-        attempt = _surface_attempt(sent.json()["turn"])
+        post_message_and_drain(client, session_id, message="vague place")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"
         assert attempt["execution"]["error"] == "maps_location_not_found"
 
@@ -1328,11 +1332,9 @@ def test_s6_pr02_maps_search_places_geocoding_and_places_leg_failures_are_typed(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message", json={"message": "geocode failure"}
-        )
-        assert sent.status_code == 200
-        attempt = _surface_attempt(sent.json()["turn"])
+        post_message_and_drain(client, session_id, message="geocode failure")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"
         assert attempt["execution"]["error"] == expected_error
 

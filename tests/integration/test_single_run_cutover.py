@@ -17,6 +17,7 @@ from ariel.persistence import ActionAttemptRecord, AIJudgmentRecord, TurnRecord
 from ariel.policy_engine import evaluate_proposal
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.responses_helpers import (
+    post_message_and_drain,
     responses_message,
     responses_run_message,
     responses_with_run_calls,
@@ -62,6 +63,14 @@ def _session_id(client: TestClient) -> str:
     active = client.get("/v1/sessions/active")
     assert active.status_code == 200
     return active.json()["session"]["id"]
+
+
+def _turn_data(client: TestClient, session_id: str) -> dict[str, Any]:
+    resp = client.get(f"/v1/sessions/{session_id}/events")
+    assert resp.status_code == 200
+    turns = resp.json()["turns"]
+    assert turns, "no turns in timeline"
+    return turns[-1]
 
 
 def _program_response(
@@ -130,10 +139,6 @@ class CapturingRunAdapter:
         return self.responses.pop(0)
 
 
-def _event_types(payload: dict[str, Any]) -> list[str]:
-    return [event["event_type"] for event in payload["turn"]["events"]]
-
-
 def test_normal_turn_exposes_only_strict_run_tool(postgres_url: str) -> None:
     adapter = CapturingRunAdapter(
         responses=[
@@ -147,10 +152,9 @@ def test_normal_turn_exposes_only_strict_run_tool(postgres_url: str) -> None:
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "hello"})
+        turn = post_message_and_drain(client, session_id, message="hello")
 
-    assert sent.status_code == 200
-    assert sent.json()["assistant"]["message"] == "done"
+    assert turn.assistant_message == "done"
     assert len(adapter.tools_seen) == 1
     assert [tool["name"] for tool in adapter.tools_seen[0]] == ["run"]
     assert adapter.tools_seen[0][0]["strict"] is True
@@ -180,14 +184,14 @@ def test_plain_assistant_text_is_protocol_feedback_not_visible(postgres_url: str
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "hello"})
+        turn = post_message_and_drain(client, session_id, message="hello")
+        turn_data = _turn_data(client, session_id)
 
-    payload = sent.json()
-    assert sent.status_code == 200
-    assert payload["assistant"]["message"] == "visible through run"
-    assert "this must stay hidden" not in payload["assistant"]["message"]
+    assert turn.assistant_message == "visible through run"
+    assert "this must stay hidden" not in (turn.assistant_message or "")
     assert "this must stay hidden" not in json.dumps(adapter.input_items_seen[-1])
-    assert "evt.model.protocol_failed" in _event_types(payload)
+    event_types = [event["event_type"] for event in turn_data["events"]]
+    assert "evt.model.protocol_failed" in event_types
     engine = create_engine(postgres_url, future=True)
     session_factory = sessionmaker(bind=engine, future=True, expire_on_commit=False)
     with session_factory() as db:
@@ -274,13 +278,13 @@ def test_invalid_direct_tool_protocol_retries_without_executing(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "hello"})
+        turn = post_message_and_drain(client, session_id, message="hello")
+        turn_data = _turn_data(client, session_id)
 
-    payload = sent.json()
-    assert sent.status_code == 200
-    assert payload["assistant"]["message"] == "recovered"
-    assert "evt.model.protocol_failed" in _event_types(payload)
-    assert payload["turn"]["surface_action_lifecycle"] == []
+    assert turn.assistant_message == "recovered"
+    event_types = [event["event_type"] for event in turn_data["events"]]
+    assert "evt.model.protocol_failed" in event_types
+    assert turn_data["surface_action_lifecycle"] == []
     assert any(item.get("type") == "function_call_output" for item in adapter.input_items_seen[-1])
 
 
@@ -306,13 +310,13 @@ def test_program_that_raises_is_a_program_failure(postgres_url: str) -> None:
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "hello"})
+        turn = post_message_and_drain(client, session_id, message="hello")
+        turn_data = _turn_data(client, session_id)
 
-    payload = sent.json()
-    assert sent.status_code == 200
-    assert payload["assistant"]["message"] == "recovered"
-    assert "evt.run.validation_failed" in _event_types(payload)
-    assert payload["turn"]["surface_action_lifecycle"] == []
+    assert turn.assistant_message == "recovered"
+    event_types = [event["event_type"] for event in turn_data["events"]]
+    assert "evt.run.validation_failed" in event_types
+    assert turn_data["surface_action_lifecycle"] == []
     feedback = json.dumps(adapter.input_items_seen[-1])
     assert "ValueError" in feedback
 
@@ -338,13 +342,13 @@ def test_program_with_syntax_error_is_a_program_failure(postgres_url: str) -> No
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "hello"})
+        turn = post_message_and_drain(client, session_id, message="hello")
+        turn_data = _turn_data(client, session_id)
 
-    payload = sent.json()
-    assert sent.status_code == 200
-    assert payload["assistant"]["message"] == "recovered"
-    assert "evt.run.validation_failed" in _event_types(payload)
-    assert payload["turn"]["surface_action_lifecycle"] == []
+    assert turn.assistant_message == "recovered"
+    event_types = [event["event_type"] for event in turn_data["events"]]
+    assert "evt.run.validation_failed" in event_types
+    assert turn_data["surface_action_lifecycle"] == []
 
 
 def test_pause_until_input_ends_turn_without_visible_output(postgres_url: str) -> None:
@@ -360,13 +364,11 @@ def test_pause_until_input_ends_turn_without_visible_output(postgres_url: str) -
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "wait"})
+        turn = post_message_and_drain(client, session_id, message="wait")
+        turn_data = _turn_data(client, session_id)
 
-    payload = sent.json()
-    assert sent.status_code == 200
-    assert payload["assistant"]["message"] == ""
-    assert payload["assistant"]["silent"] is True
-    assert payload["turn"]["surface_action_lifecycle"] == []
+    assert turn.assistant_message == ""
+    assert turn_data["surface_action_lifecycle"] == []
 
 
 def test_emit_value_is_internal_feedback_with_digest_surface(postgres_url: str) -> None:
@@ -388,15 +390,12 @@ def test_emit_value_is_internal_feedback_with_digest_surface(postgres_url: str) 
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "compute"})
+        turn = post_message_and_drain(client, session_id, message="compute")
+        turn_data = _turn_data(client, session_id)
 
-    payload = sent.json()
-    assert sent.status_code == 200
-    assert payload["assistant"]["message"] == "value handled"
+    assert turn.assistant_message == "value handled"
     value_events = [
-        event
-        for event in payload["turn"]["events"]
-        if event["event_type"] == "evt.agent.value_emitted"
+        event for event in turn_data["events"] if event["event_type"] == "evt.agent.value_emitted"
     ]
     assert len(value_events) == 1
     assert "value" not in value_events[0]["payload"]
@@ -433,12 +432,11 @@ def test_program_composes_a_mechanical_answer_in_one_turn(postgres_url: str) -> 
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "add it up"})
+        turn = post_message_and_drain(client, session_id, message="add it up")
+        turn_data = _turn_data(client, session_id)
 
-    payload = sent.json()
-    assert sent.status_code == 200
-    assert payload["assistant"]["message"] == "The total is 6."
-    assert payload["turn"]["surface_action_lifecycle"] == []
+    assert turn.assistant_message == "The total is 6."
+    assert turn_data["surface_action_lifecycle"] == []
 
 
 def test_run_program_emitting_no_output_retries(postgres_url: str) -> None:
@@ -464,11 +462,9 @@ def test_run_program_emitting_no_output_retries(postgres_url: str) -> None:
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "hello"})
+        turn = post_message_and_drain(client, session_id, message="hello")
 
-    payload = sent.json()
-    assert sent.status_code == 200
-    assert payload["assistant"]["message"] == "now visible"
+    assert turn.assistant_message == "now visible"
 
 
 def test_taint_threads_across_two_programs_in_one_turn(
@@ -558,13 +554,9 @@ def test_taint_threads_across_two_programs_in_one_turn(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message", json={"message": "act after a read"}
-        )
+        turn = post_message_and_drain(client, session_id, message="act after a read")
 
-    payload = sent.json()
-    assert sent.status_code == 200
-    assert payload["assistant"]["message"] == "remembered"
+    assert turn.assistant_message == "remembered"
     # Two syscalls ran: program 1's recall (clean baseline) and program 2's
     # side-effecting syscall, which must have seen the taint program 1 produced.
     assert len(seen_provenance) == 2
@@ -628,22 +620,20 @@ def test_two_programs_with_capability_syscalls_get_distinct_proposal_index(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "recall twice"})
+        turn = post_message_and_drain(client, session_id, message="recall twice")
 
-    payload = sent.json()
     # The turn persisted: no UniqueViolation on the (turn_id, proposal_index)
     # index when the second program's capability syscall flushed.
-    assert sent.status_code == 200, payload
-    assert payload["assistant"]["message"] == "recalled twice: recalled"
+    assert turn.assistant_message == "recalled twice: recalled"
 
     engine = create_engine(postgres_url, future=True)
     session_factory = sessionmaker(bind=engine, future=True, expire_on_commit=False)
     with session_factory() as db:
-        turn = db.scalar(select(TurnRecord).where(TurnRecord.session_id == session_id))
-        assert turn is not None
+        db_turn = db.scalar(select(TurnRecord).where(TurnRecord.session_id == session_id))
+        assert db_turn is not None
         attempts = db.scalars(
             select(ActionAttemptRecord)
-            .where(ActionAttemptRecord.turn_id == turn.id)
+            .where(ActionAttemptRecord.turn_id == db_turn.id)
             .order_by(ActionAttemptRecord.proposal_index.asc())
         ).all()
     # Both capability syscalls wrote an action attempt, and the two share a turn

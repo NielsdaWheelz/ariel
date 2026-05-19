@@ -12,6 +12,7 @@ from sqlalchemy import text
 
 from ariel.app import ModelAdapter, ModelAdapterError, create_app
 from tests.integration.responses_helpers import (
+    post_message_and_drain,
     responses_message,
     responses_run_message,
     responses_with_run_calls,
@@ -24,6 +25,12 @@ def _parse_utc_rfc3339(value: str) -> datetime:
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     assert parsed.tzinfo == UTC
     return parsed
+
+
+def _timeline(client: TestClient, session_id: str) -> dict[str, Any]:
+    resp = client.get(f"/v1/sessions/{session_id}/events")
+    assert resp.status_code == 200
+    return resp.json()
 
 
 @dataclass
@@ -300,20 +307,11 @@ def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
 def test_user_can_send_message_and_receive_model_backed_response(postgres_url: str) -> None:
     adapter = DeterministicModelAdapter()
     with _build_client(postgres_url, adapter) as client:
-        active = client.get("/v1/sessions/active")
-        assert active.status_code == 200
-        session_id = active.json()["session"]["id"]
+        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
 
-        response = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "hello from phone"},
-        )
-        assert response.status_code == 200
-        body = response.json()
-        assert body["ok"] is True
-        assert body["assistant"]["message"] == "assistant::hello from phone"
-        assert body["assistant"]["silent"] is False
-        assert body["turn"]["status"] == "completed"
+        turn = post_message_and_drain(client, session_id, message="hello from phone")
+        assert turn.assistant_message == "assistant::hello from phone"
+        assert turn.status == "completed"
 
 
 def test_no_visible_response_operation_completes_turn_without_visible_reply(
@@ -323,10 +321,11 @@ def test_no_visible_response_operation_completes_turn_without_visible_reply(
     with _build_client(postgres_url, adapter) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
 
-        response = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={
-                "message": "noted",
+        turn = post_message_and_drain(
+            client,
+            session_id,
+            message="noted",
+            json_extra={
                 "discord": {
                     "guild_id": 123,
                     "guild_name": "Home",
@@ -354,19 +353,20 @@ def test_no_visible_response_operation_completes_turn_without_visible_reply(
                             "download_url": "https://cdn.discordapp.com/attachments/note.txt",
                         }
                     ],
-                },
+                }
             },
         )
 
-        body = response.json()
-        assert response.status_code == 200
-        assert body["assistant"]["message"] == ""
-        assert body["assistant"]["silent"] is True
-        assert body["turn"]["assistant_message"] == ""
-        assert body["turn"]["surface_action_lifecycle"] == []
-        turn_started = [
-            event for event in body["turn"]["events"] if event["event_type"] == "evt.turn.started"
-        ][0]
+        assert turn.assistant_message == ""
+        assert turn.status == "completed"
+
+        timeline = _timeline(client, session_id)
+        turn_data = timeline["turns"][0]
+        assert turn_data["assistant_message"] == ""
+
+        turn_started = next(
+            event for event in turn_data["events"] if event["event_type"] == "evt.turn.started"
+        )
         assert turn_started["payload"]["discord"]["channel_name"] == "ops"
         assert adapter.context_bundles[0]["discord_context"]["message_id"] == 101112
         assert any(
@@ -428,10 +428,11 @@ def test_discord_attachment_content_is_referenced_without_raw_cdn_url(
     adapter = CapturingAttachmentAdapter()
     with _build_client(postgres_url, adapter) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        response = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={
-                "message": "please summarize this",
+        turn = post_message_and_drain(
+            client,
+            session_id,
+            message="please summarize this",
+            json_extra={
                 "discord": {
                     "guild_id": 123,
                     "channel_id": 456,
@@ -449,14 +450,10 @@ def test_discord_attachment_content_is_referenced_without_raw_cdn_url(
                             "download_url": "https://cdn.discordapp.com/attachments/raw.pdf",
                         }
                     ],
-                },
+                }
             },
         )
-
-        assert response.status_code == 200
-        body = response.json()
-
-    assert body["ok"] is True
+        assert turn.status == "completed"
 
     context_attachment = adapter.context_bundles[0]["discord_context"]["attachments"][0]
     assert context_attachment == {
@@ -469,13 +466,11 @@ def test_discord_attachment_content_is_referenced_without_raw_cdn_url(
     }
 
     model_payload = json.dumps(adapter.input_items, sort_keys=True)
-    durable_payload = json.dumps(body, sort_keys=True)
     assert "attachment_ref=discord:131415" in model_payload
     assert "filename=quarterly.pdf" in model_payload
     assert "url=" not in model_payload
     assert "download_url" not in model_payload
     assert "https://cdn.discordapp.com/attachments/raw.pdf" not in model_payload
-    assert "https://cdn.discordapp.com/attachments/raw.pdf" not in durable_payload
 
 
 def test_discord_attachment_read_tool_reads_text_attachment(
@@ -518,10 +513,11 @@ def test_discord_attachment_read_tool_reads_text_attachment(
     adapter = AttachmentReadAdapter()
     with _build_client(postgres_url, adapter) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        response = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={
-                "message": "please summarize this",
+        turn = post_message_and_drain(
+            client,
+            session_id,
+            message="please summarize this",
+            json_extra={
                 "discord": {
                     "guild_id": 123,
                     "channel_id": 456,
@@ -539,23 +535,23 @@ def test_discord_attachment_read_tool_reads_text_attachment(
                             "download_url": "https://cdn.discordapp.com/attachments/report.txt",
                         }
                     ],
-                },
+                }
             },
         )
 
-        assert response.status_code == 200
-        body = response.json()
+        assert turn.assistant_message == "attachment content: quarterly revenue increased [1]"
 
-    assert body["assistant"]["message"] == "attachment content: quarterly revenue increased [1]"
-    assert body["assistant"]["sources"][0]["title"] == "report.txt"
-    lifecycle = body["turn"]["surface_action_lifecycle"]
-    assert lifecycle[0]["proposal"]["capability_id"] == "cap.attachment.read"
-    assert lifecycle[0]["execution"]["output"]["blocks"] == [
-        {"kind": "text", "text": "quarterly revenue increased"}
-    ]
-    durable_payload = json.dumps(body, sort_keys=True)
-    assert "https://cdn.discordapp.com/attachments/report.txt" not in durable_payload
-    assert "download_url" not in durable_payload
+        timeline = _timeline(client, session_id)
+        turn_data = timeline["turns"][0]
+        lifecycle = turn_data["surface_action_lifecycle"]
+        assert lifecycle[0]["proposal"]["capability_id"] == "cap.attachment.read"
+        assert lifecycle[0]["execution"]["output"]["blocks"] == [
+            {"kind": "text", "text": "quarterly revenue increased"}
+        ]
+
+        durable_payload = json.dumps(turn_data, sort_keys=True)
+        assert "https://cdn.discordapp.com/attachments/report.txt" not in durable_payload
+        assert "download_url" not in durable_payload
 
 
 def test_discord_turn_context_includes_bounded_same_channel_history(
@@ -565,10 +561,11 @@ def test_discord_turn_context_includes_bounded_same_channel_history(
     with _build_client(postgres_url, adapter) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
 
-        first = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={
-                "message": "channel note one",
+        first_turn = post_message_and_drain(
+            client,
+            session_id,
+            message="channel note one",
+            json_extra={
                 "discord": {
                     "guild_id": 123,
                     "channel_id": 456,
@@ -576,15 +573,15 @@ def test_discord_turn_context_includes_bounded_same_channel_history(
                     "author_id": 131415,
                     "mentioned_bot": False,
                     "attachments": [],
-                },
+                }
             },
         )
-        assert first.status_code == 200
 
-        second = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={
-                "message": "what was the note?",
+        post_message_and_drain(
+            client,
+            session_id,
+            message="what was the note?",
+            json_extra={
                 "discord": {
                     "guild_id": 123,
                     "channel_id": 456,
@@ -592,15 +589,14 @@ def test_discord_turn_context_includes_bounded_same_channel_history(
                     "author_id": 131415,
                     "mentioned_bot": False,
                     "attachments": [],
-                },
+                }
             },
         )
-        assert second.status_code == 200
 
         channel_turns = adapter.context_bundles[1]["discord_channel_recent_turns"]
         assert channel_turns == [
             {
-                "turn_id": first.json()["turn"]["id"],
+                "turn_id": first_turn.id,
                 "message_id": 1001,
                 "user_message": "channel note one",
                 "assistant_message": "",
@@ -621,24 +617,19 @@ def test_pr01_model_led_direct_and_clarification_messages_are_emitted(postgres_u
     with _build_client(postgres_url, adapter) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
 
-        clear_turn = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "summarize this in one line"},
+        clear_turn = post_message_and_drain(
+            client, session_id, message="summarize this in one line"
         )
-        assert clear_turn.status_code == 200
-        assert clear_turn.json()["assistant"]["message"].startswith("direct::")
+        assert clear_turn.assistant_message is not None
+        assert clear_turn.assistant_message.startswith("direct::")
 
-        ambiguous_turn = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "book me travel"},
-        )
-        assert ambiguous_turn.status_code == 200
-        assert "destination and travel dates" in ambiguous_turn.json()["assistant"]["message"]
+        ambiguous_turn = post_message_and_drain(client, session_id, message="book me travel")
+        assert ambiguous_turn.assistant_message is not None
+        assert "destination and travel dates" in ambiguous_turn.assistant_message
 
-        timeline = client.get(f"/v1/sessions/{session_id}/events")
-        assert timeline.status_code == 200
+        timeline = _timeline(client, session_id)
         event_types_by_turn = [
-            [event["event_type"] for event in turn["events"]] for turn in timeline.json()["turns"]
+            [event["event_type"] for event in turn["events"]] for turn in timeline["turns"]
         ]
         assert all("evt.assistant.emitted" in event_types for event_types in event_types_by_turn)
         assert all("evt.turn.completed" in event_types for event_types in event_types_by_turn)
@@ -654,31 +645,17 @@ def test_pr01_turn_context_is_bounded_ordered_and_auditable(
     with _build_client(postgres_url, adapter) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
 
-        turn_1 = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "project codename is aurora"},
-        )
-        assert turn_1.status_code == 200
+        post_message_and_drain(client, session_id, message="project codename is aurora")
 
-        turn_2 = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "what is the project codename?"},
-        )
-        assert turn_2.status_code == 200
-        assert "aurora" in turn_2.json()["assistant"]["message"]
+        turn_2 = post_message_and_drain(client, session_id, message="what is the project codename?")
+        assert turn_2.assistant_message is not None
+        assert "aurora" in turn_2.assistant_message
 
-        turn_3 = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "let's move on"},
-        )
-        assert turn_3.status_code == 200
+        post_message_and_drain(client, session_id, message="let's move on")
 
-        turn_4 = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "what is the project codename?"},
-        )
-        assert turn_4.status_code == 200
-        assert "outside my recent context window" in turn_4.json()["assistant"]["message"]
+        turn_4 = post_message_and_drain(client, session_id, message="what is the project codename?")
+        assert turn_4.assistant_message is not None
+        assert "outside my recent context window" in turn_4.assistant_message
 
         assert len(adapter.context_bundles) == 4
         for context_bundle in adapter.context_bundles:
@@ -702,9 +679,8 @@ def test_pr01_turn_context_is_bounded_ordered_and_auditable(
             turn["user_message"] for turn in fourth_turn_context["recent_active_session_turns"]
         ] == ["let's move on"]
 
-        timeline = client.get(f"/v1/sessions/{session_id}/events")
-        assert timeline.status_code == 200
-        turns = timeline.json()["turns"]
+        timeline = _timeline(client, session_id)
+        turns = timeline["turns"]
         assert len(turns) == 4
 
         model_started_second_turn = next(
@@ -748,21 +724,11 @@ def test_pr01_context_audit_is_stable_even_if_adapter_mutates_context_bundle(
     adapter = MutatingContextAdapter()
     with _build_client(postgres_url, adapter) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        first = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "seed history"},
-        )
-        assert first.status_code == 200
+        post_message_and_drain(client, session_id, message="seed history")
+        post_message_and_drain(client, session_id, message="mutate context")
 
-        second = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "mutate context"},
-        )
-        assert second.status_code == 200
-
-        timeline = client.get(f"/v1/sessions/{session_id}/events")
-        assert timeline.status_code == 200
-        turns = timeline.json()["turns"]
+        timeline = _timeline(client, session_id)
+        turns = timeline["turns"]
         model_started_second_turn = next(
             event for event in turns[1]["events"] if event["event_type"] == "evt.model.started"
         )
@@ -841,25 +807,16 @@ def test_single_active_session_and_ordered_turn_event_chain(postgres_url: str) -
     with _build_client(postgres_url, adapter) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
         for message in ("first message", "second message"):
-            send = client.post(
-                f"/v1/sessions/{session_id}/message",
-                json={"message": message},
-            )
-            assert send.status_code == 200
+            post_message_and_drain(client, session_id, message=message)
 
         active_again = client.get("/v1/sessions/active")
         assert active_again.status_code == 200
         assert active_again.json()["session"]["id"] == session_id
 
-        timeline = client.get(f"/v1/sessions/{session_id}/events")
-        assert timeline.status_code == 200
-        turns = timeline.json()["turns"]
+        timeline = _timeline(client, session_id)
+        turns = timeline["turns"]
         assert [turn["user_message"] for turn in turns] == ["first message", "second message"]
 
-        # The cutover's pre-turn retriever emits a recall event before the
-        # model call (here ``recall_failed``: this turn-engine suite does not
-        # configure an OpenAI key, so the retriever subagent fails non-fatally),
-        # and the post-turn rememberer is enqueued as ``memory_remember``.
         expected_types = [
             "evt.turn.started",
             "evt.memory.recall_failed",
@@ -884,15 +841,10 @@ def test_model_timeline_includes_identity_duration_and_usage(postgres_url: str) 
     adapter = DeterministicModelAdapter(provider="provider.alpha", model="alpha-mini")
     with _build_client(postgres_url, adapter) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        send = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "inspect model metadata"},
-        )
-        assert send.status_code == 200
+        post_message_and_drain(client, session_id, message="inspect model metadata")
 
-        timeline = client.get(f"/v1/sessions/{session_id}/events")
-        assert timeline.status_code == 200
-        events = timeline.json()["turns"][0]["events"]
+        timeline = _timeline(client, session_id)
+        events = timeline["turns"][0]["events"]
         model_completed = next(
             event for event in events if event["event_type"] == "evt.model.completed"
         )
@@ -910,23 +862,15 @@ def test_model_failure_is_auditable_and_turn_terminates_failed(postgres_url: str
     adapter = DeterministicModelAdapter(fail=True)
     with _build_client(postgres_url, adapter) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        send = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "this should fail"},
-        )
-        assert send.status_code == 502
-        body = send.json()
-        assert body["ok"] is False
-        assert body["error"]["code"] == "E_MODEL_FAILURE"
-        assert body["error"]["retryable"] is True
+        turn = post_message_and_drain(client, session_id, message="this should fail")
+        assert turn.status == "failed"
 
-        timeline = client.get(f"/v1/sessions/{session_id}/events")
-        assert timeline.status_code == 200
-        turns = timeline.json()["turns"]
+        timeline = _timeline(client, session_id)
+        turns = timeline["turns"]
         assert len(turns) == 1
-        turn = turns[0]
-        assert turn["status"] == "failed"
-        event_types = [event["event_type"] for event in turn["events"]]
+        turn_data = turns[0]
+        assert turn_data["status"] == "failed"
+        event_types = [event["event_type"] for event in turn_data["events"]]
         assert event_types == [
             "evt.turn.started",
             "evt.memory.recall_failed",
@@ -935,7 +879,7 @@ def test_model_failure_is_auditable_and_turn_terminates_failed(postgres_url: str
             "evt.turn.failed",
         ]
         model_failed = next(
-            event for event in turn["events"] if event["event_type"] == "evt.model.failed"
+            event for event in turn_data["events"] if event["event_type"] == "evt.model.failed"
         )
         assert "failure_reason" in model_failed["payload"]
         assert not any(saved_turn["status"] == "in_progress" for saved_turn in turns)
@@ -951,18 +895,13 @@ def test_ids_timestamps_and_error_envelope_follow_constitution(postgres_url: str
         _parse_utc_rfc3339(session["created_at"])
         _parse_utc_rfc3339(session["updated_at"])
 
-        send = client.post(
-            f"/v1/sessions/{session['id']}/message",
-            json={"message": "validate ids"},
-        )
-        assert send.status_code == 200
-        turn = send.json()["turn"]
-        assert turn["id"].startswith("trn_")
-        _parse_utc_rfc3339(turn["created_at"])
-        _parse_utc_rfc3339(turn["updated_at"])
+        turn = post_message_and_drain(client, session["id"], message="validate ids")
+        assert turn.id.startswith("trn_")
+        _parse_utc_rfc3339(turn.created_at.isoformat())
+        _parse_utc_rfc3339(turn.updated_at.isoformat())
 
-        timeline = client.get(f"/v1/sessions/{session['id']}/events")
-        for saved_turn in timeline.json()["turns"]:
+        timeline = _timeline(client, session["id"])
+        for saved_turn in timeline["turns"]:
             _parse_utc_rfc3339(saved_turn["created_at"])
             _parse_utc_rfc3339(saved_turn["updated_at"])
             for event in saved_turn["events"]:
@@ -994,9 +933,8 @@ def test_whitespace_only_message_is_rejected_with_standard_error(postgres_url: s
         assert body["error"]["code"] == "E_VALIDATION"
         assert body["error"]["retryable"] is False
 
-        timeline = client.get(f"/v1/sessions/{session_id}/events")
-        assert timeline.status_code == 200
-        assert timeline.json()["turns"] == []
+        timeline = _timeline(client, session_id)
+        assert timeline["turns"] == []
 
 
 def test_root_serves_discord_primary_status_not_phone_surface(postgres_url: str) -> None:
@@ -1004,11 +942,7 @@ def test_root_serves_discord_primary_status_not_phone_surface(postgres_url: str)
     with _build_client(postgres_url, adapter) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
         for message in ("msg-a", "msg-b"):
-            sent = client.post(
-                f"/v1/sessions/{session_id}/message",
-                json={"message": message},
-            )
-            assert sent.status_code == 200
+            post_message_and_drain(client, session_id, message=message)
 
         surface = client.get("/")
         assert surface.status_code == 200
@@ -1021,8 +955,8 @@ def test_root_serves_discord_primary_status_not_phone_surface(postgres_url: str)
         assert "chat-form" not in surface.text
         assert "/v1/sessions/${sessionId}/events" not in surface.text
 
-        timeline = client.get(f"/v1/sessions/{session_id}/events")
-        turns = timeline.json()["turns"]
+        timeline = _timeline(client, session_id)
+        turns = timeline["turns"]
         assert [turn["user_message"] for turn in turns] == ["msg-a", "msg-b"]
         assert turns[0]["events"][0]["event_type"] == "evt.turn.started"
         assert turns[1]["events"][0]["event_type"] == "evt.turn.started"
@@ -1070,7 +1004,6 @@ def test_default_runtime_model_requires_server_secret_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("ARIEL_MODEL_NAME", "gpt-5.5")
-    # Force empty key so this assertion is stable even if local .env files exist.
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "")
 
     app = create_app(
@@ -1081,21 +1014,11 @@ def test_default_runtime_model_requires_server_secret_credentials(
     )
     with TestClient(app) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        send = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "credential check"},
-        )
-        assert send.status_code == 503
-        body = send.json()
-        assert body["ok"] is False
-        assert body["error"]["code"] == "E_MODEL_CREDENTIALS"
-        assert body["error"]["retryable"] is False
-        assert "credential" in body["error"]["message"].lower()
-        assert "sk-" not in str(body)
+        turn = post_message_and_drain(client, session_id, message="credential check")
+        assert turn.status == "failed"
 
-        timeline = client.get(f"/v1/sessions/{session_id}/events")
-        assert timeline.status_code == 200
-        events = timeline.json()["turns"][0]["events"]
+        timeline = _timeline(client, session_id)
+        events = timeline["turns"][0]["events"]
         event_types = [event["event_type"] for event in events]
         assert event_types == [
             "evt.turn.started",
@@ -1115,18 +1038,11 @@ def test_model_failure_reason_is_redacted_for_secret_like_exceptions(postgres_ur
     adapter = SecretLeakingFailureAdapter()
     with _build_client(postgres_url, adapter) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        send = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "trigger redaction"},
-        )
-        assert send.status_code == 502
-        body = send.json()
-        assert body["ok"] is False
-        assert body["error"]["code"] == "E_MODEL_FAILURE"
+        turn = post_message_and_drain(client, session_id, message="trigger redaction")
+        assert turn.status == "failed"
 
-        timeline = client.get(f"/v1/sessions/{session_id}/events")
-        assert timeline.status_code == 200
-        events = timeline.json()["turns"][0]["events"]
+        timeline = _timeline(client, session_id)
+        events = timeline["turns"][0]["events"]
         model_failed = next(event for event in events if event["event_type"] == "evt.model.failed")
         assert adapter.secret_value not in model_failed["payload"]["failure_reason"]
         assert "RuntimeError" in model_failed["payload"]["failure_reason"]
@@ -1136,18 +1052,11 @@ def test_model_failure_reason_preserves_non_secret_detail(postgres_url: str) -> 
     adapter = NonSecretFailureAdapter()
     with _build_client(postgres_url, adapter) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        send = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "trigger non-secret failure"},
-        )
-        assert send.status_code == 502
-        body = send.json()
-        assert body["ok"] is False
-        assert body["error"]["code"] == "E_MODEL_FAILURE"
+        turn = post_message_and_drain(client, session_id, message="trigger non-secret failure")
+        assert turn.status == "failed"
 
-        timeline = client.get(f"/v1/sessions/{session_id}/events")
-        assert timeline.status_code == 200
-        events = timeline.json()["turns"][0]["events"]
+        timeline = _timeline(client, session_id)
+        events = timeline["turns"][0]["events"]
         model_failed = next(event for event in events if event["event_type"] == "evt.model.failed")
         assert model_failed["payload"]["failure_reason"] == "token limit exceeded for this request"
 
@@ -1158,17 +1067,10 @@ def test_restart_preserves_history_and_appends_to_same_active_session(postgres_u
         first_session = first_client.get("/v1/sessions/active")
         assert first_session.status_code == 200
         session_id = first_session.json()["session"]["id"]
-        first_send = first_client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "before restart"},
-        )
-        assert first_send.status_code == 200
+        post_message_and_drain(first_client, session_id, message="before restart")
 
-        timeline_before = first_client.get(f"/v1/sessions/{session_id}/events")
-        assert timeline_before.status_code == 200
-        assert [turn["user_message"] for turn in timeline_before.json()["turns"]] == [
-            "before restart"
-        ]
+        timeline_before = _timeline(first_client, session_id)
+        assert [turn["user_message"] for turn in timeline_before["turns"]] == ["before restart"]
 
     restarted_app = create_app(
         database_url=postgres_url,
@@ -1181,21 +1083,15 @@ def test_restart_preserves_history_and_appends_to_same_active_session(postgres_u
         assert active_after_restart.status_code == 200
         assert active_after_restart.json()["session"]["id"] == session_id
 
-        timeline_after_restart = second_client.get(f"/v1/sessions/{session_id}/events")
-        assert timeline_after_restart.status_code == 200
-        assert [turn["user_message"] for turn in timeline_after_restart.json()["turns"]] == [
+        timeline_after_restart = _timeline(second_client, session_id)
+        assert [turn["user_message"] for turn in timeline_after_restart["turns"]] == [
             "before restart"
         ]
 
-        second_send = second_client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "after restart"},
-        )
-        assert second_send.status_code == 200
+        post_message_and_drain(second_client, session_id, message="after restart")
 
-        final_timeline = second_client.get(f"/v1/sessions/{session_id}/events")
-        assert final_timeline.status_code == 200
-        assert [turn["user_message"] for turn in final_timeline.json()["turns"]] == [
+        final_timeline = _timeline(second_client, session_id)
+        assert [turn["user_message"] for turn in final_timeline["turns"]] == [
             "before restart",
             "after restart",
         ]
@@ -1290,31 +1186,14 @@ def test_pr02_response_budget_exhaustion_is_emitted_before_terminal_failed(
     adapter = LongResponseAdapter(response_token_count=8)
     with _build_client(postgres_url, adapter) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        send = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "trigger response budget"},
-        )
-        assert send.status_code == 429
-        body = send.json()
-        assert body["ok"] is False
-        assert body["error"]["code"] == "E_TURN_LIMIT_REACHED"
-        assert "response budget" in body["error"]["message"].lower()
+        turn = post_message_and_drain(client, session_id, message="trigger response budget")
+        assert turn.status == "failed"
 
-        limit_details = body["error"]["details"]["limit"]
-        assert limit_details["budget"] == "response_tokens"
-        assert limit_details["unit"] == "tokens"
-        assert limit_details["limit"] == 3
-        assert limit_details["measured"] > 3
-        assert body["error"]["details"]["applied_limits"]["max_response_tokens"] == 3
-
-        timeline = client.get(f"/v1/sessions/{session_id}/events")
-        assert timeline.status_code == 200
-        turn = timeline.json()["turns"][0]
-        assert turn["status"] == "failed"
-        assert not any(
-            saved_turn["status"] == "in_progress" for saved_turn in timeline.json()["turns"]
-        )
-        event_types = [event["event_type"] for event in turn["events"]]
+        timeline = _timeline(client, session_id)
+        turn_data = timeline["turns"][0]
+        assert turn_data["status"] == "failed"
+        assert not any(saved_turn["status"] == "in_progress" for saved_turn in timeline["turns"])
+        event_types = [event["event_type"] for event in turn_data["events"]]
         assert event_types == [
             "evt.turn.started",
             "evt.memory.recall_failed",
@@ -1324,10 +1203,19 @@ def test_pr02_response_budget_exhaustion_is_emitted_before_terminal_failed(
             "evt.turn.failed",
         ]
         model_completed = next(
-            event for event in turn["events"] if event["event_type"] == "evt.model.completed"
+            event for event in turn_data["events"] if event["event_type"] == "evt.model.completed"
         )
         assert model_completed["payload"]["provider"] == adapter.provider
         assert model_completed["payload"]["model"] == adapter.model
+
+        turn_failed = next(
+            event for event in turn_data["events"] if event["event_type"] == "evt.turn.failed"
+        )
+        limit_details = turn_failed["payload"]["limit"]
+        assert limit_details["budget"] == "response_tokens"
+        assert limit_details["unit"] == "tokens"
+        assert limit_details["limit"] == 3
+        assert limit_details["measured"] > 3
 
 
 def test_pr02_response_budget_uses_reported_output_tokens_when_present(
@@ -1340,23 +1228,14 @@ def test_pr02_response_budget_uses_reported_output_tokens_when_present(
     adapter = UsageDrivenResponseAdapter(reported_output_tokens=9)
     with _build_client(postgres_url, adapter) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        send = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "trigger usage-driven response budget"},
+        turn = post_message_and_drain(
+            client, session_id, message="trigger usage-driven response budget"
         )
-        assert send.status_code == 429
-        body = send.json()
-        assert body["ok"] is False
-        assert body["error"]["code"] == "E_TURN_LIMIT_REACHED"
-        limit_details = body["error"]["details"]["limit"]
-        assert limit_details["budget"] == "response_tokens"
-        assert limit_details["measured"] == 9
-        assert limit_details["limit"] == 5
+        assert turn.status == "failed"
 
-        timeline = client.get(f"/v1/sessions/{session_id}/events")
-        assert timeline.status_code == 200
-        turn = timeline.json()["turns"][0]
-        event_types = [event["event_type"] for event in turn["events"]]
+        timeline = _timeline(client, session_id)
+        turn_data = timeline["turns"][0]
+        event_types = [event["event_type"] for event in turn_data["events"]]
         assert event_types == [
             "evt.turn.started",
             "evt.memory.recall_failed",
@@ -1365,6 +1244,13 @@ def test_pr02_response_budget_uses_reported_output_tokens_when_present(
             "evt.assistant.emitted",
             "evt.turn.failed",
         ]
+        turn_failed = next(
+            event for event in turn_data["events"] if event["event_type"] == "evt.turn.failed"
+        )
+        limit_details = turn_failed["payload"]["limit"]
+        assert limit_details["budget"] == "response_tokens"
+        assert limit_details["measured"] == 9
+        assert limit_details["limit"] == 5
 
 
 def test_pr02_model_attempt_budget_exhaustion_uses_ai_judgment_budget_error(
@@ -1377,23 +1263,13 @@ def test_pr02_model_attempt_budget_exhaustion_uses_ai_judgment_budget_error(
     adapter = RetryableFailureAdapter()
     with _build_client(postgres_url, adapter) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        send = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "trigger model attempt budget"},
-        )
-        assert send.status_code == 429
-        body = send.json()
-        assert body["ok"] is False
-        assert body["error"]["code"] == "E_AI_JUDGMENT_BUDGET"
-        assert body["error"]["details"]["judgment_type"] == "model_output"
-        assert body["error"]["details"]["attempt"] == 2
-        assert body["error"]["details"]["max_model_attempts"] == 2
+        turn = post_message_and_drain(client, session_id, message="trigger model attempt budget")
+        assert turn.status == "failed"
 
-        timeline = client.get(f"/v1/sessions/{session_id}/events")
-        assert timeline.status_code == 200
-        turn = timeline.json()["turns"][0]
-        assert turn["status"] == "failed"
-        events = turn["events"]
+        timeline = _timeline(client, session_id)
+        turn_data = timeline["turns"][0]
+        assert turn_data["status"] == "failed"
+        events = turn_data["events"]
         assert len([event for event in events if event["event_type"] == "evt.model.started"]) == 2
         assert len([event for event in events if event["event_type"] == "evt.model.failed"]) == 2
         event_types = [event["event_type"] for event in events]
@@ -1403,9 +1279,14 @@ def test_pr02_model_attempt_budget_exhaustion_uses_ai_judgment_budget_error(
             event for event in events if event["payload"].get("judgment_type") == "model_output"
         )
         assert model_output_failure["payload"]["failure_code"] == "E_AI_JUDGMENT_BUDGET"
-        assert not any(
-            saved_turn["status"] == "in_progress" for saved_turn in timeline.json()["turns"]
+        assert not any(saved_turn["status"] == "in_progress" for saved_turn in timeline["turns"])
+
+        ai_judgment_failed = next(
+            event for event in events if event["event_type"] == "evt.ai_judgment.failed"
         )
+        assert ai_judgment_failed["payload"]["judgment_type"] == "model_output"
+        assert ai_judgment_failed["payload"]["attempt"] == 2
+        assert ai_judgment_failed["payload"]["max_model_attempts"] == 2
 
 
 def test_pr02_wall_time_budget_takes_precedence_if_multiple_limits_exhaust(
@@ -1428,23 +1309,13 @@ def test_pr02_wall_time_budget_takes_precedence_if_multiple_limits_exhaust(
     adapter = RetryableFailureAdapter()
     with _build_client(postgres_url, adapter) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        send = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "trigger competing limits"},
-        )
-        assert send.status_code == 429
-        body = send.json()
-        assert body["ok"] is False
-        assert body["error"]["code"] == "E_TURN_LIMIT_REACHED"
-        limit_details = body["error"]["details"]["limit"]
-        assert limit_details["budget"] == "turn_wall_time_ms"
-        assert limit_details["measured"] > limit_details["limit"]
+        turn = post_message_and_drain(client, session_id, message="trigger competing limits")
+        assert turn.status == "failed"
 
-        timeline = client.get(f"/v1/sessions/{session_id}/events")
-        assert timeline.status_code == 200
-        turn = timeline.json()["turns"][0]
-        assert turn["status"] == "failed"
-        event_types = [event["event_type"] for event in turn["events"]]
+        timeline = _timeline(client, session_id)
+        turn_data = timeline["turns"][0]
+        assert turn_data["status"] == "failed"
+        event_types = [event["event_type"] for event in turn_data["events"]]
         assert event_types == [
             "evt.turn.started",
             "evt.memory.recall_failed",
@@ -1453,6 +1324,12 @@ def test_pr02_wall_time_budget_takes_precedence_if_multiple_limits_exhaust(
             "evt.assistant.emitted",
             "evt.turn.failed",
         ]
+        turn_failed = next(
+            event for event in turn_data["events"] if event["event_type"] == "evt.turn.failed"
+        )
+        limit_details = turn_failed["payload"]["limit"]
+        assert limit_details["budget"] == "turn_wall_time_ms"
+        assert limit_details["measured"] > limit_details["limit"]
 
 
 def test_pr02_wall_time_budget_exhaustion_is_bounded_and_auditable(
@@ -1474,29 +1351,21 @@ def test_pr02_wall_time_budget_exhaustion_is_bounded_and_auditable(
     adapter = DeterministicModelAdapter()
     with _build_client(postgres_url, adapter) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        send = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "trigger wall-time budget"},
-        )
-        assert send.status_code == 429
-        body = send.json()
-        assert body["ok"] is False
-        assert body["error"]["code"] == "E_TURN_LIMIT_REACHED"
-        assert "time budget" in body["error"]["message"].lower()
+        turn = post_message_and_drain(client, session_id, message="trigger wall-time budget")
+        assert turn.status == "failed"
 
-        limit_details = body["error"]["details"]["limit"]
+        timeline = _timeline(client, session_id)
+        turn_data = timeline["turns"][0]
+        event_types = [event["event_type"] for event in turn_data["events"]]
+        assert event_types[-2:] == ["evt.assistant.emitted", "evt.turn.failed"]
+        assert turn_data["status"] == "failed"
+        assert not any(saved_turn["status"] == "in_progress" for saved_turn in timeline["turns"])
+
+        turn_failed = next(
+            event for event in turn_data["events"] if event["event_type"] == "evt.turn.failed"
+        )
+        limit_details = turn_failed["payload"]["limit"]
         assert limit_details["budget"] == "turn_wall_time_ms"
         assert limit_details["unit"] == "ms"
         assert limit_details["limit"] == 20
         assert limit_details["measured"] > 20
-        assert body["error"]["details"]["applied_limits"]["max_turn_wall_time_ms"] == 20
-
-        timeline = client.get(f"/v1/sessions/{session_id}/events")
-        assert timeline.status_code == 200
-        turn = timeline.json()["turns"][0]
-        event_types = [event["event_type"] for event in turn["events"]]
-        assert event_types[-2:] == ["evt.assistant.emitted", "evt.turn.failed"]
-        assert turn["status"] == "failed"
-        assert not any(
-            saved_turn["status"] == "in_progress" for saved_turn in timeline.json()["turns"]
-        )

@@ -152,7 +152,7 @@ Discord and API consumers render action details from this surfaced projection, n
 slice-2 pr-06 locks response boundaries for user-facing slice-2 APIs:
 
 - `POST /v1/sessions/{session_id}/message`, `GET /v1/sessions/{session_id}/events`,
-  `POST /v1/approvals`, and `POST /v1/captures` are schema-enforced surfaced contracts.
+  and `POST /v1/approvals` are schema-enforced surfaced contracts.
 - message responses expose `assistant.message`, `assistant.sources`, and `assistant.silent`
   (not `assistant.provider/model`).
 - turn events use strict per-`event_type` payload schemas (no open `events[].payload` dictionaries).
@@ -649,11 +649,6 @@ export ARIEL_LOCAL_AUTH_TOKEN=<local-api-token>
 curl -sS http://127.0.0.1:8000/v1/health
 curl -sS http://127.0.0.1:8000/v1/sessions/active \
   -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}"
-curl -sS -X POST http://127.0.0.1:8000/v1/captures \
-  -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" \
-  -H "content-type: application/json" \
-  -H "Idempotency-Key: smoke-capture-001" \
-  -d '{"kind":"text","text":"smoke capture"}'
 ```
 
 ## private tailnet deployment

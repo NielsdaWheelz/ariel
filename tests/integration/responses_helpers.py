@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any, cast
 
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from ariel.action_runtime import (
@@ -16,7 +17,94 @@ from ariel.action_runtime import (
 )
 from ariel.app import _new_id, _utcnow
 from ariel.google_connector import GoogleConnectorRuntime
-from ariel.persistence import TurnRecord
+from ariel.persistence import BackgroundTaskRecord, TurnRecord
+from ariel.worker import process_one_task
+
+
+def post_message_and_drain(
+    client: TestClient,
+    session_id: str,
+    *,
+    message: str,
+    headers: dict[str, str] | None = None,
+    json_extra: dict[str, Any] | None = None,
+) -> TurnRecord:
+    """POST a user message, assert 202, drain the enqueued task via the worker,
+    and return the completed TurnRecord.
+
+    Use this in every test that sends a user message: POST → assert 202 →
+    drain until the specific task_id is gone → return TurnRecord. The caller
+    reads turn outcome and events from the TurnRecord or from GET
+    /v1/sessions/{id}/events.
+
+    Loops process_one_task until the specific task is consumed, so maintenance
+    tasks processed ahead of the user_message task do not cause a stale read.
+    Queries TurnRecord without filtering by session_id so rotation tests work
+    correctly (the new session's turn is still found).
+    """
+    posted_at = _utcnow()
+    body: dict[str, Any] = {"message": message}
+    if json_extra:
+        body.update(json_extra)
+    resp = client.post(
+        f"/v1/sessions/{session_id}/message",
+        json=body,
+        headers=headers or {},
+    )
+    assert resp.status_code == 202, f"expected 202, got {resp.status_code}: {resp.text}"
+    task_id = resp.json()["task_id"]
+
+    app_state = cast(Any, client.app).state
+    runtime = app_state.runtime
+
+    for _ in range(20):
+        process_one_task(
+            session_factory=runtime.session_factory,
+            settings=runtime.settings,
+            runtime=runtime,
+        )
+        with runtime.session_factory() as db:
+            still_pending = db.get(BackgroundTaskRecord, task_id)
+        if still_pending is None:
+            break
+    else:
+        raise AssertionError(f"task {task_id} was not consumed after 20 process_one_task calls")
+
+    with runtime.session_factory() as db:
+        turn = db.scalar(
+            select(TurnRecord)
+            .where(TurnRecord.created_at >= posted_at)
+            .where(TurnRecord.user_message == message)
+            .order_by(TurnRecord.created_at.desc())
+            .limit(1)
+        )
+    assert turn is not None, (
+        f"no TurnRecord found for message {message!r} after draining task {task_id}"
+    )
+    return turn
+
+
+def drain_task(client: TestClient, task_id: str) -> None:
+    """Drive the worker until the given task_id is consumed.
+
+    Use this when you already have a task_id from a 202 response and want to
+    drain it without posting a message again. Loops process_one_task up to 20
+    times until the task row is gone from the DB.
+    """
+    app_state = cast(Any, client.app).state
+    runtime = app_state.runtime
+
+    for _ in range(20):
+        process_one_task(
+            session_factory=runtime.session_factory,
+            settings=runtime.settings,
+            runtime=runtime,
+        )
+        with runtime.session_factory() as db:
+            still_pending = db.get(BackgroundTaskRecord, task_id)
+        if still_pending is None:
+            return
+    raise AssertionError(f"task {task_id} was not consumed after 20 process_one_task calls")
 
 
 def run_function_calls(

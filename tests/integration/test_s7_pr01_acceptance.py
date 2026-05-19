@@ -8,16 +8,22 @@ from typing import Any, cast
 
 from fastapi.testclient import TestClient
 import pytest
+from sqlalchemy import select
 
 import ariel.action_runtime as action_runtime_module
 import ariel.capability_registry as capability_registry_module
 import ariel.policy_engine as policy_engine_module
 from ariel.app import ModelAdapter, create_app
-from tests.integration.responses_helpers import responses_message, responses_with_run_calls
+from tests.integration.responses_helpers import (
+    post_message_and_drain,
+    responses_message,
+    responses_with_run_calls,
+)
 from ariel.capability_registry import (
     CapabilityDefinition,
     get_capability as registry_get_capability,
 )
+from ariel.persistence import ArtifactRecord, to_rfc3339
 from tests.fake_sandbox import FakeSandboxRuntime
 
 
@@ -138,6 +144,14 @@ def _session_id(client: TestClient) -> str:
     return active.json()["session"]["id"]
 
 
+def _turn_data(client: TestClient, session_id: str) -> dict[str, Any]:
+    resp = client.get(f"/v1/sessions/{session_id}/events")
+    assert resp.status_code == 200
+    turns = resp.json()["turns"]
+    assert turns, "no turns in timeline"
+    return turns[-1]
+
+
 def _surface_attempt(turn_payload: dict[str, Any], *, proposal_index: int = 1) -> dict[str, Any]:
     lifecycle = turn_payload.get("surface_action_lifecycle")
     assert isinstance(lifecycle, list)
@@ -159,6 +173,36 @@ def _assert_source_contract(source: dict[str, Any]) -> None:
     assert isinstance(source["source"], str)
     assert isinstance(source["retrieved_at"], str)
     assert source["published_at"] is None or isinstance(source["published_at"], str)
+
+
+def _turn_sources(client: TestClient, turn_id: str) -> list[dict[str, Any]]:
+    """Return retrieval-provenance sources for a turn by querying the DB directly.
+
+    Sources are ArtifactRecord rows with artifact_type == "retrieval_provenance";
+    they are not embedded in the events timeline.
+    """
+    session_factory = cast(Any, client.app).state.session_factory
+    with session_factory() as db:
+        artifacts = db.scalars(
+            select(ArtifactRecord)
+            .where(
+                ArtifactRecord.turn_id == turn_id,
+                ArtifactRecord.artifact_type == "retrieval_provenance",
+            )
+            .order_by(ArtifactRecord.created_at.asc(), ArtifactRecord.id.asc())
+        ).all()
+    return [
+        {
+            "artifact_id": artifact.id,
+            "title": artifact.title,
+            "source": artifact.source,
+            "retrieved_at": to_rfc3339(artifact.retrieved_at),
+            "published_at": (
+                to_rfc3339(artifact.published_at) if artifact.published_at is not None else None
+            ),
+        }
+        for artifact in artifacts
+    ]
 
 
 def _patch_capability_lookup(
@@ -255,10 +299,9 @@ def test_s7_pr01_web_extract_executes_inline_with_structured_output_citations_an
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "extract url"})
-        assert sent.status_code == 200
-        payload = sent.json()
-        attempt = _surface_attempt(payload["turn"])
+        post_message_and_drain(client, session_id, message="extract url")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
         assert attempt["proposal"]["capability_id"] == "cap.web.extract"
         assert attempt["policy"]["decision"] == "allow_inline"
         assert attempt["approval"]["status"] == "not_requested"
@@ -279,9 +322,10 @@ def test_s7_pr01_web_extract_executes_inline_with_structured_output_citations_an
             == "https://example.com/research/article?utm_source=rss"
         )
 
-        assert "[1]" in payload["assistant"]["message"]
-        assert len(payload["assistant"]["sources"]) == 1
-        source = payload["assistant"]["sources"][0]
+        assert "[1]" in turn_data["assistant_message"]
+        sources = _turn_sources(client, turn_data["id"])
+        assert len(sources) == 1
+        source = sources[0]
         _assert_source_contract(source)
         assert source["source"] == "https://example.com/research/article"
 
@@ -327,16 +371,15 @@ def test_s7_pr01_url_safety_preflight_fails_closed_before_provider_dispatch(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "unsafe url"})
-        assert sent.status_code == 200
-        payload = sent.json()
-        attempt = _surface_attempt(payload["turn"])
+        post_message_and_drain(client, session_id, message="unsafe url")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"
         assert attempt["execution"]["error"] == expected_error
-        rendered_message = payload["assistant"]["message"].lower()
+        rendered_message = turn_data["assistant_message"].lower()
         assert expected_error in rendered_message
         assert expected_hint in rendered_message
-        assert payload["assistant"]["sources"] == []
+        assert _turn_sources(client, turn_data["id"]) == []
         assert outbound_calls == 0
 
 
@@ -389,13 +432,12 @@ def test_s7_pr01_web_extract_egress_contract_failures_block_before_execute(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "intent failure"})
-        assert sent.status_code == 200
-        payload = sent.json()
-        attempt = _surface_attempt(payload["turn"])
+        post_message_and_drain(client, session_id, message="intent failure")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"
         assert expected_error in (attempt["execution"]["error"] or "")
-        assert expected_error in payload["assistant"]["message"]
+        assert expected_error in turn_data["assistant_message"]
         assert execute_attempts == 0
 
 
@@ -438,13 +480,12 @@ def test_s7_pr01_non_allowlisted_egress_is_blocked_before_web_extract_execution(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "egress deny"})
-        assert sent.status_code == 200
-        payload = sent.json()
-        attempt = _surface_attempt(payload["turn"])
+        post_message_and_drain(client, session_id, message="egress deny")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"
         assert "egress_destination_denied" in (attempt["execution"]["error"] or "")
-        assert "allowlist" in payload["assistant"]["message"].lower()
+        assert "allowlist" in turn_data["assistant_message"].lower()
         assert execute_attempts == 0
 
 
@@ -483,18 +524,14 @@ def test_s7_pr01_transient_provider_failure_retries_are_bounded_and_single_outco
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "retry extraction"},
-        )
-        assert sent.status_code == 200
-        payload = sent.json()
-        attempt = _surface_attempt(payload["turn"])
+        post_message_and_drain(client, session_id, message="retry extraction")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "succeeded"
         assert attempt["execution"]["output"]["provider"]["attempt_count"] == 2
         assert call_count == 2
-        assert len(payload["assistant"]["sources"]) == 1
-        event_types = _event_types(payload["turn"])
+        assert len(_turn_sources(client, turn_data["id"])) == 1
+        event_types = _event_types(turn_data)
         assert event_types.count("evt.action.execution.succeeded") == 1
         assert event_types.count("evt.action.execution.failed") == 0
 
@@ -526,20 +563,16 @@ def test_s7_pr01_provider_retry_exhaustion_fails_once_with_typed_error(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "retry exhaustion"},
-        )
-        assert sent.status_code == 200
-        payload = sent.json()
-        attempt = _surface_attempt(payload["turn"])
+        post_message_and_drain(client, session_id, message="retry exhaustion")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"
         assert attempt["execution"]["error"] == "provider_upstream_failure"
         assert call_count == 3
-        rendered_message = payload["assistant"]["message"].lower()
+        rendered_message = turn_data["assistant_message"].lower()
         assert "provider_upstream_failure" in rendered_message
         assert "retry" in rendered_message
-        event_types = _event_types(payload["turn"])
+        event_types = _event_types(turn_data)
         assert event_types.count("evt.action.execution.succeeded") == 0
         assert event_types.count("evt.action.execution.failed") == 1
 
@@ -584,16 +617,12 @@ def test_s7_pr01_typed_url_extraction_failures_are_actionable_and_auditable(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "failing extraction"},
-        )
-        assert sent.status_code == 200
-        payload = sent.json()
-        attempt = _surface_attempt(payload["turn"])
+        post_message_and_drain(client, session_id, message="failing extraction")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"
         assert attempt["execution"]["error"] == expected_error
-        rendered_message = payload["assistant"]["message"].lower()
+        rendered_message = turn_data["assistant_message"].lower()
         assert expected_error in rendered_message
         assert expected_hint in rendered_message
 
@@ -626,16 +655,12 @@ def test_s7_pr01_provider_malformed_final_url_is_fail_closed(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "malformed final url"},
-        )
-        assert sent.status_code == 200
-        payload = sent.json()
-        attempt = _surface_attempt(payload["turn"])
+        post_message_and_drain(client, session_id, message="malformed final url")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"
         assert attempt["execution"]["error"] == "provider_invalid_payload"
-        assert "provider_invalid_payload" in payload["assistant"]["message"]
+        assert "provider_invalid_payload" in turn_data["assistant_message"]
 
 
 def test_s7_pr01_public_ipv6_urls_remain_allowed_and_canonical(
@@ -675,13 +700,9 @@ def test_s7_pr01_public_ipv6_urls_remain_allowed_and_canonical(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "ipv6 extraction"},
-        )
-        assert sent.status_code == 200
-        payload = sent.json()
-        attempt = _surface_attempt(payload["turn"])
+        post_message_and_drain(client, session_id, message="ipv6 extraction")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "succeeded"
         output = attempt["execution"]["output"]
         assert output["canonical_url"] == "https://[2606:4700:4700::1111]/research/article"
@@ -726,13 +747,9 @@ def test_s7_pr01_large_pages_are_bounded_and_partial_disclosure_is_explicit(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "large extraction"},
-        )
-        assert sent.status_code == 200
-        payload = sent.json()
-        attempt = _surface_attempt(payload["turn"])
+        post_message_and_drain(client, session_id, message="large extraction")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "succeeded"
         output = attempt["execution"]["output"]
         assert output["extract_outcome"]["status"] == "partial"
@@ -740,7 +757,7 @@ def test_s7_pr01_large_pages_are_bounded_and_partial_disclosure_is_explicit(
         assert output["document"]["truncated"] is True
         assert output["document"]["truncation_reason"] == "content_truncated"
         assert output["document"]["content_chars"] <= 4000
-        message = payload["assistant"]["message"].lower()
+        message = turn_data["assistant_message"].lower()
         assert "partial" in message
         assert "narrow" in message or "focus" in message
 
@@ -776,15 +793,14 @@ def test_s7_pr01_web_extract_preserves_grounding_and_lifecycle_inspectability(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "mixed turn"})
-        assert sent.status_code == 200
-        payload = sent.json()
-        message = payload["assistant"]["message"].lower()
-        assert "[1]" in payload["assistant"]["message"]
+        post_message_and_drain(client, session_id, message="mixed turn")
+        turn_data = _turn_data(client, session_id)
+        message = turn_data["assistant_message"].lower()
+        assert "[1]" in turn_data["assistant_message"]
         assert "fully certain without citing anything" not in message
-        assert len(payload["assistant"]["sources"]) == 1
+        assert len(_turn_sources(client, turn_data["id"])) == 1
 
-        lifecycle = payload["turn"]["surface_action_lifecycle"]
+        lifecycle = turn_data["surface_action_lifecycle"]
         assert len(lifecycle) == 1
         lifecycle_by_capability = {
             item["proposal"]["capability_id"]: item for item in lifecycle if isinstance(item, dict)

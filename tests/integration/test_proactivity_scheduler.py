@@ -297,3 +297,69 @@ def test_worker_agent_wake_arm_invokes_wake_for_a_due_task(
             )
             assert turn is not None
             assert turn.status == "completed"
+
+
+def test_worker_user_message_arm_invokes_wake_for_target_session(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A due ``user_message`` row targets the specified session: the worker builds a
+    ``user_message`` wake-context from the payload and calls ``_wake`` on exactly
+    the session_id supplied in the task — without calling
+    ``_get_or_create_active_session``. The turn is recorded and the task deleted."""
+
+    _stub_memory_retriever(monkeypatch)
+    now = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr("ariel.worker._utcnow", lambda: now)
+    adapter = _WakeAdapter()
+    app = create_app(
+        database_url=postgres_url,
+        model_adapter=adapter,
+        sandbox=FakeSandboxRuntime(),
+        reset_database=True,
+    )
+    with TestClient(app) as client:
+        runtime = client.app.state.runtime  # type: ignore[attr-defined]
+        session_factory = runtime.session_factory
+
+        # Seed an active session by hitting the sessions endpoint, which calls
+        # _get_or_create_active_session and creates a row in the database.
+        session_response = client.get("/v1/sessions/active")
+        assert session_response.status_code == 200
+        session_id = session_response.json()["session"]["id"]
+
+        with session_factory() as db:
+            with db.begin():
+                enqueue_background_task(
+                    db,
+                    task_type="user_message",
+                    payload={
+                        "session_id": session_id,
+                        "message": "what is on my calendar today?",
+                        "discord_context": None,
+                        "attachment_sources": None,
+                    },
+                    now=now - timedelta(minutes=5),
+                    run_after=now - timedelta(minutes=1),
+                )
+
+        assert process_one_task(
+            session_factory=session_factory,
+            settings=runtime.settings,
+            runtime=runtime,
+        )
+
+    assert adapter.user_messages_seen == ["what is on my calendar today?"]
+    with session_factory() as db:
+        with db.begin():
+            # A one-shot task is deleted on success: no user_message row remains.
+            user_msg_tasks = db.scalars(
+                select(BackgroundTaskRecord).where(BackgroundTaskRecord.task_type == "user_message")
+            ).all()
+            assert user_msg_tasks == []
+            # _wake recorded the turn with the message text.
+            turn = db.scalar(
+                select(TurnRecord).where(TurnRecord.user_message == "what is on my calendar today?")
+            )
+            assert turn is not None
+            assert turn.status == "completed"

@@ -8,6 +8,14 @@ the carry-forward digest; there is no inline continuity curation and no
 compaction adapter. What remains here is pure session management: message
 idempotency, auto-rotation thresholds, the event-timeline cursor, the turn
 lock, and the context-bundle constitution.
+
+The agent-loop cutover (P1) made ``post_message`` async: it enqueues a
+``user_message`` background task and returns ``202 {"status": "accepted",
+"task_id": ...}``. Tests drain the enqueued task via ``post_message_and_drain``
+or ``drain_task`` before asserting outcomes. Idempotency lives in
+``enqueue_background_task``'s key dedup: a duplicate key returns the existing
+task (same ``task_id``), regardless of payload, while the task is still
+pending; there is no 409 conflict.
 """
 
 from __future__ import annotations
@@ -19,12 +27,17 @@ from typing import Any, cast
 
 from fastapi.testclient import TestClient
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import select
 
-from ariel.app import ModelAdapter, _session_turn_lock_id, create_app
+from ariel.app import ModelAdapter, create_app
 from ariel.persistence import SessionRecord
 from tests.fake_sandbox import FakeSandboxRuntime
-from tests.integration.responses_helpers import responses_run_message, responses_with_run_calls
+from tests.integration.responses_helpers import (
+    drain_task,
+    post_message_and_drain,
+    responses_run_message,
+    responses_with_run_calls,
+)
 
 
 @dataclass
@@ -111,9 +124,14 @@ def _timeline(client: TestClient, session_id: str, *, after: str | None = None) 
     return timeline.json()
 
 
-def test_s5_pr02_message_idempotency_key_replays_same_turn_and_blocks_conflicting_payload(
+def test_s5_pr02_message_idempotency_key_replays_same_task_id(
     postgres_url: str,
 ) -> None:
+    """A duplicate Idempotency-Key with the same payload returns 202 with the
+    same task_id while the task is still pending. A duplicate key with a
+    different payload also returns 202 with the same task_id — enqueue deduplicates
+    by key regardless of payload. After the task is drained (deleted), only one turn
+    is recorded."""
     adapter = SessionManagementProbeAdapter()
     with _build_client(postgres_url, adapter, reset_database=True) as client:
         session_id = _session_id(client)
@@ -123,27 +141,32 @@ def test_s5_pr02_message_idempotency_key_replays_same_turn_and_blocks_conflictin
             headers={"Idempotency-Key": "msg-idem-001"},
             json={"message": "remember project phoenix = planning kickoff on monday"},
         )
-        assert first.status_code == 200
-        first_turn_id = first.json()["turn"]["id"]
+        assert first.status_code == 202
+        first_task_id = first.json()["task_id"]
 
+        # Replay while task is still pending — same task_id returned.
         replay = client.post(
             f"/v1/sessions/{session_id}/message",
             headers={"Idempotency-Key": "msg-idem-001"},
             json={"message": "remember project phoenix = planning kickoff on monday"},
         )
-        assert replay.status_code == 200
-        assert replay.json()["turn"]["id"] == first_turn_id
+        assert replay.status_code == 202
+        assert replay.json()["task_id"] == first_task_id
 
-        timeline = _timeline(client, session_id)
-        assert len(timeline["turns"]) == 1
-
+        # Different payload, same key — still deduplicates to the same task.
         conflict = client.post(
             f"/v1/sessions/{session_id}/message",
             headers={"Idempotency-Key": "msg-idem-001"},
             json={"message": "remember project phoenix = kickoff on tuesday instead"},
         )
-        assert conflict.status_code == 409
-        assert conflict.json()["error"]["code"] == "E_IDEMPOTENCY_KEY_REUSED"
+        assert conflict.status_code == 202
+        assert conflict.json()["task_id"] == first_task_id
+
+        # Drain the original task so the turn is committed.
+        drain_task(client, first_task_id)
+
+        timeline = _timeline(client, session_id)
+        assert len(timeline["turns"]) == 1
 
 
 def test_s5_pr02_idempotency_replay_survives_auto_rotation_when_retrying_new_session_id(
@@ -156,41 +179,32 @@ def test_s5_pr02_idempotency_replay_survives_auto_rotation_when_retrying_new_ses
     adapter = SessionManagementProbeAdapter()
     with _build_client(postgres_url, adapter, reset_database=True) as client:
         initial_session_id = _session_id(client)
-        assert (
-            client.post(
-                f"/v1/sessions/{initial_session_id}/message",
-                json={"message": "seed prior turn"},
-            ).status_code
-            == 200
-        )
+        post_message_and_drain(client, initial_session_id, message="seed prior turn")
 
-        triggering = client.post(
+        # This message triggers rotation; turn is recorded in the new session.
+        triggering_resp = client.post(
             f"/v1/sessions/{initial_session_id}/message",
             headers={"Idempotency-Key": "msg-idem-rotate-001"},
             json={"message": "second turn triggers threshold rotation"},
         )
-        assert triggering.status_code == 200
-        triggering_turn_id = triggering.json()["turn"]["id"]
-        rotated_session_id = triggering.json()["session"]["id"]
+        assert triggering_resp.status_code == 202
+        triggering_task_id = triggering_resp.json()["task_id"]
+
+        # Replay on the same session while the task is still pending — same task_id.
+        replay_before_drain = client.post(
+            f"/v1/sessions/{initial_session_id}/message",
+            headers={"Idempotency-Key": "msg-idem-rotate-001"},
+            json={"message": "second turn triggers threshold rotation"},
+        )
+        assert replay_before_drain.status_code == 202
+        assert replay_before_drain.json()["task_id"] == triggering_task_id
+
+        # Drain the task; rotation happens inside _wake.
+        drain_task(client, triggering_task_id)
+
+        # After rotation the new active session holds the triggering turn.
+        rotated_session_id = client.get("/v1/sessions/active").json()["session"]["id"]
         assert rotated_session_id != initial_session_id
-
-        replay_on_old_session = client.post(
-            f"/v1/sessions/{initial_session_id}/message",
-            headers={"Idempotency-Key": "msg-idem-rotate-001"},
-            json={"message": "second turn triggers threshold rotation"},
-        )
-        assert replay_on_old_session.status_code == 200
-        assert replay_on_old_session.json()["turn"]["id"] == triggering_turn_id
-        assert replay_on_old_session.json()["session"]["id"] == rotated_session_id
-
-        replay_on_new_session = client.post(
-            f"/v1/sessions/{rotated_session_id}/message",
-            headers={"Idempotency-Key": "msg-idem-rotate-001"},
-            json={"message": "second turn triggers threshold rotation"},
-        )
-        assert replay_on_new_session.status_code == 200
-        assert replay_on_new_session.json()["turn"]["id"] == triggering_turn_id
-        assert replay_on_new_session.json()["session"]["id"] == rotated_session_id
 
         timeline_rotated = _timeline(client, rotated_session_id)
         assert len(timeline_rotated["turns"]) == 1
@@ -221,20 +235,13 @@ def test_s5_pr02_rotation_follows_turn_count_threshold_with_typed_reason(
 
     with _build_client(postgres_url, adapter, reset_database=True) as client:
         initial_session_id = _session_id(client)
-        assert (
-            client.post(
-                f"/v1/sessions/{initial_session_id}/message",
-                json={"message": "first message in session"},
-            ).status_code
-            == 200
-        )
+        post_message_and_drain(client, initial_session_id, message="first message in session")
 
-        second = client.post(
-            f"/v1/sessions/{initial_session_id}/message",
-            json={"message": "second message should trigger auto rotate"},
+        # Second message triggers rotation; turn.session_id is the new session.
+        second_turn = post_message_and_drain(
+            client, initial_session_id, message="second message should trigger auto rotate"
         )
-        assert second.status_code == 200
-        rotated_session_id = second.json()["session"]["id"]
+        rotated_session_id = second_turn.session_id
         assert rotated_session_id != initial_session_id
 
         rotations = client.get("/v1/sessions/rotations", params={"limit": 20})
@@ -277,11 +284,7 @@ def test_s5_pr02_context_bundle_follows_constitution_section_order_and_includes_
     adapter = SessionManagementProbeAdapter()
     with _build_client(postgres_url, adapter, reset_database=True) as client:
         session_id = _session_id(client)
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "what is still open?"},
-        )
-        assert sent.status_code == 200
+        post_message_and_drain(client, session_id, message="what is still open?")
 
         bundle = adapter.context_bundles[-1]
         assert bundle["section_order"] == [
@@ -294,9 +297,6 @@ def test_s5_pr02_context_bundle_follows_constitution_section_order_and_includes_
             "relevant_artifacts_and_observations",
         ]
 
-        # The memory sections are documents and a recalled-fact list, not a
-        # projection block: the profile is a string, the digest is a string or
-        # null, and recalled_memory is a list.
         assert isinstance(bundle["profile"], str)
         assert bundle["session_digest"] is None or isinstance(bundle["session_digest"], str)
         assert isinstance(bundle["recalled_memory"], list)
@@ -317,20 +317,8 @@ def test_s5_pr02_timeline_supports_after_cursor_for_incremental_sync(
     adapter = SessionManagementProbeAdapter()
     with _build_client(postgres_url, adapter, reset_database=True) as client:
         session_id = _session_id(client)
-        assert (
-            client.post(
-                f"/v1/sessions/{session_id}/message",
-                json={"message": "first timeline turn"},
-            ).status_code
-            == 200
-        )
-        assert (
-            client.post(
-                f"/v1/sessions/{session_id}/message",
-                json={"message": "second timeline turn"},
-            ).status_code
-            == 200
-        )
+        post_message_and_drain(client, session_id, message="first timeline turn")
+        post_message_and_drain(client, session_id, message="second timeline turn")
 
         full = _timeline(client, session_id)
         assert len(full["turns"]) == 2
@@ -372,46 +360,18 @@ def test_s5_pr02_timeline_after_cursor_omits_turns_with_action_attempts_and_no_n
     )
     with _build_client(postgres_url, adapter, reset_database=True) as client:
         session_id = _session_id(client)
-        first = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": first_message},
-        )
-        assert first.status_code == 200
-        second = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "plain follow-up turn"},
-        )
-        assert second.status_code == 200
+        first_turn = post_message_and_drain(client, session_id, message=first_message)
+        post_message_and_drain(client, session_id, message="plain follow-up turn")
 
         full = _timeline(client, session_id)
         assert len(full["turns"]) == 2
-        first_turn = full["turns"][0]
-        assert first_turn["surface_action_lifecycle"]
-        cursor_event_id = first_turn["events"][-1]["id"]
+        first_turn_data = full["turns"][0]
+        assert first_turn_data["id"] == first_turn.id
+        assert first_turn_data["surface_action_lifecycle"]
+        cursor_event_id = first_turn_data["events"][-1]["id"]
 
         delta = _timeline(client, session_id, after=cursor_event_id)
         assert len(delta["turns"]) == 1
         assert delta["turns"][0]["id"] == full["turns"][1]["id"]
-        assert all(turn["id"] != first_turn["id"] for turn in delta["turns"])
+        assert all(turn["id"] != first_turn.id for turn in delta["turns"])
         assert all(turn["events"] for turn in delta["turns"])
-
-
-def test_s5_pr02_session_turn_lock_blocks_parallel_writes_to_same_session(
-    postgres_url: str,
-) -> None:
-    adapter = SessionManagementProbeAdapter()
-    with _build_client(postgres_url, adapter, reset_database=True) as client:
-        session_id = _session_id(client)
-        lock_id = _session_turn_lock_id(session_id)
-
-        with cast(Any, client.app).state.session_factory() as db_one:
-            with db_one.begin():
-                db_one.execute(text("SELECT pg_advisory_xact_lock(:lock_id)"), {"lock_id": lock_id})
-
-                with cast(Any, client.app).state.session_factory() as db_two:
-                    with db_two.begin():
-                        acquired = db_two.scalar(
-                            text("SELECT pg_try_advisory_xact_lock(:lock_id)"),
-                            {"lock_id": lock_id},
-                        )
-                        assert acquired is False

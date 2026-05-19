@@ -1408,7 +1408,8 @@ class BackgroundTaskRecord(Base):
                 "'provider_event_received', 'provider_sync_due', 'memory_remember', "
                 "'memory_sweep', 'execute_action_attempt', 'google_object_hydration_due', "
                 "'provider_evidence_extraction_due', 'provider_write_reconcile_due', "
-                "'agent_wake', 'provider_watch_renew_due', 'provider_reconcile_sync_due')"
+                "'agent_wake', 'provider_watch_renew_due', 'provider_reconcile_sync_due', "
+                "'user_message')"
             ),
             name="ck_background_task_type",
         ),

@@ -42,6 +42,42 @@ def _outcome(
     )
 
 
+def _outcome_with_approvals(
+    *,
+    message: str = "Hello from Ariel",
+    approvals: list[dict[str, Any]],
+) -> TurnExecutionOutcome:
+    """Build a TurnExecutionOutcome whose turn carries pending approval items.
+
+    Each approval dict must have at minimum ``ref`` and ``capability_id``.
+    Optional ``expires_at`` is forwarded into the approval object.
+    """
+    lifecycle = []
+    for a in approvals:
+        approval_obj: dict[str, Any] = {
+            "status": "pending",
+            "reference": a["ref"],
+        }
+        if "expires_at" in a:
+            approval_obj["expires_at"] = a["expires_at"]
+        lifecycle.append(
+            {
+                "approval": approval_obj,
+                "proposal": {"capability_id": a["capability_id"]},
+            }
+        )
+    return TurnExecutionOutcome(
+        turn_id="trn_test",
+        effective_session_id="ses_test",
+        status_code=200,
+        response_payload={
+            "ok": True,
+            "assistant": {"message": message, "sources": [], "silent": False},
+            "turn": {"surface_action_lifecycle": lifecycle},
+        },
+    )
+
+
 def test_deliver_to_discord_posts_on_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     """A successful turn with a non-silent message POSTs to the Discord REST API."""
     posts: list[dict[str, Any]] = []
@@ -208,3 +244,148 @@ def test_deliver_to_discord_truncates_long_message(monkeypatch: pytest.MonkeyPat
     content = posted_content[0]
     assert content.endswith("\n[truncated]")
     assert len(content) <= 1900
+
+
+def test_deliver_to_discord_no_approvals_posts_no_components(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A turn with no pending approvals posts content only — no components key."""
+    posted_bodies: list[dict[str, Any]] = []
+
+    def fake_post(
+        url: str, *, headers: dict[str, str], json: dict[str, Any], timeout: float
+    ) -> MagicMock:
+        posted_bodies.append(json)
+        response = MagicMock()
+        response.status_code = 200
+        return response
+
+    monkeypatch.setattr("ariel.worker.httpx.post", fake_post)
+
+    _deliver_to_discord(outcome=_outcome(), settings=_settings())
+
+    assert len(posted_bodies) == 1
+    assert "components" not in posted_bodies[0]
+    assert posted_bodies[0]["content"] == "Hello from Ariel"
+
+
+def test_deliver_to_discord_pending_approval_adds_approval_line_and_buttons(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A turn with one pending approval appends the approval line and one button row."""
+    posted_bodies: list[dict[str, Any]] = []
+
+    def fake_post(
+        url: str, *, headers: dict[str, str], json: dict[str, Any], timeout: float
+    ) -> MagicMock:
+        posted_bodies.append(json)
+        response = MagicMock()
+        response.status_code = 200
+        return response
+
+    monkeypatch.setattr("ariel.worker.httpx.post", fake_post)
+
+    outcome = _outcome_with_approvals(
+        message="Shall I proceed?",
+        approvals=[{"ref": "ref_abc123", "capability_id": "cap.email.send"}],
+    )
+    _deliver_to_discord(outcome=outcome, settings=_settings())
+
+    assert len(posted_bodies) == 1
+    body = posted_bodies[0]
+
+    # Approval line appended after a blank line.
+    content = body["content"]
+    assert "Shall I proceed?" in content
+    assert "Approval pending" in content
+    assert "ref_abc123" in content
+    assert "Use the buttons below." in content
+
+    # One action row with Approve and Deny buttons.
+    components = body["components"]
+    assert len(components) == 1
+    row = components[0]
+    assert row["type"] == 1
+    assert len(row["components"]) == 2
+    approve, deny = row["components"]
+    assert approve["type"] == 2
+    assert approve["style"] == 3
+    assert approve["label"] == "Approve"
+    assert approve["custom_id"] == "ariel:approval:approve:ref_abc123"
+    assert deny["type"] == 2
+    assert deny["style"] == 4
+    assert deny["label"] == "Deny"
+    assert deny["custom_id"] == "ariel:approval:deny:ref_abc123"
+
+
+def test_deliver_to_discord_multiple_pending_approvals_produces_one_row_each(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Multiple pending approvals each produce one action row and one approval line."""
+    posted_bodies: list[dict[str, Any]] = []
+
+    def fake_post(
+        url: str, *, headers: dict[str, str], json: dict[str, Any], timeout: float
+    ) -> MagicMock:
+        posted_bodies.append(json)
+        response = MagicMock()
+        response.status_code = 200
+        return response
+
+    monkeypatch.setattr("ariel.worker.httpx.post", fake_post)
+
+    outcome = _outcome_with_approvals(
+        message="Two actions staged.",
+        approvals=[
+            {"ref": "ref_first", "capability_id": "cap.email.send"},
+            {"ref": "ref_second", "capability_id": "cap.calendar.event_create"},
+        ],
+    )
+    _deliver_to_discord(outcome=outcome, settings=_settings())
+
+    assert len(posted_bodies) == 1
+    body = posted_bodies[0]
+
+    content = body["content"]
+    assert "ref_first" in content
+    assert "ref_second" in content
+
+    components = body["components"]
+    assert len(components) == 2
+    assert components[0]["components"][0]["custom_id"] == "ariel:approval:approve:ref_first"
+    assert components[0]["components"][1]["custom_id"] == "ariel:approval:deny:ref_first"
+    assert components[1]["components"][0]["custom_id"] == "ariel:approval:approve:ref_second"
+    assert components[1]["components"][1]["custom_id"] == "ariel:approval:deny:ref_second"
+
+
+def test_deliver_to_discord_approval_with_expires_at_includes_suffix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An approval with ``expires_at`` appends the expiry suffix to the approval line."""
+    posted_bodies: list[dict[str, Any]] = []
+
+    def fake_post(
+        url: str, *, headers: dict[str, str], json: dict[str, Any], timeout: float
+    ) -> MagicMock:
+        posted_bodies.append(json)
+        response = MagicMock()
+        response.status_code = 200
+        return response
+
+    monkeypatch.setattr("ariel.worker.httpx.post", fake_post)
+
+    outcome = _outcome_with_approvals(
+        message="Action ready.",
+        approvals=[
+            {
+                "ref": "ref_expiring",
+                "capability_id": "cap.email.send",
+                "expires_at": "2026-06-01T13:00:00Z",
+            }
+        ],
+    )
+    _deliver_to_discord(outcome=outcome, settings=_settings())
+
+    assert len(posted_bodies) == 1
+    content = posted_bodies[0]["content"]
+    assert "expires_at=2026-06-01T13:00:00Z" in content

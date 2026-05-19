@@ -25,6 +25,7 @@ from .app import (
     build_google_runtime,
     build_runtime,
 )
+from .capability_registry import capability_action_label
 from .config import AppSettings
 from .google_connector import GOOGLE_CONNECTOR_ID
 from .persistence import (
@@ -75,15 +76,77 @@ def _deliver_to_discord(*, outcome: TurnExecutionOutcome, settings: AppSettings)
     message = assistant.get("message")
     if not isinstance(message, str) or not message.strip():
         return
+
+    # Collect pending approvals from the turn's surface_action_lifecycle.
+    turn = outcome.response_payload.get("turn")
+    lifecycle = turn.get("surface_action_lifecycle") if isinstance(turn, dict) else None
+    pending_approvals: list[dict[str, str]] = []
+    if isinstance(lifecycle, list):
+        for item in lifecycle:
+            if not isinstance(item, dict):
+                continue
+            approval = item.get("approval")
+            if not isinstance(approval, dict) or approval.get("status") != "pending":
+                continue
+            ref = approval.get("reference")
+            if not isinstance(ref, str) or not ref:
+                continue
+            proposal = item.get("proposal")
+            action_label = "Action"
+            if isinstance(proposal, dict):
+                capability_id_raw = proposal.get("capability_id")
+                if isinstance(capability_id_raw, str):
+                    action_label = capability_action_label(capability_id_raw)
+            entry: dict[str, str] = {"ref": ref, "action_label": action_label}
+            expires_at = approval.get("expires_at")
+            if isinstance(expires_at, str):
+                entry["expires_at"] = expires_at
+            pending_approvals.append(entry)
+
+    # Build message content: base message, then approval-pending lines.
     content = message.strip()
+    if pending_approvals:
+        approval_lines: list[str] = []
+        for entry in pending_approvals:
+            suffix = f" expires_at={entry['expires_at']}" if "expires_at" in entry else ""
+            approval_lines.append(
+                f"Approval pending ({entry['action_label']}): {entry['ref']}{suffix}. "
+                "Use the buttons below."
+            )
+        content = "\n".join([content, "", *approval_lines])
+
     if len(content) > 1900:
         # Discord's hard limit is 2000 characters; truncate with a marker.
         content = content[:1888].rstrip() + "\n[truncated]"
+
+    body: dict[str, Any] = {"content": content}
+    if pending_approvals:
+        body["components"] = [
+            {
+                "type": 1,
+                "components": [
+                    {
+                        "type": 2,
+                        "style": 3,
+                        "label": "Approve",
+                        "custom_id": f"ariel:approval:approve:{entry['ref']}",
+                    },
+                    {
+                        "type": 2,
+                        "style": 4,
+                        "label": "Deny",
+                        "custom_id": f"ariel:approval:deny:{entry['ref']}",
+                    },
+                ],
+            }
+            for entry in pending_approvals
+        ]
+
     try:
         httpx.post(
             f"https://discord.com/api/v10/channels/{settings.discord_channel_id}/messages",
             headers={"Authorization": f"Bot {settings.discord_bot_token}"},
-            json={"content": content},
+            json=body,
             timeout=settings.discord_notification_timeout_seconds,
         )
     except httpx.HTTPError:
@@ -314,6 +377,35 @@ def process_one_task(
                             prompt_text=note,
                             discord_context=None,
                             attachment_sources=None,
+                            ingress_provenance=None,
+                        ),
+                        google_runtime=build_google_runtime(runtime.settings),
+                    )
+                    db.commit()
+                _deliver_to_discord(outcome=outcome, settings=runtime.settings)
+            case "user_message":
+                if runtime is None:
+                    raise RuntimeError("user_message task requires a configured runtime")
+                session_id = _payload_text(task_payload, "session_id")
+                message = _payload_text(task_payload, "message")
+                if session_id is None or message is None:
+                    raise RuntimeError("user_message task payload invalid")
+                discord_context = task_payload.get("discord_context")
+                attachment_sources = task_payload.get("attachment_sources")
+                with session_factory() as db:
+                    outcome = _wake(
+                        runtime=runtime,
+                        db=db,
+                        request_session_id=session_id,
+                        wake_context=WakeContext(
+                            trigger_kind="user_message",
+                            prompt_text=message,
+                            discord_context=discord_context
+                            if isinstance(discord_context, dict)
+                            else None,
+                            attachment_sources=attachment_sources
+                            if isinstance(attachment_sources, list)
+                            else None,
                             ingress_provenance=None,
                         ),
                         google_runtime=build_google_runtime(runtime.settings),

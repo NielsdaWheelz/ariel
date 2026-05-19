@@ -11,6 +11,7 @@ from sqlalchemy import select
 from ariel.app import ModelAdapter, create_app
 from ariel.persistence import ProviderWriteReceiptRecord
 from tests.integration.responses_helpers import (
+    post_message_and_drain,
     process_queued_action_execution,
     responses_with_run_calls,
 )
@@ -375,8 +376,16 @@ def _session_id(client: TestClient) -> str:
     return active.json()["session"]["id"]
 
 
-def _surface_attempt(turn_payload: dict[str, Any], *, proposal_index: int = 1) -> dict[str, Any]:
-    lifecycle = turn_payload.get("surface_action_lifecycle")
+def _turn_data(client: TestClient, session_id: str) -> dict[str, Any]:
+    resp = client.get(f"/v1/sessions/{session_id}/events")
+    assert resp.status_code == 200
+    turns = resp.json()["turns"]
+    assert turns, "no turns in timeline"
+    return turns[-1]
+
+
+def _surface_attempt(turn_data: dict[str, Any], *, proposal_index: int = 1) -> dict[str, Any]:
+    lifecycle = turn_data.get("surface_action_lifecycle")
     assert isinstance(lifecycle, list)
     assert len(lifecycle) >= proposal_index
     item = lifecycle[proposal_index - 1]
@@ -384,8 +393,8 @@ def _surface_attempt(turn_payload: dict[str, Any], *, proposal_index: int = 1) -
     return item
 
 
-def _approval_ref(turn_payload: dict[str, Any], *, proposal_index: int = 1) -> str:
-    attempt = _surface_attempt(turn_payload, proposal_index=proposal_index)
+def _approval_ref(turn_data: dict[str, Any], *, proposal_index: int = 1) -> str:
+    attempt = _surface_attempt(turn_data, proposal_index=proposal_index)
     approval = attempt.get("approval")
     assert isinstance(approval, dict)
     ref = approval.get("reference")
@@ -393,8 +402,8 @@ def _approval_ref(turn_payload: dict[str, Any], *, proposal_index: int = 1) -> s
     return ref
 
 
-def _event_types(turn_payload: dict[str, Any]) -> list[str]:
-    return [event["event_type"] for event in turn_payload["events"]]
+def _event_types(turn_data: dict[str, Any]) -> list[str]:
+    return [event["event_type"] for event in turn_data["events"]]
 
 
 def _bind_google_fakes(
@@ -471,12 +480,8 @@ def test_s4_pr02_write_scope_remediation_reconnect_is_capability_intent_driven_a
         _connect_google(client, code="connect-read-only")
 
         session_id = _session_id(client)
-        first = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "create kickoff event"},
-        )
-        assert first.status_code == 200
-        first_turn = first.json()["turn"]
+        post_message_and_drain(client, session_id, message="create kickoff event")
+        first_turn = _turn_data(client, session_id)
         assert first_turn["surface_action_lifecycle"] == []
         assert "evt.action.execution.started" not in _event_types(first_turn)
 
@@ -499,12 +504,8 @@ def test_s4_pr02_write_scope_remediation_reconnect_is_capability_intent_driven_a
         )
         assert reconnect_callback.status_code == 200
 
-        second = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "create kickoff event"},
-        )
-        assert second.status_code == 200
-        second_turn = second.json()["turn"]
+        post_message_and_drain(client, session_id, message="create kickoff event")
+        second_turn = _turn_data(client, session_id)
         second_approval_ref = _approval_ref(second_turn)
         approved = client.post(
             "/v1/approvals",
@@ -569,12 +570,8 @@ def test_s4_pr02_calendar_create_requires_approval_and_executes_exactly_once(
         _connect_google(client, code="connect-calendar-write")
         session_id = _session_id(client)
 
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "create launch review"},
-        )
-        assert sent.status_code == 200
-        turn = sent.json()["turn"]
+        post_message_and_drain(client, session_id, message="create launch review")
+        turn = _turn_data(client, session_id)
         attempt = _surface_attempt(turn)
         assert attempt["policy"]["decision"] == "requires_approval"
         assert attempt["approval"]["status"] == "pending"
@@ -669,12 +666,9 @@ def test_s4_pr02_email_draft_queues_then_executes_as_draft_only_without_send_sid
         _connect_google(client, code="connect-compose")
         session_id = _session_id(client)
 
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message", json={"message": "draft follow-up"}
-        )
-        assert sent.status_code == 200
-        payload = sent.json()
-        attempt = _surface_attempt(payload["turn"])
+        post_message_and_drain(client, session_id, message="draft follow-up")
+        turn = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn)
         assert attempt["proposal"]["capability_id"] == "cap.email.draft"
         assert attempt["policy"]["decision"] == "requires_approval"
         assert attempt["approval"]["status"] == "pending"
@@ -683,7 +677,7 @@ def test_s4_pr02_email_draft_queues_then_executes_as_draft_only_without_send_sid
         assert len(workspace_provider.email_draft_calls) == 0
         assert len(workspace_provider.email_send_calls) == 0
 
-        approval_ref = _approval_ref(payload["turn"])
+        approval_ref = _approval_ref(turn)
         approved = client.post(
             "/v1/approvals",
             json={"approval_ref": approval_ref, "decision": "approve", "actor_id": "user.local"},
@@ -705,7 +699,7 @@ def test_s4_pr02_email_draft_queues_then_executes_as_draft_only_without_send_sid
         assert output["draft"]["subject"] == "Follow up"
         assert output["draft"]["body_redacted"]["redacted"] is True
 
-        assistant_message = payload["assistant"]["message"].lower()
+        assistant_message = turn["assistant_message"].lower()
         assert "approval" in assistant_message
         assert len(workspace_provider.email_draft_calls) == 1
         assert len(workspace_provider.email_send_calls) == 0
@@ -755,15 +749,12 @@ def test_s4_pr02_user_instruction_authority_requires_real_turn_id(
         _connect_google(client, code="connect-compose")
         session_id = _session_id(client)
 
-        sent = client.post(
-            f"/v1/sessions/{session_id}/message",
-            json={"message": "draft with slug authority"},
-        )
-        assert sent.status_code == 200
+        post_message_and_drain(client, session_id, message="draft with slug authority")
+        turn = _turn_data(client, session_id)
         approved = client.post(
             "/v1/approvals",
             json={
-                "approval_ref": _approval_ref(sent.json()["turn"]),
+                "approval_ref": _approval_ref(turn),
                 "decision": "approve",
                 "actor_id": "user.local",
             },
@@ -823,9 +814,8 @@ def test_s4_pr02_email_send_requires_approval_and_executes_exactly_once(
         _connect_google(client, code="connect-send")
         session_id = _session_id(client)
 
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "send follow-up"})
-        assert sent.status_code == 200
-        turn = sent.json()["turn"]
+        post_message_and_drain(client, session_id, message="send follow-up")
+        turn = _turn_data(client, session_id)
         attempt = _surface_attempt(turn)
         assert attempt["proposal"]["capability_id"] == "cap.email.send"
         assert attempt["policy"]["decision"] == "requires_approval"
@@ -918,9 +908,8 @@ def test_s4_pr02_draft_and_send_are_distinct_lifecycle_units_with_independent_hi
         _connect_google(client, code="connect-compose-send")
         session_id = _session_id(client)
 
-        drafted = client.post(f"/v1/sessions/{session_id}/message", json={"message": "draft note"})
-        assert drafted.status_code == 200
-        draft_turn = drafted.json()["turn"]
+        post_message_and_drain(client, session_id, message="draft note")
+        draft_turn = _turn_data(client, session_id)
         draft_attempt = _surface_attempt(draft_turn)
         assert draft_attempt["proposal"]["capability_id"] == "cap.email.draft"
         assert draft_attempt["approval"]["status"] == "pending"
@@ -935,11 +924,8 @@ def test_s4_pr02_draft_and_send_are_distinct_lifecycle_units_with_independent_hi
         assert draft_approved.status_code == 200
         assert process_queued_action_execution(client, draft_approved.json()) is True
 
-        send_proposed = client.post(
-            f"/v1/sessions/{session_id}/message", json={"message": "send note"}
-        )
-        assert send_proposed.status_code == 200
-        send_turn = send_proposed.json()["turn"]
+        post_message_and_drain(client, session_id, message="send note")
+        send_turn = _turn_data(client, session_id)
         send_attempt_pending = _surface_attempt(send_turn)
         assert send_attempt_pending["proposal"]["capability_id"] == "cap.email.send"
         assert send_attempt_pending["approval"]["status"] == "pending"
@@ -958,10 +944,10 @@ def test_s4_pr02_draft_and_send_are_distinct_lifecycle_units_with_independent_hi
         timeline = client.get(f"/v1/sessions/{session_id}/events")
         assert timeline.status_code == 200
         turns = timeline.json()["turns"]
-        draft_turn = next(turn for turn in turns if turn["user_message"] == "draft note")
+        draft_turn_final = next(turn for turn in turns if turn["user_message"] == "draft note")
         send_turn_final = next(turn for turn in turns if turn["user_message"] == "send note")
 
-        draft_attempt_final = _surface_attempt(draft_turn)
+        draft_attempt_final = _surface_attempt(draft_turn_final)
         send_attempt_final = _surface_attempt(send_turn_final)
 
         assert draft_attempt_final["action_attempt_id"] != send_attempt_final["action_attempt_id"]
@@ -1110,11 +1096,11 @@ def test_s4_pr02_write_paths_return_typed_auth_failures_with_recovery_guidance(
             _connect_google(client, code=connect_code)
 
         session_id = _session_id(client)
-        sent = client.post(f"/v1/sessions/{session_id}/message", json={"message": "perform write"})
-        assert sent.status_code == 200
+        post_message_and_drain(client, session_id, message="perform write")
+        turn = _turn_data(client, session_id)
 
         if requires_approval:
-            approval_ref = _approval_ref(sent.json()["turn"])
+            approval_ref = _approval_ref(turn)
             decided = client.post(
                 "/v1/approvals",
                 json={
@@ -1126,7 +1112,7 @@ def test_s4_pr02_write_paths_return_typed_auth_failures_with_recovery_guidance(
             assert decided.status_code == 200
             assert process_queued_action_execution(client, decided.json()) is True
         else:
-            rendered_message = sent.json()["assistant"]["message"].lower()
+            rendered_message = turn["assistant_message"].lower()
             assert expected_class in rendered_message
             assert "connect" in rendered_message
 

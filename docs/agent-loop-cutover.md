@@ -139,10 +139,9 @@ The loop code is one. `_wake` and `run_research` are thin drivers around it.
 ### Async turns and delivery
 
 Every turn runs in the single-threaded background worker. The HTTP ingress —
-the user-message endpoint (`post_message`) and the capture endpoint — enqueues a
-`background_tasks` row and returns `202`; it never runs a turn. The worker takes
-the earliest due row, dispatches by `task_type`, runs the turn, and on success
-deletes the row.
+the user-message endpoint (`post_message`) — enqueues a `background_tasks` row
+and returns `202`; it never runs a turn. The worker takes the earliest due row,
+dispatches by `task_type`, runs the turn, and on success deletes the row.
 
 A turn's emitted message is delivered by the worker after the turn commits: it
 posts the message to the user's Discord channel over the Discord REST API
@@ -157,9 +156,9 @@ against concurrent turns on one session, which can no longer occur.
 ### Durability — per-program commit
 
 A turn commits once per `run` program. A program that completes cleanly
-(`RunProgramResult.program_ok`) has its effects committed; a failed program is
-rolled back — its staged `ApprovalRequestRecord` rows are discarded, as the
-`RunProgramResult` contract already structures. There is no turn-spanning
+(`RunProgramResult.program_ok`) has its effects committed; a failed program
+commits its syscall-trace audit (events and action attempts) with its staged
+approvals voided — it is not rolled back. There is no turn-spanning
 transaction; each transaction is one program long, seconds not minutes.
 
 A turn is not journaled and not replayed. If the worker crashes mid-turn, the
@@ -393,10 +392,12 @@ They are added to the always-eligible syscall set in `run_runtime.py` beside
 
 ### HTTP
 
-- The user-message endpoint and the capture endpoint stop running turns. Each
-  validates its input, enqueues a `background_tasks` row, and returns `202` with
+- The user-message endpoint stops running turns synchronously. It validates its
+  input, enqueues a `background_tasks` row, and returns `202` with
   `{status: "accepted", task_id: "..."}`. Idempotency guards the enqueue; no
   response payload is cached, because there is no synchronous response.
+  `/v1/captures/record` stays synchronous and does not enqueue a wake.
+  `/v1/captures` is deleted.
 - A turn's result is observed through the existing session-events endpoint, or —
   for Discord, the primary surface — delivered as a pushed Discord message.
 
@@ -507,8 +508,9 @@ delivery, which is broken today.
 
 Make every turn worker-run and delete the synchronous path.
 
-- The user-message endpoint and the capture endpoint enqueue a `user_message`
-  `background_tasks` row and return `202`. They no longer call `_wake`.
+- The user-message endpoint enqueues a `user_message` `background_tasks` row
+  and returns `202`. It no longer calls `_wake`. `/v1/captures/record` stays
+  synchronous; `/v1/captures` is deleted.
 - The worker gains a `user_message` dispatch arm: it builds a `WakeContext`
   (`trigger_kind = user_message`) from the row payload and calls `_wake`.
 - The Discord bot forwards a message and does not block on a reply; the reply
@@ -684,8 +686,8 @@ The cutover is complete only when all are true:
 
 - Every turn — user message, proactive wake, research completion — runs in the
   single-threaded worker, reached through `background_tasks`.
-- The user-message and capture endpoints enqueue a task and return `202`; no
-  code path runs a turn synchronously.
+- The user-message endpoint enqueues a task and returns `202`; no code path
+  runs a turn synchronously.
 - A worker-run turn's emitted message is delivered to the user's Discord
   channel; a proactive wake reaches the user.
 - The loop runs unbounded model rounds, bounded only by the wall-clock budget
