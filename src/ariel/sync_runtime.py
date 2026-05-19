@@ -44,42 +44,6 @@ def _json_digest(payload: dict[str, Any]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def _enqueue_workspace_commitment_extraction_due(
-    db: Session,
-    *,
-    evidence_id: str,
-    now: datetime,
-    new_id_fn: Callable[[str], str],
-) -> None:
-    existing_task_id = db.scalar(
-        select(BackgroundTaskRecord.id)
-        .where(
-            BackgroundTaskRecord.task_type == "workspace_commitment_extraction_due",
-            BackgroundTaskRecord.status.in_(("pending", "running")),
-            BackgroundTaskRecord.payload["evidence_id"].as_string() == evidence_id,
-        )
-        .limit(1)
-    )
-    if existing_task_id is not None:
-        return
-    db.add(
-        BackgroundTaskRecord(
-            id=new_id_fn("tsk"),
-            task_type="workspace_commitment_extraction_due",
-            payload={"evidence_id": evidence_id},
-            status="pending",
-            attempts=0,
-            max_attempts=3,
-            error=None,
-            claimed_by=None,
-            run_after=now,
-            last_heartbeat=None,
-            created_at=now,
-            updated_at=now,
-        )
-    )
-
-
 def _acquire_provider_sync_lock(
     session_factory: sessionmaker[Session],
     *,
@@ -816,7 +780,6 @@ def _sync_calendar_item(
     if evidence is not None and evidence.lifecycle_state != "available":
         return True
     if evidence is None:
-        enqueue_extraction = False
         superseded_rows = db.scalars(
             select(ProviderEvidenceRecord)
             .where(
@@ -857,7 +820,6 @@ def _sync_calendar_item(
             .where(ProviderEvidenceBlockRecord.evidence_id == evidence.id)
             .limit(1)
         )
-        block_count = 0
         if existing_block_id is None:
             for index, block in enumerate(normalized.description_blocks):
                 db.add(
@@ -876,29 +838,11 @@ def _sync_calendar_item(
                         created_at=now,
                     )
                 )
-                block_count += 1
-        if block_count:
-            enqueue_extraction = True
-        elif existing_block_id is not None and evidence.extraction_status == "pending":
-            enqueue_extraction = True
-        if enqueue_extraction:
-            _enqueue_workspace_commitment_extraction_due(
-                db,
-                evidence_id=evidence.id,
-                now=now,
-                new_id_fn=new_id_fn,
-            )
     elif evidence.metadata_json != metadata:
         evidence.metadata_json = metadata
         evidence.extraction_status = "pending"
         evidence.observed_at = now
         evidence.updated_at = now
-        _enqueue_workspace_commitment_extraction_due(
-            db,
-            evidence_id=evidence.id,
-            now=now,
-            new_id_fn=new_id_fn,
-        )
     return True
 
 
@@ -1191,7 +1135,6 @@ def _sync_gmail_history(
                 ):
                     continue
                 if existing_evidence is None:
-                    enqueue_extraction = False
                     superseded_rows = db.scalars(
                         select(ProviderEvidenceRecord)
                         .where(
@@ -1234,7 +1177,6 @@ def _sync_gmail_history(
                         .limit(1)
                     )
                     raw_blocks = read_evidence.get("blocks")
-                    block_count = 0
                     if existing_block_id is None:
                         for index, block in enumerate(
                             raw_blocks if isinstance(raw_blocks, list) else []
@@ -1268,18 +1210,6 @@ def _sync_gmail_history(
                                     created_at=now,
                                 )
                             )
-                            block_count += 1
-                    if block_count:
-                        enqueue_extraction = True
-                    elif existing_block_id is not None and evidence.extraction_status == "pending":
-                        enqueue_extraction = True
-                    if enqueue_extraction:
-                        _enqueue_workspace_commitment_extraction_due(
-                            db,
-                            evidence_id=evidence.id,
-                            now=now,
-                            new_id_fn=new_id_fn,
-                        )
                 else:
                     labels_changed = existing_evidence.metadata_json.get("label_ids") != label_ids
                     existing_evidence.thread_external_id = thread_id
@@ -1290,18 +1220,6 @@ def _sync_gmail_history(
                     existing_evidence.updated_at = now
                     if labels_changed or key in {"labelsAdded", "labelsRemoved"}:
                         existing_evidence.extraction_status = "pending"
-                        existing_block_id = db.scalar(
-                            select(ProviderEvidenceBlockRecord.id)
-                            .where(ProviderEvidenceBlockRecord.evidence_id == existing_evidence.id)
-                            .limit(1)
-                        )
-                        if existing_block_id is not None:
-                            _enqueue_workspace_commitment_extraction_due(
-                                db,
-                                evidence_id=existing_evidence.id,
-                                now=now,
-                                new_id_fn=new_id_fn,
-                            )
             if key == "messagesAdded" and thread_id is not None:
                 watches = db.scalars(
                     select(EmailThreadWatchRecord)

@@ -416,12 +416,11 @@ def test_gmail_sync_follows_history_pages_and_dedupes_replayed_events(
     extraction_tasks = [
         task for task in tasks if task.task_type == "workspace_commitment_extraction_due"
     ]
+    wake_tasks = [task for task in tasks if task.task_type == "agent_wake"]
     assert ambient_tasks == []
-    assert [task.task_type for task in extraction_tasks] == [
-        "workspace_commitment_extraction_due",
-        "workspace_commitment_extraction_due",
-    ]
-    assert all(set(task.payload) == {"evidence_id"} for task in extraction_tasks)
+    assert extraction_tasks == []
+    # Each sync run that finds new data wakes the agent; nothing else.
+    assert len(wake_tasks) == 2
     assert observation_count == 0
     assert case_count == 0
 
@@ -519,8 +518,8 @@ def test_gmail_sync_hydrates_added_messages_into_body_evidence(
         task for task in tasks if task.task_type == "workspace_commitment_extraction_due"
     ]
     wake_tasks = [task for task in tasks if task.task_type == "agent_wake"]
-    assert [task.payload for task in extraction_tasks] == [{"evidence_id": evidence.id}]
-    # The synced message also wakes the agent (P3 push+poll convergence).
+    assert extraction_tasks == []
+    # The synced message wakes the agent (P3 push+poll convergence).
     assert len(wake_tasks) == 1
 
 
@@ -759,8 +758,11 @@ def test_gmail_sync_completes_thread_watch_on_reply(
             extraction_tasks = [
                 task for task in tasks if task.task_type == "workspace_commitment_extraction_due"
             ]
+            wake_tasks = [task for task in tasks if task.task_type == "agent_wake"]
             assert ambient_tasks == []
-            assert len(extraction_tasks) == 2
+            assert extraction_tasks == []
+            # The sync run found new data, so it wakes the agent once.
+            assert len(wake_tasks) == 1
             evidence_rows = db.scalars(select(ProviderEvidenceRecord)).all()
             assert len(evidence_rows) == 2
             assert {evidence.taint for evidence in evidence_rows} == {"provider_untrusted"}

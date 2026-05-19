@@ -1331,7 +1331,6 @@ def _persist_google_provider_evidence(
             )
             db.add(stored)
             db.flush()
-            block_count = 0
             for index, block in enumerate(raw_blocks if isinstance(raw_blocks, list) else []):
                 if not isinstance(block, dict) or not isinstance(block.get("text"), str):
                     continue
@@ -1357,24 +1356,6 @@ def _persist_google_provider_evidence(
                             "truncated": block.get("truncated"),
                         },
                         created_at=now,
-                    )
-                )
-                block_count += 1
-            if block_count:
-                db.add(
-                    BackgroundTaskRecord(
-                        id=new_id_fn("tsk"),
-                        task_type="workspace_commitment_extraction_due",
-                        payload={"evidence_id": stored.id},
-                        status="pending",
-                        attempts=0,
-                        max_attempts=3,
-                        error=None,
-                        claimed_by=None,
-                        run_after=now,
-                        last_heartbeat=None,
-                        created_at=now,
-                        updated_at=now,
                     )
                 )
             return [evidence_ref(stored)]
@@ -1497,7 +1478,6 @@ def _persist_google_provider_evidence(
         )
         db.add(stored)
         db.flush()
-        block_count = 0
         for index, block in enumerate(raw_blocks if isinstance(raw_blocks, list) else []):
             if not isinstance(block, dict) or not isinstance(block.get("text"), str):
                 continue
@@ -1519,24 +1499,6 @@ def _persist_google_provider_evidence(
                         "truncated": block.get("truncated"),
                     },
                     created_at=now,
-                )
-            )
-            block_count += 1
-        if block_count:
-            db.add(
-                BackgroundTaskRecord(
-                    id=new_id_fn("tsk"),
-                    task_type="workspace_commitment_extraction_due",
-                    payload={"evidence_id": stored.id},
-                    status="pending",
-                    attempts=0,
-                    max_attempts=3,
-                    error=None,
-                    claimed_by=None,
-                    run_after=now,
-                    last_heartbeat=None,
-                    created_at=now,
-                    updated_at=now,
                 )
             )
         return [evidence_ref(stored)]
@@ -1793,7 +1755,6 @@ def _persist_google_provider_evidence(
         db.add(stored)
         db.flush()
         raw_blocks = event.get("description_blocks")
-        block_count = 0
         for index, block in enumerate(raw_blocks if isinstance(raw_blocks, list) else []):
             if not isinstance(block, dict) or not isinstance(block.get("text"), str):
                 continue
@@ -1808,24 +1769,6 @@ def _persist_google_provider_evidence(
                     source_offsets={"block_id": block.get("block_id")},
                     metadata_json={"truncated": block.get("truncated")},
                     created_at=now,
-                )
-            )
-            block_count += 1
-        if block_count:
-            db.add(
-                BackgroundTaskRecord(
-                    id=new_id_fn("tsk"),
-                    task_type="workspace_commitment_extraction_due",
-                    payload={"evidence_id": stored.id},
-                    status="pending",
-                    attempts=0,
-                    max_attempts=3,
-                    error=None,
-                    claimed_by=None,
-                    run_after=now,
-                    last_heartbeat=None,
-                    created_at=now,
-                    updated_at=now,
                 )
             )
         stored_refs.append(evidence_ref(stored))

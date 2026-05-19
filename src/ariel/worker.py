@@ -5,7 +5,6 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-import httpx
 import ulid
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
@@ -29,48 +28,19 @@ from .google_connector import GOOGLE_CONNECTOR_ID
 from .persistence import (
     AgencyEventRecord,
     BackgroundTaskRecord,
-    EmailThreadWatchRecord,
     GoogleConnectorRecord,
     JobEventRecord,
     JobRecord,
-    NotificationDeliveryRecord,
-    NotificationRecord,
     ProviderWatchChannelRecord,
     SessionRecord,
     SyncCursorRecord,
-    WorkFollowUpLoopRecord,
-    _work_follow_up_task_idempotency_key,
     enqueue_background_task,
-    to_rfc3339,
 )
-from .leave_by import process_leave_by_evaluate_due, process_leave_by_scan_due
 from .memory import enqueue_due_memory_sweep, run_rememberer
-from .proactivity import (
-    process_proactive_action_execution_due,
-    process_proactive_deliberation_due,
-    process_proactive_feedback_learning_due,
-    process_proactive_follow_up_due,
-    process_workspace_commitment_extraction_due,
-    process_work_follow_up_evaluate_due,
-    process_ambient_interpretation_due,
-)
 from .redaction import safe_failure_reason
 from .sync_runtime import (
     process_provider_event_received,
     process_provider_sync_due,
-)
-
-
-PROACTIVE_RECOVERABLE_TASK_TYPES = (
-    "ambient_interpretation_due",
-    "proactive_deliberation_due",
-    "proactive_follow_up_due",
-    "workspace_commitment_extraction_due",
-    "work_follow_up_evaluate_due",
-    "proactive_feedback_learning_due",
-    "proactive_action_execution_due",
-    "leave_by_scan_due",
-    "leave_by_evaluate_due",
 )
 
 
@@ -84,58 +54,6 @@ def _utcnow() -> datetime:
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}_{ulid.new().str.lower()}"
-
-
-def process_due_email_thread_watches(
-    *,
-    session_factory: sessionmaker[Session],
-    now_fn: Callable[[], datetime],
-    new_id_fn: Callable[[str], str],
-) -> int:
-    now = now_fn()
-    with session_factory() as db:
-        with db.begin():
-            pending_provider_sync_task_id = db.scalar(
-                select(BackgroundTaskRecord.id)
-                .where(
-                    BackgroundTaskRecord.status.in_(("pending", "running")),
-                    BackgroundTaskRecord.run_after <= now,
-                    BackgroundTaskRecord.task_type.in_(
-                        ("provider_event_received", "provider_sync_due")
-                    ),
-                )
-                .order_by(BackgroundTaskRecord.run_after.asc(), BackgroundTaskRecord.id.asc())
-                .limit(1)
-            )
-            syncing_gmail_cursor_id = db.scalar(
-                select(SyncCursorRecord.id)
-                .where(
-                    SyncCursorRecord.provider == "google",
-                    SyncCursorRecord.resource_type == "gmail",
-                    SyncCursorRecord.status == "syncing",
-                )
-                .limit(1)
-            )
-            if pending_provider_sync_task_id is not None or syncing_gmail_cursor_id is not None:
-                return 0
-
-            watches = db.scalars(
-                select(EmailThreadWatchRecord)
-                .where(
-                    EmailThreadWatchRecord.status == "active",
-                    EmailThreadWatchRecord.deadline <= now,
-                )
-                .with_for_update()
-                .order_by(EmailThreadWatchRecord.deadline.asc(), EmailThreadWatchRecord.id.asc())
-                .limit(100)
-            ).all()
-            for watch in watches:
-                if watch.condition == "no_reply_by_deadline":
-                    watch.status = "due"
-                else:
-                    watch.status = "failed"
-                watch.updated_at = now
-            return len(watches)
 
 
 def claim_next_task(db: Session, *, worker_id: str, now: datetime) -> BackgroundTaskRecord | None:
@@ -181,97 +99,9 @@ def reap_stale_tasks(db: Session, *, now: datetime, heartbeat_timeout_seconds: i
         task.last_heartbeat = None
         task.run_after = now
         task.updated_at = now
-    recoverable_failed_tasks = db.scalars(
-        select(BackgroundTaskRecord)
-        .where(
-            BackgroundTaskRecord.status == "failed",
-            BackgroundTaskRecord.task_type.in_(PROACTIVE_RECOVERABLE_TASK_TYPES),
-            BackgroundTaskRecord.attempts < BackgroundTaskRecord.max_attempts,
-            BackgroundTaskRecord.run_after <= now,
-        )
-        .with_for_update(skip_locked=True)
-    ).all()
-    for task in recoverable_failed_tasks:
-        task.status = "pending"
-        task.claimed_by = None
-        task.last_heartbeat = None
-        task.updated_at = now
-    if stale_tasks or recoverable_failed_tasks:
+    if stale_tasks:
         db.flush()
-    return len(stale_tasks) + len(recoverable_failed_tasks)
-
-
-def enqueue_due_worker_owned_ambient_task(
-    db: Session,
-    *,
-    settings: AppSettings,
-    now: datetime,
-) -> BackgroundTaskRecord | None:
-    due_task_id = db.scalar(
-        select(BackgroundTaskRecord.id)
-        .where(
-            BackgroundTaskRecord.status == "pending",
-            BackgroundTaskRecord.run_after <= now,
-        )
-        .with_for_update(skip_locked=True)
-        .limit(1)
-    )
-    if due_task_id is not None:
-        return None
-    latest = db.scalar(
-        select(BackgroundTaskRecord)
-        .where(BackgroundTaskRecord.task_type == "ambient_interpretation_due")
-        .order_by(
-            BackgroundTaskRecord.run_after.desc(),
-            BackgroundTaskRecord.created_at.desc(),
-            BackgroundTaskRecord.id.desc(),
-        )
-        .with_for_update(skip_locked=True)
-        .limit(1)
-    )
-    if latest is not None and latest.status in {"pending", "running"}:
-        return None
-    due_after = now - timedelta(seconds=settings.proactive_ambient_interval_seconds)
-    if latest is not None and latest.run_after > due_after:
-        return None
-    return enqueue_background_task(
-        db,
-        task_type="ambient_interpretation_due",
-        payload={"origin": "worker_ambient"},
-        now=now,
-        max_attempts=settings.proactive_worker_max_attempts,
-    )
-
-
-def enqueue_due_worker_owned_leave_by_scan_task(
-    db: Session,
-    *,
-    settings: AppSettings,
-    now: datetime,
-) -> BackgroundTaskRecord | None:
-    latest = db.scalar(
-        select(BackgroundTaskRecord)
-        .where(BackgroundTaskRecord.task_type == "leave_by_scan_due")
-        .order_by(
-            BackgroundTaskRecord.run_after.desc(),
-            BackgroundTaskRecord.created_at.desc(),
-            BackgroundTaskRecord.id.desc(),
-        )
-        .with_for_update(skip_locked=True)
-        .limit(1)
-    )
-    if latest is not None and latest.status in {"pending", "running"}:
-        return None
-    due_after = now - timedelta(seconds=settings.leave_by_scan_interval_seconds)
-    if latest is not None and latest.run_after > due_after:
-        return None
-    return enqueue_background_task(
-        db,
-        task_type="leave_by_scan_due",
-        payload={"origin": "worker_leave_by_scan"},
-        now=now,
-        max_attempts=settings.proactive_worker_max_attempts,
-    )
+    return len(stale_tasks)
 
 
 _PROVIDER_WATCH_RENEW_INTERVAL_SECONDS = 6 * 3600
@@ -304,80 +134,8 @@ def seed_provider_maintenance_tasks(
             task_type=task_type,
             payload={"origin": "worker_provider_maintenance"},
             now=now,
-            max_attempts=settings.proactive_worker_max_attempts,
             recurrence_seconds=recurrence_seconds,
         )
-
-
-def enqueue_due_work_follow_up_evaluation_tasks(
-    db: Session,
-    *,
-    settings: AppSettings,
-    now: datetime,
-) -> int:
-    loops = db.scalars(
-        select(WorkFollowUpLoopRecord)
-        .where(
-            WorkFollowUpLoopRecord.state.in_(("active", "waiting", "snoozed")),
-            WorkFollowUpLoopRecord.next_check_at.is_not(None),
-            WorkFollowUpLoopRecord.next_check_at <= now,
-        )
-        .order_by(WorkFollowUpLoopRecord.next_check_at.asc(), WorkFollowUpLoopRecord.id.asc())
-        .with_for_update(skip_locked=True)
-        .limit(100)
-    ).all()
-    if not loops:
-        return 0
-
-    existing_tasks = db.scalars(
-        select(BackgroundTaskRecord).where(
-            BackgroundTaskRecord.task_type == "work_follow_up_evaluate_due",
-            BackgroundTaskRecord.status.in_(("pending", "running")),
-        )
-    ).all()
-    existing_keys: set[tuple[str, int, str | None]] = set()
-    for task in existing_tasks:
-        payload = task.payload if isinstance(task.payload, dict) else {}
-        loop_id = payload.get("loop_id")
-        loop_version = payload.get("loop_version")
-        scheduled_for = payload.get("scheduled_for")
-        if (
-            isinstance(loop_id, str)
-            and isinstance(loop_version, int)
-            and (isinstance(scheduled_for, str) or scheduled_for is None)
-        ):
-            existing_keys.add((loop_id, loop_version, scheduled_for))
-
-    enqueued = 0
-    for loop in loops:
-        if loop.next_check_at is None:
-            continue
-        scheduled_for = to_rfc3339(loop.next_check_at)
-        if (loop.id, loop.version, scheduled_for) in existing_keys:
-            continue
-        if (loop.id, loop.version, None) in existing_keys:
-            continue
-        idempotency_key = _work_follow_up_task_idempotency_key(
-            loop_id=loop.id,
-            loop_version=loop.version,
-            scheduled_for=scheduled_for,
-        )
-        enqueue_background_task(
-            db,
-            task_type="work_follow_up_evaluate_due",
-            payload={
-                "loop_id": loop.id,
-                "loop_version": loop.version,
-                "scheduled_for": scheduled_for,
-                "idempotency_key": idempotency_key,
-            },
-            now=now,
-            max_attempts=settings.proactive_worker_max_attempts,
-            idempotency_key=idempotency_key,
-        )
-        existing_keys.add((loop.id, loop.version, scheduled_for))
-        enqueued += 1
-    return enqueued
 
 
 _PROVIDER_WATCH_RENEW_LEAD_SECONDS = 24 * 3600
@@ -393,6 +151,11 @@ def process_provider_watch_renew_due(
     # Re-arm any push channel approaching expiry. register_provider_watches
     # is idempotent and absorbs per-watch failures, so renewing all eligible
     # watches once a near-expiry row exists is the whole handler.
+    #
+    # A token-refresh failure here is a connector error the user must see:
+    # access_token_for_background_sync records the connector error state on
+    # this same transaction, and we enqueue a single agent_wake before the
+    # block commits, so the wake and the connector error commit together.
     now = now_fn()
     runtime = build_google_runtime(settings)
     with session_factory() as db:
@@ -415,11 +178,26 @@ def process_provider_watch_renew_due(
             )
             if connector is None or connector.status != "connected":
                 return
-            access_token = runtime.access_token_for_background_sync(
-                db=db,
-                now_fn=now_fn,
-                new_id_fn=new_id_fn,
-            )
+            try:
+                access_token = runtime.access_token_for_background_sync(
+                    db=db,
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
+            except RuntimeError as exc:
+                error_code = safe_failure_reason(str(exc), fallback="token_refresh_failed")
+                enqueue_background_task(
+                    db,
+                    task_type="agent_wake",
+                    payload={
+                        "note": (
+                            f"The Google connector reported an error {error_code}; "
+                            "the user may need to reconnect."
+                        )
+                    },
+                    now=now,
+                )
+                return
             runtime.register_provider_watches(
                 db=db,
                 access_token=access_token,
@@ -487,23 +265,9 @@ def process_one_task(
                 heartbeat_timeout_seconds=resolved_settings.worker_heartbeat_timeout_seconds,
             )
 
-    if process_due_email_thread_watches(
-        session_factory=session_factory,
-        now_fn=_utcnow,
-        new_id_fn=_new_id,
-    ):
-        return True
-
     with session_factory() as db:
         with db.begin():
             now = _utcnow()
-            enqueue_due_work_follow_up_evaluation_tasks(
-                db,
-                settings=resolved_settings,
-                now=now,
-            )
-            enqueue_due_worker_owned_ambient_task(db, settings=resolved_settings, now=now)
-            enqueue_due_worker_owned_leave_by_scan_task(db, settings=resolved_settings, now=now)
             enqueue_due_memory_sweep(db, settings=resolved_settings, now=now, new_id_fn=_new_id)
             seed_provider_maintenance_tasks(db, settings=resolved_settings, now=now)
 
@@ -520,29 +284,6 @@ def process_one_task(
             else:
                 task_payload = {}
                 task_shape_error = f"{task_type} task payload invalid"
-            if task_type == "work_follow_up_evaluate_due":
-                if (
-                    task.work_follow_up_loop_id is None
-                    or task.work_follow_up_loop_version is None
-                    or task.work_follow_up_scheduled_for is None
-                ):
-                    task_shape_error = "work_follow_up_evaluate_due task shape invalid"
-                else:
-                    scheduled_for = to_rfc3339(task.work_follow_up_scheduled_for)
-                    idempotency_key = _work_follow_up_task_idempotency_key(
-                        loop_id=task.work_follow_up_loop_id,
-                        loop_version=task.work_follow_up_loop_version,
-                        scheduled_for=scheduled_for,
-                    )
-                    if task.idempotency_key != idempotency_key:
-                        task_shape_error = "work_follow_up_evaluate_due task idempotency mismatch"
-                    else:
-                        task_payload = {
-                            "loop_id": task.work_follow_up_loop_id,
-                            "loop_version": task.work_follow_up_loop_version,
-                            "scheduled_for": scheduled_for,
-                            "idempotency_key": idempotency_key,
-                        }
             if task_type == "provider_write_reconcile_due":
                 if task.provider_write_receipt_id is None:
                     task_shape_error = "provider_write_reconcile_due task shape invalid"
@@ -566,12 +307,6 @@ def process_one_task(
                 _process_agency_event_received(
                     session_factory=session_factory,
                     task_payload=task_payload,
-                )
-            case "deliver_discord_notification":
-                _deliver_discord_notification(
-                    session_factory=session_factory,
-                    task_payload=task_payload,
-                    settings=resolved_settings,
                 )
             case "agent_wake":
                 note = _payload_text(task_payload, "note")
@@ -665,85 +400,6 @@ def process_one_task(
                     now_fn=_utcnow,
                     new_id_fn=_new_id,
                     trigger="sweep",
-                )
-            case "ambient_interpretation_due":
-                process_ambient_interpretation_due(
-                    session_factory=session_factory,
-                    task_payload=task_payload,
-                    settings=resolved_settings,
-                    model_adapter=model_adapter,
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                )
-            case "proactive_deliberation_due":
-                process_proactive_deliberation_due(
-                    session_factory=session_factory,
-                    task_payload=task_payload,
-                    settings=resolved_settings,
-                    model_adapter=model_adapter,
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                )
-            case "proactive_follow_up_due":
-                process_proactive_follow_up_due(
-                    session_factory=session_factory,
-                    task_payload=task_payload,
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                )
-            case "workspace_commitment_extraction_due":
-                process_workspace_commitment_extraction_due(
-                    session_factory=session_factory,
-                    task_payload=task_payload,
-                    settings=resolved_settings,
-                    model_adapter=model_adapter,
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                )
-            case "work_follow_up_evaluate_due":
-                shape_error = _payload_text(task_payload, "shape_error")
-                if shape_error is not None:
-                    raise RuntimeError(shape_error)
-                process_work_follow_up_evaluate_due(
-                    session_factory=session_factory,
-                    task_payload=task_payload,
-                    settings=resolved_settings,
-                    model_adapter=model_adapter,
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                )
-            case "proactive_feedback_learning_due":
-                process_proactive_feedback_learning_due(
-                    session_factory=session_factory,
-                    task_payload=task_payload,
-                    settings=resolved_settings,
-                    model_adapter=model_adapter,
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                )
-            case "proactive_action_execution_due":
-                process_proactive_action_execution_due(
-                    session_factory=session_factory,
-                    task_payload=task_payload,
-                    google_runtime=build_google_runtime(resolved_settings),
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                )
-            case "leave_by_scan_due":
-                process_leave_by_scan_due(
-                    session_factory=session_factory,
-                    settings=resolved_settings,
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
-                )
-            case "leave_by_evaluate_due":
-                process_leave_by_evaluate_due(
-                    session_factory=session_factory,
-                    task_payload=task_payload,
-                    settings=resolved_settings,
-                    model_adapter=model_adapter,
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
                 )
             case "provider_watch_renew_due":
                 process_provider_watch_renew_due(
@@ -961,241 +617,23 @@ def _process_agency_event_received(
                 "job.cancelled",
                 "job.timed_out",
             }:
+                # A job reaching a settled state wakes the agent so it can
+                # review the job and decide whether to inform the user.
+                job_name = job.title or job.external_job_id
                 enqueue_background_task(
                     db,
-                    task_type="ambient_interpretation_due",
-                    payload={"origin": "agency_event", "agency_event_id": agency_event.id},
+                    task_type="agent_wake",
+                    payload={
+                        "note": (
+                            f"The coding job '{job_name}' is now {status}. "
+                            "Review it and decide whether to inform the user."
+                        )
+                    },
                     now=now,
-                    max_attempts=3,
                 )
 
             agency_event.status = "processed"
             agency_event.processed_at = now
-
-
-def _deliver_discord_notification(
-    *,
-    session_factory: sessionmaker[Session],
-    task_payload: dict[str, Any],
-    settings: AppSettings,
-) -> None:
-    notification_id = _payload_text(task_payload, "notification_id")
-    if notification_id is None:
-        raise RuntimeError("deliver_discord_notification task missing notification_id")
-
-    with session_factory() as db:
-        with db.begin():
-            notification = db.scalar(
-                select(NotificationRecord)
-                .where(NotificationRecord.id == notification_id)
-                .with_for_update()
-                .limit(1)
-            )
-            if notification is None:
-                raise RuntimeError("notification not found")
-            if notification.status in {"delivered", "acknowledged"}:
-                return
-            content = f"**{notification.title}**\n{notification.body}"
-            payload = notification.payload if isinstance(notification.payload, dict) else {}
-            job_id = payload.get("job_id")
-            proactive_case_id = payload.get("case_id")
-            job = (
-                db.scalar(
-                    select(JobRecord).where(JobRecord.id == job_id).with_for_update().limit(1)
-                )
-                if isinstance(job_id, str)
-                else None
-            )
-            discord_thread_id = (
-                job.discord_thread_id if job is not None and job.discord_thread_id else None
-            )
-
-    if settings.discord_bot_token is None or settings.discord_channel_id is None:
-        raise RuntimeError("Discord notification delivery is not configured")
-
-    error: str | None = None
-    response_payload: dict[str, Any] | None = None
-    created_thread_id: str | None = None
-    try:
-        target_channel_id = discord_thread_id
-        thread_payload: dict[str, Any] | None = None
-        if target_channel_id is None and job is not None:
-            thread_response = httpx.post(
-                f"https://discord.com/api/v10/channels/{settings.discord_channel_id}/threads",
-                headers={
-                    "authorization": f"Bot {settings.discord_bot_token}",
-                    "content-type": "application/json",
-                },
-                json={
-                    "name": _discord_thread_name(job),
-                    "type": 11,
-                    "auto_archive_duration": 1440,
-                },
-                timeout=settings.discord_notification_timeout_seconds,
-            )
-            thread_payload = {
-                "status_code": thread_response.status_code,
-                "body": thread_response.text[:1000],
-            }
-            if thread_response.status_code < 200 or thread_response.status_code >= 300:
-                error = f"Discord returned HTTP {thread_response.status_code} while creating thread"
-            else:
-                created_thread_payload = thread_response.json()
-                created_thread_id = (
-                    created_thread_payload.get("id")
-                    if isinstance(created_thread_payload, dict)
-                    else None
-                )
-                if isinstance(created_thread_id, str) and created_thread_id:
-                    target_channel_id = created_thread_id
-                else:
-                    error = "Discord returned invalid thread response"
-
-        message_payload: dict[str, Any] | None = None
-        if error is None:
-            if target_channel_id is None:
-                target_channel_id = str(settings.discord_channel_id)
-            response = httpx.post(
-                f"https://discord.com/api/v10/channels/{target_channel_id}/messages",
-                headers={
-                    "authorization": f"Bot {settings.discord_bot_token}",
-                    "content-type": "application/json",
-                },
-                json={
-                    "content": content,
-                    "allowed_mentions": {"parse": []},
-                    "components": _discord_notification_components(
-                        notification_id=notification_id,
-                        job_id=job.id if job is not None else None,
-                        proactive_case_id=(
-                            proactive_case_id if isinstance(proactive_case_id, str) else None
-                        ),
-                    ),
-                },
-                timeout=settings.discord_notification_timeout_seconds,
-            )
-            message_payload = {"status_code": response.status_code, "body": response.text[:1000]}
-            if response.status_code < 200 or response.status_code >= 300:
-                error = f"Discord returned HTTP {response.status_code}"
-
-        response_payload = {
-            "thread": thread_payload,
-            "message": message_payload,
-        }
-    except ValueError:
-        error = "Discord returned invalid thread JSON"
-    except httpx.HTTPError as exc:
-        error = safe_failure_reason(str(exc), fallback=f"unexpected {exc.__class__.__name__}")
-
-    with session_factory() as db:
-        with db.begin():
-            notification = db.scalar(
-                select(NotificationRecord)
-                .where(NotificationRecord.id == notification_id)
-                .with_for_update()
-                .limit(1)
-            )
-            if notification is None:
-                raise RuntimeError("notification not found after delivery attempt")
-            payload = notification.payload if isinstance(notification.payload, dict) else {}
-            job_id = payload.get("job_id")
-            job = (
-                db.scalar(
-                    select(JobRecord).where(JobRecord.id == job_id).with_for_update().limit(1)
-                )
-                if isinstance(job_id, str)
-                else None
-            )
-            now = _utcnow()
-            if job is not None and created_thread_id is not None:
-                job.discord_thread_id = created_thread_id
-                job.updated_at = now
-            db.add(
-                NotificationDeliveryRecord(
-                    id=_new_id("ndl"),
-                    notification_id=notification.id,
-                    channel="discord",
-                    status="failed" if error is not None else "succeeded",
-                    error=error,
-                    response_payload=response_payload,
-                    created_at=now,
-                )
-            )
-            notification.status = "failed" if error is not None else "delivered"
-            notification.delivered_at = now if error is None else notification.delivered_at
-            notification.updated_at = now
-
-    if error is not None:
-        raise RuntimeError(error)
-
-
-def _discord_thread_name(job: JobRecord) -> str:
-    title = job.title or job.external_job_id
-    normalized = " ".join(title.split())
-    if len(normalized) <= 80:
-        return normalized
-    return normalized[:80].rstrip()
-
-
-def _discord_notification_components(
-    *,
-    notification_id: str,
-    job_id: str | None,
-    proactive_case_id: str | None,
-) -> list[dict[str, Any]]:
-    buttons: list[dict[str, Any]] = []
-    if job_id is not None:
-        buttons.append(
-            {
-                "type": 2,
-                "style": 2,
-                "label": "Refresh job",
-                "custom_id": f"ariel:job:refresh:{job_id}",
-            }
-        )
-    if proactive_case_id is not None:
-        buttons.append(
-            {
-                "type": 2,
-                "style": 1,
-                "label": "Acknowledge",
-                "custom_id": f"ariel:proactive:ack:{proactive_case_id}",
-            }
-        )
-        buttons.append(
-            {
-                "type": 2,
-                "style": 2,
-                "label": "Correct",
-                "custom_id": f"ariel:proactive:correct:{proactive_case_id}",
-            }
-        )
-        buttons.append(
-            {
-                "type": 2,
-                "style": 2,
-                "label": "Stop pattern",
-                "custom_id": f"ariel:proactive:stop:{proactive_case_id}",
-            }
-        )
-        buttons.append(
-            {
-                "type": 2,
-                "style": 2,
-                "label": "More",
-                "custom_id": f"ariel:proactive:more:{proactive_case_id}",
-            }
-        )
-        return [{"type": 1, "components": buttons}]
-    buttons.append(
-        {
-            "type": 2,
-            "style": 1,
-            "label": "Acknowledge",
-            "custom_id": f"ariel:notification:ack:{notification_id}",
-        }
-    )
-    return [{"type": 1, "components": buttons}]
 
 
 def _expire_approvals(

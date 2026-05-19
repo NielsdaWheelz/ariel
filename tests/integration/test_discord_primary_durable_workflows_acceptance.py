@@ -246,7 +246,7 @@ def test_google_provider_event_ingress_is_token_bound_deduped_and_conflict_safe(
                     text(
                         "SELECT task_type FROM background_tasks "
                         "WHERE status = 'pending' "
-                        "AND task_type NOT IN ('memory_sweep', 'leave_by_scan_due', "
+                        "AND task_type NOT IN ('memory_sweep', "
                         "'provider_watch_renew_due', 'provider_reconcile_sync_due') "
                         "ORDER BY created_at DESC LIMIT 1"
                     )
@@ -347,10 +347,11 @@ def test_google_calendar_sync_persists_provider_evidence_without_ambient_case(
                     .mappings()
                     .all()
                 )
-                assert {
-                    "task_type": "workspace_commitment_extraction_due",
-                    "payload": {"evidence_id": evidence["id"]},
-                } in [dict(task) for task in pending_tasks]
+                # The calendar sync found new data, so it wakes the agent;
+                # there is no commitment-extraction or ambient pipeline task.
+                assert any(task["task_type"] == "agent_wake" for task in pending_tasks)
                 assert all(
-                    task["task_type"] != "ambient_interpretation_due" for task in pending_tasks
+                    task["task_type"]
+                    not in {"workspace_commitment_extraction_due", "ambient_interpretation_due"}
+                    for task in pending_tasks
                 )
