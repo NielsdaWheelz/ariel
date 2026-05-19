@@ -405,34 +405,33 @@ def test_memory_profile_is_seeded_with_one_row(
     assert profile_rows == 1
 
 
-def test_ai_judgment_type_check_admits_only_the_two_memory_judgments(
+def test_ai_judgment_type_check_admits_only_live_judgment_types(
     postgres_url: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The ``ck_ai_judgment_type`` constraint accepts ``memory_recall`` and
-    ``memory_remember`` and rejects the four removed memory judgment types
-    (``memory_curation``, ``memory_extraction``, ``reflective_consolidation``,
-    ``continuity_compaction``)."""
+    """The ``ck_ai_judgment_type`` constraint accepts the three live judgment
+    types (``memory_recall``, ``memory_remember``, ``model_output``) and
+    rejects retired ones (``feedback_learning``,
+    ``workspace_commitment_extraction``, ``ambient_interpretation``)."""
 
     engine = create_engine(postgres_url, future=True)
     with _build_client(postgres_url, cast(ModelAdapter, RunProgramAdapter()), monkeypatch):
         pass
     session_factory = sessionmaker(bind=engine, future=True, expire_on_commit=False)
 
-    for judgment_type in ("memory_recall", "memory_remember"):
+    for judgment_type in ("memory_recall", "memory_remember", "model_output"):
         with session_factory() as db:
             with db.begin():
                 db.add(_judgment_row(judgment_type))
 
-    for removed in (
-        "memory_curation",
-        "memory_extraction",
-        "reflective_consolidation",
-        "continuity_compaction",
+    for retired in (
+        "feedback_learning",
+        "workspace_commitment_extraction",
+        "ambient_interpretation",
     ):
         with pytest.raises(Exception, match="ck_ai_judgment_type"):
             with session_factory() as db:
                 with db.begin():
-                    db.add(_judgment_row(removed))
+                    db.add(_judgment_row(retired))
 
 
 def _judgment_row(judgment_type: str) -> AIJudgmentRecord:
@@ -448,18 +447,12 @@ def _judgment_row(judgment_type: str) -> AIJudgmentRecord:
         provider_response_id=None,
         input_summary="memory contract probe",
         input_refs={},
-        selected=[],
-        omitted=[],
         output={},
-        rationale=None,
-        uncertainty=None,
-        confidence=None,
         parse_status="parsed",
         validation_status="valid",
         failure_code=None,
         failure_reason=None,
         created_at=now,
-        updated_at=now,
     )
 
 

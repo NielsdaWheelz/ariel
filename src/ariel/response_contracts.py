@@ -383,19 +383,9 @@ class SurfaceEventProviderWriteReceiptReconciledPayloadContract(BaseModel):
 class SurfaceEventAIJudgmentPayloadContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    judgment_type: Literal[
-        "memory_recall",
-        "memory_remember",
-        "tool_result_interpretation",
-        "feedback_learning",
-        "ambient_interpretation",
-        "proactive_deliberation",
-        "model_output",
-        "workspace_commitment_extraction",
-    ]
+    judgment_type: Literal["memory_recall", "memory_remember", "model_output"]
     parse_status: (
         Literal[
-            "not_required_no_candidates",
             "parsed",
             "invalid_json",
             "missing_output",
@@ -431,7 +421,6 @@ class SurfaceEventAIJudgmentPayloadContract(BaseModel):
     reason_codes: list[str] | None = None
     attempt: int | None = None
     max_model_attempts: int | None = None
-    last_tool_result_interpreter_judgment_id: str | None = None
     omitted_turn_count: int | None = None
     eligible_capability_count: int | None = None
 

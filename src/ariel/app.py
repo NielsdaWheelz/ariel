@@ -38,6 +38,7 @@ from ariel.action_runtime import (
     resolve_approval_decision,
 )
 from ariel.agency_daemon import AgencyDaemonClient, AgencyRuntime
+from ariel.ai_judgments import AIJudgmentFailure, record_ai_judgment
 from ariel.attachment_content import AttachmentContentRuntime
 from ariel.capability_registry import (
     EMAIL_MUTATION_CAPABILITY_IDS,
@@ -69,7 +70,6 @@ from ariel.memory import (
 )
 from ariel.persistence import (
     ActionAttemptRecord,
-    AIJudgmentRecord,
     ApprovalRequestRecord,
     AgencyEventRecord,
     ArtifactRecord,
@@ -2399,58 +2399,6 @@ def _wake(
         db.add(event)
         created_events.append(event)
 
-    def add_ai_judgment(
-        *,
-        judgment_type: str,
-        source_type: str,
-        source_id: str,
-        status: str,
-        model: str | None,
-        prompt_version: str,
-        provider_response_id: str | None = None,
-        input_summary: str,
-        input_refs: dict[str, Any],
-        selected: list[dict[str, Any]] | None = None,
-        omitted: list[dict[str, Any]] | None = None,
-        output: dict[str, Any] | None = None,
-        rationale: str | None = None,
-        uncertainty: str | None = None,
-        confidence: float | None = None,
-        parse_status: str,
-        validation_status: str,
-        failure_code: str | None = None,
-        failure_reason: str | None = None,
-    ) -> str:
-        now_judgment = _utcnow()
-        judgment_id = _new_id("ajg")
-        db.add(
-            AIJudgmentRecord(
-                id=judgment_id,
-                judgment_type=judgment_type,
-                source_type=source_type,
-                source_id=source_id,
-                status=status,
-                model=model,
-                prompt_version=prompt_version,
-                provider_response_id=provider_response_id,
-                input_summary=input_summary,
-                input_refs=jsonable_encoder(input_refs),
-                selected=jsonable_encoder(selected or []),
-                omitted=jsonable_encoder(omitted or []),
-                output=jsonable_encoder(output or {}),
-                rationale=rationale,
-                uncertainty=uncertainty,
-                confidence=confidence,
-                parse_status=parse_status,
-                validation_status=validation_status,
-                failure_code=failure_code,
-                failure_reason=failure_reason,
-                created_at=now_judgment,
-                updated_at=now_judgment,
-            )
-        )
-        return judgment_id
-
     if discord_context is not None and discord_attachment_sources:
         runtime.attachment_runtime.record_discord_sources(
             db=db,
@@ -2587,11 +2535,11 @@ def _wake(
         failure_reason: str,
     ) -> ApiError:
         prompt_version = "model-output-v1"
-        add_ai_judgment(
+        record_ai_judgment(
+            db,
             judgment_type="model_output",
             source_type="turn",
             source_id=turn.id,
-            status="failed",
             model=runtime.model_adapter.model,
             prompt_version=prompt_version,
             provider_response_id=provider_response_id,
@@ -2602,10 +2550,16 @@ def _wake(
                 "attempt": attempt,
                 "max_model_attempts": int(runtime.settings.max_model_attempts),
             },
-            parse_status="missing_output",
-            validation_status="not_validated",
-            failure_code="E_AI_JUDGMENT_BUDGET",
-            failure_reason=failure_reason,
+            output={},
+            now=_utcnow(),
+            new_id=_new_id,
+            failure=AIJudgmentFailure(
+                code="E_AI_JUDGMENT_BUDGET",
+                safe_reason=failure_reason,
+                retryable=False,
+                parse_status="missing_output",
+                validation_status="not_validated",
+            ),
         )
         add_event(
             "evt.ai_judgment.failed",
@@ -2744,11 +2698,11 @@ def _wake(
             run_source, run_protocol_error = parse_run_function_call(function_calls)
             if run_protocol_error is not None or run_source is None:
                 provider_response_id = candidate_response.get("provider_response_id")
-                add_ai_judgment(
+                record_ai_judgment(
+                    db,
                     judgment_type="model_output",
                     source_type="turn",
                     source_id=turn.id,
-                    status="failed",
                     model=candidate_response.get("model")
                     if isinstance(candidate_response.get("model"), str)
                     else runtime.model_adapter.model,
@@ -2761,12 +2715,18 @@ def _wake(
                         "session_id": effective_session_id,
                         "turn_id": turn.id,
                         "attempt": attempt,
-                        "response_output": jsonable_encoder(output_items),
+                        "response_output": output_items,
                     },
-                    parse_status="parsed",
-                    validation_status="invalid",
-                    failure_code="E_AI_JUDGMENT_VALIDATION",
-                    failure_reason=run_protocol_error or "model failed the run tool protocol",
+                    output={},
+                    now=_utcnow(),
+                    new_id=_new_id,
+                    failure=AIJudgmentFailure(
+                        code="E_AI_JUDGMENT_VALIDATION",
+                        safe_reason=run_protocol_error or "model failed the run tool protocol",
+                        retryable=False,
+                        parse_status="parsed",
+                        validation_status="invalid",
+                    ),
                 )
                 for output_item in output_items:
                     if isinstance(output_item, dict) and output_item.get("type") == "function_call":
@@ -2875,11 +2835,11 @@ def _wake(
                     error for error in [run_program_result.program_error] if error is not None
                 ] + run_program_result.callback_errors
                 provider_response_id = candidate_response.get("provider_response_id")
-                add_ai_judgment(
+                record_ai_judgment(
+                    db,
                     judgment_type="model_output",
                     source_type="turn",
                     source_id=turn.id,
-                    status="failed",
                     model=candidate_response.get("model")
                     if isinstance(candidate_response.get("model"), str)
                     else runtime.model_adapter.model,
@@ -2894,10 +2854,16 @@ def _wake(
                         "attempt": attempt,
                         "source": run_source,
                     },
-                    parse_status="parsed",
-                    validation_status="invalid",
-                    failure_code="E_AI_JUDGMENT_VALIDATION",
-                    failure_reason=json.dumps(program_errors, sort_keys=True),
+                    output={},
+                    now=_utcnow(),
+                    new_id=_new_id,
+                    failure=AIJudgmentFailure(
+                        code="E_AI_JUDGMENT_VALIDATION",
+                        safe_reason=json.dumps(program_errors, sort_keys=True),
+                        retryable=False,
+                        parse_status="parsed",
+                        validation_status="invalid",
+                    ),
                 )
                 for output_item in output_items:
                     if isinstance(output_item, dict) and output_item.get("type") == "function_call":
@@ -2947,11 +2913,11 @@ def _wake(
                 continue
 
             provider_response_id = candidate_response.get("provider_response_id")
-            add_ai_judgment(
+            record_ai_judgment(
+                db,
                 judgment_type="model_output",
                 source_type="turn",
                 source_id=turn.id,
-                status="succeeded",
                 model=candidate_response.get("model")
                 if isinstance(candidate_response.get("model"), str)
                 else runtime.model_adapter.model,
@@ -2965,7 +2931,7 @@ def _wake(
                     "turn_id": turn.id,
                     "attempt": attempt,
                     "source": run_source,
-                    "response_output": jsonable_encoder(output_items),
+                    "response_output": output_items,
                 },
                 output={
                     "emitted_message": bool(run_program_result.emitted_message),
@@ -2973,8 +2939,8 @@ def _wake(
                     "emitted_value_count": len(run_program_result.emitted_values),
                     "action_attempt_count": len(run_program_result.action_attempts),
                 },
-                parse_status="parsed",
-                validation_status="valid",
+                now=_utcnow(),
+                new_id=_new_id,
             )
 
             # Retrieval syscalls in the program persisted citation

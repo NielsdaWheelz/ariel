@@ -36,9 +36,9 @@ import httpx
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from .ai_judgments import AIJudgmentFailure, record_ai_judgment
 from .config import AppSettings
 from .persistence import (
-    AIJudgmentRecord,
     BackgroundTaskRecord,
     MemoryFactRecord,
     MemoryProfileRecord,
@@ -111,34 +111,6 @@ _REMEMBERER_PROMPT = (
     "Return an empty operations array and null profile and digest when nothing "
     "should change."
 )
-
-
-# ---------------------------------------------------------------------------
-# Bounded AI-call failure
-# ---------------------------------------------------------------------------
-class AIJudgmentFailure(RuntimeError):
-    """A bounded memory AI call failed -- network, malformed output, or a
-    schema/validation violation. Carries the fields an ``ai_judgments`` row
-    needs so the caller can audit the failure. Memory's subagents fail closed:
-    every malformed model output raises this rather than being partly parsed."""
-
-    def __init__(
-        self,
-        *,
-        code: str,
-        safe_reason: str,
-        retryable: bool,
-        parse_status: str,
-        validation_status: str,
-        provider_response_id: str | None = None,
-    ) -> None:
-        super().__init__(safe_reason)
-        self.code = code
-        self.safe_reason = safe_reason
-        self.retryable = retryable
-        self.parse_status = parse_status
-        self.validation_status = validation_status
-        self.provider_response_id = provider_response_id
 
 
 # ---------------------------------------------------------------------------
@@ -490,55 +462,6 @@ def _validation_failure(reason: str) -> AIJudgmentFailure:
     )
 
 
-def _write_judgment(
-    db: Session,
-    *,
-    judgment_type: Literal["memory_recall", "memory_remember"],
-    prompt_version: str,
-    source_type: str,
-    source_id: str,
-    status: Literal["succeeded", "failed"],
-    settings: AppSettings,
-    input_summary: str,
-    input_refs: dict[str, Any],
-    output: dict[str, Any],
-    selected: list[dict[str, Any]],
-    provider_response_id: str | None,
-    now: datetime,
-    new_id_fn: Callable[[str], str],
-    failure: AIJudgmentFailure | None = None,
-) -> None:
-    """Write the one ``ai_judgments`` row that audits a subagent call. Called on
-    both the success and the failure path -- ``failure`` carries the parse and
-    validation status when the call failed."""
-    db.add(
-        AIJudgmentRecord(
-            id=new_id_fn("ajg"),
-            judgment_type=judgment_type,
-            source_type=source_type,
-            source_id=source_id,
-            status=status,
-            model=settings.model_name,
-            prompt_version=prompt_version,
-            provider_response_id=provider_response_id,
-            input_summary=input_summary,
-            input_refs=input_refs,
-            selected=selected,
-            omitted=[],
-            output=output,
-            rationale=None,
-            uncertainty=None,
-            confidence=None,
-            parse_status=failure.parse_status if failure is not None else "parsed",
-            validation_status=failure.validation_status if failure is not None else "valid",
-            failure_code=failure.code if failure is not None else None,
-            failure_reason=failure.safe_reason if failure is not None else None,
-            created_at=now,
-            updated_at=now,
-        )
-    )
-
-
 # ---------------------------------------------------------------------------
 # The retriever subagent
 # ---------------------------------------------------------------------------
@@ -619,21 +542,19 @@ def run_retriever(
     except AIJudgmentFailure as failure:
         with session_factory() as db:
             with db.begin():
-                _write_judgment(
+                record_ai_judgment(
                     db,
                     judgment_type="memory_recall",
                     prompt_version=RETRIEVER_PROMPT_VERSION,
                     source_type=source_type,
                     source_id=source_id,
-                    status="failed",
-                    settings=settings,
+                    model=settings.model_name,
                     input_summary="memory retrieval for a deliberative wake",
                     input_refs={"candidate_count": len(candidate_payload)},
                     output={},
-                    selected=[],
                     provider_response_id=failure.provider_response_id,
                     now=now_fn(),
-                    new_id_fn=new_id_fn,
+                    new_id=new_id_fn,
                     failure=failure,
                 )
         raise
@@ -648,21 +569,19 @@ def run_retriever(
             )
             for fact in selected:
                 fact.last_recalled_at = now
-            _write_judgment(
+            record_ai_judgment(
                 db,
                 judgment_type="memory_recall",
                 prompt_version=RETRIEVER_PROMPT_VERSION,
                 source_type=source_type,
                 source_id=source_id,
-                status="succeeded",
-                settings=settings,
+                model=settings.model_name,
                 input_summary="memory retrieval for a deliberative wake",
                 input_refs={"candidate_count": len(candidate_payload)},
-                output={"recalled_count": len(selected)},
-                selected=[{"fact_id": fact_id} for fact_id in selected_ids],
+                output={"recalled_count": len(selected), "fact_ids": list(selected_ids)},
                 provider_response_id=provider_response_id,
                 now=now,
-                new_id_fn=new_id_fn,
+                new_id=new_id_fn,
             )
     # Return the selected facts in gather order: stable and similarity-ranked.
     by_id = {fact.id: fact for fact in selected}
@@ -925,21 +844,19 @@ def run_rememberer(
     except AIJudgmentFailure as failure:
         with session_factory() as db:
             with db.begin():
-                _write_judgment(
+                record_ai_judgment(
                     db,
                     judgment_type="memory_remember",
                     prompt_version=REMEMBERER_PROMPT_VERSION,
                     source_type=audit_source_type,
                     source_id=audit_source_id,
-                    status="failed",
-                    settings=settings,
+                    model=settings.model_name,
                     input_summary=f"memory rememberer ({trigger})",
                     input_refs=input_refs,
                     output={},
-                    selected=[],
                     provider_response_id=failure.provider_response_id,
                     now=now_fn(),
-                    new_id_fn=new_id_fn,
+                    new_id=new_id_fn,
                     failure=failure,
                 )
         raise
@@ -963,14 +880,13 @@ def run_rememberer(
                 session = db.get(SessionRecord, effective_session_id)
                 if session is not None:
                     session.digest = output.digest
-            _write_judgment(
+            record_ai_judgment(
                 db,
                 judgment_type="memory_remember",
                 prompt_version=REMEMBERER_PROMPT_VERSION,
                 source_type=audit_source_type,
                 source_id=audit_source_id,
-                status="succeeded",
-                settings=settings,
+                model=settings.model_name,
                 input_summary=f"memory rememberer ({trigger})",
                 input_refs=input_refs,
                 output={
@@ -978,11 +894,11 @@ def run_rememberer(
                     "profile_rewritten": output.profile is not None,
                     "digest_rewritten": output.digest is not None,
                     "hard_deleted_forgotten": deleted,
+                    "touched_fact_ids": list(touched),
                 },
-                selected=[{"fact_id": fact_id} for fact_id in touched],
                 provider_response_id=provider_response_id,
                 now=now,
-                new_id_fn=new_id_fn,
+                new_id=new_id_fn,
             )
     return output
 

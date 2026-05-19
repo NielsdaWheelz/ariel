@@ -67,12 +67,10 @@ REQUIRED_COLUMNS: Final[dict[str, tuple[str, ...]]] = {
         "provider_response_id",
         "input_refs",
         "output",
-        "confidence",
         "parse_status",
         "validation_status",
         "failure_code",
         "created_at",
-        "updated_at",
     ),
     "google_provider_objects": (
         "provider_account_id",
@@ -222,7 +220,7 @@ REQUIRED_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
         "ck_ai_judgment_type": (
             "'memory_recall'",
             "'memory_remember'",
-            "'workspace_commitment_extraction'",
+            "'model_output'",
         ),
         "ck_ai_judgment_status": ("'succeeded'", "'failed'"),
         "ck_ai_judgment_parse_status": ("'schema_invalid'",),
@@ -303,7 +301,15 @@ REQUIRED_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
 
 FORBIDDEN_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
     "ai_judgments": {
-        "ck_ai_judgment_type": ("'tool_strategy'",),
+        "ck_ai_judgment_type": (
+            "'tool_strategy'",
+            "'tool_result_interpretation'",
+            "'feedback_learning'",
+            "'ambient_interpretation'",
+            "'proactive_deliberation'",
+            "'workspace_commitment_extraction'",
+            "'leave_by_evaluation'",
+        ),
     },
 }
 

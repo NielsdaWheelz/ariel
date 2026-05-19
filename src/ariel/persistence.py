@@ -11,7 +11,6 @@ from sqlalchemy import (
     CheckConstraint,
     Computed,
     DateTime,
-    Float,
     ForeignKey,
     Index,
     Integer,
@@ -334,12 +333,7 @@ class AIJudgmentRecord(Base):
     provider_response_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     input_summary: Mapped[str] = mapped_column(Text, nullable=False)
     input_refs: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    selected: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
-    omitted: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
     output: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    rationale: Mapped[str | None] = mapped_column(Text, nullable=True)
-    uncertainty: Mapped[str | None] = mapped_column(Text, nullable=True)
-    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     parse_status: Mapped[str] = mapped_column(String(32), nullable=False)
     validation_status: Mapped[str] = mapped_column(String(32), nullable=False)
     failure_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -347,26 +341,15 @@ class AIJudgmentRecord(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, index=True
-    )
 
     __table_args__ = (
         CheckConstraint(
-            (
-                "judgment_type IN ('memory_recall', 'tool_result_interpretation', "
-                "'memory_remember', 'feedback_learning', 'ambient_interpretation', "
-                "'proactive_deliberation', 'model_output', "
-                "'workspace_commitment_extraction', 'leave_by_evaluation')"
-            ),
+            "judgment_type IN ('memory_recall', 'memory_remember', 'model_output')",
             name="ck_ai_judgment_type",
         ),
         CheckConstraint("status IN ('succeeded', 'failed')", name="ck_ai_judgment_status"),
         CheckConstraint(
-            (
-                "parse_status IN ('not_required_no_candidates', 'parsed', 'invalid_json', "
-                "'missing_output', 'schema_invalid')"
-            ),
+            "parse_status IN ('parsed', 'invalid_json', 'missing_output', 'schema_invalid')",
             name="ck_ai_judgment_parse_status",
         ),
         CheckConstraint(
