@@ -14,7 +14,7 @@ from ariel.config import AppSettings
 from ariel.persistence import SessionRecord, TurnRecord
 from ariel.run_runtime import (
     ScratchEntry,
-    _MAX_RESEARCH_FINDING_BYTES,
+    _MAX_EMITTED_FINDING_BYTES,
     execute_run_program,
 )
 from tests.fake_sandbox import FakeSandboxRuntime
@@ -211,10 +211,10 @@ def test_research_finding_schema_invalid_wrong_type(
 def test_research_finding_too_large_rejected(
     session_factory: Any,
 ) -> None:
-    """research.finding whose JSON encoding exceeds _MAX_RESEARCH_FINDING_BYTES is rejected."""
+    """research.finding whose JSON encoding exceeds _MAX_EMITTED_FINDING_BYTES is rejected."""
     sandbox = FakeSandboxRuntime()
     sandbox.start()
-    big_summary = "x" * (_MAX_RESEARCH_FINDING_BYTES + 1)
+    big_summary = "x" * (_MAX_EMITTED_FINDING_BYTES + 1)
     with session_factory() as db:
         with db.begin():
             turn = _turn(db, session_id="ses_finding_big", turn_id="trn_finding_big")

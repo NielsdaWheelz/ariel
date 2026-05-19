@@ -52,16 +52,6 @@ from ariel.google_connector import (
     _decrypt_secret,
     _encrypt_secret,
 )
-from ariel.memory import (
-    create_note,
-    delete_note,
-    edit_note,
-    enqueue_memory_encode,
-    read_log_entry,
-    read_note,
-    run_retriever,
-    search_memory,
-)
 from ariel.persistence import (
     ActionAttemptRecord,
     ActionPrivatePayloadRecord,
@@ -648,6 +638,20 @@ def _execute_memory_capability(
     """
     if settings is None:
         raise RuntimeError("memory_runtime_settings_not_bound")
+
+    # Deferred import — ariel.memory imports ariel.agent_loop which imports
+    # back from this module; doing the import here breaks the import-time
+    # cycle while keeping the call cheap once both modules are loaded.
+    from ariel.memory import (
+        create_note,
+        delete_note,
+        edit_note,
+        enqueue_memory_encode,
+        read_log_entry,
+        read_note,
+        run_retriever,
+        search_memory,
+    )
 
     if capability_id == "cap.memory.recall":
         if sandbox is None or model_adapter is None or turn is None or caller_db is None:

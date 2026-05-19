@@ -54,43 +54,31 @@ def test_bind_host_rejects_public_interfaces(monkeypatch: pytest.MonkeyPatch) ->
         AppSettings()
 
 
-def test_max_recent_turns_loads_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ARIEL_MAX_RECENT_TURNS", "7")
-
-    settings = AppSettings()
-    assert settings.max_recent_turns == 7
-
-
-def test_max_recent_turns_rejects_non_positive_values(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ARIEL_MAX_RECENT_TURNS", "0")
-
-    with pytest.raises(ValidationError):
-        AppSettings()
-
-
 def test_slice1_turn_budget_defaults_are_configured(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("ARIEL_MAX_RECENT_TURNS", raising=False)
-    monkeypatch.delenv("ARIEL_MEMORY_RECALL_CANDIDATE_LIMIT", raising=False)
-    monkeypatch.delenv("ARIEL_MAX_CONTEXT_TOKENS", raising=False)
     monkeypatch.delenv("ARIEL_AUTO_ROTATE_MAX_TURNS", raising=False)
     monkeypatch.delenv("ARIEL_AUTO_ROTATE_MAX_AGE_SECONDS", raising=False)
-    monkeypatch.delenv("ARIEL_AUTO_ROTATE_CONTEXT_PRESSURE_TOKENS", raising=False)
     monkeypatch.delenv("ARIEL_MAX_RESPONSE_TOKENS", raising=False)
     monkeypatch.delenv("ARIEL_MAIN_TURN_BUDGET_SECONDS", raising=False)
     monkeypatch.delenv("ARIEL_AGENT_LOOP_MAX_MODEL_CALLS", raising=False)
+    monkeypatch.delenv("ARIEL_AGENT_LOOP_LIVE_ROUNDS", raising=False)
+    monkeypatch.delenv("ARIEL_MEMORY_RECALL_BUDGET_SECONDS", raising=False)
+    monkeypatch.delenv("ARIEL_MEMORY_ENCODE_BUDGET_SECONDS", raising=False)
+    monkeypatch.delenv("ARIEL_MEMORY_DREAM_BUDGET_SECONDS", raising=False)
+    monkeypatch.delenv("ARIEL_MEMORY_DREAM_INTERVAL_SECONDS", raising=False)
     monkeypatch.delenv("ARIEL_APPROVAL_TTL_SECONDS", raising=False)
     monkeypatch.delenv("ARIEL_APPROVAL_ACTOR_ID", raising=False)
 
     settings = AppSettings.model_validate({})
-    assert settings.max_recent_turns == 12
-    assert settings.memory_recall_candidate_limit == 24
-    assert settings.max_context_tokens == 6000
     assert settings.auto_rotate_max_turns == 120
     assert settings.auto_rotate_max_age_seconds == 172800
-    assert settings.auto_rotate_context_pressure_tokens == 5400
     assert settings.max_response_tokens == 700
     assert settings.main_turn_budget_seconds == 180.0
     assert settings.agent_loop_max_model_calls == 50
+    assert settings.agent_loop_live_rounds == 8
+    assert settings.memory_recall_budget_seconds == 60.0
+    assert settings.memory_encode_budget_seconds == 60.0
+    assert settings.memory_dream_budget_seconds == 600.0
+    assert settings.memory_dream_interval_seconds == 86400.0
     assert settings.approval_ttl_seconds == 900
     assert settings.approval_actor_id == "user.local"
 
@@ -150,26 +138,22 @@ def test_local_auth_rejects_weak_tokens() -> None:
 
 
 def test_turn_budget_env_overrides_are_loaded(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ARIEL_MEMORY_RECALL_CANDIDATE_LIMIT", "11")
-    monkeypatch.setenv("ARIEL_MAX_CONTEXT_TOKENS", "4321")
     monkeypatch.setenv("ARIEL_AUTO_ROTATE_MAX_TURNS", "77")
     monkeypatch.setenv("ARIEL_AUTO_ROTATE_MAX_AGE_SECONDS", "2222")
-    monkeypatch.setenv("ARIEL_AUTO_ROTATE_CONTEXT_PRESSURE_TOKENS", "3333")
     monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "321")
     monkeypatch.setenv("ARIEL_MAIN_TURN_BUDGET_SECONDS", "300.0")
     monkeypatch.setenv("ARIEL_AGENT_LOOP_MAX_MODEL_CALLS", "100")
+    monkeypatch.setenv("ARIEL_AGENT_LOOP_LIVE_ROUNDS", "4")
     monkeypatch.setenv("ARIEL_APPROVAL_TTL_SECONDS", "1200")
     monkeypatch.setenv("ARIEL_APPROVAL_ACTOR_ID", "user.integration")
 
     settings = AppSettings()
-    assert settings.memory_recall_candidate_limit == 11
-    assert settings.max_context_tokens == 4321
     assert settings.auto_rotate_max_turns == 77
     assert settings.auto_rotate_max_age_seconds == 2222
-    assert settings.auto_rotate_context_pressure_tokens == 3333
     assert settings.max_response_tokens == 321
     assert settings.main_turn_budget_seconds == 300.0
     assert settings.agent_loop_max_model_calls == 100
+    assert settings.agent_loop_live_rounds == 4
     assert settings.approval_ttl_seconds == 1200
     assert settings.approval_actor_id == "user.integration"
 
@@ -178,13 +162,19 @@ def test_memory_runtime_settings_load_from_env(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setenv("ARIEL_MEMORY_EMBEDDING_PROVIDER", "local")
     monkeypatch.setenv("ARIEL_MEMORY_EMBEDDING_MODEL", "fixture-embedding")
     monkeypatch.setenv("ARIEL_MEMORY_EMBEDDING_DIMENSIONS", "1536")
-    monkeypatch.setenv("ARIEL_MEMORY_SWEEP_INTERVAL_SECONDS", "3600")
+    monkeypatch.setenv("ARIEL_MEMORY_RECALL_BUDGET_SECONDS", "30.0")
+    monkeypatch.setenv("ARIEL_MEMORY_ENCODE_BUDGET_SECONDS", "45.0")
+    monkeypatch.setenv("ARIEL_MEMORY_DREAM_BUDGET_SECONDS", "1200.0")
+    monkeypatch.setenv("ARIEL_MEMORY_DREAM_INTERVAL_SECONDS", "3600.0")
 
     settings = AppSettings()
     assert settings.memory_embedding_provider == "local"
     assert settings.memory_embedding_model == "fixture-embedding"
     assert settings.memory_embedding_dimensions == 1536
-    assert settings.memory_sweep_interval_seconds == 3600
+    assert settings.memory_recall_budget_seconds == 30.0
+    assert settings.memory_encode_budget_seconds == 45.0
+    assert settings.memory_dream_budget_seconds == 1200.0
+    assert settings.memory_dream_interval_seconds == 3600.0
 
 
 def test_memory_embedding_dimensions_must_match_schema(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -197,14 +187,16 @@ def test_memory_embedding_dimensions_must_match_schema(monkeypatch: pytest.Monke
 @pytest.mark.parametrize(
     ("env_name", "env_value"),
     [
-        ("ARIEL_MEMORY_RECALL_CANDIDATE_LIMIT", "0"),
-        ("ARIEL_MAX_CONTEXT_TOKENS", "0"),
         ("ARIEL_AUTO_ROTATE_MAX_TURNS", "0"),
         ("ARIEL_AUTO_ROTATE_MAX_AGE_SECONDS", "0"),
-        ("ARIEL_AUTO_ROTATE_CONTEXT_PRESSURE_TOKENS", "0"),
         ("ARIEL_MAX_RESPONSE_TOKENS", "0"),
         ("ARIEL_MAIN_TURN_BUDGET_SECONDS", "0"),
         ("ARIEL_AGENT_LOOP_MAX_MODEL_CALLS", "0"),
+        ("ARIEL_AGENT_LOOP_LIVE_ROUNDS", "0"),
+        ("ARIEL_MEMORY_RECALL_BUDGET_SECONDS", "0"),
+        ("ARIEL_MEMORY_ENCODE_BUDGET_SECONDS", "0"),
+        ("ARIEL_MEMORY_DREAM_BUDGET_SECONDS", "0"),
+        ("ARIEL_MEMORY_DREAM_INTERVAL_SECONDS", "0"),
         ("ARIEL_APPROVAL_TTL_SECONDS", "0"),
     ],
 )
