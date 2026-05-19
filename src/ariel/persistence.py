@@ -54,7 +54,6 @@ class SessionRecord(Base):
         index=True,
     )
     rotation_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    digest: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
@@ -349,7 +348,7 @@ class AIJudgmentRecord(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "judgment_type IN ('memory_recall', 'memory_remember', 'model_output')",
+            ("judgment_type IN ('memory_recall', 'memory_encode', 'memory_dream', 'model_output')"),
             name="ck_ai_judgment_type",
         ),
         CheckConstraint("status IN ('succeeded', 'failed')", name="ck_ai_judgment_status"),
@@ -689,18 +688,63 @@ class AttachmentExtractionRecord(Base):
     )
 
 
-class MemoryFactRecord(Base):
-    __tablename__ = "memory_facts"
+class MemoryLogRecord(Base):
+    __tablename__ = "memory_log"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
-    status: Mapped[str] = mapped_column(String(16), nullable=False)
-    source_turn_id: Mapped[str | None] = mapped_column(
+    embedding: Mapped[list[float] | None] = mapped_column(
+        Vector(MEMORY_EMBEDDING_DIMENSIONS),
+        nullable=True,
+    )
+    search_vector: Mapped[str] = mapped_column(
+        TSVECTOR,
+        Computed("to_tsvector('english', content)", persisted=True),
+        nullable=False,
+    )
+    session_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("sessions.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    turn_id: Mapped[str | None] = mapped_column(
         String(32),
         ForeignKey("turns.id", ondelete="RESTRICT"),
         nullable=True,
     )
-    source_excerpt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    taint: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # The HNSW index over ``embedding`` is migration-only — not in __table_args__.
+    __table_args__ = (
+        CheckConstraint(
+            (
+                "kind IN ('user_message', 'agent_round', 'assistant_message', "
+                "'tool_observation', 'proactive_trigger', 'note_create', 'note_edit', "
+                "'note_delete', 'recall', 'research_finding')"
+            ),
+            name="ck_memory_log_kind",
+        ),
+        CheckConstraint(
+            "taint IN ('clean', 'tainted')",
+            name="ck_memory_log_taint",
+        ),
+        Index(
+            "ix_memory_log_search_vector",
+            "search_vector",
+            postgresql_using="gin",
+        ),
+        Index("ix_memory_log_session_created", "session_id", "created_at"),
+    )
+
+
+class MemoryNoteRecord(Base):
+    __tablename__ = "memory_notes"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
     embedding: Mapped[list[float] | None] = mapped_column(
         Vector(MEMORY_EMBEDDING_DIMENSIONS),
         nullable=True,
@@ -712,32 +756,20 @@ class MemoryFactRecord(Base):
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    last_recalled_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    taint: Mapped[str] = mapped_column(String(32), nullable=False)
 
-    # The HNSW index over ``embedding`` is created by migration 0036, mirroring
-    # MemoryEmbeddingProjectionRecord — pgvector index DDL is migration-only.
+    # The HNSW index over ``embedding`` is migration-only — not in __table_args__.
     __table_args__ = (
         CheckConstraint(
-            "status IN ('active', 'forgotten')",
-            name="ck_memory_fact_status",
+            "taint IN ('clean', 'tainted')",
+            name="ck_memory_notes_taint",
         ),
-        Index("ix_memory_facts_status", "status"),
         Index(
-            "ix_memory_facts_search_vector",
+            "ix_memory_notes_search_vector",
             "search_vector",
             postgresql_using="gin",
         ),
     )
-
-
-class MemoryProfileRecord(Base):
-    __tablename__ = "memory_profile"
-
-    id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    content: Mapped[str] = mapped_column(Text, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class ProjectStateSnapshotRecord(Base):
@@ -1410,8 +1442,8 @@ class BackgroundTaskRecord(Base):
         CheckConstraint(
             (
                 "task_type IN ('agency_event_received', 'expire_approvals', "
-                "'provider_event_received', 'provider_sync_due', 'memory_remember', "
-                "'memory_sweep', 'execute_action_attempt', 'google_object_hydration_due', "
+                "'provider_event_received', 'provider_sync_due', 'memory_encode', "
+                "'memory_dream', 'execute_action_attempt', 'google_object_hydration_due', "
                 "'provider_evidence_extraction_due', 'provider_write_reconcile_due', "
                 "'agent_wake', 'provider_watch_renew_due', 'provider_reconcile_sync_due', "
                 "'user_message', 'research_run')"

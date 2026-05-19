@@ -26,8 +26,8 @@ REQUIRED_TABLES: Final[tuple[str, ...]] = (
     "attachment_blobs",
     "attachment_sources",
     "attachment_extractions",
-    "memory_facts",
-    "memory_profile",
+    "memory_log",
+    "memory_notes",
     "project_state_snapshots",
     "weather_default_locations",
     "google_connectors",
@@ -134,20 +134,26 @@ REQUIRED_COLUMNS: Final[dict[str, tuple[str, ...]]] = {
         "payload_enc",
         "encryption_key_version",
     ),
-    "memory_facts": (
+    "memory_log": (
+        "id",
+        "created_at",
+        "kind",
         "content",
-        "status",
-        "source_turn_id",
-        "source_excerpt",
+        "embedding",
+        "search_vector",
+        "session_id",
+        "turn_id",
+        "taint",
+        "source_ref",
+    ),
+    "memory_notes": (
+        "id",
+        "content",
         "embedding",
         "search_vector",
         "created_at",
         "updated_at",
-        "last_recalled_at",
-    ),
-    "memory_profile": (
-        "content",
-        "updated_at",
+        "taint",
     ),
 }
 
@@ -206,7 +212,11 @@ REQUIRED_CONSTRAINTS: Final[dict[str, tuple[str, ...]]] = {
         "ck_action_private_payload_kind",
         "ck_action_private_payload_digest",
     ),
-    "memory_facts": ("ck_memory_fact_status",),
+    "memory_log": (
+        "ck_memory_log_kind",
+        "ck_memory_log_taint",
+    ),
+    "memory_notes": ("ck_memory_notes_taint",),
 }
 
 REQUIRED_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
@@ -219,7 +229,8 @@ REQUIRED_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
     "ai_judgments": {
         "ck_ai_judgment_type": (
             "'memory_recall'",
-            "'memory_remember'",
+            "'memory_encode'",
+            "'memory_dream'",
             "'model_output'",
         ),
         "ck_ai_judgment_status": ("'succeeded'", "'failed'"),
@@ -285,8 +296,8 @@ REQUIRED_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
             "'provider_write_reconcile_due'",
             "'provider_watch_renew_due'",
             "'provider_reconcile_sync_due'",
-            "'memory_remember'",
-            "'memory_sweep'",
+            "'memory_encode'",
+            "'memory_dream'",
         ),
         "ck_background_task_provider_write_reconcile_shape": (
             "provider_write_reconcile_due",
@@ -294,8 +305,23 @@ REQUIRED_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
         ),
         "ck_background_task_attempts_nonnegative": ("attempts", ">=", "0"),
     },
-    "memory_facts": {
-        "ck_memory_fact_status": ("'active'", "'forgotten'"),
+    "memory_log": {
+        "ck_memory_log_kind": (
+            "'user_message'",
+            "'agent_round'",
+            "'assistant_message'",
+            "'tool_observation'",
+            "'proactive_trigger'",
+            "'note_create'",
+            "'note_edit'",
+            "'note_delete'",
+            "'recall'",
+            "'research_finding'",
+        ),
+        "ck_memory_log_taint": ("taint",),
+    },
+    "memory_notes": {
+        "ck_memory_notes_taint": ("taint",),
     },
 }
 
@@ -309,6 +335,7 @@ FORBIDDEN_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
             "'proactive_deliberation'",
             "'workspace_commitment_extraction'",
             "'leave_by_evaluation'",
+            "'memory_remember'",
         ),
     },
 }
@@ -358,6 +385,15 @@ REQUIRED_INDEXES: Final[dict[str, tuple[str, ...]]] = {
         "ix_provider_write_receipts_undo_token_hash",
     ),
     "action_private_payloads": ("ix_action_private_payloads_action_attempt_id",),
+    "memory_log": (
+        "ix_memory_log_search_vector",
+        "ix_memory_log_session_created",
+        "ix_memory_log_embedding_hnsw",
+    ),
+    "memory_notes": (
+        "ix_memory_notes_search_vector",
+        "ix_memory_notes_embedding_hnsw",
+    ),
 }
 
 REQUIRED_UNIQUE_INDEXES: Final[dict[str, tuple[str, ...]]] = {
