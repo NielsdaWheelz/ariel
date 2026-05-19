@@ -32,8 +32,12 @@ _AGENT_EMIT_VALUE = "agent.emit_value"
 _AGENT_PAUSE_UNTIL_INPUT = "agent.pause_until_input"
 _AGENT_SYSCALL_NAMES = (_AGENT_EMIT_MESSAGE, _AGENT_EMIT_VALUE, _AGENT_PAUSE_UNTIL_INPUT)
 
-# Research-run terminal output syscall — eligible only in a research run.
-_RESEARCH_FINDING = "research.finding"
+# Non-main-loop terminal output syscalls — eligible only when is_research_run=True
+# (which means "non-main loop" in P4: retriever, researcher, and rememberer).
+# agent.emit_finding exits a finding/investigation run; agent.emit_done exits a
+# rememberer/operations run. System prompts steer each loop to use the right one.
+_AGENT_EMIT_FINDING = "agent.emit_finding"
+_AGENT_EMIT_DONE = "agent.emit_done"
 
 # Host-side per-turn scratch store syscalls — always eligible, not capabilities.
 _SCRATCH_SET = "scratch.set"
@@ -47,7 +51,7 @@ _SCRATCH_MAX_TOTAL_BYTES = 4 * 1024 * 1024  # 4 MiB total
 
 _MAX_EMITTED_VALUES = 10
 _MAX_EMITTED_VALUE_BYTES = 12000
-_MAX_RESEARCH_FINDING_BYTES = 64000
+_MAX_EMITTED_FINDING_BYTES = 64000
 
 
 @dataclass(slots=True, frozen=True)
@@ -84,13 +88,19 @@ class RunProgramResult:
     even if a later syscall raised.
 
     ``emitted_finding`` is set only when the program was run with
-    ``is_research_run=True`` and the program called ``research.finding``; it is
+    ``is_research_run=True`` and the program called ``agent.emit_finding``; it is
     ``None`` in main-agent runs and on ``program_ok=False``.
+
+    ``emitted_done`` is set only when the program was run with
+    ``is_research_run=True`` and the program called ``agent.emit_done``; it is
+    ``None`` in main-agent runs and on ``program_ok=False``.  When set, the value
+    is the summary string the model passed (possibly empty string).
     """
 
     emitted_message: str
     emitted_values: list[Any]
     emitted_finding: dict[str, Any] | None
+    emitted_done: str | None
     paused: bool
     action_attempts: list[ActionAttemptRecord]
     program_ok: bool
@@ -165,13 +175,16 @@ def _eligible_syscall_names(
     of every allowed capability id. A capability with no run-callable alias is
     dropped: it cannot be named in a program.
 
-    ``research.finding`` is added only when ``is_research_run=True``; it must
-    never appear in a main-agent turn's eligible set.
+    ``agent.emit_finding`` and ``agent.emit_done`` are added only when
+    ``is_research_run=True`` (i.e. any non-main loop: retriever, researcher,
+    rememberer). The system prompt for each configuration steers the model to
+    call the correct one; the flag controls eligibility.
     """
 
     names: set[str] = set(_AGENT_SYSCALL_NAMES) | set(_SCRATCH_SYSCALL_NAMES)
     if is_research_run:
-        names.add(_RESEARCH_FINDING)
+        names.add(_AGENT_EMIT_FINDING)
+        names.add(_AGENT_EMIT_DONE)
     for capability_id in allowed_capability_ids:
         run_callable_name = run_callable_name_for_capability_id(capability_id)
         if run_callable_name is not None:
@@ -258,6 +271,7 @@ def execute_run_program(
     emitted_message = ""
     emitted_values: list[Any] = []
     emitted_finding: dict[str, Any] | None = None
+    emitted_done: str | None = None
     paused = False
     callback_errors: list[str] = []
     # Boxed so the callback closure can advance taint between syscalls.
@@ -271,7 +285,7 @@ def execute_run_program(
     call_index = 0
 
     def syscall_callback(name: str, syscall_input: dict[str, Any]) -> tuple[bool, Any]:
-        nonlocal emitted_message, emitted_values, emitted_finding, paused, call_index
+        nonlocal emitted_message, emitted_values, emitted_finding, emitted_done, paused, call_index
 
         if name == _AGENT_EMIT_MESSAGE:
             text = syscall_input.get("text")
@@ -361,11 +375,9 @@ def execute_run_program(
                 program_taint_evidence.extend(entry.provenance.evidence)
             return True, entry.value
 
-        if name == _RESEARCH_FINDING:
-            # research.finding is the research run's terminal output. It is only
-            # eligible (present in syscall_names) when is_research_run=True; if
-            # somehow reached in a main-agent run it falls through to the
-            # unknown-callable path below.
+        if name == _AGENT_EMIT_FINDING:
+            # agent.emit_finding is the investigation run's terminal output. Only
+            # eligible (present in syscall_names) when is_research_run=True.
             summary = syscall_input.get("summary")
             claims = syscall_input.get("claims")
             gaps = syscall_input.get("gaps")
@@ -377,17 +389,30 @@ def execute_run_program(
                 or not isinstance(gaps, list)
                 or not isinstance(sources, list)
             ):
-                callback_errors.append("research_finding_schema_invalid")
-                return False, "research_finding_schema_invalid"
+                callback_errors.append("agent_emit_finding_schema_invalid")
+                return False, "agent_emit_finding_schema_invalid"
             try:
                 encoded = json.dumps(syscall_input, sort_keys=True)
             except TypeError:
-                callback_errors.append("research_finding_schema_invalid")
-                return False, "research_finding_schema_invalid"
-            if len(encoded.encode("utf-8")) > _MAX_RESEARCH_FINDING_BYTES:
-                callback_errors.append("research_finding_too_large")
-                return False, "research_finding_too_large"
+                callback_errors.append("agent_emit_finding_schema_invalid")
+                return False, "agent_emit_finding_schema_invalid"
+            if len(encoded.encode("utf-8")) > _MAX_EMITTED_FINDING_BYTES:
+                callback_errors.append("agent_emit_finding_too_large")
+                return False, "agent_emit_finding_too_large"
             emitted_finding = syscall_input
+            return True, None
+
+        if name == _AGENT_EMIT_DONE:
+            # agent.emit_done is the rememberer's terminal output. Only eligible
+            # (present in syscall_names) when is_research_run=True.
+            if set(syscall_input.keys()) - {"summary"}:
+                callback_errors.append("agent_emit_done_schema_invalid")
+                return False, "agent_emit_done_schema_invalid"
+            summary_val = syscall_input.get("summary", "")
+            if not isinstance(summary_val, str):
+                callback_errors.append("agent_emit_done_schema_invalid")
+                return False, "agent_emit_done_schema_invalid"
+            emitted_done = summary_val
             return True, None
 
         capability_id = capability_id_for_run_callable(name)
@@ -468,6 +493,7 @@ def execute_run_program(
             emitted_message="",
             emitted_values=[],
             emitted_finding=None,
+            emitted_done=None,
             paused=False,
             action_attempts=ctx.created_action_attempts,
             program_ok=False,
@@ -480,6 +506,7 @@ def execute_run_program(
         emitted_message=emitted_message,
         emitted_values=emitted_values,
         emitted_finding=emitted_finding,
+        emitted_done=emitted_done,
         paused=paused,
         action_attempts=ctx.created_action_attempts,
         program_ok=True,

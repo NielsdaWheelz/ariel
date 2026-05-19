@@ -1,153 +1,129 @@
-"""Ariel's memory subsystem: a flat fact store and two AI-maintained documents.
+"""Ariel's memory substrate — a two-layer append-only raw log plus an editable
+curated note layer, with agentic retrieval and encoding/dreaming.
 
-Memory has three parts, all authored by AI:
+Three functions drive the substrate, all of them ``run_agent_loop`` in a
+different configuration:
 
-- the **fact store** -- durable plain-language facts, one flat ``memory_facts``
-  table with no categories;
-- the **profile** -- one always-loaded ``memory_profile`` document: who the user
-  is, how they work, the standing context, and privacy guardrails;
-- the **session digest** -- the working state of one conversation, held on
-  ``sessions.digest``.
+- ``run_retriever`` — fires every wake; reconstructs the working context
+  agentically by searching and reading the substrate, then returns a
+  ``recall_v1`` finding.
+- ``run_rememberer`` — writes the curated layer on ``encode`` (agent-invoked)
+  or ``dream`` (scheduled) triggers; never the raw log.
+- The raw log is written only by ``append_log_event`` (a rail); the curated
+  layer only by ``create_note`` / ``edit_note`` / ``delete_note`` (rails that
+  also append ``note_*`` events to the log).
 
-Two bounded AI subagents own every memory judgment. The **retriever**
-(:func:`run_retriever`) decides which facts matter for a wake; the
-**rememberer** (:func:`run_rememberer`) decides what to write to the store and
-keeps the profile and digest current. Each is one stateless, audited
-``httpx`` call to the OpenAI Responses API, shaped exactly like every other
-bounded AI call in the codebase.
-
-Deterministic code here does five things, all rails: it stores facts and the
-two documents, it gathers candidate facts (:func:`gather_candidates`), it
-renders the profile and recalled facts into turn context, it runs the
-subagents, and it writes one ``ai_judgments`` row per subagent call. It makes
-no relevance, importance, categorization, conflict, ranking, or
-"worth remembering" decision, and it summarizes nothing.
+Deterministic code here does exactly five things, all rails: durable substrate
+storage, embedding computation, hybrid search, loop configuration, and
+background-task enqueueing.  It makes no relevance, importance, ranking, or
+"worth remembering" judgment and summarises nothing.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
-from datetime import datetime, timedelta
 import json
-from typing import Any, Literal
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
-from sqlalchemy import delete, func, select
+import ulid
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from .ai_judgments import AIJudgmentFailure, record_ai_judgment
 from .config import AppSettings
 from .persistence import (
     BackgroundTaskRecord,
-    MemoryFactRecord,
-    MemoryProfileRecord,
-    SessionRecord,
+    MemoryLogRecord,
+    MemoryNoteRecord,
     TurnRecord,
     enqueue_background_task,
+    to_rfc3339,
 )
-from .redaction import redact_text
+from .run_runtime import run_tool_definitions
+
+if TYPE_CHECKING:
+    from .agency_daemon import AgencyRuntime
+    from .app import ModelAdapter
+    from .attachment_content import AttachmentContentRuntime
+    from .google_connector import GoogleConnectorRuntime
+    from .sandbox_runtime import SandboxRuntime
+
+from .agent_loop import LoopConfig, LoopResult, run_agent_loop
+from .response_contracts import validate_memory_recall_v1
 
 
 # ---------------------------------------------------------------------------
-# Prompt versions
-#
-# Each subagent's prompt is a first-class, versioned artifact. The version
-# constant is embedded in the user-message JSON of every call: it audits which
-# prompt produced a judgment, and a caller (or a test fake) can branch on it to
-# tell a retriever call from a rememberer call without parsing prose.
+# Prompt-version constants
 # ---------------------------------------------------------------------------
+
 RETRIEVER_PROMPT_VERSION = "memory-retriever-v1"
-REMEMBERER_PROMPT_VERSION = "memory-rememberer-v1"
+REMEMBERER_ENCODE_PROMPT_VERSION = "memory-rememberer-encode-v1"
+REMEMBERER_DREAM_PROMPT_VERSION = "memory-rememberer-dream-v1"
 
-# How long a row may sit ``forgotten`` before the sweep hard-deletes it.
-_FORGOTTEN_RETENTION = timedelta(days=30)
 
-# A short evidence snippet stored on a fact's ``source_excerpt`` is capped here.
-_EXCERPT_MAX_CHARS = 700
+# ---------------------------------------------------------------------------
+# System prompts
+# ---------------------------------------------------------------------------
 
 _RETRIEVER_PROMPT = (
-    "You are Ariel's memory retriever. You are given the current wake context "
-    "(a user message or a proactive case summary) and a candidate set of stored "
-    "facts, each with an id and plain-language content. The candidates are an "
-    "unranked union of vector, keyword, and recency matches -- their order is "
-    "transport, not relevance. Decide which facts genuinely matter for this "
-    "wake and would help Ariel respond well. Be selective: surface a fact only "
-    "when it is actually pertinent, and omit the rest. Return JSON only, with a "
-    'single key "facts" -- an array of the ids of the facts that matter now. '
-    "Return an empty array when none of the candidates are relevant. Never "
-    "invent an id; every id you return must be one of the candidates."
+    "You are Ariel's memory retriever. Your job is to reconstruct the working "
+    "context for the current wake by agentically searching the memory substrate. "
+    "You may call memory.search(query, limit, since, kinds) to search both the "
+    "raw log and the curated notes, and memory.read(id) to fetch the full content "
+    "of any row by id. Search broadly, read what looks relevant, and follow up "
+    "across multiple rounds if the first results lead to more useful entries. "
+    "When satisfied — or when you have covered both relevance-based recall and "
+    "recent-session continuity — call agent.emit_finding with: "
+    '{"summary": "<the reconstructed working context in plain language>", '
+    '"items": [{"id": ..., "layer": ..., "created_at": ..., "content": ..., '
+    '"taint": ...}, ...], "status": "complete"}. '
+    "If you exhaust your budget before finishing, the loop ends with status "
+    '"partial" automatically. The retriever fires on every wake — cover both '
+    "semantic relevance and recent session continuity so the main agent can act "
+    "without missing recent history. Do not invent ids; every id in items must "
+    "be a real id returned by a memory.search or memory.read call."
 )
 
-_REMEMBERER_PROMPT = (
-    "You are Ariel's memory rememberer. You maintain three things: the flat "
-    "fact store, the always-loaded user profile, and the current session "
-    "digest.\n\n"
-    "You are given the current profile, the current session digest, a set of "
-    "existing facts (each with an id and content) so you can edit instead of "
-    "duplicate, and the material to review -- a completed conversation, an "
-    "on-demand note, or the fact store itself for a periodic sweep.\n\n"
-    "Honor the profile's privacy guardrails absolutely: if the profile says "
-    "never to remember something, do not store it.\n\n"
-    "Decide what should change and return JSON only with three keys:\n"
-    '- "operations": an array of fact operations. Each is one of '
-    '{"op": "write", "content": "<the new fact, in rich plain language>"}, '
-    '{"op": "edit", "fact_id": "<id of an existing fact>", '
-    '"content": "<the corrected fact>"}, or '
-    '{"op": "forget", "fact_id": "<id of an existing fact>"}. Write a fact '
-    "when the material contains durable knowledge worth keeping -- a "
-    "preference, a decision, a relationship, a stable piece of context. Edit a "
-    "fact when it is now partly wrong or out of date. Forget a fact when it is "
-    "wrong, stale, or superseded. Facts are flat plain-language statements: do "
-    "not categorize or tag them.\n"
-    '- "profile": the full rewritten profile document, or null to leave it '
-    "unchanged. Rewrite the profile when something durable about the user "
-    "changed. Keep it tight: synthesize, merge, and drop -- it is loaded into "
-    "every turn.\n"
-    '- "digest": the full rewritten session digest, or null to leave it '
-    "unchanged. The digest is the working state of the current conversation -- "
-    "the thread of discussion, what has been tried, open questions, where "
-    "things stand. Keep it no longer than is useful.\n\n"
-    "Return an empty operations array and null profile and digest when nothing "
-    "should change."
+_REMEMBERER_ENCODE_PROMPT = (
+    "You are Ariel's memory encoder. The user message will include "
+    '{"trigger": "encode", "note": "<what to remember>", ...}. '
+    "Your job is to write this to the curated note layer, editing rather than "
+    "duplicating when a related note already exists. "
+    "First call memory.search (with kinds omitted to search the curated layer) "
+    "to find relevant existing notes. Read candidates with memory.read(id) to "
+    "inspect their content. Then apply memory.note.create(content), "
+    "memory.note.edit(id, content), and/or memory.note.delete(id) as needed — "
+    "edit a note when the new material updates or extends it; delete a note "
+    "only when it is fully superseded. When done, call agent.emit_done with a "
+    "short string describing what you did (e.g. 'edited note mno_... to add "
+    "preference for dark mode'). The raw log is append-only and must never be "
+    "the target of note operations."
+)
+
+_REMEMBERER_DREAM_PROMPT = (
+    "You are Ariel's memory dreamer. The user message will include "
+    '{"trigger": "dream"}. '
+    "Your job is to consolidate the recent raw log into the curated note layer: "
+    "generalizations, summaries, connections, topic abstractions. "
+    "Read recent log events with memory.search (over the log; use the since "
+    "parameter to scope to recent time). Also search the curated layer for "
+    "existing notes to edit or delete rather than duplicate. Write new notes "
+    "with memory.note.create(content), update existing ones with "
+    "memory.note.edit(id, content), and delete superseded ones with "
+    "memory.note.delete(id). The raw log is append-only — only memory_notes "
+    "is mutable; never use note operations with a log id. When satisfied, call "
+    "agent.emit_done with a short summary of what you consolidated."
 )
 
 
 # ---------------------------------------------------------------------------
-# Validated subagent outputs
-#
-# Pure dataclasses. The model returns raw JSON; a ``_validated_*`` function
-# narrows it into one of these or raises ``AIJudgmentFailure``. Downstream code
-# only ever sees the narrowed type.
+# Embedding
 # ---------------------------------------------------------------------------
-@dataclass(frozen=True)
-class FactOperation:
-    """One rememberer fact-store mutation. ``content`` is set for write/edit and
-    empty for forget; ``fact_id`` is set for edit/forget and empty for write."""
-
-    op: Literal["write", "edit", "forget"]
-    content: str
-    fact_id: str
 
 
-@dataclass(frozen=True)
-class RemembererOutput:
-    """The validated rememberer judgment: fact operations plus optional full
-    rewrites of the profile and the session digest. ``None`` means leave that
-    document unchanged; a string replaces it wholesale."""
-
-    operations: tuple[FactOperation, ...]
-    profile: str | None
-    digest: str | None
-
-
-# ---------------------------------------------------------------------------
-# The embedding call
-# ---------------------------------------------------------------------------
 def embed_text(text: str, *, settings: AppSettings) -> list[float]:
-    """Embed ``text`` with the configured OpenAI embedding model. Used to give
-    a written or edited fact its ``embedding`` vector, and to embed a retriever
-    query for vector candidate gathering."""
+    """Embed ``text`` with the configured OpenAI embedding model."""
     if settings.memory_embedding_provider != "openai":
         raise RuntimeError(
             f"unsupported memory embedding provider: {settings.memory_embedding_provider}"
@@ -193,761 +169,642 @@ def embed_text(text: str, *, settings: AppSettings) -> list[float]:
 
 
 # ---------------------------------------------------------------------------
-# Fact-store and profile reads/writes
+# Substrate rails — raw log
 # ---------------------------------------------------------------------------
-def read_profile(db: Session) -> str:
-    """Return the singleton profile document's content. The migration seeds one
-    ``memory_profile`` row, so the profile always exists."""
-    profile = db.scalars(select(MemoryProfileRecord).limit(1)).first()
-    if profile is None:
-        raise RuntimeError("memory_profile is empty: the seed row is missing")
-    return profile.content
+
+_LogKind = Literal[
+    "user_message",
+    "agent_round",
+    "assistant_message",
+    "tool_observation",
+    "proactive_trigger",
+    "note_create",
+    "note_edit",
+    "note_delete",
+    "recall",
+    "research_finding",
+]
 
 
-def write_profile(db: Session, *, content: str, now: datetime) -> None:
-    """Replace the singleton profile document with ``content``."""
-    profile = db.scalars(select(MemoryProfileRecord).limit(1)).first()
-    if profile is None:
-        raise RuntimeError("memory_profile is empty: the seed row is missing")
-    profile.content = content
-    profile.updated_at = now
+def append_log_event(
+    db: Session,
+    *,
+    kind: _LogKind,
+    content: str,
+    session_id: str | None,
+    turn_id: str | None,
+    taint: Literal["clean", "tainted"],
+    source_ref: str | None,
+    settings: AppSettings,
+    now: datetime,
+    new_id_fn: Callable[[str], str],
+) -> MemoryLogRecord:
+    """Append one event to the raw log inside the caller's transaction.
+
+    Computes the embedding via ``embed_text``; on ``RuntimeError`` (network
+    failure) inserts with ``embedding=None`` (null = pending, to be backfilled).
+    """
+    try:
+        embedding: list[float] | None = embed_text(content, settings=settings)
+    except RuntimeError:
+        embedding = None
+
+    record = MemoryLogRecord(
+        id=new_id_fn("mev"),
+        created_at=now,
+        kind=kind,
+        content=content,
+        embedding=embedding,
+        session_id=session_id,
+        turn_id=turn_id,
+        taint=taint,
+        source_ref=source_ref,
+    )
+    db.add(record)
+    db.flush()
+    return record
 
 
-def list_active_facts(db: Session, *, limit: int) -> list[MemoryFactRecord]:
-    """The most-recently-updated active facts. Used by the sweep, which reviews
-    the store rather than a conversation."""
-    return list(
-        db.scalars(
-            select(MemoryFactRecord)
-            .where(MemoryFactRecord.status == "active")
-            .order_by(MemoryFactRecord.updated_at.desc(), MemoryFactRecord.id.asc())
-            .limit(limit)
-        ).all()
+def read_log_entry(db: Session, log_id: str) -> MemoryLogRecord | None:
+    """Return the log row for ``log_id``, or ``None`` if not found."""
+    return db.scalar(select(MemoryLogRecord).where(MemoryLogRecord.id == log_id))
+
+
+# ---------------------------------------------------------------------------
+# Substrate rails — curated notes
+# ---------------------------------------------------------------------------
+
+
+def read_note(db: Session, note_id: str) -> MemoryNoteRecord | None:
+    """Return the note row for ``note_id``, or ``None`` if not found."""
+    return db.scalar(select(MemoryNoteRecord).where(MemoryNoteRecord.id == note_id))
+
+
+def create_note(
+    db: Session,
+    *,
+    content: str,
+    taint: Literal["clean", "tainted"],
+    settings: AppSettings,
+    now: datetime,
+    new_id_fn: Callable[[str], str],
+) -> MemoryNoteRecord:
+    """Insert a new curated note and append a ``note_create`` log event."""
+    try:
+        embedding: list[float] | None = embed_text(content, settings=settings)
+    except RuntimeError:
+        embedding = None
+
+    note = MemoryNoteRecord(
+        id=new_id_fn("mno"),
+        content=content,
+        embedding=embedding,
+        taint=taint,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(note)
+    db.flush()
+
+    append_log_event(
+        db,
+        kind="note_create",
+        content=content,
+        session_id=None,
+        turn_id=None,
+        taint=taint,
+        source_ref=note.id,
+        settings=settings,
+        now=now,
+        new_id_fn=new_id_fn,
+    )
+    return note
+
+
+def edit_note(
+    db: Session,
+    *,
+    note_id: str,
+    content: str,
+    settings: AppSettings,
+    now: datetime,
+    new_id_fn: Callable[[str], str],
+) -> MemoryNoteRecord:
+    """Rewrite a note's content in place and append a ``note_edit`` log event."""
+    note = db.scalar(select(MemoryNoteRecord).where(MemoryNoteRecord.id == note_id))
+    if note is None:
+        raise RuntimeError(f"edit_note: note {note_id!r} does not exist")
+
+    try:
+        embedding: list[float] | None = embed_text(content, settings=settings)
+    except RuntimeError:
+        embedding = None
+
+    note.content = content
+    note.embedding = embedding
+    note.updated_at = now
+    db.flush()
+
+    append_log_event(
+        db,
+        kind="note_edit",
+        content=content,
+        session_id=None,
+        turn_id=None,
+        taint=note.taint,
+        source_ref=note.id,
+        settings=settings,
+        now=now,
+        new_id_fn=new_id_fn,
+    )
+    return note
+
+
+def delete_note(
+    db: Session,
+    *,
+    note_id: str,
+    settings: AppSettings,
+    now: datetime,
+    new_id_fn: Callable[[str], str],
+) -> None:
+    """Delete a curated note and append a ``note_delete`` log event."""
+    note = db.scalar(select(MemoryNoteRecord).where(MemoryNoteRecord.id == note_id))
+    if note is None:
+        raise RuntimeError(f"delete_note: note {note_id!r} does not exist")
+
+    taint = note.taint
+    db.delete(note)
+    db.flush()
+
+    append_log_event(
+        db,
+        kind="note_delete",
+        content=note_id,
+        session_id=None,
+        turn_id=None,
+        taint=taint,
+        source_ref=note_id,
+        settings=settings,
+        now=now,
+        new_id_fn=new_id_fn,
     )
 
 
-def gather_candidates(
+# ---------------------------------------------------------------------------
+# Hybrid search
+# ---------------------------------------------------------------------------
+
+
+def search_memory(
     db: Session,
     *,
     query: str,
     settings: AppSettings,
-    limit: int,
-) -> list[MemoryFactRecord]:
-    """The candidate gather: a generous, unranked union of vector-similarity
-    matches over ``embedding``, keyword matches over ``search_vector``, and the
-    most recent active facts.
+    limit: int = 24,
+    since: datetime | None = None,
+    kinds: tuple[str, ...] | None = None,
+    layers: tuple[Literal["log", "note"], ...] = ("log", "note"),
+) -> list[dict[str, Any]]:
+    """Hybrid search across ``memory_log`` and ``memory_notes``.
 
-    This is a rail, not a ranking. There is no similarity threshold and no
-    fusion -- the retriever and the rememberer are meant to see many facts,
-    including low-similarity ones, and judge for themselves. Vector and keyword
-    only keep the candidate set bounded as the store grows; at prototype scale
-    the union is effectively most of the store. Forgotten facts are excluded.
+    Computes the query embedding once; for each requested layer runs a keyword
+    tsquery match against ``search_vector`` and a vector cosine-distance match
+    against ``embedding`` (skipped when no rows have embeddings yet). Unions
+    the results, deduplicates by id, applies ``since``/``kinds`` filters on the
+    log layer, and returns up to ``limit`` hits ordered by ``created_at DESC``
+    (transport order — the model ranks, code does not).
+
+    Returns ``[{"id", "layer", "kind", "created_at", "snippet", "taint"}, ...]``.
+    ``"kind"`` is ``None`` for note-layer hits.
     """
-    facts: dict[str, MemoryFactRecord] = {}
+    try:
+        query_embedding: list[float] | None = embed_text(query, settings=settings)
+    except RuntimeError:
+        query_embedding = None
 
-    # Keyword: full-text match over the generated search_vector.
-    tsquery = func.websearch_to_tsquery("english", query)
-    for fact in db.scalars(
-        select(MemoryFactRecord)
-        .where(
-            MemoryFactRecord.status == "active",
-            MemoryFactRecord.search_vector.op("@@")(tsquery),
-        )
-        .order_by(
-            func.ts_rank_cd(MemoryFactRecord.search_vector, tsquery).desc(),
-            MemoryFactRecord.id.asc(),
-        )
-        .limit(limit)
-    ).all():
-        facts[fact.id] = fact
+    hits: dict[str, dict[str, Any]] = {}
 
-    # Vector: cosine-nearest active facts to the query embedding. Skipped when
-    # no fact carries an embedding yet, which keeps a cold store from making a
-    # needless embedding call.
-    embedded_exists = db.scalar(
-        select(MemoryFactRecord.id)
-        .where(
-            MemoryFactRecord.status == "active",
-            MemoryFactRecord.embedding.is_not(None),
+    if "log" in layers:
+        tsquery = func.websearch_to_tsquery("english", query)
+        stmt = select(MemoryLogRecord).where(MemoryLogRecord.search_vector.op("@@")(tsquery))
+        if since is not None:
+            stmt = stmt.where(MemoryLogRecord.created_at >= since)
+        if kinds is not None:
+            stmt = stmt.where(MemoryLogRecord.kind.in_(kinds))
+        for row in db.scalars(stmt.order_by(MemoryLogRecord.created_at.desc()).limit(limit)).all():
+            hits[row.id] = {
+                "id": row.id,
+                "layer": "log",
+                "kind": row.kind,
+                "created_at": to_rfc3339(row.created_at),
+                "snippet": row.content[:200],
+                "taint": row.taint,
+            }
+
+        has_log_embeddings = db.scalar(
+            select(MemoryLogRecord.id).where(MemoryLogRecord.embedding.is_not(None)).limit(1)
         )
-        .limit(1)
-    )
-    if embedded_exists is not None and query.strip():
-        distance = MemoryFactRecord.embedding.cosine_distance(embed_text(query, settings=settings))
-        for fact in db.scalars(
-            select(MemoryFactRecord)
-            .where(
-                MemoryFactRecord.status == "active",
-                MemoryFactRecord.embedding.is_not(None),
-            )
-            .order_by(distance.asc(), MemoryFactRecord.id.asc())
-            .limit(limit)
+        if query_embedding is not None and has_log_embeddings is not None:
+            vec_stmt = select(MemoryLogRecord).where(MemoryLogRecord.embedding.is_not(None))
+            if since is not None:
+                vec_stmt = vec_stmt.where(MemoryLogRecord.created_at >= since)
+            if kinds is not None:
+                vec_stmt = vec_stmt.where(MemoryLogRecord.kind.in_(kinds))
+            distance = MemoryLogRecord.embedding.cosine_distance(query_embedding)
+            for row in db.scalars(vec_stmt.order_by(distance.asc()).limit(limit)).all():
+                if row.id not in hits:
+                    hits[row.id] = {
+                        "id": row.id,
+                        "layer": "log",
+                        "kind": row.kind,
+                        "created_at": to_rfc3339(row.created_at),
+                        "snippet": row.content[:200],
+                        "taint": row.taint,
+                    }
+
+    if "note" in layers:
+        tsquery = func.websearch_to_tsquery("english", query)
+        note_stmt = select(MemoryNoteRecord).where(MemoryNoteRecord.search_vector.op("@@")(tsquery))
+        for row in db.scalars(
+            note_stmt.order_by(MemoryNoteRecord.created_at.desc()).limit(limit)
         ).all():
-            facts[fact.id] = fact
+            hits[row.id] = {
+                "id": row.id,
+                "layer": "note",
+                "kind": None,
+                "created_at": to_rfc3339(row.created_at),
+                "snippet": row.content[:200],
+                "taint": row.taint,
+            }
 
-    # Recency: the most-recently-updated active facts, so a brand-new fact with
-    # no embedding and no keyword overlap is still a candidate.
-    for fact in db.scalars(
-        select(MemoryFactRecord)
-        .where(MemoryFactRecord.status == "active")
-        .order_by(MemoryFactRecord.updated_at.desc(), MemoryFactRecord.id.asc())
-        .limit(limit)
-    ).all():
-        facts[fact.id] = fact
-
-    return sorted(facts.values(), key=lambda fact: fact.updated_at, reverse=True)
-
-
-# ---------------------------------------------------------------------------
-# Context rendering
-# ---------------------------------------------------------------------------
-def render_profile(profile: str) -> str:
-    """Render the profile document as a ``system`` message body for a turn or a
-    proactive deliberation. Returns an empty string for an empty profile so the
-    caller can skip the section."""
-    content = profile.strip()
-    if not content:
-        return ""
-    return "user profile (durable knowledge about the user):\n" + content
-
-
-def render_recalled_facts(facts: Sequence[MemoryFactRecord]) -> str:
-    """Render the facts the retriever surfaced as a ``recalled memory``
-    ``system`` message body, separate from the profile and the digest. Returns
-    an empty string when nothing was recalled."""
-    if not facts:
-        return ""
-    lines = ["recalled memory (facts relevant to this turn):"]
-    lines.extend(f"- {fact.content}" for fact in facts)
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# The Responses API call
-# ---------------------------------------------------------------------------
-def _extract_output_text(output_items: Any) -> str:
-    """Concatenate the ``output_text`` parts of an OpenAI Responses payload."""
-    if not isinstance(output_items, list):
-        return ""
-    parts: list[str] = []
-    for item in output_items:
-        if not isinstance(item, dict) or item.get("type") != "message":
-            continue
-        content = item.get("content")
-        if not isinstance(content, list):
-            continue
-        for content_item in content:
-            if isinstance(content_item, dict) and content_item.get("type") == "output_text":
-                text = content_item.get("text")
-                if isinstance(text, str):
-                    parts.append(text)
-    return "".join(parts).strip()
-
-
-def _call_subagent(
-    *,
-    system_prompt: str,
-    user_payload: dict[str, Any],
-    settings: AppSettings,
-) -> tuple[Any, str | None]:
-    """One bounded model call to the OpenAI Responses API, shared by the
-    retriever and the rememberer. Returns the parsed JSON the model emitted and
-    the provider response id. Every failure -- missing credentials, network,
-    HTTP error, non-JSON -- raises ``AIJudgmentFailure``; the caller turns that
-    into an ``ai_judgments`` row.
-
-    ``store: False`` and ``model = settings.model_name`` match every other
-    bounded AI call. Both subagents run host-side, so this works identically in
-    the API process and the worker process.
-    """
-    if settings.openai_api_key is None:
-        raise AIJudgmentFailure(
-            code="E_AI_JUDGMENT_CREDENTIALS",
-            safe_reason="memory subagent requires ARIEL_OPENAI_API_KEY",
-            retryable=False,
-            parse_status="missing_output",
-            validation_status="not_validated",
+        has_note_embeddings = db.scalar(
+            select(MemoryNoteRecord.id).where(MemoryNoteRecord.embedding.is_not(None)).limit(1)
         )
-    try:
-        response = httpx.post(
-            "https://api.openai.com/v1/responses",
-            headers={
-                "authorization": f"Bearer {settings.openai_api_key}",
-                "content-type": "application/json",
-            },
-            json={
-                "model": settings.model_name,
-                "input": [
-                    {"role": "system", "content": system_prompt},
-                    {
-                        "role": "user",
-                        "content": json.dumps(user_payload, sort_keys=True),
-                    },
-                ],
-                "store": False,
-                "text": {"verbosity": "low"},
-            },
-            timeout=settings.model_timeout_seconds,
-        )
-    except httpx.TimeoutException as exc:
-        raise AIJudgmentFailure(
-            code="E_AI_JUDGMENT_TIMEOUT",
-            safe_reason="memory subagent model timed out",
-            retryable=True,
-            parse_status="missing_output",
-            validation_status="not_validated",
-        ) from exc
-    except httpx.HTTPError as exc:
-        raise AIJudgmentFailure(
-            code="E_AI_JUDGMENT_REQUIRED",
-            safe_reason="memory subagent model network request failed",
-            retryable=True,
-            parse_status="missing_output",
-            validation_status="not_validated",
-        ) from exc
-    if response.status_code >= 400:
-        raise AIJudgmentFailure(
-            code="E_AI_JUDGMENT_REQUIRED",
-            safe_reason=f"memory subagent model returned HTTP {response.status_code}",
-            retryable=True,
-            parse_status="missing_output",
-            validation_status="not_validated",
-        )
-    try:
-        response_payload = response.json()
-    except ValueError as exc:
-        raise AIJudgmentFailure(
-            code="E_AI_JUDGMENT_REQUIRED",
-            safe_reason="memory subagent provider returned invalid JSON",
-            retryable=True,
-            parse_status="missing_output",
-            validation_status="not_validated",
-        ) from exc
-    raw_id = response_payload.get("id") if isinstance(response_payload, dict) else None
-    provider_response_id = raw_id if isinstance(raw_id, str) else None
-    output = response_payload.get("output") if isinstance(response_payload, dict) else None
-    try:
-        return json.loads(_extract_output_text(output)), provider_response_id
-    except json.JSONDecodeError as exc:
-        raise AIJudgmentFailure(
-            code="E_AI_JUDGMENT_INVALID_JSON",
-            safe_reason="memory subagent model returned malformed JSON",
-            retryable=False,
-            parse_status="invalid_json",
-            validation_status="invalid",
-            provider_response_id=provider_response_id,
-        ) from exc
+        if query_embedding is not None and has_note_embeddings is not None:
+            distance = MemoryNoteRecord.embedding.cosine_distance(query_embedding)
+            for row in db.scalars(
+                select(MemoryNoteRecord)
+                .where(MemoryNoteRecord.embedding.is_not(None))
+                .order_by(distance.asc())
+                .limit(limit)
+            ).all():
+                if row.id not in hits:
+                    hits[row.id] = {
+                        "id": row.id,
+                        "layer": "note",
+                        "kind": None,
+                        "created_at": to_rfc3339(row.created_at),
+                        "snippet": row.content[:200],
+                        "taint": row.taint,
+                    }
 
-
-def _schema_failure(reason: str) -> AIJudgmentFailure:
-    """An ``AIJudgmentFailure`` for a malformed subagent JSON shape."""
-    return AIJudgmentFailure(
-        code="E_AI_JUDGMENT_SCHEMA",
-        safe_reason=reason,
-        retryable=False,
-        parse_status="schema_invalid",
-        validation_status="invalid",
-    )
-
-
-def _validation_failure(reason: str) -> AIJudgmentFailure:
-    """An ``AIJudgmentFailure`` for subagent JSON that parsed but is invalid --
-    e.g. a fact id the model invented."""
-    return AIJudgmentFailure(
-        code="E_AI_JUDGMENT_VALIDATION",
-        safe_reason=reason,
-        retryable=False,
-        parse_status="parsed",
-        validation_status="invalid",
-    )
+    return sorted(hits.values(), key=lambda h: h["created_at"], reverse=True)[:limit]
 
 
 # ---------------------------------------------------------------------------
-# The retriever subagent
+# Loop helpers shared by run_retriever / run_rememberer
 # ---------------------------------------------------------------------------
-def _validated_retrieval(raw_payload: Any, *, candidate_ids: set[str]) -> list[str]:
-    """Narrow the retriever's raw JSON into the list of selected fact ids, or
-    fail closed. The contract is ``{"facts": ["<fact_id>", ...]}``; an id the
-    model invented, a duplicate, or any malformed field raises -- no partial
-    parse."""
-    if not isinstance(raw_payload, dict):
-        raise _schema_failure("memory retriever returned a non-object JSON value")
-    facts_raw = raw_payload.get("facts")
-    if not isinstance(facts_raw, list):
-        raise _schema_failure("memory retriever JSON missing a facts array")
-    selected: list[str] = []
-    for item in facts_raw:
-        if not isinstance(item, str) or not item:
-            raise _schema_failure("memory retriever facts entries must be fact ids")
-        if item not in candidate_ids:
-            raise _validation_failure("memory retriever selected an unknown fact id")
-        if item in selected:
-            raise _validation_failure("memory retriever selected a duplicate fact id")
-        selected.append(item)
-    return selected
+
+
+def _new_id(prefix: str) -> str:
+    return f"{prefix}_{ulid.new().str.lower()}"
+
+
+def _utcnow() -> datetime:
+    return datetime.now(tz=UTC)
+
+
+# ---------------------------------------------------------------------------
+# The retriever — run_agent_loop in investigation/memories/lite config
+# ---------------------------------------------------------------------------
 
 
 def run_retriever(
     *,
+    sandbox: SandboxRuntime,
+    db: Session,
     session_factory: sessionmaker[Session],
-    query: str,
-    source_type: str,
-    source_id: str,
+    session_id: str,
+    turn: TurnRecord,
     settings: AppSettings,
+    model_adapter: ModelAdapter,
+    google_runtime: GoogleConnectorRuntime,
+    agency_runtime: AgencyRuntime | None,
+    attachment_runtime: AttachmentContentRuntime | None,
+    query: str,
+    allowed_capability_ids: frozenset[str],
+    approval_ttl_seconds: int,
+    approval_actor_id: str,
+    add_event: Callable[[str, dict[str, Any]], None],
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
-) -> list[MemoryFactRecord]:
-    """Run the retriever subagent: decide which stored facts matter for a wake.
+) -> dict[str, Any]:
+    """Run the retriever and return a ``recall_v1`` dict.
 
-    ``query`` is the wake context (a user message or a proactive case summary).
-    Candidates are gathered deterministically, the model selects the relevant
-    subset, the selection is validated, and the selected facts'
-    ``last_recalled_at`` is stamped. Returns the selected facts, ordered as
-    gathered.
-
-    Every call writes one ``ai_judgments`` row (``judgment_type=memory_recall``)
-    on both success and failure. Retriever failure is non-fatal by contract:
-    this function raises ``AIJudgmentFailure`` on a failed model call after
-    auditing it, and the caller (the turn engine) proceeds on the profile and
-    digest alone.
+    Fires the shared loop in ``investigation``/``memories``/``lite``
+    configuration.  The retriever builds its own input items — context
+    firewall: its rounds never enter the main agent's context.  On any
+    failure (budget, model error, contract violation) returns a minimal
+    partial dict rather than raising; recall failure is non-fatal.
     """
-    with session_factory() as db:
-        with db.begin():
-            candidates = gather_candidates(
-                db,
-                query=query,
-                settings=settings,
-                limit=settings.memory_recall_candidate_limit,
+    eligible_callables = ["memory.search", "memory.read", "agent.emit_finding"]
+    callable_lines = "\n".join(f"- {name}" for name in eligible_callables)
+
+    responses_input_items: list[dict[str, Any]] = [
+        {"role": "system", "content": _RETRIEVER_PROMPT},
+        {
+            "role": "system",
+            "content": json.dumps(
+                {"prompt_version": RETRIEVER_PROMPT_VERSION, "wake_context": query},
+                sort_keys=True,
+            ),
+        },
+        {
+            "role": "system",
+            "content": (
+                "syscall callables available this run "
+                "(call as namespace.member(...); results are returned inline):\n"
             )
-            candidate_payload = [{"id": fact.id, "content": fact.content} for fact in candidates]
-            candidate_ids = {fact.id for fact in candidates}
+            + callable_lines,
+        },
+        {"role": "user", "content": query},
+    ]
 
-    # The bounded model call, then validation -- a failure in either path is
-    # audited as one failed memory_recall row and re-raised.
-    try:
-        raw, provider_response_id = _call_subagent(
-            system_prompt=_RETRIEVER_PROMPT,
-            user_payload={
-                "prompt_version": RETRIEVER_PROMPT_VERSION,
-                "wake_context": redact_text(query),
-                "candidate_facts": candidate_payload,
-            },
-            settings=settings,
-        )
-        try:
-            selected_ids = _validated_retrieval(raw, candidate_ids=candidate_ids)
-        except AIJudgmentFailure as exc:
-            exc.provider_response_id = provider_response_id
-            raise
-    except AIJudgmentFailure as failure:
-        with session_factory() as db:
-            with db.begin():
-                record_ai_judgment(
-                    db,
-                    judgment_type="memory_recall",
-                    prompt_version=RETRIEVER_PROMPT_VERSION,
-                    source_type=source_type,
-                    source_id=source_id,
-                    model=settings.model_name,
-                    input_summary="memory retrieval for a deliberative wake",
-                    input_refs={"candidate_count": len(candidate_payload)},
-                    output={},
-                    provider_response_id=failure.provider_response_id,
-                    now=now_fn(),
-                    new_id=new_id_fn,
-                    failure=failure,
-                )
-        raise
-
-    with session_factory() as db:
-        with db.begin():
-            now = now_fn()
-            selected = list(
-                db.scalars(
-                    select(MemoryFactRecord).where(MemoryFactRecord.id.in_(selected_ids))
-                ).all()
-            )
-            for fact in selected:
-                fact.last_recalled_at = now
-            record_ai_judgment(
-                db,
-                judgment_type="memory_recall",
-                prompt_version=RETRIEVER_PROMPT_VERSION,
-                source_type=source_type,
-                source_id=source_id,
-                model=settings.model_name,
-                input_summary="memory retrieval for a deliberative wake",
-                input_refs={"candidate_count": len(candidate_payload)},
-                output={"recalled_count": len(selected), "fact_ids": list(selected_ids)},
-                provider_response_id=provider_response_id,
-                now=now,
-                new_id=new_id_fn,
-            )
-    # Return the selected facts in gather order: stable and similarity-ranked.
-    by_id = {fact.id: fact for fact in selected}
-    return [by_id[fact_id] for fact_id in selected_ids if fact_id in by_id]
-
-
-# ---------------------------------------------------------------------------
-# The rememberer subagent
-# ---------------------------------------------------------------------------
-def _validated_rememberer_output(raw_payload: Any, *, candidate_ids: set[str]) -> RemembererOutput:
-    """Narrow the rememberer's raw JSON into a :class:`RemembererOutput`, or fail
-    closed.
-
-    The contract is ``{"operations": [...], "profile": <str|null>,
-    "digest": <str|null>}``. Each operation is ``{"op": "write", "content": ...}``,
-    ``{"op": "edit", "fact_id": ..., "content": ...}``, or
-    ``{"op": "forget", "fact_id": ...}``. An edit or forget of an id the model
-    invented, or any malformed field, raises -- there is no partial parse.
-    """
-    if not isinstance(raw_payload, dict):
-        raise _schema_failure("memory rememberer returned a non-object JSON value")
-    operations_raw = raw_payload.get("operations")
-    profile_raw = raw_payload.get("profile")
-    digest_raw = raw_payload.get("digest")
-    if not isinstance(operations_raw, list):
-        raise _schema_failure("memory rememberer JSON missing an operations array")
-    if profile_raw is not None and not isinstance(profile_raw, str):
-        raise _schema_failure("memory rememberer profile must be a string or null")
-    if digest_raw is not None and not isinstance(digest_raw, str):
-        raise _schema_failure("memory rememberer digest must be a string or null")
-
-    operations: list[FactOperation] = []
-    for item in operations_raw:
-        if not isinstance(item, dict):
-            raise _schema_failure("memory rememberer operations entries must be objects")
-        op = item.get("op")
-        if op == "write":
-            content = item.get("content")
-            if not isinstance(content, str) or not content.strip():
-                raise _schema_failure("memory rememberer write operation missing content")
-            operations.append(FactOperation(op="write", content=content.strip(), fact_id=""))
-        elif op == "edit":
-            fact_id = item.get("fact_id")
-            content = item.get("content")
-            if not isinstance(fact_id, str) or not fact_id:
-                raise _schema_failure("memory rememberer edit operation missing fact_id")
-            if not isinstance(content, str) or not content.strip():
-                raise _schema_failure("memory rememberer edit operation missing content")
-            if fact_id not in candidate_ids:
-                raise _validation_failure("memory rememberer edited an unknown fact id")
-            operations.append(FactOperation(op="edit", content=content.strip(), fact_id=fact_id))
-        elif op == "forget":
-            fact_id = item.get("fact_id")
-            if not isinstance(fact_id, str) or not fact_id:
-                raise _schema_failure("memory rememberer forget operation missing fact_id")
-            if fact_id not in candidate_ids:
-                raise _validation_failure("memory rememberer forgot an unknown fact id")
-            operations.append(FactOperation(op="forget", content="", fact_id=fact_id))
-        else:
-            raise _schema_failure("memory rememberer operation has an unknown op")
-
-    return RemembererOutput(
-        operations=tuple(operations),
-        profile=profile_raw,
-        digest=digest_raw,
+    cfg = LoopConfig(
+        output_mode="finding",
+        finding_mode="memory_recall",
+        budget_seconds=float(settings.memory_recall_budget_seconds),
+        max_model_calls=int(settings.agent_loop_max_model_calls),
+        is_research_run=True,
+        record_judgments=True,
+        judgment_type="memory_recall",
+        retry_on_model_error=False,
+        void_failed_program_approvals=False,
+        protocol_nudge=(
+            "memory retriever protocol failure: call exactly one run tool "
+            'with {"source": "..."} where source is a Python program; '
+            "finish by calling agent.emit_finding."
+        ),
+        program_failure_nudge=(
+            "No effects committed. Retry with one run call whose program "
+            "completes cleanly; finish by calling agent.emit_finding."
+        ),
+        action_trace_nudge=("Continue searching; finish by calling agent.emit_finding."),
+        emit_value_nudge=(
+            "Values emitted. Continue with one run call; finish by calling agent.emit_finding."
+        ),
+        fallback_nudge=(
+            "Program completed without a finding. Continue with one run call; "
+            "finish by calling agent.emit_finding."
+        ),
     )
 
+    loop_result: LoopResult = run_agent_loop(
+        cfg,
+        sandbox=sandbox,
+        db=db,
+        session_factory=session_factory,
+        session_id=session_id,
+        turn=turn,
+        settings=settings,
+        model_adapter=model_adapter,
+        responses_input_items=responses_input_items,
+        tools=run_tool_definitions(),
+        user_message=query,
+        history=[],
+        context_bundle={},
+        allowed_capability_ids=allowed_capability_ids,
+        scratch={},
+        proposal_index_start=0,
+        approval_ttl_seconds=approval_ttl_seconds,
+        approval_actor_id=approval_actor_id,
+        add_event=add_event,
+        now_fn=now_fn,
+        new_id_fn=new_id_fn,
+        runtime_provenance=None,
+        google_runtime=google_runtime,
+        execute_google_reads_outside_transaction=False,
+        agency_runtime=agency_runtime,
+        attachment_runtime=attachment_runtime,
+    )
 
-def apply_rememberer_output(
-    db: Session,
-    output: RemembererOutput,
-    *,
-    source_turn_id: str | None,
-    settings: AppSettings,
-    now: datetime,
-    new_id_fn: Callable[[str], str],
-) -> list[str]:
-    """Apply a validated rememberer judgment to the fact store inside the
-    caller's transaction. A ``write`` inserts an ``active`` fact; an ``edit``
-    rewrites a fact's content; a ``forget`` sets ``status=forgotten``. The
-    embedding of each written or edited fact is computed via :func:`embed_text`.
+    if loop_result.emitted_finding is not None:
+        raw = loop_result.emitted_finding
+        payload = {
+            "summary": raw.summary,
+            "items": raw.claims,  # finding carries items in claims for recall_v1
+            "status": raw.status,
+        }
+        try:
+            return validate_memory_recall_v1(payload)
+        except Exception:
+            pass
 
-    The profile and digest are not applied here: ``run_rememberer`` writes the
-    profile, and the digest is returned to the caller (the turn engine writes it
-    onto the session). Returns the ids of facts written or edited, for the audit
-    row. Applying operations is a rail; deciding them is the subagent's
-    judgment.
-    """
-    touched: list[str] = []
-    for operation in output.operations:
-        match operation.op:
-            case "write":
-                written = MemoryFactRecord(
-                    id=new_id_fn("mfa"),
-                    content=operation.content,
-                    status="active",
-                    source_turn_id=source_turn_id,
-                    source_excerpt=None,
-                    embedding=embed_text(operation.content, settings=settings),
-                    created_at=now,
-                    updated_at=now,
-                    last_recalled_at=None,
-                )
-                db.add(written)
-                touched.append(written.id)
-            case "edit":
-                edited = db.get(MemoryFactRecord, operation.fact_id)
-                if edited is None:
-                    raise RuntimeError(
-                        f"rememberer edit references missing fact {operation.fact_id}"
-                    )
-                edited.content = operation.content
-                edited.embedding = embed_text(operation.content, settings=settings)
-                edited.updated_at = now
-                touched.append(edited.id)
-            case "forget":
-                forgotten = db.get(MemoryFactRecord, operation.fact_id)
-                if forgotten is None:
-                    raise RuntimeError(
-                        f"rememberer forget references missing fact {operation.fact_id}"
-                    )
-                forgotten.status = "forgotten"
-                forgotten.updated_at = now
-    db.flush()
-    return touched
+    return {"summary": "", "items": [], "status": "partial"}
 
 
-def _conversation_for_turn(db: Session, turn_id: str) -> tuple[dict[str, str], str | None]:
-    """Read a completed turn into the rememberer's review material and return
-    its session id. Raises when the turn is missing -- a malformed task."""
-    turn = db.get(TurnRecord, turn_id)
-    if turn is None:
-        raise RuntimeError(f"memory_remember task references missing turn {turn_id}")
-    conversation = {
-        "user_message": redact_text(turn.user_message),
-        "assistant_message": redact_text(turn.assistant_message or ""),
-    }
-    return conversation, turn.session_id
+# ---------------------------------------------------------------------------
+# The rememberer — run_agent_loop in rememberer/encode|dream config
+# ---------------------------------------------------------------------------
 
 
 def run_rememberer(
     *,
+    trigger: Literal["encode", "dream"],
+    sandbox: SandboxRuntime,
+    db: Session,
     session_factory: sessionmaker[Session],
+    session_id: str | None,
     settings: AppSettings,
+    model_adapter: ModelAdapter,
+    google_runtime: GoogleConnectorRuntime,
+    agency_runtime: None,
+    attachment_runtime: None,
+    note: str | None,
+    allowed_capability_ids: frozenset[str],
+    approval_ttl_seconds: int,
+    approval_actor_id: str,
+    add_event: Callable[[str, dict[str, Any]], None],
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
-    trigger: Literal["note", "turn", "sweep"] = "note",
-    note: str | None = None,
-    session_id: str | None = None,
-    turn_id: str | None = None,
-) -> RemembererOutput:
-    """Run the rememberer subagent: maintain the fact store, the profile, and the
-    session digest from one bounded model call.
+) -> None:
+    """Run the rememberer (encode or dream) as a background task.
 
-    The three triggers differ only in what material is reviewed and which
-    documents can change; one model call and one ``apply`` path serve all three:
-
-    - ``"turn"`` -- a completed turn (``turn_id``) or a closing session. The
-      conversation is the material; facts and the session digest are updated,
-      and the profile when something durable changed. Enqueued after every turn
-      and on session rotation.
-    - ``"note"`` -- an on-demand ``memory.remember`` note. ``note`` is the
-      material; ``session_id`` scopes the digest.
-    - ``"sweep"`` -- the periodic store sweep. The active fact store is the
-      material; the rememberer prunes stale facts and re-tightens the profile,
-      and this function hard-deletes rows left ``forgotten`` past the retention
-      window. No digest is touched.
-
-    Every call writes one ``ai_judgments`` row (``judgment_type=memory_remember``)
-    on both success and failure. On a failed model call this raises
-    ``AIJudgmentFailure`` after auditing it; the background task then retries
-    under the normal retry policy.
+    Builds its own ``TurnRecord`` (kind ``memory_encode`` or ``memory_dream``),
+    calls ``run_agent_loop`` in the rememberer configuration, and returns
+    ``None``.  The loop applies note mutations via ``memory.note.*`` syscalls
+    (which call ``create_note`` / ``edit_note`` / ``delete_note`` above, which
+    also log the events).  Never raises.
     """
-    # 1. Gather the review material and the existing-fact candidates, and
-    #    hard-delete long-forgotten rows when sweeping.
-    with session_factory() as db:
-        with db.begin():
-            now = now_fn()
-            conversation: dict[str, str] | None = None
-            effective_session_id = session_id
-            review_text = note or ""
-            if trigger == "turn":
-                if turn_id is None:
-                    raise RuntimeError("memory_remember turn trigger requires a turn_id")
-                conversation, effective_session_id = _conversation_for_turn(db, turn_id)
-                review_text = " ".join(conversation.values())
-            elif trigger == "note":
-                if not (note and note.strip()):
-                    raise RuntimeError("memory_remember note trigger requires a note")
+    effective_session_id = session_id or _new_id("ses")
 
-            if trigger == "sweep":
-                long_forgotten = list(
-                    db.scalars(
-                        select(MemoryFactRecord.id).where(
-                            MemoryFactRecord.status == "forgotten",
-                            MemoryFactRecord.updated_at < now - _FORGOTTEN_RETENTION,
-                        )
-                    ).all()
-                )
-                if long_forgotten:
-                    db.execute(
-                        delete(MemoryFactRecord).where(MemoryFactRecord.id.in_(long_forgotten))
-                    )
-                deleted = len(long_forgotten)
-                candidates = list_active_facts(db, limit=settings.memory_recall_candidate_limit)
-            else:
-                deleted = 0
-                candidates = gather_candidates(
-                    db,
-                    query=review_text,
-                    settings=settings,
-                    limit=settings.memory_recall_candidate_limit,
-                )
+    now = now_fn()
+    system_prompt = _REMEMBERER_ENCODE_PROMPT if trigger == "encode" else _REMEMBERER_DREAM_PROMPT
+    prompt_version = (
+        REMEMBERER_ENCODE_PROMPT_VERSION if trigger == "encode" else REMEMBERER_DREAM_PROMPT_VERSION
+    )
+    judgment_type: Literal["memory_encode", "memory_dream"] = (
+        "memory_encode" if trigger == "encode" else "memory_dream"
+    )
+    budget = (
+        float(settings.memory_encode_budget_seconds)
+        if trigger == "encode"
+        else float(settings.memory_dream_budget_seconds)
+    )
 
-            profile = read_profile(db)
-            session_digest: str | None = None
-            if effective_session_id is not None:
-                session = db.get(SessionRecord, effective_session_id)
-                session_digest = session.digest if session is not None else None
-            candidate_payload = [{"id": fact.id, "content": fact.content} for fact in candidates]
-            candidate_ids = {fact.id for fact in candidates}
+    user_payload = {"prompt_version": prompt_version, "trigger": trigger, "note": note}
 
-    # The audit row's source identifies what was reviewed: a session for a turn
-    # or a session-scoped note, the store for a sweep, or unscoped memory for an
-    # on-demand note made outside any session.
-    if trigger == "sweep":
-        audit_source_type, audit_source_id = "memory_sweep", "memory_sweep"
-    elif effective_session_id is not None:
-        audit_source_type, audit_source_id = "session", effective_session_id
-    else:
-        audit_source_type, audit_source_id = "memory", "memory"
-    input_refs: dict[str, Any] = {
-        "trigger": trigger,
-        "candidate_count": len(candidate_payload),
-    }
-    if turn_id is not None:
-        input_refs["turn_id"] = turn_id
+    with session_factory() as task_db:
+        with task_db.begin():
+            turn = TurnRecord(
+                id=new_id_fn("trn"),
+                session_id=effective_session_id,
+                user_message=json.dumps(user_payload, sort_keys=True),
+                assistant_message=None,
+                status="in_progress",
+                kind=judgment_type,
+                created_at=now,
+                updated_at=now,
+            )
+            task_db.add(turn)
+            task_db.flush()
+            turn_id = turn.id
 
-    # 2. The bounded model call, then validation -- a failure in either path is
-    #    audited as one failed memory_remember row and re-raised.
-    try:
-        raw, provider_response_id = _call_subagent(
-            system_prompt=_REMEMBERER_PROMPT,
-            user_payload={
-                "prompt_version": REMEMBERER_PROMPT_VERSION,
-                "trigger": trigger,
-                "profile": profile,
-                "session_digest": session_digest,
-                "conversation": conversation,
-                "note": redact_text(note) if note else None,
-                "existing_facts": candidate_payload,
-            },
-            settings=settings,
-        )
-        try:
-            output = _validated_rememberer_output(raw, candidate_ids=candidate_ids)
-        except AIJudgmentFailure as exc:
-            exc.provider_response_id = provider_response_id
-            raise
-    except AIJudgmentFailure as failure:
-        with session_factory() as db:
-            with db.begin():
-                record_ai_judgment(
-                    db,
-                    judgment_type="memory_remember",
-                    prompt_version=REMEMBERER_PROMPT_VERSION,
-                    source_type=audit_source_type,
-                    source_id=audit_source_id,
-                    model=settings.model_name,
-                    input_summary=f"memory rememberer ({trigger})",
-                    input_refs=input_refs,
-                    output={},
-                    provider_response_id=failure.provider_response_id,
-                    now=now_fn(),
-                    new_id=new_id_fn,
-                    failure=failure,
-                )
-        raise
+    eligible_callables = [
+        "memory.search",
+        "memory.read",
+        "memory.note.create",
+        "memory.note.edit",
+        "memory.note.delete",
+        "agent.emit_done",
+    ]
+    callable_lines = "\n".join(f"- {name}" for name in eligible_callables)
 
-    # 3. Apply the judgment: fact operations, the profile, and the digest, then
-    #    audit -- all in one transaction.
-    with session_factory() as db:
-        with db.begin():
-            now = now_fn()
-            touched = apply_rememberer_output(
-                db,
-                output,
-                source_turn_id=turn_id,
+    responses_input_items: list[dict[str, Any]] = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "system",
+            "content": (
+                "syscall callables available this run "
+                "(call as namespace.member(...); results are returned inline):\n"
+            )
+            + callable_lines,
+        },
+        {"role": "user", "content": json.dumps(user_payload, sort_keys=True)},
+    ]
+
+    cfg = LoopConfig(
+        output_mode="operations",
+        finding_mode=trigger,
+        budget_seconds=budget,
+        max_model_calls=int(settings.agent_loop_max_model_calls),
+        is_research_run=True,
+        record_judgments=True,
+        judgment_type=judgment_type,
+        retry_on_model_error=False,
+        void_failed_program_approvals=False,
+        protocol_nudge=(
+            f"memory {trigger} protocol failure: call exactly one run tool "
+            'with {"source": "..."} where source is a Python program; '
+            "finish by calling agent.emit_done."
+        ),
+        program_failure_nudge=(
+            "No effects committed. Retry with one run call whose program "
+            "completes cleanly; finish by calling agent.emit_done."
+        ),
+        action_trace_nudge=("Continue; finish by calling agent.emit_done."),
+        emit_value_nudge=(
+            "Values emitted. Continue with one run call; finish by calling agent.emit_done."
+        ),
+        fallback_nudge=(
+            "Program completed without finishing. Continue with one run call; "
+            "finish by calling agent.emit_done."
+        ),
+    )
+
+    with session_factory() as loop_db:
+        with loop_db.begin():
+            loop_turn = loop_db.get(TurnRecord, turn_id)
+            if loop_turn is None:
+                raise RuntimeError(f"run_rememberer: turn {turn_id!r} missing")
+            run_agent_loop(
+                cfg,
+                sandbox=sandbox,
+                db=loop_db,
+                session_factory=session_factory,
+                session_id=effective_session_id,
+                turn=loop_turn,
                 settings=settings,
-                now=now,
+                model_adapter=model_adapter,
+                responses_input_items=responses_input_items,
+                tools=run_tool_definitions(),
+                user_message=json.dumps(user_payload, sort_keys=True),
+                history=[],
+                context_bundle={},
+                allowed_capability_ids=allowed_capability_ids,
+                scratch={},
+                proposal_index_start=0,
+                approval_ttl_seconds=approval_ttl_seconds,
+                approval_actor_id=approval_actor_id,
+                add_event=add_event,
+                now_fn=now_fn,
                 new_id_fn=new_id_fn,
+                runtime_provenance=None,
+                google_runtime=google_runtime,
+                execute_google_reads_outside_transaction=False,
+                agency_runtime=None,
+                attachment_runtime=None,
             )
-            if output.profile is not None:
-                write_profile(db, content=output.profile, now=now)
-            if output.digest is not None and effective_session_id is not None:
-                session = db.get(SessionRecord, effective_session_id)
-                if session is not None:
-                    session.digest = output.digest
-            record_ai_judgment(
-                db,
-                judgment_type="memory_remember",
-                prompt_version=REMEMBERER_PROMPT_VERSION,
-                source_type=audit_source_type,
-                source_id=audit_source_id,
-                model=settings.model_name,
-                input_summary=f"memory rememberer ({trigger})",
-                input_refs=input_refs,
-                output={
-                    "operation_count": len(output.operations),
-                    "profile_rewritten": output.profile is not None,
-                    "digest_rewritten": output.digest is not None,
-                    "hard_deleted_forgotten": deleted,
-                    "touched_fact_ids": list(touched),
-                },
-                provider_response_id=provider_response_id,
-                now=now,
-                new_id=new_id_fn,
-            )
-    return output
+            loop_turn.status = "completed"
+            loop_turn.updated_at = now_fn()
 
 
 # ---------------------------------------------------------------------------
 # Background-task enqueuers
-#
-# These build the rememberer's background-task rows. The worker dispatch that
-# runs them is wired in Phase 5; enqueueing is the memory module's concern.
 # ---------------------------------------------------------------------------
-def enqueue_memory_remember(
+
+
+def enqueue_memory_encode(
     db: Session,
     *,
-    turn_id: str,
+    note: str,
+    session_id: str | None,
     now: datetime,
 ) -> str:
-    """Enqueue a ``memory_remember`` background task for a completed turn (or a
-    closing session's final turn). Idempotent per turn: a second enqueue for the
-    same turn returns the existing task. Returns the task id."""
+    """Enqueue a ``memory_encode`` background task. Returns the task id."""
+    stable_id = _new_id("enc")
     task = enqueue_background_task(
         db,
-        task_type="memory_remember",
-        idempotency_key=f"memory_remember:{turn_id}",
-        payload={"turn_id": turn_id},
+        task_type="memory_encode",
+        idempotency_key=f"memory_encode:{stable_id}",
+        payload={"note": note, "session_id": session_id},
         now=now,
     )
     return task.id
 
 
-def enqueue_due_memory_sweep(
+def enqueue_due_memory_dream(
     db: Session,
     *,
     settings: AppSettings,
     now: datetime,
 ) -> str | None:
-    """Self-gating periodic sweep enqueuer: enqueue one ``memory_sweep`` task
-    when the last sweep is older than the configured interval, otherwise enqueue
-    nothing. Returns the new task id, or ``None`` when a sweep is not yet due.
-    Called from the worker's enqueue-due pass."""
-    interval = timedelta(seconds=settings.memory_sweep_interval_seconds)
-    recent_sweep = db.scalar(
+    """Self-gating periodic dream enqueuer.
+
+    Enqueues one ``memory_dream`` task when no dream has been enqueued within
+    the configured interval; otherwise returns ``None``.
+    """
+    interval = timedelta(seconds=settings.memory_dream_interval_seconds)
+    recent = db.scalar(
         select(BackgroundTaskRecord.id)
         .where(
-            BackgroundTaskRecord.task_type == "memory_sweep",
+            BackgroundTaskRecord.task_type == "memory_dream",
             BackgroundTaskRecord.created_at > now - interval,
         )
         .limit(1)
     )
-    if recent_sweep is not None:
+    if recent is not None:
         return None
-    task = enqueue_background_task(db, task_type="memory_sweep", payload={}, now=now)
+    task = enqueue_background_task(db, task_type="memory_dream", payload={}, now=now)
     return task.id

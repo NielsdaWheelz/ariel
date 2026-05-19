@@ -33,7 +33,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Literal, assert_never
 
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import Session, sessionmaker
@@ -66,9 +66,9 @@ class ResearchFinding:
     ``status`` is one of three values matching the ``research_finding_v1``
     contract:
 
-    - ``"complete"``: the run called ``research.finding``. ``summary``,
+    - ``"complete"``: the run called ``agent.emit_finding``. ``summary``,
       ``claims``, ``gaps``, and ``sources`` are the four fields the model
-      passed to ``research.finding``.
+      passed to ``agent.emit_finding``.
     - ``"partial"``: the wall-clock budget, the model-call backstop, or
       stuck-detection ended the run before a finding was emitted. The loop
       ran cleanly; it just did not converge. ``summary`` is a short honest
@@ -108,8 +108,7 @@ class LoopConfig:
         ``"message"`` exits on ``emitted_message``, an ``awaiting_approval``
         action attempt, or ``paused``.  ``"finding"`` exits on
         ``emitted_finding``.  ``"operations"`` exits on ``emitted_operations``
-        (reserved for P4 — ``run_agent_loop`` raises ``NotImplementedError``
-        for this mode today).
+        (the summary string from ``agent.emit_done``).
     finding_mode:
         The research mode string (e.g. ``"web"``, ``"personal"``) embedded in
         the returned ``ResearchFinding`` when ``output_mode="finding"``.
@@ -119,8 +118,8 @@ class LoopConfig:
     max_model_calls:
         Backstop on the number of model calls before graceful exhaustion.
     is_research_run:
-        Passed through to ``execute_run_program``; enables ``research.finding``
-        in the sandbox's syscall whitelist.
+        Passed through to ``execute_run_program``; enables ``agent.emit_finding``
+        and ``agent.emit_done`` in the sandbox's syscall whitelist.
     record_judgments:
         When True, the loop records an ``ai_judgments`` row on protocol failure
         and on program failure (the ``_wake`` behaviour).  When False it does
@@ -179,7 +178,8 @@ class LoopResult:
 
     - ``"message"`` — the program emitted a user-visible message.
     - ``"finding"`` — the program emitted a research finding.
-    - ``"operations"`` — the program emitted operations (P4, not yet wired).
+    - ``"operations"`` — the program called ``agent.emit_done``; ``emitted_operations``
+      is the summary string.
     - ``"approval"`` — the program staged an approval proposal without
       emitting a message; the awaiting action attempt is in
       ``awaiting_approval``.
@@ -204,7 +204,7 @@ class LoopResult:
     ]
     emitted_message: str | None
     emitted_finding: ResearchFinding | None
-    emitted_operations: list[dict[str, Any]] | None
+    emitted_operations: str | None
     model_call_count: int
     created_action_attempt_count: int
     awaiting_approval: ActionAttemptRecord | None
@@ -253,9 +253,6 @@ def run_agent_loop(
     ``responses_input_items``, the ``turn`` record, ``scratch``, and mapping
     the returned ``LoopResult`` to a domain-level outcome.
     """
-
-    if cfg.output_mode == "operations":
-        raise NotImplementedError("output_mode='operations' is not yet wired (P4)")
 
     loop_started_at = time.perf_counter()
     budget_item_index: int | None = None
@@ -577,73 +574,93 @@ def run_agent_loop(
 
         db.commit()
 
-        # --- Terminal branches ---
+        # --- Terminal branches (exhaustive over output_mode) ---
 
-        if cfg.output_mode == "finding" and run_program_result.emitted_finding is not None:
-            raw = run_program_result.emitted_finding
-            return LoopResult(
-                outcome="finding",
-                emitted_message=None,
-                emitted_finding=ResearchFinding(
-                    question=user_message,
-                    mode=cfg.finding_mode,
-                    status="complete",
-                    summary=str(raw["summary"]),
-                    claims=list(raw["claims"]),
-                    gaps=list(raw["gaps"]),
-                    sources=list(raw["sources"]),
-                ),
-                emitted_operations=None,
-                model_call_count=model_call_count,
-                created_action_attempt_count=created_action_attempt_count,
-                awaiting_approval=None,
-                bounded_failure_details=None,
-                runtime_provenance=final_runtime_provenance,
-            )
+        match cfg.output_mode:
+            case "finding":
+                if run_program_result.emitted_finding is not None:
+                    raw = run_program_result.emitted_finding
+                    return LoopResult(
+                        outcome="finding",
+                        emitted_message=None,
+                        emitted_finding=ResearchFinding(
+                            question=user_message,
+                            mode=cfg.finding_mode,
+                            status="complete",
+                            summary=str(raw["summary"]),
+                            claims=list(raw["claims"]),
+                            gaps=list(raw["gaps"]),
+                            sources=list(raw["sources"]),
+                        ),
+                        emitted_operations=None,
+                        model_call_count=model_call_count,
+                        created_action_attempt_count=created_action_attempt_count,
+                        awaiting_approval=None,
+                        bounded_failure_details=None,
+                        runtime_provenance=final_runtime_provenance,
+                    )
+            case "operations":
+                if run_program_result.emitted_done is not None:
+                    return LoopResult(
+                        outcome="operations",
+                        emitted_message=None,
+                        emitted_finding=None,
+                        emitted_operations=run_program_result.emitted_done,
+                        model_call_count=model_call_count,
+                        created_action_attempt_count=created_action_attempt_count,
+                        awaiting_approval=None,
+                        bounded_failure_details=None,
+                        runtime_provenance=final_runtime_provenance,
+                    )
+            case "message":
+                if run_program_result.emitted_message:
+                    return LoopResult(
+                        outcome="message",
+                        emitted_message=run_program_result.emitted_message,
+                        emitted_finding=None,
+                        emitted_operations=None,
+                        model_call_count=model_call_count,
+                        created_action_attempt_count=created_action_attempt_count,
+                        awaiting_approval=None,
+                        bounded_failure_details=None,
+                        runtime_provenance=final_runtime_provenance,
+                    )
 
-        if cfg.output_mode == "message":
-            if run_program_result.emitted_message:
-                return LoopResult(
-                    outcome="message",
-                    emitted_message=run_program_result.emitted_message,
-                    emitted_finding=None,
-                    emitted_operations=None,
-                    model_call_count=model_call_count,
-                    created_action_attempt_count=created_action_attempt_count,
-                    awaiting_approval=None,
-                    bounded_failure_details=None,
-                    runtime_provenance=final_runtime_provenance,
+                awaiting = next(
+                    (
+                        a
+                        for a in run_program_result.action_attempts
+                        if a.status == "awaiting_approval"
+                    ),
+                    None,
                 )
+                if awaiting is not None:
+                    return LoopResult(
+                        outcome="approval",
+                        emitted_message=None,
+                        emitted_finding=None,
+                        emitted_operations=None,
+                        model_call_count=model_call_count,
+                        created_action_attempt_count=created_action_attempt_count,
+                        awaiting_approval=awaiting,
+                        bounded_failure_details=None,
+                        runtime_provenance=final_runtime_provenance,
+                    )
 
-            awaiting = next(
-                (a for a in run_program_result.action_attempts if a.status == "awaiting_approval"),
-                None,
-            )
-            if awaiting is not None:
-                return LoopResult(
-                    outcome="approval",
-                    emitted_message=None,
-                    emitted_finding=None,
-                    emitted_operations=None,
-                    model_call_count=model_call_count,
-                    created_action_attempt_count=created_action_attempt_count,
-                    awaiting_approval=awaiting,
-                    bounded_failure_details=None,
-                    runtime_provenance=final_runtime_provenance,
-                )
-
-            if run_program_result.paused:
-                return LoopResult(
-                    outcome="paused",
-                    emitted_message=None,
-                    emitted_finding=None,
-                    emitted_operations=None,
-                    model_call_count=model_call_count,
-                    created_action_attempt_count=created_action_attempt_count,
-                    awaiting_approval=None,
-                    bounded_failure_details=None,
-                    runtime_provenance=final_runtime_provenance,
-                )
+                if run_program_result.paused:
+                    return LoopResult(
+                        outcome="paused",
+                        emitted_message=None,
+                        emitted_finding=None,
+                        emitted_operations=None,
+                        model_call_count=model_call_count,
+                        created_action_attempt_count=created_action_attempt_count,
+                        awaiting_approval=None,
+                        bounded_failure_details=None,
+                        runtime_provenance=final_runtime_provenance,
+                    )
+            case _:
+                assert_never(cfg.output_mode)
 
         # --- Non-terminal branches (continue the loop) ---
 

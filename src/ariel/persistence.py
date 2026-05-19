@@ -172,7 +172,7 @@ class TurnRecord(Base):
             name="ck_turn_status",
         ),
         CheckConstraint(
-            "kind IN ('agent_turn', 'research')",
+            "kind IN ('agent_turn', 'research', 'memory_encode', 'memory_dream')",
             name="ck_turn_kind",
         ),
     )

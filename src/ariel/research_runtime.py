@@ -4,15 +4,15 @@
 ``run_agent_loop`` body, in research configuration.  It differs from the main
 configuration only where a research run must differ:
 
-- ``output_mode="finding"`` — terminates on ``research.finding``;
-- ``is_research_run=True`` — enables ``research.finding`` in the sandbox whitelist;
+- ``output_mode="finding"`` — terminates on ``agent.emit_finding``;
+- ``is_research_run=True`` — enables ``agent.emit_finding`` in the sandbox whitelist;
 - the eligible capabilities are exactly one mode whitelist —
   ``RESEARCH_WEB_CAPABILITY_IDS`` for ``mode == "web"`` or
   ``RESEARCH_PERSONAL_CAPABILITY_IDS`` for ``mode == "personal"``, never both:
   the lethal-trifecta defence (a run touches web XOR personal);
 - ``research_run_budget_seconds`` budget;
 - the prompt is research-framed — question, mode, eligible callables, and the
-  instruction to call ``research.finding`` once;
+  instruction to call ``agent.emit_finding`` once;
 - the run is persisted as a ``TurnRecord`` with ``kind="research"``;
 - it returns a typed ``ResearchFinding``, not a Discord-delivered message.
 
@@ -20,7 +20,7 @@ The whitelists hold only ``impact_level="read"`` capabilities, so a research
 run stages no approvals and emits no message; it is strictly read-only.  The
 loop ends in one of three ways:
 
-- ``research.finding`` was called → ``ResearchFinding(status="complete", ...)``,
+- ``agent.emit_finding`` was called → ``ResearchFinding(status="complete", ...)``,
   ``TurnRecord.status="completed"``.
 - budget exhaustion / model-call backstop / stuck-detection →
   ``ResearchFinding(status="partial", ...)``, ``TurnRecord.status="completed"``.
@@ -136,8 +136,8 @@ def _build_research_input_items(
     """The research prompt: the run-program syscall framing plus research framing.
 
     The model authors ``run`` programs against the mode's read capabilities, the
-    two ``scratch.*`` store syscalls, and ``research.finding``.  It investigates
-    over as many rounds as it needs, then calls ``research.finding`` exactly once
+    two ``scratch.*`` store syscalls, and ``agent.emit_finding``.  It investigates
+    over as many rounds as it needs, then calls ``agent.emit_finding`` exactly once
     to finish.
     """
 
@@ -169,7 +169,7 @@ def _build_research_input_items(
                 "syscall callables your run program may call this run "
                 "(each is namespace.member(...) and returns its result; "
                 "scratch.set, scratch.get, agent.emit_value, and "
-                "research.finding are always available):\n"
+                "agent.emit_finding are always available):\n"
             )
             + "\n".join(callable_lines),
         },
@@ -178,12 +178,12 @@ def _build_research_input_items(
             "content": (
                 "Begin by writing your sub-questions, then investigate them with "
                 "the read capabilities above. When you have investigated enough, "
-                "call research.finding(summary=, claims=, gaps=, sources=) "
+                "call agent.emit_finding(summary=, claims=, gaps=, sources=) "
                 "exactly once to finish the run. summary is a bounded synthesis; "
                 "claims is a list of {statement, sources, confidence}; gaps is a "
                 "list of what you could not determine; sources is a list of "
                 "{title, reference, retrieved_at}. The run ends when you call "
-                "research.finding; nothing you emit is shown to a user directly."
+                "agent.emit_finding; nothing you emit is shown to a user directly."
             ),
         },
         {"role": "user", "content": question},
@@ -207,7 +207,7 @@ def run_research(
     ``session_id`` is the active session the research ``TurnRecord`` is
     attached to.  The loop runs ``run`` programs against the mode whitelist,
     committing after each clean program; it ends when a program calls
-    ``research.finding``, when the budget/backstop/stuck-detection halts it,
+    ``agent.emit_finding``, when the budget/backstop/stuck-detection halts it,
     or when the model call raises.  Returns
     ``ResearchFinding(status="complete"|"partial"|"failed", ...)``;
     never raises.
@@ -283,23 +283,23 @@ def run_research(
         protocol_nudge=(
             "model protocol failure: call exactly one tool named run "
             'with JSON arguments {"source":"..."} where source is a '
-            "Python program; finish the run by calling research.finding."
+            "Python program; finish the run by calling agent.emit_finding."
         ),
         program_failure_nudge=(
             "No effects were committed. Retry with exactly one "
             "run call whose source is a Python program that completes "
-            "cleanly; finish the run by calling research.finding."
+            "cleanly; finish the run by calling agent.emit_finding."
         ),
         action_trace_nudge=(
-            "Continue with exactly one run call; finish by calling research.finding."
+            "Continue with exactly one run call; finish by calling agent.emit_finding."
         ),
         emit_value_nudge=(
             "run program emitted internal values. Continue with "
-            "exactly one run call; finish by calling research.finding."
+            "exactly one run call; finish by calling agent.emit_finding."
         ),
         fallback_nudge=(
             "run program completed without a finding. Continue with "
-            "exactly one run call; finish by calling research.finding."
+            "exactly one run call; finish by calling agent.emit_finding."
         ),
     )
 

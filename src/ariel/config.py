@@ -50,6 +50,10 @@ class AppSettings(BaseSettings):
     max_response_tokens: int = 700
     main_turn_budget_seconds: float = 180.0
     research_run_budget_seconds: float = 300.0
+    memory_recall_budget_seconds: float = 60.0
+    memory_encode_budget_seconds: float = 60.0
+    memory_dream_budget_seconds: float = 600.0
+    memory_dream_interval_seconds: float = 86400.0
     agent_loop_max_model_calls: int = 50
     agent_loop_live_rounds: int = 8
     approval_ttl_seconds: int = 900
@@ -324,6 +328,34 @@ class AppSettings(BaseSettings):
     def _research_run_budget_seconds_must_be_positive(cls, value: float) -> float:
         if value <= 0:
             raise ValueError("research_run_budget_seconds must be > 0")
+        return value
+
+    @field_validator("memory_recall_budget_seconds")
+    @classmethod
+    def _memory_recall_budget_seconds_must_be_positive(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("memory_recall_budget_seconds must be > 0")
+        return value
+
+    @field_validator("memory_encode_budget_seconds")
+    @classmethod
+    def _memory_encode_budget_seconds_must_be_positive(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("memory_encode_budget_seconds must be > 0")
+        return value
+
+    @field_validator("memory_dream_budget_seconds")
+    @classmethod
+    def _memory_dream_budget_seconds_must_be_positive(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("memory_dream_budget_seconds must be > 0")
+        return value
+
+    @field_validator("memory_dream_interval_seconds")
+    @classmethod
+    def _memory_dream_interval_seconds_must_be_positive(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("memory_dream_interval_seconds must be > 0")
         return value
 
     @field_validator("agent_loop_max_model_calls")

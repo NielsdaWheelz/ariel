@@ -840,6 +840,30 @@ class SurfaceCaptureFailureResponseContract(BaseModel):
     error: SurfaceErrorContract
 
 
+class MemoryRecallItemContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    layer: Literal["log", "note"]
+    created_at: str
+    content: str
+    taint: Literal["clean", "tainted"]
+
+
+class MemoryRecallV1Contract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str
+    items: list[MemoryRecallItemContract]
+    status: Literal["complete", "partial"]
+
+
+def validate_memory_recall_v1(payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate and return a ``recall_v1`` finding dict, or raise
+    ``ResponseContractViolation``."""
+    return _validate_contract("memory_recall_v1", MemoryRecallV1Contract, payload)
+
+
 def _validate_contract(
     contract: str,
     model_type: type[BaseModel],
