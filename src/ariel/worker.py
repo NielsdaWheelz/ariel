@@ -5,6 +5,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import httpx
 import ulid
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
@@ -16,6 +17,7 @@ from .action_runtime import (
 )
 from .app import (
     Runtime,
+    TurnExecutionOutcome,
     WakeContext,
     _get_or_create_active_session,
     _wake,
@@ -60,6 +62,32 @@ def _utcnow() -> datetime:
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}_{ulid.new().str.lower()}"
+
+
+def _deliver_to_discord(*, outcome: TurnExecutionOutcome, settings: AppSettings) -> None:
+    if settings.discord_bot_token is None or settings.discord_channel_id is None:
+        return
+    if outcome.status_code != 200:
+        return
+    assistant = outcome.response_payload.get("assistant")
+    if not isinstance(assistant, dict) or assistant.get("silent") is True:
+        return
+    message = assistant.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return
+    content = message.strip()
+    if len(content) > 1900:
+        # Discord's hard limit is 2000 characters; truncate with a marker.
+        content = content[:1888].rstrip() + "\n[truncated]"
+    try:
+        httpx.post(
+            f"https://discord.com/api/v10/channels/{settings.discord_channel_id}/messages",
+            headers={"Authorization": f"Bot {settings.discord_bot_token}"},
+            json={"content": content},
+            timeout=settings.discord_notification_timeout_seconds,
+        )
+    except httpx.HTTPError:
+        return
 
 
 def select_next_task(db: Session, *, now: datetime) -> BackgroundTaskRecord | None:
@@ -277,7 +305,7 @@ def process_one_task(
                     raise RuntimeError("agent_wake task requires a configured runtime")
                 with session_factory() as db:
                     session = _get_or_create_active_session(db)
-                    _wake(
+                    outcome = _wake(
                         runtime=runtime,
                         db=db,
                         request_session_id=session.id,
@@ -291,6 +319,7 @@ def process_one_task(
                         google_runtime=build_google_runtime(runtime.settings),
                     )
                     db.commit()
+                _deliver_to_discord(outcome=outcome, settings=runtime.settings)
             case "execute_action_attempt":
                 action_attempt_id = _payload_text(task_payload, "action_attempt_id")
                 if action_attempt_id is None:
