@@ -574,6 +574,50 @@ def run_agent_loop(
 
         db.commit()
 
+        # Append an agent_round event to the raw memory log for main-agent
+        # turns (not research/retriever runs).  This is the within-turn
+        # round-eviction complement: evicted rounds live in the log and can
+        # be recalled by memory.recall if a later round needs them.
+        # Imported lazily to avoid the agent_loop ↔ memory circular import.
+        if not cfg.is_research_run:
+            from .memory import append_log_event  # noqa: PLC0415
+
+            action_summary = [
+                {"capability_id": a.capability_id, "status": a.status}
+                for a in run_program_result.action_attempts
+            ]
+            round_content = json.dumps(
+                {
+                    "source": run_source,
+                    "action_attempts": action_summary,
+                    "emitted_message": bool(run_program_result.emitted_message),
+                    "emitted_values": len(run_program_result.emitted_values),
+                    "paused": run_program_result.paused,
+                },
+                sort_keys=True,
+            )
+            taint: Literal["clean", "tainted"] = (
+                "tainted"
+                if (
+                    final_runtime_provenance is not None
+                    and final_runtime_provenance.status == "tainted"
+                )
+                else "clean"
+            )
+            append_log_event(
+                db,
+                kind="agent_round",
+                content=round_content,
+                session_id=session_id,
+                turn_id=turn.id,
+                taint=taint,
+                source_ref=turn.id,
+                settings=settings,
+                now=now_fn(),
+                new_id_fn=new_id_fn,
+            )
+            db.commit()
+
         # --- Terminal branches (exhaustive over output_mode) ---
 
         match cfg.output_mode:

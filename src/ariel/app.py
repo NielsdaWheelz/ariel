@@ -9,7 +9,7 @@ from pathlib import Path
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, AsyncIterator, Literal, Protocol
+from typing import Any, AsyncIterator, Literal, Protocol, assert_never
 from urllib.parse import urlparse
 
 import httpx
@@ -45,6 +45,7 @@ from ariel.capability_registry import (
     MEMORY_CAPABILITY_IDS,
     PROACTIVE_CAPABILITY_IDS,
     RESEARCH_CAPABILITY_IDS,
+    RESEARCH_MEMORIES_CAPABILITY_IDS,
     get_capability,
     internal_callable_capability_ids,
     run_callable_name_for_capability_id,
@@ -61,11 +62,7 @@ from ariel.google_connector import (
     GoogleWorkspaceProvider,
 )
 from ariel.memory import (
-    enqueue_memory_remember,
-    list_active_facts,
-    read_profile,
-    render_profile,
-    render_recalled_facts,
+    append_log_event,
     run_retriever,
 )
 from ariel.persistence import (
@@ -80,7 +77,6 @@ from ariel.persistence import (
     GoogleConnectorRecord,
     JobEventRecord,
     JobRecord,
-    MemoryFactRecord,
     ProviderEventRecord,
     ProviderWriteReceiptRecord,
     SessionRecord,
@@ -144,15 +140,13 @@ _ALLOWED_ROTATION_REASONS = {
     "user_initiated",
     "threshold_turn_count",
     "threshold_age",
-    "threshold_context_pressure",
 }
 
-_CONTEXT_SECTION_ORDER = (
+_TAINT_LOOKBACK_TURNS = 12
+
+_CONTEXT_SECTION_ORDER: tuple[str, ...] = (
     "policy_system_instructions",
-    "recent_active_session_turns",
-    "profile",
-    "session_digest",
-    "recalled_memory",
+    "recall_v1",
     "open_commitments_and_jobs",
     "relevant_artifacts_and_observations",
 )
@@ -498,6 +492,32 @@ class OpenAIResponsesAdapter:
         }
 
 
+def _render_recall_v1(recall: dict[str, Any]) -> str:
+    """Render a ``recall_v1`` dict as a compact system-message block."""
+    lines: list[str] = ["memory recall:"]
+    summary = recall.get("summary", "")
+    if isinstance(summary, str) and summary.strip():
+        lines.append(summary.strip())
+    items = recall.get("items")
+    if isinstance(items, list) and items:
+        lines.append("cited items:")
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_id = item.get("id", "")
+            layer = item.get("layer", "")
+            created_at = item.get("created_at", "")
+            content = item.get("content", "")
+            taint = item.get("taint", "")
+            snippet = content[:200] if isinstance(content, str) else ""
+            taint_note = " [tainted]" if taint == "tainted" else ""
+            lines.append(f"  [{item_id}, {layer}, {created_at}]{taint_note}: {snippet}")
+    status = recall.get("status", "")
+    if status == "partial":
+        lines.append("(recall partial — budget exhausted)")
+    return "\n".join(lines)
+
+
 def _build_responses_input_items(
     *,
     context_bundle: dict[str, Any],
@@ -505,16 +525,19 @@ def _build_responses_input_items(
 ) -> list[dict[str, Any]]:
     input_items: list[dict[str, Any]] = []
 
+    # 1. Policy system instructions
     policy_system_instructions = context_bundle.get("policy_system_instructions")
     if isinstance(policy_system_instructions, list):
         for instruction in policy_system_instructions:
             if isinstance(instruction, str) and instruction:
                 input_items.append({"role": "system", "content": instruction})
 
+    # 2. Discord context (when present)
     discord_context_text = _discord_context_text(context_bundle.get("discord_context"))
     if discord_context_text is not None:
         input_items.append({"role": "system", "content": discord_context_text})
 
+    # 3. Eligible callables list
     eligible_callables = context_bundle.get("eligible_internal_callables")
     if isinstance(eligible_callables, list):
         callable_lines = [
@@ -536,6 +559,7 @@ def _build_responses_input_items(
                 }
             )
 
+    # 4. Tool surface facts
     tool_surface_facts = context_bundle.get("tool_surface_facts")
     if isinstance(tool_surface_facts, dict):
         input_items.append(
@@ -550,45 +574,13 @@ def _build_responses_input_items(
             }
         )
 
-    discord_channel_recent_turns = context_bundle.get("discord_channel_recent_turns")
-    if isinstance(discord_channel_recent_turns, list) and discord_channel_recent_turns:
-        channel_lines: list[str] = []
-        for prior_turn in discord_channel_recent_turns:
-            if not isinstance(prior_turn, dict):
-                continue
-            message_id = prior_turn.get("message_id")
-            prior_user_message = prior_turn.get("user_message")
-            assistant_message = prior_turn.get("assistant_message")
-            if isinstance(message_id, int) and isinstance(prior_user_message, str):
-                line = f"- message_id={message_id} user={prior_user_message}"
-                if isinstance(assistant_message, str) and assistant_message:
-                    line = f"{line} assistant={assistant_message}"
-                channel_lines.append(line)
-        if channel_lines:
-            input_items.append(
-                {
-                    "role": "system",
-                    "content": "recent Discord channel context:\n" + "\n".join(channel_lines),
-                }
-            )
-
-    recent_turns = context_bundle.get("recent_active_session_turns")
-    if not isinstance(recent_turns, list):
-        recent_turns = []
-
+    # 6. Turn-id reference block for write authority
     turn_ref_lines: list[str] = []
     current_turn = context_bundle.get("current_turn")
     if isinstance(current_turn, dict):
         current_turn_id = current_turn.get("turn_id")
         if isinstance(current_turn_id, str) and current_turn_id:
             turn_ref_lines.append(f"- current user instruction: turn:{current_turn_id}")
-    for prior_turn in recent_turns:
-        if not isinstance(prior_turn, dict):
-            continue
-        turn_id = prior_turn.get("turn_id")
-        prior_user_message = prior_turn.get("user_message")
-        if isinstance(turn_id, str) and turn_id and isinstance(prior_user_message, str):
-            turn_ref_lines.append(f"- prior user instruction: turn:{turn_id} {prior_user_message}")
     if turn_ref_lines:
         input_items.append(
             {
@@ -597,28 +589,14 @@ def _build_responses_input_items(
             }
         )
 
-    profile = context_bundle.get("profile")
-    rendered_profile = render_profile(profile) if isinstance(profile, str) else ""
-    if rendered_profile:
-        input_items.append({"role": "system", "content": rendered_profile})
+    # recall_v1 reconstruction — the retriever's working-context reconstruction
+    recall_v1 = context_bundle.get("recall_v1")
+    if isinstance(recall_v1, dict):
+        rendered = _render_recall_v1(recall_v1)
+        if rendered:
+            input_items.append({"role": "system", "content": rendered})
 
-    session_digest = context_bundle.get("session_digest")
-    if isinstance(session_digest, str) and session_digest.strip():
-        input_items.append(
-            {
-                "role": "system",
-                "content": "session digest (working state of this conversation):\n"
-                + session_digest.strip(),
-            }
-        )
-
-    recalled_memory = context_bundle.get("recalled_memory")
-    rendered_recalled = (
-        render_recalled_facts(recalled_memory) if isinstance(recalled_memory, list) else ""
-    )
-    if rendered_recalled:
-        input_items.append({"role": "system", "content": rendered_recalled})
-
+    # 10. Open jobs
     open_commitments_and_jobs = context_bundle.get("open_commitments_and_jobs")
     if isinstance(open_commitments_and_jobs, dict):
         jobs_raw = open_commitments_and_jobs.get("open_jobs")
@@ -640,6 +618,7 @@ def _build_responses_input_items(
                     }
                 )
 
+    # 11. Recent artifacts
     relevant_artifacts_and_observations = context_bundle.get("relevant_artifacts_and_observations")
     if isinstance(relevant_artifacts_and_observations, dict):
         artifacts_raw = relevant_artifacts_and_observations.get("artifacts")
@@ -660,15 +639,7 @@ def _build_responses_input_items(
                     }
                 )
 
-    for prior_turn in recent_turns:
-        if not isinstance(prior_turn, dict):
-            continue
-        prior_user_message = prior_turn.get("user_message")
-        if isinstance(prior_user_message, str) and prior_user_message:
-            input_items.append({"role": "user", "content": prior_user_message})
-        prior_assistant_message = prior_turn.get("assistant_message")
-        if isinstance(prior_assistant_message, str) and prior_assistant_message:
-            input_items.append({"role": "assistant", "content": prior_assistant_message})
+    # 13. Current user message
     input_items.append({"role": "user", "content": user_message})
     return input_items
 
@@ -720,11 +691,6 @@ def _discord_context_text(raw_context: Any) -> str | None:
     return "\n".join(lines)
 
 
-def _count_context_tokens(text: str) -> int:
-    """Count whitespace-delimited words, the unit every context budget uses."""
-    return len(text.split())
-
-
 @dataclass(slots=True, frozen=True)
 class TurnLimitViolation:
     budget: str
@@ -738,92 +704,16 @@ def _response_tokens_from_model_payload(
     *,
     assistant_text: str,
 ) -> int:
+    del assistant_text
     usage_payload = assistant_response.get("usage")
     if isinstance(usage_payload, dict):
         output_tokens = usage_payload.get("output_tokens")
         if isinstance(output_tokens, int) and output_tokens >= 0:
             return output_tokens
-    return _count_context_tokens(assistant_text)
-
-
-def _estimate_context_tokens(*, context_bundle: dict[str, Any], user_message: str) -> int:
-    token_total = _count_context_tokens(user_message)
-
-    policy_system_instructions = context_bundle.get("policy_system_instructions")
-    if isinstance(policy_system_instructions, list):
-        for instruction in policy_system_instructions:
-            if isinstance(instruction, str):
-                token_total += _count_context_tokens(instruction)
-
-    discord_context_text = _discord_context_text(context_bundle.get("discord_context"))
-    if discord_context_text is not None:
-        token_total += _count_context_tokens(discord_context_text)
-
-    discord_channel_recent_turns = context_bundle.get("discord_channel_recent_turns")
-    if isinstance(discord_channel_recent_turns, list):
-        for prior_turn in discord_channel_recent_turns:
-            if not isinstance(prior_turn, dict):
-                continue
-            prior_user_message = prior_turn.get("user_message")
-            if isinstance(prior_user_message, str):
-                token_total += _count_context_tokens(prior_user_message)
-            prior_assistant_message = prior_turn.get("assistant_message")
-            if isinstance(prior_assistant_message, str):
-                token_total += _count_context_tokens(prior_assistant_message)
-
-    recent_active_session_turns = context_bundle.get("recent_active_session_turns")
-    if isinstance(recent_active_session_turns, list):
-        for prior_turn in recent_active_session_turns:
-            if not isinstance(prior_turn, dict):
-                continue
-            prior_user_message = prior_turn.get("user_message")
-            if isinstance(prior_user_message, str):
-                token_total += _count_context_tokens(prior_user_message)
-            prior_assistant_message = prior_turn.get("assistant_message")
-            if isinstance(prior_assistant_message, str):
-                token_total += _count_context_tokens(prior_assistant_message)
-
-    profile = context_bundle.get("profile")
-    if isinstance(profile, str):
-        token_total += _count_context_tokens(profile)
-
-    session_digest = context_bundle.get("session_digest")
-    if isinstance(session_digest, str):
-        token_total += _count_context_tokens(session_digest)
-
-    open_commitments_and_jobs = context_bundle.get("open_commitments_and_jobs")
-    if isinstance(open_commitments_and_jobs, dict):
-        jobs_raw = open_commitments_and_jobs.get("open_jobs")
-        if isinstance(jobs_raw, list):
-            for job in jobs_raw:
-                if not isinstance(job, dict):
-                    continue
-                for key in ("id", "status", "title", "external_job_id", "summary"):
-                    raw_value = job.get(key)
-                    if isinstance(raw_value, str):
-                        token_total += _count_context_tokens(raw_value)
-
-    relevant_artifacts_and_observations = context_bundle.get("relevant_artifacts_and_observations")
-    if isinstance(relevant_artifacts_and_observations, dict):
-        artifacts_raw = relevant_artifacts_and_observations.get("artifacts")
-        if isinstance(artifacts_raw, list):
-            for artifact in artifacts_raw:
-                if not isinstance(artifact, dict):
-                    continue
-                for key in ("title", "source"):
-                    raw_value = artifact.get(key)
-                    if isinstance(raw_value, str):
-                        token_total += _count_context_tokens(raw_value)
-
-    return token_total
+    return 0
 
 
 def _turn_limit_message(violation: TurnLimitViolation) -> str:
-    if violation.budget == "context_tokens":
-        return (
-            "this turn stopped because the context budget was exhausted. "
-            "please resend with only the most relevant details needed to proceed."
-        )
     if violation.budget == "response_tokens":
         return (
             "this turn stopped because the response budget was exhausted. "
@@ -834,8 +724,6 @@ def _turn_limit_message(violation: TurnLimitViolation) -> str:
 
 def _applied_turn_limits(settings: AppSettings) -> dict[str, Any]:
     return {
-        "max_recent_turns": int(settings.max_recent_turns),
-        "max_context_tokens": int(settings.max_context_tokens),
         "max_response_tokens": int(settings.max_response_tokens),
         "main_turn_budget_seconds": float(settings.main_turn_budget_seconds),
         "agent_loop_max_model_calls": int(settings.agent_loop_max_model_calls),
@@ -1629,14 +1517,10 @@ def _rotate_active_session(
     active_session.lifecycle_state = "closed"
     active_session.updated_at = now
 
-    # Carry the conversation digest forward so continuity survives the rotation:
-    # a deterministic copy of state, not a judgment. The closing session's final
-    # turn still gets its normal post-turn rememberer, which evolves the digest.
     rotated_session = SessionRecord(
         id=rotated_session_id,
         is_active=True,
         lifecycle_state="active",
-        digest=active_session.digest,
         rotated_from_session_id=prior_session_id,
         rotation_reason=reason,
         created_at=now,
@@ -1665,21 +1549,17 @@ def _auto_rotation_reason(
     *,
     session_created_at: datetime,
     prior_turn_count: int,
-    estimated_context_tokens: int,
     max_turns: int,
     max_age_seconds: int,
-    max_context_pressure_tokens: int,
     now: datetime,
 ) -> tuple[str | None, dict[str, Any]]:
     session_age_seconds = max(0, int((now - session_created_at).total_seconds()))
     snapshot = {
         "session_age_seconds": session_age_seconds,
         "prior_turn_count": prior_turn_count,
-        "estimated_context_tokens": estimated_context_tokens,
         "thresholds": {
             "max_turns": max_turns,
             "max_age_seconds": max_age_seconds,
-            "max_context_pressure_tokens": max_context_pressure_tokens,
         },
     }
     if prior_turn_count <= 0:
@@ -1688,84 +1568,29 @@ def _auto_rotation_reason(
         return "threshold_turn_count", snapshot
     if session_age_seconds >= max_age_seconds:
         return "threshold_age", snapshot
-    if estimated_context_tokens >= max_context_pressure_tokens:
-        return "threshold_context_pressure", snapshot
     return None, snapshot
 
 
 def _build_turn_context_bundle(
     *,
-    prior_turns: Sequence[TurnRecord],
-    max_recent_turns: int,
     discord_context: dict[str, Any] | None,
-    profile: str,
-    session_digest: str | None,
-    recalled_memory: Sequence[MemoryFactRecord],
+    recall_v1: dict[str, Any],
     open_commitments_and_jobs: dict[str, Any],
     relevant_artifacts_and_observations: dict[str, Any],
 ) -> dict[str, Any]:
-    recent_turns = prior_turns[-max_recent_turns:]
-    recent_active_session_turns = [
-        {
-            "turn_id": turn.id,
-            "user_message": turn.user_message,
-            "assistant_message": turn.assistant_message,
-            "status": turn.status,
-        }
-        for turn in recent_turns
-    ]
-    discord_channel_recent_turns: list[dict[str, Any]] = []
-    discord_channel_id = discord_context.get("channel_id") if discord_context is not None else None
-    if isinstance(discord_channel_id, int):
-        for turn in prior_turns:
-            for event in turn.events:
-                if event.event_type != "evt.turn.started":
-                    continue
-                event_discord = event.payload.get("discord")
-                if not isinstance(event_discord, dict):
-                    continue
-                if event_discord.get("channel_id") != discord_channel_id:
-                    continue
-                discord_channel_recent_turns.append(
-                    {
-                        "turn_id": turn.id,
-                        "message_id": event_discord.get("message_id"),
-                        "user_message": turn.user_message,
-                        "assistant_message": turn.assistant_message,
-                        "status": turn.status,
-                    }
-                )
-                break
-        discord_channel_recent_turns = discord_channel_recent_turns[-max_recent_turns:]
-    omitted_turn_count = len(prior_turns) - len(recent_active_session_turns)
-    included_turn_ids = [turn["turn_id"] for turn in recent_active_session_turns]
-
     section_order = list(_CONTEXT_SECTION_ORDER)
     if discord_context is not None:
         section_order.insert(1, "discord_context")
-    if discord_channel_recent_turns:
-        section_order.insert(2, "discord_channel_recent_turns")
 
     context_bundle: dict[str, Any] = {
         "section_order": section_order,
         "policy_system_instructions": list(_POLICY_SYSTEM_INSTRUCTIONS),
-        "recent_active_session_turns": recent_active_session_turns,
-        "profile": profile,
-        "session_digest": session_digest,
-        "recalled_memory": list(recalled_memory),
+        "recall_v1": recall_v1,
         "open_commitments_and_jobs": dict(open_commitments_and_jobs),
         "relevant_artifacts_and_observations": dict(relevant_artifacts_and_observations),
-        "recent_window": {
-            "max_recent_turns": max_recent_turns,
-            "included_turn_count": len(recent_active_session_turns),
-            "omitted_turn_count": omitted_turn_count,
-            "included_turn_ids": included_turn_ids,
-        },
     }
     if discord_context is not None:
         context_bundle["discord_context"] = dict(discord_context)
-    if discord_channel_recent_turns:
-        context_bundle["discord_channel_recent_turns"] = discord_channel_recent_turns
     return context_bundle
 
 
@@ -1915,9 +1740,8 @@ def _runtime_provenance_for_turn(
     *,
     db: Session,
     prior_turns: Sequence[TurnRecord],
-    max_recent_turns: int,
 ) -> RuntimeProvenance:
-    recent_turns = prior_turns[-max_recent_turns:]
+    recent_turns = prior_turns[-_TAINT_LOOKBACK_TURNS:]
     recent_turn_ids = [turn.id for turn in recent_turns]
     if not recent_turn_ids:
         return RuntimeProvenance(status="clean", evidence=())
@@ -2154,33 +1978,11 @@ def _wake(
         .where(TurnRecord.session_id == active_session.id)
         .order_by(TurnRecord.created_at.asc(), TurnRecord.id.asc())
     ).all()
-    # Estimate context size for the rotation-pressure trigger. The retriever
-    # is a per-turn step, not part of this estimate, so recalled_memory is
-    # empty here; the profile and digest are the always-loaded documents.
-    pre_rotation_context_bundle = _build_turn_context_bundle(
-        prior_turns=prior_turns,
-        max_recent_turns=int(runtime.settings.max_recent_turns),
-        discord_context=discord_context,
-        profile=read_profile(db),
-        session_digest=active_session.digest,
-        recalled_memory=[],
-        open_commitments_and_jobs=_open_commitments_and_jobs_context(db=db),
-        relevant_artifacts_and_observations=_relevant_artifacts_and_observations_context(
-            db=db,
-            prior_turns=prior_turns,
-        ),
-    )
-    estimated_context_tokens = _estimate_context_tokens(
-        context_bundle=pre_rotation_context_bundle,
-        user_message=user_message,
-    )
     auto_rotation_reason, trigger_snapshot = _auto_rotation_reason(
         session_created_at=active_session.created_at,
         prior_turn_count=len(prior_turns),
-        estimated_context_tokens=estimated_context_tokens,
         max_turns=int(runtime.settings.auto_rotate_max_turns),
         max_age_seconds=int(runtime.settings.auto_rotate_max_age_seconds),
-        max_context_pressure_tokens=int(runtime.settings.auto_rotate_context_pressure_tokens),
         now=_utcnow(),
     )
     if auto_rotation_reason is not None:
@@ -2201,7 +2003,6 @@ def _wake(
     runtime_provenance = _runtime_provenance_for_turn(
         db=db,
         prior_turns=prior_turns,
-        max_recent_turns=int(runtime.settings.max_recent_turns),
     )
     runtime_provenance = _merge_runtime_provenance(
         baseline=runtime_provenance,
@@ -2251,25 +2052,54 @@ def _wake(
         )
     add_event("evt.turn.started", {"message": user_message, "discord": discord_context})
 
-    # Pre-turn memory: the always-loaded profile and session digest, plus the
-    # retriever's verdict on which stored facts matter now. The retriever is
-    # a bounded AI subagent that audits its own ai_judgments row; it is
-    # non-fatal -- any failure leaves the turn alive on the profile and
-    # digest alone, so recall is never on the turn's critical-failure path.
-    memory_profile = read_profile(db)
-    session_digest = active_session.digest
+    # Append wake-entry event to memory_log before the retriever runs so the
+    # retriever can find the current wake in its search.
+    match wake_context.trigger_kind:
+        case "user_message":
+            wake_log_kind: Literal["user_message", "proactive_trigger"] = "user_message"
+        case "scheduled_task" | "research_completion":
+            wake_log_kind = "proactive_trigger"
+        case _:
+            assert_never(wake_context.trigger_kind)
+    append_log_event(
+        db,
+        kind=wake_log_kind,
+        content=user_message,
+        session_id=effective_session_id,
+        turn_id=turn.id,
+        taint=runtime_provenance.status,
+        source_ref=turn.id,
+        settings=runtime.settings,
+        now=_utcnow(),
+        new_id_fn=_new_id,
+    )
+
+    # Pre-turn retrieval — the retriever reconstructs the working context
+    # agentically.  Recall failure is non-fatal: the turn proceeds on the
+    # system prompt alone.
+    _recall_partial: dict[str, Any] = {"summary": "", "items": [], "status": "partial"}
     try:
-        recalled_facts: list[MemoryFactRecord] = run_retriever(
+        recall_v1: dict[str, Any] = run_retriever(
+            sandbox=runtime.sandbox,
+            db=db,
             session_factory=runtime.session_factory,
-            query=user_message,
-            source_type="turn",
-            source_id=turn.id,
+            session_id=effective_session_id,
+            turn=turn,
             settings=runtime.settings,
+            model_adapter=runtime.model_adapter,
+            google_runtime=google_runtime,
+            agency_runtime=build_agency_runtime(runtime.settings),
+            attachment_runtime=runtime.attachment_runtime,
+            query=user_message,
+            allowed_capability_ids=RESEARCH_MEMORIES_CAPABILITY_IDS,
+            approval_ttl_seconds=int(runtime.settings.approval_ttl_seconds),
+            approval_actor_id=str(runtime.settings.approval_actor_id),
+            add_event=add_event,
             now_fn=_utcnow,
             new_id_fn=_new_id,
         )
     except Exception as exc:
-        recalled_facts = []
+        recall_v1 = _recall_partial
         add_event(
             "evt.memory.recall_failed",
             {
@@ -2281,15 +2111,10 @@ def _wake(
             },
         )
 
-    open_commitments_and_jobs = _open_commitments_and_jobs_context(db=db)
     context_bundle = _build_turn_context_bundle(
-        prior_turns=prior_turns,
-        max_recent_turns=int(runtime.settings.max_recent_turns),
         discord_context=discord_context,
-        profile=memory_profile,
-        session_digest=session_digest,
-        recalled_memory=recalled_facts,
-        open_commitments_and_jobs=open_commitments_and_jobs,
+        recall_v1=recall_v1,
+        open_commitments_and_jobs=_open_commitments_and_jobs_context(db=db),
         relevant_artifacts_and_observations=_relevant_artifacts_and_observations_context(
             db=db,
             prior_turns=prior_turns,
@@ -2309,11 +2134,6 @@ def _wake(
         agency_configured=agency_configured,
         settings=runtime.settings,
     )
-    if recalled_facts:
-        add_event(
-            "evt.memory.recalled",
-            {"turn_id": turn.id, "recalled_fact_ids": [fact.id for fact in recalled_facts]},
-        )
     applied_limits = _applied_turn_limits(runtime.settings)
 
     def build_turn_limit_failure(
@@ -2432,7 +2252,7 @@ def _wake(
         responses_input_items=responses_input_items,
         tools=responses_tools,
         user_message=user_message,
-        history=context_bundle["recent_active_session_turns"],
+        history=[],
         context_bundle=context_bundle,
         allowed_capability_ids=frozenset(allowed_capability_ids),
         scratch=scratch,
@@ -2548,16 +2368,17 @@ def _wake(
             }
         assistant_message = assistant_response["assistant_text"]
         turn.assistant_message = assistant_message
-        # Post-turn memory: one rememberer task reviews the completed turn
-        # and maintains the fact store, the profile, and the session digest.
-        remember_task_id = enqueue_memory_remember(
+        append_log_event(
             db,
+            kind="assistant_message",
+            content=assistant_message,
+            session_id=effective_session_id,
             turn_id=turn.id,
+            taint=runtime_provenance.status,
+            source_ref=turn.id,
+            settings=runtime.settings,
             now=_utcnow(),
-        )
-        add_event(
-            "evt.memory.remember_queued",
-            {"task_id": remember_task_id, "turn_id": turn.id},
+            new_id_fn=_new_id,
         )
 
         turn.status = "completed"
@@ -2676,11 +2497,8 @@ def create_app(
     app.state.bind_port = settings.bind_port
     app.state.local_auth_required = settings.local_auth_required
     app.state.local_auth_token = settings.local_auth_token
-    app.state.max_recent_turns = settings.max_recent_turns
-    app.state.max_context_tokens = settings.max_context_tokens
     app.state.auto_rotate_max_turns = settings.auto_rotate_max_turns
     app.state.auto_rotate_max_age_seconds = settings.auto_rotate_max_age_seconds
-    app.state.auto_rotate_context_pressure_tokens = settings.auto_rotate_context_pressure_tokens
     app.state.max_response_tokens = settings.max_response_tokens
     app.state.main_turn_budget_seconds = settings.main_turn_budget_seconds
     app.state.agent_loop_max_model_calls = settings.agent_loop_max_model_calls
@@ -3064,33 +2882,6 @@ def create_app(
                     return build_surface_rotation_list_response(rotations=payload)
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
-
-    @app.get("/v1/memory/facts", response_model=None)
-    def get_memory_facts(limit: int = 200) -> dict[str, Any]:
-        # Operator inspection of the flat fact store. The model reaches memory
-        # only through the memory.recall / memory.remember syscalls; this read
-        # route is for humans, not a memory-mutation surface.
-        _ensure_schema_ready()
-        bounded_limit = max(1, min(limit, 1000))
-        with session_factory() as db:
-            with db.begin():
-                facts = list_active_facts(db, limit=bounded_limit)
-                return {
-                    "ok": True,
-                    "facts": [
-                        {
-                            "id": fact.id,
-                            "content": fact.content,
-                            "status": fact.status,
-                            "created_at": to_rfc3339(fact.created_at),
-                            "updated_at": to_rfc3339(fact.updated_at),
-                            "last_recalled_at": to_rfc3339(fact.last_recalled_at)
-                            if fact.last_recalled_at is not None
-                            else None,
-                        }
-                        for fact in facts
-                    ],
-                }
 
     @app.get("/v1/weather/default-location")
     def get_weather_default_location() -> dict[str, Any]:

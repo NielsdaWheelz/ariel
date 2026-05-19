@@ -37,16 +37,11 @@ class AppSettings(BaseSettings):
     model_timeout_seconds: float = 30.0
     model_reasoning_effort: str = "medium"
     model_verbosity: str = "low"
-    max_recent_turns: int = 12
-    memory_recall_candidate_limit: int = 24
-    max_context_tokens: int = 6000
     memory_embedding_provider: str = "openai"
     memory_embedding_model: str = "text-embedding-3-small"
     memory_embedding_dimensions: int = MEMORY_EMBEDDING_DIMENSIONS
-    memory_sweep_interval_seconds: int = 86400
     auto_rotate_max_turns: int = 120
     auto_rotate_max_age_seconds: int = 172800
-    auto_rotate_context_pressure_tokens: int = 5400
     max_response_tokens: int = 700
     main_turn_budget_seconds: float = 180.0
     research_run_budget_seconds: float = 300.0
@@ -242,27 +237,6 @@ class AppSettings(BaseSettings):
             raise ValueError("model_verbosity must be one of: low, medium, high")
         return normalized
 
-    @field_validator("max_recent_turns")
-    @classmethod
-    def _max_recent_turns_must_be_positive(cls, value: int) -> int:
-        if value < 1:
-            raise ValueError("max_recent_turns must be >= 1")
-        return value
-
-    @field_validator("memory_recall_candidate_limit")
-    @classmethod
-    def _memory_recall_candidate_limit_must_be_positive(cls, value: int) -> int:
-        if value < 1:
-            raise ValueError("memory_recall_candidate_limit must be >= 1")
-        return value
-
-    @field_validator("max_context_tokens")
-    @classmethod
-    def _max_context_tokens_must_be_positive(cls, value: int) -> int:
-        if value < 1:
-            raise ValueError("max_context_tokens must be >= 1")
-        return value
-
     @field_validator(
         "memory_embedding_provider",
         "memory_embedding_model",
@@ -281,13 +255,6 @@ class AppSettings(BaseSettings):
             raise ValueError(f"memory_embedding_dimensions must be {MEMORY_EMBEDDING_DIMENSIONS}")
         return value
 
-    @field_validator("memory_sweep_interval_seconds")
-    @classmethod
-    def _memory_sweep_interval_seconds_must_be_positive(cls, value: int) -> int:
-        if value < 1:
-            raise ValueError("memory_sweep_interval_seconds must be >= 1")
-        return value
-
     @field_validator("auto_rotate_max_turns")
     @classmethod
     def _auto_rotate_max_turns_must_be_positive(cls, value: int) -> int:
@@ -300,13 +267,6 @@ class AppSettings(BaseSettings):
     def _auto_rotate_max_age_seconds_must_be_positive(cls, value: int) -> int:
         if value < 1:
             raise ValueError("auto_rotate_max_age_seconds must be >= 1")
-        return value
-
-    @field_validator("auto_rotate_context_pressure_tokens")
-    @classmethod
-    def _auto_rotate_context_pressure_tokens_must_be_positive(cls, value: int) -> int:
-        if value < 1:
-            raise ValueError("auto_rotate_context_pressure_tokens must be >= 1")
         return value
 
     @field_validator("max_response_tokens")
