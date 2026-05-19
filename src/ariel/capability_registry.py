@@ -55,7 +55,17 @@ EMAIL_MUTATION_CAPABILITY_IDS = {
     "cap.email.labels.modify",
     "cap.email.undo",
 }
-MEMORY_CAPABILITY_IDS = {"cap.memory.recall", "cap.memory.remember"}
+MEMORY_CAPABILITY_IDS: frozenset[str] = frozenset(
+    {
+        "cap.memory.recall",
+        "cap.memory.remember",
+        "cap.memory.search",
+        "cap.memory.read",
+        "cap.memory.note.create",
+        "cap.memory.note.edit",
+        "cap.memory.note.delete",
+    }
+)
 PROACTIVE_CAPABILITY_IDS = {"cap.proactive.schedule"}
 MAPS_CAPABILITY_IDS = {"cap.maps.directions", "cap.maps.search_places"}
 RESEARCH_CAPABILITY_IDS = {"cap.research.investigate"}
@@ -69,6 +79,21 @@ RESEARCH_PERSONAL_CAPABILITY_IDS: frozenset[str] = frozenset(
         "cap.drive.search",
         "cap.drive.read",
         "cap.calendar.list",
+    }
+)
+RESEARCH_MEMORIES_CAPABILITY_IDS: frozenset[str] = frozenset(
+    {
+        "cap.memory.search",
+        "cap.memory.read",
+    }
+)
+REMEMBERER_CAPABILITY_IDS: frozenset[str] = frozenset(
+    {
+        "cap.memory.search",
+        "cap.memory.read",
+        "cap.memory.note.create",
+        "cap.memory.note.edit",
+        "cap.memory.note.delete",
     }
 )
 
@@ -1049,6 +1074,99 @@ def _validate_memory_remember_input(
     return _validate_exact_text_input(raw_input, field_name="note", max_length=12_000)
 
 
+_MEMORY_LOG_KINDS = frozenset(
+    {
+        "user_message",
+        "agent_round",
+        "assistant_message",
+        "tool_observation",
+        "proactive_trigger",
+        "note_create",
+        "note_edit",
+        "note_delete",
+        "recall",
+        "research_finding",
+    }
+)
+
+
+def _validate_memory_search_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not set(raw_input.keys()).issubset({"query", "limit", "since", "kinds"}):
+        return None, "schema_invalid"
+    query_raw = raw_input.get("query")
+    if not isinstance(query_raw, str):
+        return None, "schema_invalid"
+    query = query_raw.strip()
+    if not query or len(query) > 12_000:
+        return None, "schema_invalid"
+    limit_raw = raw_input.get("limit")
+    if limit_raw is None:
+        limit = None
+    elif isinstance(limit_raw, int) and not isinstance(limit_raw, bool):
+        if limit_raw < 1 or limit_raw > 100:
+            return None, "schema_invalid"
+        limit = limit_raw
+    else:
+        return None, "schema_invalid"
+    since_raw = raw_input.get("since")
+    if since_raw is None:
+        since = None
+    elif isinstance(since_raw, str):
+        since = since_raw.strip() or None
+    else:
+        return None, "schema_invalid"
+    kinds_raw = raw_input.get("kinds")
+    if kinds_raw is None:
+        kinds = None
+    elif isinstance(kinds_raw, list):
+        kinds: list[str] | None = []
+        for k in kinds_raw:
+            if not isinstance(k, str) or k not in _MEMORY_LOG_KINDS:
+                return None, "schema_invalid"
+            kinds.append(k)
+    else:
+        return None, "schema_invalid"
+    return {"query": query, "limit": limit, "since": since, "kinds": kinds}, None
+
+
+def _validate_memory_read_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    return _validate_exact_text_input(raw_input, field_name="id", max_length=32)
+
+
+def _validate_memory_note_create_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    return _validate_exact_text_input(raw_input, field_name="content", max_length=12_000)
+
+
+def _validate_memory_note_edit_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if set(raw_input.keys()) != {"id", "content"}:
+        return None, "schema_invalid"
+    id_raw = raw_input.get("id")
+    content_raw = raw_input.get("content")
+    if not isinstance(id_raw, str) or not isinstance(content_raw, str):
+        return None, "schema_invalid"
+    note_id = id_raw.strip()
+    content = content_raw.strip()
+    if not note_id or len(note_id) > 32:
+        return None, "schema_invalid"
+    if not content or len(content) > 12_000:
+        return None, "schema_invalid"
+    return {"id": note_id, "content": content}, None
+
+
+def _validate_memory_note_delete_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    return _validate_exact_text_input(raw_input, field_name="id", max_length=32)
+
+
 def _validate_proactive_schedule_input(
     raw_input: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
@@ -1067,7 +1185,7 @@ def _validate_proactive_schedule_input(
 
 
 _RESEARCH_INVESTIGATE_MAX_QUESTION_LENGTH = 4000
-_RESEARCH_INVESTIGATE_ALLOWED_MODES = {"web", "personal"}
+_RESEARCH_INVESTIGATE_ALLOWED_MODES = {"web", "personal", "memories"}
 
 
 def _validate_research_investigate_input(
@@ -3580,6 +3698,81 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         validate_input=_validate_memory_remember_input,
         execute=None,
     ),
+    "cap.memory.search": CapabilityDefinition(
+        capability_id="cap.memory.search",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "memory_search_v1",
+            "output_schema": "memory_search_result_v1",
+            "idempotency": "deterministic_read",
+            "execution_mode": "memory_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_search_input,
+        execute=None,
+    ),
+    "cap.memory.read": CapabilityDefinition(
+        capability_id="cap.memory.read",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "memory_read_v1",
+            "output_schema": "memory_read_result_v1",
+            "idempotency": "deterministic_read",
+            "execution_mode": "memory_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_read_input,
+        execute=None,
+    ),
+    "cap.memory.note.create": CapabilityDefinition(
+        capability_id="cap.memory.note.create",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "memory_note_create_v1",
+            "output_schema": "memory_note_create_result_v1",
+            "idempotency": "action_attempt_id",
+            "execution_mode": "memory_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_note_create_input,
+        execute=None,
+    ),
+    "cap.memory.note.edit": CapabilityDefinition(
+        capability_id="cap.memory.note.edit",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "memory_note_edit_v1",
+            "output_schema": "memory_note_edit_result_v1",
+            "idempotency": "action_attempt_id",
+            "execution_mode": "memory_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_note_edit_input,
+        execute=None,
+    ),
+    "cap.memory.note.delete": CapabilityDefinition(
+        capability_id="cap.memory.note.delete",
+        version="1.0",
+        impact_level="write_reversible",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "memory_note_delete_v1",
+            "output_schema": "memory_note_delete_result_v1",
+            "idempotency": "action_attempt_id",
+            "execution_mode": "memory_runtime_only",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_memory_note_delete_input,
+        execute=None,
+    ),
     "cap.proactive.schedule": CapabilityDefinition(
         capability_id="cap.proactive.schedule",
         version="1.0",
@@ -3689,8 +3882,13 @@ _RUN_CALLABLE_ALIASES = {
     "email.undo": "cap.email.undo",
     "maps.directions": "cap.maps.directions",
     "maps.search_places": "cap.maps.search_places",
+    "memory.note.create": "cap.memory.note.create",
+    "memory.note.delete": "cap.memory.note.delete",
+    "memory.note.edit": "cap.memory.note.edit",
+    "memory.read": "cap.memory.read",
     "memory.recall": "cap.memory.recall",
     "memory.remember": "cap.memory.remember",
+    "memory.search": "cap.memory.search",
     "proactive.schedule": "cap.proactive.schedule",
     "research.investigate": "cap.research.investigate",
     "search.news": "cap.search.news",

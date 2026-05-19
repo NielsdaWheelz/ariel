@@ -6,7 +6,11 @@ from datetime import UTC, datetime, timedelta
 import hashlib
 import json
 import secrets
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from ariel.app import ModelAdapter
+    from ariel.sandbox_runtime import SandboxRuntime
 
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy import select, text
@@ -24,6 +28,7 @@ from ariel.capability_registry import (
     MEMORY_CAPABILITY_IDS,
     PROACTIVE_CAPABILITY_IDS,
     RESEARCH_CAPABILITY_IDS,
+    RESEARCH_MEMORIES_CAPABILITY_IDS,
     canonical_action_payload,
     capability_contract_hash,
     get_capability,
@@ -47,7 +52,16 @@ from ariel.google_connector import (
     _decrypt_secret,
     _encrypt_secret,
 )
-from ariel.memory import run_rememberer, run_retriever
+from ariel.memory import (
+    create_note,
+    delete_note,
+    edit_note,
+    enqueue_memory_encode,
+    read_log_entry,
+    read_note,
+    run_retriever,
+    search_memory,
+)
 from ariel.persistence import (
     ActionAttemptRecord,
     ActionPrivatePayloadRecord,
@@ -605,45 +619,166 @@ def _execute_memory_capability(
     capability_id: str,
     normalized_input: dict[str, Any],
     session_id: str,
+    turn: TurnRecord | None = None,
+    caller_db: Session | None = None,
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
     settings: AppSettings | None = None,
+    sandbox: SandboxRuntime | None = None,
+    model_adapter: ModelAdapter | None = None,
+    google_runtime: GoogleConnectorRuntime | None = None,
+    agency_runtime: Any | None = None,
+    attachment_runtime: AttachmentContentRuntime | None = None,
+    approval_ttl_seconds: int = 0,
+    approval_actor_id: str = "",
+    add_event: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    """Run one memory syscall: ``cap.memory.recall`` delegates to the retriever
-    subagent, ``cap.memory.remember`` to the rememberer. Both subagents own their
-    own sessions and transactions, so they take ``session_factory`` rather than a
-    caller-held ``Session``. The main agent reaches memory only through these two
-    syscalls; it never touches the fact store, the profile, or the digest
-    directly."""
+    """Run one memory syscall.
+
+    ``cap.memory.recall`` runs the retriever subagent inline (firewalled context,
+    bounded budget) and returns a ``recall_v1`` dict.
+    ``cap.memory.remember`` enqueues a ``memory_encode`` background task and
+    returns the task id — fire-and-forget.
+    ``cap.memory.search`` / ``.read`` / ``.note.*`` execute directly against the
+    substrate inside their own short transaction.
+
+    All subagent-driven branches take ``session_factory`` rather than a
+    caller-held ``Session`` so they manage their own transactions.  The substrate
+    branches open a session from ``session_factory`` for the same reason.
+    """
     if settings is None:
         raise RuntimeError("memory_runtime_settings_not_bound")
+
     if capability_id == "cap.memory.recall":
-        facts = run_retriever(
+        if sandbox is None or model_adapter is None or turn is None or caller_db is None:
+            raise RuntimeError("memory_runtime_not_bound")
+        _add_event = add_event if add_event is not None else lambda _t, _p: None
+        recall = run_retriever(
+            sandbox=sandbox,
+            db=caller_db,
             session_factory=session_factory,
-            query=str(normalized_input["query"]),
-            source_type="session",
-            source_id=session_id,
-            settings=settings,
-            now_fn=now_fn,
-            new_id_fn=new_id_fn,
-        )
-        return {"status": "recalled", "facts": [fact.content for fact in facts]}
-    if capability_id == "cap.memory.remember":
-        output = run_rememberer(
-            session_factory=session_factory,
-            settings=settings,
-            now_fn=now_fn,
-            new_id_fn=new_id_fn,
-            trigger="note",
-            note=str(normalized_input["note"]),
             session_id=session_id,
+            turn=turn,
+            settings=settings,
+            model_adapter=model_adapter,
+            google_runtime=google_runtime,
+            agency_runtime=agency_runtime,
+            attachment_runtime=attachment_runtime,
+            query=str(normalized_input["query"]),
+            allowed_capability_ids=RESEARCH_MEMORIES_CAPABILITY_IDS,
+            approval_ttl_seconds=approval_ttl_seconds,
+            approval_actor_id=approval_actor_id,
+            add_event=_add_event,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
         )
-        return {
-            "status": "remembered",
-            "operation_count": len(output.operations),
-            "profile_updated": output.profile is not None,
-            "digest_updated": output.digest is not None,
-        }
+        return {"status": "recalled", "recall": recall}
+
+    if capability_id == "cap.memory.remember":
+        with session_factory() as db:
+            with db.begin():
+                task_id = enqueue_memory_encode(
+                    db,
+                    note=str(normalized_input["note"]),
+                    session_id=session_id,
+                    now=now_fn(),
+                )
+        return {"status": "queued", "encode_id": task_id}
+
+    if capability_id == "cap.memory.search":
+        query = str(normalized_input["query"])
+        limit_raw = normalized_input.get("limit")
+        limit = int(limit_raw) if limit_raw is not None else 24
+        since_raw = normalized_input.get("since")
+        since: datetime | None = None
+        if isinstance(since_raw, str) and since_raw:
+            try:
+                since = datetime.fromisoformat(since_raw.replace("Z", "+00:00"))
+            except ValueError:
+                raise RuntimeError("memory_search_since_invalid")
+        kinds_raw = normalized_input.get("kinds")
+        kinds: tuple[str, ...] | None = tuple(kinds_raw) if kinds_raw is not None else None
+        with session_factory() as db:
+            with db.begin():
+                hits = search_memory(
+                    db,
+                    query=query,
+                    settings=settings,
+                    limit=limit,
+                    since=since,
+                    kinds=kinds,
+                )
+        return {"status": "succeeded", "hits": hits}
+
+    if capability_id == "cap.memory.read":
+        entry_id = str(normalized_input["id"])
+        with session_factory() as db:
+            with db.begin():
+                log_row = read_log_entry(db, entry_id)
+                if log_row is not None:
+                    return {
+                        "status": "found",
+                        "layer": "log",
+                        "id": log_row.id,
+                        "kind": log_row.kind,
+                        "created_at": to_rfc3339(log_row.created_at),
+                        "content": log_row.content,
+                        "taint": log_row.taint,
+                        "session_id": log_row.session_id,
+                        "turn_id": log_row.turn_id,
+                    }
+                note_row = read_note(db, entry_id)
+                if note_row is not None:
+                    return {
+                        "status": "found",
+                        "layer": "note",
+                        "id": note_row.id,
+                        "kind": None,
+                        "created_at": to_rfc3339(note_row.created_at),
+                        "content": note_row.content,
+                        "taint": note_row.taint,
+                    }
+        return {"status": "not_found"}
+
+    if capability_id == "cap.memory.note.create":
+        with session_factory() as db:
+            with db.begin():
+                note = create_note(
+                    db,
+                    content=str(normalized_input["content"]),
+                    taint="clean",
+                    settings=settings,
+                    now=now_fn(),
+                    new_id_fn=new_id_fn,
+                )
+        return {"status": "created", "id": note.id}
+
+    if capability_id == "cap.memory.note.edit":
+        with session_factory() as db:
+            with db.begin():
+                note = edit_note(
+                    db,
+                    note_id=str(normalized_input["id"]),
+                    content=str(normalized_input["content"]),
+                    settings=settings,
+                    now=now_fn(),
+                    new_id_fn=new_id_fn,
+                )
+        return {"status": "edited", "id": note.id}
+
+    if capability_id == "cap.memory.note.delete":
+        note_id = str(normalized_input["id"])
+        with session_factory() as db:
+            with db.begin():
+                delete_note(
+                    db,
+                    note_id=note_id,
+                    settings=settings,
+                    now=now_fn(),
+                    new_id_fn=new_id_fn,
+                )
+        return {"status": "deleted", "id": note_id}
+
     raise RuntimeError("unknown_memory_capability")
 
 
@@ -2544,6 +2679,8 @@ def process_one_call(
     attachment_runtime: AttachmentContentRuntime | None,
     allowed_capability_id_set: set[str],
     settings: AppSettings | None,
+    sandbox: SandboxRuntime | None = None,
+    model_adapter: ModelAdapter | None = None,
 ) -> None:
     function_call_payload = function_call_raw if isinstance(function_call_raw, dict) else {}
     call_id_raw = function_call_payload.get("call_id")
@@ -3184,9 +3321,19 @@ def process_one_call(
                 capability_id=capability_id,
                 normalized_input=evaluation.normalized_input,
                 session_id=session_id,
+                turn=turn,
+                caller_db=db,
                 now_fn=now_fn,
                 new_id_fn=new_id_fn,
                 settings=settings,
+                sandbox=sandbox,
+                model_adapter=model_adapter,
+                google_runtime=google_runtime,
+                agency_runtime=agency_runtime,
+                attachment_runtime=attachment_runtime,
+                approval_ttl_seconds=approval_ttl_seconds,
+                approval_actor_id=approval_actor_id,
+                add_event=add_event,
             )
         except Exception as exc:  # noqa: BLE001
             execution_result = ExecutionResult(
