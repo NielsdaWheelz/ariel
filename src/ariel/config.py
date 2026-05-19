@@ -51,6 +51,7 @@ class AppSettings(BaseSettings):
     main_turn_budget_seconds: float = 180.0
     research_run_budget_seconds: float = 300.0
     agent_loop_max_model_calls: int = 50
+    agent_loop_live_rounds: int = 8
     approval_ttl_seconds: int = 900
     approval_actor_id: str = "user.local"
     google_oauth_client_id: str | None = None
@@ -330,6 +331,13 @@ class AppSettings(BaseSettings):
     def _agent_loop_max_model_calls_must_be_positive(cls, value: int) -> int:
         if value < 1:
             raise ValueError("agent_loop_max_model_calls must be >= 1")
+        return value
+
+    @field_validator("agent_loop_live_rounds")
+    @classmethod
+    def _agent_loop_live_rounds_must_be_positive(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("agent_loop_live_rounds must be >= 1")
         return value
 
     @field_validator("approval_ttl_seconds")
