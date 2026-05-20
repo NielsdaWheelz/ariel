@@ -35,6 +35,10 @@ class AppSettings(BaseSettings):
     bind_port: int = 8000
     local_auth_required: bool = False
     local_auth_token: str | None = None
+    # Schema reflection cost (inspector across REQUIRED_* maps + an alembic_version
+    # SELECT) is non-trivial under load. A short TTL coalesces health-check bursts
+    # while still letting a post-startup migration unblock 503s within seconds.
+    schema_readiness_ttl_seconds: float = 10.0
     model_name: str = "gpt-5.5"
     openai_api_key: str | None = None
     model_timeout_seconds: float = 30.0
@@ -506,6 +510,7 @@ class AppSettings(BaseSettings):
         "worker_poll_seconds",
         "subscriber_heartbeat_interval_seconds",
         "subscriber_heartbeat_staleness_factor",
+        "schema_readiness_ttl_seconds",
     )
     @classmethod
     def _positive_float_settings_must_be_positive(cls, value: float) -> float:

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
+import threading
+import time
 from typing import Any, Final
 
 from alembic import command
@@ -632,3 +635,58 @@ def missing_required_tables(engine: Engine) -> list[str]:
                     break
 
     return missing
+
+
+class SchemaReadinessProbe:
+    """TTL-cached schema readiness check shared by /v1/health and every protected handler.
+
+    Re-runs `missing_required_tables(engine)` at most once per `ttl_seconds` so a
+    burst of health checks does not slam the DB inspector, while a post-startup
+    migration becomes visible within the TTL window. Lock-coalesces concurrent
+    re-checks so only one thread reflects against the DB at a time."""
+
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        ttl_seconds: float,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
+        if ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be > 0")
+        self._engine = engine
+        self._ttl_seconds = float(ttl_seconds)
+        self._clock = clock if clock is not None else time.monotonic
+        self._lock = threading.Lock()
+        self._cached_missing: list[str] | None = None
+        self._cached_at: float | None = None
+
+    def missing_tables(self) -> list[str]:
+        now = self._clock()
+        cached_missing = self._cached_missing
+        cached_at = self._cached_at
+        if (
+            cached_missing is not None
+            and cached_at is not None
+            and (now - cached_at) < self._ttl_seconds
+        ):
+            return list(cached_missing)
+        with self._lock:
+            now = self._clock()
+            cached_missing = self._cached_missing
+            cached_at = self._cached_at
+            if (
+                cached_missing is not None
+                and cached_at is not None
+                and (now - cached_at) < self._ttl_seconds
+            ):
+                return list(cached_missing)
+            fresh = missing_required_tables(self._engine)
+            self._cached_missing = list(fresh)
+            self._cached_at = self._clock()
+            return list(fresh)
+
+    def invalidate(self) -> None:
+        with self._lock:
+            self._cached_missing = None
+            self._cached_at = None

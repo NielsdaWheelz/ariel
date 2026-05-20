@@ -51,7 +51,7 @@ from ariel.capability_registry import (
     run_callable_name_for_capability_id,
 )
 from ariel.config import AppSettings
-from ariel.db import missing_required_tables, reset_schema_for_tests
+from ariel.db import SchemaReadinessProbe, reset_schema_for_tests
 from ariel.google_connector import (
     DefaultGoogleOAuthClient,
     DefaultGoogleWorkspaceProvider,
@@ -2550,7 +2550,13 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if reset_database:
             reset_schema_for_tests(engine, db_url)
-        app.state.schema_missing_tables = missing_required_tables(engine)
+        # Prime the cache so the first health check is fast. A failure here does
+        # not abort startup — health stays 503 until the probe's next refresh
+        # sees the schema cleared, so operators can run migrations against the
+        # live process and recover without a restart.
+        probe = app.state.schema_probe
+        probe.invalidate()
+        probe.missing_tables()
         if run_sandbox is not None:
             run_sandbox.start()
         try:
@@ -2597,7 +2603,10 @@ def create_app(
         timeout_seconds=settings.google_oauth_timeout_seconds,
     )
     app.state.google_workspace_provider = DefaultGoogleWorkspaceProvider()
-    app.state.schema_missing_tables = []
+    app.state.schema_probe = SchemaReadinessProbe(
+        engine,
+        ttl_seconds=settings.schema_readiness_ttl_seconds,
+    )
 
     @app.exception_handler(ApiError)
     def _handle_api_error(_: Request, exc: ApiError) -> JSONResponse:
@@ -2687,12 +2696,14 @@ def create_app(
         }
 
     def _ensure_schema_ready() -> None:
-        if app.state.schema_missing_tables:
+        # Resolved from app.state so tests can inject a clock-controlled probe.
+        missing = app.state.schema_probe.missing_tables()
+        if missing:
             raise ApiError(
                 status_code=503,
                 code="E_SCHEMA_NOT_READY",
                 message="database schema is not migrated",
-                details={"missing_tables": app.state.schema_missing_tables},
+                details={"missing_tables": missing},
                 retryable=False,
             )
 
@@ -2707,13 +2718,14 @@ def create_app(
 
     @app.get("/v1/health", response_model=None)
     def health() -> JSONResponse | dict[str, Any]:
-        if app.state.schema_missing_tables:
+        missing = app.state.schema_probe.missing_tables()
+        if missing:
             return _error_response(
                 ApiError(
                     status_code=503,
                     code="E_SCHEMA_NOT_READY",
                     message="database schema is not migrated",
-                    details={"missing_tables": app.state.schema_missing_tables},
+                    details={"missing_tables": missing},
                     retryable=False,
                 )
             )

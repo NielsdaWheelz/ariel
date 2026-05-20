@@ -19,7 +19,7 @@ from tests.integration.responses_helpers import (
     responses_run_message,
     responses_with_run_calls,
 )
-from ariel.db import run_migrations
+from ariel.db import SchemaReadinessProbe, run_migrations
 from tests.fake_sandbox import FakeSandboxRuntime
 
 
@@ -739,6 +739,63 @@ def test_schema_not_ready_returns_503_until_migrated(unmigrated_postgres_url: st
     )
     with TestClient(app_with_migration) as client:
         assert client.get("/v1/health").status_code == 200
+        assert client.get("/v1/sessions/active").status_code == 200
+
+
+def test_schema_readiness_recovers_when_migrations_land_after_startup(
+    unmigrated_postgres_url: str,
+) -> None:
+    # Regression: before this fix, app.state.schema_missing_tables was computed
+    # once at lifespan startup and never re-checked, so a post-startup migration
+    # left /v1/health stuck at 503 forever. The TTL-cached probe must reflect
+    # the current DB state within the TTL window.
+    adapter = DeterministicModelAdapter()
+    app = create_app(
+        database_url=unmigrated_postgres_url,
+        model_adapter=adapter,
+        reset_database=False,
+        sandbox=FakeSandboxRuntime(),
+    )
+    fake_now = [0.0]
+
+    def fake_clock() -> float:
+        return fake_now[0]
+
+    ttl_seconds = 10.0
+    app.state.schema_probe = SchemaReadinessProbe(
+        app.state.engine,
+        ttl_seconds=ttl_seconds,
+        clock=fake_clock,
+    )
+    with TestClient(app) as client:
+        first = client.get("/v1/health")
+        assert first.status_code == 503
+        first_body = first.json()
+        assert first_body["error"]["code"] == "E_SCHEMA_NOT_READY"
+        first_missing = first_body["error"]["details"]["missing_tables"]
+        assert first_missing
+
+        # A second hit within the TTL window must come from the cache, not
+        # re-reflect against the DB — same payload, same identity.
+        cached = client.get("/v1/health")
+        assert cached.status_code == 503
+        assert cached.json()["error"]["details"]["missing_tables"] == first_missing
+
+        # Migrations land while the process keeps running.
+        run_migrations(unmigrated_postgres_url)
+
+        # Still within the TTL window: the probe returns the cached 503.
+        stale = client.get("/v1/health")
+        assert stale.status_code == 503
+
+        # Advance past the TTL: the next probe re-reflects against the DB and
+        # sees the schema is now ready.
+        fake_now[0] += ttl_seconds + 0.1
+
+        recovered = client.get("/v1/health")
+        assert recovered.status_code == 200
+
+        # And every other protected route also recovers without a restart.
         assert client.get("/v1/sessions/active").status_code == 200
 
 
