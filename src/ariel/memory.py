@@ -831,19 +831,30 @@ def enqueue_due_memory_dream(
 ) -> str | None:
     """Self-gating periodic dream enqueuer.
 
-    Enqueues one ``memory_dream`` task when no dream has been enqueued within
-    the configured interval; otherwise returns ``None``.
+    Enqueues one ``memory_dream`` task when no dream task is currently queued
+    AND the last dream turn (queued, in_progress, or completed) is older than
+    ``memory_dream_interval_seconds``. Gating on ``turns`` rather than
+    ``background_tasks`` is essential: the queue row is deleted on completion,
+    so a queue-only check re-enqueues after every cycle (~1-2 minutes) instead
+    of honouring the configured interval (24h default).
     """
     interval = timedelta(seconds=settings.memory_dream_interval_seconds)
-    recent = db.scalar(
+    queued = db.scalar(
         select(BackgroundTaskRecord.id)
+        .where(BackgroundTaskRecord.task_type == "memory_dream")
+        .limit(1)
+    )
+    if queued is not None:
+        return None
+    recent_turn = db.scalar(
+        select(TurnRecord.id)
         .where(
-            BackgroundTaskRecord.task_type == "memory_dream",
-            BackgroundTaskRecord.created_at > now - interval,
+            TurnRecord.kind == "memory_dream",
+            TurnRecord.created_at > now - interval,
         )
         .limit(1)
     )
-    if recent is not None:
+    if recent_turn is not None:
         return None
     task = enqueue_background_task(db, task_type="memory_dream", payload={}, now=now)
     return task.id

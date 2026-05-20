@@ -134,15 +134,24 @@ def _deliver_to_discord(
             pending_approvals.append(entry)
 
     # Build message content: base message, then approval-pending lines.
+    # The expires_at timestamp is rendered as a Discord relative-time marker
+    # (e.g. "in 14 minutes") rather than an opaque ISO string. The approval
+    # reference id is intentionally omitted — the buttons carry it.
     content = message.strip()
     if pending_approvals:
         approval_lines: list[str] = []
         for entry in pending_approvals:
-            suffix = f" expires_at={entry['expires_at']}" if "expires_at" in entry else ""
-            approval_lines.append(
-                f"Approval pending ({entry['action_label']}): {entry['ref']}{suffix}. "
-                "Use the buttons below."
-            )
+            line = f"⏳ {entry['action_label']} — needs approval"
+            expires_at = entry.get("expires_at")
+            if isinstance(expires_at, str):
+                try:
+                    epoch = int(
+                        datetime.fromisoformat(expires_at.replace("Z", "+00:00")).timestamp()
+                    )
+                    line = f"{line} (expires <t:{epoch}:R>)"
+                except ValueError:
+                    pass
+            approval_lines.append(line)
         content = "\n".join([content, "", *approval_lines])
 
     if len(content) > 1900:

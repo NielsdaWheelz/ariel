@@ -3835,6 +3835,12 @@ _ACTION_LABELS_BY_CAPABILITY_ID = {
     "cap.email.send": "Send email",
     "cap.email.trash": "Move email to trash",
     "cap.email.undo": "Undo email change",
+    "cap.memory.remember": "Save to memory",
+    "cap.memory.note.create": "Create memory note",
+    "cap.memory.note.edit": "Edit memory note",
+    "cap.memory.note.delete": "Delete memory note",
+    "cap.proactive.schedule": "Schedule reminder",
+    "cap.research.investigate": "Start research",
 }
 
 
