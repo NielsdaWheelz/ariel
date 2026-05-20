@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from sqlalchemy import select
@@ -625,7 +625,7 @@ def _seed_connected_google_connector(
                         key_version=settings.connector_encryption_key_version,
                         encryption_keys=settings.connector_encryption_keys,
                     ),
-                    access_token_expires_at=None,
+                    access_token_expires_at=now + timedelta(hours=1),
                     token_obtained_at=now,
                     encryption_key_version=settings.connector_encryption_key_version,
                     last_error_code=None,
@@ -673,6 +673,7 @@ def test_run_research_personal_mode_threads_google_runtime(
             session_id="ses_research_grt",
             question="What is on my calendar today?",
             mode="personal",
+            now_fn=lambda: NOW,
         )
     sandbox.close()
 

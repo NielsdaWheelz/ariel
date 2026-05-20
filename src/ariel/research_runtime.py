@@ -39,6 +39,7 @@ a cycle.  The model adapter is taken structurally via the small
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
@@ -208,6 +209,7 @@ def run_research(
     session_id: str,
     question: str,
     mode: str,
+    now_fn: Callable[[], datetime] | None = None,
 ) -> ResearchFinding:
     """Drive the read-only research loop and return a typed finding.
 
@@ -225,8 +227,9 @@ def run_research(
     """
 
     allowed_capability_ids = _research_capability_ids(mode)
+    clock = now_fn or _utcnow
 
-    now = _utcnow()
+    now = clock()
     turn = TurnRecord(
         id=_new_id("trn"),
         session_id=session_id,
@@ -253,7 +256,7 @@ def run_research(
                 sequence=sequence,
                 event_type=event_type,
                 payload=jsonable_encoder(payload_data),
-                created_at=_utcnow(),
+                created_at=clock(),
             )
         )
 
@@ -331,7 +334,7 @@ def run_research(
         approval_ttl_seconds=int(settings.approval_ttl_seconds),
         approval_actor_id=str(settings.approval_actor_id),
         add_event=add_event,
-        now_fn=_utcnow,
+        now_fn=clock,
         new_id_fn=_new_id,
         runtime_provenance=None,
         google_runtime=google_runtime,
@@ -389,7 +392,7 @@ def run_research(
             turn.status = "completed"
             add_event("evt.research.partial", {"mode": mode})
 
-    turn.updated_at = _utcnow()
+    turn.updated_at = clock()
     add_event("evt.turn.completed", {})
     db.commit()
     return finding

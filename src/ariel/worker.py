@@ -776,6 +776,7 @@ def _process_research_run(*, runtime: Runtime, task_payload: dict[str, Any]) -> 
             session_id=session_id,
             question=question,
             mode=mode,
+            now_fn=_utcnow,
         )
 
     with runtime.session_factory() as db:
