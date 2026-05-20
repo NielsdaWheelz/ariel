@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
@@ -30,6 +31,8 @@ from ariel.google_workspace_normalization import (
     normalize_gmail_message,
 )
 from ariel.redaction import redact_json_value, safe_failure_reason
+
+_log = logging.getLogger(__name__)
 
 
 GOOGLE_CONNECTOR_ID = "con_google"
@@ -3866,7 +3869,7 @@ def _is_google_gmail_message_evidence_output(payload: dict[str, Any]) -> bool:
     }
     if not _has_only_keys(evidence, allowed_evidence):
         return False
-    if _has_forbidden_text_key(evidence, allowed={"body_digest"}):
+    if _has_forbidden_text_key(evidence, allowed=allowed_evidence):
         return False
     read_outcome = payload.get("read_outcome")
     if not isinstance(read_outcome, dict):
@@ -3894,7 +3897,13 @@ def _is_google_gmail_message_evidence_output(payload: dict[str, Any]) -> bool:
         if not _has_non_empty_string(message_id):
             return False
         thread_id = message.get("thread_id")
-        if not _has_non_empty_string(thread_id):
+        # Degraded read outcomes (body_too_large, decode_failed, no_body) may
+        # not carry a thread_id when the body fetch failed before we could
+        # learn it. Require thread_id only on the "ok" path.
+        if read_status == "ok":
+            if not _has_non_empty_string(thread_id):
+                return False
+        elif thread_id is not None and not isinstance(thread_id, str):
             return False
         evidence_message_id = evidence.get("message_id")
         if not _has_non_empty_string(evidence_message_id) or evidence_message_id != message_id:
@@ -4037,6 +4046,15 @@ def _is_google_drive_share_output(payload: dict[str, Any]) -> bool:
         if not _has_non_empty_string(payload.get(key)):
             return False
     return True
+
+
+def _tuples_to_lists(value: Any) -> Any:
+    """Recursively convert tuples to lists so JSON-native validators accept them."""
+    if isinstance(value, dict):
+        return {k: _tuples_to_lists(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_tuples_to_lists(v) for v in value]
+    return value
 
 
 def _is_typed_google_read_output(*, capability_id: str, payload: dict[str, Any]) -> bool:
@@ -5898,6 +5916,13 @@ class GoogleConnectorRuntime:
                 auth_failure=None,
                 error="invalid_provider_output",
             )
+        # Provider methods build their payloads with ``dataclasses.asdict`` on
+        # frozen dataclasses whose fields use ``tuple[...]``. ``asdict``
+        # preserves tuples, but the typed-output validators below check
+        # ``isinstance(value, list)``. JSON has no tuple type, so normalize
+        # tuples to lists here — once, at the provider boundary — instead of
+        # widening every ``isinstance`` site downstream.
+        output_payload = _tuples_to_lists(output_payload)
         if provider_account_id is not None and provider_account_id.strip():
             account_id = provider_account_id.strip()
             if output_payload.get("schema_version") == "google.calendar.events.v1":
@@ -5927,6 +5952,14 @@ class GoogleConnectorRuntime:
             capability_id=capability_id,
             payload=output_payload,
         ):
+            try:
+                with open(f"/tmp/ariel-diag-{capability_id.replace('.', '_')}.json", "w") as _f:
+                    json.dump(output_payload, _f, default=str, indent=2)
+            except OSError:
+                pass
+            _log.warning(
+                "invalid_provider_output capability=%s (full payload in /tmp/)", capability_id
+            )
             return GoogleCapabilityExecutionResult(
                 status="failed",
                 output=None,
