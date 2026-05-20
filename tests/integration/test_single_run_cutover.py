@@ -115,7 +115,9 @@ class CapturingRunAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         if is_retriever_call(input_items):
-            return empty_recall_response(provider=self.provider, model=self.model)
+            return empty_recall_response(
+                provider=self.provider, model=self.model, input_items=input_items
+            )
         del user_message, history, context_bundle
         self.tools_seen.append(tools)
         self.input_items_seen.append(input_items)
@@ -419,7 +421,9 @@ def test_emit_value_eviction_discards_prior_round(postgres_url: str) -> None:
             context_bundle: dict[str, Any],
         ) -> dict[str, Any]:
             if is_retriever_call(input_items):
-                return empty_recall_response(provider=self.provider, model=self.model)
+                return empty_recall_response(
+                    provider=self.provider, model=self.model, input_items=input_items
+                )
             del tools, user_message, history, context_bundle
             self.snapshots.append(list(input_items))
             return self.responses.pop(0)

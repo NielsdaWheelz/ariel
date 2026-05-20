@@ -37,6 +37,15 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}_{ulid.new().str.lower()}"
 
 
+# Stable id of the singleton session row that owns background work without a
+# calling user session — currently the ``memory_dream`` scheduled rememberer
+# (and any future system-owned background turn). The row is seeded by the
+# ``system_session`` migration and is ``is_active=False, lifecycle_state='closed'``
+# so it never collides with the partial unique index on the user-facing active
+# session. See ``ensure_system_session`` for the defensive self-heal helper.
+SYSTEM_SESSION_ID = "ses_system"
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -99,6 +108,35 @@ class SessionRecord(Base):
             postgresql_where=(rotated_from_session_id.is_not(None)),
         ),
     )
+
+
+def ensure_system_session(db: Session, *, now: datetime) -> str:
+    """Idempotently ensure the singleton ``SYSTEM_SESSION_ID`` row exists.
+
+    The system session is seeded by the ``system_session`` migration; this
+    helper is the defensive self-heal that re-creates the row if it ever goes
+    missing (operator wipe, partial restore). Background work without a
+    calling user session — currently the ``memory_dream`` scheduled rememberer
+    — must call this before inserting any FK-owning row (turn, action_attempt,
+    event) that references the system session.
+
+    Returns ``SYSTEM_SESSION_ID``. Safe to call from inside an existing
+    transaction; uses ``ON CONFLICT DO NOTHING`` so concurrent callers race
+    safely.
+    """
+    db.execute(
+        text(
+            "INSERT INTO sessions "
+            "(id, is_active, lifecycle_state, "
+            " rotated_from_session_id, rotation_reason, "
+            " created_at, updated_at) "
+            "VALUES "
+            "(:id, FALSE, 'closed', NULL, NULL, :now, :now) "
+            "ON CONFLICT (id) DO NOTHING"
+        ),
+        {"id": SYSTEM_SESSION_ID, "now": now},
+    )
+    return SYSTEM_SESSION_ID
 
 
 class SessionRotationRecord(Base):

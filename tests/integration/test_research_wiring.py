@@ -272,7 +272,9 @@ class _ResearchRunAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         if is_retriever_call(input_items):
-            return empty_recall_response(provider=self.provider, model=self.model)
+            return empty_recall_response(
+                provider=self.provider, model=self.model, input_items=input_items
+            )
         del tools, user_message, history, context_bundle
         self.snapshots.append(list(input_items))
         call_index = len(self.snapshots)
@@ -537,7 +539,9 @@ def test_worker_completion_wake_renders_finding_into_main_agent_context(
             context_bundle: dict[str, Any],
         ) -> dict[str, Any]:
             if is_retriever_call(input_items):
-                return empty_recall_response(provider=self.provider, model=self.model)
+                return empty_recall_response(
+                    provider=self.provider, model=self.model, input_items=input_items
+                )
             del tools, user_message, history, context_bundle
             self.snapshots.append(list(input_items))
             source = "agent.emit_message(text='Here is what the research found.')\n"

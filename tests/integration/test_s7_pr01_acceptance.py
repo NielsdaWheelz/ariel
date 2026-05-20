@@ -46,7 +46,9 @@ class ActionRunAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         if is_retriever_call(input_items):
-            return empty_recall_response(provider=self.provider, model=self.model)
+            return empty_recall_response(
+                provider=self.provider, model=self.model, input_items=input_items
+            )
         del tools, history
         if context_bundle.get("origin") == "tool_result_interpretation":
             interpreter_input = context_bundle.get("tool_result_interpreter_input")

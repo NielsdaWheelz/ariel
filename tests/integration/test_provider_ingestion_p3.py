@@ -158,7 +158,9 @@ class _NoCallAdapter:
         **_: Any,
     ) -> dict[str, Any]:
         if is_retriever_call(input_items):
-            return empty_recall_response(provider=self.provider, model=self.model)
+            return empty_recall_response(
+                provider=self.provider, model=self.model, input_items=input_items
+            )
         raise AssertionError("model should not be called in this test")
 
 

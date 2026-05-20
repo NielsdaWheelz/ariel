@@ -102,7 +102,9 @@ class SnapshotAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         if is_retriever_call(input_items):
-            return empty_recall_response(provider=self.provider, model=self.model)
+            return empty_recall_response(
+                provider=self.provider, model=self.model, input_items=input_items
+            )
         del tools, user_message, history, context_bundle
         self.snapshots.append(list(input_items))
         return self.responses.pop(0)
@@ -448,7 +450,9 @@ def test_run_research_model_call_failure_returns_failed_finding(
             context_bundle: dict[str, Any],
         ) -> dict[str, Any]:
             if is_retriever_call(input_items):
-                return empty_recall_response(provider=self.provider, model=self.model)
+                return empty_recall_response(
+                    provider=self.provider, model=self.model, input_items=input_items
+                )
             del tools, user_message, history, context_bundle
             self.snapshots.append(list(input_items))
             raise RuntimeError("model unavailable")

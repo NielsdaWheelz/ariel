@@ -37,6 +37,7 @@ from .persistence import (
     MemoryLogRecord,
     MemoryNoteRecord,
     TurnRecord,
+    ensure_system_session,
     enqueue_background_task,
     to_rfc3339,
 )
@@ -637,10 +638,23 @@ def run_rememberer(
     ``None``.  The loop applies note mutations via ``memory.note.*`` syscalls
     (which call ``create_note`` / ``edit_note`` / ``delete_note`` above, which
     also log the events).  Never raises.
-    """
-    effective_session_id = session_id or _new_id("ses")
 
+    A background run without a calling user session — every ``dream`` task,
+    and any ``encode`` enqueued before a user session existed — hangs its
+    ``TurnRecord`` (and any downstream ``ActionAttemptRecord`` / ``EventRecord``)
+    off the singleton system session row (``SYSTEM_SESSION_ID``). The row is
+    seeded by the ``system_session`` migration; we call
+    ``ensure_system_session`` defensively on every invocation so the loop
+    self-heals if the row was somehow wiped.
+    """
     now = now_fn()
+    if session_id is None:
+        with session_factory() as bootstrap_db:
+            with bootstrap_db.begin():
+                effective_session_id = ensure_system_session(bootstrap_db, now=now)
+    else:
+        effective_session_id = session_id
+
     system_prompt = _REMEMBERER_ENCODE_PROMPT if trigger == "encode" else _REMEMBERER_DREAM_PROMPT
     prompt_version = (
         REMEMBERER_ENCODE_PROMPT_VERSION if trigger == "encode" else REMEMBERER_DREAM_PROMPT_VERSION
@@ -724,41 +738,46 @@ def run_rememberer(
         ),
     )
 
+    # ``run_agent_loop`` commits its own transactions per program-round
+    # (clean-program commit, program-failure commit). The driver must not wrap
+    # the call in ``with db.begin():`` — that would close the outer transaction
+    # mid-loop and the post-loop ``status = 'completed'`` assignment would
+    # raise. This mirrors ``run_research`` in ``research_runtime.py``.
     with session_factory() as loop_db:
-        with loop_db.begin():
-            loop_turn = loop_db.get(TurnRecord, turn_id)
-            if loop_turn is None:
-                raise RuntimeError(f"run_rememberer: turn {turn_id!r} missing")
-            run_agent_loop(
-                cfg,
-                sandbox=sandbox,
-                db=loop_db,
-                session_factory=session_factory,
-                session_id=effective_session_id,
-                turn=loop_turn,
-                settings=settings,
-                model_adapter=model_adapter,
-                responses_input_items=responses_input_items,
-                tools=run_tool_definitions(),
-                user_message=json.dumps(user_payload, sort_keys=True),
-                history=[],
-                context_bundle={},
-                allowed_capability_ids=allowed_capability_ids,
-                scratch={},
-                proposal_index_start=0,
-                approval_ttl_seconds=approval_ttl_seconds,
-                approval_actor_id=approval_actor_id,
-                add_event=add_event,
-                now_fn=now_fn,
-                new_id_fn=new_id_fn,
-                runtime_provenance=None,
-                google_runtime=google_runtime,
-                execute_google_reads_outside_transaction=False,
-                agency_runtime=None,
-                attachment_runtime=None,
-            )
-            loop_turn.status = "completed"
-            loop_turn.updated_at = now_fn()
+        loop_turn = loop_db.get(TurnRecord, turn_id)
+        if loop_turn is None:
+            raise RuntimeError(f"run_rememberer: turn {turn_id!r} missing")
+        run_agent_loop(
+            cfg,
+            sandbox=sandbox,
+            db=loop_db,
+            session_factory=session_factory,
+            session_id=effective_session_id,
+            turn=loop_turn,
+            settings=settings,
+            model_adapter=model_adapter,
+            responses_input_items=responses_input_items,
+            tools=run_tool_definitions(),
+            user_message=json.dumps(user_payload, sort_keys=True),
+            history=[],
+            context_bundle={},
+            allowed_capability_ids=allowed_capability_ids,
+            scratch={},
+            proposal_index_start=0,
+            approval_ttl_seconds=approval_ttl_seconds,
+            approval_actor_id=approval_actor_id,
+            add_event=add_event,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+            runtime_provenance=None,
+            google_runtime=google_runtime,
+            execute_google_reads_outside_transaction=False,
+            agency_runtime=None,
+            attachment_runtime=None,
+        )
+        loop_turn.status = "completed"
+        loop_turn.updated_at = now_fn()
+        loop_db.commit()
 
 
 # ---------------------------------------------------------------------------

@@ -587,3 +587,278 @@ def test_memory_log_append_only_via_sqlalchemy_session(
                     text("UPDATE memory_log SET content=:c WHERE id=:id"),
                     {"c": "y", "id": row_id},
                 )
+
+
+# ===========================================================================
+# 13. System session row exists after migrations; supports background turns
+# ===========================================================================
+
+
+def test_system_session_row_seeded_by_migration(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """The ``ses_system`` singleton row is present after migrations, inactive,
+    and ``lifecycle_state='closed'`` (so it never collides with the partial
+    unique index ``ix_single_active_session``)."""
+    from ariel.persistence import SYSTEM_SESSION_ID, SessionRecord
+
+    with session_factory() as db:
+        system_session = db.get(SessionRecord, SYSTEM_SESSION_ID)
+    assert system_session is not None, "migration must seed ses_system"
+    assert system_session.is_active is False
+    assert system_session.lifecycle_state == "closed"
+    assert system_session.rotated_from_session_id is None
+    assert system_session.rotation_reason is None
+
+
+def test_ensure_system_session_is_idempotent(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """``ensure_system_session`` returns the singleton id and never duplicates it.
+    Re-calling on a fresh DB and on a DB where the row already exists are both
+    no-ops; deleting the row and re-calling re-creates it (self-heal)."""
+    from ariel.persistence import SYSTEM_SESSION_ID, SessionRecord, ensure_system_session
+
+    now = datetime.now(tz=UTC)
+
+    # Idempotent on a DB where the row was already seeded by the migration.
+    with session_factory() as db:
+        with db.begin():
+            sid = ensure_system_session(db, now=now)
+        assert sid == SYSTEM_SESSION_ID
+
+    # Self-heal: wipe the row, ensure_system_session re-creates it.
+    with session_factory() as db:
+        with db.begin():
+            db.execute(text("DELETE FROM sessions WHERE id = :id"), {"id": SYSTEM_SESSION_ID})
+        with db.begin():
+            sid = ensure_system_session(db, now=now)
+        assert sid == SYSTEM_SESSION_ID
+        assert db.get(SessionRecord, SYSTEM_SESSION_ID) is not None
+
+
+# ===========================================================================
+# 14. run_rememberer(trigger="dream") with no user session inserts cleanly
+# ===========================================================================
+
+
+@dataclass
+class _DreamCompleteAdapter:
+    """One call → the rememberer emits ``agent.emit_done(...)`` and the loop ends."""
+
+    provider: str = "provider.test"
+    model: str = "model.test"
+    call_count: int = 0
+
+    def create_response(
+        self, *, input_items: Any, tools: Any, user_message: Any, history: Any, context_bundle: Any
+    ) -> dict[str, Any]:
+        del tools, user_message, history, context_bundle, input_items
+        self.call_count += 1
+        return _run_response("agent.emit_done(summary='dreamt')\n", idx=self.call_count)
+
+
+def test_run_rememberer_dream_succeeds_with_no_user_session(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh DB (no user session, never had one) accepts a ``dream`` run:
+    the ``TurnRecord`` is inserted against the system session, status reaches
+    ``completed``, no ``ForeignKeyViolation`` is raised. Regression for the
+    production ``turns_session_id_fkey`` failure."""
+    from ariel.config import AppSettings
+    from ariel.capability_registry import REMEMBERER_CAPABILITY_IDS
+    from ariel.memory import run_rememberer
+    from ariel.persistence import SYSTEM_SESSION_ID, SessionRecord, TurnRecord
+
+    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
+    settings = AppSettings()
+
+    engine = create_engine(postgres_url, future=True, pool_pre_ping=True)
+    from ariel.db import reset_schema_for_tests
+
+    reset_schema_for_tests(engine, postgres_url)
+    sf = sessionmaker(bind=engine, future=True, expire_on_commit=False)
+
+    sandbox = FakeSandboxRuntime()
+    sandbox.start()
+    try:
+        # No user session has ever existed — this is the production dream path.
+        with sf() as db:
+            assert (
+                db.scalar(select(SessionRecord).where(SessionRecord.is_active.is_(True))) is None
+            ), "fresh DB must have no active user session"
+
+        with sf() as db:
+            run_rememberer(
+                trigger="dream",
+                sandbox=sandbox,
+                db=db,
+                session_factory=sf,
+                session_id=None,
+                settings=settings,
+                model_adapter=cast(Any, _DreamCompleteAdapter()),
+                google_runtime=None,
+                agency_runtime=None,
+                attachment_runtime=None,
+                note=None,
+                allowed_capability_ids=REMEMBERER_CAPABILITY_IDS,
+                approval_ttl_seconds=int(settings.approval_ttl_seconds),
+                approval_actor_id=str(settings.approval_actor_id),
+                add_event=lambda *_args, **_kwargs: None,
+                now_fn=lambda: datetime.now(tz=UTC),
+                new_id_fn=_new_id,
+            )
+
+        with sf() as db:
+            dream_turns = db.scalars(
+                select(TurnRecord).where(TurnRecord.kind == "memory_dream")
+            ).all()
+        assert len(dream_turns) == 1, f"expected 1 memory_dream turn, got {len(dream_turns)}"
+        assert dream_turns[0].session_id == SYSTEM_SESSION_ID
+        assert dream_turns[0].status == "completed"
+    finally:
+        sandbox.close()
+        engine.dispose()
+
+
+def test_run_rememberer_dream_self_heals_if_system_session_missing(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the system session row is wiped, ``run_rememberer(trigger='dream')``
+    re-creates it via ``ensure_system_session`` and completes — the loop is
+    not permanently broken by an operator wipe."""
+    from ariel.config import AppSettings
+    from ariel.capability_registry import REMEMBERER_CAPABILITY_IDS
+    from ariel.memory import run_rememberer
+    from ariel.persistence import SYSTEM_SESSION_ID, SessionRecord, TurnRecord
+
+    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
+    settings = AppSettings()
+
+    engine = create_engine(postgres_url, future=True, pool_pre_ping=True)
+    from ariel.db import reset_schema_for_tests
+
+    reset_schema_for_tests(engine, postgres_url)
+    sf = sessionmaker(bind=engine, future=True, expire_on_commit=False)
+
+    sandbox = FakeSandboxRuntime()
+    sandbox.start()
+    try:
+        # Wipe the system session row to simulate operator deletion.
+        with sf() as db:
+            with db.begin():
+                db.execute(
+                    text("DELETE FROM sessions WHERE id = :id"),
+                    {"id": SYSTEM_SESSION_ID},
+                )
+            assert db.get(SessionRecord, SYSTEM_SESSION_ID) is None
+
+        with sf() as db:
+            run_rememberer(
+                trigger="dream",
+                sandbox=sandbox,
+                db=db,
+                session_factory=sf,
+                session_id=None,
+                settings=settings,
+                model_adapter=cast(Any, _DreamCompleteAdapter()),
+                google_runtime=None,
+                agency_runtime=None,
+                attachment_runtime=None,
+                note=None,
+                allowed_capability_ids=REMEMBERER_CAPABILITY_IDS,
+                approval_ttl_seconds=int(settings.approval_ttl_seconds),
+                approval_actor_id=str(settings.approval_actor_id),
+                add_event=lambda *_args, **_kwargs: None,
+                now_fn=lambda: datetime.now(tz=UTC),
+                new_id_fn=_new_id,
+            )
+
+        with sf() as db:
+            assert db.get(SessionRecord, SYSTEM_SESSION_ID) is not None, (
+                "self-heal must re-create ses_system"
+            )
+            dream_turns = db.scalars(
+                select(TurnRecord).where(TurnRecord.kind == "memory_dream")
+            ).all()
+        assert len(dream_turns) == 1
+        assert dream_turns[0].session_id == SYSTEM_SESSION_ID
+        assert dream_turns[0].status == "completed"
+    finally:
+        sandbox.close()
+        engine.dispose()
+
+
+def test_worker_memory_dream_task_inserts_turn_against_system_session(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end via ``process_one_task``: a queued ``memory_dream`` task runs
+    cleanly on a fresh DB, the turn row is attached to the system session, and
+    no ``ForeignKeyViolation`` marks it failed. Regression for the production
+    ``turns_session_id_fkey`` failure where the dream task looped on retries.
+
+    ``process_one_task`` is called repeatedly until a ``memory_dream`` turn
+    exists; each call processes at most one task and the worker also seeds
+    provider-maintenance tasks alongside the dream, so the dream may not be
+    the first task popped on a single iteration."""
+    from ariel.persistence import SYSTEM_SESSION_ID, TurnRecord, enqueue_background_task
+
+    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
+    app = create_app(
+        database_url=postgres_url,
+        model_adapter=cast(ModelAdapter, _DreamCompleteAdapter()),
+        reset_database=True,
+        sandbox=FakeSandboxRuntime(),
+    )
+    with TestClient(app) as client:
+        runtime = cast(Any, client.app).state.runtime
+        sf = runtime.session_factory
+
+        with sf() as db:
+            with db.begin():
+                enqueue_background_task(db, task_type="memory_dream", payload={}, now=NOW)
+
+        # Drain at most a handful of tasks; on a fresh DB the queue is small
+        # (memory_dream + the provider-maintenance seeds). The dream is the
+        # only task that creates a memory_dream turn; other tasks may fail in
+        # the test environment (missing google connector, etc.) which is fine.
+        dream_turn_present = False
+        for _ in range(6):
+            try:
+                processed = process_one_task(
+                    session_factory=sf, settings=runtime.settings, runtime=runtime
+                )
+            except Exception:
+                # The worker arms its own failure path; some tasks (e.g. the
+                # google provider maintenance ones) have no configured runtime
+                # in this test and the worker marks them failed without
+                # raising. A surprise raise here is itself a regression.
+                pytest.fail("process_one_task must never raise")
+            with sf() as db:
+                dream_turn = db.scalar(select(TurnRecord).where(TurnRecord.kind == "memory_dream"))
+            if dream_turn is not None:
+                dream_turn_present = True
+                break
+            if not processed:
+                break
+
+        assert dream_turn_present, "memory_dream task must produce a memory_dream turn"
+        with sf() as db:
+            dream_turns = db.scalars(
+                select(TurnRecord).where(TurnRecord.kind == "memory_dream")
+            ).all()
+        assert all(t.session_id == SYSTEM_SESSION_ID for t in dream_turns), (
+            "every memory_dream turn must reference the system session"
+        )
+        # Status is the strong contract: if the FK insert had failed, the turn
+        # row wouldn't exist; if the loop crashed mid-run, status would still
+        # be 'in_progress'.
+        assert all(t.status == "completed" for t in dream_turns), (
+            "every memory_dream turn must reach status='completed'"
+        )

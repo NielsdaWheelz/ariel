@@ -56,7 +56,9 @@ class SessionManagementProbeAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         if is_retriever_call(input_items):
-            return empty_recall_response(provider=self.provider, model=self.model)
+            return empty_recall_response(
+                provider=self.provider, model=self.model, input_items=input_items
+            )
         assert [tool.get("name") for tool in tools] == ["run"]
         with self._lock:
             self.context_bundles.append(copy.deepcopy(context_bundle))

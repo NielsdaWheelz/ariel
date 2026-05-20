@@ -241,7 +241,9 @@ class _WakeAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         if is_retriever_call(input_items):
-            return empty_recall_response(provider=self.provider, model=self.model)
+            return empty_recall_response(
+                provider=self.provider, model=self.model, input_items=input_items
+            )
         del input_items, tools, history, context_bundle
         self.user_messages_seen.append(user_message)
         return responses_run_message(

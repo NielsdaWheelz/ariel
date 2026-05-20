@@ -49,7 +49,9 @@ class ActionProposalAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         if is_retriever_call(input_items):
-            return empty_recall_response(provider=self.provider, model=self.model)
+            return empty_recall_response(
+                provider=self.provider, model=self.model, input_items=input_items
+            )
         del tools, history
         run_calls = copy.deepcopy(self.run_calls_by_message.get(user_message, []))
         current_turn_ref = None

@@ -43,7 +43,9 @@ class StaticModelAdapter:
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
         if is_retriever_call(input_items):
-            return empty_recall_response(provider=self.provider, model=self.model)
+            return empty_recall_response(
+                provider=self.provider, model=self.model, input_items=input_items
+            )
         del input_items, tools, user_message, history, context_bundle
         return {
             "provider": self.provider,
