@@ -49,7 +49,7 @@ class SessionManagementProbeAdapter(FakeModelAdapter):
         message_delays_seconds: dict[str, float] | None = None,
     ) -> None:
         super().__init__()
-        self.context_bundles: list[Any] = []
+        self.input_items: list[Any] = []
         self.history_lengths_by_message: dict[str, int] = {}
         self.message_delays_seconds: dict[str, float] = (
             message_delays_seconds if message_delays_seconds is not None else {}
@@ -67,7 +67,7 @@ class SessionManagementProbeAdapter(FakeModelAdapter):
             )
         assert [tool.name for tool in request.tools] == ["run"]
         with self._lock:
-            self.context_bundles.append(copy.deepcopy(list(request.messages)))
+            self.input_items.append(copy.deepcopy(list(request.messages)))
             self.history_lengths_by_message[user_message] = len(request.messages)
         run_calls = self.run_calls_by_message.get(user_message)
         if isinstance(run_calls, list):

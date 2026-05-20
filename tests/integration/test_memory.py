@@ -13,12 +13,12 @@ No test asserts that the model "chose correctly."
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from itertools import count
 from typing import Any, cast
 
 import pytest
+from fastapi.encoders import jsonable_encoder
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
@@ -27,11 +27,11 @@ from sqlalchemy.orm import Session, sessionmaker
 from ariel.agent_loop import run_agent_loop
 from ariel.app import create_app
 from ariel.capability_registry import capability_id_for_run_callable, get_capability
-from ariel.model_adapter import ModelAdapter
+from ariel.model_adapter import ModelAdapter, ModelCall, ModelResponse
 from ariel.persistence import BackgroundTaskRecord, MemoryLogRecord, MemoryNoteRecord
 from ariel.worker import UnsupportedTaskType, process_one_task
 from tests.fake_sandbox import FakeSandboxRuntime
-from tests.integration.responses_helpers import post_message_and_drain
+from tests.integration.responses_helpers import FakeModelAdapter, post_message_and_drain, run_response
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -80,45 +80,37 @@ def _sf(client: TestClient) -> sessionmaker[Session]:
 # ---------------------------------------------------------------------------
 
 
-def _run_response(source: str, *, idx: int, provider: str = "provider.test") -> dict[str, Any]:
-    return {
-        "provider": provider,
-        "model": "model.test",
-        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-        "provider_response_id": f"resp_{idx}",
-        "output": [
-            {
-                "type": "function_call",
-                "id": f"fc_{idx}",
-                "call_id": f"call_{idx}",
-                "name": "run",
-                "arguments": json.dumps({"source": source}, sort_keys=True),
-                "status": "completed",
-            }
-        ],
-    }
+def _run_response(source: str, *, idx: int) -> ModelResponse:
+    """Build a one-tool-call ``ModelResponse`` carrying the run program ``source``."""
+    return run_response(
+        source=source,
+        provider="provider.test",
+        model="model.test",
+        provider_response_id=f"resp_{idx}",
+        input_tokens=1,
+        output_tokens=1,
+    )
 
 
-@dataclass
-class _TwoPhaseAdapter:
+class _TwoPhaseAdapter(FakeModelAdapter):
     """Odd calls → retriever (emit_finding); even calls → main agent (emit_message)."""
 
-    provider: str = "provider.test"
-    model: str = "model.test"
-    call_count: int = 0
-    snapshots: list[list[dict[str, Any]]] = field(default_factory=list)
+    provider = "provider.test"
+    model = "model.test"
 
-    def create_response(
-        self, *, input_items: Any, tools: Any, user_message: Any, history: Any, context_bundle: Any
-    ) -> dict[str, Any]:
+    def __init__(self) -> None:
+        super().__init__()
+        self.call_count: int = 0
+        self.snapshots: list[list[Any]] = []
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
         self.call_count += 1
-        self.snapshots.append(list(input_items))
+        self.snapshots.append(list(request.messages))
         source = _RETRIEVER_PROGRAM if self.call_count % 2 == 1 else _EMIT_MSG
         return _run_response(source, idx=self.call_count)
 
 
-@dataclass
-class _FailingRetrieverAdapter:
+class _FailingRetrieverAdapter(FakeModelAdapter):
     """Retriever emits the same source twice → stuck-detection ends it with no finding.
 
     On calls 1 and 2 (both retriever rounds) the same emit_value source is
@@ -127,14 +119,16 @@ class _FailingRetrieverAdapter:
     agent, which emits a message.
     """
 
-    provider: str = "provider.test"
-    model: str = "model.test"
-    call_count: int = 0
-    _stuck_source: str = "agent.emit_value(value={'stuck':1})\n"
+    provider = "provider.test"
+    model = "model.test"
+    _stuck_source = "agent.emit_value(value={'stuck':1})\n"
 
-    def create_response(
-        self, *, input_items: Any, tools: Any, user_message: Any, history: Any, context_bundle: Any
-    ) -> dict[str, Any]:
+    def __init__(self) -> None:
+        super().__init__()
+        self.call_count: int = 0
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        del request
         self.call_count += 1
         # Calls 1 and 2: retriever stuck-detection (same source twice → exits).
         # Call 3: main agent emits a message.
@@ -142,18 +136,19 @@ class _FailingRetrieverAdapter:
         return _run_response(source, idx=self.call_count)
 
 
-@dataclass
-class _RememberAdapter:
+class _RememberAdapter(FakeModelAdapter):
     """Retriever on odd calls; main agent calls memory.remember then emits on even."""
 
-    provider: str = "provider.test"
-    model: str = "model.test"
-    call_count: int = 0
-    note_text: str = "user prefers dark mode"
+    provider = "provider.test"
+    model = "model.test"
+    note_text = "user prefers dark mode"
 
-    def create_response(
-        self, *, input_items: Any, tools: Any, user_message: Any, history: Any, context_bundle: Any
-    ) -> dict[str, Any]:
+    def __init__(self) -> None:
+        super().__init__()
+        self.call_count: int = 0
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        del request
         self.call_count += 1
         if self.call_count % 2 == 1:
             source = _RETRIEVER_PROGRAM
@@ -174,7 +169,7 @@ def test_schema_memory_tables_are_only_log_and_notes(
     """``memory_log`` and ``memory_notes`` are the only ``memory_*`` tables;
     ``memory_facts`` and ``memory_profile`` do not exist."""
     engine = create_engine(postgres_url, future=True)
-    with TestClient(_app(postgres_url, cast(ModelAdapter, _TwoPhaseAdapter()), monkeypatch)):
+    with TestClient(_app(postgres_url, _TwoPhaseAdapter(), monkeypatch)):
         table_names = set(inspect(engine).get_table_names())
     memory_tables = {t for t in table_names if t.startswith("memory_")}
     assert memory_tables == {"memory_log", "memory_notes"}, (
@@ -195,7 +190,7 @@ def test_schema_sessions_has_no_digest_column(
 ) -> None:
     """``sessions`` table has no ``digest`` column."""
     engine = create_engine(postgres_url, future=True)
-    with TestClient(_app(postgres_url, cast(ModelAdapter, _TwoPhaseAdapter()), monkeypatch)):
+    with TestClient(_app(postgres_url, _TwoPhaseAdapter(), monkeypatch)):
         cols = {c["name"] for c in inspect(engine).get_columns("sessions")}
     assert "digest" not in cols
 
@@ -334,12 +329,12 @@ def test_retriever_fires_preturn_and_no_profile_or_digest_injected(
     reconstruction) and does NOT include a ``user profile`` or ``session digest``
     block."""
     adapter = _TwoPhaseAdapter()
-    with TestClient(_app(postgres_url, cast(ModelAdapter, adapter), monkeypatch)) as client:
+    with TestClient(_app(postgres_url, adapter, monkeypatch)) as client:
         sid = _session_id(client)
         post_message_and_drain(client, sid, message="hello")
 
     assert adapter.call_count >= 2, "expected retriever + main agent calls"
-    rendered = json.dumps(adapter.snapshots[1])  # main-agent snapshot
+    rendered = json.dumps(jsonable_encoder(adapter.snapshots[1]))  # main-agent snapshot
     assert "memory recall:" in rendered
     assert "user profile" not in rendered.lower()
     assert "session digest" not in rendered.lower()
@@ -357,7 +352,7 @@ def test_recall_failure_is_nonfatal(
     """When the retriever emits the same source twice (stuck-detection fires, no
     finding emitted), the main-agent turn still completes with the assistant message."""
     adapter = _FailingRetrieverAdapter()
-    with TestClient(_app(postgres_url, cast(ModelAdapter, adapter), monkeypatch)) as client:
+    with TestClient(_app(postgres_url, adapter, monkeypatch)) as client:
         sid = _session_id(client)
         turn = post_message_and_drain(client, sid, message="ping")
     assert turn.status == "completed"
@@ -376,7 +371,7 @@ def test_memory_remember_enqueues_memory_encode_task(
     """A ``memory.remember(note='...')`` syscall enqueues exactly one
     ``memory_encode`` background task whose payload carries the note."""
     adapter = _RememberAdapter()
-    with TestClient(_app(postgres_url, cast(ModelAdapter, adapter), monkeypatch)) as client:
+    with TestClient(_app(postgres_url, adapter, monkeypatch)) as client:
         sid = _session_id(client)
         sf = _sf(client)
         post_message_and_drain(client, sid, message="remember this")
@@ -396,8 +391,7 @@ def test_memory_remember_enqueues_memory_encode_task(
 # ===========================================================================
 
 
-@dataclass
-class _RetrieverSearchesThenMainSearchesAdapter:
+class _RetrieverSearchesThenMainSearchesAdapter(FakeModelAdapter):
     """Retriever calls ``memory.search``; main agent then calls ``memory.search``.
 
     Both syscalls create ``ActionAttemptRecord`` rows on the same parent turn.
@@ -405,13 +399,15 @@ class _RetrieverSearchesThenMainSearchesAdapter:
     first call collided on the ``(turn_id, proposal_index)`` unique index.
     """
 
-    provider: str = "provider.test"
-    model: str = "model.test"
-    call_count: int = 0
+    provider = "provider.test"
+    model = "model.test"
 
-    def create_response(
-        self, *, input_items: Any, tools: Any, user_message: Any, history: Any, context_bundle: Any
-    ) -> dict[str, Any]:
+    def __init__(self) -> None:
+        super().__init__()
+        self.call_count: int = 0
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        del request
         self.call_count += 1
         if self.call_count == 1:
             source = (
@@ -431,7 +427,7 @@ def test_retriever_and_main_loop_action_attempts_do_not_collide(
     main loop's first capability call must not violate ``(turn_id,
     proposal_index)`` uniqueness."""
     adapter = _RetrieverSearchesThenMainSearchesAdapter()
-    with TestClient(_app(postgres_url, cast(ModelAdapter, adapter), monkeypatch)) as client:
+    with TestClient(_app(postgres_url, adapter, monkeypatch)) as client:
         sid = _session_id(client)
         turn = post_message_and_drain(client, sid, message="ping")
     assert turn.status == "completed", f"turn status={turn.status!r}"
@@ -455,7 +451,7 @@ def test_worker_accepts_memory_encode_and_memory_dream(
     monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
     app = create_app(
         database_url=postgres_url,
-        model_adapter=cast(ModelAdapter, _TwoPhaseAdapter()),
+        model_adapter=_TwoPhaseAdapter(),
         reset_database=True,
         sandbox=FakeSandboxRuntime(),
     )
@@ -535,7 +531,7 @@ def test_memory_log_accumulates_events_after_turn(
     ``user_message``, ``agent_round``, and ``assistant_message`` events, all
     sharing the same ``session_id`` and ``turn_id``."""
     adapter = _TwoPhaseAdapter()
-    with TestClient(_app(postgres_url, cast(ModelAdapter, adapter), monkeypatch)) as client:
+    with TestClient(_app(postgres_url, adapter, monkeypatch)) as client:
         sid = _session_id(client)
         sf = _sf(client)
         turn = post_message_and_drain(client, sid, message="what day is it")
@@ -687,17 +683,18 @@ def test_ensure_system_session_is_idempotent(
 # ===========================================================================
 
 
-@dataclass
-class _DreamCompleteAdapter:
+class _DreamCompleteAdapter(FakeModelAdapter):
     """One call → the rememberer emits ``agent.emit_done(...)`` and the loop ends."""
 
-    provider: str = "provider.test"
-    model: str = "model.test"
-    call_count: int = 0
+    provider = "provider.test"
+    model = "model.test"
 
-    def create_response(
-        self, *, input_items: Any, tools: Any, user_message: Any, history: Any, context_bundle: Any
-    ) -> dict[str, Any]:
+    def __init__(self) -> None:
+        super().__init__()
+        self.call_count: int = 0
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        del request
         self.call_count += 1
         return _run_response("agent.emit_done(summary='dreamt')\n", idx=self.call_count)
 
@@ -742,7 +739,7 @@ def test_run_rememberer_dream_succeeds_with_no_user_session(
                 session_factory=sf,
                 session_id=None,
                 settings=settings,
-                model_adapter=cast(Any, _DreamCompleteAdapter()),
+                model_adapter=_DreamCompleteAdapter(),
                 google_runtime=None,
                 agency_runtime=None,
                 attachment_runtime=None,
@@ -809,7 +806,7 @@ def test_run_rememberer_dream_self_heals_if_system_session_missing(
                 session_factory=sf,
                 session_id=None,
                 settings=settings,
-                model_adapter=cast(Any, _DreamCompleteAdapter()),
+                model_adapter=_DreamCompleteAdapter(),
                 google_runtime=None,
                 agency_runtime=None,
                 attachment_runtime=None,
@@ -856,7 +853,7 @@ def test_worker_memory_dream_task_inserts_turn_against_system_session(
     monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
     app = create_app(
         database_url=postgres_url,
-        model_adapter=cast(ModelAdapter, _DreamCompleteAdapter()),
+        model_adapter=_DreamCompleteAdapter(),
         reset_database=True,
         sandbox=FakeSandboxRuntime(),
     )

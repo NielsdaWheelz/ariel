@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy import select
 
 from ariel.app import build_google_runtime
@@ -322,7 +323,7 @@ def test_run_research_web_mode_exposes_only_web_capabilities(session_factory: An
         )
     sandbox.close()
 
-    rendered = json.dumps(adapter.snapshots[0])
+    rendered = json.dumps(jsonable_encoder(adapter.snapshots[0]))
     # The web whitelist's run callables are advertised to the model.
     assert "search.web" in rendered
     assert "search.news" in rendered
@@ -359,7 +360,7 @@ def test_run_research_personal_mode_exposes_only_personal_capabilities(
         )
     sandbox.close()
 
-    rendered = json.dumps(adapter.snapshots[0])
+    rendered = json.dumps(jsonable_encoder(adapter.snapshots[0]))
     # The personal whitelist's run callables are advertised to the model.
     assert "email.search" in rendered
     assert "email.read" in rendered
@@ -413,7 +414,7 @@ def test_run_research_web_mode_program_cannot_call_personal_capability(
     assert finding.claims == []
     # The personal capability was unreachable: the program did not complete and
     # that failure — not a private-data read — was fed back to the model.
-    feedback = json.dumps(adapter.snapshots[-1])
+    feedback = json.dumps(jsonable_encoder(adapter.snapshots[-1]))
     assert "did not complete" in feedback
 
 

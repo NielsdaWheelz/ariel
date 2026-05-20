@@ -240,10 +240,10 @@ def test_plain_assistant_text_is_protocol_feedback_not_visible(postgres_url: str
 
     assert turn.assistant_message == "visible through run"
     assert "this must stay hidden" not in (turn.assistant_message or "")
-    assert "this must stay hidden" not in json.dumps(adapter.input_items_seen[-1])
-    retry_input = json.dumps(adapter.input_items_seen[-1])
-    assert "private AI butler-operator" in retry_input
-    assert "model protocol failure" in retry_input
+    rendered_retry_input = json.dumps(jsonable_encoder(adapter.input_items_seen[-1]))
+    assert "this must stay hidden" not in rendered_retry_input
+    assert "private AI butler-operator" in rendered_retry_input
+    assert "model protocol failure" in rendered_retry_input
     event_types = [event["event_type"] for event in turn_data["events"]]
     assert "evt.model.protocol_failed" in event_types
     engine = create_engine(postgres_url, future=True)
@@ -340,7 +340,14 @@ def test_invalid_direct_tool_protocol_retries_without_executing(
     event_types = [event["event_type"] for event in turn_data["events"]]
     assert "evt.model.protocol_failed" in event_types
     assert turn_data["surface_action_lifecycle"] == []
-    assert any(item.get("type") == "function_call_output" for item in adapter.input_items_seen[-1])
+    from pydantic_ai.messages import ModelRequest, ToolReturnPart  # noqa: PLC0415
+
+    assert any(
+        isinstance(part, ToolReturnPart)
+        for message in adapter.input_items_seen[-1]
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+    )
 
 
 def test_program_that_raises_is_a_program_failure(postgres_url: str) -> None:
@@ -372,7 +379,7 @@ def test_program_that_raises_is_a_program_failure(postgres_url: str) -> None:
     event_types = [event["event_type"] for event in turn_data["events"]]
     assert "evt.run.validation_failed" in event_types
     assert turn_data["surface_action_lifecycle"] == []
-    feedback = json.dumps(adapter.input_items_seen[-1])
+    feedback = json.dumps(jsonable_encoder(adapter.input_items_seen[-1]))
     assert "ValueError" in feedback
 
 
@@ -527,15 +534,18 @@ def test_emit_value_eviction_discards_prior_round(postgres_url: str) -> None:
     assert turn.assistant_message == "done"
     assert len(adapter.snapshots) == 3
 
-    # Parse the function_call_output items from the third snapshot: their
-    # ``output`` field is a JSON string (not an embedded object), so
-    # asserting on json.dumps(snapshot) would double-escape the quotes
-    # and a naive '"round": 2' substring check would silently fail.
-    third_fco_outputs = [
-        json.loads(item["output"])
-        for item in adapter.snapshots[2]
-        if item.get("type") == "function_call_output"
-    ]
+    # Parse the ToolReturnPart payloads from the third snapshot: their ``content``
+    # is the JSON string the run tool returned to the loop, so we json.load each
+    # part's content and collect the ``emitted_values`` it carried.
+    from pydantic_ai.messages import ModelRequest, ToolReturnPart  # noqa: PLC0415
+
+    third_fco_outputs: list[dict[str, Any]] = []
+    for message in adapter.snapshots[2]:
+        if not isinstance(message, ModelRequest):
+            continue
+        for part in message.parts:
+            if isinstance(part, ToolReturnPart) and isinstance(part.content, str):
+                third_fco_outputs.append(json.loads(part.content))
     all_emitted = [val for fco in third_fco_outputs for val in fco.get("emitted_values", [])]
 
     # The third call must NOT contain round 1's emitted value (evicted).

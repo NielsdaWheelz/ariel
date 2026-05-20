@@ -80,7 +80,6 @@ class NoVisibleResponseAdapter(FakeModelAdapter):
     def __init__(self) -> None:
         super().__init__()
         self.input_items: list[list[Any]] = []
-        self.context_bundles: list[list[Any]] = []
 
     def _respond(self, request: ModelCall) -> ModelResponse:
         if is_retriever_call(request.messages):
@@ -88,7 +87,6 @@ class NoVisibleResponseAdapter(FakeModelAdapter):
                 provider=self.provider, model=self.model, messages=request.messages
             )
         self.input_items.append(list(request.messages))
-        self.context_bundles.append(list(request.messages))
         calls = [{"name": "agent.pause_until_input", "input": {}}]
         return responses_with_run_calls(
             assistant_text="",
@@ -108,7 +106,6 @@ class CapturingAttachmentAdapter(FakeModelAdapter):
     def __init__(self) -> None:
         super().__init__()
         self.input_items: list[list[Any]] = []
-        self.context_bundles: list[list[Any]] = []
 
     def _respond(self, request: ModelCall) -> ModelResponse:
         if is_retriever_call(request.messages):
@@ -117,7 +114,6 @@ class CapturingAttachmentAdapter(FakeModelAdapter):
             )
         user_message = last_user_message(request.messages)
         self.input_items.append(list(request.messages))
-        self.context_bundles.append(list(request.messages))
         return responses_run_message(
             assistant_text=f"ack::{user_message}",
             provider=self.provider,
@@ -182,14 +178,14 @@ class ContextWindowDecisionAdapter(FakeModelAdapter):
 
     def __init__(self) -> None:
         super().__init__()
-        self.context_bundles: list[list[Any]] = []
+        self.input_items: list[list[Any]] = []
 
     def _respond(self, request: ModelCall) -> ModelResponse:
         if is_retriever_call(request.messages):
             return empty_recall_response(
                 provider=self.provider, model=self.model, messages=request.messages
             )
-        self.context_bundles.append(list(request.messages))
+        self.input_items.append(list(request.messages))
         user_message = last_user_message(request.messages)
 
         normalized = user_message.strip().lower()
@@ -436,7 +432,7 @@ def test_discord_attachment_content_is_referenced_without_raw_cdn_url(
 
     captured_systems = [
         part.content
-        for snapshot in adapter.context_bundles
+        for snapshot in adapter.input_items
         for message in snapshot
         if isinstance(message, ModelRequest)
         for part in message.parts
@@ -572,7 +568,7 @@ def test_pr01_turn_context_section_order_and_audit_metadata(
         post_message_and_drain(client, session_id, message="first turn")
         post_message_and_drain(client, session_id, message="second turn")
 
-        assert len(adapter.context_bundles) == 2
+        assert len(adapter.input_items) == 2
         # Post-cutover the adapter receives a pydantic-ai ``ModelMessage``
         # graph, not a context_bundle dict — the legacy section_order /
         # prompt_version asserts move to the ``evt.model.started`` payload

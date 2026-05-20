@@ -25,6 +25,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+from fastapi.encoders import jsonable_encoder
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
@@ -588,7 +589,7 @@ def test_worker_completion_wake_renders_finding_into_main_agent_context(
 
     # The main agent's context carried the finding as an attributed result block.
     assert adapter.snapshots, "the main agent was never woken"
-    rendered = json.dumps(adapter.snapshots[0])
+    rendered = json.dumps(jsonable_encoder(adapter.snapshots[0]))
     assert "Research run result" in rendered
     assert "Paris is the capital of France." in rendered
     assert "research.investigate call" in rendered
