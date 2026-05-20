@@ -14,6 +14,7 @@ from ariel.persistence import GoogleConnectorRecord
 from tests.integration.responses_helpers import (
     FakeModelAdapter,
     empty_recall_response,
+    has_tool_returns,
     is_retriever_call,
     last_user_message,
     post_message_and_drain,
@@ -84,6 +85,8 @@ class ActionProposalAdapter(FakeModelAdapter):
             user_message,
             f"assistant::{user_message}",
         )
+        if has_tool_returns(request.messages):
+            run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
         if not run_calls:
             run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
         return responses_with_run_calls(

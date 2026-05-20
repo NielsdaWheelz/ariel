@@ -961,8 +961,11 @@ def test_default_runtime_model_requires_server_secret_credentials(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("ARIEL_MODEL_NAME", "gpt-5.5")
-    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "")
+    # MAIN tier defaults to anthropic:claude-sonnet-4-6 (see model_tiers.DEFAULT_TIERS);
+    # BULK tier (retriever) defaults to google. Empty both creds so both calls
+    # surface a typed credential-missing failure_reason.
+    monkeypatch.setenv("ARIEL_ANTHROPIC_API_KEY", "")
+    monkeypatch.setenv("ARIEL_GOOGLE_API_KEY", "")
 
     app = create_app(
         database_url=postgres_url,
@@ -978,8 +981,10 @@ def test_default_runtime_model_requires_server_secret_credentials(
         timeline = _timeline(client, session_id)
         events = timeline["turns"][0]["events"]
         event_types = [event["event_type"] for event in events]
-        # The real adapter raises ModelAdapterError(safe_reason="model credentials
-        # are not configured") for both the retriever call and the main agent call.
+        # pydantic-ai's per-provider Model raises a typed credential-missing
+        # exception ("Set the ANTHROPIC_API_KEY environment variable...") for
+        # both the retriever (BULK / google) and main-agent (MAIN / anthropic)
+        # calls; the loop surfaces ``str(exc)`` as ``failure_reason``.
         assert event_types == [
             "evt.turn.started",
             "evt.model.started",  # retriever (no API key)
@@ -991,7 +996,9 @@ def test_default_runtime_model_requires_server_secret_credentials(
         # The main agent's model.failed is the last evt.model.failed event.
         model_failed_events = [e for e in events if e["event_type"] == "evt.model.failed"]
         failure_payload = model_failed_events[-1]["payload"]
-        assert "credential" in failure_payload["failure_reason"].lower()
+        # The pydantic-ai message names the env var; assert on that stable
+        # token rather than the exact wording.
+        assert "api_key" in failure_payload["failure_reason"].lower()
         assert "sk-" not in failure_payload["failure_reason"]
 
 

@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any, cast
 
 from fastapi.testclient import TestClient
-from pydantic_ai.messages import ModelRequest, SystemPromptPart, UserPromptPart
+from pydantic_ai.messages import ModelRequest, SystemPromptPart, ToolReturnPart, UserPromptPart
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -334,6 +334,23 @@ def last_user_message(messages: list[ModelMessage]) -> str:
             if isinstance(part, UserPromptPart) and isinstance(part.content, str):
                 return part.content
     return ""
+
+
+def has_tool_returns(messages: list[ModelMessage]) -> bool:
+    """True iff ``messages`` carries any ``ToolReturnPart`` (a prior round's
+    tool returns).
+
+    Test fakes that respond with a syscall on round 1 use this to detect the
+    next round and switch to an ``agent.emit_message`` finalisation — the
+    equivalent of the legacy ``input_items`` ``function_call_output`` check
+    against the pre-cutover dict-shaped input.
+    """
+    for message in messages:
+        if not isinstance(message, ModelRequest):
+            continue
+        if any(isinstance(part, ToolReturnPart) for part in message.parts):
+            return True
+    return False
 
 
 def _detect_memory_subsystem(messages: list[ModelMessage]) -> str | None:

@@ -16,6 +16,7 @@ from ariel.app import create_app
 from tests.integration.responses_helpers import (
     FakeModelAdapter,
     empty_recall_response,
+    has_tool_returns,
     is_retriever_call,
     last_user_message,
     post_message_and_drain,
@@ -57,8 +58,18 @@ class ActionRunAdapter(FakeModelAdapter):
             )
         run_calls = self.run_calls_by_message.get(user_message, [])
         assistant_text = self.assistant_text_by_message.get(
-            user_message, f"assistant::{user_message}"
+            user_message,
+            {
+                "extract url": "The extracted article supports the launch details [1].",
+                "egress deny": "blocked by the allowlist.",
+                "retry extraction": "The recovered extraction is available [1].",
+                "malformed final url": "provider_invalid_payload",
+                "ipv6 extraction": "The IPv6 extraction is available [1].",
+                "large extraction": "Partial extraction only; narrow or focus the request [1].",
+            }.get(user_message, f"assistant::{user_message}"),
         )
+        if has_tool_returns(request.messages):
+            run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
         if not run_calls:
             run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
         return responses_with_run_calls(
