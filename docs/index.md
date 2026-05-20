@@ -31,6 +31,8 @@ This directory is the canonical home for repository documentation.
 ### Code style
 
 - [ai-first.md](ai-first.md): AI owns judgment, deterministic code owns rails
+- [openclaw-parity-and-beyond.md](openclaw-parity-and-beyond.md): OpenClaw
+  parity backlog and beyond-OpenClaw product direction
 - [north-star-cutover.md](north-star-cutover.md): hard cutover spec for the
   single-`run`, Agency-centered product architecture
 - [run-program-cutover.md](run-program-cutover.md): hard cutover from the
