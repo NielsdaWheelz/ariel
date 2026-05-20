@@ -242,6 +242,7 @@ def execute_run_program(
     allowed_capability_ids: set[str],
     settings: AppSettings | None,
     scratch: dict[str, ScratchEntry],
+    model_adapter: Any | None = None,
     is_research_run: bool = False,
 ) -> RunProgramResult:
     """Run one model-authored Python ``run`` program inside the sandbox.
@@ -452,6 +453,8 @@ def execute_run_program(
             attachment_runtime=attachment_runtime,
             allowed_capability_id_set=allowed_capability_ids,
             settings=settings,
+            sandbox=sandbox,
+            model_adapter=model_adapter,
         )
         # Within-program taint: a syscall that returned untrusted-influenced
         # content taints every later syscall in this program, and contributes

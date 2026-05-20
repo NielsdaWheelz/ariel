@@ -693,13 +693,10 @@ def test_two_programs_with_capability_syscalls_get_distinct_proposal_index(
     persist. This asserts both attempts persist with distinct ``proposal_index``.
 
     Unlike ``test_taint_threads_across_two_programs_in_one_turn``, this exercises
-    the real ``process_one_call`` so the unique index is actually hit.
-
-    ``memory.search`` is used instead of ``memory.recall`` because ``memory.recall``
-    spawns a retriever sub-agent that requires model_adapter and sandbox to be
-    threaded through execute_run_program → process_one_call (they are not).
-    ``memory.search`` is allow_inline and executes entirely from session_factory,
-    so it works correctly in this path.
+    the real ``process_one_call`` so the unique index is actually hit.  Uses
+    ``memory.search`` (a substrate-rail read) rather than ``memory.recall`` (which
+    would also spin up the retriever's bounded model loop) — same proposal-index
+    path, less moving parts.
     """
 
     # Each program runs a real capability syscall (memory.search -- allow_inline,

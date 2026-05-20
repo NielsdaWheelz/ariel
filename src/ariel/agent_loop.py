@@ -467,6 +467,7 @@ def run_agent_loop(
             allowed_capability_ids=set(allowed_capability_ids),
             settings=settings,
             scratch=scratch,
+            model_adapter=model_adapter,
             is_research_run=cfg.is_research_run,
         )
         created_action_attempt_count += len(run_program_result.action_attempts)
