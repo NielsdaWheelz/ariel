@@ -33,6 +33,8 @@ from ariel.capability_registry import (
     capability_contract_hash,
     get_capability,
     payload_hash,
+    run_callable_name_for_capability_id,
+    run_callable_signature,
 )
 from ariel.config import AppSettings
 from ariel.executor import (
@@ -2863,14 +2865,21 @@ def process_one_call(
         action_attempt.updated_at = now_fn()
         ctx.blocked_reasons.append(f"{capability_id}: {evaluation.reason}")
         if call_id:
+            blocked_payload: dict[str, Any] = {
+                "status": "blocked",
+                "capability_id": capability_id,
+                "reason": evaluation.reason,
+            }
+            if evaluation.reason == "schema_invalid":
+                callable_name = run_callable_name_for_capability_id(capability_id)
+                if callable_name is not None:
+                    sig = run_callable_signature(callable_name)
+                    if sig:
+                        blocked_payload["expected"] = f"{callable_name}{sig}"
             ctx.function_call_outputs.append(
                 _response_function_call_output(
                     call_id=call_id,
-                    payload={
-                        "status": "blocked",
-                        "capability_id": capability_id,
-                        "reason": evaluation.reason,
-                    },
+                    payload=blocked_payload,
                 )
             )
         add_event(

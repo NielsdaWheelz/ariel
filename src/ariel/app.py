@@ -49,6 +49,7 @@ from ariel.capability_registry import (
     get_capability,
     internal_callable_capability_ids,
     run_callable_name_for_capability_id,
+    run_callable_signature,
 )
 from ariel.config import AppSettings
 from ariel.db import SchemaReadinessProbe, reset_schema_for_tests
@@ -601,11 +602,11 @@ def _build_responses_input_items(
     if discord_context_text is not None:
         input_items.append({"role": "system", "content": discord_context_text})
 
-    # 3. Eligible callables list
+    # 3. Eligible callables list (with signatures so the model does not guess args)
     eligible_callables = context_bundle.get("eligible_internal_callables")
     if isinstance(eligible_callables, list):
         callable_lines = [
-            f"- {callable_name}"
+            f"- {callable_name}{run_callable_signature(callable_name)}"
             for callable_name in eligible_callables
             if isinstance(callable_name, str) and callable_name
         ]
@@ -618,9 +619,12 @@ def _build_responses_input_items(
                         "Their namespaces (agent, memory, email, calendar, etc.) "
                         "are pre-injected globals — do NOT import them; "
                         "`import ariel` fails. All arguments are keyword "
-                        "arguments (e.g. agent.emit_message(text='...')). "
-                        "agent.emit_message, agent.emit_value, and "
-                        "agent.pause_until_input are always available:\n"
+                        "arguments (the signature shown is the contract; "
+                        "calls that pass extra or wrong-named keys return "
+                        "blocked/schema_invalid). The agent.* terminals "
+                        "(agent.emit_message(text: str), "
+                        "agent.emit_value(value: Any), "
+                        "agent.pause_until_input()) are always available.\n"
                     )
                     + "\n".join(callable_lines),
                 }

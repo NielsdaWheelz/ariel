@@ -45,6 +45,12 @@ GOOGLE_GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
 GOOGLE_DRIVE_METADATA_READ_SCOPE = "https://www.googleapis.com/auth/drive.metadata.readonly"
 GOOGLE_DRIVE_READ_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
 GOOGLE_DRIVE_SHARE_SCOPE = "https://www.googleapis.com/auth/drive"
+# OpenID Connect identity scopes — without them the /oauth2/v3/userinfo call
+# in ``_exchange_authorization_code`` returns no profile data and the
+# connector stores ``account_email = "unknown-email"``.
+GOOGLE_OPENID_SCOPE = "openid"
+GOOGLE_USERINFO_EMAIL_SCOPE = "https://www.googleapis.com/auth/userinfo.email"
+GOOGLE_USERINFO_PROFILE_SCOPE = "https://www.googleapis.com/auth/userinfo.profile"
 
 GOOGLE_READ_CAPABILITY_SCOPES: dict[str, set[str]] = {
     "cap.calendar.list": {GOOGLE_CALENDAR_READ_SCOPE},
@@ -77,7 +83,13 @@ GOOGLE_RECONNECT_INTENT_EXTRA_SCOPES: dict[str, set[str]] = {
     "cap.calendar.propose_slots": {GOOGLE_CALENDAR_FREEBUSY_SCOPE},
 }
 
-_GOOGLE_MINIMUM_READ_SCOPES = {GOOGLE_CALENDAR_READ_SCOPE, GOOGLE_GMAIL_READ_SCOPE}
+_GOOGLE_MINIMUM_READ_SCOPES = {
+    GOOGLE_CALENDAR_READ_SCOPE,
+    GOOGLE_GMAIL_READ_SCOPE,
+    GOOGLE_OPENID_SCOPE,
+    GOOGLE_USERINFO_EMAIL_SCOPE,
+    GOOGLE_USERINFO_PROFILE_SCOPE,
+}
 _READINESS_BLOCKING_FAILURE_CODES = {
     "consent_required",
     "scope_missing",

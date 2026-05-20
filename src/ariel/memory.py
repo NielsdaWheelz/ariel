@@ -31,6 +31,7 @@ import ulid
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from .capability_registry import run_callable_signature
 from .config import AppSettings
 from .persistence import (
     BackgroundTaskRecord,
@@ -517,7 +518,9 @@ def run_retriever(
     partial dict rather than raising; recall failure is non-fatal.
     """
     eligible_callables = ["memory.search", "memory.read", "agent.emit_finding"]
-    callable_lines = "\n".join(f"- {name}" for name in eligible_callables)
+    callable_lines = "\n".join(
+        f"- {name}{run_callable_signature(name)}" for name in eligible_callables
+    )
 
     responses_input_items: list[dict[str, Any]] = [
         {"role": "system", "content": _RETRIEVER_PROMPT},
@@ -534,8 +537,8 @@ def run_retriever(
                 "syscall callables available this run. Their namespaces "
                 "(agent, memory) are pre-injected globals — do NOT import "
                 "them; `import ariel` fails. All arguments are keyword "
-                "arguments (e.g. memory.search(query='...')). Results are "
-                "returned inline:\n"
+                "arguments — the signature shown is the contract. Results "
+                "are returned inline:\n"
             )
             + callable_lines,
         },
@@ -704,7 +707,9 @@ def run_rememberer(
         "memory.note.delete",
         "agent.emit_done",
     ]
-    callable_lines = "\n".join(f"- {name}" for name in eligible_callables)
+    callable_lines = "\n".join(
+        f"- {name}{run_callable_signature(name)}" for name in eligible_callables
+    )
 
     responses_input_items: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
@@ -714,8 +719,8 @@ def run_rememberer(
                 "syscall callables available this run. Their namespaces "
                 "(agent, memory) are pre-injected globals — do NOT import "
                 "them; `import ariel` fails. All arguments are keyword "
-                "arguments (e.g. memory.search(query='...')). Results are "
-                "returned inline:\n"
+                "arguments — the signature shown is the contract. Results "
+                "are returned inline:\n"
             )
             + callable_lines,
         },
