@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -50,6 +51,9 @@ from .sync_runtime import (
 )
 
 
+_log = logging.getLogger(__name__)
+
+
 class UnsupportedTaskType(RuntimeError):
     pass
 
@@ -68,8 +72,13 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}_{ulid.new().str.lower()}"
 
 
-def _deliver_to_discord(*, outcome: TurnExecutionOutcome, settings: AppSettings) -> None:
-    if settings.discord_bot_token is None or settings.discord_channel_id is None:
+def _deliver_to_discord(
+    *,
+    outcome: TurnExecutionOutcome,
+    settings: AppSettings,
+    discord_context: dict[str, Any] | None = None,
+) -> None:
+    if settings.discord_bot_token is None:
         return
     if outcome.status_code != 200:
         return
@@ -78,6 +87,24 @@ def _deliver_to_discord(*, outcome: TurnExecutionOutcome, settings: AppSettings)
         return
     message = assistant.get("message")
     if not isinstance(message, str) or not message.strip():
+        return
+
+    # A wake that originates from a Discord message replies to it in its own
+    # channel; a wake without an originating message posts to the default
+    # notification channel. discord_channel_id is therefore a fallback, not a
+    # gate — see docs/production-runbook.md and docs/modules/proactivity.md.
+    target_channel_id: int | str | None = None
+    reply_to_message_id: int | None = None
+    if isinstance(discord_context, dict):
+        raw_channel_id = discord_context.get("channel_id")
+        if isinstance(raw_channel_id, (int, str)) and raw_channel_id:
+            target_channel_id = raw_channel_id
+        raw_message_id = discord_context.get("message_id")
+        if isinstance(raw_message_id, int):
+            reply_to_message_id = raw_message_id
+    if target_channel_id is None:
+        target_channel_id = settings.discord_channel_id
+    if target_channel_id is None:
         return
 
     # Collect pending approvals from the turn's surface_action_lifecycle.
@@ -123,6 +150,12 @@ def _deliver_to_discord(*, outcome: TurnExecutionOutcome, settings: AppSettings)
         content = content[:1888].rstrip() + "\n[truncated]"
 
     body: dict[str, Any] = {"content": content}
+    if reply_to_message_id is not None:
+        body["message_reference"] = {
+            "message_id": str(reply_to_message_id),
+            "channel_id": str(target_channel_id),
+            "fail_if_not_exists": False,
+        }
     if pending_approvals:
         body["components"] = [
             {
@@ -147,12 +180,18 @@ def _deliver_to_discord(*, outcome: TurnExecutionOutcome, settings: AppSettings)
 
     try:
         httpx.post(
-            f"https://discord.com/api/v10/channels/{settings.discord_channel_id}/messages",
+            f"https://discord.com/api/v10/channels/{target_channel_id}/messages",
             headers={"Authorization": f"Bot {settings.discord_bot_token}"},
             json=body,
             timeout=settings.discord_notification_timeout_seconds,
         )
-    except httpx.HTTPError:
+    except httpx.HTTPError as exc:
+        _log.warning(
+            "discord delivery HTTP error (channel_id=%s, turn_id=%s): %s",
+            target_channel_id,
+            outcome.turn_id,
+            exc,
+        )
         return
 
 
@@ -404,7 +443,10 @@ def process_one_task(
                 message = _payload_text(task_payload, "message")
                 if session_id is None or message is None:
                     raise RuntimeError("user_message task payload invalid")
-                discord_context = task_payload.get("discord_context")
+                raw_discord_context = task_payload.get("discord_context")
+                discord_context_for_wake = (
+                    raw_discord_context if isinstance(raw_discord_context, dict) else None
+                )
                 attachment_sources = task_payload.get("attachment_sources")
                 with session_factory() as db:
                     outcome = _wake(
@@ -414,9 +456,7 @@ def process_one_task(
                         wake_context=WakeContext(
                             trigger_kind="user_message",
                             prompt_text=message,
-                            discord_context=discord_context
-                            if isinstance(discord_context, dict)
-                            else None,
+                            discord_context=discord_context_for_wake,
                             attachment_sources=attachment_sources
                             if isinstance(attachment_sources, list)
                             else None,
@@ -425,7 +465,11 @@ def process_one_task(
                         google_runtime=build_google_runtime(runtime.settings),
                     )
                     db.commit()
-                _deliver_to_discord(outcome=outcome, settings=runtime.settings)
+                _deliver_to_discord(
+                    outcome=outcome,
+                    settings=runtime.settings,
+                    discord_context=discord_context_for_wake,
+                )
             case "execute_action_attempt":
                 action_attempt_id = _payload_text(task_payload, "action_attempt_id")
                 if action_attempt_id is None:
@@ -531,10 +575,22 @@ def process_one_task(
                 )
             case _:
                 raise UnsupportedTaskType(f"unsupported task type: {task_type}")
-    except UnsupportedTaskType:
+    except UnsupportedTaskType as exc:
+        _log.error("worker rejected task %s: %s", task_id, exc)
         _mark_task_failed(session_factory=session_factory, task_id=task_id)
         return True
     except Exception:
+        # The worker is the boundary for arbitrary task-type dispatch: each arm
+        # has its own failure modes (model errors, sandbox crashes, DB
+        # conflicts) and a single task must never down the worker. The catch
+        # must therefore log the full traceback — silent swallow makes
+        # production failures undiagnosable, which is exactly the regression
+        # this comment guards against.
+        _log.exception(
+            "worker task %s (%s) failed; marking attempt as failed",
+            task_id,
+            task_type,
+        )
         _mark_task_failed(session_factory=session_factory, task_id=task_id)
         return True
 
@@ -566,6 +622,10 @@ def run_worker(*, runtime: Runtime) -> None:
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     sandbox = SandboxRuntime()
     runtime, engine = build_runtime(sandbox=sandbox)
     try:

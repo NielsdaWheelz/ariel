@@ -389,3 +389,156 @@ def test_deliver_to_discord_approval_with_expires_at_includes_suffix(
     assert len(posted_bodies) == 1
     content = posted_bodies[0]["content"]
     assert "expires_at=2026-06-01T13:00:00Z" in content
+
+
+def test_deliver_to_discord_dm_posts_to_origin_channel_and_replies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wake originating from a Discord DM must POST to the DM channel and reply to
+    the originating message — not to the configured guild notification channel.
+
+    This is the regression for the production incident where a user DM was
+    accepted by the API (202), processed by the worker, but the bot's reply
+    went to the configured guild channel (the user couldn't see it).
+    """
+    posts: list[dict[str, Any]] = []
+
+    def fake_post(
+        url: str, *, headers: dict[str, str], json: dict[str, Any], timeout: float
+    ) -> MagicMock:
+        posts.append({"url": url, "json": json})
+        response = MagicMock()
+        response.status_code = 200
+        return response
+
+    monkeypatch.setattr("ariel.worker.httpx.post", fake_post)
+
+    dm_channel_id = 1506583531923439699
+    dm_message_id = 1506583537367912530
+    discord_context = {
+        "guild_id": None,
+        "channel_id": dm_channel_id,
+        "channel_type": "private",
+        "message_id": dm_message_id,
+        "author_id": 481630254318878743,
+        "mentioned_bot": False,
+    }
+    _deliver_to_discord(
+        outcome=_outcome(),
+        settings=_settings(),
+        discord_context=discord_context,
+    )
+
+    assert len(posts) == 1
+    post = posts[0]
+    # URL targets the DM channel, NOT the configured guild channel (123456789).
+    assert post["url"] == f"https://discord.com/api/v10/channels/{dm_channel_id}/messages"
+    body = post["json"]
+    assert body["content"] == "Hello from Ariel"
+    # The reply targets the originating message so it threads cleanly.
+    assert body["message_reference"] == {
+        "message_id": str(dm_message_id),
+        "channel_id": str(dm_channel_id),
+        "fail_if_not_exists": False,
+    }
+
+
+def test_deliver_to_discord_no_context_falls_back_to_default_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wake without a Discord-origin (e.g. a scheduled task) posts to the
+    default notification channel and includes no message_reference."""
+    posts: list[dict[str, Any]] = []
+
+    def fake_post(
+        url: str, *, headers: dict[str, str], json: dict[str, Any], timeout: float
+    ) -> MagicMock:
+        posts.append({"url": url, "json": json})
+        response = MagicMock()
+        response.status_code = 200
+        return response
+
+    monkeypatch.setattr("ariel.worker.httpx.post", fake_post)
+
+    _deliver_to_discord(
+        outcome=_outcome(),
+        settings=_settings(),
+        discord_context=None,
+    )
+
+    assert len(posts) == 1
+    post = posts[0]
+    assert post["url"] == "https://discord.com/api/v10/channels/123456789/messages"
+    assert "message_reference" not in post["json"]
+
+
+def test_deliver_to_discord_guild_message_posts_to_origin_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wake from a guild message posts to that guild channel, not the
+    configured default notification channel."""
+    posts: list[dict[str, Any]] = []
+
+    def fake_post(
+        url: str, *, headers: dict[str, str], json: dict[str, Any], timeout: float
+    ) -> MagicMock:
+        posts.append({"url": url, "json": json})
+        response = MagicMock()
+        response.status_code = 200
+        return response
+
+    monkeypatch.setattr("ariel.worker.httpx.post", fake_post)
+
+    other_channel_id = 999999999
+    other_message_id = 888888888
+    _deliver_to_discord(
+        outcome=_outcome(),
+        settings=_settings(),
+        discord_context={
+            "guild_id": 1234567,
+            "channel_id": other_channel_id,
+            "channel_type": "GUILD_TEXT",
+            "message_id": other_message_id,
+            "author_id": 481630254318878743,
+            "mentioned_bot": True,
+        },
+    )
+
+    assert len(posts) == 1
+    post = posts[0]
+    assert post["url"] == f"https://discord.com/api/v10/channels/{other_channel_id}/messages"
+    assert post["json"]["message_reference"]["message_id"] == str(other_message_id)
+
+
+def test_deliver_to_discord_no_default_channel_with_origin_still_posts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ARIEL_DISCORD_CHANNEL_ID is unset but a Discord-origin message
+    carries a channel_id, delivery still happens — the default channel is a
+    fallback, not a gate."""
+    posts: list[dict[str, Any]] = []
+
+    def fake_post(
+        url: str, *, headers: dict[str, str], json: dict[str, Any], timeout: float
+    ) -> MagicMock:
+        posts.append({"url": url, "json": json})
+        response = MagicMock()
+        response.status_code = 200
+        return response
+
+    monkeypatch.setattr("ariel.worker.httpx.post", fake_post)
+
+    settings = _settings(discord_channel_id=None)
+    dm_channel_id = 1506583531923439699
+    _deliver_to_discord(
+        outcome=_outcome(),
+        settings=settings,
+        discord_context={
+            "channel_id": dm_channel_id,
+            "message_id": 1506583537367912530,
+            "author_id": 481630254318878743,
+        },
+    )
+
+    assert len(posts) == 1
+    assert posts[0]["url"] == f"https://discord.com/api/v10/channels/{dm_channel_id}/messages"
