@@ -1,7 +1,7 @@
-"""Integration tests for the ``research.finding`` syscall.
+"""Integration tests for the ``agent.emit_finding`` syscall.
 
 Tests the happy path, schema/size violations, and the gating behaviour
-(``research.finding`` is not eligible in a main-agent run) via the
+(``agent.emit_finding`` is not eligible in a main-agent run) via the
 FakeSandboxRuntime.
 """
 
@@ -22,7 +22,7 @@ from tests.fake_sandbox import FakeSandboxRuntime
 NOW = datetime(2026, 5, 20, 10, 0, tzinfo=UTC)
 
 _VALID_FINDING_SOURCE = (
-    "research.finding(\n"
+    "agent.emit_finding(\n"
     "    summary='Found key facts.',\n"
     "    claims=[{'statement': 'Fact A', 'sources': ['https://example.test'], 'confidence': 'high'}],\n"
     "    gaps=['Could not determine X.'],\n"
@@ -164,7 +164,7 @@ def test_research_finding_schema_invalid_missing_field(
         with db.begin():
             turn = _turn(db, session_id="ses_finding_schema", turn_id="trn_finding_schema")
             # Missing 'sources' key.
-            source = "research.finding(\n    summary='ok',\n    claims=[],\n    gaps=[],\n)\n"
+            source = "agent.emit_finding(\n    summary='ok',\n    claims=[],\n    gaps=[],\n)\n"
             result = _run(
                 sandbox=sandbox,
                 db=db,
@@ -174,7 +174,7 @@ def test_research_finding_schema_invalid_missing_field(
                 is_research_run=True,
             )
             assert not result.program_ok
-            assert "research_finding_schema_invalid" in result.callback_errors
+            assert "agent_emit_finding_schema_invalid" in result.callback_errors
     sandbox.close()
 
 
@@ -188,7 +188,7 @@ def test_research_finding_schema_invalid_wrong_type(
         with db.begin():
             turn = _turn(db, session_id="ses_finding_type", turn_id="trn_finding_type")
             source = (
-                "research.finding(\n"
+                "agent.emit_finding(\n"
                 "    summary='ok',\n"
                 "    claims='not a list',\n"
                 "    gaps=[],\n"
@@ -204,7 +204,7 @@ def test_research_finding_schema_invalid_wrong_type(
                 is_research_run=True,
             )
             assert not result.program_ok
-            assert "research_finding_schema_invalid" in result.callback_errors
+            assert "agent_emit_finding_schema_invalid" in result.callback_errors
     sandbox.close()
 
 
@@ -219,7 +219,7 @@ def test_research_finding_too_large_rejected(
         with db.begin():
             turn = _turn(db, session_id="ses_finding_big", turn_id="trn_finding_big")
             source = (
-                f"research.finding(\n"
+                f"agent.emit_finding(\n"
                 f"    summary={big_summary!r},\n"
                 f"    claims=[],\n"
                 f"    gaps=[],\n"
@@ -235,7 +235,7 @@ def test_research_finding_too_large_rejected(
                 is_research_run=True,
             )
             assert not result.program_ok
-            assert "research_finding_too_large" in result.callback_errors
+            assert "agent_emit_finding_too_large" in result.callback_errors
     sandbox.close()
 
 

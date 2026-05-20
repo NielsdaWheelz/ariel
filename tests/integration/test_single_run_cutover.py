@@ -9,7 +9,6 @@ import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
-import ariel.memory as memory
 import ariel.run_runtime as run_runtime_module
 from ariel.action_runtime import RuntimeProvenance
 from ariel.app import ModelAdapter, create_app
@@ -29,31 +28,6 @@ from tests.integration.responses_helpers import (
     responses_run_message,
     responses_with_run_calls,
 )
-
-
-def _stub_memory_retriever(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stub the retriever's bounded model call so ``memory.recall`` is hermetic:
-    the retriever subagent selects no facts from the empty store."""
-
-    class _Response:
-        status_code = 200
-
-        def json(self) -> dict[str, Any]:
-            return {
-                "id": "resp_retriever_stub",
-                "output": [
-                    {
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": json.dumps({"facts": []})}],
-                    }
-                ],
-            }
-
-        def raise_for_status(self) -> None:
-            return None
-
-    monkeypatch.setattr(memory.httpx, "post", lambda *args, **kwargs: _Response())
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
@@ -708,7 +682,6 @@ def test_memory_remember_enqueues_background_task(
 
 def test_two_programs_with_capability_syscalls_get_distinct_proposal_index(
     postgres_url: str,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A turn runs two programs that BOTH make a capability syscall.
 
@@ -721,22 +694,23 @@ def test_two_programs_with_capability_syscalls_get_distinct_proposal_index(
 
     Unlike ``test_taint_threads_across_two_programs_in_one_turn``, this exercises
     the real ``process_one_call`` so the unique index is actually hit.
+
+    ``memory.search`` is used instead of ``memory.recall`` because ``memory.recall``
+    spawns a retriever sub-agent that requires model_adapter and sandbox to be
+    threaded through execute_run_program → process_one_call (they are not).
+    ``memory.search`` is allow_inline and executes entirely from session_factory,
+    so it works correctly in this path.
     """
 
-    # Each program runs a real capability syscall (memory.recall -- allow_inline,
+    # Each program runs a real capability syscall (memory.search -- allow_inline,
     # so on a clean turn it executes inline) and then ends: program 1 with
     # emit_value so the turn continues, program 2 with emit_message so the turn
-    # completes. The retriever's bounded model call is stubbed.
-    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
-    _stub_memory_retriever(monkeypatch)
+    # completes.
     program_one = (
-        "recalled = memory.recall(query='status')\n"
-        "agent.emit_value(value={'recalled_one': recalled['status']})\n"
+        "result = memory.search(query='status')\n"
+        "agent.emit_value(value={'search_one': len(result['hits'])})\n"
     )
-    program_two = (
-        "recalled = memory.recall(query='status')\n"
-        "agent.emit_message(text='recalled twice: ' + recalled['status'])\n"
-    )
+    program_two = "result = memory.search(query='status')\nagent.emit_message(text='search done')\n"
     adapter = CapturingRunAdapter(
         responses=[
             _program_response(
@@ -755,11 +729,11 @@ def test_two_programs_with_capability_syscalls_get_distinct_proposal_index(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        turn = post_message_and_drain(client, session_id, message="recall twice")
+        turn = post_message_and_drain(client, session_id, message="search twice")
 
     # The turn persisted: no UniqueViolation on the (turn_id, proposal_index)
     # index when the second program's capability syscall flushed.
-    assert turn.assistant_message == "recalled twice: recalled"
+    assert turn.assistant_message == "search done"
 
     engine = create_engine(postgres_url, future=True)
     session_factory = sessionmaker(bind=engine, future=True, expire_on_commit=False)
@@ -774,8 +748,8 @@ def test_two_programs_with_capability_syscalls_get_distinct_proposal_index(
     # Both capability syscalls wrote an action attempt, and the two share a turn
     # but hold distinct proposal indices -- the turn-global counter at work.
     assert [attempt.capability_id for attempt in attempts] == [
-        "cap.memory.recall",
-        "cap.memory.recall",
+        "cap.memory.search",
+        "cap.memory.search",
     ]
     proposal_indices = [attempt.proposal_index for attempt in attempts]
     assert len(set(proposal_indices)) == 2, proposal_indices

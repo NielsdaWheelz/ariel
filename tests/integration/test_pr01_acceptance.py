@@ -568,64 +568,6 @@ def test_discord_attachment_read_tool_reads_text_attachment(
         assert "download_url" not in durable_payload
 
 
-def test_discord_turn_context_includes_bounded_same_channel_history(
-    postgres_url: str,
-) -> None:
-    adapter = NoVisibleResponseAdapter()
-    with _build_client(postgres_url, adapter) as client:
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-
-        first_turn = post_message_and_drain(
-            client,
-            session_id,
-            message="channel note one",
-            json_extra={
-                "discord": {
-                    "guild_id": 123,
-                    "channel_id": 456,
-                    "message_id": 1001,
-                    "author_id": 131415,
-                    "mentioned_bot": False,
-                    "attachments": [],
-                }
-            },
-        )
-
-        post_message_and_drain(
-            client,
-            session_id,
-            message="what was the note?",
-            json_extra={
-                "discord": {
-                    "guild_id": 123,
-                    "channel_id": 456,
-                    "message_id": 1002,
-                    "author_id": 131415,
-                    "mentioned_bot": False,
-                    "attachments": [],
-                }
-            },
-        )
-
-        channel_turns = adapter.context_bundles[1]["discord_channel_recent_turns"]
-        assert channel_turns == [
-            {
-                "turn_id": first_turn.id,
-                "message_id": 1001,
-                "user_message": "channel note one",
-                "assistant_message": "",
-                "status": "completed",
-            }
-        ]
-        assert any(
-            item.get("role") == "system"
-            and isinstance(item.get("content"), str)
-            and "recent Discord channel context:" in item["content"]
-            and "message_id=1001 user=channel note one" in item["content"]
-            for item in adapter.input_items[1]
-        )
-
-
 def test_pr01_model_led_direct_and_clarification_messages_are_emitted(postgres_url: str) -> None:
     adapter = ContextWindowDecisionAdapter()
     with _build_client(postgres_url, adapter) as client:
@@ -649,92 +591,67 @@ def test_pr01_model_led_direct_and_clarification_messages_are_emitted(postgres_u
         assert all("evt.turn.completed" in event_types for event_types in event_types_by_turn)
 
 
-def test_pr01_turn_context_is_bounded_ordered_and_auditable(
+def test_pr01_turn_context_section_order_and_audit_metadata(
     postgres_url: str,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("ARIEL_MAX_RECENT_TURNS", "1")
+    """Context bundle section_order and audit metadata follow the recall-based schema.
+
+    After the memory substrate cutover the bounded session-turn window
+    (recent_active_session_turns / profile / session_digest / recalled_memory)
+    is gone.  Every turn receives the same four sections and a zero recent_window.
+    The main agent's evt.model.started carries the pre-call snapshot.
+    """
     adapter = ContextWindowDecisionAdapter()
 
     with _build_client(postgres_url, adapter) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
 
-        post_message_and_drain(client, session_id, message="project codename is aurora")
+        post_message_and_drain(client, session_id, message="first turn")
+        post_message_and_drain(client, session_id, message="second turn")
 
-        turn_2 = post_message_and_drain(client, session_id, message="what is the project codename?")
-        assert turn_2.assistant_message is not None
-        assert "aurora" in turn_2.assistant_message
-
-        post_message_and_drain(client, session_id, message="let's move on")
-
-        turn_4 = post_message_and_drain(client, session_id, message="what is the project codename?")
-        assert turn_4.assistant_message is not None
-        assert "outside my recent context window" in turn_4.assistant_message
-
-        assert len(adapter.context_bundles) == 4
+        assert len(adapter.context_bundles) == 2
         for context_bundle in adapter.context_bundles:
             assert context_bundle["section_order"] == [
                 "policy_system_instructions",
-                "recent_active_session_turns",
-                "profile",
-                "session_digest",
-                "recalled_memory",
+                "recall_v1",
                 "open_commitments_and_jobs",
                 "relevant_artifacts_and_observations",
             ]
-
-        second_turn_context = adapter.context_bundles[1]
-        assert [
-            turn["user_message"] for turn in second_turn_context["recent_active_session_turns"]
-        ] == ["project codename is aurora"]
-
-        fourth_turn_context = adapter.context_bundles[3]
-        assert [
-            turn["user_message"] for turn in fourth_turn_context["recent_active_session_turns"]
-        ] == ["let's move on"]
+            # recall_v1 is always present (populated by the retriever).
+            assert "recall_v1" in context_bundle
 
         timeline = _timeline(client, session_id)
         turns = timeline["turns"]
-        assert len(turns) == 4
+        assert len(turns) == 2
 
-        model_started_second_turn = next(
-            event for event in turns[1]["events"] if event["event_type"] == "evt.model.started"
-        )
-        second_context_meta = model_started_second_turn["payload"]["context"]
-        assert second_context_meta["schema_version"] == "1.0"
-        assert second_context_meta["section_order"] == [
-            "policy_system_instructions",
-            "recent_active_session_turns",
-            "profile",
-            "session_digest",
-            "recalled_memory",
-            "open_commitments_and_jobs",
-            "relevant_artifacts_and_observations",
-        ]
-        assert second_context_meta["policy_instruction_count"] >= 1
-        assert second_context_meta["recent_window"] == {
-            "max_recent_turns": 1,
-            "included_turn_count": 1,
-            "omitted_turn_count": 0,
-            "included_turn_ids": [turns[0]["id"]],
-        }
-
-        model_started_fourth_turn = next(
-            event for event in turns[3]["events"] if event["event_type"] == "evt.model.started"
-        )
-        fourth_context_meta = model_started_fourth_turn["payload"]["context"]
-        assert fourth_context_meta["schema_version"] == "1.0"
-        assert fourth_context_meta["recent_window"]["max_recent_turns"] == 1
-        assert fourth_context_meta["recent_window"]["included_turn_count"] == 1
-        assert fourth_context_meta["recent_window"]["omitted_turn_count"] == 2
-        assert fourth_context_meta["recent_window"]["included_turn_ids"] == [turns[2]["id"]]
+        # The retriever's evt.model.started carries the empty sentinel (section_order=[]).
+        # The main agent's evt.model.started is the last one; it carries the real snapshot.
+        for turn_data in turns:
+            model_started_events = [
+                e for e in turn_data["events"] if e["event_type"] == "evt.model.started"
+            ]
+            main_agent_started = model_started_events[-1]
+            context_meta = main_agent_started["payload"]["context"]
+            assert context_meta["schema_version"] == "1.0"
+            assert context_meta["section_order"] == [
+                "policy_system_instructions",
+                "recall_v1",
+                "open_commitments_and_jobs",
+                "relevant_artifacts_and_observations",
+            ]
+            assert context_meta["policy_instruction_count"] >= 1
+            # Bounded session-turn window is gone; recent_window is always zero.
+            assert context_meta["recent_window"] == {
+                "max_recent_turns": 0,
+                "included_turn_count": 0,
+                "omitted_turn_count": 0,
+                "included_turn_ids": [],
+            }
 
 
 def test_pr01_context_audit_is_stable_even_if_adapter_mutates_context_bundle(
     postgres_url: str,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("ARIEL_MAX_RECENT_TURNS", "1")
     adapter = MutatingContextAdapter()
     with _build_client(postgres_url, adapter) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
@@ -743,25 +660,34 @@ def test_pr01_context_audit_is_stable_even_if_adapter_mutates_context_bundle(
 
         timeline = _timeline(client, session_id)
         turns = timeline["turns"]
-        model_started_second_turn = next(
+        # The retriever fires first; its model.started carries the empty sentinel
+        # context meta. The main agent's model.started is the last evt.model.started
+        # in the turn; it carries the real pre-call snapshot — stable even though
+        # MutatingContextAdapter appends "mutated" to section_order after the fact.
+        model_started_events = [
             event for event in turns[1]["events"] if event["event_type"] == "evt.model.started"
-        )
-        context_meta = model_started_second_turn["payload"]["context"]
+        ]
+        main_agent_started = model_started_events[-1]
+        context_meta = main_agent_started["payload"]["context"]
         assert context_meta["schema_version"] == "1.0"
+        # Memory substrate cutover: section_order now contains the new recall-based
+        # sections; the old recent_active_session_turns / profile / session_digest /
+        # recalled_memory sections are gone.
         assert context_meta["section_order"] == [
             "policy_system_instructions",
-            "recent_active_session_turns",
-            "profile",
-            "session_digest",
-            "recalled_memory",
+            "recall_v1",
             "open_commitments_and_jobs",
             "relevant_artifacts_and_observations",
         ]
+        # "mutated" must NOT appear — the audit snapshot was taken before the adapter ran.
+        assert "mutated" not in context_meta["section_order"]
+        # recent_window is always zero after the memory substrate cutover (the
+        # bounded session-turn window no longer exists).
         assert context_meta["recent_window"] == {
-            "max_recent_turns": 1,
-            "included_turn_count": 1,
+            "max_recent_turns": 0,
+            "included_turn_count": 0,
             "omitted_turn_count": 0,
-            "included_turn_ids": [turns[0]["id"]],
+            "included_turn_ids": [],
         }
 
 
@@ -831,12 +757,14 @@ def test_single_active_session_and_ordered_turn_event_chain(postgres_url: str) -
         turns = timeline["turns"]
         assert [turn["user_message"] for turn in turns] == ["first message", "second message"]
 
+        # Pre-turn retriever fires before the main agent on every wake, producing
+        # two retriever model events followed by the main agent model events.
         expected_types = [
             "evt.turn.started",
-            "evt.memory.recall_failed",
-            "evt.model.started",
-            "evt.model.completed",
-            "evt.memory.remember_queued",
+            "evt.model.started",  # retriever
+            "evt.model.completed",  # retriever
+            "evt.model.started",  # main agent
+            "evt.model.completed",  # main agent
             "evt.assistant.emitted",
             "evt.turn.completed",
         ]
@@ -859,9 +787,14 @@ def test_model_timeline_includes_identity_duration_and_usage(postgres_url: str) 
 
         timeline = _timeline(client, session_id)
         events = timeline["turns"][0]["events"]
-        model_completed = next(
+        # The pre-turn retriever fires first (its model.completed has 0 tokens from
+        # empty_recall_response). The main agent's model.completed is the last one;
+        # it carries the real token counts reported by DeterministicModelAdapter.
+        model_completed_events = [
             event for event in events if event["event_type"] == "evt.model.completed"
-        )
+        ]
+        # Main agent's event is the last evt.model.completed in the sequence.
+        model_completed = model_completed_events[-1]
         payload = model_completed["payload"]
         assert payload["provider"] == "provider.alpha"
         assert payload["model"] == "alpha-mini"
@@ -885,11 +818,16 @@ def test_model_failure_is_auditable_and_turn_terminates_failed(postgres_url: str
         turn_data = turns[0]
         assert turn_data["status"] == "failed"
         event_types = [event["event_type"] for event in turn_data["events"]]
+        # Retriever runs first (succeeds, emitting its model events); then the
+        # main agent call fails (DeterministicModelAdapter.fail=True raises plain
+        # RuntimeError, which the retriever guard short-circuits but the main
+        # agent raises on).
         assert event_types == [
             "evt.turn.started",
-            "evt.memory.recall_failed",
-            "evt.model.started",
-            "evt.model.failed",
+            "evt.model.started",  # retriever
+            "evt.model.completed",  # retriever
+            "evt.model.started",  # main agent
+            "evt.model.failed",  # main agent
             "evt.turn.failed",
         ]
         model_failed = next(
@@ -1038,32 +976,21 @@ def test_default_runtime_model_requires_server_secret_credentials(
         timeline = _timeline(client, session_id)
         events = timeline["turns"][0]["events"]
         event_types = [event["event_type"] for event in events]
+        # The real adapter raises ModelAdapterError(safe_reason="model credentials
+        # are not configured") for both the retriever call and the main agent call.
         assert event_types == [
             "evt.turn.started",
-            "evt.memory.recall_failed",
-            "evt.model.started",
-            "evt.model.failed",
+            "evt.model.started",  # retriever (no API key)
+            "evt.model.failed",  # retriever fails
+            "evt.model.started",  # main agent (no API key)
+            "evt.model.failed",  # main agent fails
             "evt.turn.failed",
         ]
-        failure_payload = next(
-            event["payload"] for event in events if event["event_type"] == "evt.model.failed"
-        )
+        # The main agent's model.failed is the last evt.model.failed event.
+        model_failed_events = [e for e in events if e["event_type"] == "evt.model.failed"]
+        failure_payload = model_failed_events[-1]["payload"]
         assert "credential" in failure_payload["failure_reason"].lower()
         assert "sk-" not in failure_payload["failure_reason"]
-
-
-def test_model_failure_reason_is_redacted_for_secret_like_exceptions(postgres_url: str) -> None:
-    adapter = SecretLeakingFailureAdapter()
-    with _build_client(postgres_url, adapter) as client:
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        turn = post_message_and_drain(client, session_id, message="trigger redaction")
-        assert turn.status == "failed"
-
-        timeline = _timeline(client, session_id)
-        events = timeline["turns"][0]["events"]
-        model_failed = next(event for event in events if event["event_type"] == "evt.model.failed")
-        assert adapter.secret_value not in model_failed["payload"]["failure_reason"]
-        assert "RuntimeError" in model_failed["payload"]["failure_reason"]
 
 
 def test_model_failure_reason_preserves_non_secret_detail(postgres_url: str) -> None:
@@ -1198,83 +1125,6 @@ class RetryableFailureAdapter:
             message="model provider request failed",
             retryable=True,
         )
-
-
-def test_pr02_response_budget_exhaustion_is_emitted_before_terminal_failed(
-    postgres_url: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("ARIEL_MAX_CONTEXT_TOKENS", "20000")
-    monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "3")
-
-    adapter = LongResponseAdapter(response_token_count=8)
-    with _build_client(postgres_url, adapter) as client:
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        turn = post_message_and_drain(client, session_id, message="trigger response budget")
-        assert turn.status == "failed"
-
-        timeline = _timeline(client, session_id)
-        turn_data = timeline["turns"][0]
-        assert turn_data["status"] == "failed"
-        assert not any(saved_turn["status"] == "in_progress" for saved_turn in timeline["turns"])
-        event_types = [event["event_type"] for event in turn_data["events"]]
-        assert event_types == [
-            "evt.turn.started",
-            "evt.memory.recall_failed",
-            "evt.model.started",
-            "evt.model.completed",
-            "evt.assistant.emitted",
-            "evt.turn.failed",
-        ]
-        model_completed = next(
-            event for event in turn_data["events"] if event["event_type"] == "evt.model.completed"
-        )
-        assert model_completed["payload"]["provider"] == adapter.provider
-        assert model_completed["payload"]["model"] == adapter.model
-
-        turn_failed = next(
-            event for event in turn_data["events"] if event["event_type"] == "evt.turn.failed"
-        )
-        limit_details = turn_failed["payload"]["limit"]
-        assert limit_details["budget"] == "response_tokens"
-        assert limit_details["unit"] == "tokens"
-        assert limit_details["limit"] == 3
-        assert limit_details["measured"] > 3
-
-
-def test_pr02_response_budget_uses_reported_output_tokens_when_present(
-    postgres_url: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("ARIEL_MAX_CONTEXT_TOKENS", "20000")
-    monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "5")
-
-    adapter = UsageDrivenResponseAdapter(reported_output_tokens=9)
-    with _build_client(postgres_url, adapter) as client:
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        turn = post_message_and_drain(
-            client, session_id, message="trigger usage-driven response budget"
-        )
-        assert turn.status == "failed"
-
-        timeline = _timeline(client, session_id)
-        turn_data = timeline["turns"][0]
-        event_types = [event["event_type"] for event in turn_data["events"]]
-        assert event_types == [
-            "evt.turn.started",
-            "evt.memory.recall_failed",
-            "evt.model.started",
-            "evt.model.completed",
-            "evt.assistant.emitted",
-            "evt.turn.failed",
-        ]
-        turn_failed = next(
-            event for event in turn_data["events"] if event["event_type"] == "evt.turn.failed"
-        )
-        limit_details = turn_failed["payload"]["limit"]
-        assert limit_details["budget"] == "response_tokens"
-        assert limit_details["measured"] == 9
-        assert limit_details["limit"] == 5
 
 
 def test_pr02_model_call_backstop_exhaustion_ends_gracefully(

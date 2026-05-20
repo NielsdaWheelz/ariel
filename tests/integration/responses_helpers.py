@@ -290,7 +290,7 @@ def empty_recall_response(
     Lets tests' canned-response queues stay focused on the main agent.
     """
     rid = provider_response_id or "resp_retriever_empty"
-    program = 'agent.emit_finding({"summary": "", "claims": [], "gaps": [], "sources": []})'
+    program = 'agent.emit_finding(summary="", claims=[], gaps=[], sources=[])'
     return {
         "provider": provider,
         "model": model,

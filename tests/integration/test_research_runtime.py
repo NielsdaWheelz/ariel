@@ -44,7 +44,7 @@ from tests.integration.responses_helpers import empty_recall_response, is_retrie
 NOW = datetime(2026, 5, 20, 10, 0, tzinfo=UTC)
 
 _FINDING_PROGRAM = (
-    "research.finding(\n"
+    "agent.emit_finding(\n"
     "    summary='Investigated the question.',\n"
     "    claims=[{'statement': 'Fact A', 'sources': ['https://example.test'], "
     "'confidence': 'high'}],\n"
@@ -583,7 +583,7 @@ _PERSONAL_FINDING_PROGRAM = (
 )
 
 _PERSONAL_FINISH_PROGRAM = (
-    "research.finding(\n"
+    "agent.emit_finding(\n"
     "    summary='Checked calendar.',\n"
     "    claims=[],\n"
     "    gaps=[],\n"

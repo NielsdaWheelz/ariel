@@ -239,7 +239,7 @@ def test_research_investigate_syscall_rejects_a_bad_mode(
 
 
 _FINDING_PROGRAM = (
-    "research.finding(\n"
+    "agent.emit_finding(\n"
     "    summary='France is in Europe.',\n"
     "    claims=[{'statement': 'Paris is the capital', "
     "'sources': ['https://example.test'], 'confidence': 'high'}],\n"

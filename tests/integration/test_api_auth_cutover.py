@@ -53,15 +53,15 @@ def test_local_auth_guards_authority_routes(
     with TestClient(app) as client:
         assert client.get("/v1/health").status_code == 200
 
-        unauthenticated = client.get("/v1/memory/facts")
+        unauthenticated = client.get("/v1/memory/log")
         assert unauthenticated.status_code == 401
         assert unauthenticated.json()["error"]["code"] == "E_LOCAL_AUTH_TOKEN_INVALID"
 
-        rejected = client.get("/v1/memory/facts", headers={"Authorization": "Bearer wrong"})
+        rejected = client.get("/v1/memory/log", headers={"Authorization": "Bearer wrong"})
         assert rejected.status_code == 401
 
         accepted = client.get(
-            "/v1/memory/facts",
+            "/v1/memory/log",
             headers={"Authorization": f"Bearer {LOCAL_AUTH_TOKEN}"},
         )
         assert accepted.status_code == 200
