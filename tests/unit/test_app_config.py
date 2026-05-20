@@ -404,3 +404,119 @@ def test_worker_and_agency_numeric_settings_reject_non_positive_values(
 
     with pytest.raises(ValidationError):
         _app_settings_without_env_files()
+
+
+def test_public_webhook_base_url_strips_trailing_slash(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARIEL_PUBLIC_WEBHOOK_BASE_URL", "https://ariel.example.com/")
+
+    settings = _app_settings_without_env_files()
+
+    assert settings.public_webhook_base_url == "https://ariel.example.com"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "http://ariel.example.com",
+        "https://ariel.example.com/foo",
+        "https://ariel.example.com/?q=1",
+        "https://ariel.example.com/#frag",
+        "ariel.example.com",
+    ],
+)
+def test_public_webhook_base_url_rejects_non_clean_https(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("ARIEL_PUBLIC_WEBHOOK_BASE_URL", value)
+
+    with pytest.raises(ValidationError):
+        _app_settings_without_env_files()
+
+
+def test_production_requires_public_webhook_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARIEL_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("ARIEL_LOCAL_AUTH_REQUIRED", "true")
+    monkeypatch.setenv("ARIEL_LOCAL_AUTH_TOKEN", STRONG_LOCAL_AUTH_TOKEN)
+    monkeypatch.setenv("ARIEL_CONNECTOR_ENCRYPTION_SECRET", "prod-not-default")
+    monkeypatch.setenv("ARIEL_CONNECTOR_ENCRYPTION_KEYS", CONNECTOR_KEYRING)
+
+    with pytest.raises(ValidationError, match="public_webhook_base_url is required in production"):
+        _app_settings_without_env_files()
+
+
+def test_google_pubsub_subscription_rejects_non_resource_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARIEL_GOOGLE_PUBSUB_SUBSCRIPTION", "not-a-resource-path")
+    monkeypatch.setenv("ARIEL_GOOGLE_APPLICATION_CREDENTIALS_PATH", "/etc/sa.json")
+
+    with pytest.raises(ValidationError, match="google_pubsub_subscription"):
+        _app_settings_without_env_files()
+
+
+def test_google_application_credentials_path_must_be_absolute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "ARIEL_GOOGLE_PUBSUB_SUBSCRIPTION",
+        "projects/my-project/subscriptions/ariel-gmail-watch-sub",
+    )
+    monkeypatch.setenv("ARIEL_GOOGLE_APPLICATION_CREDENTIALS_PATH", "relative/sa.json")
+
+    with pytest.raises(ValidationError, match="absolute"):
+        _app_settings_without_env_files()
+
+
+@pytest.mark.parametrize(
+    "subscription, credentials_path",
+    [
+        ("projects/my-project/subscriptions/ariel-gmail-watch-sub", None),
+        (None, "/etc/sa.json"),
+    ],
+)
+def test_pubsub_subscription_and_credentials_must_be_set_together(
+    monkeypatch: pytest.MonkeyPatch,
+    subscription: str | None,
+    credentials_path: str | None,
+) -> None:
+    if subscription is not None:
+        monkeypatch.setenv("ARIEL_GOOGLE_PUBSUB_SUBSCRIPTION", subscription)
+    if credentials_path is not None:
+        monkeypatch.setenv("ARIEL_GOOGLE_APPLICATION_CREDENTIALS_PATH", credentials_path)
+
+    with pytest.raises(ValidationError, match="must be set together"):
+        _app_settings_without_env_files()
+
+
+def test_pubsub_subscription_and_credentials_set_together_validate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "ARIEL_GOOGLE_PUBSUB_SUBSCRIPTION",
+        "projects/my-project/subscriptions/ariel-gmail-watch-sub",
+    )
+    monkeypatch.setenv("ARIEL_GOOGLE_APPLICATION_CREDENTIALS_PATH", "/etc/sa.json")
+
+    settings = _app_settings_without_env_files()
+
+    assert settings.google_pubsub_subscription == (
+        "projects/my-project/subscriptions/ariel-gmail-watch-sub"
+    )
+    assert settings.google_application_credentials_path == "/etc/sa.json"
+
+
+@pytest.mark.parametrize(
+    "env_name",
+    [
+        "ARIEL_SUBSCRIBER_HEARTBEAT_INTERVAL_SECONDS",
+        "ARIEL_SUBSCRIBER_HEARTBEAT_STALENESS_FACTOR",
+    ],
+)
+def test_subscriber_heartbeat_settings_reject_non_positive_values(
+    monkeypatch: pytest.MonkeyPatch,
+    env_name: str,
+) -> None:
+    monkeypatch.setenv(env_name, "0")
+
+    with pytest.raises(ValidationError):
+        _app_settings_without_env_files()

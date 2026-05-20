@@ -15,6 +15,9 @@ from ariel.google_connector import ConnectorTokenCipher
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MEMORY_EMBEDDING_DIMENSIONS = 1536
 _LOCAL_AUTH_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,}$")
+_PUBSUB_SUBSCRIPTION_PATTERN = re.compile(
+    r"^projects/[a-z][a-z0-9-]{4,28}[a-z0-9]/subscriptions/[A-Za-z][A-Za-z0-9_.~+%-]{2,254}$"
+)
 _ENV_FILES = (_PROJECT_ROOT / ".env", _PROJECT_ROOT / ".env.local")
 
 
@@ -60,7 +63,11 @@ class AppSettings(BaseSettings):
     google_oauth_timeout_seconds: float = 10.0
     google_provider_event_token: str | None = None
     google_pubsub_topic: str | None = None
-    google_provider_event_url: str | None = None
+    public_webhook_base_url: str | None = None
+    google_pubsub_subscription: str | None = None
+    google_application_credentials_path: str | None = None
+    subscriber_heartbeat_interval_seconds: float = 30.0
+    subscriber_heartbeat_staleness_factor: float = 2.0
     provider_reconcile_sync_interval_seconds: int = 3600
     connector_encryption_secret: str = "dev-local-connector-secret"
     connector_encryption_key_version: str = "v1"
@@ -145,7 +152,9 @@ class AppSettings(BaseSettings):
         "weather_default_location",
         "home_address",
         "google_pubsub_topic",
-        "google_provider_event_url",
+        "public_webhook_base_url",
+        "google_pubsub_subscription",
+        "google_application_credentials_path",
         mode="before",
     )
     @classmethod
@@ -153,6 +162,41 @@ class AppSettings(BaseSettings):
         if isinstance(value, str) and not value.strip():
             return None
         return value
+
+    @field_validator("public_webhook_base_url")
+    @classmethod
+    def _public_webhook_base_url_must_be_clean_https(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().rstrip("/")
+        parsed = urlparse(normalized)
+        if parsed.scheme != "https" or not parsed.netloc:
+            raise ValueError("public_webhook_base_url must be an https:// URL with a host")
+        if parsed.path or parsed.params or parsed.query or parsed.fragment:
+            raise ValueError("public_webhook_base_url must have no path, query, or fragment")
+        return normalized
+
+    @field_validator("google_pubsub_subscription")
+    @classmethod
+    def _google_pubsub_subscription_must_be_resource_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not _PUBSUB_SUBSCRIPTION_PATTERN.fullmatch(normalized):
+            raise ValueError(
+                "google_pubsub_subscription must match projects/<project>/subscriptions/<name>"
+            )
+        return normalized
+
+    @field_validator("google_application_credentials_path")
+    @classmethod
+    def _google_application_credentials_path_must_be_absolute(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not Path(normalized).is_absolute():
+            raise ValueError("google_application_credentials_path must be an absolute path")
+        return normalized
 
     @field_validator("weather_provider_mode")
     @classmethod
@@ -219,6 +263,15 @@ class AppSettings(BaseSettings):
                 )
             except RuntimeError as exc:
                 raise ValueError(str(exc)) from exc
+            if self.public_webhook_base_url is None:
+                raise ValueError("public_webhook_base_url is required in production")
+        if (self.google_pubsub_subscription is None) != (
+            self.google_application_credentials_path is None
+        ):
+            raise ValueError(
+                "google_pubsub_subscription and google_application_credentials_path "
+                "must be set together (both for Gmail push on, neither for off)"
+            )
         return self
 
     @field_validator("model_reasoning_effort")
@@ -451,6 +504,8 @@ class AppSettings(BaseSettings):
         "weather_production_timeout_seconds",
         "weather_dev_timeout_seconds",
         "worker_poll_seconds",
+        "subscriber_heartbeat_interval_seconds",
+        "subscriber_heartbeat_staleness_factor",
     )
     @classmethod
     def _positive_float_settings_must_be_positive(cls, value: float) -> float:

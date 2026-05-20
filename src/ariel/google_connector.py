@@ -4480,7 +4480,7 @@ class GoogleConnectorRuntime:
     encryption_key_version: str
     encryption_keys: str | None = None
     pubsub_topic: str | None = None
-    provider_event_url: str | None = None
+    public_webhook_base_url: str | None = None
 
     def _connector_for_update(
         self,
@@ -5071,7 +5071,7 @@ class GoogleConnectorRuntime:
                         now=now,
                         new_id_fn=new_id_fn,
                     )
-        if self.provider_event_url is not None and GOOGLE_CALENDAR_READ_SCOPE in scopes:
+        if self.public_webhook_base_url is not None and GOOGLE_CALENDAR_READ_SCOPE in scopes:
             channel_id = new_id_fn("wch")
             channel_token = secrets.token_urlsafe(24)
             try:
@@ -5080,7 +5080,10 @@ class GoogleConnectorRuntime:
                     calendar_id="primary",
                     channel_id=channel_id,
                     channel_token=channel_token,
-                    address=self.provider_event_url,
+                    address=(
+                        f"{self.public_webhook_base_url}"
+                        "/v1/providers/google/events?resource_type=calendar&resource_id=primary"
+                    ),
                     ttl_seconds=_CALENDAR_WATCH_TTL_SECONDS,
                 )
             except Exception as exc:

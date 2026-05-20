@@ -1,0 +1,36 @@
+{
+    email niels@trysolid.com
+    servers {
+        trusted_proxies static private_ranges
+    }
+}
+
+ariel.nielseriknandal.com {
+    log {
+        output file /var/log/caddy/ariel-webhook.log {
+            roll_size 50mb
+            roll_keep 10
+            roll_keep_for 720h
+        }
+        format json
+    }
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "no-referrer"
+        -Server
+    }
+
+    handle /v1/providers/google/events {
+        reverse_proxy 127.0.0.1:8000
+    }
+
+    handle /v1/connectors/google/callback {
+        reverse_proxy 127.0.0.1:8000
+    }
+
+    handle {
+        respond 404
+    }
+}

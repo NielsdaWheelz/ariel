@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 import hashlib
 import hmac
 import json
 import time
-from typing import Any
+from typing import Any, cast
 
 from fastapi.testclient import TestClient
 import pytest
 
 from ariel.app import create_app
+from ariel.persistence import ProviderWatchChannelRecord
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.responses_helpers import empty_recall_response, is_retriever_call
 
@@ -86,6 +88,26 @@ def test_provider_callback_auth_is_owned_by_provider_verification(
         response = client.get("/v1/connectors/google/callback")
         assert response.status_code != 401
         assert response.json()["error"]["code"] != "E_LOCAL_AUTH_TOKEN_INVALID"
+
+        now = datetime(2026, 5, 19, 12, 0, tzinfo=UTC)
+        with cast(Any, client.app).state.session_factory() as db:
+            with db.begin():
+                db.add(
+                    ProviderWatchChannelRecord(
+                        id="wch_chan_1",
+                        provider="google",
+                        resource_type="calendar",
+                        resource_id="primary",
+                        channel_id="chan_1",
+                        channel_token="provider-token",
+                        provider_resource_id="res_chan_1",
+                        cursor_seed=None,
+                        status="active",
+                        expires_at=datetime(2026, 5, 26, 12, 0, tzinfo=UTC),
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
 
         provider_event = client.post(
             "/v1/providers/google/events?resource_type=calendar&resource_id=primary",

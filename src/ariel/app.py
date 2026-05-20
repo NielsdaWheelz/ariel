@@ -80,7 +80,9 @@ from ariel.persistence import (
     MemoryLogRecord,
     MemoryNoteRecord,
     ProviderEventRecord,
+    ProviderWatchChannelRecord,
     ProviderWriteReceiptRecord,
+    SubscriberHeartbeatRecord,
     SessionRecord,
     SessionRotationRecord,
     SyncCursorRecord,
@@ -1980,7 +1982,7 @@ def build_google_runtime(
         encryption_key_version=settings.connector_encryption_key_version,
         encryption_keys=settings.connector_encryption_keys,
         pubsub_topic=settings.google_pubsub_topic,
-        provider_event_url=settings.google_provider_event_url,
+        public_webhook_base_url=settings.public_webhook_base_url,
     )
 
 
@@ -2696,7 +2698,7 @@ def create_app(
         )
 
     @app.get("/v1/health", response_model=None)
-    def health() -> JSONResponse | dict[str, bool]:
+    def health() -> JSONResponse | dict[str, Any]:
         if app.state.schema_missing_tables:
             return _error_response(
                 ApiError(
@@ -2707,7 +2709,35 @@ def create_app(
                     retryable=False,
                 )
             )
-        return {"ok": True}
+        if settings.google_pubsub_subscription is None:
+            return {"ok": True}
+
+        with session_factory() as db:
+            heartbeat = db.get(SubscriberHeartbeatRecord, "gmail_pubsub")
+        staleness_threshold_seconds = (
+            settings.subscriber_heartbeat_interval_seconds
+            * settings.subscriber_heartbeat_staleness_factor
+        )
+        now = _utcnow()
+        is_fresh = heartbeat is not None and (
+            (now - heartbeat.last_seen_at).total_seconds() <= staleness_threshold_seconds
+        )
+        subscriber_block: dict[str, Any] = {
+            "gmail_pubsub": {
+                "last_seen_at": heartbeat.last_seen_at.isoformat() if heartbeat else None,
+                "last_message_at": (
+                    heartbeat.last_message_at.isoformat()
+                    if heartbeat and heartbeat.last_message_at
+                    else None
+                ),
+                "in_flight_count": heartbeat.in_flight_count if heartbeat else 0,
+                "errors_in_window": heartbeat.errors_in_window if heartbeat else 0,
+            }
+        }
+        body = {"ok": is_fresh, "subscribers": subscriber_block}
+        if is_fresh:
+            return body
+        return JSONResponse(status_code=503, content=body)
 
     @app.post("/v1/agency/events", response_model=None)
     async def post_agency_event(request: Request) -> JSONResponse | dict[str, Any]:
@@ -3633,7 +3663,7 @@ def create_app(
     @app.post("/v1/providers/google/events", response_model=None)
     async def post_google_provider_event(
         request: Request,
-        resource_type: Literal["calendar", "gmail", "drive"],
+        resource_type: Literal["calendar"],
         resource_id: str = "primary",
     ) -> JSONResponse:
         _ensure_schema_ready()
@@ -3677,6 +3707,26 @@ def create_app(
                 retryable=False,
             )
 
+        channel_id = str(required_headers["X-Goog-Channel-ID"]).strip()
+        with session_factory() as db:
+            channel_record = db.scalar(
+                select(ProviderWatchChannelRecord)
+                .where(ProviderWatchChannelRecord.channel_id == channel_id)
+                .limit(1)
+            )
+        if (
+            channel_record is None
+            or channel_record.channel_token is None
+            or not hmac.compare_digest(provided_token, channel_record.channel_token)
+        ):
+            raise ApiError(
+                status_code=401,
+                code="E_PROVIDER_EVENT_CHANNEL_INVALID",
+                message="google provider event channel id or token is invalid",
+                details={},
+                retryable=False,
+            )
+
         body = await request.body()
         body_digest = hashlib.sha256(body).hexdigest() if body else None
         payload: dict[str, Any] = {}
@@ -3701,7 +3751,6 @@ def create_app(
                 )
             payload = raw_payload
 
-        channel_id = str(required_headers["X-Goog-Channel-ID"]).strip()
         message_number = str(required_headers["X-Goog-Message-Number"]).strip()
         resource_state = str(required_headers["X-Goog-Resource-State"]).strip()
         normalized_resource_id = resource_id.strip() or "primary"

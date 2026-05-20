@@ -252,7 +252,7 @@ def process_provider_sync_due(
         encryption_key_version=settings.connector_encryption_key_version,
         encryption_keys=settings.connector_encryption_keys,
         pubsub_topic=settings.google_pubsub_topic,
-        provider_event_url=settings.google_provider_event_url,
+        public_webhook_base_url=settings.public_webhook_base_url,
     )
 
     outputs: list[dict[str, Any]] = []

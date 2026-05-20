@@ -1,0 +1,18 @@
+[Unit]
+Description=Ariel Gmail Pub/Sub subscriber sidecar
+After=network-online.target docker.service ariel-api.service
+Wants=network-online.target docker.service ariel-api.service
+
+[Service]
+Type=simple
+User=niels
+Group=niels
+WorkingDirectory=/home/niels/src/personal/ariel
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/niels/src/personal/ariel/.venv/bin/python -m ariel.pubsub_subscriber
+Restart=always
+RestartSec=5
+SyslogIdentifier=ariel-pubsub
+
+[Install]
+WantedBy=multi-user.target

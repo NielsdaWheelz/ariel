@@ -180,11 +180,21 @@ ARIEL_WORKER_POLL_SECONDS=1.0
 ARIEL_PROVIDER_RECONCILE_SYNC_INTERVAL_SECONDS=3600
 ```
 
-Required provider callback settings when Google provider ingress is enabled:
+Required Google Workspace push settings when Gmail/Calendar push is enabled:
 
 ```sh
+ARIEL_PUBLIC_WEBHOOK_BASE_URL=https://<your-fqdn>
 ARIEL_GOOGLE_PROVIDER_EVENT_TOKEN=<shared-google-callback-token>
+ARIEL_GOOGLE_PUBSUB_TOPIC=projects/<gcp-project>/topics/ariel-gmail-watch
+ARIEL_GOOGLE_PUBSUB_SUBSCRIPTION=projects/<gcp-project>/subscriptions/ariel-gmail-watch-sub
+ARIEL_GOOGLE_APPLICATION_CREDENTIALS_PATH=/etc/ariel/secrets/gcp-pubsub-sa.json
 ```
+
+`ARIEL_PUBLIC_WEBHOOK_BASE_URL` is required in production; the Calendar
+`events.watch` `address` and the Google OAuth redirect URI are derived from
+it. `ARIEL_GOOGLE_PUBSUB_SUBSCRIPTION` and
+`ARIEL_GOOGLE_APPLICATION_CREDENTIALS_PATH` must be set together: both for
+Gmail push on, neither for off.
 
 The single-threaded `ariel-worker` service drains the one `background_tasks`
 queue: scheduled agent wakes, provider push and poll ingestion, the memory
@@ -232,6 +242,89 @@ skipped. There is no leave-by subsystem: a "leave by HH:MM" reminder is now an
 ordinary agent behavior — the agent uses calendar access, the maps capability,
 and `proactive.schedule` on a normal wake. See
 [modules/proactivity.md](modules/proactivity.md).
+
+## Google Workspace Push
+
+Live Gmail and Calendar push run alongside the reconcile poll. The poll is
+the backstop; push is the live path. See
+[modules/google-workspace-push-cutover.md](modules/google-workspace-push-cutover.md)
+for the design.
+
+### Prerequisites
+
+- A public FQDN with an A record to the host's public IPv4; ports 80 and 443
+  reachable from the public internet.
+- A GCP project with billing enabled; the operator has Owner or Editor and
+  `roles/pubsub.admin`.
+- `gcloud` installed and authenticated to that project.
+
+### Provision
+
+Run from the repo root:
+
+```sh
+export GCP_PROJECT=<your-gcp-project>
+bash scripts/gcp_create_runtime_sa.sh
+# prints the runtime SA email and the key path
+export RUNTIME_SA_EMAIL=ariel-runtime@${GCP_PROJECT}.iam.gserviceaccount.com
+bash scripts/gcp_provision_pubsub.sh
+# prints the topic and subscription resource paths to paste into the env
+```
+
+Move the key into the deployment's secrets dir and chmod 600:
+
+```sh
+sudo install -m 0600 -o ariel -g ariel \
+  ~/.ariel-secrets/gcp-pubsub-sa.json /etc/ariel/secrets/gcp-pubsub-sa.json
+```
+
+### Caddy
+
+```sh
+sudo bash deploy/caddy/install.sh
+```
+
+The install script provisions Caddy from the official apt repo, deploys
+`deploy/caddy/Caddyfile` to `/etc/caddy/Caddyfile`, validates, opens UFW
+80/443 if UFW is active, and enables `caddy.service`. The Caddyfile forwards
+only `/v1/providers/google/events` and `/v1/connectors/google/callback` to
+`127.0.0.1:8000`; every other path returns 404. TLS is provisioned
+automatically via Let's Encrypt against the FQDN in the Caddyfile — edit
+that file to match your FQDN before running the installer.
+
+### OAuth client
+
+In the GCP console, add
+`https://<your-fqdn>/v1/connectors/google/callback` to the OAuth client's
+authorized redirect URIs. Without this the connect flow returns
+`redirect_uri_mismatch`.
+
+### Smoke test
+
+Connect a Google account from Discord. After consent, the worker registers
+a Gmail `users.watch` (publishes to the Pub/Sub topic) and a Calendar
+`events.watch` (HTTPS push channel). Verify:
+
+```sh
+curl -I https://<your-fqdn>/                                # 404
+curl -I https://<your-fqdn>/v1/providers/google/events      # 405 (POST-only)
+curl http://127.0.0.1:8000/v1/health                        # subscribers.gmail_pubsub present
+```
+
+Create a Calendar event in the connected account → `provider_events` row
+appears within seconds → the worker enqueues `agent_wake` → Ariel posts to
+Discord. Send an email to the connected mailbox → same path via Pub/Sub.
+
+### Monitoring
+
+Configure Cloud Monitoring alerts on the subscription:
+
+- `subscription/oldest_unacked_message_age > 5m`
+- `subscription/expired_ack_deadlines_count > 1%`
+- Any non-zero count of messages on the `ariel-gmail-watch-dlq` topic
+
+A stuck message on the DLQ topic is investigated by pulling from
+`ariel-gmail-watch-dlq-sub`.
 
 ## Services
 

@@ -204,7 +204,10 @@ def seed_provider_maintenance_tasks(
         )
 
 
-_PROVIDER_WATCH_RENEW_LEAD_SECONDS = 24 * 3600
+# Gmail's watch expires after 7 days; Google recommends daily renewal. With
+# the 6-hour sweep, a 6-day lead means every watch under 6 days remaining is
+# renewed each sweep — effective daily cadence with retry headroom.
+_PROVIDER_WATCH_RENEW_LEAD_SECONDS = 6 * 24 * 3600
 
 
 def process_provider_watch_renew_due(

@@ -1613,6 +1613,19 @@ class JobEventRecord(Base):
     job: Mapped[JobRecord] = relationship(back_populates="events")
 
 
+class SubscriberHeartbeatRecord(Base):
+    __tablename__ = "subscriber_heartbeat"
+
+    subscriber_name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    in_flight_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    errors_in_window: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_error_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 def serialize_session(session: SessionRecord) -> dict[str, Any]:
     return {
         "id": session.id,

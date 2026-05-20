@@ -92,7 +92,7 @@ per-capability `requires_approval` policy, not an autonomy-scope table.
 
 Provider ingestion routes:
 
-- `POST /v1/providers/google/events` — the Gmail/Calendar push callback
+- `POST /v1/providers/google/events` — Calendar push callback (per-channel HMAC). Gmail push arrives via the `ariel-pubsub` sidecar.
 - `GET /v1/connectors/google/sync-cursors`
 - `POST /v1/connectors/google/sync`
 - `GET /v1/provider-events`

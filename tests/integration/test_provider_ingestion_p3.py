@@ -36,7 +36,8 @@ from tests.fake_sandbox import FakeSandboxRuntime
 GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 CALENDAR_READ_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
 PUBSUB_TOPIC = "projects/ariel/topics/gmail-watch"
-EVENT_URL = "https://ariel.example/v1/providers/google/events"
+PUBLIC_WEBHOOK_BASE_URL = "https://ariel.example"
+EXPECTED_CALENDAR_WATCH_ADDRESS = f"{PUBLIC_WEBHOOK_BASE_URL}/v1/providers/google/events?resource_type=calendar&resource_id=primary"
 
 
 @dataclass
@@ -166,7 +167,7 @@ def test_connect_registers_gmail_and_calendar_watches_and_persists_rows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("ARIEL_GOOGLE_PUBSUB_TOPIC", PUBSUB_TOPIC)
-    monkeypatch.setenv("ARIEL_GOOGLE_PROVIDER_EVENT_URL", EVENT_URL)
+    monkeypatch.setenv("ARIEL_PUBLIC_WEBHOOK_BASE_URL", PUBLIC_WEBHOOK_BASE_URL)
     provider = WatchRecordingProvider()
     oauth_client = ConnectOAuthClient(granted_scopes=[GMAIL_READ_SCOPE, CALENDAR_READ_SCOPE])
     app = create_app(
@@ -200,7 +201,7 @@ def test_connect_registers_gmail_and_calendar_watches_and_persists_rows(
     assert len(provider.gmail_watch_calls) == 1
     assert provider.gmail_watch_calls[0]["topic_name"] == PUBSUB_TOPIC
     assert len(provider.calendar_watch_calls) == 1
-    assert provider.calendar_watch_calls[0]["address"] == EVENT_URL
+    assert provider.calendar_watch_calls[0]["address"] == EXPECTED_CALENDAR_WATCH_ADDRESS
     assert provider.calendar_watch_calls[0]["calendar_id"] == "primary"
 
     by_type = {channel.resource_type: channel for channel in channels}
@@ -323,7 +324,7 @@ def test_watch_renew_handler_rearms_near_expiry_channel(
                     provider_resource_id=None,
                     cursor_seed="hist-old",
                     status="active",
-                    # Within the 24h renewal window.
+                    # Within the 6-day renewal window.
                     expires_at=now + timedelta(hours=3),
                     last_error_code=None,
                     last_error_at=None,
@@ -342,7 +343,7 @@ def test_watch_renew_handler_rearms_near_expiry_channel(
         encryption_key_version=settings.connector_encryption_key_version,
         encryption_keys=settings.connector_encryption_keys,
         pubsub_topic=PUBSUB_TOPIC,
-        provider_event_url=None,
+        public_webhook_base_url=None,
     )
     monkeypatch.setattr("ariel.worker.build_google_runtime", lambda _settings: runtime)
 
@@ -385,8 +386,8 @@ def test_watch_renew_handler_skips_when_no_channel_near_expiry(
                     provider_resource_id=None,
                     cursor_seed="hist-fresh",
                     status="active",
-                    # Far beyond the 24h renewal window.
-                    expires_at=now + timedelta(days=5),
+                    # Far beyond the 6-day renewal window.
+                    expires_at=now + timedelta(days=10),
                     last_error_code=None,
                     last_error_at=None,
                     created_at=now,
@@ -404,7 +405,7 @@ def test_watch_renew_handler_skips_when_no_channel_near_expiry(
         encryption_key_version=settings.connector_encryption_key_version,
         encryption_keys=settings.connector_encryption_keys,
         pubsub_topic=PUBSUB_TOPIC,
-        provider_event_url=None,
+        public_webhook_base_url=None,
     )
     monkeypatch.setattr("ariel.worker.build_google_runtime", lambda _settings: runtime)
 
