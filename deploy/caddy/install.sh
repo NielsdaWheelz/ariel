@@ -46,7 +46,39 @@ cp "$SRC_CADDYFILE" "$DST_CADDYFILE"
 caddy validate --config "$DST_CADDYFILE"
 ok "Caddyfile validated"
 
-# ── 4. Open UFW ports (if active) ──────────────────────────────────────
+# ── 4. Bootstrap log directory & files ─────────────────────────────────
+# Caddy's shipped unit runs as user 'caddy' but does NOT declare
+# LogsDirectory=, so on a fresh box the first writer can race and leave
+# /var/log/caddy/<file> as a root:root 0600 stub — every later reload
+# then fails with "permission denied". Pre-creating the dir and each
+# referenced log file with caddy:caddy ownership closes the race.
+# Keep CADDY_LOG_FILES in sync with `output file` paths in Caddyfile.
+info "Bootstrapping /var/log/caddy"
+id -u caddy >/dev/null 2>&1 || { fail "caddy user missing (apt install failed?)"; exit 1; }
+getent group caddy >/dev/null 2>&1 || { fail "caddy group missing (apt install failed?)"; exit 1; }
+install -d -o caddy -g caddy -m 0755 /var/log/caddy
+ok "/var/log/caddy ready (caddy:caddy 0755)"
+CADDY_LOG_FILES=(
+  /var/log/caddy/ariel-webhook.log
+)
+for f in "${CADDY_LOG_FILES[@]}"; do
+  if [ ! -e "$f" ]; then
+    install -o caddy -g caddy -m 0640 /dev/null "$f"
+    ok "created $f (caddy:caddy 0640)"
+  else
+    # Only fix ownership/mode if drifted; never truncate existing logs.
+    cur="$(stat -c '%U:%G:%a' "$f")"
+    if [ "$cur" != "caddy:caddy:640" ]; then
+      chown caddy:caddy "$f"
+      chmod 0640 "$f"
+      ok "repaired $f ownership/mode (was $cur)"
+    else
+      ok "$f already caddy:caddy 0640"
+    fi
+  fi
+done
+
+# ── 5. Open UFW ports (if active) ──────────────────────────────────────
 info "Configuring firewall"
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
   ufw allow 80/tcp
@@ -56,11 +88,11 @@ else
   ok "ufw not active; skipping (operator may use a different firewall)"
 fi
 
-# ── 5. Enable & reload caddy ───────────────────────────────────────────
+# ── 6. Enable & reload caddy ───────────────────────────────────────────
 info "Starting Caddy"
 systemctl enable --now caddy
 systemctl reload caddy
 ok "caddy enabled and reloaded"
 
-# ── 6. Done ────────────────────────────────────────────────────────────
+# ── 7. Done ────────────────────────────────────────────────────────────
 info "Caddy is running on 80/443; verify with: curl -I https://ariel.nielseriknandal.com/"
