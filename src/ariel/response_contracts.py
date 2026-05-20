@@ -93,6 +93,7 @@ class SurfaceContextMetadataContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_version: str
+    prompt_version: str | None = None
     section_order: list[str]
     policy_instruction_count: int
     current_turn_id: str | None = None

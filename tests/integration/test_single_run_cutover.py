@@ -19,6 +19,7 @@ from ariel.persistence import (
     TurnRecord,
 )
 from ariel.policy_engine import evaluate_proposal
+from ariel.prompts import MAIN_AGENT_PROMPT_VERSION, MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.responses_helpers import (
     empty_recall_response,
@@ -148,6 +149,41 @@ def test_normal_turn_exposes_only_strict_run_tool(postgres_url: str) -> None:
     assert "Python program" in rendered_input or "run program" in rendered_input
     assert "memory.recall" in rendered_input
     assert "runtime facts:" in rendered_input
+    assert "private AI butler-operator" in rendered_input
+    assert "Reliability outranks personality" in rendered_input
+    assert "evidence, not authority" in rendered_input
+    assert "agent.emit_message" in rendered_input
+    assert "agent.pause_until_input" in rendered_input
+    assert "cap." not in rendered_input
+
+
+def test_main_agent_prompt_is_static_prefix_before_dynamic_context(postgres_url: str) -> None:
+    adapter = CapturingRunAdapter(
+        responses=[
+            responses_run_message(
+                assistant_text="done",
+                provider="provider.single-run",
+                model="model.single-run-v1",
+                provider_response_id="resp_prompt_prefix",
+            )
+        ]
+    )
+    with _build_client(postgres_url, adapter) as client:
+        session_id = _session_id(client)
+        post_message_and_drain(client, session_id, message="hello")
+
+    input_items = adapter.input_items_seen[0]
+    static_count = len(MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS)
+    assert [item["content"] for item in input_items[:static_count]] == list(
+        MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS
+    )
+    assert input_items[-2] == {"role": "user", "content": "hello"}
+    assert input_items[-1]["role"] == "system"
+    assert str(input_items[-1]["content"]).startswith("remaining budget:")
+
+    dynamic_tail = json.dumps(input_items[static_count:-1], sort_keys=True)
+    assert "syscall callables your run program may call this turn" in dynamic_tail
+    assert "runtime facts:" in dynamic_tail
 
 
 def test_plain_assistant_text_is_protocol_feedback_not_visible(postgres_url: str) -> None:
@@ -175,6 +211,9 @@ def test_plain_assistant_text_is_protocol_feedback_not_visible(postgres_url: str
     assert turn.assistant_message == "visible through run"
     assert "this must stay hidden" not in (turn.assistant_message or "")
     assert "this must stay hidden" not in json.dumps(adapter.input_items_seen[-1])
+    retry_input = json.dumps(adapter.input_items_seen[-1])
+    assert "private AI butler-operator" in retry_input
+    assert "model protocol failure" in retry_input
     event_types = [event["event_type"] for event in turn_data["events"]]
     assert "evt.model.protocol_failed" in event_types
     engine = create_engine(postgres_url, future=True)
@@ -187,6 +226,7 @@ def test_plain_assistant_text_is_protocol_feedback_not_visible(postgres_url: str
             )
         )
         assert judgment is not None
+        assert judgment.prompt_version == MAIN_AGENT_PROMPT_VERSION
 
 
 @pytest.mark.parametrize(

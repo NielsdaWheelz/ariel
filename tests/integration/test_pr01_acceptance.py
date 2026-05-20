@@ -11,6 +11,8 @@ from fastapi.testclient import TestClient
 from sqlalchemy import text
 
 from ariel.app import ModelAdapter, ModelAdapterError, create_app
+from ariel.prompts import MAIN_AGENT_PROMPT_VERSION, MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS
+from ariel.db import SchemaReadinessProbe, run_migrations
 from tests.integration.responses_helpers import (
     empty_recall_response,
     is_retriever_call,
@@ -19,7 +21,6 @@ from tests.integration.responses_helpers import (
     responses_run_message,
     responses_with_run_calls,
 )
-from ariel.db import SchemaReadinessProbe, run_migrations
 from tests.fake_sandbox import FakeSandboxRuntime
 
 
@@ -623,6 +624,7 @@ def test_pr01_turn_context_section_order_and_audit_metadata(
 
         assert len(adapter.context_bundles) == 2
         for context_bundle in adapter.context_bundles:
+            assert context_bundle["prompt_version"] == MAIN_AGENT_PROMPT_VERSION
             assert context_bundle["section_order"] == [
                 "policy_system_instructions",
                 "recall_v1",
@@ -631,6 +633,9 @@ def test_pr01_turn_context_section_order_and_audit_metadata(
             ]
             # recall_v1 is always present (populated by the retriever).
             assert "recall_v1" in context_bundle
+            assert context_bundle["policy_system_instructions"] == list(
+                MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS
+            )
 
         timeline = _timeline(client, session_id)
         turns = timeline["turns"]
@@ -645,13 +650,16 @@ def test_pr01_turn_context_section_order_and_audit_metadata(
             main_agent_started = model_started_events[-1]
             context_meta = main_agent_started["payload"]["context"]
             assert context_meta["schema_version"] == "1.0"
+            assert context_meta["prompt_version"] == MAIN_AGENT_PROMPT_VERSION
             assert context_meta["section_order"] == [
                 "policy_system_instructions",
                 "recall_v1",
                 "open_commitments_and_jobs",
                 "relevant_artifacts_and_observations",
             ]
-            assert context_meta["policy_instruction_count"] >= 1
+            assert context_meta["policy_instruction_count"] == len(
+                MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS
+            )
             # Bounded session-turn window is gone; recent_window is always zero.
             assert context_meta["recent_window"] == {
                 "max_recent_turns": 0,
@@ -682,6 +690,7 @@ def test_pr01_context_audit_is_stable_even_if_adapter_mutates_context_bundle(
         main_agent_started = model_started_events[-1]
         context_meta = main_agent_started["payload"]["context"]
         assert context_meta["schema_version"] == "1.0"
+        assert context_meta["prompt_version"] == MAIN_AGENT_PROMPT_VERSION
         # Memory substrate cutover: section_order now contains the new recall-based
         # sections; the old recent_active_session_turns / profile / session_digest /
         # recalled_memory sections are gone.

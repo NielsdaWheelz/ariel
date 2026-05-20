@@ -536,6 +536,7 @@ def run_retriever(
     cfg = LoopConfig(
         output_mode="finding",
         finding_mode="memory_recall",
+        prompt_version=RETRIEVER_PROMPT_VERSION,
         budget_seconds=float(settings.memory_recall_budget_seconds),
         max_model_calls=int(settings.agent_loop_max_model_calls),
         is_research_run=True,
@@ -712,6 +713,7 @@ def run_rememberer(
     cfg = LoopConfig(
         output_mode="operations",
         finding_mode=trigger,
+        prompt_version=prompt_version,
         budget_seconds=budget,
         max_model_calls=int(settings.agent_loop_max_model_calls),
         is_research_run=True,

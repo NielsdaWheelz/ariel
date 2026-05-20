@@ -27,6 +27,8 @@ This directory is the canonical home for repository documentation.
 - [keys-and-identities.md](keys-and-identities.md): identity naming, brands, and sealing
 - [json-values.md](json-values.md): structured JSON values
 - [generated-text.md](generated-text.md): escaping and quoting at generated-text boundaries
+- [jarvis-system-prompt.md](jarvis-system-prompt.md): Jarvis-style assistant
+  prompt, persona, tool policy, proactivity policy, and eval checklist
 
 ### Code style
 
@@ -44,6 +46,8 @@ This directory is the canonical home for repository documentation.
 - [memory-substrate-cutover.md](memory-substrate-cutover.md): hard cutover —
   two-layer memory substrate (raw log + curated notes), agentic recall, and
   unified rememberer
+- [main-agent-jarvis-prompt-cutover.md](main-agent-jarvis-prompt-cutover.md):
+  hard cutover to a versioned, code-owned Jarvis prompt for the main agent
 - [simplicity.md](simplicity.md): fewer code paths, no speculative surface
 - [function-parameters.md](function-parameters.md): parameter conventions
 - [control-flow.md](control-flow.md): exhaustive branching and race-safety

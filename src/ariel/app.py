@@ -105,6 +105,7 @@ from ariel.persistence import (
     serialize_turn,
     to_rfc3339,
 )
+from ariel.prompts import MAIN_AGENT_PROMPT_VERSION, MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS
 from ariel.redaction import redact_text, safe_failure_reason
 from ariel.response_contracts import (
     ResponseContractViolation,
@@ -190,6 +191,7 @@ def _context_bundle_audit_metadata(context_bundle: dict[str, Any]) -> dict[str, 
     policy_count = (
         len([s for s in policy_raw if isinstance(s, str)]) if isinstance(policy_raw, list) else 0
     )
+    prompt_version = context_bundle.get("prompt_version")
     current_turn_raw = context_bundle.get("current_turn")
     current_turn_id: str | None = (
         current_turn_raw.get("turn_id")
@@ -198,6 +200,7 @@ def _context_bundle_audit_metadata(context_bundle: dict[str, Any]) -> dict[str, 
     )
     return {
         "schema_version": _CONTEXT_AUDIT_SCHEMA_VERSION,
+        "prompt_version": prompt_version if isinstance(prompt_version, str) else None,
         "section_order": section_order,
         "policy_instruction_count": policy_count,
         "current_turn_id": current_turn_id,
@@ -209,20 +212,6 @@ def _context_bundle_audit_metadata(context_bundle: dict[str, Any]) -> dict[str, 
         },
     }
 
-
-_POLICY_SYSTEM_INSTRUCTIONS = (
-    "You are Ariel, a private assistant for one active user session.",
-    "If user intent is clear, answer directly in this turn.",
-    "If user intent is ambiguous or conflicting, ask for the missing details instead of guessing.",
-    "If the user asks about details not present in this context, state uncertainty and ask for recovery details.",
-    (
-        "For Google write actions, cite exactly one authority: source_evidence_id "
-        "or user_instruction_ref. Use user_instruction_ref=turn:<turn_id> "
-        "only for an explicit user instruction shown in the turn-id context."
-    ),
-    "If the right Discord behavior is to listen without a visible reply, call agent.pause_until_input.",
-    "Discord attachments are metadata until attachment.read is called; attachment_ref is not content.",
-)
 
 _CAPTURE_ALLOWED_KINDS = {"text", "url", "shared_content"}
 _CAPTURE_ALLOWED_SOURCE_FIELDS = {"app", "title", "url"}
@@ -1643,7 +1632,8 @@ def _build_turn_context_bundle(
 
     context_bundle: dict[str, Any] = {
         "section_order": section_order,
-        "policy_system_instructions": list(_POLICY_SYSTEM_INSTRUCTIONS),
+        "prompt_version": MAIN_AGENT_PROMPT_VERSION,
+        "policy_system_instructions": list(MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS),
         "recall_v1": recall_v1,
         "open_commitments_and_jobs": dict(open_commitments_and_jobs),
         "relevant_artifacts_and_observations": dict(relevant_artifacts_and_observations),
@@ -2275,6 +2265,7 @@ def _wake(
     loop_cfg = LoopConfig(
         output_mode="message",
         finding_mode="",
+        prompt_version=MAIN_AGENT_PROMPT_VERSION,
         budget_seconds=float(runtime.settings.main_turn_budget_seconds),
         max_model_calls=int(runtime.settings.agent_loop_max_model_calls),
         is_research_run=False,

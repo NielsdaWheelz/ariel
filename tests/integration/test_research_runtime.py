@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any, cast
 
 from sqlalchemy import select
@@ -625,7 +625,7 @@ def _seed_connected_google_connector(
                         key_version=settings.connector_encryption_key_version,
                         encryption_keys=settings.connector_encryption_keys,
                     ),
-                    access_token_expires_at=now + timedelta(hours=1),
+                    access_token_expires_at=None,
                     token_obtained_at=now,
                     encryption_key_version=settings.connector_encryption_key_version,
                     last_error_code=None,

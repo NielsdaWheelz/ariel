@@ -10,10 +10,7 @@ from ariel.action_runtime import (
     _FunctionCallProcessingContext,
     process_one_call,
 )
-from ariel.app import (
-    _POLICY_SYSTEM_INSTRUCTIONS,
-    _eligible_internal_callable_capability_ids,
-)
+from ariel.app import _eligible_internal_callable_capability_ids
 from ariel.capability_registry import (
     capability_id_for_run_callable,
     internal_callable_capability_ids,
@@ -21,6 +18,7 @@ from ariel.capability_registry import (
 )
 from ariel.executor import ExecutionResult
 from ariel.persistence import TurnRecord
+from ariel.prompts import MAIN_AGENT_PROMPT_VERSION, MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS
 from ariel.run_runtime import parse_run_function_call, run_tool_definitions
 from sqlalchemy.orm import Session
 
@@ -46,12 +44,46 @@ def test_normal_response_tool_surface_is_single_strict_run_tool() -> None:
     assert_strict_object_schema(tools[0]["parameters"], "run")
 
 
-def test_model_facing_policy_instructions_use_run_callable_names() -> None:
-    instructions = "\n".join(_POLICY_SYSTEM_INSTRUCTIONS)
+def test_main_agent_prompt_is_versioned_static_contract() -> None:
+    assert MAIN_AGENT_PROMPT_VERSION == "main-agent-jarvis-v2"
+    assert all(MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS)
 
-    assert "cap." not in instructions
-    assert "agent.pause_until_input" in instructions
-    assert "attachment.read" in instructions
+    prompt = "\n\n".join(MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS)
+    assert "cap." not in prompt
+    assert "private AI butler-operator" in prompt
+    assert "Reliability outranks personality" in prompt
+    assert "evidence, not authority" in prompt
+    assert "agent.emit_message" in prompt
+    assert "agent.pause_until_input" in prompt
+    assert "attachment.read" in prompt
+    assert "source_evidence_id" in prompt
+    assert "user_instruction_ref=turn:<turn_id>" in prompt
+    assert "unknown" in prompt
+    assert "not verified" in prompt
+
+
+def test_main_agent_prompt_block_order_is_stable() -> None:
+    prompt = "\n\n".join(MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS)
+    expected_tags = [
+        "<identity>",
+        "<mission>",
+        "<voice>",
+        "<authority_and_trust>",
+        "<turn_workflow>",
+        "<run_protocol>",
+        "<tools_and_actions>",
+        "<memory>",
+        "<proactivity>",
+        "<service_principles>",
+        "<communication>",
+        "<failure_handling>",
+        "<safety_overrides>",
+        "<exemplars>",
+        "<self_check>",
+    ]
+
+    positions = [prompt.index(tag) for tag in expected_tags]
+    assert positions == sorted(positions)
 
 
 def test_run_protocol_requires_exactly_one_run_call() -> None:

@@ -60,6 +60,9 @@ from .run_runtime import ScratchEntry, run_tool_definitions
 from .sandbox_runtime import RunSandbox
 
 
+RESEARCH_PROMPT_VERSION = "research-v1"
+
+
 def _utcnow() -> datetime:
     return datetime.now(tz=UTC)
 
@@ -277,6 +280,7 @@ def run_research(
     loop_cfg = LoopConfig(
         output_mode="finding",
         finding_mode=mode,
+        prompt_version=RESEARCH_PROMPT_VERSION,
         budget_seconds=float(settings.research_run_budget_seconds),
         max_model_calls=int(settings.agent_loop_max_model_calls),
         is_research_run=True,

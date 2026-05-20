@@ -114,6 +114,9 @@ class LoopConfig:
         The research mode string (e.g. ``"web"``, ``"personal"``) embedded in
         the returned ``ResearchFinding`` when ``output_mode="finding"``.
         Ignored for other output modes.
+    prompt_version:
+        The semantic version of the system prompt for this loop configuration.
+        Recorded with any ``ai_judgments`` row the loop writes.
     budget_seconds:
         Wall-clock budget for the loop.
     max_model_calls:
@@ -155,6 +158,7 @@ class LoopConfig:
 
     output_mode: Literal["message", "finding", "operations"]
     finding_mode: str
+    prompt_version: str
     budget_seconds: float
     max_model_calls: int
     is_research_run: bool
@@ -884,7 +888,7 @@ def _record_judgment(
         model=candidate_response.get("model")
         if isinstance(candidate_response.get("model"), str)
         else model_adapter.model,
-        prompt_version="model-output-v1",
+        prompt_version=cfg.prompt_version,
         provider_response_id=provider_response_id
         if isinstance(provider_response_id, str)
         else None,
