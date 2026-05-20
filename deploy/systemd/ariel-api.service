@@ -1,0 +1,18 @@
+[Unit]
+Description=Ariel API (FastAPI, loopback 127.0.0.1:8000)
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+User=niels
+Group=niels
+WorkingDirectory=/home/niels/src/personal/ariel
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/niels/src/personal/ariel/.venv/bin/uvicorn ariel.app:create_app --factory --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+SyslogIdentifier=ariel-api
+
+[Install]
+WantedBy=multi-user.target

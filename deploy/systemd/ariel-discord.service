@@ -1,0 +1,18 @@
+[Unit]
+Description=Ariel Discord surface bot
+After=network-online.target ariel-api.service
+Wants=network-online.target ariel-api.service
+
+[Service]
+Type=simple
+User=niels
+Group=niels
+WorkingDirectory=/home/niels/src/personal/ariel
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/niels/src/personal/ariel/.venv/bin/python -m ariel.discord_bot
+Restart=always
+RestartSec=5
+SyslogIdentifier=ariel-discord
+
+[Install]
+WantedBy=multi-user.target

@@ -129,7 +129,7 @@ from ariel.run_runtime import (
     ScratchEntry,
     run_tool_definitions,
 )
-from ariel.sandbox_runtime import RunSandbox, SandboxRuntime
+from ariel.sandbox_runtime import RunSandbox
 from ariel.weather_state import get_weather_default_location_state, set_weather_default_location
 
 
@@ -1469,7 +1469,9 @@ class WakeContext:
 class Runtime:
     settings: AppSettings
     model_adapter: ModelAdapter
-    sandbox: RunSandbox
+    # None when this process never runs the agent loop — the API surface stores
+    # turns and enqueues work; only the worker invokes ``_wake`` / ``run_*``.
+    sandbox: RunSandbox | None
     attachment_runtime: AttachmentContentRuntime
     session_factory: sessionmaker[Session]
 
@@ -1929,7 +1931,6 @@ def build_runtime(
     settings = AppSettings()
     db_url = database_url or settings.database_url
     adapter = model_adapter or _build_default_model_adapter(settings)
-    run_sandbox = sandbox if sandbox is not None else SandboxRuntime()
 
     engine = create_engine(
         db_url,
@@ -1955,7 +1956,7 @@ def build_runtime(
     runtime = Runtime(
         settings=settings,
         model_adapter=adapter,
-        sandbox=run_sandbox,
+        sandbox=sandbox,
         attachment_runtime=attachment_runtime,
         session_factory=session_factory,
     )
@@ -2009,6 +2010,12 @@ def _wake(
     wake_context: WakeContext,
     execute_google_reads_outside_transaction: bool = False,
 ) -> TurnExecutionOutcome:
+    # _wake invokes the agent loop, which always needs a sandbox; only the
+    # worker calls _wake, and worker.main() always attaches one. The API
+    # surface omits it because no HTTP handler runs the loop itself.
+    sandbox = runtime.sandbox
+    if sandbox is None:
+        raise RuntimeError("_wake requires runtime.sandbox; caller must attach one")
     user_message = wake_context.prompt_text
     discord_context = wake_context.discord_context
     discord_attachment_sources = wake_context.attachment_sources
@@ -2143,7 +2150,7 @@ def _wake(
     _recall_partial: dict[str, Any] = {"summary": "", "items": [], "status": "partial"}
     try:
         recall_v1: dict[str, Any] = run_retriever(
-            sandbox=runtime.sandbox,
+            sandbox=sandbox,
             db=db,
             session_factory=runtime.session_factory,
             session_id=effective_session_id,
@@ -2306,7 +2313,7 @@ def _wake(
     )
     loop_result = run_agent_loop(
         loop_cfg,
-        sandbox=runtime.sandbox,
+        sandbox=sandbox,
         db=db,
         session_factory=runtime.session_factory,
         session_id=effective_session_id,
@@ -2544,11 +2551,13 @@ def create_app(
         if reset_database:
             reset_schema_for_tests(engine, db_url)
         app.state.schema_missing_tables = missing_required_tables(engine)
-        run_sandbox.start()
+        if run_sandbox is not None:
+            run_sandbox.start()
         try:
             yield
         finally:
-            run_sandbox.close()
+            if run_sandbox is not None:
+                run_sandbox.close()
             engine.dispose()
 
     app = FastAPI(title="Ariel Slice 0", lifespan=lifespan)
@@ -2556,7 +2565,6 @@ def create_app(
     app.state.engine = engine
     app.state.session_factory = session_factory
     app.state.model_adapter = adapter
-    app.state.sandbox = run_sandbox
     app.state.bind_host = settings.bind_host
     app.state.bind_port = settings.bind_port
     app.state.local_auth_required = settings.local_auth_required

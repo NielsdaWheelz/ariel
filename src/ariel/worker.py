@@ -43,6 +43,7 @@ from .persistence import (
 from .memory import enqueue_due_memory_dream, run_rememberer
 from .redaction import safe_failure_reason
 from .research_runtime import ResearchFinding, render_finding, run_research
+from .sandbox_runtime import RunSandbox, SandboxRuntime
 from .sync_runtime import (
     process_provider_event_received,
     process_provider_sync_due,
@@ -313,6 +314,16 @@ def process_provider_reconcile_sync_due(
                 )
 
 
+def _require_sandbox(runtime: Runtime) -> RunSandbox:
+    sandbox = runtime.sandbox
+    if sandbox is None:
+        raise RuntimeError(
+            "worker requires runtime.sandbox; worker.main() must call "
+            "build_runtime(sandbox=SandboxRuntime())"
+        )
+    return sandbox
+
+
 def process_one_task(
     *,
     session_factory: sessionmaker[Session],
@@ -465,7 +476,7 @@ def process_one_task(
                 with runtime.session_factory() as db:
                     run_rememberer(
                         trigger="encode",
-                        sandbox=runtime.sandbox,
+                        sandbox=_require_sandbox(runtime),
                         db=db,
                         session_factory=runtime.session_factory,
                         session_id=session_id,
@@ -488,7 +499,7 @@ def process_one_task(
                 with runtime.session_factory() as db:
                     run_rememberer(
                         trigger="dream",
-                        sandbox=runtime.sandbox,
+                        sandbox=_require_sandbox(runtime),
                         db=db,
                         session_factory=runtime.session_factory,
                         session_id=None,
@@ -555,12 +566,13 @@ def run_worker(*, runtime: Runtime) -> None:
 
 
 def main() -> None:
-    runtime, engine = build_runtime()
+    sandbox = SandboxRuntime()
+    runtime, engine = build_runtime(sandbox=sandbox)
     try:
-        runtime.sandbox.start()
+        sandbox.start()
         run_worker(runtime=runtime)
     finally:
-        runtime.sandbox.close()
+        sandbox.close()
         engine.dispose()
 
 
@@ -695,7 +707,7 @@ def _process_research_run(*, runtime: Runtime, task_payload: dict[str, Any]) -> 
 
     with runtime.session_factory() as db:
         finding = run_research(
-            sandbox=runtime.sandbox,
+            sandbox=_require_sandbox(runtime),
             db=db,
             session_factory=runtime.session_factory,
             settings=runtime.settings,

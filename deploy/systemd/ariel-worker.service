@@ -1,0 +1,18 @@
+[Unit]
+Description=Ariel durable background worker
+After=network-online.target docker.service ariel-api.service
+Wants=network-online.target docker.service ariel-api.service
+
+[Service]
+Type=simple
+User=niels
+Group=niels
+WorkingDirectory=/home/niels/src/personal/ariel
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/niels/src/personal/ariel/.venv/bin/python -m ariel.worker
+Restart=always
+RestartSec=5
+SyslogIdentifier=ariel-worker
+
+[Install]
+WantedBy=multi-user.target

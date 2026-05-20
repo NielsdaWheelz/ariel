@@ -197,6 +197,18 @@ class SandboxRuntime:
             if not _GUEST_WORKER_PATH.exists():
                 raise SandboxRuntimeError("guest worker script is missing")
 
+            # Defensive: a previous ungraceful exit (SIGKILL, crash, OOM,
+            # ``systemctl stop`` racing) leaves the container's state file in
+            # /var/run/runsc, which makes ``runsc run`` fail with "container
+            # already exists". Best-effort delete reclaims that name.
+            subprocess.run(  # noqa: S603 - fixed argv, no shell
+                self._base_command("delete", "--force", self.container_id),
+                capture_output=True,
+                text=True,
+                timeout=self.wall_clock_seconds,
+                check=False,
+            )
+
             bundle = Path(tempfile.mkdtemp(prefix="ariel-sandbox-"))
             rootfs = bundle / "rootfs"
             (rootfs / "opt" / "ariel").mkdir(parents=True, exist_ok=True)
