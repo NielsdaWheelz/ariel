@@ -72,9 +72,17 @@ ok "$TOPIC: $GMAIL_PUBLISHER → roles/pubsub.publisher"
 gcloud pubsub topics add-iam-policy-binding "$DLQ_TOPIC" --project="$GCP_PROJECT" \
   --member="$PUBSUB_AGENT" --role="roles/pubsub.publisher" >/dev/null
 ok "$DLQ_TOPIC: $PUBSUB_AGENT → roles/pubsub.publisher"
+# The runtime SA needs TWO roles on the source subscription: `subscriber` grants
+# `pubsub.subscriptions.consume` (pull messages), but the sidecar also calls
+# `GetSubscription` at startup, which needs `pubsub.subscriptions.get` — that
+# permission is in `viewer`, not `subscriber`. The DLQ sub is operator-only
+# (manual pulls per runbook), so it keeps `subscriber` alone.
 gcloud pubsub subscriptions add-iam-policy-binding "$SUB" --project="$GCP_PROJECT" \
   --member="$RUNTIME_SA" --role="roles/pubsub.subscriber" >/dev/null
 ok "$SUB: $RUNTIME_SA → roles/pubsub.subscriber"
+gcloud pubsub subscriptions add-iam-policy-binding "$SUB" --project="$GCP_PROJECT" \
+  --member="$RUNTIME_SA" --role="roles/pubsub.viewer" >/dev/null
+ok "$SUB: $RUNTIME_SA → roles/pubsub.viewer"
 gcloud pubsub subscriptions add-iam-policy-binding "$DLQ_SUB" --project="$GCP_PROJECT" \
   --member="$RUNTIME_SA" --role="roles/pubsub.subscriber" >/dev/null
 ok "$DLQ_SUB: $RUNTIME_SA → roles/pubsub.subscriber"

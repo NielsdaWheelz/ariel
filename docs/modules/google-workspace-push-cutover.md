@@ -325,8 +325,10 @@ liveness without introducing a metrics exporter.
 The startup verifies the subscription exists; **it does not create it**. The
 provisioning script (operator-owned, `gcloud`-based) is the sole path that
 creates the topic, subscription, DLQ topic, DLQ subscription, and IAM
-bindings. The runtime SA has `roles/pubsub.subscriber` on the subscription and
-the DLQ subscription, nothing more. Least privilege for the runtime;
+bindings. The runtime SA has `roles/pubsub.subscriber` + `roles/pubsub.viewer`
+on the source subscription (subscriber covers `consume`; viewer covers the
+`get` call the sidecar issues at startup) and `roles/pubsub.subscriber` on the
+DLQ subscription, nothing more. Least privilege for the runtime;
 provisioning runs out-of-band as the operator's own credentials.
 
 ### Auth model — three layers
@@ -637,9 +639,9 @@ The legacy `ARIEL_GOOGLE_PROVIDER_EVENT_URL` line is removed.
   creates the topic, subscription with `--enable-exactly-once-delivery`,
   DLQ topic, DLQ subscription, IAM bindings (Publisher on topic for
   `gmail-api-push@system.gserviceaccount.com`, Publisher on DLQ for the
-  Pub/Sub service agent, Subscriber on source sub for the runtime SA, etc.).
-  Inputs: `GCP_PROJECT`, `RUNTIME_SA_EMAIL`. Outputs: full resource paths to
-  paste into `.env.local`.
+  Pub/Sub service agent, Subscriber + Viewer on source sub for the runtime SA,
+  Subscriber on DLQ sub for the runtime SA). Inputs: `GCP_PROJECT`,
+  `RUNTIME_SA_EMAIL`. Outputs: full resource paths to paste into `.env.local`.
 - `scripts/gcp_create_runtime_sa.sh` — `gcloud`-based: creates the runtime
   service account, creates a key, writes it to
   `~/.ariel-secrets/gcp-pubsub-sa.json` with `chmod 600`. Re-running rotates
