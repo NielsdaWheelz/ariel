@@ -4432,6 +4432,86 @@ def process_action_execution_task(
                 )
                 return True
 
+            if action_attempt.capability_id in PROACTIVE_CAPABILITY_IDS:
+                # proactive.* is allow_inline but taint can escalate it; on
+                # approval the action re-executes through this path. Mirror
+                # the inline dispatch so the agent_wake row gets written.
+                try:
+                    proactive_output = _execute_proactive_capability(
+                        db=db,
+                        capability_id=action_attempt.capability_id,
+                        normalized_input=normalized_input,
+                        now_fn=now_fn,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    _fail_action_execution(
+                        db=db,
+                        action_attempt=action_attempt,
+                        error=safe_failure_reason(
+                            str(exc),
+                            fallback=f"unexpected {exc.__class__.__name__}",
+                        ),
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
+                    return True
+                action_attempt.status = "succeeded"
+                action_attempt.execution_output = proactive_output
+                action_attempt.execution_error = None
+                action_attempt.updated_at = now_fn()
+                _append_action_execution_event(
+                    db=db,
+                    action_attempt=action_attempt,
+                    event_type="evt.action.execution.succeeded",
+                    payload_data={
+                        "action_attempt_id": action_attempt.id,
+                        "output": proactive_output,
+                    },
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
+                return True
+
+            if action_attempt.capability_id in RESEARCH_CAPABILITY_IDS:
+                # research.* enqueues a research_run task in the inline path.
+                # On approval, the same dispatch must happen here.
+                try:
+                    research_output = _execute_research_capability(
+                        db=db,
+                        capability_id=action_attempt.capability_id,
+                        normalized_input=normalized_input,
+                        session_id=action_attempt.session_id,
+                        now_fn=now_fn,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    _fail_action_execution(
+                        db=db,
+                        action_attempt=action_attempt,
+                        error=safe_failure_reason(
+                            str(exc),
+                            fallback=f"unexpected {exc.__class__.__name__}",
+                        ),
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
+                    return True
+                action_attempt.status = "succeeded"
+                action_attempt.execution_output = research_output
+                action_attempt.execution_error = None
+                action_attempt.updated_at = now_fn()
+                _append_action_execution_event(
+                    db=db,
+                    action_attempt=action_attempt,
+                    event_type="evt.action.execution.succeeded",
+                    payload_data={
+                        "action_attempt_id": action_attempt.id,
+                        "output": research_output,
+                    },
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
+                return True
+
             if action_attempt.capability_id in EMAIL_MUTATION_CAPABILITY_IDS:
                 if google_runtime is None:
                     _fail_action_execution(
