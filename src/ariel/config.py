@@ -41,6 +41,16 @@ class AppSettings(BaseSettings):
     schema_readiness_ttl_seconds: float = 10.0
     model_name: str = "gpt-5.5"
     openai_api_key: str | None = None
+    anthropic_api_key: str | None = None
+    google_api_key: str | None = None
+    openrouter_api_key: str | None = None
+    openai_base_url: str | None = None
+    model_tier_main: str | None = None
+    model_tier_bulk: str | None = None
+    model_tier_structured: str | None = None
+    model_tier_coding: str | None = None
+    model_tier_vision: str | None = None
+    model_tier_embedding: str | None = None
     model_timeout_seconds: float = 30.0
     model_reasoning_effort: str = "medium"
     model_verbosity: str = "low"
@@ -142,6 +152,25 @@ class AppSettings(BaseSettings):
     @field_validator("openai_api_key", mode="before")
     @classmethod
     def _blank_openai_api_key_is_unset(cls, value: Any) -> Any:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator(
+        "anthropic_api_key",
+        "google_api_key",
+        "openrouter_api_key",
+        "openai_base_url",
+        "model_tier_main",
+        "model_tier_bulk",
+        "model_tier_structured",
+        "model_tier_coding",
+        "model_tier_vision",
+        "model_tier_embedding",
+        mode="before",
+    )
+    @classmethod
+    def _blank_model_settings_are_unset(cls, value: Any) -> Any:
         if isinstance(value, str) and not value.strip():
             return None
         return value
