@@ -614,10 +614,13 @@ def _build_responses_input_items(
                 {
                     "role": "system",
                     "content": (
-                        "syscall callables your run program may call this turn "
-                        "(each is namespace.member(...) and returns its result; "
+                        "syscall callables your run program may call this turn. "
+                        "Their namespaces (agent, memory, email, calendar, etc.) "
+                        "are pre-injected globals — do NOT import them; "
+                        "`import ariel` fails. All arguments are keyword "
+                        "arguments (e.g. agent.emit_message(text='...')). "
                         "agent.emit_message, agent.emit_value, and "
-                        "agent.pause_until_input are always available):\n"
+                        "agent.pause_until_input are always available:\n"
                     )
                     + "\n".join(callable_lines),
                 }

@@ -58,9 +58,9 @@ from .response_contracts import validate_memory_recall_v1
 # Prompt-version constants
 # ---------------------------------------------------------------------------
 
-RETRIEVER_PROMPT_VERSION = "memory-retriever-v1"
-REMEMBERER_ENCODE_PROMPT_VERSION = "memory-rememberer-encode-v1"
-REMEMBERER_DREAM_PROMPT_VERSION = "memory-rememberer-dream-v1"
+RETRIEVER_PROMPT_VERSION = "memory-retriever-v3"
+REMEMBERER_ENCODE_PROMPT_VERSION = "memory-rememberer-encode-v2"
+REMEMBERER_DREAM_PROMPT_VERSION = "memory-rememberer-dream-v2"
 
 
 # ---------------------------------------------------------------------------
@@ -70,20 +70,24 @@ REMEMBERER_DREAM_PROMPT_VERSION = "memory-rememberer-dream-v1"
 _RETRIEVER_PROMPT = (
     "You are Ariel's memory retriever. Your job is to reconstruct the working "
     "context for the current wake by agentically searching the memory substrate. "
-    "You may call memory.search(query, limit, since, kinds) to search both the "
-    "raw log and the curated notes, and memory.read(id) to fetch the full content "
-    "of any row by id. Search broadly, read what looks relevant, and follow up "
-    "across multiple rounds if the first results lead to more useful entries. "
-    "When satisfied — or when you have covered both relevance-based recall and "
-    "recent-session continuity — call agent.emit_finding with: "
-    '{"summary": "<the reconstructed working context in plain language>", '
-    '"items": [{"id": ..., "layer": ..., "created_at": ..., "content": ..., '
-    '"taint": ...}, ...], "status": "complete"}. '
-    "If you exhaust your budget before finishing, the loop ends with status "
-    '"partial" automatically. The retriever fires on every wake — cover both '
-    "semantic relevance and recent session continuity so the main agent can act "
-    "without missing recent history. Do not invent ids; every id in items must "
-    "be a real id returned by a memory.search or memory.read call."
+    "The `agent` and `memory` namespaces are pre-injected globals in your run "
+    "program — do not import them. All syscall arguments are keyword arguments. "
+    "Call memory.search(query='...', limit=N, since='...', kinds=[...]) to search "
+    "both the raw log and the curated notes (query is required; limit/since/kinds "
+    "are optional). Call memory.read(id='...') to fetch the full content of any "
+    "row by id. Search broadly, read what looks relevant, and follow up across "
+    "multiple rounds if the first results lead to more useful entries. When "
+    "satisfied — or when you have covered both relevance-based recall and "
+    "recent-session continuity — call agent.emit_finding(summary='...', "
+    "claims=[{'id': ..., 'layer': ..., 'created_at': ..., 'content': ..., "
+    "'taint': ...}, ...], gaps=[], sources=[]). Exactly these four keyword "
+    "arguments are accepted; pass empty lists for gaps and sources when there "
+    "is nothing to report. If you exhaust your budget before finishing, the "
+    'loop ends with status "partial" automatically. The retriever fires on '
+    "every wake — cover both semantic relevance and recent session continuity "
+    "so the main agent can act without missing recent history. Do not invent "
+    "ids; every id in claims must be a real id returned by a memory.search or "
+    "memory.read call."
 )
 
 _REMEMBERER_ENCODE_PROMPT = (
@@ -91,15 +95,16 @@ _REMEMBERER_ENCODE_PROMPT = (
     '{"trigger": "encode", "note": "<what to remember>", ...}. '
     "Your job is to write this to the curated note layer, editing rather than "
     "duplicating when a related note already exists. "
-    "First call memory.search (with kinds omitted to search the curated layer) "
-    "to find relevant existing notes. Read candidates with memory.read(id) to "
-    "inspect their content. Then apply memory.note.create(content), "
-    "memory.note.edit(id, content), and/or memory.note.delete(id) as needed — "
-    "edit a note when the new material updates or extends it; delete a note "
-    "only when it is fully superseded. When done, call agent.emit_done with a "
-    "short string describing what you did (e.g. 'edited note mno_... to add "
-    "preference for dark mode'). The raw log is append-only and must never be "
-    "the target of note operations."
+    "First call memory.search(query='...') (with kinds omitted to search the "
+    "curated layer) to find relevant existing notes. Read candidates with "
+    "memory.read(id='...') to inspect their content. Then apply "
+    "memory.note.create(content='...'), memory.note.edit(id='...', content='...'), "
+    "and/or memory.note.delete(id='...') as needed — edit a note when the new "
+    "material updates or extends it; delete a note only when it is fully "
+    "superseded. All syscall arguments must be keyword arguments. When done, "
+    "call agent.emit_done(summary='...') with a short string describing what you "
+    "did. The raw log is append-only and must never be the target of note "
+    "operations."
 )
 
 _REMEMBERER_DREAM_PROMPT = (
@@ -107,14 +112,15 @@ _REMEMBERER_DREAM_PROMPT = (
     '{"trigger": "dream"}. '
     "Your job is to consolidate the recent raw log into the curated note layer: "
     "generalizations, summaries, connections, topic abstractions. "
-    "Read recent log events with memory.search (over the log; use the since "
-    "parameter to scope to recent time). Also search the curated layer for "
-    "existing notes to edit or delete rather than duplicate. Write new notes "
-    "with memory.note.create(content), update existing ones with "
-    "memory.note.edit(id, content), and delete superseded ones with "
-    "memory.note.delete(id). The raw log is append-only — only memory_notes "
-    "is mutable; never use note operations with a log id. When satisfied, call "
-    "agent.emit_done with a short summary of what you consolidated."
+    "Read recent log events with memory.search(query='...', since='...') (over "
+    "the log; use the since parameter to scope to recent time). Also search the "
+    "curated layer for existing notes to edit or delete rather than duplicate. "
+    "Write new notes with memory.note.create(content='...'), update existing "
+    "ones with memory.note.edit(id='...', content='...'), and delete superseded "
+    "ones with memory.note.delete(id='...'). All syscall arguments must be "
+    "keyword arguments. The raw log is append-only — only memory_notes is "
+    "mutable; never use note operations with a log id. When satisfied, call "
+    "agent.emit_done(summary='...') with a short summary of what you consolidated."
 )
 
 
@@ -525,8 +531,11 @@ def run_retriever(
         {
             "role": "system",
             "content": (
-                "syscall callables available this run "
-                "(call as namespace.member(...); results are returned inline):\n"
+                "syscall callables available this run. Their namespaces "
+                "(agent, memory) are pre-injected globals — do NOT import "
+                "them; `import ariel` fails. All arguments are keyword "
+                "arguments (e.g. memory.search(query='...')). Results are "
+                "returned inline:\n"
             )
             + callable_lines,
         },
@@ -702,8 +711,11 @@ def run_rememberer(
         {
             "role": "system",
             "content": (
-                "syscall callables available this run "
-                "(call as namespace.member(...); results are returned inline):\n"
+                "syscall callables available this run. Their namespaces "
+                "(agent, memory) are pre-injected globals — do NOT import "
+                "them; `import ariel` fails. All arguments are keyword "
+                "arguments (e.g. memory.search(query='...')). Results are "
+                "returned inline:\n"
             )
             + callable_lines,
         },
