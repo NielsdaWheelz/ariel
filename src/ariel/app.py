@@ -525,8 +525,26 @@ class OpenAIResponsesAdapter:
                 retryable=True,
             ) from exc
 
-        usage_payload = payload.get("usage")
-        usage = usage_payload if isinstance(usage_payload, dict) else None
+        # Narrow OpenAI's usage shape: flat trio + cached/reasoning lifted from nested details.
+        raw_usage = payload.get("usage")
+        usage: dict[str, int] | None = None
+        if isinstance(raw_usage, dict):
+            normalized: dict[str, int] = {}
+            for key in ("input_tokens", "output_tokens", "total_tokens"):
+                value = raw_usage.get(key)
+                if isinstance(value, int):
+                    normalized[key] = value
+            input_details = raw_usage.get("input_tokens_details")
+            if isinstance(input_details, dict):
+                cached = input_details.get("cached_tokens")
+                if isinstance(cached, int):
+                    normalized["cached_tokens"] = cached
+            output_details = raw_usage.get("output_tokens_details")
+            if isinstance(output_details, dict):
+                reasoning = output_details.get("reasoning_tokens")
+                if isinstance(reasoning, int):
+                    normalized["reasoning_tokens"] = reasoning
+            usage = normalized or None
         provider_response_id = payload.get("id")
 
         return {
