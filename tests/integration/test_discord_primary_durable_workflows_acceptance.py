@@ -12,10 +12,13 @@ from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import text
 
-from ariel.app import ModelAdapter, create_app
+from ariel.app import create_app
+from ariel.model_adapter import ModelAdapter, ModelCall, ModelResponse
 from tests.integration.responses_helpers import (
+    FakeModelAdapter,
     empty_recall_response,
     is_retriever_call,
+    last_user_message,
     responses_run_message,
 )
 from ariel.config import AppSettings
@@ -24,25 +27,18 @@ from ariel.worker import process_one_task
 from tests.fake_sandbox import FakeSandboxRuntime
 
 
-@dataclass
-class DurableWorkflowAdapter:
-    provider: str = "provider.discord-primary-durable"
-    model: str = "model.discord-primary-durable-v1"
+class DurableWorkflowAdapter(FakeModelAdapter):
+    provider = "provider.discord-primary-durable"
+    model = "model.discord-primary-durable-v1"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+    def _respond(self, request: ModelCall) -> ModelResponse:
+
+        user_message = last_user_message(request.messages)
+        if is_retriever_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del input_items, tools, history, context_bundle
+
         return responses_run_message(
             assistant_text=f"assistant::{user_message}",
             provider=self.provider,

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 
-from ariel.app import _build_responses_input_items, _build_turn_context_bundle
+from pydantic_ai.messages import ModelRequest, SystemPromptPart, UserPromptPart
+
+from ariel.app import _build_initial_messages, _build_turn_context_bundle
 from ariel.prompts import MAIN_AGENT_PROMPT_VERSION, MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS
 
 
@@ -37,15 +39,25 @@ def test_responses_input_items_keep_static_prompt_before_dynamic_context() -> No
     context["eligible_internal_callables"] = ["memory.search", "agent.emit_message"]
     context["tool_surface_facts"] = {"runtime_bindings": {"agency": False}}
 
-    input_items = _build_responses_input_items(context_bundle=context, user_message="hello")
-    static_count = len(MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS)
+    messages = _build_initial_messages(context_bundle=context, user_message="hello")
 
-    assert [item["content"] for item in input_items[:static_count]] == list(
+    # _build_initial_messages emits exactly one ModelRequest carrying the full
+    # system-prompt prefix and the user turn.
+    assert len(messages) == 1
+    request = messages[0]
+    assert isinstance(request, ModelRequest)
+    parts = list(request.parts)
+
+    static_count = len(MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS)
+    system_parts = [p for p in parts if isinstance(p, SystemPromptPart)]
+    assert [part.content for part in system_parts[:static_count]] == list(
         MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS
     )
-    assert input_items[-1] == {"role": "user", "content": "hello"}
+    user_parts = [p for p in parts if isinstance(p, UserPromptPart)]
+    assert len(user_parts) == 1
+    assert user_parts[0].content == "hello"
 
-    dynamic_tail = json.dumps(input_items[static_count:], sort_keys=True)
+    dynamic_tail = json.dumps([p.content for p in system_parts[static_count:]], sort_keys=True)
     assert "discord context:" in dynamic_tail
     assert "syscall callables your run program may call this turn" in dynamic_tail
     assert "runtime facts:" in dynamic_tail

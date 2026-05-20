@@ -20,6 +20,7 @@ from .capability_registry import (
 )
 from .config import AppSettings
 from .google_connector import GoogleConnectorRuntime
+from .model_adapter import ToolCall, ToolSpec
 from .persistence import ActionAttemptRecord, TurnRecord
 from .sandbox_runtime import ProgramResult, RunSandbox
 
@@ -119,12 +120,11 @@ class RunProgramResult:
     runtime_provenance: RuntimeProvenance | None
 
 
-def run_tool_definitions() -> list[dict[str, Any]]:
+def run_tool_definitions() -> list[ToolSpec]:
     return [
-        {
-            "type": "function",
-            "name": "run",
-            "description": (
+        ToolSpec(
+            name="run",
+            description=(
                 "Execute one Ariel run program. The source is a Python program run in a "
                 "sandbox: it may use variables, if/for/while, comprehensions, exception "
                 "handling, and the safe standard library (json, re, datetime, math). Every "
@@ -135,7 +135,7 @@ def run_tool_definitions() -> list[dict[str, Any]]:
                 "approval-gated syscall returns a pending value and is not executed inline. "
                 "Call exactly one run tool with the program as the source string."
             ),
-            "parameters": {
+            parameters={
                 "type": "object",
                 "additionalProperties": False,
                 "properties": {
@@ -147,24 +147,26 @@ def run_tool_definitions() -> list[dict[str, Any]]:
                 },
                 "required": ["source"],
             },
-            "strict": True,
-        }
+        )
     ]
 
 
 def parse_run_function_call(
-    function_calls: list[dict[str, Any]],
+    tool_calls: list[ToolCall],
 ) -> tuple[str | None, str | None]:
-    if len(function_calls) != 1:
+    """Validate the model's tool-call envelope for the ``run`` protocol.
+
+    The model must emit exactly one ``run`` tool call whose ``arguments`` carry
+    a single non-empty ``source`` string bounded by ``_MAX_RUN_SOURCE_CHARS``.
+    Returns ``(source, None)`` on success or ``(None, reason)`` on protocol
+    failure; the source itself is executed by the sandbox, not parsed here.
+    """
+    if len(tool_calls) != 1:
         return None, "run_protocol_requires_exactly_one_tool_call"
-    function_call = function_calls[0]
-    if function_call.get("name") != "run":
+    tool_call = tool_calls[0]
+    if tool_call.name != "run":
         return None, "run_protocol_requires_run_tool"
-    raw_arguments = function_call.get("arguments")
-    try:
-        arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else {}
-    except ValueError:
-        return None, "run_arguments_invalid_json"
+    arguments = tool_call.arguments
     if set(arguments.keys()) != {"source"} or not isinstance(arguments.get("source"), str):
         return None, "run_arguments_schema_invalid"
     source = arguments["source"].strip()

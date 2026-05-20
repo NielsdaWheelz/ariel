@@ -25,8 +25,9 @@ from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 from sqlalchemy.orm import Session, sessionmaker
 
 from ariel.agent_loop import run_agent_loop
-from ariel.app import ModelAdapter, create_app
+from ariel.app import create_app
 from ariel.capability_registry import capability_id_for_run_callable, get_capability
+from ariel.model_adapter import ModelAdapter
 from ariel.persistence import BackgroundTaskRecord, MemoryLogRecord, MemoryNoteRecord
 from ariel.worker import UnsupportedTaskType, process_one_task
 from tests.fake_sandbox import FakeSandboxRuntime
@@ -110,7 +111,6 @@ class _TwoPhaseAdapter:
     def create_response(
         self, *, input_items: Any, tools: Any, user_message: Any, history: Any, context_bundle: Any
     ) -> dict[str, Any]:
-        del tools, user_message, history, context_bundle
         self.call_count += 1
         self.snapshots.append(list(input_items))
         source = _RETRIEVER_PROGRAM if self.call_count % 2 == 1 else _EMIT_MSG
@@ -135,7 +135,6 @@ class _FailingRetrieverAdapter:
     def create_response(
         self, *, input_items: Any, tools: Any, user_message: Any, history: Any, context_bundle: Any
     ) -> dict[str, Any]:
-        del tools, user_message, history, context_bundle, input_items
         self.call_count += 1
         # Calls 1 and 2: retriever stuck-detection (same source twice → exits).
         # Call 3: main agent emits a message.
@@ -155,7 +154,6 @@ class _RememberAdapter:
     def create_response(
         self, *, input_items: Any, tools: Any, user_message: Any, history: Any, context_bundle: Any
     ) -> dict[str, Any]:
-        del tools, user_message, history, context_bundle, input_items
         self.call_count += 1
         if self.call_count % 2 == 1:
             source = _RETRIEVER_PROGRAM
@@ -414,7 +412,6 @@ class _RetrieverSearchesThenMainSearchesAdapter:
     def create_response(
         self, *, input_items: Any, tools: Any, user_message: Any, history: Any, context_bundle: Any
     ) -> dict[str, Any]:
-        del input_items, tools, user_message, history, context_bundle
         self.call_count += 1
         if self.call_count == 1:
             source = (
@@ -701,7 +698,6 @@ class _DreamCompleteAdapter:
     def create_response(
         self, *, input_items: Any, tools: Any, user_message: Any, history: Any, context_bundle: Any
     ) -> dict[str, Any]:
-        del tools, user_message, history, context_bundle, input_items
         self.call_count += 1
         return _run_response("agent.emit_done(summary='dreamt')\n", idx=self.call_count)
 

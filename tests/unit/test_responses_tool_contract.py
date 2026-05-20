@@ -17,6 +17,7 @@ from ariel.capability_registry import (
     run_callable_name_for_capability_id,
 )
 from ariel.executor import ExecutionResult
+from ariel.model_adapter import ToolCall
 from ariel.persistence import TurnRecord
 from ariel.prompts import MAIN_AGENT_PROMPT_VERSION, MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS
 from ariel.run_runtime import parse_run_function_call, run_tool_definitions
@@ -38,10 +39,8 @@ def test_normal_response_tool_surface_is_single_strict_run_tool() -> None:
             assert_strict_object_schema(items, f"{path}[]")
 
     tools = run_tool_definitions()
-    assert [tool["name"] for tool in tools] == ["run"]
-    assert tools[0]["type"] == "function"
-    assert tools[0]["strict"] is True
-    assert_strict_object_schema(tools[0]["parameters"], "run")
+    assert [tool.name for tool in tools] == ["run"]
+    assert_strict_object_schema(tools[0].parameters, "run")
 
 
 def test_main_agent_prompt_is_versioned_static_contract() -> None:
@@ -86,15 +85,20 @@ def test_main_agent_prompt_block_order_is_stable() -> None:
     assert positions == sorted(positions)
 
 
+def _run_call(arguments: dict[str, Any], *, name: str = "run") -> ToolCall:
+    return ToolCall(call_id="call_test", name=name, arguments=arguments)
+
+
 def test_run_protocol_requires_exactly_one_run_call() -> None:
     assert parse_run_function_call([]) == (
         None,
         "run_protocol_requires_exactly_one_tool_call",
     )
-    assert parse_run_function_call(
-        [{"name": "run", "arguments": "{}"}, {"name": "run", "arguments": "{}"}]
-    ) == (None, "run_protocol_requires_exactly_one_tool_call")
-    assert parse_run_function_call([{"name": "not_the_run_tool", "arguments": "{}"}]) == (
+    assert parse_run_function_call([_run_call({}), _run_call({})]) == (
+        None,
+        "run_protocol_requires_exactly_one_tool_call",
+    )
+    assert parse_run_function_call([_run_call({}, name="not_the_run_tool")]) == (
         None,
         "run_protocol_requires_run_tool",
     )
@@ -143,20 +147,20 @@ def test_run_source_is_a_python_program_string() -> None:
         "results = memory.recall(query='project phoenix')\n"
         "agent.emit_message(text='Found ' + str(len(results['facts'])) + ' memories.')\n"
     )
-    parsed_source, error = parse_run_function_call(
-        [{"name": "run", "arguments": json.dumps({"source": source})}]
-    )
+    parsed_source, error = parse_run_function_call([_run_call({"source": source})])
     assert error is None
     assert parsed_source == source.strip()
 
 
 def test_run_source_rejects_blank_and_oversized_programs() -> None:
-    assert parse_run_function_call(
-        [{"name": "run", "arguments": json.dumps({"source": "   "})}]
-    ) == (None, "run_source_empty")
-    assert parse_run_function_call(
-        [{"name": "run", "arguments": json.dumps({"source": "x" * 20001})}]
-    ) == (None, "run_source_too_large")
+    assert parse_run_function_call([_run_call({"source": "   "})]) == (
+        None,
+        "run_source_empty",
+    )
+    assert parse_run_function_call([_run_call({"source": "x" * 20001})]) == (
+        None,
+        "run_source_too_large",
+    )
 
 
 def test_action_runtime_has_no_deterministic_tool_result_synthesizer() -> None:

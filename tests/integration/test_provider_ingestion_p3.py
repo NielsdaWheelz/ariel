@@ -9,8 +9,13 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from ariel.app import ModelAdapter, create_app
-from tests.integration.responses_helpers import empty_recall_response, is_retriever_call
+from ariel.app import create_app
+from ariel.model_adapter import ModelCall, ModelResponse
+from tests.integration.responses_helpers import (
+    FakeModelAdapter,
+    empty_recall_response,
+    is_retriever_call,
+)
 from ariel.config import AppSettings
 from ariel.google_connector import (
     GOOGLE_CONNECTOR_ID,
@@ -146,20 +151,14 @@ class ConnectOAuthClient:
         del token
 
 
-@dataclass
-class _NoCallAdapter:
-    provider: str = "provider.test"
-    model: str = "model.test"
+class _NoCallAdapter(FakeModelAdapter):
+    provider = "provider.test"
+    model = "model.test"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        **_: Any,
-    ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_retriever_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
         raise AssertionError("model should not be called in this test")
 
@@ -174,7 +173,7 @@ def test_connect_registers_gmail_and_calendar_watches_and_persists_rows(
     oauth_client = ConnectOAuthClient(granted_scopes=[GMAIL_READ_SCOPE, CALENDAR_READ_SCOPE])
     app = create_app(
         database_url=postgres_url,
-        model_adapter=cast(ModelAdapter, _NoCallAdapter()),
+        model_adapter=_NoCallAdapter(),
         reset_database=True,
         sandbox=FakeSandboxRuntime(),
     )
@@ -235,7 +234,7 @@ def test_connect_watch_registration_failure_is_non_fatal(
     oauth_client = ConnectOAuthClient(granted_scopes=[GMAIL_READ_SCOPE, CALENDAR_READ_SCOPE])
     app = create_app(
         database_url=postgres_url,
-        model_adapter=cast(ModelAdapter, _NoCallAdapter()),
+        model_adapter=_NoCallAdapter(),
         reset_database=True,
         sandbox=FakeSandboxRuntime(),
     )

@@ -38,13 +38,15 @@ a cycle.  The model adapter is taken structurally via the small
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import Any
 
 import ulid
 from fastapi.encoders import jsonable_encoder
+from pydantic_ai.messages import ModelRequest, SystemPromptPart, UserPromptPart
 from sqlalchemy.orm import Session, sessionmaker
 
 from .agent_loop import LoopConfig, ResearchFinding, run_agent_loop
@@ -56,6 +58,7 @@ from .capability_registry import (
 )
 from .config import AppSettings
 from .google_connector import GoogleConnectorRuntime
+from .model_adapter import ModelAdapter, ModelMessage
 from .persistence import EventRecord, TurnRecord
 from .run_runtime import ScratchEntry, run_tool_definitions
 from .sandbox_runtime import RunSandbox
@@ -70,28 +73,6 @@ def _utcnow() -> datetime:
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}_{ulid.new().str.lower()}"
-
-
-class ResearchModelAdapter(Protocol):
-    """The model surface ``run_research`` needs.
-
-    Structurally identical to the slice of ``app.ModelAdapter`` the loop uses;
-    declared locally so this module does not import ``app.py``.  The worker
-    passes its ``Runtime.model_adapter``, which satisfies this protocol.
-    """
-
-    provider: str
-    model: str
-
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]: ...
 
 
 def render_finding(finding: ResearchFinding) -> str:
@@ -135,12 +116,12 @@ def _research_capability_ids(mode: str) -> frozenset[str]:
     raise ValueError(f"unknown research mode: {mode}")
 
 
-def _build_research_input_items(
+def _build_research_messages(
     *,
     question: str,
     mode: str,
     eligible_callables: list[str],
-) -> list[dict[str, Any]]:
+) -> list[ModelMessage]:
     """The research prompt: the run-program syscall framing plus research framing.
 
     The model authors ``run`` programs against the mode's read capabilities, the
@@ -150,40 +131,36 @@ def _build_research_input_items(
     """
 
     callable_lines = [f"- {name}" for name in eligible_callables]
-    return [
-        {
-            "role": "system",
-            "content": (
+    parts: list[Any] = [
+        SystemPromptPart(
+            content=(
                 "You are Ariel's research subagent. You investigate one bounded "
                 "question read-only and report a structured finding. You author "
                 "Ariel run programs: each is a Python program run in a sandbox "
                 "whose effects are namespaced syscalls. Call exactly one run tool "
                 "per round with the program as its source."
-            ),
-        },
-        {
-            "role": "system",
-            "content": (
+            )
+        ),
+        SystemPromptPart(
+            content=(
                 f"research mode: {mode}. This run is read-only and limited to "
                 f"{mode} sources; it has no other reach. Hold raw evidence "
                 "(search results, fetched pages, extracts) in the scratch store "
                 "with scratch.set / scratch.get so it stays out of your context; "
                 "carry only what you need to reason over with agent.emit_value."
-            ),
-        },
-        {
-            "role": "system",
-            "content": (
+            )
+        ),
+        SystemPromptPart(
+            content=(
                 "syscall callables your run program may call this run "
                 "(each is namespace.member(...) and returns its result; "
                 "scratch.set, scratch.get, agent.emit_value, and "
                 "agent.emit_finding are always available):\n"
             )
-            + "\n".join(callable_lines),
-        },
-        {
-            "role": "system",
-            "content": (
+            + "\n".join(callable_lines)
+        ),
+        SystemPromptPart(
+            content=(
                 "Begin by writing your sub-questions, then investigate them with "
                 "the read capabilities above. When you have investigated enough, "
                 "call agent.emit_finding(summary=, claims=, gaps=, sources=) "
@@ -192,10 +169,11 @@ def _build_research_input_items(
                 "list of what you could not determine; sources is a list of "
                 "{title, reference, retrieved_at}. The run ends when you call "
                 "agent.emit_finding; nothing you emit is shown to a user directly."
-            ),
-        },
-        {"role": "user", "content": question},
+            )
+        ),
+        UserPromptPart(content=question),
     ]
+    return [ModelRequest(parts=parts)]
 
 
 def run_research(
@@ -204,7 +182,7 @@ def run_research(
     db: Session,
     session_factory: sessionmaker[Session],
     settings: AppSettings,
-    model_adapter: ResearchModelAdapter,
+    model_adapter: ModelAdapter,
     google_runtime: GoogleConnectorRuntime,
     session_id: str,
     question: str,
@@ -273,7 +251,7 @@ def run_research(
         {"research_question": question, "research_mode": mode},
     )
 
-    responses_input_items = _build_research_input_items(
+    initial_messages = _build_research_messages(
         question=question,
         mode=mode,
         eligible_callables=eligible_callables,
@@ -323,11 +301,8 @@ def run_research(
         turn=turn,
         settings=settings,
         model_adapter=model_adapter,
-        responses_input_items=responses_input_items,
+        messages=initial_messages,
         tools=run_tool_definitions(),
-        user_message=question,
-        history=[],
-        context_bundle={},
         allowed_capability_ids=allowed_capability_ids,
         scratch=scratch,
         proposal_index_start=0,
@@ -344,10 +319,12 @@ def run_research(
     )
 
     # Map loop outcome to a ResearchFinding and update the turn record.
+    # The loop emits ``question=""`` on the finding — only the caller knows
+    # the question it dispatched; we splice it back in here.
     match loop_result.outcome:
         case "finding":
             assert loop_result.emitted_finding is not None
-            finding = loop_result.emitted_finding
+            finding = dataclasses.replace(loop_result.emitted_finding, question=question)
             turn.assistant_message = finding.summary
             turn.status = "completed"
             add_event("evt.research.finding_emitted", {"mode": mode})

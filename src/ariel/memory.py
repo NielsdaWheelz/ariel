@@ -28,10 +28,12 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
 import ulid
+from pydantic_ai.messages import ModelRequest, SystemPromptPart, UserPromptPart
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from .config import AppSettings
+from .model_adapter import ModelAdapter, ModelMessage
 from .persistence import (
     BackgroundTaskRecord,
     MemoryLogRecord,
@@ -45,7 +47,6 @@ from .run_runtime import run_tool_definitions
 
 if TYPE_CHECKING:
     from .agency_daemon import AgencyRuntime
-    from .app import ModelAdapter
     from .attachment_content import AttachmentContentRuntime
     from .google_connector import GoogleConnectorRuntime
     from .sandbox_runtime import RunSandbox
@@ -513,25 +514,24 @@ def run_retriever(
     eligible_callables = ["memory.search", "memory.read", "agent.emit_finding"]
     callable_lines = "\n".join(f"- {name}" for name in eligible_callables)
 
-    responses_input_items: list[dict[str, Any]] = [
-        {"role": "system", "content": _RETRIEVER_PROMPT},
-        {
-            "role": "system",
-            "content": json.dumps(
+    retriever_parts: list[Any] = [
+        SystemPromptPart(content=_RETRIEVER_PROMPT),
+        SystemPromptPart(
+            content=json.dumps(
                 {"prompt_version": RETRIEVER_PROMPT_VERSION, "wake_context": query},
                 sort_keys=True,
-            ),
-        },
-        {
-            "role": "system",
-            "content": (
+            )
+        ),
+        SystemPromptPart(
+            content=(
                 "syscall callables available this run "
                 "(call as namespace.member(...); results are returned inline):\n"
             )
-            + callable_lines,
-        },
-        {"role": "user", "content": query},
+            + callable_lines
+        ),
+        UserPromptPart(content=query),
     ]
+    retriever_messages: list[ModelMessage] = [ModelRequest(parts=retriever_parts)]
 
     cfg = LoopConfig(
         output_mode="finding",
@@ -572,11 +572,8 @@ def run_retriever(
         turn=turn,
         settings=settings,
         model_adapter=model_adapter,
-        responses_input_items=responses_input_items,
+        messages=retriever_messages,
         tools=run_tool_definitions(),
-        user_message=query,
-        history=[],
-        context_bundle={},
         allowed_capability_ids=allowed_capability_ids,
         scratch={},
         proposal_index_start=0,
@@ -697,18 +694,18 @@ def run_rememberer(
     ]
     callable_lines = "\n".join(f"- {name}" for name in eligible_callables)
 
-    responses_input_items: list[dict[str, Any]] = [
-        {"role": "system", "content": system_prompt},
-        {
-            "role": "system",
-            "content": (
+    rememberer_parts: list[Any] = [
+        SystemPromptPart(content=system_prompt),
+        SystemPromptPart(
+            content=(
                 "syscall callables available this run "
                 "(call as namespace.member(...); results are returned inline):\n"
             )
-            + callable_lines,
-        },
-        {"role": "user", "content": json.dumps(user_payload, sort_keys=True)},
+            + callable_lines
+        ),
+        UserPromptPart(content=json.dumps(user_payload, sort_keys=True)),
     ]
+    rememberer_messages: list[ModelMessage] = [ModelRequest(parts=rememberer_parts)]
 
     cfg = LoopConfig(
         output_mode="operations",
@@ -758,11 +755,8 @@ def run_rememberer(
             turn=loop_turn,
             settings=settings,
             model_adapter=model_adapter,
-            responses_input_items=responses_input_items,
+            messages=rememberer_messages,
             tools=run_tool_definitions(),
-            user_message=json.dumps(user_payload, sort_keys=True),
-            history=[],
-            context_bundle={},
             allowed_capability_ids=allowed_capability_ids,
             scratch={},
             proposal_index_start=0,

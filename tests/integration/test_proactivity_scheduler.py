@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 import json
 from typing import Any
@@ -22,11 +21,14 @@ from ariel.persistence import (
 from ariel.worker import process_one_task
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.responses_helpers import (
+    FakeModelAdapter,
     empty_recall_response,
     is_retriever_call,
+    last_user_message,
     responses_run_message,
     run_function_calls,
 )
+from ariel.model_adapter import ModelCall, ModelResponse
 
 NOW = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
 
@@ -221,30 +223,25 @@ def test_schedule_syscall_rejects_a_malformed_when(
 # ===========================================================================
 
 
-@dataclass
-class _WakeAdapter:
+class _WakeAdapter(FakeModelAdapter):
     """A model adapter whose single ``run`` program emits a message. It records
     the ``user_message`` of every turn so the test can assert the worker handed
     the scheduled note to ``_wake``."""
 
-    provider: str = "provider.wake"
-    model: str = "model.wake-v1"
-    user_messages_seen: list[str] = field(default_factory=list)
+    provider = "provider.wake"
+    model = "model.wake-v1"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+    def __init__(self) -> None:
+        super().__init__()
+        self.user_messages_seen: list[str] = []
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+
+        user_message = last_user_message(request.messages)
+        if is_retriever_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del input_items, tools, history, context_bundle
         self.user_messages_seen.append(user_message)
         return responses_run_message(
             assistant_text="handled the scheduled wake",

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import json
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -9,15 +8,17 @@ from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import text
 
-from ariel.app import ModelAdapter, build_google_runtime, create_app
+from ariel.app import build_google_runtime, create_app
 from ariel.google_connector import GoogleWorkspaceProvider
 from tests.integration.responses_helpers import (
+    FakeModelAdapter,
     empty_recall_response,
     is_retriever_call,
+    last_user_message,
     post_message_and_drain,
-    responses_message,
     responses_with_run_calls,
 )
+from ariel.model_adapter import ModelAdapter, ModelCall, ModelResponse
 from tests.fake_sandbox import FakeSandboxRuntime
 
 
@@ -26,59 +27,29 @@ GOOGLE_CALENDAR_FREEBUSY_SCOPE = "https://www.googleapis.com/auth/calendar.freeb
 GOOGLE_GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 
 
-@dataclass
-class ActionProposalAdapter:
-    provider: str = "provider.s4-pr01"
-    model: str = "model.s4-pr01-v1"
-    run_calls_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
-    assistant_text_by_message: dict[str, str] = field(default_factory=dict)
+class ActionProposalAdapter(FakeModelAdapter):
+    provider = "provider.s4-pr01"
+    model = "model.s4-pr01-v1"
 
-    def create_response(
+    def __init__(
         self,
         *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+        run_calls_by_message: dict[str, list[dict[str, Any]]] | None = None,
+        assistant_text_by_message: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__()
+        self.run_calls_by_message: dict[str, list[dict[str, Any]]] = (
+            run_calls_by_message if run_calls_by_message is not None else {}
+        )
+        self.assistant_text_by_message: dict[str, str] = (
+            assistant_text_by_message if assistant_text_by_message is not None else {}
+        )
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        user_message = last_user_message(request.messages)
+        if is_retriever_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
-            )
-        del tools, history
-        if context_bundle.get("origin") == "tool_result_interpretation":
-            interpreter_input = context_bundle.get("tool_result_interpreter_input")
-            if not isinstance(interpreter_input, dict):
-                interpreter_input = {}
-            audited_outputs = interpreter_input.get("audited_tool_outputs")
-            selected_output_refs = []
-            if isinstance(audited_outputs, list):
-                selected_output_refs = [
-                    output["output_ref"]
-                    for output in audited_outputs
-                    if isinstance(output, dict) and isinstance(output.get("output_ref"), str)
-                ]
-            return responses_message(
-                assistant_text=json.dumps(
-                    {
-                        "findings": ["workspace evidence inspected"],
-                        "contradictions": [],
-                        "uncertainty": [],
-                        "selected_output_refs": selected_output_refs,
-                        "omitted_output_refs": [],
-                        "citation_refs": interpreter_input.get("citation_refs", []),
-                        "artifact_refs": interpreter_input.get("artifact_refs", []),
-                        "recommended_next_evidence": [],
-                        "confidence": 0.9,
-                    },
-                    sort_keys=True,
-                ),
-                provider=self.provider,
-                model=self.model,
-                provider_response_id="resp_s4_pr01_interpreter",
-                input_tokens=31,
-                output_tokens=20,
+                provider=self.provider, model=self.model, messages=request.messages
             )
         run_calls = copy.deepcopy(self.run_calls_by_message.get(user_message, []))
         assistant_text = self.assistant_text_by_message.get(
@@ -91,11 +62,6 @@ class ActionProposalAdapter:
                 "plan team sync": "attendee availability is limited to user-calendar-only; reconnect to include attendee calendars.",
             }.get(user_message, f"assistant::{user_message}"),
         )
-        if any(
-            isinstance(item, dict) and item.get("type") == "function_call_output"
-            for item in input_items
-        ):
-            run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
         if not run_calls:
             run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
         return responses_with_run_calls(

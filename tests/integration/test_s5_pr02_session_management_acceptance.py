@@ -16,62 +16,61 @@ from __future__ import annotations
 
 import copy
 import threading
-from dataclasses import dataclass, field
 from typing import Any, cast
 
 from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import select
 
-from ariel.app import ModelAdapter, create_app
+from ariel.app import create_app
 from ariel.persistence import SessionRecord
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.responses_helpers import (
+    FakeModelAdapter,
     drain_task,
     empty_recall_response,
     is_retriever_call,
+    last_user_message,
     post_message_and_drain,
     responses_run_message,
     responses_with_run_calls,
 )
+from ariel.model_adapter import ModelAdapter, ModelCall, ModelResponse
 
 
-@dataclass
-class SessionManagementProbeAdapter:
-    provider: str = "provider.s5-pr02"
-    model: str = "model.s5-pr02-v1"
-    context_bundles: list[dict[str, Any]] = field(default_factory=list)
-    history_lengths_by_message: dict[str, int] = field(default_factory=dict)
-    message_delays_seconds: dict[str, float] = field(default_factory=dict)
-    run_calls_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
-    _lock: threading.Lock = field(default_factory=threading.Lock)
+class SessionManagementProbeAdapter(FakeModelAdapter):
+    provider = "provider.s5-pr02"
+    model = "model.s5-pr02-v1"
 
-    def create_response(
+    def __init__(
         self,
         *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+        run_calls_by_message: dict[str, list[dict[str, Any]]] | None = None,
+        message_delays_seconds: dict[str, float] | None = None,
+    ) -> None:
+        super().__init__()
+        self.context_bundles: list[Any] = []
+        self.history_lengths_by_message: dict[str, int] = {}
+        self.message_delays_seconds: dict[str, float] = (
+            message_delays_seconds if message_delays_seconds is not None else {}
+        )
+        self.run_calls_by_message: dict[str, list[dict[str, Any]]] = (
+            run_calls_by_message if run_calls_by_message is not None else {}
+        )
+        self._lock = threading.Lock()
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        user_message = last_user_message(request.messages)
+        if is_retriever_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        assert [tool.get("name") for tool in tools] == ["run"]
+        assert [tool.name for tool in request.tools] == ["run"]
         with self._lock:
-            self.context_bundles.append(copy.deepcopy(context_bundle))
-            self.history_lengths_by_message[user_message] = len(history)
+            self.context_bundles.append(copy.deepcopy(list(request.messages)))
+            self.history_lengths_by_message[user_message] = len(request.messages)
         run_calls = self.run_calls_by_message.get(user_message)
         if isinstance(run_calls, list):
-            if any(
-                isinstance(item, dict) and item.get("type") == "function_call_output"
-                for item in input_items
-            ):
-                run_calls = [
-                    {"name": "agent.emit_message", "input": {"text": f"assistant::{user_message}"}}
-                ]
             if not run_calls:
                 run_calls = [
                     {"name": "agent.emit_message", "input": {"text": f"assistant::{user_message}"}}

@@ -9,16 +9,16 @@ from pathlib import Path
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, AsyncIterator, Literal, Protocol, assert_never
+from typing import Any, AsyncIterator, Literal, assert_never
 from urllib.parse import urlparse
 
-import httpx
 import ulid
 from fastapi import Body, FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic_ai.messages import ModelRequest, SystemPromptPart, UserPromptPart
 from sqlalchemy import (
     Engine,
     and_,
@@ -65,6 +65,7 @@ from ariel.memory import (
     append_log_event,
     run_retriever,
 )
+from ariel.model_adapter import ModelAdapter, ModelMessage, ModelTier
 from ariel.persistence import (
     ActionAttemptRecord,
     ApprovalRequestRecord,
@@ -385,177 +386,6 @@ class WeatherDefaultLocationRequest(BaseModel):
         return normalized
 
 
-class ModelAdapter(Protocol):
-    provider: str
-    model: str
-
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]: ...
-
-
-class ModelAdapterError(Exception):
-    def __init__(
-        self,
-        *,
-        safe_reason: str,
-        status_code: int,
-        code: str,
-        message: str,
-        retryable: bool,
-        provider: str | None = None,
-        model: str | None = None,
-        usage: dict[str, Any] | None = None,
-        provider_response_id: str | None = None,
-        parse_status: str | None = None,
-        validation_status: str | None = None,
-        raw_output_shape: dict[str, Any] | None = None,
-    ) -> None:
-        super().__init__(safe_reason)
-        self.safe_reason = safe_reason
-        self.status_code = status_code
-        self.code = code
-        self.message = message
-        self.retryable = retryable
-        self.provider = provider
-        self.model = model
-        self.usage = usage
-        self.provider_response_id = provider_response_id
-        self.parse_status = parse_status
-        self.validation_status = validation_status
-        self.raw_output_shape = raw_output_shape
-
-
-@dataclass(slots=True)
-class OpenAIResponsesAdapter:
-    provider: str
-    model: str
-    api_key: str | None
-    timeout_seconds: float = 30.0
-    reasoning_effort: str = "medium"
-    verbosity: str = "low"
-
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        del user_message, history, context_bundle
-        if not self.api_key:
-            raise ModelAdapterError(
-                safe_reason="model credentials are not configured",
-                status_code=503,
-                code="E_MODEL_CREDENTIALS",
-                message="model credentials are not configured",
-                retryable=False,
-            )
-
-        try:
-            response = httpx.post(
-                "https://api.openai.com/v1/responses",
-                headers={
-                    "authorization": f"Bearer {self.api_key}",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": self.model,
-                    "input": input_items,
-                    "tools": tools,
-                    "tool_choice": "auto",
-                    "parallel_tool_calls": False,
-                    "store": False,
-                    "reasoning": {"effort": self.reasoning_effort},
-                    "text": {"verbosity": self.verbosity},
-                },
-                timeout=self.timeout_seconds,
-            )
-        except httpx.TimeoutException as exc:
-            raise ModelAdapterError(
-                safe_reason="model provider request timed out",
-                status_code=502,
-                code="E_MODEL_FAILURE",
-                message="model provider request failed",
-                retryable=True,
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise ModelAdapterError(
-                safe_reason="model provider network request failed",
-                status_code=502,
-                code="E_MODEL_FAILURE",
-                message="model provider request failed",
-                retryable=True,
-            ) from exc
-
-        if response.status_code in {401, 403}:
-            raise ModelAdapterError(
-                safe_reason="model credentials were rejected by provider",
-                status_code=502,
-                code="E_MODEL_CREDENTIALS",
-                message="model credentials were rejected by provider",
-                retryable=False,
-            )
-
-        if response.status_code >= 400:
-            raise ModelAdapterError(
-                safe_reason=f"model provider returned HTTP {response.status_code}",
-                status_code=502,
-                code="E_MODEL_FAILURE",
-                message="model provider request failed",
-                retryable=True,
-            )
-
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise ModelAdapterError(
-                safe_reason="model provider returned invalid JSON",
-                status_code=502,
-                code="E_MODEL_FAILURE",
-                message="model provider request failed",
-                retryable=True,
-            ) from exc
-
-        # Narrow OpenAI's usage shape: flat trio + cached/reasoning lifted from nested details.
-        raw_usage = payload.get("usage")
-        usage: dict[str, int] | None = None
-        if isinstance(raw_usage, dict):
-            normalized: dict[str, int] = {}
-            for key in ("input_tokens", "output_tokens", "total_tokens"):
-                value = raw_usage.get(key)
-                if isinstance(value, int):
-                    normalized[key] = value
-            input_details = raw_usage.get("input_tokens_details")
-            if isinstance(input_details, dict):
-                cached = input_details.get("cached_tokens")
-                if isinstance(cached, int):
-                    normalized["cached_tokens"] = cached
-            output_details = raw_usage.get("output_tokens_details")
-            if isinstance(output_details, dict):
-                reasoning = output_details.get("reasoning_tokens")
-                if isinstance(reasoning, int):
-                    normalized["reasoning_tokens"] = reasoning
-            usage = normalized or None
-        provider_response_id = payload.get("id")
-
-        return {
-            "output": payload.get("output"),
-            "provider": self.provider,
-            "model": self.model,
-            "usage": usage,
-            "provider_response_id": provider_response_id,
-        }
-
-
 def _render_recall_v1(recall: dict[str, Any]) -> str:
     """Render a ``recall_v1`` dict as a compact system-message block."""
     lines: list[str] = ["memory recall:"]
@@ -582,24 +412,33 @@ def _render_recall_v1(recall: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _build_responses_input_items(
+def _build_initial_messages(
     *,
     context_bundle: dict[str, Any],
     user_message: str,
-) -> list[dict[str, Any]]:
-    input_items: list[dict[str, Any]] = []
+) -> list[ModelMessage]:
+    """Render the pre-loop conversation as a list of pydantic-ai messages.
+
+    One ``ModelRequest`` carries the full system-prompt context (each system
+    block as its own ``SystemPromptPart``) followed by the user turn as a
+    ``UserPromptPart``. This is the stable prefix the agent loop never evicts.
+    """
+    system_parts: list[SystemPromptPart] = []
+
+    def push_system(content: str) -> None:
+        system_parts.append(SystemPromptPart(content=content))
 
     # 1. Policy system instructions
     policy_system_instructions = context_bundle.get("policy_system_instructions")
     if isinstance(policy_system_instructions, list):
         for instruction in policy_system_instructions:
             if isinstance(instruction, str) and instruction:
-                input_items.append({"role": "system", "content": instruction})
+                push_system(instruction)
 
     # 2. Discord context (when present)
     discord_context_text = _discord_context_text(context_bundle.get("discord_context"))
     if discord_context_text is not None:
-        input_items.append({"role": "system", "content": discord_context_text})
+        push_system(discord_context_text)
 
     # 3. Eligible callables list
     eligible_callables = context_bundle.get("eligible_internal_callables")
@@ -610,32 +449,24 @@ def _build_responses_input_items(
             if isinstance(callable_name, str) and callable_name
         ]
         if callable_lines:
-            input_items.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "syscall callables your run program may call this turn "
-                        "(each is namespace.member(...) and returns its result; "
-                        "agent.emit_message, agent.emit_value, and "
-                        "agent.pause_until_input are always available):\n"
-                    )
-                    + "\n".join(callable_lines),
-                }
+            push_system(
+                "syscall callables your run program may call this turn "
+                "(each is namespace.member(...) and returns its result; "
+                "agent.emit_message, agent.emit_value, and "
+                "agent.pause_until_input are always available):\n"
+                + "\n".join(callable_lines)
             )
 
     # 4. Tool surface facts
     tool_surface_facts = context_bundle.get("tool_surface_facts")
     if isinstance(tool_surface_facts, dict):
-        input_items.append(
-            {
-                "role": "system",
-                "content": "runtime facts:\n"
-                + json.dumps(
-                    jsonable_encoder(tool_surface_facts),
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-            }
+        push_system(
+            "runtime facts:\n"
+            + json.dumps(
+                jsonable_encoder(tool_surface_facts),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
         )
 
     # 6. Turn-id reference block for write authority
@@ -646,19 +477,14 @@ def _build_responses_input_items(
         if isinstance(current_turn_id, str) and current_turn_id:
             turn_ref_lines.append(f"- current user instruction: turn:{current_turn_id}")
     if turn_ref_lines:
-        input_items.append(
-            {
-                "role": "system",
-                "content": "turn-id context for write authority:\n" + "\n".join(turn_ref_lines),
-            }
-        )
+        push_system("turn-id context for write authority:\n" + "\n".join(turn_ref_lines))
 
     # recall_v1 reconstruction — the retriever's working-context reconstruction
     recall_v1 = context_bundle.get("recall_v1")
     if isinstance(recall_v1, dict):
         rendered = _render_recall_v1(recall_v1)
         if rendered:
-            input_items.append({"role": "system", "content": rendered})
+            push_system(rendered)
 
     # 10. Open jobs
     open_commitments_and_jobs = context_bundle.get("open_commitments_and_jobs")
@@ -675,12 +501,7 @@ def _build_responses_input_items(
                 if isinstance(job_id, str) and isinstance(status, str) and isinstance(title, str):
                     job_lines.append(f"- {job_id}: {status}: {title}")
             if job_lines:
-                input_items.append(
-                    {
-                        "role": "system",
-                        "content": "open jobs:\n" + "\n".join(job_lines),
-                    }
-                )
+                push_system("open jobs:\n" + "\n".join(job_lines))
 
     # 11. Recent artifacts
     relevant_artifacts_and_observations = context_bundle.get("relevant_artifacts_and_observations")
@@ -696,16 +517,10 @@ def _build_responses_input_items(
                 if isinstance(title, str) and isinstance(source, str):
                     artifact_lines.append(f"- {title} ({source})")
             if artifact_lines:
-                input_items.append(
-                    {
-                        "role": "system",
-                        "content": "recent artifacts:\n" + "\n".join(artifact_lines),
-                    }
-                )
+                push_system("recent artifacts:\n" + "\n".join(artifact_lines))
 
-    # 13. Current user message
-    input_items.append({"role": "user", "content": user_message})
-    return input_items
+    parts: list[Any] = [*system_parts, UserPromptPart(content=user_message)]
+    return [ModelRequest(parts=parts)]
 
 
 def _discord_context_text(raw_context: Any) -> str | None:
@@ -817,17 +632,6 @@ def _build_turn_limit_error(
             "applied_limits": applied_limits,
         },
         retryable=False,
-    )
-
-
-def _build_default_model_adapter(settings: AppSettings) -> ModelAdapter:
-    return OpenAIResponsesAdapter(
-        provider="provider.openai.responses",
-        model=settings.model_name,
-        api_key=settings.openai_api_key,
-        timeout_seconds=settings.model_timeout_seconds,
-        reasoning_effort=settings.model_reasoning_effort,
-        verbosity=settings.model_verbosity,
     )
 
 
@@ -1938,7 +1742,7 @@ def build_runtime(
 ) -> tuple[Runtime, Engine]:
     settings = AppSettings()
     db_url = database_url or settings.database_url
-    adapter = model_adapter or _build_default_model_adapter(settings)
+    adapter = model_adapter or ModelAdapter(settings)
 
     engine = create_engine(
         db_url,
@@ -2274,8 +2078,8 @@ def _wake(
         if callable_name is not None:
             eligible_internal_callables.append(callable_name)
     context_bundle["eligible_internal_callables"] = sorted(eligible_internal_callables)
-    responses_tools = run_tool_definitions()
-    responses_input_items = _build_responses_input_items(
+    main_loop_tools = run_tool_definitions()
+    initial_messages = _build_initial_messages(
         context_bundle=context_bundle,
         user_message=user_message,
     )
@@ -2329,11 +2133,8 @@ def _wake(
         turn=turn,
         settings=runtime.settings,
         model_adapter=runtime.model_adapter,
-        responses_input_items=responses_input_items,
-        tools=responses_tools,
-        user_message=user_message,
-        history=[],
-        context_bundle=context_bundle,
+        messages=initial_messages,
+        tools=main_loop_tools,
         allowed_capability_ids=frozenset(allowed_capability_ids),
         scratch=scratch,
         proposal_index_start=0,
@@ -2356,9 +2157,10 @@ def _wake(
     assistant_sources = _turn_retrieval_sources(db=db, turn_id=turn.id)
 
     # Map loop outcome to the post-loop variables.
+    main_binding = runtime.model_adapter.tier_binding(ModelTier.MAIN)
     exhausted_response: dict[str, Any] = {
-        "provider": runtime.model_adapter.provider,
-        "model": runtime.model_adapter.model,
+        "provider": main_binding.provider,
+        "model": main_binding.model,
         "assistant_text": "I wasn't able to finish that within the time available.",
         "assistant_silent": False,
     }

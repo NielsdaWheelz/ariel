@@ -26,7 +26,7 @@ from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import ToolDefinition
 
 from .config import AppSettings
-from .model_tiers import ModelTier, TierBinding, resolve_tier
+from .model_tiers import ModelTier as ModelTier, TierBinding, resolve_tier
 from .response_contracts import ResponseContractViolation
 
 
@@ -158,6 +158,14 @@ class ModelAdapter:
         raise ValueError(
             f"EMBEDDING tier provider {binding.provider!r} not yet supported; only openai"
         )
+
+    def tier_binding(self, tier: ModelTier) -> TierBinding:
+        """Return the resolved ``TierBinding`` for ``tier``.
+
+        Callers use this to source ``provider``/``model`` for telemetry events
+        emitted *before* the response is in hand (e.g. ``evt.model.started``).
+        """
+        return self._tiers[tier]
 
     # Test-injection seam: substitute a substrate model under unit test.
     def _override_model(self, tier: ModelTier, model: Model) -> None:

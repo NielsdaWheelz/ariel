@@ -21,7 +21,6 @@ worker pattern).
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -43,10 +42,12 @@ from ariel.research_runtime import ResearchFinding, render_finding
 from ariel.worker import _agent_wake_context, process_one_task
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.responses_helpers import (
+    FakeModelAdapter,
     empty_recall_response,
     is_retriever_call,
     run_function_calls,
 )
+from ariel.model_adapter import ModelCall, ModelResponse
 
 NOW = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
 
@@ -250,50 +251,37 @@ _FINDING_PROGRAM = (
 )
 
 
-@dataclass
-class _ResearchRunAdapter:
+class _ResearchRunAdapter(FakeModelAdapter):
     """A model adapter whose single ``run`` program calls ``research.finding``.
 
     Records the ``input_items`` of every call so a test can assert what the
     research loop and the completion wake placed in the model's context."""
 
-    provider: str = "provider.research"
-    model: str = "model.research-v1"
-    snapshots: list[list[dict[str, Any]]] = field(default_factory=list)
-    program_source: str = _FINDING_PROGRAM
+    provider = "provider.research"
+    model = "model.research-v1"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+    def __init__(self) -> None:
+        super().__init__()
+        self.snapshots: list[list[Any]] = []
+        self.program_source = _FINDING_PROGRAM
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_retriever_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del tools, user_message, history, context_bundle
-        self.snapshots.append(list(input_items))
+        self.snapshots.append(list(request.messages))
         call_index = len(self.snapshots)
-        return {
-            "provider": self.provider,
-            "model": self.model,
-            "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
-            "provider_response_id": f"resp_research_{call_index}",
-            "output": [
-                {
-                    "type": "function_call",
-                    "id": f"fc_research_{call_index}",
-                    "call_id": f"call_research_{call_index}",
-                    "name": "run",
-                    "arguments": json.dumps({"source": self.program_source}, sort_keys=True),
-                    "status": "completed",
-                }
-            ],
-        }
+        from tests.integration.responses_helpers import run_response  # noqa: PLC0415
+
+        return run_response(
+            source=self.program_source,
+            provider=self.provider,
+            model=self.model,
+            provider_response_id=f"resp_research_{call_index}",
+            input_tokens=3,
+            output_tokens=2,
+        )
 
 
 def test_worker_research_run_arm_runs_research_and_enqueues_completion_wake(
@@ -521,46 +509,33 @@ def test_worker_completion_wake_renders_finding_into_main_agent_context(
     _stub_memory_retriever(monkeypatch)
     monkeypatch.setattr("ariel.worker._utcnow", lambda: NOW)
 
-    @dataclass
-    class _MainAgentAdapter:
+    class _MainAgentAdapter(FakeModelAdapter):
         """The main agent: emits a message; records its context items."""
 
-        provider: str = "provider.main"
-        model: str = "model.main-v1"
-        snapshots: list[list[dict[str, Any]]] = field(default_factory=list)
+        provider = "provider.main"
+        model = "model.main-v1"
 
-        def create_response(
-            self,
-            *,
-            input_items: list[dict[str, Any]],
-            tools: list[dict[str, Any]],
-            user_message: str,
-            history: list[dict[str, Any]],
-            context_bundle: dict[str, Any],
-        ) -> dict[str, Any]:
-            if is_retriever_call(input_items):
+        def __init__(self) -> None:
+            super().__init__()
+            self.snapshots: list[list[Any]] = []
+
+        def _respond(self, request: ModelCall) -> ModelResponse:
+            if is_retriever_call(request.messages):
                 return empty_recall_response(
-                    provider=self.provider, model=self.model, input_items=input_items
+                    provider=self.provider, model=self.model, messages=request.messages
                 )
-            del tools, user_message, history, context_bundle
-            self.snapshots.append(list(input_items))
+            self.snapshots.append(list(request.messages))
             source = "agent.emit_message(text='Here is what the research found.')\n"
-            return {
-                "provider": self.provider,
-                "model": self.model,
-                "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
-                "provider_response_id": f"resp_main_{len(self.snapshots)}",
-                "output": [
-                    {
-                        "type": "function_call",
-                        "id": "fc_main",
-                        "call_id": "call_main",
-                        "name": "run",
-                        "arguments": json.dumps({"source": source}, sort_keys=True),
-                        "status": "completed",
-                    }
-                ],
-            }
+            from tests.integration.responses_helpers import run_response  # noqa: PLC0415
+
+            return run_response(
+                source=source,
+                provider=self.provider,
+                model=self.model,
+                provider_response_id=f"resp_main_{len(self.snapshots)}",
+                input_tokens=3,
+                output_tokens=2,
+            )
 
     adapter = _MainAgentAdapter()
     app = create_app(

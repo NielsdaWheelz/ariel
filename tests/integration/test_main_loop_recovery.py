@@ -16,8 +16,6 @@ These exercise three new behaviours layered on top of ``run_agent_loop``:
 
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
@@ -26,31 +24,22 @@ from fastapi.testclient import TestClient
 from ariel.app import create_app
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.responses_helpers import (
+    FakeModelAdapter,
     empty_recall_response,
     is_retriever_call,
     post_message_and_drain,
     responses_message,
 )
+from ariel.model_adapter import ModelCall, ModelResponse
 
 
-def _run_response(source: str, *, provider: str, model: str, rid: str) -> dict[str, Any]:
-    """Wrap a raw run-program source as a Responses-API function_call payload."""
-    return {
-        "provider": provider,
-        "model": model,
-        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-        "provider_response_id": rid,
-        "output": [
-            {
-                "type": "function_call",
-                "id": f"fc_{rid}",
-                "call_id": f"call_{rid}",
-                "name": "run",
-                "arguments": json.dumps({"source": source}, sort_keys=True),
-                "status": "completed",
-            }
-        ],
-    }
+def _run_response(source: str, *, provider: str, model: str, rid: str) -> ModelResponse:
+    """Wrap a raw run-program source as a ``run`` tool-call ``ModelResponse``."""
+    from tests.integration.responses_helpers import run_response  # noqa: PLC0415
+
+    return run_response(
+        source=source, provider=provider, model=model, provider_response_id=rid
+    )
 
 
 _EMIT_FINDING_MAIN_ERROR = (
@@ -78,31 +67,24 @@ def _build_client(postgres_url: str, adapter: Any) -> TestClient:
 # ===========================================================================
 
 
-@dataclass
-class _FindingThenMessageAdapter:
+class _FindingThenMessageAdapter(FakeModelAdapter):
     """Round 1: invalid emit_finding (main-loop). Round 2: valid emit_message."""
 
-    provider: str = "provider.recovery"
-    model: str = "model.recovery-v1"
-    main_call_count: int = 0
-    last_input_items: list[list[dict[str, Any]]] = field(default_factory=list)
+    provider = "provider.recovery"
+    model = "model.recovery-v1"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+    def __init__(self) -> None:
+        super().__init__()
+        self.main_call_count: int = 0
+        self.last_messages: list[list[Any]] = []
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_retriever_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del tools, user_message, history, context_bundle
         self.main_call_count += 1
-        self.last_input_items.append(list(input_items))
+        self.last_messages.append(list(request.messages))
         if self.main_call_count == 1:
             return _run_response(
                 _INVALID_FINDING_SOURCE,
@@ -146,11 +128,18 @@ def test_main_loop_emit_finding_misuse_recovers_with_typed_nudge(
 
         # The second model call sees the specialised typed nudge, not the
         # generic program-failure nudge.
-        recovery_items = adapter.last_input_items[1]
+        from pydantic_ai.messages import ModelRequest, SystemPromptPart
+
+        recovery_messages = adapter.last_messages[1]
+        system_contents = [
+            part.content
+            for message in recovery_messages
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+            if isinstance(part, SystemPromptPart)
+        ]
         nudge_seen = any(
-            isinstance(item.get("content"), str)
-            and "is not available in this loop" in item["content"]
-            for item in recovery_items
+            "is not available in this loop" in content for content in system_contents
         )
         assert nudge_seen
 
@@ -168,28 +157,21 @@ _WHITESPACE_VARIANTS = (
 )
 
 
-@dataclass
-class _WhitespaceVariantFindingAdapter:
+class _WhitespaceVariantFindingAdapter(FakeModelAdapter):
     """Returns whitespace-different but semantically identical emit_finding calls."""
 
-    provider: str = "provider.stuck-semantic"
-    model: str = "model.stuck-semantic-v1"
-    main_call_count: int = 0
+    provider = "provider.stuck-semantic"
+    model = "model.stuck-semantic-v1"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+    def __init__(self) -> None:
+        super().__init__()
+        self.main_call_count = 0
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_retriever_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del tools, user_message, history, context_bundle, input_items
         index = self.main_call_count
         self.main_call_count += 1
         # Beyond the prepared variants, keep returning the last one so the
@@ -248,37 +230,30 @@ def test_main_loop_semantic_stuck_rail_halts_on_repeated_program_errors(
 # ===========================================================================
 
 
-@dataclass
-class _BudgetExhaustedSummaryAdapter:
+class _BudgetExhaustedSummaryAdapter(FakeModelAdapter):
     """Round 1: invalid emit_finding. Round 2 (constrained, tools=[]): plain text."""
 
-    provider: str = "provider.summary"
-    model: str = "model.summary-v1"
-    final_summary_text: str = (
+    provider = "provider.summary"
+    model = "model.summary-v1"
+    final_summary_text = (
         "I started looking up your calendar but ran out of time before producing an answer."
     )
-    main_call_count: int = 0
-    constrained_tools_snapshot: list[list[dict[str, Any]]] = field(default_factory=list)
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+    def __init__(self) -> None:
+        super().__init__()
+        self.main_call_count: int = 0
+        self.constrained_tools_snapshot: list[list[Any]] = []
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_retriever_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del user_message, history, context_bundle
         self.main_call_count += 1
         # The constrained final-summary call carries tools=[]. Return a
         # plain message response, which becomes the assistant message.
-        if tools == []:
-            self.constrained_tools_snapshot.append(list(input_items))
+        if request.tools == []:
+            self.constrained_tools_snapshot.append(list(request.messages))
             return responses_message(
                 assistant_text=self.final_summary_text,
                 provider=self.provider,
@@ -327,31 +302,24 @@ def test_main_loop_budget_exhaustion_invokes_model_summary(
         assert len(adapter.constrained_tools_snapshot) == 1
 
 
-@dataclass
-class _BudgetExhaustedEmptySummaryAdapter:
+class _BudgetExhaustedEmptySummaryAdapter(FakeModelAdapter):
     """Constrained call returns empty/garbage; the canned line is emitted."""
 
-    provider: str = "provider.empty-summary"
-    model: str = "model.empty-summary-v1"
-    main_call_count: int = 0
-    constrained_calls: int = 0
+    provider = "provider.empty-summary"
+    model = "model.empty-summary-v1"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+    def __init__(self) -> None:
+        super().__init__()
+        self.main_call_count = 0
+        self.constrained_calls = 0
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_retriever_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del user_message, history, context_bundle, input_items
         self.main_call_count += 1
-        if tools == []:
+        if request.tools == []:
             self.constrained_calls += 1
             return responses_message(
                 assistant_text="",

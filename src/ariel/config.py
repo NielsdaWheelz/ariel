@@ -3,7 +3,7 @@ from __future__ import annotations
 from ipaddress import ip_address
 from pathlib import Path
 import re
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from pydantic import field_validator, model_validator
@@ -52,7 +52,7 @@ class AppSettings(BaseSettings):
     model_tier_vision: str | None = None
     model_tier_embedding: str | None = None
     model_timeout_seconds: float = 30.0
-    model_reasoning_effort: str = "medium"
+    model_reasoning_effort: Literal["minimal", "low", "medium", "high"] = "medium"
     model_verbosity: str = "low"
     memory_embedding_provider: str = "openai"
     memory_embedding_model: str = "text-embedding-3-small"
@@ -307,13 +307,19 @@ class AppSettings(BaseSettings):
             )
         return self
 
-    @field_validator("model_reasoning_effort")
+    @field_validator("model_reasoning_effort", mode="before")
     @classmethod
-    def _model_reasoning_effort_must_be_supported(cls, value: str) -> str:
+    def _model_reasoning_effort_normalized(
+        cls, value: Any
+    ) -> Literal["minimal", "low", "medium", "high"]:
+        # Pydantic validates the Literal after this hook returns; we just
+        # normalize whitespace + case so common env-var typos still resolve.
+        if not isinstance(value, str):
+            raise ValueError("model_reasoning_effort must be a string")
         normalized = value.strip().lower()
         if normalized not in {"minimal", "low", "medium", "high"}:
             raise ValueError("model_reasoning_effort must be one of: minimal, low, medium, high")
-        return normalized
+        return normalized  # type: ignore[return-value]  # justify-narrowed-by-set-check
 
     @field_validator("model_verbosity")
     @classmethod

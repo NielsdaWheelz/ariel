@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import json
 from typing import Any
 
+from fastapi.encoders import jsonable_encoder
 from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import create_engine, select
@@ -11,7 +11,7 @@ from sqlalchemy.orm import sessionmaker
 
 import ariel.run_runtime as run_runtime_module
 from ariel.action_runtime import RuntimeProvenance
-from ariel.app import ModelAdapter, create_app
+from ariel.app import create_app
 from ariel.persistence import (
     ActionAttemptRecord,
     AIJudgmentRecord,
@@ -22,6 +22,7 @@ from ariel.policy_engine import evaluate_proposal
 from ariel.prompts import MAIN_AGENT_PROMPT_VERSION, MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.responses_helpers import (
+    FakeModelAdapter,
     empty_recall_response,
     is_retriever_call,
     post_message_and_drain,
@@ -29,6 +30,7 @@ from tests.integration.responses_helpers import (
     responses_run_message,
     responses_with_run_calls,
 )
+from ariel.model_adapter import ModelAdapter, ModelCall, ModelResponse, ModelTier
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
@@ -61,25 +63,18 @@ def _program_response(
     provider: str,
     model: str,
     provider_response_id: str,
-) -> dict[str, Any]:
+) -> ModelResponse:
     """A model response whose single ``run`` call carries a Python program."""
+    from tests.integration.responses_helpers import run_response  # noqa: PLC0415
 
-    return {
-        "provider": provider,
-        "model": model,
-        "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
-        "provider_response_id": provider_response_id,
-        "output": [
-            {
-                "type": "function_call",
-                "id": "fc_run_test",
-                "call_id": "call_run_test",
-                "name": "run",
-                "arguments": json.dumps({"source": source}, sort_keys=True),
-                "status": "completed",
-            }
-        ],
-    }
+    return run_response(
+        source=source,
+        provider=provider,
+        model=model,
+        provider_response_id=provider_response_id,
+        input_tokens=3,
+        output_tokens=2,
+    )
 
 
 def _direct_function_response(
@@ -88,40 +83,54 @@ def _direct_function_response(
     provider: str,
     model: str,
     provider_response_id: str,
-) -> dict[str, Any]:
-    return {
-        "provider": provider,
-        "model": model,
-        "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
-        "provider_response_id": provider_response_id,
-        "output": function_calls,
-    }
+) -> ModelResponse:
+    """A response carrying arbitrary tool calls (used to test protocol failure paths)."""
+    from ariel.model_adapter import TokenUsage, ToolCall  # noqa: PLC0415
+
+    tool_calls = [
+        ToolCall(
+            call_id=str(call.get("call_id", "call_test")),
+            name=str(call.get("name", "unknown")),
+            arguments=(
+                json.loads(call["arguments"])
+                if isinstance(call.get("arguments"), str)
+                else dict(call.get("arguments", {}))
+            ),
+        )
+        for call in function_calls
+        if isinstance(call, dict) and call.get("type") == "function_call"
+    ]
+    return ModelResponse(
+        text=None,
+        tool_calls=tool_calls,
+        structured_output=None,
+        reasoning_summary=None,
+        usage=TokenUsage(input_tokens=3, output_tokens=2),
+        provider=provider,
+        model=model,
+        tier=ModelTier.MAIN,
+        duration_ms=1,
+        provider_response_id=provider_response_id,
+    )
 
 
-@dataclass
-class CapturingRunAdapter:
-    provider: str = "provider.single-run"
-    model: str = "model.single-run-v1"
-    responses: list[dict[str, Any]] = field(default_factory=list)
-    tools_seen: list[list[dict[str, Any]]] = field(default_factory=list)
-    input_items_seen: list[list[dict[str, Any]]] = field(default_factory=list)
+class CapturingRunAdapter(FakeModelAdapter):
+    provider = "provider.single-run"
+    model = "model.single-run-v1"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+    def __init__(self, *, responses: list[ModelResponse] | None = None) -> None:
+        super().__init__()
+        self.responses: list[ModelResponse] = responses if responses is not None else []
+        self.tools_seen: list[list[Any]] = []
+        self.input_items_seen: list[list[Any]] = []
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_retriever_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del user_message, history, context_bundle
-        self.tools_seen.append(tools)
-        self.input_items_seen.append(input_items)
+        self.tools_seen.append(list(request.tools))
+        self.input_items_seen.append(list(request.messages))
         return self.responses.pop(0)
 
 
@@ -142,9 +151,8 @@ def test_normal_turn_exposes_only_strict_run_tool(postgres_url: str) -> None:
 
     assert turn.assistant_message == "done"
     assert len(adapter.tools_seen) == 1
-    assert [tool["name"] for tool in adapter.tools_seen[0]] == ["run"]
-    assert adapter.tools_seen[0][0]["strict"] is True
-    rendered_input = json.dumps(adapter.input_items_seen[0])
+    assert [tool.name for tool in adapter.tools_seen[0]] == ["run"]
+    rendered_input = json.dumps(jsonable_encoder(adapter.input_items_seen[0]))
     # The run tool's source is described to the model as a Python program.
     assert "Python program" in rendered_input or "run program" in rendered_input
     assert "memory.recall" in rendered_input
@@ -172,16 +180,38 @@ def test_main_agent_prompt_is_static_prefix_before_dynamic_context(postgres_url:
         session_id = _session_id(client)
         post_message_and_drain(client, session_id, message="hello")
 
+    from pydantic_ai.messages import ModelRequest, SystemPromptPart, UserPromptPart
+
     input_items = adapter.input_items_seen[0]
+    # The initial ModelRequest holds the system-prompt prefix and the user
+    # turn; subsequent messages may be appended by the loop (e.g. the budget
+    # signal). The stable prefix is the first ModelRequest.
+    initial = input_items[0]
+    assert isinstance(initial, ModelRequest)
+    system_parts = [p for p in initial.parts if isinstance(p, SystemPromptPart)]
+    user_parts = [p for p in initial.parts if isinstance(p, UserPromptPart)]
     static_count = len(MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS)
-    assert [item["content"] for item in input_items[:static_count]] == list(
+    assert [p.content for p in system_parts[:static_count]] == list(
         MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS
     )
-    assert input_items[-2] == {"role": "user", "content": "hello"}
-    assert input_items[-1]["role"] == "system"
-    assert str(input_items[-1]["content"]).startswith("remaining budget:")
+    assert len(user_parts) == 1
+    assert user_parts[0].content == "hello"
 
-    dynamic_tail = json.dumps(input_items[static_count:-1], sort_keys=True)
+    # The budget signal lives in a separate ModelRequest the loop appends.
+    budget_messages = [
+        msg
+        for msg in input_items[1:]
+        if isinstance(msg, ModelRequest)
+        and any(
+            isinstance(p, SystemPromptPart) and p.content.startswith("remaining budget:")
+            for p in msg.parts
+        )
+    ]
+    assert budget_messages, "expected the loop's remaining-budget system message"
+
+    dynamic_tail = json.dumps(
+        [p.content for p in system_parts[static_count:]], sort_keys=True
+    )
     assert "syscall callables your run program may call this turn" in dynamic_tail
     assert "runtime facts:" in dynamic_tail
 
@@ -288,7 +318,7 @@ def test_plain_assistant_text_is_protocol_feedback_not_visible(postgres_url: str
     ],
 )
 def test_invalid_direct_tool_protocol_retries_without_executing(
-    postgres_url: str, first_response: dict[str, Any]
+    postgres_url: str, first_response: ModelResponse
 ) -> None:
     adapter = CapturingRunAdapter(
         responses=[
@@ -426,11 +456,15 @@ def test_emit_value_is_internal_feedback_with_digest_surface(postgres_url: str) 
     assert "value" not in value_events[0]["payload"]
     assert len(value_events[0]["payload"]["value_digest"]) == 64
     assert value_events[0]["payload"]["value_bytes"] > 0
-    value_feedback = [
-        json.loads(item["output"])
-        for item in adapter.input_items_seen[-1]
-        if item.get("type") == "function_call_output"
-    ]
+    from pydantic_ai.messages import ModelRequest, ToolReturnPart
+
+    value_feedback: list[dict[str, Any]] = []
+    for message in adapter.input_items_seen[-1]:
+        if not isinstance(message, ModelRequest):
+            continue
+        for part in message.parts:
+            if isinstance(part, ToolReturnPart) and isinstance(part.content, str):
+                value_feedback.append(json.loads(part.content))
     assert value_feedback[0]["emitted_values"] == [{"answer": 42}]
 
 
@@ -442,30 +476,23 @@ def test_emit_value_eviction_discards_prior_round(postgres_url: str) -> None:
     second round's emitted value should remain in context.
     """
 
-    @dataclass
-    class SnapshotAdapter:
-        """Captures a shallow copy of input_items on each call."""
+    class SnapshotAdapter(FakeModelAdapter):
+        """Captures a shallow copy of the request messages on each call."""
 
-        provider: str = "provider.eviction"
-        model: str = "model.eviction-v1"
-        responses: list[dict[str, Any]] = field(default_factory=list)
-        snapshots: list[list[dict[str, Any]]] = field(default_factory=list)
+        provider = "provider.eviction"
+        model = "model.eviction-v1"
 
-        def create_response(
-            self,
-            *,
-            input_items: list[dict[str, Any]],
-            tools: list[dict[str, Any]],
-            user_message: str,
-            history: list[dict[str, Any]],
-            context_bundle: dict[str, Any],
-        ) -> dict[str, Any]:
-            if is_retriever_call(input_items):
+        def __init__(self, *, responses: list[ModelResponse] | None = None) -> None:
+            super().__init__()
+            self.responses: list[ModelResponse] = responses if responses is not None else []
+            self.snapshots: list[list[Any]] = []
+
+        def _respond(self, request: ModelCall) -> ModelResponse:
+            if is_retriever_call(request.messages):
                 return empty_recall_response(
-                    provider=self.provider, model=self.model, input_items=input_items
+                    provider=self.provider, model=self.model, messages=request.messages
                 )
-            del tools, user_message, history, context_bundle
-            self.snapshots.append(list(input_items))
+            self.snapshots.append(list(request.messages))
             return self.responses.pop(0)
 
     adapter = SnapshotAdapter(

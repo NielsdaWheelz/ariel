@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import json
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any, cast
@@ -15,72 +14,44 @@ from sqlalchemy import select
 import ariel.action_runtime as action_runtime_module
 import ariel.capability_registry as capability_registry_module
 import ariel.policy_engine as policy_engine_module
-from ariel.app import ModelAdapter, create_app
+from ariel.app import create_app
 from tests.integration.responses_helpers import (
+    FakeModelAdapter,
     empty_recall_response,
     is_retriever_call,
+    last_user_message,
     post_message_and_drain,
-    responses_message,
     responses_with_run_calls,
 )
+from ariel.model_adapter import ModelAdapter, ModelCall, ModelResponse
 from ariel.capability_registry import CapabilityDefinition
 from ariel.persistence import ArtifactRecord
 from tests.fake_sandbox import FakeSandboxRuntime
 
 
-@dataclass
-class ActionProposalAdapter:
-    provider: str = "provider.s6-pr02"
-    model: str = "model.s6-pr02-v1"
-    run_calls_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
-    assistant_text_by_message: dict[str, str] = field(default_factory=dict)
+class ActionProposalAdapter(FakeModelAdapter):
+    provider = "provider.s6-pr02"
+    model = "model.s6-pr02-v1"
 
-    def create_response(
+    def __init__(
         self,
         *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+        run_calls_by_message: dict[str, list[dict[str, Any]]] | None = None,
+        assistant_text_by_message: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__()
+        self.run_calls_by_message: dict[str, list[dict[str, Any]]] = (
+            run_calls_by_message if run_calls_by_message is not None else {}
+        )
+        self.assistant_text_by_message: dict[str, str] = (
+            assistant_text_by_message if assistant_text_by_message is not None else {}
+        )
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        user_message = last_user_message(request.messages)
+        if is_retriever_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
-            )
-        del tools, history
-        if context_bundle.get("origin") == "tool_result_interpretation":
-            interpreter_input = context_bundle.get("tool_result_interpreter_input")
-            if not isinstance(interpreter_input, dict):
-                interpreter_input = {}
-            audited_outputs = interpreter_input.get("audited_tool_outputs")
-            selected_output_refs = []
-            if isinstance(audited_outputs, list):
-                selected_output_refs = [
-                    output["output_ref"]
-                    for output in audited_outputs
-                    if isinstance(output, dict) and isinstance(output.get("output_ref"), str)
-                ]
-            return responses_message(
-                assistant_text=json.dumps(
-                    {
-                        "findings": ["maps evidence inspected"],
-                        "contradictions": [],
-                        "uncertainty": [],
-                        "selected_output_refs": selected_output_refs,
-                        "omitted_output_refs": [],
-                        "citation_refs": interpreter_input.get("citation_refs", []),
-                        "artifact_refs": interpreter_input.get("artifact_refs", []),
-                        "recommended_next_evidence": [],
-                        "confidence": 0.9,
-                    },
-                    sort_keys=True,
-                ),
-                provider=self.provider,
-                model=self.model,
-                provider_response_id="resp_s6_pr02_interpreter",
-                input_tokens=41,
-                output_tokens=26,
+                provider=self.provider, model=self.model, messages=request.messages
             )
         run_calls = copy.deepcopy(self.run_calls_by_message.get(user_message, []))
         assistant_text = self.assistant_text_by_message.get(
@@ -94,11 +65,6 @@ class ActionProposalAdapter:
                 "mixed retrieval": "Route and construction updates are available [1][2].",
             }.get(user_message, f"assistant::{user_message}"),
         )
-        if any(
-            isinstance(item, dict) and item.get("type") == "function_call_output"
-            for item in input_items
-        ):
-            run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
         if not run_calls:
             run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
         return responses_with_run_calls(

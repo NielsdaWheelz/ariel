@@ -39,7 +39,8 @@ from ariel.google_connector import (
 from ariel.persistence import SessionRecord, TurnRecord
 from ariel.research_runtime import ResearchFinding, run_research
 from tests.fake_sandbox import FakeSandboxRuntime
-from tests.integration.responses_helpers import empty_recall_response, is_retriever_call
+from tests.integration.responses_helpers import FakeModelAdapter, empty_recall_response, is_retriever_call
+from ariel.model_adapter import ModelCall, ModelResponse
 
 NOW = datetime(2026, 5, 20, 10, 0, tzinfo=UTC)
 
@@ -62,51 +63,38 @@ def _settings(**overrides: Any) -> AppSettings:
     return cast(AppSettings, cast(Any, AppSettings)(_env_file=None, **overrides))
 
 
-def _program_response(*, source: str, provider_response_id: str) -> dict[str, Any]:
+def _program_response(*, source: str, provider_response_id: str) -> ModelResponse:
     """A model response whose single ``run`` call carries a Python program."""
 
-    return {
-        "provider": "provider.research",
-        "model": "model.research-v1",
-        "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
-        "provider_response_id": provider_response_id,
-        "output": [
-            {
-                "type": "function_call",
-                "id": f"fc_{provider_response_id}",
-                "call_id": f"call_{provider_response_id}",
-                "name": "run",
-                "arguments": json.dumps({"source": source}, sort_keys=True),
-                "status": "completed",
-            }
-        ],
-    }
+    from tests.integration.responses_helpers import run_response  # noqa: PLC0415
+
+    return run_response(
+        source=source,
+        provider="provider.research",
+        model="model.research-v1",
+        provider_response_id=provider_response_id,
+        input_tokens=3,
+        output_tokens=2,
+    )
 
 
-@dataclass
-class SnapshotAdapter:
+class SnapshotAdapter(FakeModelAdapter):
     """Fake adapter: returns queued responses and snapshots each call's input."""
 
-    provider: str = "provider.research"
-    model: str = "model.research-v1"
-    responses: list[dict[str, Any]] = field(default_factory=list)
-    snapshots: list[list[dict[str, Any]]] = field(default_factory=list)
+    provider = "provider.research"
+    model = "model.research-v1"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+    def __init__(self, *, responses: list[ModelResponse] | None = None) -> None:
+        super().__init__()
+        self.responses: list[ModelResponse] = responses if responses is not None else []
+        self.snapshots: list[list[Any]] = []
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_retriever_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del tools, user_message, history, context_bundle
-        self.snapshots.append(list(input_items))
+        self.snapshots.append(list(request.messages))
         return self.responses.pop(0)
 
 
@@ -434,27 +422,20 @@ def test_run_research_model_call_failure_returns_failed_finding(
 ) -> None:
     """A model call that raises yields ResearchFinding(status='failed') and a failed TurnRecord."""
 
-    @dataclass
-    class RaisingAdapter:
-        provider: str = "provider.research"
-        model: str = "model.research-v1"
-        snapshots: list[list[dict[str, Any]]] = field(default_factory=list)
+    class RaisingAdapter(FakeModelAdapter):
+        provider = "provider.research"
+        model = "model.research-v1"
 
-        def create_response(
-            self,
-            *,
-            input_items: list[dict[str, Any]],
-            tools: list[dict[str, Any]],
-            user_message: str,
-            history: list[dict[str, Any]],
-            context_bundle: dict[str, Any],
-        ) -> dict[str, Any]:
-            if is_retriever_call(input_items):
+        def __init__(self) -> None:
+            super().__init__()
+            self.snapshots: list[list[Any]] = []
+
+        def _respond(self, request: ModelCall) -> ModelResponse:
+            if is_retriever_call(request.messages):
                 return empty_recall_response(
-                    provider=self.provider, model=self.model, input_items=input_items
+                    provider=self.provider, model=self.model, messages=request.messages
                 )
-            del tools, user_message, history, context_bundle
-            self.snapshots.append(list(input_items))
+            self.snapshots.append(list(request.messages))
             raise RuntimeError("model unavailable")
 
     _seed_session(session_factory, "ses_research_fail")

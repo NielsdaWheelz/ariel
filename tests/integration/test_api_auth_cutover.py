@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import UTC, datetime
 import hashlib
 import hmac
@@ -12,32 +11,27 @@ from fastapi.testclient import TestClient
 import pytest
 
 from ariel.app import create_app
+from ariel.model_adapter import ModelCall, ModelResponse
 from ariel.persistence import ProviderWatchChannelRecord
 from tests.fake_sandbox import FakeSandboxRuntime
-from tests.integration.responses_helpers import empty_recall_response, is_retriever_call
+from tests.integration.responses_helpers import (
+    FakeModelAdapter,
+    empty_recall_response,
+    is_retriever_call,
+)
 
 LOCAL_AUTH_TOKEN = "test_local_auth_token_0123456789abcdef"
 
 
-@dataclass
-class NoModelAdapter:
-    provider: str = "provider.api-auth-test"
-    model: str = "model.api-auth-test"
+class NoModelAdapter(FakeModelAdapter):
+    provider = "provider.api-auth-test"
+    model = "model.api-auth-test"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_retriever_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del input_items, tools, user_message, history, context_bundle
         raise AssertionError("API auth tests must not call the model")
 
 

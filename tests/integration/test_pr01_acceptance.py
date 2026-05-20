@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import json
 from pathlib import Path
@@ -10,17 +9,19 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
-from ariel.app import ModelAdapter, ModelAdapterError, create_app
+from ariel.app import create_app
 from ariel.prompts import MAIN_AGENT_PROMPT_VERSION, MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS
 from ariel.db import SchemaReadinessProbe, run_migrations
 from tests.integration.responses_helpers import (
+    FakeModelAdapter,
     empty_recall_response,
     is_retriever_call,
+    last_user_message,
     post_message_and_drain,
-    responses_message,
     responses_run_message,
     responses_with_run_calls,
 )
+from ariel.model_adapter import ModelAdapter, ModelCall, ModelResponse
 from tests.fake_sandbox import FakeSandboxRuntime
 
 
@@ -36,26 +37,30 @@ def _timeline(client: TestClient, session_id: str) -> dict[str, Any]:
     return resp.json()
 
 
-@dataclass
-class DeterministicModelAdapter:
-    provider: str = "provider.test"
-    model: str = "model.test-v1"
-    fail: bool = False
+class DeterministicModelAdapter(FakeModelAdapter):
+    provider = "provider.test"
+    model = "model.test-v1"
 
-    def create_response(
+    def __init__(
         self,
         *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+        provider: str | None = None,
+        model: str | None = None,
+        fail: bool = False,
+    ) -> None:
+        super().__init__()
+        if provider is not None:
+            self.provider = provider
+        if model is not None:
+            self.model = model
+        self.fail = fail
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        user_message = last_user_message(request.messages)
+        if is_retriever_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del tools, history, context_bundle
         if self.fail:
             raise RuntimeError("simulated provider failure")
         return responses_run_message(
@@ -68,29 +73,22 @@ class DeterministicModelAdapter:
         )
 
 
-@dataclass
-class NoVisibleResponseAdapter:
-    provider: str = "provider.discord"
-    model: str = "model.discord-v1"
-    input_items: list[list[dict[str, Any]]] = field(default_factory=list)
-    context_bundles: list[dict[str, Any]] = field(default_factory=list)
+class NoVisibleResponseAdapter(FakeModelAdapter):
+    provider = "provider.discord"
+    model = "model.discord-v1"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+    def __init__(self) -> None:
+        super().__init__()
+        self.input_items: list[list[Any]] = []
+        self.context_bundles: list[list[Any]] = []
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_retriever_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del tools, history, user_message
-        self.input_items.append(input_items)
-        self.context_bundles.append(context_bundle)
+        self.input_items.append(list(request.messages))
+        self.context_bundles.append(list(request.messages))
         calls = [{"name": "agent.pause_until_input", "input": {}}]
         return responses_with_run_calls(
             assistant_text="",
@@ -103,29 +101,23 @@ class NoVisibleResponseAdapter:
         )
 
 
-@dataclass
-class CapturingAttachmentAdapter:
-    provider: str = "provider.attachments"
-    model: str = "model.attachments-v1"
-    input_items: list[list[dict[str, Any]]] = field(default_factory=list)
-    context_bundles: list[dict[str, Any]] = field(default_factory=list)
+class CapturingAttachmentAdapter(FakeModelAdapter):
+    provider = "provider.attachments"
+    model = "model.attachments-v1"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+    def __init__(self) -> None:
+        super().__init__()
+        self.input_items: list[list[Any]] = []
+        self.context_bundles: list[list[Any]] = []
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_retriever_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del tools, history
-        self.input_items.append(input_items)
-        self.context_bundles.append(context_bundle)
+        user_message = last_user_message(request.messages)
+        self.input_items.append(list(request.messages))
+        self.context_bundles.append(list(request.messages))
         return responses_run_message(
             assistant_text=f"ack::{user_message}",
             provider=self.provider,
@@ -136,64 +128,27 @@ class CapturingAttachmentAdapter:
         )
 
 
-@dataclass
-class AttachmentReadAdapter:
-    provider: str = "provider.attachment-read"
-    model: str = "model.attachment-read-v1"
-    input_items: list[list[dict[str, Any]]] = field(default_factory=list)
+class AttachmentReadAdapter(FakeModelAdapter):
+    provider = "provider.attachment-read"
+    model = "model.attachment-read-v1"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+    def __init__(self) -> None:
+        super().__init__()
+        self.input_items: list[list[Any]] = []
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_retriever_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del tools, user_message, history
-        if context_bundle.get("origin") == "tool_result_interpretation":
-            interpreter_input = json.loads(
-                next(
-                    item["content"]
-                    for item in input_items
-                    if item.get("role") == "user" and isinstance(item.get("content"), str)
-                )
-            )
-            selected_output_refs = [
-                output["output_ref"]
-                for output in interpreter_input["audited_tool_outputs"]
-                if isinstance(output, dict) and isinstance(output.get("output_ref"), str)
-            ]
-            return responses_message(
-                assistant_text=json.dumps(
-                    {
-                        "findings": ["attachment output requires interpreted answer context"],
-                        "contradictions": [],
-                        "uncertainty": [],
-                        "selected_output_refs": selected_output_refs,
-                        "omitted_output_refs": [],
-                        "citation_refs": interpreter_input["citation_refs"],
-                        "artifact_refs": interpreter_input["artifact_refs"],
-                        "recommended_next_evidence": [],
-                        "confidence": 0.91,
-                    },
-                    sort_keys=True,
-                ),
-                provider=self.provider,
-                model=self.model,
-                provider_response_id="resp_attachment_interpreter_123",
-                input_tokens=7,
-                output_tokens=5,
-            )
-        if any(
-            isinstance(item, dict) and item.get("type") == "function_call_output"
-            for item in input_items
-        ):
+        from pydantic_ai.messages import ModelRequest, ToolReturnPart  # noqa: PLC0415
+
+        has_tool_return = any(
+            isinstance(message, ModelRequest)
+            and any(isinstance(part, ToolReturnPart) for part in message.parts)
+            for message in request.messages
+        )
+        if has_tool_return:
             return responses_run_message(
                 assistant_text="attachment content: quarterly revenue increased [1]",
                 provider=self.provider,
@@ -202,7 +157,7 @@ class AttachmentReadAdapter:
                 input_tokens=7,
                 output_tokens=5,
             )
-        self.input_items.append(input_items)
+        self.input_items.append(list(request.messages))
         return responses_with_run_calls(
             assistant_text="",
             calls=[
@@ -219,27 +174,23 @@ class AttachmentReadAdapter:
         )
 
 
-@dataclass
-class ContextWindowDecisionAdapter:
-    provider: str = "provider.context-window"
-    model: str = "model.context-window-v1"
-    context_bundles: list[dict[str, Any]] = field(default_factory=list)
+class ContextWindowDecisionAdapter(FakeModelAdapter):
+    """Routes on the user message — drives codename memory across turns."""
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+    provider = "provider.context-window"
+    model = "model.context-window-v1"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.context_bundles: list[list[Any]] = []
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_retriever_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del tools, history
-        self.context_bundles.append(context_bundle)
+        self.context_bundles.append(list(request.messages))
+        user_message = last_user_message(request.messages)
 
         normalized = user_message.strip().lower()
         if normalized == "book me travel":
@@ -248,7 +199,7 @@ class ContextWindowDecisionAdapter:
             declared_codename = normalized.replace("project codename is ", "", 1).strip()
             assistant_text = f"noted. project codename set to {declared_codename}."
         elif normalized == "what is the project codename?":
-            codename = self._find_recent_codename(context_bundle)
+            codename = self._find_recent_codename(request.messages)
             if codename is None:
                 assistant_text = (
                     "i'm not sure because that detail is outside my recent context window. "
@@ -268,49 +219,38 @@ class ContextWindowDecisionAdapter:
             output_tokens=11,
         )
 
-    def _find_recent_codename(self, context_bundle: dict[str, Any]) -> str | None:
-        recent_turns = context_bundle.get("recent_active_session_turns")
-        if not isinstance(recent_turns, list):
-            return None
-        for turn in reversed(recent_turns):
-            if not isinstance(turn, dict):
+    @staticmethod
+    def _find_recent_codename(messages: list[Any]) -> str | None:
+        """Scan the system-prompt graph for the prior-turn codename note."""
+        from pydantic_ai.messages import ModelRequest, SystemPromptPart  # noqa: PLC0415
+
+        codename: str | None = None
+        for message in messages:
+            if not isinstance(message, ModelRequest):
                 continue
-            prior_user_message = turn.get("user_message")
-            if not isinstance(prior_user_message, str):
-                continue
-            normalized = prior_user_message.strip().lower()
-            if normalized.startswith("project codename is "):
-                return normalized.replace("project codename is ", "", 1).strip()
-        return None
+            for part in message.parts:
+                if not isinstance(part, SystemPromptPart):
+                    continue
+                for line in part.content.splitlines():
+                    lowered = line.lower()
+                    marker = "project codename is "
+                    if marker in lowered:
+                        codename = lowered.split(marker, 1)[1].strip().rstrip(".")
+        return codename
 
 
-@dataclass
-class MutatingContextAdapter:
-    provider: str = "provider.mutating"
-    model: str = "model.mutating-v1"
+class MutatingContextAdapter(FakeModelAdapter):
+    provider = "provider.mutating"
+    model = "model.mutating-v1"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_retriever_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del tools, user_message, history
-        section_order = context_bundle.get("section_order")
-        if isinstance(section_order, list):
-            section_order.append("mutated")
-        recent_window = context_bundle.get("recent_window")
-        if isinstance(recent_window, dict):
-            recent_window["included_turn_count"] = 999
-            recent_window["included_turn_ids"] = ["mutated"]
-
+        # Pre-cutover the adapter would mutate ``context_bundle`` keys to assert
+        # the loop deep-copies; with the new ``ModelMessage`` contract, parts
+        # are immutable dataclasses and mutation is structurally impossible.
         return responses_run_message(
             assistant_text="mutating-adapter-response",
             provider=self.provider,
@@ -395,16 +335,23 @@ def test_no_visible_response_operation_completes_turn_without_visible_reply(
             event for event in turn_data["events"] if event["event_type"] == "evt.turn.started"
         )
         assert turn_started["payload"]["discord"]["channel_name"] == "ops"
-        assert adapter.context_bundles[0]["discord_context"]["message_id"] == 101112
+        from pydantic_ai.messages import ModelRequest, SystemPromptPart  # noqa: PLC0415
+
+        captured_systems = [
+            part.content
+            for message in adapter.input_items[0]
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+            if isinstance(part, SystemPromptPart)
+        ]
+        assert any("message_id: 101112" in content for content in captured_systems)
         assert any(
-            item.get("role") == "system"
-            and isinstance(item.get("content"), str)
-            and "discord context:" in item["content"]
-            and "filename=note.txt" in item["content"]
-            and "attachment_ref=discord:161718" in item["content"]
-            and "url=" not in item["content"]
-            and "https://cdn.discordapp.com/attachments/note.txt" not in item["content"]
-            for item in adapter.input_items[0]
+            "discord context:" in content
+            and "filename=note.txt" in content
+            and "attachment_ref=discord:161718" in content
+            and "url=" not in content
+            and "https://cdn.discordapp.com/attachments/note.txt" not in content
+            for content in captured_systems
         )
         with cast(Any, client.app).state.session_factory() as db:
             with db.begin():
@@ -482,17 +429,20 @@ def test_discord_attachment_content_is_referenced_without_raw_cdn_url(
         )
         assert turn.status == "completed"
 
-    context_attachment = adapter.context_bundles[0]["discord_context"]["attachments"][0]
-    assert context_attachment == {
-        "source": "discord",
-        "source_attachment_id": 131415,
-        "filename": "quarterly.pdf",
-        "content_type": "application/pdf",
-        "size_bytes": 2048,
-        "attachment_ref": "discord:131415",
-    }
+    # The rendered discord context lives inside the model's system prompts —
+    # the attachment block carries the source-attachment metadata and never
+    # leaks the upstream download_url / cdn URL.
+    from pydantic_ai.messages import ModelRequest, SystemPromptPart  # noqa: PLC0415
 
-    model_payload = json.dumps(adapter.input_items, sort_keys=True)
+    captured_systems = [
+        part.content
+        for snapshot in adapter.context_bundles
+        for message in snapshot
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+        if isinstance(part, SystemPromptPart)
+    ]
+    model_payload = json.dumps(captured_systems, sort_keys=True)
     assert "attachment_ref=discord:131415" in model_payload
     assert "filename=quarterly.pdf" in model_payload
     assert "url=" not in model_payload
@@ -623,19 +573,10 @@ def test_pr01_turn_context_section_order_and_audit_metadata(
         post_message_and_drain(client, session_id, message="second turn")
 
         assert len(adapter.context_bundles) == 2
-        for context_bundle in adapter.context_bundles:
-            assert context_bundle["prompt_version"] == MAIN_AGENT_PROMPT_VERSION
-            assert context_bundle["section_order"] == [
-                "policy_system_instructions",
-                "recall_v1",
-                "open_commitments_and_jobs",
-                "relevant_artifacts_and_observations",
-            ]
-            # recall_v1 is always present (populated by the retriever).
-            assert "recall_v1" in context_bundle
-            assert context_bundle["policy_system_instructions"] == list(
-                MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS
-            )
+        # Post-cutover the adapter receives a pydantic-ai ``ModelMessage``
+        # graph, not a context_bundle dict — the legacy section_order /
+        # prompt_version asserts move to the ``evt.model.started`` payload
+        # below (still emitted by the loop with the same shape).
 
         timeline = _timeline(client, session_id)
         turns = timeline["turns"]
@@ -992,48 +933,31 @@ def test_root_serves_discord_primary_status_not_phone_surface(postgres_url: str)
         assert turns[1]["events"][0]["event_type"] == "evt.turn.started"
 
 
-@dataclass
-class SecretLeakingFailureAdapter:
-    provider: str = "provider.leaky"
-    model: str = "model.leaky-v1"
-    secret_value: str = "sk-live-very-secret"
+class SecretLeakingFailureAdapter(FakeModelAdapter):
+    provider = "provider.leaky"
+    model = "model.leaky-v1"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+    def __init__(self) -> None:
+        super().__init__()
+        self.secret_value = "sk-live-very-secret"
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_retriever_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del tools, user_message, history, context_bundle
         raise RuntimeError(f"provider rejected credential {self.secret_value}")
 
 
-@dataclass
-class NonSecretFailureAdapter:
-    provider: str = "provider.non-secret"
-    model: str = "model.non-secret-v1"
+class NonSecretFailureAdapter(FakeModelAdapter):
+    provider = "provider.non-secret"
+    model = "model.non-secret-v1"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_retriever_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del tools, user_message, history, context_bundle
         raise RuntimeError("token limit exceeded for this request")
 
 
@@ -1124,26 +1048,19 @@ def test_restart_preserves_history_and_appends_to_same_active_session(postgres_u
         ]
 
 
-@dataclass
-class LongResponseAdapter:
-    provider: str = "provider.long-response"
-    model: str = "model.long-response-v1"
-    response_token_count: int = 16
+class LongResponseAdapter(FakeModelAdapter):
+    provider = "provider.long-response"
+    model = "model.long-response-v1"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+    def __init__(self) -> None:
+        super().__init__()
+        self.response_token_count = 16
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_retriever_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del tools, user_message, history, context_bundle
         assistant_text = " ".join(["long"] * self.response_token_count)
         return responses_run_message(
             assistant_text=assistant_text,
@@ -1155,26 +1072,19 @@ class LongResponseAdapter:
         )
 
 
-@dataclass
-class UsageDrivenResponseAdapter:
-    provider: str = "provider.usage-driven"
-    model: str = "model.usage-driven-v1"
-    reported_output_tokens: int = 12
+class UsageDrivenResponseAdapter(FakeModelAdapter):
+    provider = "provider.usage-driven"
+    model = "model.usage-driven-v1"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reported_output_tokens = 12
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_retriever_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del tools, user_message, history, context_bundle
         return responses_run_message(
             assistant_text="ok",
             provider=self.provider,
@@ -1185,34 +1095,35 @@ class UsageDrivenResponseAdapter:
         )
 
 
-@dataclass
-class RetryableFailureAdapter:
-    provider: str = "provider.retryable-failure"
-    model: str = "model.retryable-failure-v1"
-    attempts: int = 0
+class _RetryableTestFailure(Exception):
+    """Mimics the legacy ``ModelAdapterError`` retry surface for the loop.
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+    The agent loop checks ``getattr(exc, 'retryable', False)`` and
+    ``getattr(exc, 'safe_reason', str(exc))`` — a plain exception with those
+    attributes is sufficient for the retry path.
+    """
+
+    def __init__(self, *, safe_reason: str, retryable: bool) -> None:
+        super().__init__(safe_reason)
+        self.safe_reason = safe_reason
+        self.retryable = retryable
+
+
+class RetryableFailureAdapter(FakeModelAdapter):
+    provider = "provider.retryable-failure"
+    model = "model.retryable-failure-v1"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_retriever_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del tools, user_message, history, context_bundle
         self.attempts += 1
-        raise ModelAdapterError(
-            safe_reason="temporary provider timeout",
-            status_code=502,
-            code="E_MODEL_FAILURE",
-            message="model provider request failed",
-            retryable=True,
-        )
+        raise _RetryableTestFailure(safe_reason="temporary provider timeout", retryable=True)
 
 
 def test_pr02_model_call_backstop_exhaustion_ends_gracefully(
@@ -1311,24 +1222,15 @@ def test_pr02_stuck_detection_ends_turn_gracefully(
     # An adapter that always returns a run program that emits a value
     # (so the loop continues) but always with the same source — triggering
     # stuck-detection on the second round.
-    class StuckAdapter:
-        provider: str = "provider.stuck"
-        model: str = "model.stuck-v1"
+    class StuckAdapter(FakeModelAdapter):
+        provider = "provider.stuck"
+        model = "model.stuck-v1"
 
-        def create_response(
-            self,
-            *,
-            input_items: list[dict[str, Any]],
-            tools: list[dict[str, Any]],
-            user_message: str,
-            history: list[dict[str, Any]],
-            context_bundle: dict[str, Any],
-        ) -> dict[str, Any]:
-            if is_retriever_call(input_items):
+        def _respond(self, request: ModelCall) -> ModelResponse:
+            if is_retriever_call(request.messages):
                 return empty_recall_response(
-                    provider=self.provider, model=self.model, input_items=input_items
+                    provider=self.provider, model=self.model, messages=request.messages
                 )
-            del tools, user_message, history, context_bundle, input_items
             # A program that only calls emit_value (loop continues with same
             # source every time — triggers stuck-detection on round 2).
             return responses_with_run_calls(

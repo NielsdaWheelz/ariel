@@ -7,32 +7,26 @@ from typing import Any, cast
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
-from ariel.app import ModelAdapter, create_app
+from ariel.app import create_app
+from ariel.model_adapter import ModelAdapter, ModelCall, ModelResponse
 from ariel.persistence import JobRecord
 from tests.fake_sandbox import FakeSandboxRuntime
-from tests.integration.responses_helpers import empty_recall_response, is_retriever_call
+from tests.integration.responses_helpers import FakeModelAdapter, empty_recall_response, is_retriever_call
 
 
-@dataclass
-class NoAiOpsAdapter:
-    provider: str = "provider.no-ai-ops"
-    model: str = "model.no-ai-ops-v1"
-    calls: int = 0
+class NoAiOpsAdapter(FakeModelAdapter):
+    provider = "provider.no-ai-ops"
+    model = "model.no-ai-ops-v1"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_retriever_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del input_items, tools, user_message, history, context_bundle
         self.calls += 1
         raise AssertionError("no-AI ops must not call the model adapter")
 

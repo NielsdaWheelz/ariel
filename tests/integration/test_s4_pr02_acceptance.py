@@ -8,15 +8,18 @@ from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import select
 
-from ariel.app import ModelAdapter, create_app
+from ariel.app import create_app
 from ariel.persistence import ProviderWriteReceiptRecord
 from tests.integration.responses_helpers import (
+    FakeModelAdapter,
     empty_recall_response,
     is_retriever_call,
+    last_user_message,
     post_message_and_drain,
     process_queued_action_execution,
     responses_with_run_calls,
 )
+from ariel.model_adapter import ModelAdapter, ModelCall, ModelResponse
 from tests.fake_sandbox import FakeSandboxRuntime
 
 
@@ -28,36 +31,46 @@ GOOGLE_GMAIL_COMPOSE_SCOPE = "https://www.googleapis.com/auth/gmail.compose"
 GOOGLE_GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 
 
-@dataclass
-class ActionProposalAdapter:
-    provider: str = "provider.s4-pr02"
-    model: str = "model.s4-pr02-v1"
-    run_calls_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
-    assistant_text_by_message: dict[str, str] = field(default_factory=dict)
+class ActionProposalAdapter(FakeModelAdapter):
+    provider = "provider.s4-pr02"
+    model = "model.s4-pr02-v1"
 
-    def create_response(
+    def __init__(
         self,
         *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+        run_calls_by_message: dict[str, list[dict[str, Any]]] | None = None,
+        assistant_text_by_message: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__()
+        self.run_calls_by_message: dict[str, list[dict[str, Any]]] = (
+            run_calls_by_message if run_calls_by_message is not None else {}
+        )
+        self.assistant_text_by_message: dict[str, str] = (
+            assistant_text_by_message if assistant_text_by_message is not None else {}
+        )
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+
+        user_message = last_user_message(request.messages)
+        if is_retriever_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del tools, history
         run_calls = copy.deepcopy(self.run_calls_by_message.get(user_message, []))
         current_turn_ref = None
-        for item in input_items:
-            content = item.get("content")
-            if not isinstance(content, str):
+        from pydantic_ai.messages import ModelRequest, SystemPromptPart  # noqa: PLC0415
+
+        for message in request.messages:
+            if not isinstance(message, ModelRequest):
                 continue
-            for line in content.splitlines():
-                if line.startswith("- current user instruction: "):
-                    current_turn_ref = line.removeprefix("- current user instruction: ").strip()
+            for part in message.parts:
+                if not isinstance(part, SystemPromptPart):
+                    continue
+                for line in part.content.splitlines():
+                    if line.startswith("- current user instruction: "):
+                        current_turn_ref = line.removeprefix(
+                            "- current user instruction: "
+                        ).strip()
         for run_call in run_calls:
             input_payload = run_call.get("input")
             if (
@@ -70,11 +83,6 @@ class ActionProposalAdapter:
             user_message,
             f"assistant::{user_message}",
         )
-        if any(
-            isinstance(item, dict) and item.get("type") == "function_call_output"
-            for item in input_items
-        ):
-            run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
         if not run_calls:
             run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
         return responses_with_run_calls(
