@@ -86,9 +86,12 @@ GOOGLE_RECONNECT_INTENT_EXTRA_SCOPES: dict[str, set[str]] = {
     "cap.calendar.propose_slots": {GOOGLE_CALENDAR_FREEBUSY_SCOPE},
 }
 
-_GOOGLE_MINIMUM_READ_SCOPES = {
-    GOOGLE_CALENDAR_READ_SCOPE,
-    GOOGLE_GMAIL_READ_SCOPE,
+_GOOGLE_MINIMUM_READ_SCOPES = {GOOGLE_CALENDAR_READ_SCOPE, GOOGLE_GMAIL_READ_SCOPE}
+# Identity scopes are requested by default at OAuth start so the userinfo
+# call returns account_email / account_subject — but they are not required
+# for "connected" readiness, because pre-identity-scopes connectors are
+# still functional for Gmail/Calendar reads.
+_GOOGLE_DEFAULT_REQUESTED_SCOPES = _GOOGLE_MINIMUM_READ_SCOPES | {
     GOOGLE_OPENID_SCOPE,
     GOOGLE_USERINFO_EMAIL_SCOPE,
     GOOGLE_USERINFO_PROFILE_SCOPE,
@@ -3347,7 +3350,7 @@ def _resolve_reconnect_scopes(
 ) -> tuple[list[str], str | None]:
     requested_scopes = set(_normalize_scope_list(granted_scopes))
     if not requested_scopes:
-        requested_scopes = set(_GOOGLE_MINIMUM_READ_SCOPES)
+        requested_scopes = set(_GOOGLE_DEFAULT_REQUESTED_SCOPES)
     normalized_intent = _normalize_capability_intent(capability_intent)
     if normalized_intent is not None:
         required_scopes = GOOGLE_CAPABILITY_SCOPES.get(normalized_intent)
@@ -4593,7 +4596,7 @@ class GoogleConnectorRuntime:
                     retryable=False,
                 ) from exc
         else:
-            requested_scopes = sorted(_GOOGLE_MINIMUM_READ_SCOPES)
+            requested_scopes = sorted(_GOOGLE_DEFAULT_REQUESTED_SCOPES)
             normalized_capability_intent = None
         state_handle = f"st_{secrets.token_urlsafe(24)}"
         verifier = _pkce_verifier()
