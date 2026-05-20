@@ -37,6 +37,7 @@ from datetime import datetime
 from typing import Any, Literal, assert_never
 
 from fastapi.encoders import jsonable_encoder
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from .action_runtime import RuntimeProvenance
@@ -277,7 +278,17 @@ def run_agent_loop(
     prev_run_source: str | None = None
     last_program_errors: list[str] | None = None
     model_call_count = 0
-    created_action_attempt_count = proposal_index_start
+    # Start past any earlier loop's attempts on this turn (e.g. retriever
+    # before main loop) — the (turn_id, proposal_index) unique index is the rail.
+    existing_attempt_count = int(
+        db.scalar(
+            select(func.count())
+            .select_from(ActionAttemptRecord)
+            .where(ActionAttemptRecord.turn_id == turn.id)
+        )
+        or 0
+    )
+    created_action_attempt_count = max(proposal_index_start, existing_attempt_count)
     final_runtime_provenance = runtime_provenance
 
     while True:

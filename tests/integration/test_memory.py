@@ -394,6 +394,54 @@ def test_memory_remember_enqueues_memory_encode_task(
 
 
 # ===========================================================================
+# 7b. Retriever+main proposal_index regression
+# ===========================================================================
+
+
+@dataclass
+class _RetrieverSearchesThenMainSearchesAdapter:
+    """Retriever calls ``memory.search``; main agent then calls ``memory.search``.
+
+    Both syscalls create ``ActionAttemptRecord`` rows on the same parent turn.
+    Pre-fix: both loops started ``proposal_index_start=0`` so the main loop's
+    first call collided on the ``(turn_id, proposal_index)`` unique index.
+    """
+
+    provider: str = "provider.test"
+    model: str = "model.test"
+    call_count: int = 0
+
+    def create_response(
+        self, *, input_items: Any, tools: Any, user_message: Any, history: Any, context_bundle: Any
+    ) -> dict[str, Any]:
+        del input_items, tools, user_message, history, context_bundle
+        self.call_count += 1
+        if self.call_count == 1:
+            source = (
+                "memory.search(query='ping', limit=3)\n"
+                "agent.emit_finding(summary='ok',claims=[],gaps=[],sources=[])\n"
+            )
+        else:
+            source = "memory.search(query='ping', limit=3)\n" + _EMIT_MSG
+        return _run_response(source, idx=self.call_count)
+
+
+def test_retriever_and_main_loop_action_attempts_do_not_collide(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the retriever creates ``action_attempts`` on the parent turn, the
+    main loop's first capability call must not violate ``(turn_id,
+    proposal_index)`` uniqueness."""
+    adapter = _RetrieverSearchesThenMainSearchesAdapter()
+    with TestClient(_app(postgres_url, cast(ModelAdapter, adapter), monkeypatch)) as client:
+        sid = _session_id(client)
+        turn = post_message_and_drain(client, sid, message="ping")
+    assert turn.status == "completed", f"turn status={turn.status!r}"
+    assert turn.assistant_message == "hello"
+
+
+# ===========================================================================
 # 8. Worker accepts memory_encode and memory_dream; rejects retired task_types
 # ===========================================================================
 
