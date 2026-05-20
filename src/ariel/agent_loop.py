@@ -275,6 +275,7 @@ def run_agent_loop(
     last_emit_value_tail: int | None = None
 
     prev_run_source: str | None = None
+    last_program_errors: list[str] | None = None
     model_call_count = 0
     created_action_attempt_count = proposal_index_start
     final_runtime_provenance = runtime_provenance
@@ -283,16 +284,17 @@ def run_agent_loop(
         # --- Budget and backstop checks ---
         elapsed_s = time.perf_counter() - loop_started_at
         if elapsed_s > cfg.budget_seconds or model_call_count > cfg.max_model_calls:
-            return LoopResult(
-                outcome="budget_exhausted",
-                emitted_message=None,
-                emitted_finding=None,
-                emitted_operations=None,
+            return _budget_exhausted_result(
+                cfg=cfg,
+                model_adapter=model_adapter,
+                responses_input_items=responses_input_items,
+                user_message=user_message,
+                history=history,
+                context_bundle=context_bundle,
+                add_event=add_event,
                 model_call_count=model_call_count,
                 created_action_attempt_count=created_action_attempt_count,
-                awaiting_approval=None,
-                bounded_failure_details=None,
-                runtime_provenance=final_runtime_provenance,
+                final_runtime_provenance=final_runtime_provenance,
             )
 
         # Remaining-budget signal: replace the previous round's item in-place.
@@ -434,16 +436,17 @@ def run_agent_loop(
 
         # Stuck-detection: identical source in consecutive rounds → budget_exhausted.
         if run_source == prev_run_source:
-            return LoopResult(
-                outcome="budget_exhausted",
-                emitted_message=None,
-                emitted_finding=None,
-                emitted_operations=None,
+            return _budget_exhausted_result(
+                cfg=cfg,
+                model_adapter=model_adapter,
+                responses_input_items=responses_input_items,
+                user_message=user_message,
+                history=history,
+                context_bundle=context_bundle,
+                add_event=add_event,
                 model_call_count=model_call_count,
                 created_action_attempt_count=created_action_attempt_count,
-                awaiting_approval=None,
-                bounded_failure_details=None,
-                runtime_provenance=final_runtime_provenance,
+                final_runtime_provenance=final_runtime_provenance,
             )
         prev_run_source = run_source
 
@@ -487,6 +490,21 @@ def run_agent_loop(
             program_errors = [
                 e for e in [run_program_result.program_error] if e is not None
             ] + run_program_result.callback_errors
+            # Stuck-detection: identical program_errors in consecutive rounds.
+            if program_errors and program_errors == last_program_errors:
+                return _budget_exhausted_result(
+                    cfg=cfg,
+                    model_adapter=model_adapter,
+                    responses_input_items=responses_input_items,
+                    user_message=user_message,
+                    history=history,
+                    context_bundle=context_bundle,
+                    add_event=add_event,
+                    model_call_count=model_call_count,
+                    created_action_attempt_count=created_action_attempt_count,
+                    final_runtime_provenance=final_runtime_provenance,
+                )
+            last_program_errors = program_errors
             if cfg.record_judgments:
                 _record_judgment(
                     db=db,
@@ -518,6 +536,22 @@ def run_agent_loop(
                         ),
                     }
                 )
+            nudge = cfg.program_failure_nudge
+            for err in program_errors:
+                if "agent.emit_finding is only available inside a research run" in err:
+                    nudge = (
+                        "agent.emit_finding is not available in this loop. "
+                        "Continue with one run call that ends by calling "
+                        "agent.emit_message(text=...) to reply to the user."
+                    )
+                    break
+                if "agent.emit_done is only available inside memory subsystem runs" in err:
+                    nudge = (
+                        "agent.emit_done is not available in this loop. "
+                        "Continue with one run call that ends by calling "
+                        "agent.emit_message(text=...) to reply to the user."
+                    )
+                    break
             responses_input_items.append(
                 {
                     "role": "system",
@@ -525,7 +559,7 @@ def run_agent_loop(
                         "run program did not complete: "
                         + json.dumps(program_errors, sort_keys=True)
                         + ". "
-                        + cfg.program_failure_nudge
+                        + nudge
                     ),
                 }
             )
@@ -556,6 +590,7 @@ def run_agent_loop(
             continue
 
         # Clean program.
+        last_program_errors = None
         if cfg.record_judgments:
             _record_judgment(
                 db=db,
@@ -843,6 +878,152 @@ def run_agent_loop(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+_BUDGET_EXHAUSTED_SUMMARY_INSTRUCTION = (
+    "Your time has run out. In one short paragraph of plain text, tell the "
+    "user what you did and what remains. Do not call any tools — return the "
+    "text directly."
+)
+
+
+def _budget_exhausted_result(
+    *,
+    cfg: LoopConfig,
+    model_adapter: Any,
+    responses_input_items: list[dict[str, Any]],
+    user_message: str,
+    history: list[dict[str, Any]],
+    context_bundle: dict[str, Any],
+    add_event: Callable[[str, dict[str, Any]], None],
+    model_call_count: int,
+    created_action_attempt_count: int,
+    final_runtime_provenance: RuntimeProvenance | None,
+) -> LoopResult:
+    """Build the budget-exhausted result, attempting a one-shot summary call
+    on the main loop (``output_mode == "message"``).
+
+    On main-loop budget exhaustion, makes one constrained model call with
+    ``tools=[]`` and a tight system instruction asking the model to summarise
+    what it did and what remains. On usable text, returns an ``outcome="message"``
+    result so the caller's existing assistant-message path handles it. On any
+    failure, empty text, or non-message output mode, returns the unchanged
+    ``outcome="budget_exhausted"`` result.
+    """
+    if cfg.output_mode != "message":
+        return LoopResult(
+            outcome="budget_exhausted",
+            emitted_message=None,
+            emitted_finding=None,
+            emitted_operations=None,
+            model_call_count=model_call_count,
+            created_action_attempt_count=created_action_attempt_count,
+            awaiting_approval=None,
+            bounded_failure_details=None,
+            runtime_provenance=final_runtime_provenance,
+        )
+
+    summary_input_items = [
+        *responses_input_items,
+        {"role": "system", "content": _BUDGET_EXHAUSTED_SUMMARY_INSTRUCTION},
+    ]
+    model_call_count += 1
+    add_event(
+        "evt.model.started",
+        {
+            "provider": model_adapter.provider,
+            "model": model_adapter.model,
+            "model_call_count": model_call_count,
+        },
+    )
+    started_at = time.perf_counter()
+    try:
+        summary_response = model_adapter.create_response(
+            input_items=summary_input_items,
+            tools=[],
+            user_message=user_message,
+            history=history,
+            context_bundle=context_bundle,
+        )
+    except Exception as exc:
+        add_event(
+            "evt.model.failed",
+            {
+                "provider": model_adapter.provider,
+                "model": model_adapter.model,
+                "duration_ms": int((time.perf_counter() - started_at) * 1000),
+                "failure_reason": getattr(exc, "safe_reason", str(exc)),
+                "model_call_count": model_call_count,
+            },
+        )
+        return LoopResult(
+            outcome="budget_exhausted",
+            emitted_message=None,
+            emitted_finding=None,
+            emitted_operations=None,
+            model_call_count=model_call_count,
+            created_action_attempt_count=created_action_attempt_count,
+            awaiting_approval=None,
+            bounded_failure_details=None,
+            runtime_provenance=final_runtime_provenance,
+        )
+    add_event(
+        "evt.model.completed",
+        {
+            "provider": summary_response.get("provider"),
+            "model": summary_response.get("model"),
+            "duration_ms": int((time.perf_counter() - started_at) * 1000),
+            "usage": summary_response.get("usage"),
+            "provider_response_id": summary_response.get("provider_response_id"),
+            "model_call_count": model_call_count,
+        },
+    )
+
+    output_items = summary_response.get("output")
+    if not isinstance(output_items, list):
+        output_items = []
+    has_function_call = any(
+        isinstance(item, dict) and item.get("type") == "function_call" for item in output_items
+    )
+    text_parts: list[str] = []
+    for item in output_items:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text")
+            if part.get("type") in {"output_text", "text"} and isinstance(text, str):
+                text_parts.append(text)
+    summary_text = "\n".join(text_parts).strip()
+
+    if has_function_call or not summary_text:
+        return LoopResult(
+            outcome="budget_exhausted",
+            emitted_message=None,
+            emitted_finding=None,
+            emitted_operations=None,
+            model_call_count=model_call_count,
+            created_action_attempt_count=created_action_attempt_count,
+            awaiting_approval=None,
+            bounded_failure_details=None,
+            runtime_provenance=final_runtime_provenance,
+        )
+
+    return LoopResult(
+        outcome="message",
+        emitted_message=summary_text,
+        emitted_finding=None,
+        emitted_operations=None,
+        model_call_count=model_call_count,
+        created_action_attempt_count=created_action_attempt_count,
+        awaiting_approval=None,
+        bounded_failure_details=None,
+        runtime_provenance=final_runtime_provenance,
+    )
 
 
 def _merge_provenance(

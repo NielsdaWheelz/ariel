@@ -32,12 +32,22 @@ _AGENT_EMIT_VALUE = "agent.emit_value"
 _AGENT_PAUSE_UNTIL_INPUT = "agent.pause_until_input"
 _AGENT_SYSCALL_NAMES = (_AGENT_EMIT_MESSAGE, _AGENT_EMIT_VALUE, _AGENT_PAUSE_UNTIL_INPUT)
 
-# Non-main-loop terminal output syscalls — eligible only when is_research_run=True
-# (which means "non-main loop" in P4: retriever, researcher, and rememberer).
-# agent.emit_finding exits a finding/investigation run; agent.emit_done exits a
-# rememberer/operations run. System prompts steer each loop to use the right one.
+# Non-main-loop terminal output syscalls. Always bound into the sandbox so a
+# misuse in the main loop surfaces as a typed host-callback error rather than an
+# AttributeError traceback. The gate is the host callback, keyed on
+# is_research_run. agent.emit_finding exits a retriever/researcher run;
+# agent.emit_done exits a rememberer run.
 _AGENT_EMIT_FINDING = "agent.emit_finding"
 _AGENT_EMIT_DONE = "agent.emit_done"
+
+_AGENT_EMIT_FINDING_MAIN_LOOP_ERROR = (
+    "agent.emit_finding is only available inside a research run; "
+    "finish the main loop with agent.emit_message"
+)
+_AGENT_EMIT_DONE_MAIN_LOOP_ERROR = (
+    "agent.emit_done is only available inside memory subsystem runs; "
+    "finish the main loop with agent.emit_message"
+)
 
 # Host-side per-turn scratch store syscalls — always eligible, not capabilities.
 _SCRATCH_SET = "scratch.set"
@@ -165,26 +175,25 @@ def parse_run_function_call(
     return source, None
 
 
-def _eligible_syscall_names(
-    allowed_capability_ids: set[str], *, is_research_run: bool = False
-) -> tuple[str, ...]:
+def _eligible_syscall_names(allowed_capability_ids: set[str]) -> tuple[str, ...]:
     """The syscall callables the program may call this turn.
 
-    The three ``agent.*`` output syscalls, the two ``scratch.*`` store syscalls
-    (always eligible — host-side, not capabilities), plus the run-callable name
-    of every allowed capability id. A capability with no run-callable alias is
-    dropped: it cannot be named in a program.
+    The three ``agent.*`` output syscalls, the two non-main-loop terminal output
+    syscalls (``agent.emit_finding``, ``agent.emit_done``), the two ``scratch.*``
+    store syscalls, plus the run-callable name of every allowed capability id.
+    A capability with no run-callable alias is dropped: it cannot be named in a
+    program.
 
-    ``agent.emit_finding`` and ``agent.emit_done`` are added only when
-    ``is_research_run=True`` (i.e. any non-main loop: retriever, researcher,
-    rememberer). The system prompt for each configuration steers the model to
-    call the correct one; the flag controls eligibility.
+    ``agent.emit_finding`` and ``agent.emit_done`` are always bound so a main-loop
+    misuse surfaces as a typed host-callback error (see the callback) rather than
+    a sandbox ``AttributeError`` traceback.
     """
 
-    names: set[str] = set(_AGENT_SYSCALL_NAMES) | set(_SCRATCH_SYSCALL_NAMES)
-    if is_research_run:
-        names.add(_AGENT_EMIT_FINDING)
-        names.add(_AGENT_EMIT_DONE)
+    names: set[str] = (
+        set(_AGENT_SYSCALL_NAMES)
+        | set(_SCRATCH_SYSCALL_NAMES)
+        | {_AGENT_EMIT_FINDING, _AGENT_EMIT_DONE}
+    )
     for capability_id in allowed_capability_ids:
         run_callable_name = run_callable_name_for_capability_id(capability_id)
         if run_callable_name is not None:
@@ -267,7 +276,7 @@ def execute_run_program(
     """
 
     ctx = _FunctionCallProcessingContext()
-    syscall_names = _eligible_syscall_names(allowed_capability_ids, is_research_run=is_research_run)
+    syscall_names = _eligible_syscall_names(allowed_capability_ids)
 
     emitted_message = ""
     emitted_values: list[Any] = []
@@ -377,8 +386,13 @@ def execute_run_program(
             return True, entry.value
 
         if name == _AGENT_EMIT_FINDING:
-            # agent.emit_finding is the investigation run's terminal output. Only
-            # eligible (present in syscall_names) when is_research_run=True.
+            # agent.emit_finding is the investigation run's terminal output. The
+            # syscall is bound regardless of is_research_run so a main-loop
+            # misuse surfaces here as a typed error the model can recover from
+            # rather than an AttributeError traceback.
+            if not is_research_run:
+                callback_errors.append(_AGENT_EMIT_FINDING_MAIN_LOOP_ERROR)
+                return False, _AGENT_EMIT_FINDING_MAIN_LOOP_ERROR
             summary = syscall_input.get("summary")
             claims = syscall_input.get("claims")
             gaps = syscall_input.get("gaps")
@@ -404,8 +418,12 @@ def execute_run_program(
             return True, None
 
         if name == _AGENT_EMIT_DONE:
-            # agent.emit_done is the rememberer's terminal output. Only eligible
-            # (present in syscall_names) when is_research_run=True.
+            # agent.emit_done is the rememberer's terminal output. Bound
+            # regardless of is_research_run; a main-loop misuse surfaces as a
+            # typed error here.
+            if not is_research_run:
+                callback_errors.append(_AGENT_EMIT_DONE_MAIN_LOOP_ERROR)
+                return False, _AGENT_EMIT_DONE_MAIN_LOOP_ERROR
             if set(syscall_input.keys()) - {"summary"}:
                 callback_errors.append("agent_emit_done_schema_invalid")
                 return False, "agent_emit_done_schema_invalid"
