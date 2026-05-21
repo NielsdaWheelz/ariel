@@ -45,7 +45,7 @@ def test_normal_response_tool_surface_is_single_strict_run_tool() -> None:
 
 
 def test_main_agent_prompt_is_versioned_static_contract() -> None:
-    assert MAIN_AGENT_PROMPT_VERSION == "main-agent-jarvis-v5"
+    assert MAIN_AGENT_PROMPT_VERSION == "main-agent-jarvis-v6"
     assert all(MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS)
 
     prompt = "\n\n".join(MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS)
@@ -62,6 +62,12 @@ def test_main_agent_prompt_is_versioned_static_contract() -> None:
     # Honesty about own program errors: the model must not blame a connector
     # when its own run program failed to compile or execute.
     assert "is your error, not the connector's" in prompt
+    # v6: when a capability succeeded, the assistant message must surface its
+    # data instead of fabricating an "unavailable" failure register.
+    assert "Never report a successful call as a failure" in prompt
+    assert "Ground every assistant message in the data" in prompt
+    # v6: synthesis questions require deliberation across rounds.
+    assert "For synthesis questions" in prompt
 
 
 def test_main_agent_prompt_block_order_is_stable() -> None:
