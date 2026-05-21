@@ -321,7 +321,10 @@ def test_research_prompt_calendar_list_signature_uses_window_keys() -> None:
     ``window_start`` / ``window_end``.
     """
     content = _callables_block("personal")
-    assert "- calendar.list(window_start: str, window_end: str)" in content
+    assert (
+        "- calendar.list(window_start: str, window_end: str, calendar_id: str = 'primary')"
+        in content
+    )
     # Argument names the model previously invented must not appear as keys.
     assert "start_time" not in content
     assert "end_time" not in content

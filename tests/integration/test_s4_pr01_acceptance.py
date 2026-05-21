@@ -405,6 +405,7 @@ class FakeGoogleWorkspaceProvider:
                 }
             ],
             "retrieved_at": "2026-03-03T12:00:00Z",
+            "total_estimate": 1,
         }
 
     def email_read(

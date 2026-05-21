@@ -57,6 +57,7 @@ GOOGLE_USERINFO_PROFILE_SCOPE = "https://www.googleapis.com/auth/userinfo.profil
 
 GOOGLE_READ_CAPABILITY_SCOPES: dict[str, set[str]] = {
     "cap.calendar.list": {GOOGLE_CALENDAR_READ_SCOPE},
+    "cap.calendar.list_calendars": {GOOGLE_CALENDAR_READ_SCOPE},
     "cap.calendar.propose_slots": {GOOGLE_CALENDAR_READ_SCOPE},
     "cap.email.search": {GOOGLE_GMAIL_READ_SCOPE},
     "cap.email.read": {GOOGLE_GMAIL_READ_SCOPE},
@@ -123,7 +124,7 @@ _GOOGLE_TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
 # Google Calendar push channels expire after at most ~7 days; request a 6-day
 # TTL so the worker re-arms before Google drops the channel.
 _CALENDAR_WATCH_TTL_SECONDS = 6 * 24 * 3600
-_MAX_GOOGLE_RESULTS = 5
+_MAX_GOOGLE_RESULTS = 25
 _GMAIL_BATCH_MODIFY_LIMIT = 1000
 _MAX_CALENDAR_RESPONSE_BYTES = 262144
 _MAX_GMAIL_EVIDENCE_BLOCKS = 12
@@ -238,6 +239,13 @@ class GoogleOAuthClient(Protocol):
 
 class GoogleWorkspaceProvider(Protocol):
     def calendar_list(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]: ...
+
+    def calendar_list_calendars(
         self,
         *,
         access_token: str,
@@ -741,10 +749,11 @@ class DefaultGoogleWorkspaceProvider:
         access_token: str,
         window_start: str,
         window_end: str,
+        calendar_id: str,
     ) -> list[dict[str, Any]]:
         payload = self._request_json(
             method="GET",
-            url=f"{self.calendar_api_base_url}/calendars/primary/events",
+            url=f"{self.calendar_api_base_url}/calendars/{quote(calendar_id, safe='')}/events",
             access_token=access_token,
             params={
                 "timeMin": window_start,
@@ -768,10 +777,12 @@ class DefaultGoogleWorkspaceProvider:
     ) -> dict[str, Any]:
         window_start = str(normalized_input["window_start"])
         window_end = str(normalized_input["window_end"])
+        calendar_id = str(normalized_input.get("calendar_id", "primary"))
         items = self._calendar_events(
             access_token=access_token,
             window_start=window_start,
             window_end=window_end,
+            calendar_id=calendar_id,
         )
         events: list[dict[str, Any]] = []
         for item in items:
@@ -780,7 +791,7 @@ class DefaultGoogleWorkspaceProvider:
                     normalize_calendar_event(
                         item,
                         provider_account_id="google",
-                        calendar_id="primary",
+                        calendar_id=calendar_id,
                     )
                 )
             )
@@ -792,6 +803,46 @@ class DefaultGoogleWorkspaceProvider:
             "retrieved_at": to_rfc3339(_utcnow()),
             "window_start": window_start,
             "window_end": window_end,
+        }
+
+    def calendar_list_calendars(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]:
+        del normalized_input
+        payload = self._request_json(
+            method="GET",
+            url=f"{self.calendar_api_base_url}/users/me/calendarList",
+            access_token=access_token,
+            max_response_bytes=_MAX_CALENDAR_RESPONSE_BYTES,
+        )
+        raw_items = payload.get("items")
+        items = raw_items if isinstance(raw_items, list) else []
+        calendars: list[dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            calendar_id = item.get("id")
+            if not isinstance(calendar_id, str) or not calendar_id:
+                continue
+            calendars.append(
+                {
+                    "calendar_id": calendar_id,
+                    "summary": item.get("summary"),
+                    "primary": bool(item.get("primary", False)),
+                    "access_role": item.get("accessRole") or "reader",
+                    "time_zone": item.get("timeZone"),
+                }
+            )
+            if len(calendars) >= _MAX_GOOGLE_RESULTS:
+                break
+        return {
+            "schema_version": "google.calendar.calendar_list.v1",
+            "calendars": calendars,
+            "retrieved_at": to_rfc3339(_utcnow()),
+            "status": "succeeded",
         }
 
     def calendar_list_event_deltas(
@@ -954,6 +1005,7 @@ class DefaultGoogleWorkspaceProvider:
             access_token=access_token,
             window_start=to_rfc3339(window_start),
             window_end=to_rfc3339(window_end),
+            calendar_id="primary",
         )
         intervals: list[tuple[datetime, datetime]] = []
         for item in items:
@@ -1034,6 +1086,14 @@ class DefaultGoogleWorkspaceProvider:
             if isinstance(raw_messages, list)
             else []
         )
+        raw_estimate = payload.get("resultSizeEstimate")
+        total_estimate = (
+            raw_estimate
+            if isinstance(raw_estimate, int)
+            and not isinstance(raw_estimate, bool)
+            and raw_estimate >= 0
+            else None
+        )
         results: list[dict[str, Any]] = []
         for message in messages[:_MAX_GOOGLE_RESULTS]:
             message_id_raw = message.get("id")
@@ -1083,6 +1143,7 @@ class DefaultGoogleWorkspaceProvider:
             "schema_version": "google.gmail.message_refs.v1",
             "messages": results,
             "retrieved_at": to_rfc3339(_utcnow()),
+            "total_estimate": total_estimate,
         }
 
     def email_read(
@@ -3521,6 +3582,38 @@ def _is_calendar_attendees(value: Any) -> bool:
     return True
 
 
+def _is_google_calendar_calendar_list_output(payload: dict[str, Any]) -> bool:
+    if not _has_only_keys(payload, {"schema_version", "calendars", "retrieved_at", "status"}):
+        return False
+    if payload.get("schema_version") != "google.calendar.calendar_list.v1":
+        return False
+    if not _has_non_empty_string(payload.get("retrieved_at")):
+        return False
+    if payload.get("status") != "succeeded":
+        return False
+    calendars = payload.get("calendars")
+    if not isinstance(calendars, list):
+        return False
+    for item in calendars:
+        if not isinstance(item, dict):
+            return False
+        if not _has_only_keys(
+            item, {"calendar_id", "summary", "primary", "access_role", "time_zone"}
+        ):
+            return False
+        if not _has_non_empty_string(item.get("calendar_id")):
+            return False
+        if not _is_string_or_none(item.get("summary")):
+            return False
+        if not isinstance(item.get("primary"), bool):
+            return False
+        if not _has_non_empty_string(item.get("access_role")):
+            return False
+        if not _is_string_or_none(item.get("time_zone")):
+            return False
+    return True
+
+
 def _is_google_calendar_events_output(payload: dict[str, Any]) -> bool:
     if payload.get("schema_version") != "google.calendar.events.v1" or "results" in payload:
         return False
@@ -3738,6 +3831,15 @@ def _is_google_gmail_message_refs_output(payload: dict[str, Any]) -> bool:
     if payload.get("schema_version") != "google.gmail.message_refs.v1" or "results" in payload:
         return False
     if not _has_non_empty_string(payload.get("retrieved_at")):
+        return False
+    if "total_estimate" not in payload:
+        return False
+    total_estimate = payload["total_estimate"]
+    if total_estimate is not None and (
+        not isinstance(total_estimate, int)
+        or isinstance(total_estimate, bool)
+        or total_estimate < 0
+    ):
         return False
     messages = payload.get("messages")
     if not isinstance(messages, list):
@@ -4089,6 +4191,8 @@ def _tuples_to_lists(value: Any) -> Any:
 def _is_typed_google_read_output(*, capability_id: str, payload: dict[str, Any]) -> bool:
     if capability_id == "cap.calendar.list":
         return _is_google_calendar_events_output(payload)
+    if capability_id == "cap.calendar.list_calendars":
+        return _is_google_calendar_calendar_list_output(payload)
     if capability_id == "cap.calendar.propose_slots":
         return _is_google_calendar_slot_options_output(payload)
     if capability_id == "cap.calendar.create_event":
@@ -5823,6 +5927,11 @@ class GoogleConnectorRuntime:
         try:
             if capability_id == "cap.calendar.list":
                 output_payload = self.workspace_provider.calendar_list(
+                    access_token=access_token,
+                    normalized_input=normalized_input,
+                )
+            elif capability_id == "cap.calendar.list_calendars":
+                output_payload = self.workspace_provider.calendar_list_calendars(
                     access_token=access_token,
                     normalized_input=normalized_input,
                 )

@@ -190,7 +190,12 @@ def _normalize_rfc3339_like(value: Any) -> str | None:
 def _validate_calendar_list_input(
     raw_input: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
-    if set(raw_input.keys()) != {"window_start", "window_end"}:
+    keys = set(raw_input.keys())
+    if keys != {"window_start", "window_end"} and keys != {
+        "window_start",
+        "window_end",
+        "calendar_id",
+    }:
         return None, "schema_invalid"
     window_start = _normalize_rfc3339_like(raw_input.get("window_start"))
     window_end = _normalize_rfc3339_like(raw_input.get("window_end"))
@@ -200,10 +205,28 @@ def _validate_calendar_list_input(
     window_end_dt = datetime.fromisoformat(window_end.replace("Z", "+00:00"))
     if window_end_dt <= window_start_dt:
         return None, "schema_invalid"
-    return {
+    normalized: dict[str, Any] = {
         "window_start": window_start,
         "window_end": window_end,
-    }, None
+    }
+    if "calendar_id" in raw_input:
+        calendar_id_raw = raw_input["calendar_id"]
+        if (
+            not isinstance(calendar_id_raw, str)
+            or not calendar_id_raw
+            or len(calendar_id_raw) > 320
+        ):
+            return None, "schema_invalid"
+        normalized["calendar_id"] = calendar_id_raw
+    return normalized, None
+
+
+def _validate_calendar_list_calendars_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if raw_input:
+        return None, "schema_invalid"
+    return {}, None
 
 
 def _validate_calendar_propose_slots_input(
@@ -2580,13 +2603,28 @@ def _declare_maps_search_places_egress_intent(
 def _declare_google_calendar_list_egress_intent(
     input_payload: dict[str, Any],
 ) -> list[dict[str, Any]]:
+    calendar_id = quote(str(input_payload.get("calendar_id", "primary")), safe="")
     return [
         {
-            "destination": "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+            "destination": (
+                f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events"
+            ),
             "payload": {
                 "window_start": input_payload["window_start"],
                 "window_end": input_payload["window_end"],
             },
+        }
+    ]
+
+
+def _declare_google_calendar_list_calendars_egress_intent(
+    input_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    del input_payload
+    return [
+        {
+            "destination": "https://www.googleapis.com/calendar/v3/users/me/calendarList",
+            "payload": {},
         }
     ]
 
@@ -3264,6 +3302,22 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         execute=None,
         declare_egress_intent=_declare_google_calendar_list_egress_intent,
     ),
+    "cap.calendar.list_calendars": CapabilityDefinition(
+        capability_id="cap.calendar.list_calendars",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "calendar_list_calendars_v1",
+            "output_schema": "google_calendar_calendar_list_v1",
+            "idempotency": "deterministic_read",
+            "required_scopes": [_GOOGLE_CALENDAR_READ_SCOPE],
+        },
+        allowed_egress_destinations=_GOOGLE_ALLOWED_EGRESS_DESTINATIONS,
+        validate_input=_validate_calendar_list_calendars_input,
+        execute=None,
+        declare_egress_intent=_declare_google_calendar_list_calendars_egress_intent,
+    ),
     "cap.calendar.propose_slots": CapabilityDefinition(
         capability_id="cap.calendar.propose_slots",
         version="1.0",
@@ -3899,6 +3953,7 @@ _RUN_CALLABLE_ALIASES = {
     "attachment.read": "cap.attachment.read",
     "calendar.create_event": "cap.calendar.create_event",
     "calendar.list": "cap.calendar.list",
+    "calendar.list_calendars": "cap.calendar.list_calendars",
     "calendar.propose_slots": "cap.calendar.propose_slots",
     "calendar.respond_to_event": "cap.calendar.respond_to_event",
     "calendar.update_event": "cap.calendar.update_event",
@@ -3979,14 +4034,23 @@ RUN_CALLABLE_SIGNATURES: dict[str, str] = {
     # RFC3339 strings (e.g. ``"2026-05-20T12:00:00Z"``). Other names
     # (``start_time``, ``end_time``, ``start``, ``end``, ``time_min``,
     # ``time_max``) are rejected as schema_invalid. ``window_end`` must be
-    # strictly after ``window_start``.
-    "calendar.list": "(window_start: str, window_end: str) -> {'schema_version': 'google.calendar.events.v1', 'events': list[{'event_id', 'calendar_id', 'summary', 'start', 'end', ...}], 'retrieved_at': str, 'window_start': str, 'window_end': str, 'status': 'succeeded'}",
+    # strictly after ``window_start``. Optional ``calendar_id`` selects which
+    # calendar to read; it defaults to ``"primary"`` (the user's main
+    # calendar). Use ``calendar.list_calendars`` to discover other ids.
+    "calendar.list": "(window_start: str, window_end: str, calendar_id: str = 'primary') -> {'schema_version': 'google.calendar.events.v1', 'events': list[{'event_id', 'calendar_id', 'summary', 'start', 'end', ...}], 'retrieved_at': str, 'window_start': str, 'window_end': str, 'status': 'succeeded'}",
+    # calendar.list_calendars: no arguments. Returns the calendars the user has
+    # access to — primary, secondary, and subscribed — so the model can pass a
+    # specific ``calendar_id`` to ``calendar.list``.
+    "calendar.list_calendars": "() -> {'schema_version': 'google.calendar.calendar_list.v1', 'calendars': list[{'calendar_id': str, 'summary': str, 'primary': bool, 'access_role': str, 'time_zone': str | None}], 'retrieved_at': str, 'status': 'succeeded'}",
     # email (read)
     # email.search: the only accepted key is ``query``. Returns
     # ``{messages: [{message_id, thread_id, subject, sender, ...}], ...}``;
     # use ``message_id`` (NOT ``thread_id`` alone) to fetch the full body
-    # with ``email.read``.
-    "email.search": "(query: str) -> {'schema_version': 'google.gmail.message_refs.v1', 'messages': list[{'message_id': str, 'thread_id': str, 'subject': str | None, 'preview': str | None, 'direction': Literal['sent', 'received', 'draft'], ...}], 'retrieved_at': str, 'status': 'succeeded'}",
+    # with ``email.read``. ``total_estimate`` is Gmail's ``resultSizeEstimate``
+    # — the server's best estimate of total matches for the query, useful for
+    # "how many" questions (e.g. unread count) when the returned message list
+    # is capped.
+    "email.search": "(query: str) -> {'schema_version': 'google.gmail.message_refs.v1', 'messages': list[{'message_id': str, 'thread_id': str, 'subject': str | None, 'preview': str | None, 'direction': Literal['sent', 'received', 'draft'], ...}], 'retrieved_at': str, 'total_estimate': int | None, 'status': 'succeeded'}",
     # email.read: at least one of ``message_id`` or ``thread_id`` MUST be
     # provided and non-null. Use a value from a prior ``email.search`` result;
     # never invent ids and never pass both as None. ``mode`` defaults to

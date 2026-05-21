@@ -241,6 +241,7 @@ class FakeGoogleWorkspaceProvider:
             "schema_version": "google.gmail.message_refs.v1",
             "messages": [],
             "retrieved_at": "2026-03-06T12:00:00Z",
+            "total_estimate": 0,
         }
 
     def email_read(

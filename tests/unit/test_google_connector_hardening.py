@@ -1361,6 +1361,7 @@ def test_gmail_message_refs_validator_accepts_minimal_real_search_payload() -> N
     payload: dict[str, Any] = {
         "schema_version": "google.gmail.message_refs.v1",
         "retrieved_at": "2026-05-20T12:00:00Z",
+        "total_estimate": None,
         "messages": [
             {
                 "message_id": "msg_1",
@@ -1389,6 +1390,7 @@ def test_gmail_message_refs_validator_rejects_unknown_evidence_status() -> None:
     payload: dict[str, Any] = {
         "schema_version": "google.gmail.message_refs.v1",
         "retrieved_at": "2026-05-20T12:00:00Z",
+        "total_estimate": 1,
         "messages": [
             {
                 "message_id": "msg_1",
@@ -1409,6 +1411,59 @@ def test_gmail_message_refs_validator_rejects_unknown_evidence_status() -> None:
             }
         ],
     }
+    assert not is_typed_google_read_output(capability_id="cap.email.search", payload=payload)
+
+
+def _gmail_message_refs_payload_with_total_estimate(total_estimate: Any) -> dict[str, Any]:
+    return {
+        "schema_version": "google.gmail.message_refs.v1",
+        "retrieved_at": "2026-05-20T12:00:00Z",
+        "total_estimate": total_estimate,
+        "messages": [
+            {
+                "message_id": "msg_1",
+                "thread_id": "thr_1",
+                "provider_url": "https://mail.google.com/mail/u/0/#all/msg_1",
+                "history_id": "42",
+                "subject": "Invoice",
+                "subject_key": "invoice",
+                "sender": {"name": None, "email": "ada@example.com"},
+                "recipients": [],
+                "cc": [],
+                "header_date": "2026-05-20T11:55:00Z",
+                "internal_date": "2026-05-20T11:55:00Z",
+                "label_ids": ["INBOX"],
+                "direction": "received",
+                "preview": "preview",
+                "evidence_status": "needs_read",
+            }
+        ],
+    }
+
+
+def test_gmail_message_refs_output_accepts_total_estimate_int() -> None:
+    payload = _gmail_message_refs_payload_with_total_estimate(247)
+    assert is_typed_google_read_output(capability_id="cap.email.search", payload=payload)
+
+
+def test_gmail_message_refs_output_accepts_total_estimate_null() -> None:
+    payload = _gmail_message_refs_payload_with_total_estimate(None)
+    assert is_typed_google_read_output(capability_id="cap.email.search", payload=payload)
+
+
+def test_gmail_message_refs_output_rejects_missing_total_estimate() -> None:
+    payload = _gmail_message_refs_payload_with_total_estimate(None)
+    del payload["total_estimate"]
+    assert not is_typed_google_read_output(capability_id="cap.email.search", payload=payload)
+
+
+def test_gmail_message_refs_output_rejects_negative_total_estimate() -> None:
+    payload = _gmail_message_refs_payload_with_total_estimate(-1)
+    assert not is_typed_google_read_output(capability_id="cap.email.search", payload=payload)
+
+
+def test_gmail_message_refs_output_rejects_string_total_estimate() -> None:
+    payload = _gmail_message_refs_payload_with_total_estimate("5")
     assert not is_typed_google_read_output(capability_id="cap.email.search", payload=payload)
 
 
@@ -1829,3 +1884,91 @@ def test_drive_share_validator_rejects_missing_permission_id() -> None:
         "permission_id": "",
     }
     assert not is_typed_google_read_output(capability_id="cap.drive.share", payload=payload)
+
+
+def test_calendar_list_calendars_output_valid_minimal() -> None:
+    payload: dict[str, Any] = {
+        "schema_version": "google.calendar.calendar_list.v1",
+        "calendars": [
+            {
+                "calendar_id": "primary",
+                "summary": "Niels Calendar",
+                "primary": True,
+                "access_role": "owner",
+                "time_zone": "Europe/Amsterdam",
+            }
+        ],
+        "retrieved_at": "2026-05-21T12:00:00Z",
+        "status": "succeeded",
+    }
+    assert is_typed_google_read_output(capability_id="cap.calendar.list_calendars", payload=payload)
+
+
+def test_calendar_list_calendars_output_rejects_missing_id() -> None:
+    payload: dict[str, Any] = {
+        "schema_version": "google.calendar.calendar_list.v1",
+        "calendars": [
+            {
+                "summary": "Niels Calendar",
+                "primary": True,
+                "access_role": "owner",
+                "time_zone": "Europe/Amsterdam",
+            }
+        ],
+        "retrieved_at": "2026-05-21T12:00:00Z",
+        "status": "succeeded",
+    }
+    assert not is_typed_google_read_output(
+        capability_id="cap.calendar.list_calendars", payload=payload
+    )
+
+
+def test_calendar_list_input_accepts_explicit_calendar_id() -> None:
+    calendar_list = get_capability("cap.calendar.list")
+    assert calendar_list is not None
+    normalized, error = calendar_list.validate_input(
+        {
+            "window_start": "2026-03-04T00:00:00Z",
+            "window_end": "2026-03-05T00:00:00Z",
+            "calendar_id": "work@example.com",
+        }
+    )
+    assert error is None
+    assert normalized == {
+        "window_start": "2026-03-04T00:00:00Z",
+        "window_end": "2026-03-05T00:00:00Z",
+        "calendar_id": "work@example.com",
+    }
+
+
+def test_calendar_list_input_rejects_empty_calendar_id() -> None:
+    calendar_list = get_capability("cap.calendar.list")
+    assert calendar_list is not None
+    normalized, error = calendar_list.validate_input(
+        {
+            "window_start": "2026-03-04T00:00:00Z",
+            "window_end": "2026-03-05T00:00:00Z",
+            "calendar_id": "",
+        }
+    )
+    assert normalized is None
+    assert error == "schema_invalid"
+
+
+def test_calendar_list_egress_intent_varies_by_calendar_id() -> None:
+    calendar_list = get_capability("cap.calendar.list")
+    assert calendar_list is not None
+    assert calendar_list.declare_egress_intent is not None
+    intents = calendar_list.declare_egress_intent(
+        {
+            "window_start": "2026-03-04T00:00:00Z",
+            "window_end": "2026-03-05T00:00:00Z",
+            "calendar_id": "work@example.com",
+        }
+    )
+    assert intents is not None
+    assert len(intents) == 1
+    assert (
+        intents[0]["destination"]
+        == "https://www.googleapis.com/calendar/v3/calendars/work%40example.com/events"
+    )

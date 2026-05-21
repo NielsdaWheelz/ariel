@@ -330,6 +330,7 @@ def test_google_cutover_read_outputs_reject_legacy_results_shape(capability_id: 
                     }
                 ],
                 "retrieved_at": "2026-03-03T12:00:00Z",
+                "total_estimate": 1,
             },
         ),
         (
@@ -391,6 +392,7 @@ def test_google_cutover_gmail_search_accepts_message_refs_that_need_read() -> No
                 }
             ],
             "retrieved_at": "2026-03-03T12:00:00Z",
+            "total_estimate": 1,
         },
     )
 
