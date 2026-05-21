@@ -112,6 +112,7 @@ def _execute(
 def _calendar_events_output(event: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema_version": "google.calendar.events.v1",
+        "status": "succeeded",
         "events": [event],
         "retrieved_at": "2026-03-03T12:00:00Z",
         "window_start": "2026-03-04T00:00:00Z",
@@ -186,6 +187,7 @@ def test_google_cutover_read_outputs_reject_legacy_results_shape(capability_id: 
             "cap.calendar.list",
             {
                 "schema_version": "google.calendar.events.v1",
+                "status": "succeeded",
                 "events": [
                     {
                         "event_id": "evt_1",
@@ -312,6 +314,7 @@ def test_google_cutover_read_outputs_reject_legacy_results_shape(capability_id: 
             "cap.email.search",
             {
                 "schema_version": "google.gmail.message_refs.v1",
+                "status": "succeeded",
                 "messages": [
                     {
                         "message_id": "msg_1",
@@ -374,6 +377,7 @@ def test_google_cutover_gmail_search_accepts_message_refs_that_need_read() -> No
         "cap.email.search",
         {
             "schema_version": "google.gmail.message_refs.v1",
+            "status": "succeeded",
             "messages": [
                 {
                     "message_id": "msg_1",

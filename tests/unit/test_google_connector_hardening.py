@@ -1063,6 +1063,7 @@ def test_default_workspace_provider_email_undo_skips_immutable_system_labels(
 def test_calendar_list_validator_accepts_confirmed_event_and_cancelled_recurring_instance() -> None:
     payload: dict[str, Any] = {
         "schema_version": "google.calendar.events.v1",
+        "status": "succeeded",
         "retrieved_at": "2026-05-20T12:00:00Z",
         "window_start": "2026-05-20T00:00:00Z",
         "window_end": "2026-05-21T00:00:00Z",
@@ -1360,6 +1361,7 @@ def test_gmail_message_refs_validator_accepts_minimal_real_search_payload() -> N
     # internal_date can be ``None``.
     payload: dict[str, Any] = {
         "schema_version": "google.gmail.message_refs.v1",
+        "status": "succeeded",
         "retrieved_at": "2026-05-20T12:00:00Z",
         "total_estimate": None,
         "messages": [
@@ -1417,6 +1419,7 @@ def test_gmail_message_refs_validator_rejects_unknown_evidence_status() -> None:
 def _gmail_message_refs_payload_with_total_estimate(total_estimate: Any) -> dict[str, Any]:
     return {
         "schema_version": "google.gmail.message_refs.v1",
+        "status": "succeeded",
         "retrieved_at": "2026-05-20T12:00:00Z",
         "total_estimate": total_estimate,
         "messages": [

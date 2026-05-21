@@ -198,6 +198,7 @@ class FakeGoogleWorkspaceProvider:
         del access_token
         return {
             "schema_version": "google.calendar.events.v1",
+            "status": "succeeded",
             "events": [],
             "retrieved_at": "2026-03-06T12:00:00Z",
             "window_start": normalized_input["window_start"],
@@ -239,6 +240,7 @@ class FakeGoogleWorkspaceProvider:
         del access_token, normalized_input
         return {
             "schema_version": "google.gmail.message_refs.v1",
+            "status": "succeeded",
             "messages": [],
             "retrieved_at": "2026-03-06T12:00:00Z",
             "total_estimate": 0,

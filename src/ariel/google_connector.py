@@ -803,6 +803,7 @@ class DefaultGoogleWorkspaceProvider:
             "retrieved_at": to_rfc3339(_utcnow()),
             "window_start": window_start,
             "window_end": window_end,
+            "status": "succeeded",
         }
 
     def calendar_list_calendars(
@@ -1144,6 +1145,7 @@ class DefaultGoogleWorkspaceProvider:
             "messages": results,
             "retrieved_at": to_rfc3339(_utcnow()),
             "total_estimate": total_estimate,
+            "status": "succeeded",
         }
 
     def email_read(
@@ -3628,7 +3630,8 @@ def _is_google_calendar_events_output(payload: dict[str, Any]) -> bool:
     if payload.get("schema_version") != "google.calendar.events.v1" or "results" in payload:
         return False
     if not _has_only_keys(
-        payload, {"schema_version", "events", "retrieved_at", "window_start", "window_end"}
+        payload,
+        {"schema_version", "events", "retrieved_at", "window_start", "window_end", "status"},
     ):
         return False
     if not _has_non_empty_string(payload.get("retrieved_at")):
@@ -3636,6 +3639,8 @@ def _is_google_calendar_events_output(payload: dict[str, Any]) -> bool:
     if not _has_non_empty_string(payload.get("window_start")):
         return False
     if not _has_non_empty_string(payload.get("window_end")):
+        return False
+    if payload.get("status") != "succeeded":
         return False
     events = payload.get("events")
     if not isinstance(events, list):
@@ -3841,6 +3846,8 @@ def _is_google_gmail_message_refs_output(payload: dict[str, Any]) -> bool:
     if payload.get("schema_version") != "google.gmail.message_refs.v1" or "results" in payload:
         return False
     if not _has_non_empty_string(payload.get("retrieved_at")):
+        return False
+    if payload.get("status") != "succeeded":
         return False
     if "total_estimate" not in payload:
         return False

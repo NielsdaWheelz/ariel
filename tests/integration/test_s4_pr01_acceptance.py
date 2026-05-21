@@ -204,6 +204,7 @@ class FakeGoogleWorkspaceProvider:
             raise RuntimeError("insufficient_permissions")
         return {
             "schema_version": "google.calendar.events.v1",
+            "status": "succeeded",
             "events": [
                 {
                     "provider_account_id": "google",
@@ -382,6 +383,7 @@ class FakeGoogleWorkspaceProvider:
         query = normalized_input["query"]
         return {
             "schema_version": "google.gmail.message_refs.v1",
+            "status": "succeeded",
             "messages": [
                 {
                     "message_id": "msg-1",

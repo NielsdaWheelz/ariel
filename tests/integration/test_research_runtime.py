@@ -506,6 +506,7 @@ class FakeCalendarProvider:
         self.calendar_list_calls.append(dict(normalized_input))
         return {
             "schema_version": "google.calendar.events.v1",
+            "status": "succeeded",
             "events": [],
             "retrieved_at": "2026-05-19T10:00:00Z",
             "window_start": normalized_input["window_start"],

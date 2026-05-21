@@ -120,6 +120,7 @@ def _fat_calendar_event() -> dict[str, Any]:
 def _calendar_list_output(*events: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema_version": "google.calendar.events.v1",
+        "status": "succeeded",
         "events": list(events),
         "retrieved_at": "2026-05-20T12:00:00Z",
         "window_start": "2026-05-20T00:00:00Z",
