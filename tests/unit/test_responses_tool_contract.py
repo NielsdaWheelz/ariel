@@ -266,9 +266,7 @@ def test_run_callable_signatures_warn_about_email_read_invented_nulls() -> None:
 
     capability = get_capability("cap.email.read")
     assert capability is not None
-    _, error = capability.validate_input(
-        {"message_id": None, "thread_id": None, "mode": "message"}
-    )
+    _, error = capability.validate_input({"message_id": None, "thread_id": None, "mode": "message"})
     assert error == "schema_invalid"
 
 
