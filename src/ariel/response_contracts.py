@@ -113,12 +113,21 @@ class SurfaceModelUsageContract(BaseModel):
 class SurfaceTaintEvidenceContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # ``research_finding_in_context`` is the evidence kind that a research-
+    # completion ``agent_wake`` carries: the wake renders the finding into the
+    # main agent's context as untrusted-influenced content, so the wake's
+    # ``ingress_provenance`` records it. ``research_mode`` (``web`` | ``personal``
+    # | ``memories``) and ``research_status`` (``complete`` | ``partial`` |
+    # ``failed``) mirror the producer in ``worker._agent_wake_context`` so the
+    # surface can show *which* research run motivated the proposal. See
+    # ``docs/modules/agent-loop.md`` (The completion wake).
     kind: Literal[
         "prior_tool_output_in_context",
         "runtime_provenance_missing",
         "runtime_provenance_evidence_malformed",
         "capture_shared_content_ingress",
         "attachment_content_read",
+        "research_finding_in_context",
     ]
     turn_id: str | None = None
     action_attempt_id: str | None = None
@@ -127,6 +136,8 @@ class SurfaceTaintEvidenceContract(BaseModel):
     attachment_ref: str | None = None
     filename: str | None = None
     modality: str | None = None
+    research_mode: Literal["web", "personal", "memories"] | None = None
+    research_status: Literal["complete", "partial", "failed"] | None = None
 
 
 class SurfaceRuntimeProvenanceContract(BaseModel):
