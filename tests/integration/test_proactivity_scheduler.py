@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-import json
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -9,7 +8,6 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-import ariel.memory as memory
 from ariel.action_runtime import RuntimeProvenance
 from ariel.app import create_app
 from ariel.persistence import (
@@ -34,28 +32,9 @@ NOW = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
 
 
 def _stub_memory_retriever(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stub the retriever's bounded model call so a wake's per-turn ``recall``
-    is hermetic: the retriever subagent selects no facts from the empty store."""
-
-    class _Response:
-        status_code = 200
-
-        def json(self) -> dict[str, Any]:
-            return {
-                "id": "resp_retriever_stub",
-                "output": [
-                    {
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": json.dumps({"facts": []})}],
-                    }
-                ],
-            }
-
-        def raise_for_status(self) -> None:
-            return None
-
-    monkeypatch.setattr(memory.httpx, "post", lambda *args, **kwargs: _Response())
+    """Stub embed_text so the per-turn ``recall`` is hermetic: writes get a
+    null vector and search runs purely on tsquery — no network."""
+    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, adapter, settings: None)
 
 
 # ===========================================================================

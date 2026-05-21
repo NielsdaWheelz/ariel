@@ -16,6 +16,7 @@ from ariel.action_runtime import (
     process_one_call,
 )
 from ariel.app import _new_id, _utcnow
+from ariel.config import MEMORY_EMBEDDING_DIMENSIONS
 from ariel.google_connector import GoogleConnectorRuntime
 from ariel.model_adapter import (
     ModelAdapter,
@@ -459,6 +460,17 @@ class FakeModelAdapter(ModelAdapter):
 
     async def call(self, request: ModelCall) -> ModelResponse:  # type: ignore[override]  # justify-test-fake
         return self._respond(request)
+
+    async def embed(  # type: ignore[override]  # justify-test-fake
+        self, texts: list[str], tier: ModelTier = ModelTier.EMBEDDING
+    ) -> list[list[float]]:
+        del tier
+        # Stub: zero vectors of the configured DB-column width. Tests that
+        # exercise memory writes/searches go through ``embed_text``; the
+        # production adapter would hit OpenAIEmbeddingModel which the fake
+        # never instantiated (``__init__`` is bypassed). Override on the
+        # subclass if a test cares about vector content / ranking.
+        return [[0.0] * MEMORY_EMBEDDING_DIMENSIONS for _ in texts]
 
 
 def process_queued_action_execution(client: TestClient, approval_payload: dict[str, Any]) -> bool:

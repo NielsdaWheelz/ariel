@@ -638,6 +638,11 @@ def _execute_memory_capability(
     """
     if settings is None:
         raise RuntimeError("memory_runtime_settings_not_bound")
+    # Every memory branch — recall, search, read, note.*, remember — needs the
+    # adapter (for the EMBEDDING tier on writes, for the retriever subagent on
+    # recall). Bind once at the top so each branch can use it without re-guards.
+    if model_adapter is None:
+        raise RuntimeError("memory_runtime_adapter_not_bound")
 
     # Deferred import — ariel.memory imports ariel.agent_loop which imports
     # back from this module; doing the import here breaks the import-time
@@ -654,7 +659,7 @@ def _execute_memory_capability(
     )
 
     if capability_id == "cap.memory.recall":
-        if sandbox is None or model_adapter is None or turn is None or caller_db is None:
+        if sandbox is None or turn is None or caller_db is None:
             raise RuntimeError("memory_runtime_not_bound")
         _add_event = add_event if add_event is not None else lambda _t, _p: None
         recall = run_retriever(
@@ -707,6 +712,7 @@ def _execute_memory_capability(
                 hits = search_memory(
                     db,
                     query=query,
+                    adapter=model_adapter,
                     settings=settings,
                     limit=limit,
                     since=since,
@@ -751,6 +757,7 @@ def _execute_memory_capability(
                     db,
                     content=str(normalized_input["content"]),
                     taint="clean",
+                    adapter=model_adapter,
                     settings=settings,
                     now=now_fn(),
                     new_id_fn=new_id_fn,
@@ -764,6 +771,7 @@ def _execute_memory_capability(
                     db,
                     note_id=str(normalized_input["id"]),
                     content=str(normalized_input["content"]),
+                    adapter=model_adapter,
                     settings=settings,
                     now=now_fn(),
                     new_id_fn=new_id_fn,
@@ -777,6 +785,7 @@ def _execute_memory_capability(
                 delete_note(
                     db,
                     note_id=note_id,
+                    adapter=model_adapter,
                     settings=settings,
                     now=now_fn(),
                     new_id_fn=new_id_fn,

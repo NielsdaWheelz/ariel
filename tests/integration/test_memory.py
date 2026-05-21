@@ -56,7 +56,7 @@ _EMIT_MSG = "agent.emit_message(text='hello')\n"
 def _app(postgres_url: str, adapter: ModelAdapter, monkeypatch: pytest.MonkeyPatch) -> Any:
     """Build a ``create_app`` instance with embed_text stubbed out."""
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
-    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
+    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, adapter, settings: None)
     return create_app(
         database_url=postgres_url,
         model_adapter=adapter,
@@ -448,7 +448,7 @@ def test_worker_accepts_memory_encode_and_memory_dream(
     from ariel.persistence import enqueue_background_task
 
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
-    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
+    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, adapter, settings: None)
     app = create_app(
         database_url=postgres_url,
         model_adapter=_TwoPhaseAdapter(),
@@ -713,7 +713,7 @@ def test_run_rememberer_dream_succeeds_with_no_user_session(
     from ariel.persistence import SYSTEM_SESSION_ID, SessionRecord, TurnRecord
 
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
-    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
+    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, adapter, settings: None)
     settings = AppSettings()
 
     engine = create_engine(postgres_url, future=True, pool_pre_ping=True)
@@ -777,7 +777,7 @@ def test_run_rememberer_dream_self_heals_if_system_session_missing(
     from ariel.persistence import SYSTEM_SESSION_ID, SessionRecord, TurnRecord
 
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
-    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
+    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, adapter, settings: None)
     settings = AppSettings()
 
     engine = create_engine(postgres_url, future=True, pool_pre_ping=True)
@@ -850,7 +850,7 @@ def test_worker_memory_dream_task_inserts_turn_against_system_session(
     from ariel.persistence import SYSTEM_SESSION_ID, TurnRecord, enqueue_background_task
 
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
-    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
+    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, adapter, settings: None)
     app = create_app(
         database_url=postgres_url,
         model_adapter=_DreamCompleteAdapter(),

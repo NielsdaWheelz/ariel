@@ -665,6 +665,7 @@ def run_agent_loop(
                 turn_id=turn.id,
                 taint=taint,
                 source_ref=turn.id,
+                adapter=model_adapter,
                 settings=settings,
                 now=now_fn(),
                 new_id_fn=new_id_fn,

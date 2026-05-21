@@ -21,12 +21,12 @@ background-task enqueueing.  It makes no relevance, importance, ranking, or
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal
 
-import httpx
 import ulid
 from pydantic_ai.messages import ModelRequest, SystemPromptPart, UserPromptPart
 from sqlalchemy import func, select
@@ -124,50 +124,30 @@ _REMEMBERER_DREAM_PROMPT = (
 # ---------------------------------------------------------------------------
 
 
-def embed_text(text: str, *, settings: AppSettings) -> list[float]:
-    """Embed ``text`` with the configured OpenAI embedding model."""
-    if settings.memory_embedding_provider != "openai":
-        raise RuntimeError(
-            f"unsupported memory embedding provider: {settings.memory_embedding_provider}"
-        )
-    if settings.openai_api_key is None:
-        raise RuntimeError("ARIEL_OPENAI_API_KEY is required for memory embeddings")
+def embed_text(text: str, *, adapter: ModelAdapter, settings: AppSettings) -> list[float]:
+    """Embed ``text`` via the shared ``ModelAdapter``'s EMBEDDING tier.
 
-    response = httpx.post(
-        "https://api.openai.com/v1/embeddings",
-        headers={
-            "Authorization": f"Bearer {settings.openai_api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": settings.memory_embedding_model,
-            "input": " ".join(text.split()),
-            "dimensions": settings.memory_embedding_dimensions,
-            "encoding_format": "float",
-        },
-        timeout=settings.model_timeout_seconds,
-    )
+    The adapter is async; we bridge with ``asyncio.run`` because the rest of
+    the memory path is sync — same pattern as ``agent_loop.py``. The DB column
+    is fixed-width so we validate the response dimension here and raise on
+    mismatch; callers (``append_log_event`` / ``create_note`` / ``edit_note``
+    / ``search_memory``) catch ``RuntimeError`` to fall back to a null vector.
+
+    Any provider-side failure (missing credentials, network, malformed
+    response) is wrapped in ``RuntimeError`` so the fail-soft contract holds
+    regardless of which substrate the EMBEDDING tier resolves to.
+    """
     try:
-        response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        raise RuntimeError(
-            f"memory embedding request failed: HTTP {exc.response.status_code}"
-        ) from exc
-
-    payload = response.json()
-    data = payload.get("data") if isinstance(payload, dict) else None
-    first = data[0] if isinstance(data, list) and data else None
-    vector = first.get("embedding") if isinstance(first, dict) else None
-    if not isinstance(vector, list):
-        raise RuntimeError("memory embedding response missing vector")
+        vectors = asyncio.run(adapter.embed([" ".join(text.split())]))
+    except Exception as exc:  # noqa: BLE001 — justify-embedding-fail-soft
+        raise RuntimeError(f"memory embedding failed: {exc}") from exc
+    vector = vectors[0]
     if len(vector) != settings.memory_embedding_dimensions:
         raise RuntimeError(
             "memory embedding response dimension mismatch: "
             f"expected {settings.memory_embedding_dimensions}, got {len(vector)}"
         )
-    if not all(isinstance(item, int | float) for item in vector):
-        raise RuntimeError("memory embedding response vector must be numeric")
-    return [float(item) for item in vector]
+    return vector
 
 
 # ---------------------------------------------------------------------------
@@ -197,17 +177,20 @@ def append_log_event(
     turn_id: str | None,
     taint: Literal["clean", "tainted"],
     source_ref: str | None,
+    adapter: ModelAdapter,
     settings: AppSettings,
     now: datetime,
     new_id_fn: Callable[[str], str],
 ) -> MemoryLogRecord:
     """Append one event to the raw log inside the caller's transaction.
 
-    Computes the embedding via ``embed_text``; on ``RuntimeError`` (network
-    failure) inserts with ``embedding=None`` (null = pending, to be backfilled).
+    Computes the embedding via ``embed_text``; on ``RuntimeError`` (dimension
+    mismatch) inserts with ``embedding=None`` (null = pending, to be backfilled).
+    Provider/network errors from the EMBEDDING tier propagate — the loop's
+    ``model_failed`` exhaustion path handles them.
     """
     try:
-        embedding: list[float] | None = embed_text(content, settings=settings)
+        embedding: list[float] | None = embed_text(content, adapter=adapter, settings=settings)
     except RuntimeError:
         embedding = None
 
@@ -247,13 +230,14 @@ def create_note(
     *,
     content: str,
     taint: Literal["clean", "tainted"],
+    adapter: ModelAdapter,
     settings: AppSettings,
     now: datetime,
     new_id_fn: Callable[[str], str],
 ) -> MemoryNoteRecord:
     """Insert a new curated note and append a ``note_create`` log event."""
     try:
-        embedding: list[float] | None = embed_text(content, settings=settings)
+        embedding: list[float] | None = embed_text(content, adapter=adapter, settings=settings)
     except RuntimeError:
         embedding = None
 
@@ -276,6 +260,7 @@ def create_note(
         turn_id=None,
         taint=taint,
         source_ref=note.id,
+        adapter=adapter,
         settings=settings,
         now=now,
         new_id_fn=new_id_fn,
@@ -288,6 +273,7 @@ def edit_note(
     *,
     note_id: str,
     content: str,
+    adapter: ModelAdapter,
     settings: AppSettings,
     now: datetime,
     new_id_fn: Callable[[str], str],
@@ -298,7 +284,7 @@ def edit_note(
         raise RuntimeError(f"edit_note: note {note_id!r} does not exist")
 
     try:
-        embedding: list[float] | None = embed_text(content, settings=settings)
+        embedding: list[float] | None = embed_text(content, adapter=adapter, settings=settings)
     except RuntimeError:
         embedding = None
 
@@ -316,6 +302,7 @@ def edit_note(
         turn_id=None,
         taint=note_taint,
         source_ref=note.id,
+        adapter=adapter,
         settings=settings,
         now=now,
         new_id_fn=new_id_fn,
@@ -327,6 +314,7 @@ def delete_note(
     db: Session,
     *,
     note_id: str,
+    adapter: ModelAdapter,
     settings: AppSettings,
     now: datetime,
     new_id_fn: Callable[[str], str],
@@ -348,6 +336,7 @@ def delete_note(
         turn_id=None,
         taint=note_taint,
         source_ref=note_id,
+        adapter=adapter,
         settings=settings,
         now=now,
         new_id_fn=new_id_fn,
@@ -363,6 +352,7 @@ def search_memory(
     db: Session,
     *,
     query: str,
+    adapter: ModelAdapter,
     settings: AppSettings,
     limit: int = 24,
     since: datetime | None = None,
@@ -382,7 +372,9 @@ def search_memory(
     ``"kind"`` is ``None`` for note-layer hits.
     """
     try:
-        query_embedding: list[float] | None = embed_text(query, settings=settings)
+        query_embedding: list[float] | None = embed_text(
+            query, adapter=adapter, settings=settings
+        )
     except RuntimeError:
         query_embedding = None
 

@@ -54,8 +54,8 @@ class AppSettings(BaseSettings):
     model_timeout_seconds: float = 30.0
     model_reasoning_effort: Literal["minimal", "low", "medium", "high"] = "medium"
     model_verbosity: str = "low"
-    memory_embedding_provider: str = "openai"
-    memory_embedding_model: str = "text-embedding-3-small"
+    # ``memory_embedding_dimensions`` is the DB column width invariant; the
+    # actual provider/model are resolved by the EMBEDDING tier in the adapter.
     memory_embedding_dimensions: int = MEMORY_EMBEDDING_DIMENSIONS
     auto_rotate_max_turns: int = 120
     auto_rotate_max_age_seconds: int = 172800
@@ -97,9 +97,11 @@ class AppSettings(BaseSettings):
     attachment_fetch_timeout_seconds: float = 10.0
     attachment_handle_ttl_seconds: int = 3600
     attachment_scanner_mode: str = "fail_closed"
-    attachment_openai_model: str = "gpt-5.5"
+    # Image/PDF extraction routes through the VISION tier on the shared
+    # ``ModelAdapter``. Audio transcription still calls OpenAI directly (no
+    # audio Model in pydantic-ai 1.99), and uses this audio-model name plus
+    # ``model_timeout_seconds`` for the timeout.
     attachment_openai_audio_model: str = "gpt-4o-transcribe"
-    attachment_openai_timeout_seconds: float = 30.0
     agency_socket_path: str = "/tmp/agency-daemon.sock"
     agency_allowed_repo_roots: str = ""
     agency_default_base_branch: str = "main"
@@ -329,17 +331,6 @@ class AppSettings(BaseSettings):
             raise ValueError("model_verbosity must be one of: low, medium, high")
         return normalized
 
-    @field_validator(
-        "memory_embedding_provider",
-        "memory_embedding_model",
-    )
-    @classmethod
-    def _memory_projection_text_settings_must_not_be_blank(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("memory projection settings must not be blank")
-        return normalized
-
     @field_validator("memory_embedding_dimensions")
     @classmethod
     def _memory_embedding_dimensions_must_match_schema(cls, value: int) -> int:
@@ -534,7 +525,6 @@ class AppSettings(BaseSettings):
     @field_validator(
         "discord_notification_timeout_seconds",
         "attachment_fetch_timeout_seconds",
-        "attachment_openai_timeout_seconds",
         "agency_timeout_seconds",
         "search_web_timeout_seconds",
         "search_news_timeout_seconds",
@@ -574,7 +564,6 @@ class AppSettings(BaseSettings):
 
     @field_validator(
         "attachment_blob_store_path",
-        "attachment_openai_model",
         "attachment_openai_audio_model",
     )
     @classmethod

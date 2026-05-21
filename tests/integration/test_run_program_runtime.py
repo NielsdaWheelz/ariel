@@ -35,6 +35,7 @@ from ariel.config import AppSettings
 from ariel.persistence import SessionRecord, TurnRecord
 from ariel.run_runtime import execute_run_program
 from ariel.sandbox_runtime import SandboxRuntime
+from tests.integration.responses_helpers import FakeModelAdapter
 
 NOW = datetime(2026, 5, 17, 12, 0, tzinfo=UTC)
 
@@ -131,6 +132,10 @@ def _execute(
         execute_google_reads_outside_transaction=False,
         agency_runtime=None,
         attachment_runtime=None,
+        # Memory syscalls need an adapter for embedding queries; FakeModelAdapter
+        # returns zero vectors so search degrades to text-only, which is what
+        # these run-runtime tests actually exercise.
+        model_adapter=FakeModelAdapter(),
         allowed_capability_ids=allowed_capability_ids,
         settings=settings,
         scratch={},

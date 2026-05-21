@@ -32,8 +32,8 @@ loop ends in one of three ways:
 This module does not import from ``app.py`` (the worker imports both, so an
 ``app.py`` import would close a layering cycle).  ``ResearchFinding`` lives in
 ``agent_loop.py`` so both this module and ``app.py`` can reference it without
-a cycle.  The model adapter is taken structurally via the small
-``ResearchModelAdapter`` protocol.
+a cycle.  The model adapter is the shared ``ModelAdapter`` from
+``src/ariel/model_adapter.py`` — no research-specific protocol.
 """
 
 from __future__ import annotations
