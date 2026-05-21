@@ -1896,6 +1896,7 @@ def test_calendar_list_calendars_output_valid_minimal() -> None:
                 "primary": True,
                 "access_role": "owner",
                 "time_zone": "Europe/Amsterdam",
+                "provider_account_id": "108887646973684316062",
             }
         ],
         "retrieved_at": "2026-05-21T12:00:00Z",
@@ -1909,6 +1910,27 @@ def test_calendar_list_calendars_output_rejects_missing_id() -> None:
         "schema_version": "google.calendar.calendar_list.v1",
         "calendars": [
             {
+                "summary": "Niels Calendar",
+                "primary": True,
+                "access_role": "owner",
+                "time_zone": "Europe/Amsterdam",
+                "provider_account_id": "108887646973684316062",
+            }
+        ],
+        "retrieved_at": "2026-05-21T12:00:00Z",
+        "status": "succeeded",
+    }
+    assert not is_typed_google_read_output(
+        capability_id="cap.calendar.list_calendars", payload=payload
+    )
+
+
+def test_calendar_list_calendars_output_rejects_missing_provider_account_id() -> None:
+    payload: dict[str, Any] = {
+        "schema_version": "google.calendar.calendar_list.v1",
+        "calendars": [
+            {
+                "calendar_id": "primary",
                 "summary": "Niels Calendar",
                 "primary": True,
                 "access_role": "owner",

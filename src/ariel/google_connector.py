@@ -3598,7 +3598,15 @@ def _is_google_calendar_calendar_list_output(payload: dict[str, Any]) -> bool:
         if not isinstance(item, dict):
             return False
         if not _has_only_keys(
-            item, {"calendar_id", "summary", "primary", "access_role", "time_zone"}
+            item,
+            {
+                "calendar_id",
+                "summary",
+                "primary",
+                "access_role",
+                "time_zone",
+                "provider_account_id",
+            },
         ):
             return False
         if not _has_non_empty_string(item.get("calendar_id")):
@@ -3610,6 +3618,8 @@ def _is_google_calendar_calendar_list_output(payload: dict[str, Any]) -> bool:
         if not _has_non_empty_string(item.get("access_role")):
             return False
         if not _is_string_or_none(item.get("time_zone")):
+            return False
+        if not _has_non_empty_string(item.get("provider_account_id")):
             return False
     return True
 
@@ -6084,6 +6094,12 @@ class GoogleConnectorRuntime:
                     for thread_message in messages:
                         if isinstance(thread_message, dict):
                             thread_message["provider_account_id"] = account_id
+            elif output_payload.get("schema_version") == "google.calendar.calendar_list.v1":
+                calendars = output_payload.get("calendars")
+                if isinstance(calendars, list):
+                    for calendar in calendars:
+                        if isinstance(calendar, dict):
+                            calendar["provider_account_id"] = account_id
             else:
                 output_payload["provider_account_id"] = account_id
         if not _is_typed_google_read_output(

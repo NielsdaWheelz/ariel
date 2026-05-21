@@ -4041,7 +4041,7 @@ RUN_CALLABLE_SIGNATURES: dict[str, str] = {
     # calendar.list_calendars: no arguments. Returns the calendars the user has
     # access to — primary, secondary, and subscribed — so the model can pass a
     # specific ``calendar_id`` to ``calendar.list``.
-    "calendar.list_calendars": "() -> {'schema_version': 'google.calendar.calendar_list.v1', 'calendars': list[{'calendar_id': str, 'summary': str, 'primary': bool, 'access_role': str, 'time_zone': str | None}], 'retrieved_at': str, 'status': 'succeeded'}",
+    "calendar.list_calendars": "() -> {'schema_version': 'google.calendar.calendar_list.v1', 'calendars': list[{'calendar_id': str, 'summary': str | None, 'primary': bool, 'access_role': str, 'time_zone': str | None, 'provider_account_id': str}], 'retrieved_at': str, 'status': 'succeeded'}",
     # email (read)
     # email.search: the only accepted key is ``query``. Returns
     # ``{messages: [{message_id, thread_id, subject, sender, ...}], ...}``;
