@@ -22,6 +22,7 @@ background-task enqueueing.  It makes no relevance, importance, ranking, or
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal
@@ -249,6 +250,24 @@ _LogKind = Literal[
 ]
 
 
+# Error-fallback messages the agent emits when it's stuck — "Calendar fetch
+# failed", "Email query unavailable", "Drive errored", "re-link in settings",
+# etc. Writing these to ``memory_log`` poisons future retrieval: the
+# retriever surfaces them as authoritative evidence of failure even when the
+# capability is now succeeding with real data, so the model re-emits the
+# same fallback and reinforces the pattern. Filter at the WRITE site so the
+# log never contains them. Deliberately tight: only matches the
+# failure-vocabulary the agent emits when stuck. "no events found" is NOT
+# matched — that can be legitimate. Note the explicit failure word at the
+# tail is what discriminates this from valid "no X found" content.
+_ASSISTANT_ERROR_FALLBACK_RE = re.compile(
+    r"^(calendar|email|drive|memory|inbox)\s*"
+    r"(fetch|query|search|request)?\s*(failed|unavailable|errored)\b"
+    r"|re-link in settings",
+    re.IGNORECASE,
+)
+
+
 def append_log_event(
     db: Session,
     *,
@@ -261,12 +280,20 @@ def append_log_event(
     settings: AppSettings,
     now: datetime,
     new_id_fn: Callable[[str], str],
-) -> MemoryLogRecord:
+) -> MemoryLogRecord | None:
     """Append one event to the raw log inside the caller's transaction.
 
     Computes the embedding via ``embed_text``; on ``RuntimeError`` (network
     failure) inserts with ``embedding=None`` (null = pending, to be backfilled).
+
+    Returns ``None`` when the row is skipped by an inbound filter — currently
+    only ``assistant_message`` rows whose content matches
+    ``_ASSISTANT_ERROR_FALLBACK_RE`` (error-fallback prose the agent emits
+    when stuck; see the regex docstring for why these poison the log).
     """
+    if kind == "assistant_message" and _ASSISTANT_ERROR_FALLBACK_RE.search(content):
+        return None
+
     try:
         embedding: list[float] | None = embed_text(content, settings=settings)
     except RuntimeError:

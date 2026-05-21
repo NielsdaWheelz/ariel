@@ -921,3 +921,172 @@ def test_worker_memory_dream_task_inserts_turn_against_system_session(
         assert all(t.status == "completed" for t in dream_turns), (
             "every memory_dream turn must reach status='completed'"
         )
+
+
+# ===========================================================================
+# Error-fallback assistant_message filter — these messages poison retrieval
+# when they live in ``memory_log``: the retriever surfaces them as evidence
+# of failure even when the capability is now succeeding with real data.
+# Filter at the WRITE site so the log never contains them.
+# ===========================================================================
+
+
+@pytest.mark.parametrize(
+    "fallback_text",
+    [
+        "Calendar fetch failed",
+        "Calendar query failed",
+        "Calendar fetch failed.",
+        "calendar fetch failed",
+        "Email search failed",
+        "Drive errored",
+        "Inbox unavailable",
+        "Memory query failed",
+        "Email errored — please re-link in settings.",
+        # Pure "re-link in settings" should also filter.
+        "Try to re-link in settings and retry.",
+    ],
+)
+def test_append_log_event_skips_error_fallback_assistant_messages(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+    fallback_text: str,
+) -> None:
+    """An ``assistant_message`` whose text matches the error-fallback regex is
+    skipped at the write site: ``append_log_event`` returns ``None`` and no
+    row is inserted into ``memory_log``."""
+    from ariel.config import AppSettings
+    from ariel.memory import append_log_event
+    from ariel.persistence import MemoryLogRecord
+
+    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
+    settings = AppSettings()
+    now = datetime.now(tz=UTC)
+
+    with session_factory() as db:
+        with db.begin():
+            result = append_log_event(
+                db,
+                kind="assistant_message",
+                content=fallback_text,
+                session_id=None,
+                turn_id=None,
+                taint="clean",
+                source_ref=None,
+                settings=settings,
+                now=now,
+                new_id_fn=_new_id,
+            )
+        assert result is None, f"expected fallback {fallback_text!r} to be filtered"
+
+    with session_factory() as db:
+        rows = db.scalars(
+            select(MemoryLogRecord).where(MemoryLogRecord.content == fallback_text)
+        ).all()
+    assert rows == [], f"fallback {fallback_text!r} must not be written to memory_log"
+
+
+@pytest.mark.parametrize(
+    "legitimate_text",
+    [
+        "No emails from today.",
+        "Calendar — no events in the next 7 days.",
+        "You have 3 meetings tomorrow.",
+        "Drive search returned 2 files.",
+        "hello",
+        # "no X" phrases must pass — they describe a real empty result, not
+        # a connector failure.
+        "no events found",
+        "no matches for that query",
+    ],
+)
+def test_append_log_event_preserves_legitimate_assistant_messages(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+    legitimate_text: str,
+) -> None:
+    """An ``assistant_message`` that does not match the error-fallback regex
+    is written normally: ``append_log_event`` returns the row, and the row
+    exists in ``memory_log``."""
+    from ariel.config import AppSettings
+    from ariel.memory import append_log_event
+    from ariel.persistence import MemoryLogRecord
+
+    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
+    settings = AppSettings()
+    now = datetime.now(tz=UTC)
+
+    with session_factory() as db:
+        with db.begin():
+            result = append_log_event(
+                db,
+                kind="assistant_message",
+                content=legitimate_text,
+                session_id=None,
+                turn_id=None,
+                taint="clean",
+                source_ref=None,
+                settings=settings,
+                now=now,
+                new_id_fn=_new_id,
+            )
+        assert result is not None, f"legitimate message {legitimate_text!r} must be written"
+        written_id = result.id
+
+    with session_factory() as db:
+        row = db.get(MemoryLogRecord, written_id)
+    assert row is not None
+    assert row.kind == "assistant_message"
+    assert row.content == legitimate_text
+
+
+def test_append_log_event_filter_applies_only_to_assistant_messages(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The filter only suppresses ``assistant_message`` rows. Other event
+    kinds (``user_message``, ``agent_round``, ``tool_observation``,
+    ``proactive_trigger``) with matching text are written normally — the
+    user is allowed to say "calendar fetch failed" and the agent_round
+    JSON may legitimately contain that phrase as part of a syscall trace.
+    """
+    from ariel.config import AppSettings
+    from ariel.memory import append_log_event
+    from ariel.persistence import MemoryLogRecord
+
+    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
+    settings = AppSettings()
+    now = datetime.now(tz=UTC)
+    fallback_text = "Calendar fetch failed"
+
+    with session_factory() as db:
+        with db.begin():
+            for kind in (
+                "user_message",
+                "agent_round",
+                "tool_observation",
+                "proactive_trigger",
+            ):
+                result = append_log_event(
+                    db,
+                    kind=kind,  # type: ignore[arg-type]
+                    content=fallback_text,
+                    session_id=None,
+                    turn_id=None,
+                    taint="clean",
+                    source_ref=None,
+                    settings=settings,
+                    now=now,
+                    new_id_fn=_new_id,
+                )
+                assert result is not None, f"non-assistant kind {kind} must not be filtered"
+
+    with session_factory() as db:
+        rows = db.scalars(
+            select(MemoryLogRecord).where(MemoryLogRecord.content == fallback_text)
+        ).all()
+    kinds = {r.kind for r in rows}
+    assert kinds == {"user_message", "agent_round", "tool_observation", "proactive_trigger"}

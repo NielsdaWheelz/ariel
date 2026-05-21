@@ -37,6 +37,15 @@ message; proactive triggers append on wake; the rememberer's note mutations each
 append a `note_create`/`note_edit`/`note_delete` event. The model never writes
 the log directly.
 
+`append_log_event` skips one specific class of `assistant_message` rows at the
+write site: error-fallback prose the agent emits when it is stuck — "Calendar
+fetch failed", "Email errored", "re-link in settings", and similar. The regex
+`_ASSISTANT_ERROR_FALLBACK_RE` in `memory.py` is the source of truth; the
+filter is deliberately tight so that legitimate "no X found" messages still
+write. Without this rail those rows would surface in the retriever as
+authoritative evidence of failure even after the capability has recovered,
+making the model re-emit the same fallback and reinforce the pattern.
+
 ### `memory_notes` — the curated layer
 
 Flat, editable. One row per note. The agent authors and shapes it.

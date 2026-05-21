@@ -64,6 +64,15 @@ FALLBACK_TEST_NAME_ALLOWLIST = {
         "tests/integration/test_s4_pr03_acceptance.py::"
         "test_s4_pr03_attendee_reconnect_intent_requests_freebusy_and_closes_fallback_path"
     ): "calendar reconnect flow verifies a removed connector fallback path closes",
+    (
+        "tests/integration/test_memory.py::"
+        "test_append_log_event_skips_error_fallback_assistant_messages"
+    ): (
+        "memory write-site filter rejects error-fallback assistant prose ("
+        "'Calendar fetch failed', 're-link in settings', ...) so it cannot "
+        "poison the retriever; the 'fallback' here names the model behaviour "
+        "the filter blocks, not an AI-first judgment fallback path"
+    ),
 }
 _TEST_DEF_RE = re.compile(r"^(?P<path>[^:]+):\d+:def (?P<name>test_[^(]+)\(")
 _AI_JUDGMENT_CODE_RE = re.compile(r"E_AI_JUDGMENT_[A-Z_]+")
