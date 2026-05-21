@@ -3929,7 +3929,11 @@ RUN_CALLABLE_SIGNATURES: dict[str, str] = {
     "agent.emit_done": "(summary: str)",
     "agent.pause_until_input": "()",
     # memory.*
-    "memory.search": "(query: str, limit: int = 24, since: str | None = None, kinds: list[str] | None = None) -> {'hits': list[{'id', 'layer', 'kind', 'created_at', 'snippet', 'taint'}], 'status': 'succeeded'}",
+    # memory.search: both layers (memory_log + memory_notes) are always
+    # searched together — there is no layer-selector arg. ``kinds`` filters the
+    # log layer to specific event types only; pass it only with values from the
+    # enum below. ``since`` is RFC3339 (e.g. ``"2026-05-20T12:00:00Z"``).
+    "memory.search": "(query: str, limit: int = 24, since: str | None = None, kinds: list[Literal['user_message','agent_round','assistant_message','tool_observation','proactive_trigger','note_create','note_edit','note_delete','recall','research_finding']] | None = None) -> {'hits': list[{'id', 'layer', 'kind', 'created_at', 'snippet', 'taint'}], 'status': 'succeeded'}",
     "memory.read": "(id: str) -> {'id', 'layer', 'kind', 'created_at', 'content', 'taint'}",
     "memory.recall": "(query: str) -> {'summary', 'items': list, 'status'}",
     "memory.remember": "(note: str) -> {'task_id': str}",
