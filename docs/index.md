@@ -68,6 +68,8 @@ This directory is the canonical home for repository documentation.
 - [dev-environment.md](dev-environment.md): isolated local dev stack — `.env.dev`,
   parallel postgres on `:5435`, dev API on `:8001`, coexistence with the prod
   systemd services
+- [google-reconnect.md](google-reconnect.md): how to (re)connect Google and grant
+  identity + write scopes (Gmail send/modify, Calendar write, Drive share)
 
 ### Modules
 
