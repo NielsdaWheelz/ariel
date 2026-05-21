@@ -787,6 +787,14 @@ def run_agent_loop(
             for output_item in output_items:
                 if isinstance(output_item, dict) and output_item.get("type") == "function_call":
                     responses_input_items.append(jsonable_encoder(output_item))
+            # When a round runs capability syscalls alongside emit_value, surface
+            # their execution_output (bounded) so the model sees the actual data
+            # its tools returned — not just what it deliberately emitted. Without
+            # this the model is blind to syscall results across rounds and
+            # fabricates absence ("no events found") despite real data.
+            attempt_observations_value = _action_attempt_observations(
+                run_program_result.action_attempts
+            )
             if run_call_id:
                 responses_input_items.append(
                     {
@@ -798,6 +806,7 @@ def run_agent_loop(
                                 "emitted_values": jsonable_encoder(
                                     run_program_result.emitted_values
                                 ),
+                                "action_attempts": attempt_observations_value,
                             },
                             sort_keys=True,
                         ),
@@ -816,19 +825,15 @@ def run_agent_loop(
 
         if run_program_result.action_attempts:
             # Syscall trace: feed back so the model can author the next program.
+            # Each succeeded attempt's bounded ``execution_output`` is included
+            # so the model sees the actual data its capabilities returned.
+            # Without ``execution_output`` the model is blind across rounds —
+            # it sees only "cap.X succeeded" with no payload and fabricates
+            # absence ("no events found") despite real data being available.
             for output_item in output_items:
                 if isinstance(output_item, dict) and output_item.get("type") == "function_call":
                     responses_input_items.append(jsonable_encoder(output_item))
-            action_attempt_summary = [
-                {
-                    "action_attempt_id": a.id,
-                    "capability_id": a.capability_id,
-                    "status": a.status,
-                    "policy_decision": a.policy_decision,
-                    "approval_required": a.approval_required,
-                }
-                for a in run_program_result.action_attempts
-            ]
+            attempt_observations = _action_attempt_observations(run_program_result.action_attempts)
             if run_call_id:
                 responses_input_items.append(
                     {
@@ -838,7 +843,7 @@ def run_agent_loop(
                             {
                                 "status": "completed",
                                 "message_emitted": False,
-                                "action_attempts": action_attempt_summary,
+                                "action_attempts": attempt_observations,
                             },
                             sort_keys=True,
                         ),
@@ -849,7 +854,7 @@ def run_agent_loop(
                     "role": "system",
                     "content": (
                         "run program syscall trace:\n"
-                        + json.dumps(action_attempt_summary, sort_keys=True)
+                        + json.dumps(attempt_observations, sort_keys=True)
                         + "\n"
                         + cfg.action_trace_nudge
                     ),
@@ -1056,6 +1061,63 @@ def _merge_provenance(
         status=merged_status,
         evidence=tuple([*baseline.evidence, *ingress.evidence]),
     )
+
+
+# Per-attempt cap on the bytes of ``execution_output`` surfaced back to the
+# model in the syscall-trace / emit_value branches. Sized to fit a few rich
+# results (5 emails, 5 calendar events, 5 web hits) without overwhelming the
+# context window. Larger payloads are truncated and marked so the model knows
+# to ``scratch.get`` for the full value if it needs it.
+_MAX_ATTEMPT_OBSERVATION_OUTPUT_BYTES = 4096
+
+
+def _action_attempt_observations(
+    action_attempts: list[ActionAttemptRecord],
+) -> list[dict[str, Any]]:
+    """Build the per-attempt observation list fed back to the model.
+
+    Each entry carries the attempt's identity, rail decision, status, AND the
+    bounded ``execution_output`` of a succeeded read. This closes the data-flow
+    loop: capability → program → model context. Without ``execution_output``
+    the model is blind to syscall results across rounds — it sees only
+    ``cap.X succeeded`` with no payload — and fabricates absence ("no events
+    found") despite real data sitting on the attempt record.
+
+    Failed/blocked/denied attempts carry the safe ``execution_error`` so the
+    model can name the actual failure mode rather than guess at one.
+
+    Large outputs are truncated at ``_MAX_ATTEMPT_OBSERVATION_OUTPUT_BYTES``
+    and marked ``execution_output_truncated``; the full value is still on the
+    ``ActionAttemptRecord`` and was returned into the program at syscall time.
+    """
+
+    observations: list[dict[str, Any]] = []
+    for attempt in action_attempts:
+        entry: dict[str, Any] = {
+            "action_attempt_id": attempt.id,
+            "capability_id": attempt.capability_id,
+            "status": attempt.status,
+            "policy_decision": attempt.policy_decision,
+            "approval_required": attempt.approval_required,
+        }
+        if attempt.status == "succeeded" and attempt.execution_output is not None:
+            encoded = json.dumps(
+                jsonable_encoder(attempt.execution_output),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if len(encoded.encode("utf-8")) > _MAX_ATTEMPT_OBSERVATION_OUTPUT_BYTES:
+                entry["execution_output_truncated"] = True
+                entry["execution_output_bytes"] = len(encoded.encode("utf-8"))
+                # Still ship a prefix so the model has *something* to ground
+                # on, plus knows how much was elided.
+                entry["execution_output_prefix"] = encoded[:_MAX_ATTEMPT_OBSERVATION_OUTPUT_BYTES]
+            else:
+                entry["execution_output"] = jsonable_encoder(attempt.execution_output)
+        elif attempt.execution_error is not None:
+            entry["execution_error"] = attempt.execution_error
+        observations.append(entry)
+    return observations
 
 
 def _record_judgment(

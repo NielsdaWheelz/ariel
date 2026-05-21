@@ -18,12 +18,16 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 from ariel.app import create_app
+from ariel.persistence import MemoryLogRecord
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.responses_helpers import (
     empty_recall_response,
@@ -395,3 +399,168 @@ def test_main_loop_budget_exhaustion_uses_canned_line_when_summary_empty(
         # Empty model summary → existing canned line emission path.
         assert turn.assistant_message == ("I wasn't able to finish that within the time available.")
         assert adapter.constrained_calls == 1
+
+
+# ===========================================================================
+# Test 4 — succeeded read capability's execution_output is surfaced to the
+# model on the next round so its emit_message can be grounded.
+#
+# Structural bug fixed: prior to this, the syscall-trace branch of
+# ``run_agent_loop`` fed back only ``{action_attempt_id, capability_id,
+# status, policy_decision, approval_required}`` — stripping the actual
+# ``execution_output``. The model saw "cap.X succeeded" with no payload and
+# either fabricated absence ("no events found") or guessed at content. The
+# rail closes the data-flow loop: capability → program → model context.
+# ===========================================================================
+
+
+_DISTINCTIVE_SNIPPET = "Weekly Career Meeting at Fractal Tech"
+
+
+@dataclass
+class _SyscallThenMessageAdapter:
+    """Round 1: program runs a read cap, emits NO message (falls into the
+    syscall-trace branch). Round 2: program emits a grounded message. The
+    test asserts round 2's input_items carry the round-1 cap's
+    ``execution_output`` — without the fix, only a status summary appears.
+    """
+
+    provider: str = "provider.exec-output"
+    model: str = "model.exec-output-v1"
+    main_call_count: int = 0
+    last_input_items: list[list[dict[str, Any]]] = field(default_factory=list)
+
+    def create_response(
+        self,
+        *,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
+        history: list[dict[str, Any]],
+        context_bundle: dict[str, Any],
+    ) -> dict[str, Any]:
+        if is_retriever_call(input_items):
+            return empty_recall_response(
+                provider=self.provider, model=self.model, input_items=input_items
+            )
+        del tools, user_message, history, context_bundle
+        self.main_call_count += 1
+        self.last_input_items.append(list(input_items))
+        if self.main_call_count == 1:
+            # Round 1: search memory, store nothing in scratch, emit no message
+            # — this exercises the syscall-trace branch on the next round.
+            source = (
+                "result = memory.search(query='career meeting')\n"
+                # No emit_message — the loop must continue.
+            )
+            return _run_response(
+                source, provider=self.provider, model=self.model, rid="resp_round1"
+            )
+        # Round 2: emit a grounded message. (The structural fix asserted here
+        # is about the input_items the model SEES, not the message text the
+        # adapter fabricates.)
+        return _run_response(
+            "agent.emit_message(text='Found one hit on your career meeting.')\n",
+            provider=self.provider,
+            model=self.model,
+            rid="resp_round2",
+        )
+
+
+def _seed_memory_log_hit(postgres_url: str, snippet: str) -> None:
+    """Insert a memory_log row the search query can find, so ``cap.memory.search``
+    returns a non-empty ``hits`` payload (the data that must reach the model)."""
+    engine = create_engine(postgres_url, future=True)
+    session_factory = sessionmaker(bind=engine, future=True, expire_on_commit=False)
+    with session_factory() as db:
+        with db.begin():
+            db.add(
+                MemoryLogRecord(
+                    id="mev_test_distinctive_hit",
+                    created_at=datetime.now(tz=UTC),
+                    kind="user_message",
+                    content=snippet,
+                    embedding=None,
+                    session_id=None,
+                    turn_id=None,
+                    taint="clean",
+                    source_ref=None,
+                )
+            )
+
+
+def test_succeeded_read_execution_output_reaches_next_round_context(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A round that runs ``memory.search`` and emits no message must surface
+    that call's ``execution_output`` (containing the seeded snippet) in the
+    NEXT round's ``input_items`` — both in the structured ``function_call_output``
+    payload and in the human-readable syscall-trace system message.
+
+    Without the fix the model sees only ``{capability_id, status, ...}`` with
+    no payload, is structurally blind to what its tool returned, and produces
+    hollow responses.
+    """
+
+    monkeypatch.setenv("ARIEL_MAX_CONTEXT_TOKENS", "20000")
+    monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "20000")
+    monkeypatch.setenv("ARIEL_MAIN_TURN_BUDGET_SECONDS", "300.0")
+    monkeypatch.setenv("ARIEL_AGENT_LOOP_MAX_MODEL_CALLS", "100")
+
+    adapter = _SyscallThenMessageAdapter()
+    with _build_client(postgres_url, adapter) as client:
+        _seed_memory_log_hit(postgres_url, _DISTINCTIVE_SNIPPET)
+        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
+        turn = post_message_and_drain(client, session_id, message="what's on my career meeting?")
+
+    assert turn.status == "completed"
+    assert adapter.main_call_count == 2
+
+    # Round 2 input_items must contain the seeded snippet — proof the
+    # execution_output of round 1's memory.search reached the model context.
+    round2_items = adapter.last_input_items[1]
+
+    # The function_call_output for the run call must carry the action_attempts
+    # observation list, and that list must include the execution_output payload
+    # (the hits with the seeded snippet) — not just a status summary.
+    function_call_outputs = [
+        item for item in round2_items if item.get("type") == "function_call_output"
+    ]
+    found_output_in_structured = False
+    for fc_out in function_call_outputs:
+        body = json.loads(fc_out["output"])
+        attempts = body.get("action_attempts")
+        if not isinstance(attempts, list):
+            continue
+        for attempt in attempts:
+            exec_output = attempt.get("execution_output")
+            if not isinstance(exec_output, dict):
+                continue
+            hits = exec_output.get("hits")
+            if isinstance(hits, list) and any(
+                isinstance(h, dict) and _DISTINCTIVE_SNIPPET in str(h.get("snippet", ""))
+                for h in hits
+            ):
+                found_output_in_structured = True
+                break
+        if found_output_in_structured:
+            break
+    assert found_output_in_structured, (
+        "Round 2 must receive the round-1 memory.search execution_output "
+        "(carrying the seeded distinctive snippet) in the function_call_output "
+        "payload. Without this the model is blind to capability results."
+    )
+
+    # The human-readable system "syscall trace" block must also contain the
+    # snippet — defense in depth for models that parse system text more than
+    # structured tool outputs.
+    system_blocks = [
+        item.get("content", "")
+        for item in round2_items
+        if item.get("role") == "system" and isinstance(item.get("content"), str)
+    ]
+    assert any(_DISTINCTIVE_SNIPPET in block for block in system_blocks), (
+        "Round 2 must include the syscall-trace system block with the "
+        "memory.search execution_output containing the seeded snippet."
+    )
