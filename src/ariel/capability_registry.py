@@ -3835,6 +3835,12 @@ _ACTION_LABELS_BY_CAPABILITY_ID = {
     "cap.email.send": "Send email",
     "cap.email.trash": "Move email to trash",
     "cap.email.undo": "Undo email change",
+    "cap.memory.remember": "Save to memory",
+    "cap.memory.note.create": "Create memory note",
+    "cap.memory.note.edit": "Edit memory note",
+    "cap.memory.note.delete": "Delete memory note",
+    "cap.proactive.schedule": "Schedule reminder",
+    "cap.research.investigate": "Start research",
 }
 
 
@@ -3908,6 +3914,56 @@ def run_callable_name_for_capability_id(capability_id: str) -> str | None:
         if mapped_capability_id == capability_id:
             return name
     return None
+
+
+# One short keyword-args signature per syscall callable, surfaced both in the
+# eligible-callables prompt block (so the model knows the contract up front)
+# and inside the blocked-call response when a schema_invalid rejection fires
+# (so the model can self-correct mid-program). Optional args use ``= None`` /
+# default-value notation; keys not present here render as bare names.
+RUN_CALLABLE_SIGNATURES: dict[str, str] = {
+    # agent.* — sandbox-level syscalls, not in the capability registry.
+    "agent.emit_message": "(text: str)",
+    "agent.emit_value": "(value: Any)",
+    "agent.emit_finding": "(summary: str, claims: list, gaps: list, sources: list)",
+    "agent.emit_done": "(summary: str)",
+    "agent.pause_until_input": "()",
+    # memory.*
+    "memory.search": "(query: str, limit: int = 24, since: str | None = None, kinds: list[str] | None = None) -> {'hits': list[{'id', 'layer', 'kind', 'created_at', 'snippet', 'taint'}], 'status': 'succeeded'}",
+    "memory.read": "(id: str) -> {'id', 'layer', 'kind', 'created_at', 'content', 'taint'}",
+    "memory.recall": "(query: str) -> {'summary', 'items': list, 'status'}",
+    "memory.remember": "(note: str) -> {'task_id': str}",
+    "memory.note.create": "(content: str) -> {'id', 'status'}",
+    "memory.note.edit": "(id: str, content: str) -> {'id', 'status'}",
+    "memory.note.delete": "(id: str) -> {'id', 'status'}",
+    # search / web
+    "search.web": "(query: str)",
+    "search.news": "(query: str)",
+    "web.extract": "(url: str)",
+    # research
+    "research.investigate": "(question: str, mode: 'web' | 'personal' | 'memories')",
+    # calendar (read)
+    "calendar.list": "(window_start: str, window_end: str)",
+    # email (read)
+    "email.search": "(query: str)",
+    "email.read": "(message_id: str | None = None, thread_id: str | None = None, mode: str | None = None)",
+    # drive (read)
+    "drive.search": "(query: str)",
+    "drive.read": "(file_id: str)",
+    # maps
+    "maps.search_places": "(query: str, location_context: str | None = None, radius_meters: int | None = None)",
+    # weather
+    "weather.forecast": "(location: str | None = None, timeframe: str | None = None)",
+    # proactive
+    "proactive.schedule": "(when: str, note: str)",
+    # attachment
+    "attachment.read": "(attachment_ref: str, intent: str)",
+}
+
+
+def run_callable_signature(name: str) -> str:
+    """Return ``(args)`` for ``name`` or the empty string if unknown."""
+    return RUN_CALLABLE_SIGNATURES.get(name, "")
 
 
 def capability_contract_hash(capability: CapabilityDefinition) -> str:

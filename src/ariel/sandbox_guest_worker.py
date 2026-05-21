@@ -51,6 +51,7 @@ _ALLOWED_IMPORTS = frozenset(
         "calendar",
         "zoneinfo",
         "unicodedata",
+        "typing",
     }
 )
 

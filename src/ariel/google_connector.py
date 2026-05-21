@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
@@ -31,6 +32,8 @@ from ariel.google_workspace_normalization import (
 )
 from ariel.redaction import redact_json_value, safe_failure_reason
 
+_log = logging.getLogger(__name__)
+
 
 GOOGLE_CONNECTOR_ID = "con_google"
 GOOGLE_PROVIDER = "google"
@@ -45,6 +48,12 @@ GOOGLE_GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
 GOOGLE_DRIVE_METADATA_READ_SCOPE = "https://www.googleapis.com/auth/drive.metadata.readonly"
 GOOGLE_DRIVE_READ_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
 GOOGLE_DRIVE_SHARE_SCOPE = "https://www.googleapis.com/auth/drive"
+# OpenID Connect identity scopes — without them the /oauth2/v3/userinfo call
+# in ``_exchange_authorization_code`` returns no profile data and the
+# connector stores ``account_email = "unknown-email"``.
+GOOGLE_OPENID_SCOPE = "openid"
+GOOGLE_USERINFO_EMAIL_SCOPE = "https://www.googleapis.com/auth/userinfo.email"
+GOOGLE_USERINFO_PROFILE_SCOPE = "https://www.googleapis.com/auth/userinfo.profile"
 
 GOOGLE_READ_CAPABILITY_SCOPES: dict[str, set[str]] = {
     "cap.calendar.list": {GOOGLE_CALENDAR_READ_SCOPE},
@@ -78,6 +87,15 @@ GOOGLE_RECONNECT_INTENT_EXTRA_SCOPES: dict[str, set[str]] = {
 }
 
 _GOOGLE_MINIMUM_READ_SCOPES = {GOOGLE_CALENDAR_READ_SCOPE, GOOGLE_GMAIL_READ_SCOPE}
+# Identity scopes are requested by default at OAuth start so the userinfo
+# call returns account_email / account_subject — but they are not required
+# for "connected" readiness, because pre-identity-scopes connectors are
+# still functional for Gmail/Calendar reads.
+_GOOGLE_DEFAULT_REQUESTED_SCOPES = _GOOGLE_MINIMUM_READ_SCOPES | {
+    GOOGLE_OPENID_SCOPE,
+    GOOGLE_USERINFO_EMAIL_SCOPE,
+    GOOGLE_USERINFO_PROFILE_SCOPE,
+}
 _READINESS_BLOCKING_FAILURE_CODES = {
     "consent_required",
     "scope_missing",
@@ -3332,7 +3350,7 @@ def _resolve_reconnect_scopes(
 ) -> tuple[list[str], str | None]:
     requested_scopes = set(_normalize_scope_list(granted_scopes))
     if not requested_scopes:
-        requested_scopes = set(_GOOGLE_MINIMUM_READ_SCOPES)
+        requested_scopes = set(_GOOGLE_DEFAULT_REQUESTED_SCOPES)
     normalized_intent = _normalize_capability_intent(capability_intent)
     if normalized_intent is not None:
         required_scopes = GOOGLE_CAPABILITY_SCOPES.get(normalized_intent)
@@ -3854,7 +3872,7 @@ def _is_google_gmail_message_evidence_output(payload: dict[str, Any]) -> bool:
     }
     if not _has_only_keys(evidence, allowed_evidence):
         return False
-    if _has_forbidden_text_key(evidence, allowed={"body_digest"}):
+    if _has_forbidden_text_key(evidence, allowed=allowed_evidence):
         return False
     read_outcome = payload.get("read_outcome")
     if not isinstance(read_outcome, dict):
@@ -3882,7 +3900,13 @@ def _is_google_gmail_message_evidence_output(payload: dict[str, Any]) -> bool:
         if not _has_non_empty_string(message_id):
             return False
         thread_id = message.get("thread_id")
-        if not _has_non_empty_string(thread_id):
+        # Degraded read outcomes (body_too_large, decode_failed, no_body) may
+        # not carry a thread_id when the body fetch failed before we could
+        # learn it. Require thread_id only on the "ok" path.
+        if read_status == "ok":
+            if not _has_non_empty_string(thread_id):
+                return False
+        elif thread_id is not None and not isinstance(thread_id, str):
             return False
         evidence_message_id = evidence.get("message_id")
         if not _has_non_empty_string(evidence_message_id) or evidence_message_id != message_id:
@@ -4025,6 +4049,15 @@ def _is_google_drive_share_output(payload: dict[str, Any]) -> bool:
         if not _has_non_empty_string(payload.get(key)):
             return False
     return True
+
+
+def _tuples_to_lists(value: Any) -> Any:
+    """Recursively convert tuples to lists so JSON-native validators accept them."""
+    if isinstance(value, dict):
+        return {k: _tuples_to_lists(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_tuples_to_lists(v) for v in value]
+    return value
 
 
 def _is_typed_google_read_output(*, capability_id: str, payload: dict[str, Any]) -> bool:
@@ -4563,7 +4596,7 @@ class GoogleConnectorRuntime:
                     retryable=False,
                 ) from exc
         else:
-            requested_scopes = sorted(_GOOGLE_MINIMUM_READ_SCOPES)
+            requested_scopes = sorted(_GOOGLE_DEFAULT_REQUESTED_SCOPES)
             normalized_capability_intent = None
         state_handle = f"st_{secrets.token_urlsafe(24)}"
         verifier = _pkce_verifier()
@@ -5886,6 +5919,13 @@ class GoogleConnectorRuntime:
                 auth_failure=None,
                 error="invalid_provider_output",
             )
+        # Provider methods build their payloads with ``dataclasses.asdict`` on
+        # frozen dataclasses whose fields use ``tuple[...]``. ``asdict``
+        # preserves tuples, but the typed-output validators below check
+        # ``isinstance(value, list)``. JSON has no tuple type, so normalize
+        # tuples to lists here — once, at the provider boundary — instead of
+        # widening every ``isinstance`` site downstream.
+        output_payload = _tuples_to_lists(output_payload)
         if provider_account_id is not None and provider_account_id.strip():
             account_id = provider_account_id.strip()
             if output_payload.get("schema_version") == "google.calendar.events.v1":
@@ -5915,6 +5955,14 @@ class GoogleConnectorRuntime:
             capability_id=capability_id,
             payload=output_payload,
         ):
+            try:
+                with open(f"/tmp/ariel-diag-{capability_id.replace('.', '_')}.json", "w") as _f:
+                    json.dump(output_payload, _f, default=str, indent=2)
+            except OSError:
+                pass
+            _log.warning(
+                "invalid_provider_output capability=%s (full payload in /tmp/)", capability_id
+            )
             return GoogleCapabilityExecutionResult(
                 status="failed",
                 output=None,

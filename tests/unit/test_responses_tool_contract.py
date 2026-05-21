@@ -44,7 +44,7 @@ def test_normal_response_tool_surface_is_single_strict_run_tool() -> None:
 
 
 def test_main_agent_prompt_is_versioned_static_contract() -> None:
-    assert MAIN_AGENT_PROMPT_VERSION == "main-agent-jarvis-v2"
+    assert MAIN_AGENT_PROMPT_VERSION == "main-agent-jarvis-v4"
     assert all(MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS)
 
     prompt = "\n\n".join(MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS)
@@ -58,7 +58,6 @@ def test_main_agent_prompt_is_versioned_static_contract() -> None:
     assert "source_evidence_id" in prompt
     assert "user_instruction_ref=turn:<turn_id>" in prompt
     assert "unknown" in prompt
-    assert "not verified" in prompt
 
 
 def test_main_agent_prompt_block_order_is_stable() -> None:

@@ -32,6 +32,7 @@ from pydantic_ai.messages import ModelRequest, SystemPromptPart, UserPromptPart
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from .capability_registry import run_callable_signature
 from .config import AppSettings
 from .model_adapter import ModelAdapter, ModelMessage
 from .persistence import (
@@ -59,9 +60,9 @@ from .response_contracts import validate_memory_recall_v1
 # Prompt-version constants
 # ---------------------------------------------------------------------------
 
-RETRIEVER_PROMPT_VERSION = "memory-retriever-v1"
-REMEMBERER_ENCODE_PROMPT_VERSION = "memory-rememberer-encode-v1"
-REMEMBERER_DREAM_PROMPT_VERSION = "memory-rememberer-dream-v1"
+RETRIEVER_PROMPT_VERSION = "memory-retriever-v3"
+REMEMBERER_ENCODE_PROMPT_VERSION = "memory-rememberer-encode-v2"
+REMEMBERER_DREAM_PROMPT_VERSION = "memory-rememberer-dream-v2"
 
 
 # ---------------------------------------------------------------------------
@@ -71,20 +72,24 @@ REMEMBERER_DREAM_PROMPT_VERSION = "memory-rememberer-dream-v1"
 _RETRIEVER_PROMPT = (
     "You are Ariel's memory retriever. Your job is to reconstruct the working "
     "context for the current wake by agentically searching the memory substrate. "
-    "You may call memory.search(query, limit, since, kinds) to search both the "
-    "raw log and the curated notes, and memory.read(id) to fetch the full content "
-    "of any row by id. Search broadly, read what looks relevant, and follow up "
-    "across multiple rounds if the first results lead to more useful entries. "
-    "When satisfied — or when you have covered both relevance-based recall and "
-    "recent-session continuity — call agent.emit_finding with: "
-    '{"summary": "<the reconstructed working context in plain language>", '
-    '"items": [{"id": ..., "layer": ..., "created_at": ..., "content": ..., '
-    '"taint": ...}, ...], "status": "complete"}. '
-    "If you exhaust your budget before finishing, the loop ends with status "
-    '"partial" automatically. The retriever fires on every wake — cover both '
-    "semantic relevance and recent session continuity so the main agent can act "
-    "without missing recent history. Do not invent ids; every id in items must "
-    "be a real id returned by a memory.search or memory.read call."
+    "The `agent` and `memory` namespaces are pre-injected globals in your run "
+    "program — do not import them. All syscall arguments are keyword arguments. "
+    "Call memory.search(query='...', limit=N, since='...', kinds=[...]) to search "
+    "both the raw log and the curated notes (query is required; limit/since/kinds "
+    "are optional). Call memory.read(id='...') to fetch the full content of any "
+    "row by id. Search broadly, read what looks relevant, and follow up across "
+    "multiple rounds if the first results lead to more useful entries. When "
+    "satisfied — or when you have covered both relevance-based recall and "
+    "recent-session continuity — call agent.emit_finding(summary='...', "
+    "claims=[{'id': ..., 'layer': ..., 'created_at': ..., 'content': ..., "
+    "'taint': ...}, ...], gaps=[], sources=[]). Exactly these four keyword "
+    "arguments are accepted; pass empty lists for gaps and sources when there "
+    "is nothing to report. If you exhaust your budget before finishing, the "
+    'loop ends with status "partial" automatically. The retriever fires on '
+    "every wake — cover both semantic relevance and recent session continuity "
+    "so the main agent can act without missing recent history. Do not invent "
+    "ids; every id in claims must be a real id returned by a memory.search or "
+    "memory.read call."
 )
 
 _REMEMBERER_ENCODE_PROMPT = (
@@ -92,15 +97,16 @@ _REMEMBERER_ENCODE_PROMPT = (
     '{"trigger": "encode", "note": "<what to remember>", ...}. '
     "Your job is to write this to the curated note layer, editing rather than "
     "duplicating when a related note already exists. "
-    "First call memory.search (with kinds omitted to search the curated layer) "
-    "to find relevant existing notes. Read candidates with memory.read(id) to "
-    "inspect their content. Then apply memory.note.create(content), "
-    "memory.note.edit(id, content), and/or memory.note.delete(id) as needed — "
-    "edit a note when the new material updates or extends it; delete a note "
-    "only when it is fully superseded. When done, call agent.emit_done with a "
-    "short string describing what you did (e.g. 'edited note mno_... to add "
-    "preference for dark mode'). The raw log is append-only and must never be "
-    "the target of note operations."
+    "First call memory.search(query='...') (with kinds omitted to search the "
+    "curated layer) to find relevant existing notes. Read candidates with "
+    "memory.read(id='...') to inspect their content. Then apply "
+    "memory.note.create(content='...'), memory.note.edit(id='...', content='...'), "
+    "and/or memory.note.delete(id='...') as needed — edit a note when the new "
+    "material updates or extends it; delete a note only when it is fully "
+    "superseded. All syscall arguments must be keyword arguments. When done, "
+    "call agent.emit_done(summary='...') with a short string describing what you "
+    "did. The raw log is append-only and must never be the target of note "
+    "operations."
 )
 
 _REMEMBERER_DREAM_PROMPT = (
@@ -108,14 +114,15 @@ _REMEMBERER_DREAM_PROMPT = (
     '{"trigger": "dream"}. '
     "Your job is to consolidate the recent raw log into the curated note layer: "
     "generalizations, summaries, connections, topic abstractions. "
-    "Read recent log events with memory.search (over the log; use the since "
-    "parameter to scope to recent time). Also search the curated layer for "
-    "existing notes to edit or delete rather than duplicate. Write new notes "
-    "with memory.note.create(content), update existing ones with "
-    "memory.note.edit(id, content), and delete superseded ones with "
-    "memory.note.delete(id). The raw log is append-only — only memory_notes "
-    "is mutable; never use note operations with a log id. When satisfied, call "
-    "agent.emit_done with a short summary of what you consolidated."
+    "Read recent log events with memory.search(query='...', since='...') (over "
+    "the log; use the since parameter to scope to recent time). Also search the "
+    "curated layer for existing notes to edit or delete rather than duplicate. "
+    "Write new notes with memory.note.create(content='...'), update existing "
+    "ones with memory.note.edit(id='...', content='...'), and delete superseded "
+    "ones with memory.note.delete(id='...'). All syscall arguments must be "
+    "keyword arguments. The raw log is append-only — only memory_notes is "
+    "mutable; never use note operations with a log id. When satisfied, call "
+    "agent.emit_done(summary='...') with a short summary of what you consolidated."
 )
 
 
@@ -502,7 +509,9 @@ def run_retriever(
     partial dict rather than raising; recall failure is non-fatal.
     """
     eligible_callables = ["memory.search", "memory.read", "agent.emit_finding"]
-    callable_lines = "\n".join(f"- {name}" for name in eligible_callables)
+    callable_lines = "\n".join(
+        f"- {name}{run_callable_signature(name)}" for name in eligible_callables
+    )
 
     retriever_parts: list[Any] = [
         SystemPromptPart(content=_RETRIEVER_PROMPT),
@@ -514,8 +523,11 @@ def run_retriever(
         ),
         SystemPromptPart(
             content=(
-                "syscall callables available this run "
-                "(call as namespace.member(...); results are returned inline):\n"
+                "syscall callables available this run. Their namespaces "
+                "(agent, memory) are pre-injected globals — do NOT import "
+                "them; `import ariel` fails. All arguments are keyword "
+                "arguments — the signature shown is the contract. Results "
+                "are returned inline:\n"
             )
             + callable_lines
         ),
@@ -682,14 +694,19 @@ def run_rememberer(
         "memory.note.delete",
         "agent.emit_done",
     ]
-    callable_lines = "\n".join(f"- {name}" for name in eligible_callables)
+    callable_lines = "\n".join(
+        f"- {name}{run_callable_signature(name)}" for name in eligible_callables
+    )
 
     rememberer_parts: list[Any] = [
         SystemPromptPart(content=system_prompt),
         SystemPromptPart(
             content=(
-                "syscall callables available this run "
-                "(call as namespace.member(...); results are returned inline):\n"
+                "syscall callables available this run. Their namespaces "
+                "(agent, memory) are pre-injected globals — do NOT import "
+                "them; `import ariel` fails. All arguments are keyword "
+                "arguments — the signature shown is the contract. Results "
+                "are returned inline:\n"
             )
             + callable_lines
         ),
@@ -798,19 +815,30 @@ def enqueue_due_memory_dream(
 ) -> str | None:
     """Self-gating periodic dream enqueuer.
 
-    Enqueues one ``memory_dream`` task when no dream has been enqueued within
-    the configured interval; otherwise returns ``None``.
+    Enqueues one ``memory_dream`` task when no dream task is currently queued
+    AND the last dream turn (queued, in_progress, or completed) is older than
+    ``memory_dream_interval_seconds``. Gating on ``turns`` rather than
+    ``background_tasks`` is essential: the queue row is deleted on completion,
+    so a queue-only check re-enqueues after every cycle (~1-2 minutes) instead
+    of honouring the configured interval (24h default).
     """
     interval = timedelta(seconds=settings.memory_dream_interval_seconds)
-    recent = db.scalar(
+    queued = db.scalar(
         select(BackgroundTaskRecord.id)
+        .where(BackgroundTaskRecord.task_type == "memory_dream")
+        .limit(1)
+    )
+    if queued is not None:
+        return None
+    recent_turn = db.scalar(
+        select(TurnRecord.id)
         .where(
-            BackgroundTaskRecord.task_type == "memory_dream",
-            BackgroundTaskRecord.created_at > now - interval,
+            TurnRecord.kind == "memory_dream",
+            TurnRecord.created_at > now - interval,
         )
         .limit(1)
     )
-    if recent is not None:
+    if recent_turn is not None:
         return None
     task = enqueue_background_task(db, task_type="memory_dream", payload={}, now=now)
     return task.id
