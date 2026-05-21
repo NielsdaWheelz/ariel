@@ -30,6 +30,9 @@ GOOGLE_DRIVE_SHARE_SCOPE = "https://www.googleapis.com/auth/drive"
 GOOGLE_GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 GOOGLE_GMAIL_COMPOSE_SCOPE = "https://www.googleapis.com/auth/gmail.compose"
 GOOGLE_CALENDAR_WRITE_SCOPE = "https://www.googleapis.com/auth/calendar.events"
+GOOGLE_OPENID_SCOPE = "openid"
+GOOGLE_USERINFO_EMAIL_SCOPE = "https://www.googleapis.com/auth/userinfo.email"
+GOOGLE_USERINFO_PROFILE_SCOPE = "https://www.googleapis.com/auth/userinfo.profile"
 
 
 @dataclass
@@ -784,6 +787,14 @@ def test_s6_pr01_drive_reconnect_intent_is_capability_scoped_and_least_privilege
         assert GOOGLE_GMAIL_SEND_SCOPE not in share_scopes
         assert GOOGLE_GMAIL_COMPOSE_SCOPE not in share_scopes
         assert GOOGLE_CALENDAR_WRITE_SCOPE not in share_scopes
+
+        # Reconnect must always union in the current default scope set so that
+        # identity scopes added to the default (openid/email/profile) reach
+        # users who first connected before those scopes existed.
+        for scopes in (search_scopes, read_scopes, share_scopes):
+            assert GOOGLE_OPENID_SCOPE in scopes
+            assert GOOGLE_USERINFO_EMAIL_SCOPE in scopes
+            assert GOOGLE_USERINFO_PROFILE_SCOPE in scopes
 
 
 def test_s6_pr01_drive_share_is_approval_gated_exact_payload_and_exactly_once(

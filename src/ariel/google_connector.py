@@ -3348,9 +3348,14 @@ def _resolve_reconnect_scopes(
     granted_scopes: list[str],
     capability_intent: str | None,
 ) -> tuple[list[str], str | None]:
-    requested_scopes = set(_normalize_scope_list(granted_scopes))
-    if not requested_scopes:
-        requested_scopes = set(_GOOGLE_DEFAULT_REQUESTED_SCOPES)
+    # Always request at least the current default set so that scopes added to
+    # the default after a user first connected (e.g. identity scopes) reach
+    # them on reconnect — without this union an existing user with only
+    # gmail.readonly + calendar.readonly granted would re-grant the same
+    # narrow set and never pick up openid/email/profile.
+    requested_scopes = set(_normalize_scope_list(granted_scopes)) | set(
+        _GOOGLE_DEFAULT_REQUESTED_SCOPES
+    )
     normalized_intent = _normalize_capability_intent(capability_intent)
     if normalized_intent is not None:
         required_scopes = GOOGLE_CAPABILITY_SCOPES.get(normalized_intent)
