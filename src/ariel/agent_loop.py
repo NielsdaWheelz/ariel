@@ -1131,6 +1131,60 @@ def _merge_provenance(
 _MAX_ATTEMPT_OBSERVATION_OUTPUT_BYTES = 4096
 
 
+def _project_calendar_list_output(output: dict[str, Any]) -> dict[str, Any]:
+    """Project a ``cap.calendar.list`` output down to model-useful fields only.
+
+    A single ``cap.calendar.list`` event with ~30 attendees plus
+    ``description_blocks``, ``conference_data``, ``raw_payload_digest``, and
+    ``provider_evidence_refs`` balloons past 8KB and gets truncated mid-JSON
+    by ``_MAX_ATTEMPT_OBSERVATION_OUTPUT_BYTES``, leaving the model with no
+    usable substance. The full payload is preserved on the
+    ``ActionAttemptRecord`` for audit; this projection is only for the bytes
+    fed back into the model's context.
+
+    Kept fields per event: ``event_id``, ``calendar_id``, ``status``,
+    ``summary``, ``start``, ``end``, ``all_day``, ``location``,
+    ``organizer_email`` (extracted), ``attendee_count`` (count, not list),
+    ``html_link`` (from ``provider_url``). Dropped: ``attendees`` list,
+    ``description_blocks``, ``conference_data``, ``raw_payload_digest``,
+    ``provider_evidence_refs``, plus the various redacted/digest/etag fields
+    the model does not act on.
+    """
+    events_raw = output.get("events")
+    if not isinstance(events_raw, list):
+        return output
+    projected_events: list[dict[str, Any]] = []
+    for event in events_raw:
+        if not isinstance(event, dict):
+            continue
+        organizer_raw = event.get("organizer")
+        organizer = organizer_raw if isinstance(organizer_raw, dict) else None
+        attendees_raw = event.get("attendees")
+        attendees: list[Any] = attendees_raw if isinstance(attendees_raw, list) else []
+        projected_events.append(
+            {
+                "event_id": event.get("event_id"),
+                "calendar_id": event.get("calendar_id"),
+                "status": event.get("status"),
+                "summary": event.get("summary"),
+                "start": event.get("start"),
+                "end": event.get("end"),
+                "all_day": event.get("all_day"),
+                "location": event.get("location"),
+                "organizer_email": organizer.get("email") if organizer is not None else None,
+                "attendee_count": len(attendees),
+                "html_link": event.get("provider_url"),
+            }
+        )
+    return {
+        "schema_version": output.get("schema_version"),
+        "events": projected_events,
+        "retrieved_at": output.get("retrieved_at"),
+        "window_start": output.get("window_start"),
+        "window_end": output.get("window_end"),
+    }
+
+
 def _action_attempt_observations(
     action_attempts: list[ActionAttemptRecord],
 ) -> list[dict[str, Any]]:
@@ -1149,6 +1203,14 @@ def _action_attempt_observations(
     Large outputs are truncated at ``_MAX_ATTEMPT_OBSERVATION_OUTPUT_BYTES``
     and marked ``execution_output_truncated``; the full value is still on the
     ``ActionAttemptRecord`` and was returned into the program at syscall time.
+
+    ``cap.calendar.list`` is projected down to model-useful fields by
+    ``_project_calendar_list_output`` BEFORE serialization: a single fat
+    event (~30+ attendees + description_blocks + raw_payload_digest +
+    conference_data + provider_evidence_refs) routinely overflows the 4KB
+    cap, leaving the model with a mid-JSON prefix and no grounding. Extend
+    by capability name when other capabilities exhibit the same symptom; do
+    NOT introduce a generic projection layer.
     """
 
     observations: list[dict[str, Any]] = []
@@ -1161,8 +1223,11 @@ def _action_attempt_observations(
             "approval_required": attempt.approval_required,
         }
         if attempt.status == "succeeded" and attempt.execution_output is not None:
+            output_for_model = jsonable_encoder(attempt.execution_output)
+            if attempt.capability_id == "cap.calendar.list" and isinstance(output_for_model, dict):
+                output_for_model = _project_calendar_list_output(output_for_model)
             encoded = json.dumps(
-                jsonable_encoder(attempt.execution_output),
+                output_for_model,
                 sort_keys=True,
                 separators=(",", ":"),
             )
@@ -1173,7 +1238,7 @@ def _action_attempt_observations(
                 # on, plus knows how much was elided.
                 entry["execution_output_prefix"] = encoded[:_MAX_ATTEMPT_OBSERVATION_OUTPUT_BYTES]
             else:
-                entry["execution_output"] = jsonable_encoder(attempt.execution_output)
+                entry["execution_output"] = output_for_model
         elif attempt.execution_error is not None:
             entry["execution_error"] = attempt.execution_error
         observations.append(entry)
