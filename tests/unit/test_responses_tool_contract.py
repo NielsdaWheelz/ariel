@@ -289,6 +289,39 @@ def test_internal_callable_eligibility_is_default_deny() -> None:
     assert "cap.weather.forecast" not in capability_ids
 
 
+def test_agency_capabilities_become_eligible_when_runtime_is_bound() -> None:
+    """The agency.* family is gated by ``runtime_bindings.agency`` (set true when
+    both ``ARIEL_AGENCY_ALLOWED_REPO_ROOTS`` is non-empty and the daemon socket
+    file exists; see app._tool_surface_facts and the inline predicate at the
+    turn-context build site). When the binding flips on, all four agency caps
+    become eligible. When off, none are."""
+
+    on = set(
+        _eligible_internal_callable_capability_ids(
+            tool_surface_facts={
+                "discord": {"available": True, "attachment_count": 0},
+                "runtime_bindings": {"agency": True},
+            }
+        )
+    )
+    assert {
+        "cap.agency.run",
+        "cap.agency.status",
+        "cap.agency.artifacts",
+        "cap.agency.request_pr",
+    }.issubset(on)
+
+    off = set(
+        _eligible_internal_callable_capability_ids(
+            tool_surface_facts={
+                "discord": {"available": True, "attachment_count": 0},
+                "runtime_bindings": {"agency": False},
+            }
+        )
+    )
+    assert not any(cap_id.startswith("cap.agency.") for cap_id in off)
+
+
 def test_run_source_is_a_python_program_string() -> None:
     """A valid run call carries a Python-program source string; it is not parsed
     as a flat-JSON call list. ``parse_run_function_call`` validates only the
