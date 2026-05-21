@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -297,9 +298,7 @@ def test_deliver_to_discord_pending_approval_adds_approval_line_and_buttons(
     # Approval line appended after a blank line.
     content = body["content"]
     assert "Shall I proceed?" in content
-    assert "Approval pending" in content
-    assert "ref_abc123" in content
-    assert "Use the buttons below." in content
+    assert "⏳ Send email — needs approval" in content
 
     # One action row with Approve and Deny buttons.
     components = body["components"]
@@ -347,8 +346,8 @@ def test_deliver_to_discord_multiple_pending_approvals_produces_one_row_each(
     body = posted_bodies[0]
 
     content = body["content"]
-    assert "ref_first" in content
-    assert "ref_second" in content
+    assert "⏳ Send email — needs approval" in content
+    assert "⏳ Calendar action — needs approval" in content
 
     components = body["components"]
     assert len(components) == 2
@@ -388,7 +387,8 @@ def test_deliver_to_discord_approval_with_expires_at_includes_suffix(
 
     assert len(posted_bodies) == 1
     content = posted_bodies[0]["content"]
-    assert "expires_at=2026-06-01T13:00:00Z" in content
+    expected_epoch = int(datetime(2026, 6, 1, 13, 0, 0, tzinfo=timezone.utc).timestamp())
+    assert f"⏳ Send email — needs approval (expires <t:{expected_epoch}:R>)" in content
 
 
 def test_deliver_to_discord_dm_posts_to_origin_channel_and_replies(
