@@ -17,7 +17,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.models import Model, ModelRequestParameters
 from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.google import GoogleModel
-from pydantic_ai.models.openai import OpenAIResponsesModel
+from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
 from pydantic_ai.output import OutputObjectDefinition
 from pydantic_ai.providers.anthropic import AnthropicProvider
 from pydantic_ai.providers.google import GoogleProvider
@@ -146,6 +146,17 @@ class ModelAdapter:
             )
         if binding.provider == "google":
             return GoogleModel(binding.model, provider=GoogleProvider(api_key=s.google_api_key))
+        if binding.provider == "cloudflare":
+            # Workers AI exposes only chat-completions + embeddings; the Responses
+            # API is OpenAI-only. Account id lives in the URL path; auth is a
+            # bearer token. See docs/ai-sdk-cutover.md and providers/cloudflare.
+            base_url = (
+                f"https://api.cloudflare.com/client/v4/accounts/{s.cloudflare_account_id}/ai/v1"
+            )
+            return OpenAIChatModel(
+                binding.model,
+                provider=OpenAIProvider(api_key=s.cloudflare_api_token, base_url=base_url),
+            )
         raise ValueError(f"unsupported provider {binding.provider!r} for tier model")
 
     def _build_embedder(self, binding: TierBinding) -> EmbeddingModel:
@@ -155,9 +166,15 @@ class ModelAdapter:
                 binding.model,
                 provider=OpenAIProvider(api_key=s.openai_api_key, base_url=s.openai_base_url),
             )
-        raise ValueError(
-            f"EMBEDDING tier provider {binding.provider!r} not yet supported; only openai"
-        )
+        if binding.provider == "cloudflare":
+            base_url = (
+                f"https://api.cloudflare.com/client/v4/accounts/{s.cloudflare_account_id}/ai/v1"
+            )
+            return OpenAIEmbeddingModel(
+                binding.model,
+                provider=OpenAIProvider(api_key=s.cloudflare_api_token, base_url=base_url),
+            )
+        raise ValueError(f"EMBEDDING tier provider {binding.provider!r} not yet supported")
 
     def tier_binding(self, tier: ModelTier) -> TierBinding:
         """Return the resolved ``TierBinding`` for ``tier``.

@@ -74,7 +74,7 @@ DEFAULT_TIERS: dict[ModelTier, TierBinding] = {
     ),
 }
 
-_SUPPORTED_PROVIDERS = frozenset({"openai", "anthropic", "google", "openrouter"})
+_SUPPORTED_PROVIDERS = frozenset({"openai", "anthropic", "google", "openrouter", "cloudflare"})
 
 
 def parse_tier_override(value: str) -> tuple[str, str]:

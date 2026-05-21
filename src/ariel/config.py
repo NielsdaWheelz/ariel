@@ -45,6 +45,8 @@ class AppSettings(BaseSettings):
     google_api_key: str | None = None
     openrouter_api_key: str | None = None
     openai_base_url: str | None = None
+    cloudflare_api_token: str | None = None
+    cloudflare_account_id: str | None = None
     model_tier_main: str | None = None
     model_tier_bulk: str | None = None
     model_tier_structured: str | None = None
@@ -163,6 +165,8 @@ class AppSettings(BaseSettings):
         "google_api_key",
         "openrouter_api_key",
         "openai_base_url",
+        "cloudflare_api_token",
+        "cloudflare_account_id",
         "model_tier_main",
         "model_tier_bulk",
         "model_tier_structured",

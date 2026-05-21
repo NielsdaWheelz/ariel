@@ -460,8 +460,7 @@ def _build_initial_messages(
                 "blocked/schema_invalid). The agent.* terminals "
                 "(agent.emit_message(text: str), "
                 "agent.emit_value(value: Any), "
-                "agent.pause_until_input()) are always available.\n"
-                + "\n".join(callable_lines)
+                "agent.pause_until_input()) are always available.\n" + "\n".join(callable_lines)
             )
 
     # 4. Tool surface facts

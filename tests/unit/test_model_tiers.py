@@ -15,6 +15,10 @@ def test_parse_tier_override_returns_provider_and_model() -> None:
         "openrouter",
         "deepseek/deepseek-chat-v4",
     )
+    assert parse_tier_override("cloudflare:@cf/baai/bge-m3") == (
+        "cloudflare",
+        "@cf/baai/bge-m3",
+    )
 
 
 @pytest.mark.parametrize(
