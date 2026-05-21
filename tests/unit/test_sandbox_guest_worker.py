@@ -51,3 +51,47 @@ def test_program_cannot_import_os_even_through_the_import_builtin() -> None:
         exec(  # noqa: S102
             compile("__import__('socket')\n", "<t>", "exec"), program_globals
         )
+
+
+def test_program_can_import_urllib_parse_for_url_text_parsing() -> None:
+    # ``urllib.parse`` is pure-text URL parsing — no network, no I/O. The
+    # model reached for it on a web-research run (smoke-B personal-research
+    # finding), where the sandbox rejected ``import urllib.parse`` and the
+    # program aborted. Pure-text utilities should not block normal use.
+    assert "urllib.parse" in _ALLOWED_IMPORTS
+    program_globals = _exec_program(
+        "from urllib.parse import urlparse\n"
+        "parsed = urlparse('https://example.com/path?q=1')\n"
+        "host = parsed.netloc\n"
+    )
+    assert program_globals["host"] == "example.com"
+
+
+def test_program_can_import_email_utils_for_rfc2822_dates() -> None:
+    # ``email.utils`` is pure-text RFC2822 date and address parsing. The
+    # model reached for ``parsedate_to_datetime`` on a personal research run
+    # (smoke-B), where the sandbox rejected it.
+    assert "email.utils" in _ALLOWED_IMPORTS
+    program_globals = _exec_program(
+        "from email.utils import parsedate_to_datetime\n"
+        "dt = parsedate_to_datetime('Tue, 20 May 2026 12:00:00 +0000')\n"
+        "year = dt.year\n"
+    )
+    assert program_globals["year"] == 2026
+
+
+def test_program_cannot_import_urllib_request_or_other_io_submodules() -> None:
+    # The allowlist is per-exact-dotted-path: ``urllib.parse`` is allowed
+    # but ``urllib.request`` (network-capable), ``urllib.robotparser`` (HTTP
+    # client), and the bare ``urllib`` package are not.
+    program_globals: dict[str, Any] = {"__builtins__": _build_safe_builtins()}
+    for blocked in (
+        "import urllib.request\n",
+        "import urllib.robotparser\n",
+        "import urllib\n",
+        "from urllib.request import urlopen\n",
+        "import email.message\n",
+        "import email\n",
+    ):
+        with pytest.raises(ImportError, match="not allowed"):
+            exec(compile(blocked, "<t>", "exec"), program_globals)  # noqa: S102

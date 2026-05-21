@@ -61,7 +61,7 @@ from .run_runtime import ScratchEntry, run_tool_definitions
 from .sandbox_runtime import RunSandbox
 
 
-RESEARCH_PROMPT_VERSION = "research-v1"
+RESEARCH_PROMPT_VERSION = "research-v2"
 
 
 def _utcnow() -> datetime:
@@ -177,7 +177,15 @@ def _build_research_input_items(
                 "syscall callables your run program may call this run "
                 "(each is namespace.member(...) and returns its result; "
                 "scratch.set, scratch.get, agent.emit_value, and "
-                "agent.emit_finding are always available):\n"
+                "agent.emit_finding are always available). The agent, scratch, "
+                "and capability namespaces are pre-injected globals in your "
+                "program. Do NOT import them: ``import agent`` and ``import "
+                "memory`` are rejected by the sandbox, and ``import ariel`` "
+                "fails. All syscall arguments are keyword arguments — "
+                "``agent.emit_value(value=...)``, not ``agent.emit_value(...)``. "
+                "The standard library is available for compute (json, re, "
+                "datetime, urllib.parse, email.utils, etc.); calls that pass "
+                "extra or wrong-named keys return schema_invalid.\n"
             )
             + "\n".join(callable_lines),
         },

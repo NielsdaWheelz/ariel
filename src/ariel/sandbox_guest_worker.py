@@ -28,6 +28,12 @@ from typing import Any, Callable
 
 # Standard-library modules the program may import: the safe compute surface
 # named in the run-program cutover. No os, sys, socket, subprocess, importlib.
+# Entries are matched as exact module paths in ``_restricted_import``, so
+# ``urllib`` listed here means the bare ``urllib`` package and not the
+# I/O-capable ``urllib.request``. The two dotted entries below
+# (``urllib.parse``, ``email.utils``) are pure-text stdlib utilities — URL
+# parsing and RFC2822 date/address parsing — with no I/O, no network, and no
+# subprocess; the model reaches for them in normal programs.
 _ALLOWED_IMPORTS = frozenset(
     {
         "json",
@@ -53,6 +59,8 @@ _ALLOWED_IMPORTS = frozenset(
         "zoneinfo",
         "unicodedata",
         "typing",
+        "urllib.parse",
+        "email.utils",
     }
 )
 
@@ -163,13 +171,24 @@ def _restricted_import(
     fromlist: Any = (),
     level: int = 0,
 ) -> Any:
-    del globals_, locals_, fromlist
+    del globals_, locals_
     if level != 0:
         raise ImportError("relative imports are not allowed in a run program")
-    root = name.split(".", 1)[0]
-    if root not in _ALLOWED_IMPORTS:
-        raise ImportError(f"import of {name!r} is not allowed in a run program")
-    return __import__(name, level=0)
+    # Match against the exact module path, then progressively-shorter dotted
+    # prefixes. ``urllib.parse`` is allowed by an exact entry; ``urllib.request``
+    # (network-capable), ``urllib.robotparser`` (HTTP client), and the bare
+    # ``urllib`` package are not. ``from urllib.parse import urlparse`` passes
+    # ``"urllib.parse"`` as ``name``, so the exact match covers ``from`` imports
+    # as well as ``import urllib.parse``.
+    segments = name.split(".")
+    for i in range(len(segments), 0, -1):
+        candidate = ".".join(segments[:i])
+        if candidate in _ALLOWED_IMPORTS:
+            # Forward the original ``fromlist`` so ``from pkg.sub import name``
+            # gets the leaf module CPython expects (a bare ``__import__(name)``
+            # returns the top-level package and breaks ``from`` imports).
+            return __import__(name, fromlist=fromlist or (), level=0)
+    raise ImportError(f"import of {name!r} is not allowed in a run program")
 
 
 def _build_safe_builtins() -> dict[str, Any]:
