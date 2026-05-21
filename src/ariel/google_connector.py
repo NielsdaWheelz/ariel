@@ -3449,11 +3449,19 @@ def _is_calendar_person(value: Any) -> bool:
     )
 
 
-def _is_calendar_datetime(value: Any) -> bool:
+def _is_calendar_datetime(value: Any, *, value_required: bool) -> bool:
+    # Cancelled events from the Google Calendar API legitimately have
+    # ``{"start": {}, "end": {}}`` — the normalizer carries that forward as
+    # ``value=None``. Pass ``value_required=False`` to accept that shape.
     if not isinstance(value, dict):
         return False
-    return (
+    value_ok = (
         _has_non_empty_string(value.get("value"))
+        if value_required
+        else _is_string_or_none(value.get("value"))
+    )
+    return (
+        value_ok
         and _is_string_or_none(value.get("timezone"))
         and isinstance(value.get("all_day"), bool)
     )
@@ -3568,8 +3576,11 @@ def _is_google_calendar_events_output(payload: dict[str, Any]) -> bool:
             return False
         if not _is_string_or_none(event.get("recurring_event_id")):
             return False
+        # The Google Calendar API defaults ``status`` to "confirmed" but the
+        # field is technically optional; the normalizer carries that absence
+        # through as ``None``.
         status = event.get("status")
-        if status not in {"confirmed", "cancelled", "tentative"}:
+        if status is not None and status not in {"confirmed", "cancelled", "tentative"}:
             return False
         if not _is_string_or_none(event.get("summary")):
             return False
@@ -3581,15 +3592,21 @@ def _is_google_calendar_events_output(payload: dict[str, Any]) -> bool:
             return False
         if not _is_calendar_attendees(event.get("attendees")):
             return False
-        if not _is_calendar_datetime(event.get("start")):
+        # Cancelled instances of recurring events arrive from Google with
+        # empty ``start``/``end`` objects; everything else carries the real
+        # start/end timestamp.
+        value_required = status != "cancelled"
+        if not _is_calendar_datetime(event.get("start"), value_required=value_required):
             return False
-        if not _is_calendar_datetime(event.get("end")):
+        if not _is_calendar_datetime(event.get("end"), value_required=value_required):
             return False
         if not isinstance(event.get("all_day"), bool):
             return False
         if not _is_string_list(event.get("recurrence")):
             return False
-        if not _has_non_empty_string(event.get("updated")):
+        # ``updated`` is normally set by Google, but cancelled instances of
+        # recurring events and some sync-deleted entries may omit it.
+        if not _is_string_or_none(event.get("updated")):
             return False
         for key in ("location", "etag", "provider_url", "hangout_link"):
             if not _is_string_or_none(event.get(key)):
@@ -3729,8 +3746,14 @@ def _is_google_gmail_message_refs_output(payload: dict[str, Any]) -> bool:
             return False
         if not _has_non_empty_string(message.get("provider_url")):
             return False
-        for key in ("history_id", "subject", "subject_key", "direction"):
-            if not isinstance(message.get(key), str):
+        # ``direction`` is always set by the normalizer to "sent" | "received"
+        # | "draft". The remaining string fields are absent on legitimate
+        # Gmail payloads: missing Subject header, brand-new messages without
+        # a history id, or bot mail without a parseable internal date.
+        if message.get("direction") not in {"sent", "received", "draft"}:
+            return False
+        for key in ("history_id", "subject", "subject_key", "internal_date"):
+            if not _is_string_or_none(message.get(key)):
                 return False
         if not isinstance(message.get("recipients"), list):
             return False
@@ -3738,8 +3761,6 @@ def _is_google_gmail_message_refs_output(payload: dict[str, Any]) -> bool:
             return False
         preview = message.get("preview")
         if preview is not None and not isinstance(preview, str):
-            return False
-        if not _has_non_empty_string(message.get("internal_date")):
             return False
         if message.get("evidence_status") not in _GMAIL_SEARCH_EVIDENCE_STATUSES:
             return False
