@@ -16,14 +16,17 @@ from pydantic import ValidationError
 
 from ariel.capability_registry import (
     RESEARCH_CAPABILITY_IDS,
+    RESEARCH_MEMORIES_CAPABILITY_IDS,
     RESEARCH_PERSONAL_CAPABILITY_IDS,
     RESEARCH_WEB_CAPABILITY_IDS,
     _validate_research_investigate_input,
     capability_id_for_run_callable,
     get_capability,
     run_callable_name_for_capability_id,
+    run_callable_signature,
 )
 from ariel.config import AppSettings
+from ariel.research_runtime import _build_research_input_items
 
 
 # ---------------------------------------------------------------------------
@@ -180,3 +183,108 @@ def test_research_personal_whitelist_capabilities_exist_and_are_read() -> None:
 def test_research_web_and_personal_whitelists_are_disjoint() -> None:
     """The two research mode whitelists share no capabilities — the Rule of Two."""
     assert RESEARCH_WEB_CAPABILITY_IDS.isdisjoint(RESEARCH_PERSONAL_CAPABILITY_IDS)
+
+
+# ---------------------------------------------------------------------------
+# research_runtime.py — eligible-callables block carries precise signatures
+# ---------------------------------------------------------------------------
+
+
+def _eligible_for(mode: str) -> list[str]:
+    if mode == "web":
+        cap_ids = RESEARCH_WEB_CAPABILITY_IDS
+    elif mode == "personal":
+        cap_ids = RESEARCH_PERSONAL_CAPABILITY_IDS
+    elif mode == "memories":
+        cap_ids = RESEARCH_MEMORIES_CAPABILITY_IDS
+    else:
+        raise AssertionError(f"unknown research mode: {mode}")
+    return sorted(
+        name
+        for name in (run_callable_name_for_capability_id(cap_id) for cap_id in cap_ids)
+        if name is not None
+    )
+
+
+def _callables_block(mode: str) -> str:
+    """The third system block — the eligible-callables enumeration."""
+    items = _build_research_input_items(
+        question="probe question",
+        mode=mode,
+        eligible_callables=_eligible_for(mode),
+    )
+    # Layout: [system(role framing), system(mode framing), system(callables),
+    #          system(finishing), user(question)]
+    block = items[2]
+    assert block["role"] == "system"
+    return cast(str, block["content"])
+
+
+def test_research_prompt_lists_every_web_callable_with_signature() -> None:
+    """Every web-mode callable appears in the prompt rendered as
+    ``- name(args)`` — the same shape ``run_callable_signature`` returns."""
+    content = _callables_block("web")
+    for name in _eligible_for("web"):
+        signature = run_callable_signature(name)
+        assert signature, f"{name} has no signature in RUN_CALLABLE_SIGNATURES"
+        assert f"- {name}{signature}" in content, (
+            f"web prompt missing precise signature for {name}: expected line '- {name}{signature}'"
+        )
+
+
+def test_research_prompt_lists_every_personal_callable_with_signature() -> None:
+    """Every personal-mode callable appears in the prompt rendered as
+    ``- name(args)`` — the same shape ``run_callable_signature`` returns."""
+    content = _callables_block("personal")
+    for name in _eligible_for("personal"):
+        signature = run_callable_signature(name)
+        assert signature, f"{name} has no signature in RUN_CALLABLE_SIGNATURES"
+        assert f"- {name}{signature}" in content, (
+            f"personal prompt missing precise signature for {name}: expected "
+            f"line '- {name}{signature}'"
+        )
+
+
+def test_research_prompt_lists_every_memories_callable_with_signature() -> None:
+    """Every memories-mode callable appears in the prompt rendered as
+    ``- name(args)`` — the same shape ``run_callable_signature`` returns."""
+    content = _callables_block("memories")
+    for name in _eligible_for("memories"):
+        signature = run_callable_signature(name)
+        assert signature, f"{name} has no signature in RUN_CALLABLE_SIGNATURES"
+        assert f"- {name}{signature}" in content, (
+            f"memories prompt missing precise signature for {name}: expected "
+            f"line '- {name}{signature}'"
+        )
+
+
+def test_research_prompt_search_web_signature_is_query_only() -> None:
+    """``search.web`` shows ``(query: str)`` — no ``max_results``, no ``topn``.
+
+    This is the smoke-trace bug that motivated the fix: the subagent invented
+    ``max_results=10`` because the bare-name listing didn't tell it the validator
+    rejects everything except ``query``.
+    """
+    content = _callables_block("web")
+    assert "- search.web(query: str)" in content
+    assert "max_results" not in content
+    assert "topn" not in content
+
+
+def test_research_prompt_calendar_list_signature_uses_window_keys() -> None:
+    """``calendar.list`` shows ``(window_start: str, window_end: str)`` —
+    not ``start``/``end`` or ``start_time``/``end_time``.
+
+    This is the second smoke-trace bug: the subagent invented ``start``/``end``
+    because the bare-name listing didn't tell it the validator requires
+    ``window_start`` / ``window_end``.
+    """
+    content = _callables_block("personal")
+    assert "- calendar.list(window_start: str, window_end: str)" in content
+    # Argument names the model previously invented must not appear as keys.
+    assert "start_time" not in content
+    assert "end_time" not in content
+    # ``start``/``end`` appear inside the output schema (e.g. event ``start``,
+    # ``end`` fields) for calendar.list, so we cannot blanket-ban them. The
+    # precise check above (``window_start``/``window_end`` as the argument
+    # signature) is what matters.

@@ -53,6 +53,7 @@ from .capability_registry import (
     RESEARCH_PERSONAL_CAPABILITY_IDS,
     RESEARCH_WEB_CAPABILITY_IDS,
     run_callable_name_for_capability_id,
+    run_callable_signature,
 )
 from .config import AppSettings
 from .google_connector import GoogleConnectorRuntime
@@ -61,7 +62,7 @@ from .run_runtime import ScratchEntry, run_tool_definitions
 from .sandbox_runtime import RunSandbox
 
 
-RESEARCH_PROMPT_VERSION = "research-v2"
+RESEARCH_PROMPT_VERSION = "research-v3"
 
 
 def _utcnow() -> datetime:
@@ -149,7 +150,7 @@ def _build_research_input_items(
     to finish.
     """
 
-    callable_lines = [f"- {name}" for name in eligible_callables]
+    callable_lines = [f"- {name}{run_callable_signature(name)}" for name in eligible_callables]
     return [
         {
             "role": "system",
@@ -184,7 +185,8 @@ def _build_research_input_items(
                 "fails. All syscall arguments are keyword arguments — "
                 "``agent.emit_value(value=...)``, not ``agent.emit_value(...)``. "
                 "The standard library is available for compute (json, re, "
-                "datetime, urllib.parse, email.utils, etc.); calls that pass "
+                "datetime, urllib.parse, email.utils, etc.). The signature "
+                "shown after each callable is the contract: calls that pass "
                 "extra or wrong-named keys return schema_invalid.\n"
             )
             + "\n".join(callable_lines),
