@@ -564,3 +564,187 @@ def test_succeeded_read_execution_output_reaches_next_round_context(
         "Round 2 must include the syscall-trace system block with the "
         "memory.search execution_output containing the seeded snippet."
     )
+
+
+# ===========================================================================
+# Test 5 — premature-synthesis rail: a round-one program that both performs
+# a read capability call and emits a user-visible message has its message
+# dropped, because the message text was authored before the call's result
+# was observed.  The loop continues; the model authors a second round whose
+# emit_message is grounded in the round-one observation.
+#
+# This is the structural fix for the synthesis-question bug: a synthesis
+# prompt ("given my calendar and emails, what's most important") used to
+# terminate in 2 model rounds (retriever + main agent's single "fetch +
+# fabricate" program), producing a hollow paragraph that quoted nothing the
+# tools returned.  The rail forces the model into a real reason→act→observe
+# cadence: round 1 observes, round 2+ synthesises.
+# ===========================================================================
+
+
+@dataclass
+class _PrematureSynthesisAdapter:
+    """Round 1: memory.search + agent.emit_message (the synthesis-question
+    bug shape).  Round 2: a grounded agent.emit_message.
+
+    Without the premature-synthesis rail, round 1 emits a hollow message and
+    the loop ends in one main-agent model call.  With the rail, the round-1
+    message is dropped, the loop continues, and the round-2 message is
+    delivered as the assistant message.
+    """
+
+    provider: str = "provider.synthesis"
+    model: str = "model.synthesis-v1"
+    main_call_count: int = 0
+    last_input_items: list[list[dict[str, Any]]] = field(default_factory=list)
+    round_one_message: str = "The most important thing today is the career meeting at Fractal Tech."
+    round_two_message: str = (
+        "After looking at the search results, the most important thing today is "
+        "the career meeting at Fractal Tech."
+    )
+
+    def create_response(
+        self,
+        *,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
+        history: list[dict[str, Any]],
+        context_bundle: dict[str, Any],
+    ) -> dict[str, Any]:
+        if is_retriever_call(input_items):
+            return empty_recall_response(
+                provider=self.provider, model=self.model, input_items=input_items
+            )
+        del tools, user_message, history, context_bundle
+        self.main_call_count += 1
+        self.last_input_items.append(list(input_items))
+        if self.main_call_count == 1:
+            # The bug shape: a read capability + an emit_message in the same
+            # program.  The message text was authored before the search ran.
+            source = (
+                "result = memory.search(query='career meeting')\n"
+                f"agent.emit_message(text={self.round_one_message!r})\n"
+            )
+            return _run_response(
+                source,
+                provider=self.provider,
+                model=self.model,
+                rid="resp_synthesis_round1",
+            )
+        # Round 2: a clean emit_message (grounded in the round-1 observation).
+        return _run_response(
+            f"agent.emit_message(text={self.round_two_message!r})\n",
+            provider=self.provider,
+            model=self.model,
+            rid="resp_synthesis_round2",
+        )
+
+
+def test_main_loop_premature_synthesis_rail_drops_round_one_message_and_forces_a_deliberation_round(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A round-one program that runs a read capability AND emits a message
+    has its message dropped.  The loop continues; round two's emit_message
+    becomes the assistant message.
+
+    Without the structural rail the loop would exit at round 1 — the model
+    would have emitted exactly once, and the hollow paragraph it authored
+    before observing the search result would be delivered to the user.
+    """
+
+    monkeypatch.setenv("ARIEL_MAX_CONTEXT_TOKENS", "20000")
+    monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "20000")
+    monkeypatch.setenv("ARIEL_MAIN_TURN_BUDGET_SECONDS", "300.0")
+    monkeypatch.setenv("ARIEL_AGENT_LOOP_MAX_MODEL_CALLS", "100")
+
+    adapter = _PrematureSynthesisAdapter()
+    with _build_client(postgres_url, adapter) as client:
+        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
+        turn = post_message_and_drain(
+            client,
+            session_id,
+            message="given my notes, what's the most important thing for me today?",
+        )
+
+    assert turn.status == "completed"
+    # The loop ran two main-agent model rounds, not one — the rail forced
+    # the deliberation round.
+    assert adapter.main_call_count == 2
+    # The delivered message is round two's grounded text, not round one's
+    # hollow paragraph.
+    assert turn.assistant_message == adapter.round_two_message
+
+    # The premature-synthesis rail event was emitted with the expected payload
+    # (rejected message length and the read capability_id that triggered it).
+    timeline = client.get(f"/v1/sessions/{session_id}/events").json()
+    events = timeline["turns"][0]["events"]
+    rejection_events = [
+        event for event in events if event["event_type"] == "evt.agent.premature_synthesis_rejected"
+    ]
+    assert len(rejection_events) == 1
+    payload = rejection_events[0]["payload"]
+    assert payload["model_call_count"] == 1
+    assert payload["rejected_message_chars"] == len(adapter.round_one_message)
+    assert payload["read_capability_ids"] == ["cap.memory.search"]
+
+
+@dataclass
+class _GreetingOnlyAdapter:
+    """Round 1: only ``agent.emit_message`` with no capability call.
+
+    A pure-greeting round must not be dropped — the rail's domain is
+    ``read capability + emit_message``, not every round-one emit.
+    """
+
+    provider: str = "provider.greeting"
+    model: str = "model.greeting-v1"
+    main_call_count: int = 0
+    greeting_text: str = "Hello."
+
+    def create_response(
+        self,
+        *,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
+        history: list[dict[str, Any]],
+        context_bundle: dict[str, Any],
+    ) -> dict[str, Any]:
+        if is_retriever_call(input_items):
+            return empty_recall_response(
+                provider=self.provider, model=self.model, input_items=input_items
+            )
+        del tools, user_message, history, context_bundle, input_items
+        self.main_call_count += 1
+        return _run_response(
+            f"agent.emit_message(text={self.greeting_text!r})\n",
+            provider=self.provider,
+            model=self.model,
+            rid="resp_greeting",
+        )
+
+
+def test_main_loop_pure_emit_message_round_one_is_not_dropped(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A round-one program that emits a message with no capability call is
+    delivered as-is; the rail only fires on ``read capability + emit_message``."""
+
+    monkeypatch.setenv("ARIEL_MAX_CONTEXT_TOKENS", "20000")
+    monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "20000")
+
+    adapter = _GreetingOnlyAdapter()
+    with _build_client(postgres_url, adapter) as client:
+        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
+        turn = post_message_and_drain(client, session_id, message="hi")
+
+    assert turn.status == "completed"
+    assert adapter.main_call_count == 1
+    assert turn.assistant_message == adapter.greeting_text
+
+    timeline = client.get(f"/v1/sessions/{session_id}/events").json()
+    event_types = [event["event_type"] for event in timeline["turns"][0]["events"]]
+    assert "evt.agent.premature_synthesis_rejected" not in event_types

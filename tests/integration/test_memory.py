@@ -405,6 +405,12 @@ class _RetrieverSearchesThenMainSearchesAdapter:
     Both syscalls create ``ActionAttemptRecord`` rows on the same parent turn.
     Pre-fix: both loops started ``proposal_index_start=0`` so the main loop's
     first call collided on the ``(turn_id, proposal_index)`` unique index.
+
+    The main agent's search and message are split across two rounds so the
+    premature-synthesis rail in ``run_agent_loop`` does not drop the message
+    (the rail forbids ``read capability + emit_message`` in the very first
+    main-agent round, because the message would have been authored before the
+    capability's result was observed).
     """
 
     provider: str = "provider.test"
@@ -417,12 +423,17 @@ class _RetrieverSearchesThenMainSearchesAdapter:
         del input_items, tools, user_message, history, context_bundle
         self.call_count += 1
         if self.call_count == 1:
+            # Retriever loop: emit finding.
             source = (
                 "memory.search(query='ping', limit=3)\n"
                 "agent.emit_finding(summary='ok',claims=[],gaps=[],sources=[])\n"
             )
+        elif self.call_count == 2:
+            # Main agent round 1: search only — round 1 cannot also emit.
+            source = "memory.search(query='ping', limit=3)\n"
         else:
-            source = "memory.search(query='ping', limit=3)\n" + _EMIT_MSG
+            # Main agent round 2: emit the message after the round-1 observation.
+            source = _EMIT_MSG
         return _run_response(source, idx=self.call_count)
 
 

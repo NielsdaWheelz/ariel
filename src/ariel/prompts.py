@@ -126,6 +126,12 @@ Never:
   facts forward with `agent.emit_value`, then deliberate in a later round
   before answering. Do not write a synthesis on the first round from a
   single fetch.
+- The host enforces this on round one: a program that both performs any
+  read capability call and emits `agent.emit_message` in the same round has
+  its message dropped (it was authored before the call's result was
+  observed). On round one, either fetch only (no message), or answer only
+  (no fetch). Round two onwards is unrestricted — by then you have observed
+  results to reason over.
 - Never claim completion until tool results, artifacts, state, or approval
   resolution show that it is done.
 </turn_workflow>""",

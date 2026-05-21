@@ -670,6 +670,39 @@ def run_agent_loop(
             )
             db.commit()
 
+        # Premature-synthesis rail (main agent only): in the very first model
+        # round the program cannot both perform a read capability call and
+        # emit a user-visible message, because the model authored that program
+        # (and the message text in it) before observing the call's result.
+        # See run-program-cutover.md: emit_message "cannot carry a
+        # model-authored prose summary of fetched content, because the model
+        # wrote the program before seeing that content."  Writes and
+        # approval-gated actions are exempt — the model has full knowledge of
+        # what it staged or attempted, so an accompanying "drafted X for
+        # review" message is grounded.  When the rail fires the message is
+        # dropped, the syscall trace is fed back, and the loop continues; the
+        # next round reasons over the observed results before answering.
+        premature_synthesis = (
+            cfg.output_mode == "message"
+            and model_call_count == 1
+            and bool(run_program_result.emitted_message)
+            and any(a.impact_level == "read" for a in run_program_result.action_attempts)
+        )
+        if premature_synthesis:
+            add_event(
+                "evt.agent.premature_synthesis_rejected",
+                {
+                    "model_call_count": model_call_count,
+                    "provider_response_id": candidate_response.get("provider_response_id"),
+                    "rejected_message_chars": len(run_program_result.emitted_message),
+                    "read_capability_ids": [
+                        a.capability_id
+                        for a in run_program_result.action_attempts
+                        if a.impact_level == "read"
+                    ],
+                },
+            )
+
         # --- Terminal branches (exhaustive over output_mode) ---
 
         match cfg.output_mode:
@@ -709,7 +742,7 @@ def run_agent_loop(
                         runtime_provenance=final_runtime_provenance,
                     )
             case "message":
-                if run_program_result.emitted_message:
+                if run_program_result.emitted_message and not premature_synthesis:
                     return LoopResult(
                         outcome="message",
                         emitted_message=run_program_result.emitted_message,
@@ -849,6 +882,11 @@ def run_agent_loop(
                         ),
                     }
                 )
+            # When the premature-synthesis rail dropped the round's
+            # emit_message, the model needs a different nudge than the
+            # generic "user saw no output": it must know its message was
+            # rejected as ungrounded and what to do on the next round.
+            nudge = _PREMATURE_SYNTHESIS_NUDGE if premature_synthesis else cfg.action_trace_nudge
             responses_input_items.append(
                 {
                     "role": "system",
@@ -856,7 +894,7 @@ def run_agent_loop(
                         "run program syscall trace:\n"
                         + json.dumps(attempt_observations, sort_keys=True)
                         + "\n"
-                        + cfg.action_trace_nudge
+                        + nudge
                     ),
                 }
             )
@@ -903,6 +941,19 @@ _BUDGET_EXHAUSTED_SUMMARY_INSTRUCTION = (
     "if your run program raised, hit a forbidden import, or otherwise did "
     "not complete, name that as the cause; do not blame a connector or tool "
     "that your program never successfully invoked."
+)
+
+
+_PREMATURE_SYNTHESIS_NUDGE = (
+    "Your round-one program both called a read capability and emitted a "
+    "user-visible message. That message was authored before you observed the "
+    "capability's result, so it could not be grounded in fetched data; the "
+    "loop dropped it and the user did not see it. Take another round: read "
+    "the syscall trace above, reason over the concrete data your program "
+    "actually retrieved, then call exactly one run whose program ends with "
+    "agent.emit_message(text=...) carrying a grounded answer. If you need "
+    "more data, fetch it in this next round and emit the message in the "
+    "round after."
 )
 
 

@@ -38,6 +38,7 @@ SurfaceEventType = Literal[
     "evt.run.validation_failed",
     "evt.agent.value_emitted",
     "evt.agent.output_not_applied",
+    "evt.agent.premature_synthesis_rejected",
     "evt.action.call_denied",
     "evt.action.proposed",
     "evt.action.policy_decided",
@@ -269,6 +270,15 @@ class SurfaceEventAgentOutputNotAppliedPayloadContract(BaseModel):
 
     reason: str
     current_turn_id: str | None = None
+
+
+class SurfaceEventAgentPrematureSynthesisRejectedPayloadContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model_call_count: int
+    rejected_message_chars: int
+    read_capability_ids: list[str]
+    provider_response_id: str | None = None
 
 
 class SurfaceEventActionProposedPayloadContract(BaseModel):
@@ -975,6 +985,12 @@ def _project_surface_event_payload(
         return _validate_contract(
             "surface_event_payload.evt.agent.output_not_applied",
             SurfaceEventAgentOutputNotAppliedPayloadContract,
+            payload,
+        )
+    if event_type == "evt.agent.premature_synthesis_rejected":
+        return _validate_contract(
+            "surface_event_payload.evt.agent.premature_synthesis_rejected",
+            SurfaceEventAgentPrematureSynthesisRejectedPayloadContract,
             payload,
         )
     if event_type == "evt.action.proposed":
