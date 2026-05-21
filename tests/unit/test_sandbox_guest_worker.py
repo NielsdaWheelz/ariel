@@ -10,11 +10,13 @@ do not require ``runsc``; gVisor isolation is covered separately in
 
 from __future__ import annotations
 
+import io
+import json
 from typing import Any
 
 import pytest
 
-from ariel.sandbox_guest_worker import _ALLOWED_IMPORTS, _build_safe_builtins
+from ariel.sandbox_guest_worker import _ALLOWED_IMPORTS, _build_safe_builtins, _run
 
 
 def _exec_program(source: str) -> dict[str, Any]:
@@ -95,3 +97,52 @@ def test_program_cannot_import_urllib_request_or_other_io_submodules() -> None:
     ):
         with pytest.raises(ImportError, match="not allowed"):
             exec(compile(blocked, "<t>", "exec"), program_globals)  # noqa: S102
+
+
+def _drive_run(source: str, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    # Drive ``_run`` end-to-end so the exec try/except in the production code
+    # path is the thing under test. Feed a single ``run-program`` start message
+    # on stdin; discard whatever the worker writes to stdout; return the dict
+    # ``_run`` produces. No syscalls means the program cannot block on the host
+    # channel, which keeps the test single-shot.
+    start = {
+        "type": "run-program",
+        "source": source,
+        "syscall_names": [],
+        "limits": {"max_syscalls": 1, "max_output_bytes": 1024},
+    }
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(start) + "\n"))
+    monkeypatch.setattr("sys.stdout", io.StringIO())
+    return _run()
+
+
+def test_program_clean_systemexit(monkeypatch: pytest.MonkeyPatch) -> None:
+    # ``raise SystemExit()`` is the natural Python idiom for "end here, all
+    # good". A live smoke turn crashed because ``SystemExit`` was not in the
+    # builtin allowlist and the program errored with NameError.
+    result = _drive_run("raise SystemExit()\n", monkeypatch)
+    assert result == {"type": "program-result", "ok": True, "error": None}
+
+
+def test_program_systemexit_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    # ``raise SystemExit(0)`` is also a clean exit, mirroring CPython.
+    result = _drive_run("raise SystemExit(0)\n", monkeypatch)
+    assert result == {"type": "program-result", "ok": True, "error": None}
+
+
+def test_program_systemexit_nonzero(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A non-zero int code is a failure exit; the code is rendered into the
+    # error string so the host can see what the program reported.
+    result = _drive_run("raise SystemExit(2)\n", monkeypatch)
+    assert result["type"] == "program-result"
+    assert result["ok"] is False
+    assert "SystemExit: 2" in result["error"]
+
+
+def test_program_systemexit_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A string code is the "die with a message" idiom; treat it as failure
+    # and surface the message in the error string.
+    result = _drive_run("raise SystemExit('no results found')\n", monkeypatch)
+    assert result["type"] == "program-result"
+    assert result["ok"] is False
+    assert "no results found" in result["error"]

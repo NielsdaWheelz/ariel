@@ -130,6 +130,7 @@ _SAFE_BUILTIN_NAMES = frozenset(
         "RecursionError",
         "RuntimeError",
         "StopIteration",
+        "SystemExit",
         "TypeError",
         "UnicodeError",
         "ValueError",
@@ -324,6 +325,21 @@ def _run() -> dict[str, Any]:
         raise
     except _SyscallError as exc:
         return {"type": "program-result", "ok": False, "error": f"syscall_error: {exc}"}
+    except SystemExit as exc:
+        # ``raise SystemExit(...)`` is a natural Python idiom the model reaches
+        # for to end a program early. Mirror CPython's semantics: code=None or
+        # code=0 is a clean exit; anything else (non-zero int, string message)
+        # is a program failure with the code rendered into the error string.
+        code = exc.code
+        if code is None:
+            return {"type": "program-result", "ok": True, "error": None}
+        if isinstance(code, int) and code == 0:
+            return {"type": "program-result", "ok": True, "error": None}
+        return {
+            "type": "program-result",
+            "ok": False,
+            "error": f"program_error: SystemExit: {code}",
+        }
     except Exception as exc:  # noqa: BLE001 - report any program failure to the host
         return {
             "type": "program-result",
