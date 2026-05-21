@@ -73,6 +73,12 @@ FALLBACK_TEST_NAME_ALLOWLIST = {
         "poison the retriever; the 'fallback' here names the model behaviour "
         "the filter blocks, not an AI-first judgment fallback path"
     ),
+    ("tests/integration/test_memory.py::test_is_assistant_error_fallback_is_module_public"): (
+        "checks that the error-fallback regex predicate is exposed at module "
+        "scope so the retrieval-side filter reuses the same vocabulary as the "
+        "write site; the 'fallback' here names the model behaviour the filter "
+        "blocks, not an AI-first judgment fallback path"
+    ),
 }
 _TEST_DEF_RE = re.compile(r"^(?P<path>[^:]+):\d+:def (?P<name>test_[^(]+)\(")
 _AI_JUDGMENT_CODE_RE = re.compile(r"E_AI_JUDGMENT_[A-Z_]+")

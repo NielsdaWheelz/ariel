@@ -40,11 +40,15 @@ the log directly.
 `append_log_event` skips one specific class of `assistant_message` rows at the
 write site: error-fallback prose the agent emits when it is stuck — "Calendar
 fetch failed", "Email errored", "re-link in settings", and similar. The regex
-`_ASSISTANT_ERROR_FALLBACK_RE` in `memory.py` is the source of truth; the
+`ASSISTANT_ERROR_FALLBACK_RE` in `memory.py` is the source of truth; the
 filter is deliberately tight so that legitimate "no X found" messages still
-write. Without this rail those rows would surface in the retriever as
-authoritative evidence of failure even after the capability has recovered,
-making the model re-emit the same fallback and reinforce the pattern.
+write. The same predicate (`is_assistant_error_fallback`) runs at the
+retrieval site (`search_memory`) so legacy rows that pre-date the write-time
+filter — and which `memory_log`'s append-only trigger keeps us from deleting —
+never surface in `memory.search` / `memory.recall` results. Without these
+rails those rows would surface in the retriever as authoritative evidence of
+failure even after the capability has recovered, making the model re-emit the
+same fallback and reinforce the pattern.
 
 ### `memory_notes` — the curated layer
 

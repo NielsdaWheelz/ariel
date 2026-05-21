@@ -256,16 +256,29 @@ _LogKind = Literal[
 # retriever surfaces them as authoritative evidence of failure even when the
 # capability is now succeeding with real data, so the model re-emits the
 # same fallback and reinforces the pattern. Filter at the WRITE site so the
-# log never contains them. Deliberately tight: only matches the
-# failure-vocabulary the agent emits when stuck. "no events found" is NOT
-# matched — that can be legitimate. Note the explicit failure word at the
-# tail is what discriminates this from valid "no X found" content.
-_ASSISTANT_ERROR_FALLBACK_RE = re.compile(
+# log never contains them, AND at the retrieval site so legacy rows written
+# before the write-time filter (and any rows ``memory_log``'s append-only
+# trigger keeps us from deleting) never surface to the model. Deliberately
+# tight: only matches the failure-vocabulary the agent emits when stuck.
+# "no events found" is NOT matched — that can be legitimate. Note the
+# explicit failure word at the tail is what discriminates this from valid
+# "no X found" content. Module-public so the projection layer can reuse it.
+ASSISTANT_ERROR_FALLBACK_RE = re.compile(
     r"^(calendar|email|drive|memory|inbox)\s*"
     r"(fetch|query|search|request)?\s*(failed|unavailable|errored)\b"
     r"|re-link in settings",
     re.IGNORECASE,
 )
+
+
+def is_assistant_error_fallback(content: str) -> bool:
+    """True iff ``content`` matches the error-fallback vocabulary.
+
+    See ``ASSISTANT_ERROR_FALLBACK_RE`` for the rationale. Used at both the
+    write site (``append_log_event``) and the retrieval site (``search_memory``)
+    so the same vocabulary is filtered on both sides.
+    """
+    return ASSISTANT_ERROR_FALLBACK_RE.search(content) is not None
 
 
 def append_log_event(
@@ -288,10 +301,10 @@ def append_log_event(
 
     Returns ``None`` when the row is skipped by an inbound filter — currently
     only ``assistant_message`` rows whose content matches
-    ``_ASSISTANT_ERROR_FALLBACK_RE`` (error-fallback prose the agent emits
+    ``ASSISTANT_ERROR_FALLBACK_RE`` (error-fallback prose the agent emits
     when stuck; see the regex docstring for why these poison the log).
     """
-    if kind == "assistant_message" and _ASSISTANT_ERROR_FALLBACK_RE.search(content):
+    if kind == "assistant_message" and is_assistant_error_fallback(content):
         return None
 
     try:
@@ -466,6 +479,14 @@ def search_memory(
     log layer, and returns up to ``limit`` hits ordered by ``created_at DESC``
     (transport order — the model ranks, code does not).
 
+    Skips ``assistant_message`` log rows whose content matches the
+    error-fallback vocabulary (``is_assistant_error_fallback``).  The same
+    filter applies at the write site (``append_log_event``); the retrieval-side
+    filter handles legacy rows that pre-date the write-site filter and which
+    ``memory_log``'s append-only trigger keeps us from deleting.  Filter-
+    after-LIMIT: the cap is honoured as a cap, no overfetching, and surfacing
+    fewer hits is more honest to the model than padding with noise.
+
     Returns ``[{"id", "layer", "kind", "created_at", "snippet", "taint"}, ...]``.
     ``"kind"`` is ``None`` for note-layer hits.
     """
@@ -484,6 +505,8 @@ def search_memory(
         if kinds is not None:
             stmt = stmt.where(MemoryLogRecord.kind.in_(kinds))
         for row in db.scalars(stmt.order_by(MemoryLogRecord.created_at.desc()).limit(limit)).all():
+            if row.kind == "assistant_message" and is_assistant_error_fallback(row.content):
+                continue
             hits[row.id] = {
                 "id": row.id,
                 "layer": "log",
@@ -504,6 +527,8 @@ def search_memory(
                 vec_stmt = vec_stmt.where(MemoryLogRecord.kind.in_(kinds))
             distance = MemoryLogRecord.embedding.cosine_distance(query_embedding)
             for row in db.scalars(vec_stmt.order_by(distance.asc()).limit(limit)).all():
+                if row.kind == "assistant_message" and is_assistant_error_fallback(row.content):
+                    continue
                 if row.id not in hits:
                     hits[row.id] = {
                         "id": row.id,

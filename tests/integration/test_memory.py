@@ -1090,3 +1090,136 @@ def test_append_log_event_filter_applies_only_to_assistant_messages(
         ).all()
     kinds = {r.kind for r in rows}
     assert kinds == {"user_message", "agent_round", "tool_observation", "proactive_trigger"}
+
+
+# ===========================================================================
+# Retrieval-side filter — legacy polluting rows that pre-date the write-site
+# filter (and which ``memory_log``'s append-only trigger keeps us from
+# deleting) must NOT surface from ``search_memory``. The same regex applies
+# symmetrically on both sides.
+# ===========================================================================
+
+
+def _insert_log_row_directly(
+    session_factory: sessionmaker[Session],
+    *,
+    kind: str,
+    content: str,
+    created_at: datetime,
+) -> str:
+    """Insert a ``memory_log`` row via the ORM, bypassing ``append_log_event``.
+
+    The append-only trigger only blocks UPDATE/DELETE; raw INSERTs go through.
+    This is how we seed legacy polluting rows in tests: they were written
+    before the write-time filter existed, so they're sitting in the log
+    waiting to poison retrieval.
+    """
+    row_id = _new_id("mev")
+    with session_factory() as db:
+        with db.begin():
+            db.add(
+                MemoryLogRecord(
+                    id=row_id,
+                    created_at=created_at,
+                    kind=kind,
+                    content=content,
+                    embedding=None,
+                    session_id=None,
+                    turn_id=None,
+                    taint="clean",
+                    source_ref=None,
+                )
+            )
+    return row_id
+
+
+def test_search_memory_skips_legacy_error_assistant_messages(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A legacy ``assistant_message`` whose content matches the error regex
+    is seeded directly into ``memory_log`` (simulating rows that pre-date the
+    write-site filter) and ``search_memory`` must not return it. A legitimate
+    ``assistant_message`` ("No emails today") seeded the same way is returned.
+    """
+    from ariel.config import AppSettings
+    from ariel.memory import search_memory
+
+    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
+    settings = AppSettings()
+    now = datetime.now(tz=UTC)
+
+    polluting_id = _insert_log_row_directly(
+        session_factory,
+        kind="assistant_message",
+        content="Calendar fetch failed",
+        created_at=now,
+    )
+    legitimate_id = _insert_log_row_directly(
+        session_factory,
+        kind="assistant_message",
+        content="No emails from today.",
+        created_at=now,
+    )
+
+    with session_factory() as db:
+        with db.begin():
+            calendar_hits = search_memory(db, query="calendar", settings=settings, limit=24)
+        with db.begin():
+            email_hits = search_memory(db, query="emails today", settings=settings, limit=24)
+
+    calendar_ids = {h["id"] for h in calendar_hits}
+    email_ids = {h["id"] for h in email_hits}
+
+    assert polluting_id not in calendar_ids, (
+        f"polluting legacy row must not surface; got hits={calendar_hits!r}"
+    )
+    assert legitimate_id in email_ids, (
+        f"legitimate 'no emails today' row must surface; got hits={email_hits!r}"
+    )
+
+
+def test_search_memory_does_not_filter_non_assistant_kinds(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The retrieval-side filter only suppresses ``assistant_message`` rows.
+    A ``user_message`` row whose content happens to contain "calendar fetch
+    failed" (the user complaining) must still surface — the filter is
+    symmetric with the write site, which also only filters
+    ``assistant_message``.
+    """
+    from ariel.config import AppSettings
+    from ariel.memory import search_memory
+
+    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
+    settings = AppSettings()
+    now = datetime.now(tz=UTC)
+
+    user_id = _insert_log_row_directly(
+        session_factory,
+        kind="user_message",
+        content="Calendar fetch failed for me yesterday — can you check?",
+        created_at=now,
+    )
+
+    with session_factory() as db:
+        with db.begin():
+            hits = search_memory(db, query="calendar", settings=settings, limit=24)
+
+    assert user_id in {h["id"] for h in hits}, (
+        f"user_message with matching text must surface; got hits={hits!r}"
+    )
+
+
+def test_is_assistant_error_fallback_is_module_public() -> None:
+    """The predicate is exposed at module scope so the projection layer can
+    reuse the same vocabulary the write site uses."""
+    from ariel.memory import is_assistant_error_fallback
+
+    assert is_assistant_error_fallback("Calendar fetch failed")
+    assert is_assistant_error_fallback("Email errored — re-link in settings.")
+    assert not is_assistant_error_fallback("No emails from today.")
+    assert not is_assistant_error_fallback("Calendar — no events in the next 7 days.")
