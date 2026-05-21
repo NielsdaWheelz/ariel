@@ -11,7 +11,11 @@ from ariel.app import create_app
 from ariel.model_adapter import ModelAdapter, ModelCall, ModelResponse
 from ariel.persistence import JobRecord
 from tests.fake_sandbox import FakeSandboxRuntime
-from tests.integration.responses_helpers import FakeModelAdapter, empty_recall_response, is_retriever_call
+from tests.integration.responses_helpers import (
+    FakeModelAdapter,
+    empty_recall_response,
+    is_retriever_call,
+)
 
 
 class NoAiOpsAdapter(FakeModelAdapter):

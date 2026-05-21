@@ -453,8 +453,7 @@ def _build_initial_messages(
                 "syscall callables your run program may call this turn "
                 "(each is namespace.member(...) and returns its result; "
                 "agent.emit_message, agent.emit_value, and "
-                "agent.pause_until_input are always available):\n"
-                + "\n".join(callable_lines)
+                "agent.pause_until_input are always available):\n" + "\n".join(callable_lines)
             )
 
     # 4. Tool surface facts

@@ -40,7 +40,11 @@ from ariel.google_connector import (
 from ariel.persistence import SessionRecord, TurnRecord
 from ariel.research_runtime import ResearchFinding, run_research
 from tests.fake_sandbox import FakeSandboxRuntime
-from tests.integration.responses_helpers import FakeModelAdapter, empty_recall_response, is_retriever_call
+from tests.integration.responses_helpers import (
+    FakeModelAdapter,
+    empty_recall_response,
+    is_retriever_call,
+)
 from ariel.model_adapter import ModelCall, ModelResponse
 
 NOW = datetime(2026, 5, 20, 10, 0, tzinfo=UTC)

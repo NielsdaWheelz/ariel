@@ -31,7 +31,11 @@ from ariel.model_adapter import ModelAdapter, ModelCall, ModelResponse
 from ariel.persistence import BackgroundTaskRecord, MemoryLogRecord, MemoryNoteRecord
 from ariel.worker import UnsupportedTaskType, process_one_task
 from tests.fake_sandbox import FakeSandboxRuntime
-from tests.integration.responses_helpers import FakeModelAdapter, post_message_and_drain, run_response
+from tests.integration.responses_helpers import (
+    FakeModelAdapter,
+    post_message_and_drain,
+    run_response,
+)
 
 # ---------------------------------------------------------------------------
 # Shared helpers

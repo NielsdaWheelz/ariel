@@ -37,9 +37,7 @@ def _run_response(source: str, *, provider: str, model: str, rid: str) -> ModelR
     """Wrap a raw run-program source as a ``run`` tool-call ``ModelResponse``."""
     from tests.integration.responses_helpers import run_response  # noqa: PLC0415
 
-    return run_response(
-        source=source, provider=provider, model=model, provider_response_id=rid
-    )
+    return run_response(source=source, provider=provider, model=model, provider_response_id=rid)
 
 
 _EMIT_FINDING_MAIN_ERROR = (
@@ -138,9 +136,7 @@ def test_main_loop_emit_finding_misuse_recovers_with_typed_nudge(
             for part in message.parts
             if isinstance(part, SystemPromptPart)
         ]
-        nudge_seen = any(
-            "is not available in this loop" in content for content in system_contents
-        )
+        nudge_seen = any("is not available in this loop" in content for content in system_contents)
         assert nudge_seen
 
 

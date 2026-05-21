@@ -209,9 +209,7 @@ def test_main_agent_prompt_is_static_prefix_before_dynamic_context(postgres_url:
     ]
     assert budget_messages, "expected the loop's remaining-budget system message"
 
-    dynamic_tail = json.dumps(
-        [p.content for p in system_parts[static_count:]], sort_keys=True
-    )
+    dynamic_tail = json.dumps([p.content for p in system_parts[static_count:]], sort_keys=True)
     assert "syscall callables your run program may call this turn" in dynamic_tail
     assert "runtime facts:" in dynamic_tail
 

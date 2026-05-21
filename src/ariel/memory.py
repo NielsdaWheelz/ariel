@@ -372,9 +372,7 @@ def search_memory(
     ``"kind"`` is ``None`` for note-layer hits.
     """
     try:
-        query_embedding: list[float] | None = embed_text(
-            query, adapter=adapter, settings=settings
-        )
+        query_embedding: list[float] | None = embed_text(query, adapter=adapter, settings=settings)
     except RuntimeError:
         query_embedding = None
 

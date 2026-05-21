@@ -8,7 +8,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from ariel.app import create_app
-from tests.integration.responses_helpers import FakeModelAdapter, empty_recall_response, is_retriever_call
+from tests.integration.responses_helpers import (
+    FakeModelAdapter,
+    empty_recall_response,
+    is_retriever_call,
+)
 from ariel.model_adapter import ModelCall, ModelResponse
 from ariel.persistence import (
     ActionAttemptRecord,

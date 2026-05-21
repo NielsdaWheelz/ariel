@@ -34,7 +34,9 @@ def test_no_provider_sdk_imports_in_subsystems() -> None:
     routed exclusively through ``ariel.model_adapter``. pydantic-ai pulls the
     real SDKs as transitive dependencies; subsystems never import them.
     """
-    hits = _grep(r"^\s*(from openai|import openai|from anthropic|import anthropic|from google\.genai|import google\.genai)\b")
+    hits = _grep(
+        r"^\s*(from openai|import openai|from anthropic|import anthropic|from google\.genai|import google\.genai)\b"
+    )
     assert hits == [], f"unexpected provider-SDK imports: {hits}"
 
 

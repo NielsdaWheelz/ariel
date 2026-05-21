@@ -612,9 +612,7 @@ def run_agent_loop(
                 input_summary="executed run program for model response",
                 input_refs={
                     "source": run_source,
-                    "tool_calls": [
-                        {"name": t.name, "arguments": t.arguments} for t in tool_calls
-                    ],
+                    "tool_calls": [{"name": t.name, "arguments": t.arguments} for t in tool_calls],
                 },
                 output={
                     "emitted_message": bool(run_program_result.emitted_message),

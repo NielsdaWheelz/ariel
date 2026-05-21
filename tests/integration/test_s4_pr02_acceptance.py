@@ -69,9 +69,7 @@ class ActionProposalAdapter(FakeModelAdapter):
                     continue
                 for line in part.content.splitlines():
                     if line.startswith("- current user instruction: "):
-                        current_turn_ref = line.removeprefix(
-                            "- current user instruction: "
-                        ).strip()
+                        current_turn_ref = line.removeprefix("- current user instruction: ").strip()
         for run_call in run_calls:
             input_payload = run_call.get("input")
             if (
