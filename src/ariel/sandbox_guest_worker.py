@@ -49,6 +49,7 @@ _ALLOWED_IMPORTS = frozenset(
         "hmac",
         "uuid",
         "calendar",
+        "time",
         "zoneinfo",
         "unicodedata",
         "typing",

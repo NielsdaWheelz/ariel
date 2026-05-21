@@ -45,7 +45,7 @@ def test_normal_response_tool_surface_is_single_strict_run_tool() -> None:
 
 
 def test_main_agent_prompt_is_versioned_static_contract() -> None:
-    assert MAIN_AGENT_PROMPT_VERSION == "main-agent-jarvis-v4"
+    assert MAIN_AGENT_PROMPT_VERSION == "main-agent-jarvis-v5"
     assert all(MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS)
 
     prompt = "\n\n".join(MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS)
@@ -59,6 +59,9 @@ def test_main_agent_prompt_is_versioned_static_contract() -> None:
     assert "source_evidence_id" in prompt
     assert "user_instruction_ref=turn:<turn_id>" in prompt
     assert "unknown" in prompt
+    # Honesty about own program errors: the model must not blame a connector
+    # when its own run program failed to compile or execute.
+    assert "is your error, not the connector's" in prompt
 
 
 def test_main_agent_prompt_block_order_is_stable() -> None:

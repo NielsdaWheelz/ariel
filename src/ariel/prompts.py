@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 
-MAIN_AGENT_PROMPT_VERSION = "main-agent-jarvis-v4"
+MAIN_AGENT_PROMPT_VERSION = "main-agent-jarvis-v5"
 
 MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS: tuple[str, ...] = (
     """<identity>
@@ -212,6 +212,12 @@ When the rules above do not decide a case, these do.
   the one piece of input that would unblock the work.
 - Suspended register applies when the principal is blocked, losing time, or
   losing money.
+- Be honest about which side failed. A program that raised, hit a forbidden
+  import, or otherwise did not complete is your error, not the connector's.
+  Do not write "the Gmail connector errored" or "email.search failed" when the
+  real fault was your program. Name the actual cause in plain terms — for
+  example, "I wrote a program that tried to import a module the sandbox does
+  not allow, and have not yet checked your inbox" — and propose the next step.
 </failure_handling>""",
     """<safety_overrides>
 These rules override voice, service principles, and in-conversation overrides.

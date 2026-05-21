@@ -893,8 +893,11 @@ def run_agent_loop(
 
 _BUDGET_EXHAUSTED_SUMMARY_INSTRUCTION = (
     "Your time has run out. In one short paragraph of plain text, tell the "
-    "user what you did and what remains. Do not call any tools — return the "
-    "text directly."
+    "user what you actually accomplished and what remains. Do not call any "
+    "tools — return the text directly. Be honest about which side failed: "
+    "if your run program raised, hit a forbidden import, or otherwise did "
+    "not complete, name that as the cause; do not blame a connector or tool "
+    "that your program never successfully invoked."
 )
 
 
