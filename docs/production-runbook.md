@@ -24,6 +24,12 @@ taint, replay, recovery, and audit.
 No voice, legacy model provider, Chat Completions, public Ariel API, fallback provider, or
 Tailscale requirement is part of this deployment.
 
+For running an isolated local dev stack on the same host without touching the
+prod database or the running systemd services, see
+[dev-environment.md](dev-environment.md). The prod stack defined here reads
+`.env.local`; the dev stack reads `.env.dev` via `ARIEL_ENV_FILE` and runs on
+parallel ports (Postgres `:5435`, API `:8001`).
+
 ## Host Layout
 
 Use a dedicated Linux user:

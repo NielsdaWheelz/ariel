@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from ipaddress import ip_address
 from pathlib import Path
 import re
@@ -18,7 +19,23 @@ _LOCAL_AUTH_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,}$")
 _PUBSUB_SUBSCRIPTION_PATTERN = re.compile(
     r"^projects/[a-z][a-z0-9-]{4,28}[a-z0-9]/subscriptions/[A-Za-z][A-Za-z0-9_.~+%-]{2,254}$"
 )
-_ENV_FILES = (_PROJECT_ROOT / ".env", _PROJECT_ROOT / ".env.local")
+# Default env-file stack: `.env` for shared local defaults, `.env.local` for the
+# production env that systemd reads. Dev workflows set `ARIEL_ENV_FILE` (e.g.,
+# to `.env.dev`) to swap in an isolated env file without touching the prod one.
+_DEFAULT_ENV_FILES = (_PROJECT_ROOT / ".env", _PROJECT_ROOT / ".env.local")
+
+
+def _resolve_env_files() -> tuple[Path, ...]:
+    override = os.environ.get("ARIEL_ENV_FILE", "").strip()
+    if not override:
+        return _DEFAULT_ENV_FILES
+    path = Path(override)
+    if not path.is_absolute():
+        path = _PROJECT_ROOT / path
+    return (path,)
+
+
+_ENV_FILES = _resolve_env_files()
 
 
 class AppSettings(BaseSettings):

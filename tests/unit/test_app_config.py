@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
 from pydantic import ValidationError
 
 from ariel.app import create_app
-from ariel.config import AppSettings, _ENV_FILES
+from ariel.config import AppSettings, _DEFAULT_ENV_FILES, _ENV_FILES, _resolve_env_files
 
 STRONG_LOCAL_AUTH_TOKEN = "test_local_auth_token_0123456789abcdef"
 CONNECTOR_KEYRING = '{"v1":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}'
@@ -18,8 +19,41 @@ def _app_settings_without_env_files() -> AppSettings:
 
 @pytest.mark.uses_real_env_files
 def test_app_settings_load_from_project_env_files() -> None:
-    assert {path.name for path in _ENV_FILES} == {".env", ".env.local"}
+    assert {path.name for path in _DEFAULT_ENV_FILES} == {".env", ".env.local"}
     assert AppSettings.model_config["env_file"] == _ENV_FILES
+
+
+def test_resolve_env_files_defaults_to_env_and_env_local(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ARIEL_ENV_FILE", raising=False)
+
+    resolved = _resolve_env_files()
+
+    assert resolved == _DEFAULT_ENV_FILES
+
+
+def test_resolve_env_files_honors_ariel_env_file_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARIEL_ENV_FILE", ".env.dev")
+
+    resolved = _resolve_env_files()
+
+    assert len(resolved) == 1
+    assert resolved[0].name == ".env.dev"
+    assert resolved[0].is_absolute()
+
+
+def test_resolve_env_files_accepts_absolute_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    absolute = "/tmp/ariel.test.env"
+    monkeypatch.setenv("ARIEL_ENV_FILE", absolute)
+
+    resolved = _resolve_env_files()
+
+    assert resolved == (Path(absolute),)
 
 
 def test_create_app_uses_ariel_database_url_env(monkeypatch: pytest.MonkeyPatch) -> None:

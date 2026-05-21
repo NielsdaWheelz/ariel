@@ -65,6 +65,9 @@ This directory is the canonical home for repository documentation.
 - [production-runbook.md](production-runbook.md): production deployment, operations,
   ambient Discord chat, deterministic slash operations, health checks, recovery,
   and acceptance criteria
+- [dev-environment.md](dev-environment.md): isolated local dev stack — `.env.dev`,
+  parallel postgres on `:5435`, dev API on `:8001`, coexistence with the prod
+  systemd services
 
 ### Modules
 
