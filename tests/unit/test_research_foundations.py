@@ -112,6 +112,47 @@ def test_research_investigate_input_rejects_bad_inputs() -> None:
         assert error == "schema_invalid", raw_input
 
 
+def test_research_investigate_input_rejects_status_poll_questions() -> None:
+    """The model has been observed treating the queued response of
+    ``cap.research.investigate`` as something to poll by re-issuing
+    ``investigate({question: "status:tsk_...", mode: "personal"})``
+    repeatedly — 22 stuck agent wakes built up in 1 minute. The validator
+    must reject the two precise poll shapes so a malformed poll never
+    enqueues another research run.
+    """
+    poll_questions: list[str] = [
+        "status:tsk_01ks4etnmd54cb2qg1z2khe58d",
+        "Status:tsk_01abc",  # case-insensitive
+        "STATUS:anything",
+        "status: tsk_01abc",  # space after colon
+        "tsk_01abc",  # short bare task id
+        "tsk_01ks4et",
+        "is tsk_01abc?",  # < 20 chars with tsk_
+    ]
+    for question in poll_questions:
+        normalized, error = _validate_research_investigate_input(
+            {"question": question, "mode": "personal"}
+        )
+        assert normalized is None, question
+        assert error == "schema_invalid", question
+
+
+def test_research_investigate_input_accepts_real_questions_mentioning_tsk() -> None:
+    """The status-poll guard must not swallow legitimate longer questions
+    that happen to contain a ``tsk_`` substring (e.g. a question about an
+    earlier task). The guard is bounded to short questions only.
+    """
+    legitimate = (
+        "What did the earlier research task tsk_01abc actually find about "
+        "the Q2 retainer revisions?"
+    )
+    normalized, error = _validate_research_investigate_input(
+        {"question": legitimate, "mode": "memories"}
+    )
+    assert error is None
+    assert normalized == {"question": legitimate, "mode": "memories"}
+
+
 # ---------------------------------------------------------------------------
 # capability_registry.py — cap.research.investigate contract
 # ---------------------------------------------------------------------------

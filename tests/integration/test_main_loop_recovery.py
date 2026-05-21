@@ -748,3 +748,138 @@ def test_main_loop_pure_emit_message_round_one_is_not_dropped(
     timeline = client.get(f"/v1/sessions/{session_id}/events").json()
     event_types = [event["event_type"] for event in timeline["turns"][0]["events"]]
     assert "evt.agent.premature_synthesis_rejected" not in event_types
+
+
+# ===========================================================================
+# Test 6 — failed program preserves the succeeded action_attempts'
+# execution_output in the next round's function_call_output payload.
+#
+# Bug fixed: the failed-program branch of ``run_agent_loop`` previously fed
+# back only ``{status: "failed", errors: [...]}`` — stripping the
+# action_attempts list entirely. When a program ran a successful syscall
+# (e.g. ``memory.search``) and THEN raised Python (NameError, ImportError,
+# AttributeError, etc.), the recovery round was blind to what actually ran.
+# The fix mirrors the clean-program and emit_value branches, both of which
+# already pass ``_action_attempt_observations(...)`` through.
+# ===========================================================================
+
+
+_FAILED_PROGRAM_DISTINCTIVE_SNIPPET = "Acme term sheet revision from counsel"
+
+
+@dataclass
+class _SearchThenRaiseAdapter:
+    """Round 1: program runs memory.search (succeeds) then raises NameError
+    on the next line. Round 2: program emits a recovery message. The test
+    asserts round 2's function_call_output carries the round-1 search's
+    ``execution_output`` (containing the seeded snippet) — without the fix,
+    the payload is ``{status: "failed", errors: [...]}`` only.
+    """
+
+    provider: str = "provider.failed-with-syscalls"
+    model: str = "model.failed-with-syscalls-v1"
+    main_call_count: int = 0
+    last_input_items: list[list[dict[str, Any]]] = field(default_factory=list)
+
+    def create_response(
+        self,
+        *,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
+        history: list[dict[str, Any]],
+        context_bundle: dict[str, Any],
+    ) -> dict[str, Any]:
+        if is_retriever_call(input_items):
+            return empty_recall_response(
+                provider=self.provider, model=self.model, input_items=input_items
+            )
+        del tools, user_message, history, context_bundle
+        self.main_call_count += 1
+        self.last_input_items.append(list(input_items))
+        if self.main_call_count == 1:
+            # Round 1: search succeeds, then a NameError raises on the next
+            # line. The bug-1 fix must still pass the succeeded search's
+            # execution_output forward to round 2.
+            source = "result = memory.search(query='term sheet')\nraise NameError('e')\n"
+            return _run_response(
+                source,
+                provider=self.provider,
+                model=self.model,
+                rid="resp_failed_round1",
+            )
+        return _run_response(
+            "agent.emit_message(text='Recovered after the prior round raised.')\n",
+            provider=self.provider,
+            model=self.model,
+            rid="resp_failed_round2",
+        )
+
+
+def test_failed_program_preserves_succeeded_action_attempt_output_for_recovery(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a program runs ``memory.search`` successfully and then raises
+    Python, the next round MUST receive that succeeded call's
+    ``execution_output`` (with the seeded snippet) inside the
+    function_call_output payload's ``action_attempts`` list.
+
+    Without the fix the recovery round sees only ``{status: "failed",
+    errors: [...]}`` and is structurally blind to what its own program
+    accomplished before the crash. With the fix the model can reason from
+    real data on its recovery round.
+    """
+
+    monkeypatch.setenv("ARIEL_MAX_CONTEXT_TOKENS", "20000")
+    monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "20000")
+    monkeypatch.setenv("ARIEL_MAIN_TURN_BUDGET_SECONDS", "300.0")
+    monkeypatch.setenv("ARIEL_AGENT_LOOP_MAX_MODEL_CALLS", "100")
+
+    adapter = _SearchThenRaiseAdapter()
+    with _build_client(postgres_url, adapter) as client:
+        _seed_memory_log_hit(postgres_url, _FAILED_PROGRAM_DISTINCTIVE_SNIPPET)
+        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
+        turn = post_message_and_drain(
+            client, session_id, message="what's in my term sheet revision?"
+        )
+
+    assert turn.status == "completed"
+    assert adapter.main_call_count == 2
+
+    # Round 2 must see the round-1 succeeded memory.search's execution_output
+    # in the function_call_output for the failed run — proof the
+    # action_attempts list is preserved across the failure recovery path.
+    round2_items = adapter.last_input_items[1]
+    function_call_outputs = [
+        item for item in round2_items if item.get("type") == "function_call_output"
+    ]
+    found_output_in_failed_payload = False
+    for fc_out in function_call_outputs:
+        body = json.loads(fc_out["output"])
+        if body.get("status") != "failed":
+            continue
+        attempts = body.get("action_attempts")
+        if not isinstance(attempts, list):
+            continue
+        for attempt in attempts:
+            exec_output = attempt.get("execution_output")
+            if not isinstance(exec_output, dict):
+                continue
+            hits = exec_output.get("hits")
+            if isinstance(hits, list) and any(
+                isinstance(h, dict)
+                and _FAILED_PROGRAM_DISTINCTIVE_SNIPPET in str(h.get("snippet", ""))
+                for h in hits
+            ):
+                found_output_in_failed_payload = True
+                break
+        if found_output_in_failed_payload:
+            break
+    assert found_output_in_failed_payload, (
+        "Round 2 must receive the round-1 memory.search execution_output "
+        "(carrying the seeded snippet) inside the failed-program's "
+        "function_call_output action_attempts list. Without this the model "
+        "is blind on recovery to what its own program actually accomplished "
+        "before the crash."
+    )

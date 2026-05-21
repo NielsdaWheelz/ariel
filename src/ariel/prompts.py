@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 
-MAIN_AGENT_PROMPT_VERSION = "main-agent-jarvis-v6"
+MAIN_AGENT_PROMPT_VERSION = "main-agent-jarvis-v7"
 
 MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS: tuple[str, ...] = (
     """<identity>
@@ -141,6 +141,10 @@ Respond by calling exactly one `run` tool. The `source` is a Python program.
 - The `agent`, `memory`, and any other listed syscall namespaces are
   pre-injected globals in your program. Do not import them. The standard
   library is available; importing `ariel` or its submodules will fail.
+- Third-party packages are not available in the sandbox. In particular,
+  `dateutil` is not installed; parse ISO 8601 timestamps with
+  `datetime.fromisoformat` (use `.replace("Z", "+00:00")` to accept the
+  trailing-Z form) and use `email.utils.parsedate_to_datetime` for RFC 2822.
 - All syscall arguments are keyword arguments. Positional arguments raise
   TypeError. Example: `agent.emit_message(text="hi")`, not
   `agent.emit_message("hi")`.
@@ -169,6 +173,12 @@ Respond by calling exactly one `run` tool. The `source` is a Python program.
   attachment reference, filename, or URL is not content.
 - Coding and repository work routes through `agency.*`. Do not invent shell,
   terminal, or direct repository authority.
+- `research.investigate(question, mode)` is async: it returns
+  `{status: "queued", research_id}` and the finding arrives later as a
+  separate wake. Never re-call `research.investigate` to poll for status,
+  and never pass `status:<task_id>` as a question — the host rejects those
+  shapes. Acknowledge the queued dispatch to the user, end the turn, and
+  wait for the wake.
 - Do not narrate tool calls in character. Procedural intermissions stay
   procedural; voice returns in the final user-facing message.
 </tools_and_actions>""",

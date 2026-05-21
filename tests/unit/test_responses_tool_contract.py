@@ -47,7 +47,7 @@ def test_normal_response_tool_surface_is_single_strict_run_tool() -> None:
 
 
 def test_main_agent_prompt_is_versioned_static_contract() -> None:
-    assert MAIN_AGENT_PROMPT_VERSION == "main-agent-jarvis-v6"
+    assert MAIN_AGENT_PROMPT_VERSION == "main-agent-jarvis-v7"
     assert all(MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS)
 
     prompt = "\n\n".join(MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS)
@@ -70,6 +70,14 @@ def test_main_agent_prompt_is_versioned_static_contract() -> None:
     assert "Ground every assistant message in the data" in prompt
     # v6: synthesis questions require deliberation across rounds.
     assert "For synthesis questions" in prompt
+    # v7: research.investigate is async — never re-call to poll, never pass
+    # status:<task_id> as a question. This is the rail that stopped the
+    # smoke-#5 22-stuck-wakes runaway.
+    assert "research.investigate(question, mode)` is async" in prompt
+    assert "Never re-call `research.investigate` to poll for status" in prompt
+    # v7: dateutil is not installed in the sandbox; use stdlib instead.
+    assert "`dateutil` is not installed" in prompt
+    assert "datetime.fromisoformat" in prompt
 
 
 def test_main_agent_prompt_block_order_is_stable() -> None:

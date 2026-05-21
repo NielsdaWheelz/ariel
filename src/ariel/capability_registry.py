@@ -1189,6 +1189,30 @@ _RESEARCH_INVESTIGATE_MAX_QUESTION_LENGTH = 4000
 _RESEARCH_INVESTIGATE_ALLOWED_MODES = {"web", "personal", "memories"}
 
 
+def _looks_like_research_status_poll(question: str) -> bool:
+    """True if the question is a status-poll attempt rather than an investigation.
+
+    ``cap.research.investigate`` is async — it returns ``{status: "queued",
+    research_id}`` and the finding arrives later via an ``agent_wake``. Smoke
+    evidence: the model has been observed treating the queued response as
+    something to poll by re-issuing
+    ``investigate({question: "status:tsk_01ks4...", mode: "personal"})``
+    repeatedly, building up dozens of stuck wakes. Reject these here so a
+    malformed poll never enqueues another research run.
+
+    Two precise shapes:
+    - prefixed ``status:`` (case-insensitive) — the model's literal poll form.
+    - a short (< 20 chars) question containing a ``tsk_`` task id — anything
+      this short with a task-id substring is a poll attempt, not an
+      investigation question.
+    """
+    if question.lower().startswith("status:"):
+        return True
+    if len(question) < 20 and "tsk_" in question:
+        return True
+    return False
+
+
 def _validate_research_investigate_input(
     raw_input: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
@@ -1202,6 +1226,8 @@ def _validate_research_investigate_input(
         not normalized_question
         or len(normalized_question) > _RESEARCH_INVESTIGATE_MAX_QUESTION_LENGTH
     ):
+        return None, "schema_invalid"
+    if _looks_like_research_status_poll(normalized_question):
         return None, "schema_invalid"
     mode = raw_input.get("mode")
     if not isinstance(mode, str) or mode not in _RESEARCH_INVESTIGATE_ALLOWED_MODES:

@@ -536,13 +536,22 @@ def run_agent_loop(
             for output_item in output_items:
                 if isinstance(output_item, dict) and output_item.get("type") == "function_call":
                     responses_input_items.append(jsonable_encoder(output_item))
+            # A failed program may still have succeeded syscalls before it
+            # raised — surface their bounded ``execution_output`` to the next
+            # round so recovery is grounded in what actually ran, not blind.
+            # Mirrors the clean-program and emit_value branches below.
+            attempt_observations = _action_attempt_observations(run_program_result.action_attempts)
             if run_call_id:
                 responses_input_items.append(
                     {
                         "type": "function_call_output",
                         "call_id": run_call_id,
                         "output": json.dumps(
-                            {"status": "failed", "errors": program_errors},
+                            {
+                                "status": "failed",
+                                "errors": program_errors,
+                                "action_attempts": attempt_observations,
+                            },
                             sort_keys=True,
                         ),
                     }
