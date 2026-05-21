@@ -12,7 +12,9 @@ from ariel.action_runtime import (
 )
 from ariel.app import _eligible_internal_callable_capability_ids
 from ariel.capability_registry import (
+    RUN_CALLABLE_SIGNATURES,
     capability_id_for_run_callable,
+    get_capability,
     internal_callable_capability_ids,
     run_callable_name_for_capability_id,
 )
@@ -120,6 +122,154 @@ def test_run_callable_aliases_are_unique_and_deliberate() -> None:
 
     assert capability_id_for_run_callable("discord.no_response") is None
     assert capability_id_for_run_callable("memory.forget_all") is None
+
+
+def test_run_callable_signatures_match_validators_for_common_capabilities() -> None:
+    """Each high-traffic capability's signature string must list every key its
+    input validator accepts, by exact name. The model sees this signature both
+    in the per-turn callable list and (on schema_invalid) as the ``expected``
+    field of the rejection payload — those are the only sources from which it
+    learns the right keyword names. Drift between signature and validator
+    causes the model to invent arg names and waste model rounds on rejected
+    calls (the smoke battery's pattern 2).
+
+    Each entry pairs a syscall alias with (a) the set of arg names that must
+    appear in its signature string, and (b) a single payload that the
+    validator must accept. Both halves are asserted: the signature is what
+    the model reads; the payload-acceptance check confirms the documented
+    shape is the one the validator implements.
+    """
+
+    cases: list[tuple[str, str, set[str], dict[str, Any]]] = [
+        (
+            "search.web",
+            "cap.search.web",
+            {"query"},
+            {"query": "best espresso machines 2026"},
+        ),
+        (
+            "search.news",
+            "cap.search.news",
+            {"query"},
+            {"query": "berlin elections"},
+        ),
+        (
+            "web.extract",
+            "cap.web.extract",
+            {"url"},
+            {"url": "https://example.com/article"},
+        ),
+        (
+            "calendar.list",
+            "cap.calendar.list",
+            {"window_start", "window_end"},
+            {
+                "window_start": "2026-05-20T00:00:00Z",
+                "window_end": "2026-05-21T00:00:00Z",
+            },
+        ),
+        (
+            "email.search",
+            "cap.email.search",
+            {"query"},
+            {"query": "from:stripe@example.com newer_than:7d"},
+        ),
+        (
+            "email.read",
+            "cap.email.read",
+            {"message_id", "thread_id", "mode"},
+            {"message_id": "msg_123", "thread_id": "thr_456", "mode": "message"},
+        ),
+        (
+            "drive.search",
+            "cap.drive.search",
+            {"query"},
+            {"query": "Q2 retainer"},
+        ),
+        (
+            "drive.read",
+            "cap.drive.read",
+            {"file_id"},
+            {"file_id": "1AbCdEf"},
+        ),
+        (
+            "maps.search_places",
+            "cap.maps.search_places",
+            {"query", "location_context", "radius_meters"},
+            {"query": "coffee", "location_context": "Berlin", "radius_meters": 2000},
+        ),
+        (
+            "maps.directions",
+            "cap.maps.directions",
+            {"origin", "destination", "travel_mode", "waypoints", "optimize_order"},
+            {
+                "origin": "Brandenburger Tor",
+                "destination": "Berliner Hauptbahnhof",
+                "travel_mode": "walking",
+                "waypoints": [],
+                "optimize_order": False,
+            },
+        ),
+        (
+            "weather.forecast",
+            "cap.weather.forecast",
+            {"location", "timeframe"},
+            {"location": "Berlin", "timeframe": "today"},
+        ),
+        (
+            "attachment.read",
+            "cap.attachment.read",
+            {"attachment_ref", "intent"},
+            {"attachment_ref": "discord:777", "intent": "summarize"},
+        ),
+        (
+            "proactive.schedule",
+            "cap.proactive.schedule",
+            {"when", "note"},
+            {"when": "2026-05-21T09:00:00Z", "note": "remind about offsite"},
+        ),
+        (
+            "research.investigate",
+            "cap.research.investigate",
+            {"question", "mode"},
+            {"question": "What is the state of fusion in 2026?", "mode": "web"},
+        ),
+    ]
+
+    for alias, capability_id, required_names, payload in cases:
+        signature = RUN_CALLABLE_SIGNATURES[alias]
+        for name in required_names:
+            assert name in signature, (
+                f"signature for {alias} is missing the {name!r} arg name; "
+                f"the model needs to see it to pass the validator. signature={signature!r}"
+            )
+        capability = get_capability(capability_id)
+        assert capability is not None, capability_id
+        normalized, error = capability.validate_input(payload)
+        assert error is None, (
+            f"validator for {capability_id} rejected the payload documented in "
+            f"its signature ({payload!r}); signature/validator have drifted. "
+            f"signature={signature!r} error={error!r}"
+        )
+        assert normalized is not None
+
+
+def test_run_callable_signatures_warn_about_email_read_invented_nulls() -> None:
+    """email.read fails when both ids are null. The signature must spell out
+    that the model has to fill at least one with a value from a prior
+    ``email.search`` result — otherwise the model emits the all-null payload
+    that produced repeated schema_invalid rejections in the smoke battery
+    (trn_01ks43ttrgxdm4f92xy30320g4)."""
+
+    signature = RUN_CALLABLE_SIGNATURES["email.read"]
+    assert "non-null" in signature.lower() or "from a prior" in signature.lower(), signature
+
+    capability = get_capability("cap.email.read")
+    assert capability is not None
+    _, error = capability.validate_input(
+        {"message_id": None, "thread_id": None, "mode": "message"}
+    )
+    assert error == "schema_invalid"
 
 
 def test_internal_callable_eligibility_is_default_deny() -> None:

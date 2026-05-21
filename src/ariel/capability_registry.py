@@ -3941,27 +3941,50 @@ RUN_CALLABLE_SIGNATURES: dict[str, str] = {
     "memory.note.edit": "(id: str, content: str) -> {'id', 'status'}",
     "memory.note.delete": "(id: str) -> {'id', 'status'}",
     # search / web
-    "search.web": "(query: str)",
-    "search.news": "(query: str)",
-    "web.extract": "(url: str)",
+    # search.web: the only accepted key is ``query``. Other names (``q``,
+    # ``topn``, ``count``, ``limit``) are rejected as schema_invalid.
+    "search.web": "(query: str) -> {'query': str, 'retrieved_at': str, 'results': list[{'title', 'source', 'snippet', 'published_at'}], 'status': 'succeeded'}",
+    "search.news": "(query: str) -> {'query': str, 'retrieved_at': str, 'results': list[{'title', 'source', 'snippet', 'published_at'}], 'status': 'succeeded'}",
+    "web.extract": "(url: str) -> {'url': str, 'retrieved_at': str, 'title': str | None, 'text': str, 'status': 'succeeded'}",
     # research
-    "research.investigate": "(question: str, mode: 'web' | 'personal' | 'memories')",
+    "research.investigate": "(question: str, mode: Literal['web', 'personal', 'memories']) -> {'status': 'queued', 'research_id': str}",
     # calendar (read)
-    "calendar.list": "(window_start: str, window_end: str)",
+    # calendar.list: REQUIRED keys ``window_start`` and ``window_end``, both
+    # RFC3339 strings (e.g. ``"2026-05-20T12:00:00Z"``). Other names
+    # (``start_time``, ``end_time``, ``start``, ``end``, ``time_min``,
+    # ``time_max``) are rejected as schema_invalid. ``window_end`` must be
+    # strictly after ``window_start``.
+    "calendar.list": "(window_start: str, window_end: str) -> {'schema_version': 'google.calendar.events.v1', 'events': list[{'event_id', 'calendar_id', 'summary', 'start', 'end', ...}], 'retrieved_at': str, 'window_start': str, 'window_end': str, 'status': 'succeeded'}",
     # email (read)
-    "email.search": "(query: str)",
-    "email.read": "(message_id: str | None = None, thread_id: str | None = None, mode: str | None = None)",
+    # email.search: the only accepted key is ``query``. Returns
+    # ``{messages: [{message_id, thread_id, subject, sender, ...}], ...}``;
+    # use ``message_id`` (NOT ``thread_id`` alone) to fetch the full body
+    # with ``email.read``.
+    "email.search": "(query: str) -> {'schema_version': 'google.gmail.message_refs.v1', 'messages': list[{'message_id': str, 'thread_id': str, 'subject': str | None, 'preview': str | None, 'direction': Literal['sent', 'received', 'draft'], ...}], 'retrieved_at': str, 'status': 'succeeded'}",
+    # email.read: at least one of ``message_id`` or ``thread_id`` MUST be
+    # provided and non-null. Use a value from a prior ``email.search`` result;
+    # never invent ids and never pass both as None. ``mode`` defaults to
+    # ``"message"`` when ``message_id`` is given, else ``"thread"``.
+    "email.read": "(message_id: str | None = None, thread_id: str | None = None, mode: Literal['message', 'thread', 'thread_context'] | None = None)  # at least one id must be non-null, from a prior email.search result -> {'schema_version': 'google.gmail.message_evidence.v1', 'message': {'subject', 'sender', 'recipients', 'internal_date', ...}, 'evidence_blocks': list[{'kind', 'text', ...}], 'status': 'succeeded'}",
     # drive (read)
-    "drive.search": "(query: str)",
-    "drive.read": "(file_id: str)",
+    "drive.search": "(query: str) -> {'schema_version': 'drive_search_results_v1', 'files': list, 'status': 'succeeded'}",
+    "drive.read": "(file_id: str) -> {'schema_version': 'drive_read_result_v1', 'file': dict, 'status': 'succeeded'}",
     # maps
-    "maps.search_places": "(query: str, location_context: str | None = None, radius_meters: int | None = None)",
+    # maps.search_places: ``query`` is required. ``radius_meters`` is in
+    # [100, 50000] (default 2000). No other arg names are accepted.
+    "maps.search_places": "(query: str, location_context: str | None = None, radius_meters: int = 2000) -> {'query': str, 'places': list[{'name', 'address', 'place_ref', ...}], 'retrieved_at': str, 'status': 'succeeded'}",
+    # maps.directions: ``travel_mode`` is one of the four below (default
+    # ``"driving"``). ``waypoints`` is a list of place strings (max 10).
+    "maps.directions": "(origin: str | None = None, destination: str | None = None, travel_mode: Literal['driving', 'walking', 'bicycling', 'transit'] = 'driving', waypoints: list[str] = [], optimize_order: bool = False) -> {'origin', 'destination', 'routes': list, 'retrieved_at': str, 'status': 'succeeded'}",
     # weather
-    "weather.forecast": "(location: str | None = None, timeframe: str | None = None)",
+    # weather.forecast: ``timeframe`` is one of the four below (default
+    # ``"today"``). ``location`` is an optional plain-language place string.
+    "weather.forecast": "(location: str | None = None, timeframe: Literal['now', 'today', 'tomorrow', 'next_24h'] = 'today') -> {'location', 'timeframe', 'forecast': dict, 'retrieved_at': str, 'status': 'succeeded'}",
     # proactive
-    "proactive.schedule": "(when: str, note: str)",
+    "proactive.schedule": "(when: str, note: str) -> {'status': 'scheduled', 'task_id': str}",
     # attachment
-    "attachment.read": "(attachment_ref: str, intent: str)",
+    # attachment.read: ``intent`` must be one of the five below.
+    "attachment.read": "(attachment_ref: str, intent: Literal['summarize', 'ocr', 'transcribe', 'extract_text', 'answer']) -> {'attachment_ref', 'filename', 'blocks': list, 'status': 'succeeded'}",
 }
 
 
