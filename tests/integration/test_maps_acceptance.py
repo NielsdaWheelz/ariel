@@ -15,7 +15,8 @@ from sqlalchemy import select
 import ariel.action_runtime as action_runtime_module
 import ariel.capability_registry as capability_registry_module
 import ariel.policy_engine as policy_engine_module
-from ariel.app import ModelAdapter, create_app
+from ariel.app import ModelAdapter
+from tests.integration.app_helpers import create_migrated_app
 from tests.integration.responses_helpers import (
     empty_recall_response,
     is_memory_subsystem_call,
@@ -30,8 +31,8 @@ from tests.fake_sandbox import FakeSandboxRuntime
 
 @dataclass
 class ActionProposalAdapter:
-    provider: str = "provider.s6-pr02"
-    model: str = "model.s6-pr02-v1"
+    provider: str = "provider.maps"
+    model: str = "model.maps-v1"
     run_calls_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     assistant_text_by_message: dict[str, str] = field(default_factory=dict)
 
@@ -78,7 +79,7 @@ class ActionProposalAdapter:
                 ),
                 provider=self.provider,
                 model=self.model,
-                provider_response_id="resp_s6_pr02_interpreter",
+                provider_response_id="resp_maps_interpreter",
                 input_tokens=41,
                 output_tokens=26,
             )
@@ -106,7 +107,7 @@ class ActionProposalAdapter:
             calls=run_calls,
             provider=self.provider,
             model=self.model,
-            provider_response_id="resp_s6_pr02_123",
+            provider_response_id="resp_maps_123",
             input_tokens=41,
             output_tokens=26,
         )
@@ -125,10 +126,9 @@ class _FakeHTTPResponse:
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
-    app = create_app(
+    app = create_migrated_app(
         database_url=postgres_url,
         model_adapter=adapter,
-        reset_database=True,
         sandbox=FakeSandboxRuntime(),
     )
     return TestClient(app)
@@ -269,7 +269,7 @@ def _maps_provider_bound(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ARIEL_MAPS_API_KEY", "test-maps-key")
 
 
-def test_s6_pr02_maps_directions_executes_against_routes_api_with_citations(
+def test_maps_directions_executes_against_routes_api_with_citations(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -374,7 +374,7 @@ def test_s6_pr02_maps_directions_executes_against_routes_api_with_citations(
         assert "evt.action.execution.succeeded" in event_type_list
 
 
-def test_s6_pr02_maps_search_places_executes_against_places_api_with_metadata(
+def test_maps_search_places_executes_against_places_api_with_metadata(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -469,7 +469,7 @@ def test_s6_pr02_maps_search_places_executes_against_places_api_with_metadata(
         assert len(_turn_sources(client, turn_data["id"])) >= 1
 
 
-def test_s6_pr02_maps_search_places_enforces_radius_with_haversine_filter(
+def test_maps_search_places_enforces_radius_with_haversine_filter(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -537,7 +537,7 @@ def test_s6_pr02_maps_search_places_enforces_radius_with_haversine_filter(
         ),
     ],
 )
-def test_s6_pr02_maps_directions_missing_required_route_fields_asks_explicit_clarification(
+def test_maps_directions_missing_required_route_fields_asks_explicit_clarification(
     postgres_url: str,
     input_payload: dict[str, Any],
     expected_error: str,
@@ -567,7 +567,7 @@ def test_s6_pr02_maps_directions_missing_required_route_fields_asks_explicit_cla
         assert _turn_sources(client, turn_data["id"]) == []
 
 
-def test_s6_pr02_maps_search_places_missing_location_context_asks_explicit_clarification(
+def test_maps_search_places_missing_location_context_asks_explicit_clarification(
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
@@ -591,7 +591,7 @@ def test_s6_pr02_maps_search_places_missing_location_context_asks_explicit_clari
         assert _turn_sources(client, turn_data["id"]) == []
 
 
-def test_s6_pr02_maps_capability_not_offered_when_api_key_missing(
+def test_maps_capability_not_offered_when_api_key_missing(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -636,7 +636,7 @@ def test_s6_pr02_maps_capability_not_offered_when_api_key_missing(
         ("invalid_payload", "provider_invalid_payload", "retry"),
     ],
 )
-def test_s6_pr02_maps_provider_failures_are_typed_and_recoverable(
+def test_maps_provider_failures_are_typed_and_recoverable(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
     failure_mode: str,
@@ -714,7 +714,7 @@ def test_s6_pr02_maps_provider_failures_are_typed_and_recoverable(
         assert expected_hint in rendered_message
 
 
-def test_s6_pr02_maps_egress_preflight_remains_fail_closed_before_execution(
+def test_maps_egress_preflight_remains_fail_closed_before_execution(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -768,7 +768,7 @@ def test_s6_pr02_maps_egress_preflight_remains_fail_closed_before_execution(
         assert execute_attempts == 0
 
 
-def test_s6_pr02_maps_retrieval_isolation_from_google_connector_readiness(
+def test_maps_retrieval_isolation_from_google_connector_readiness(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -810,7 +810,7 @@ def test_s6_pr02_maps_retrieval_isolation_from_google_connector_readiness(
         assert len(_turn_sources(client, turn_data["id"])) == 1
 
 
-def test_s6_pr02_maps_outputs_remain_normalized_for_mixed_retrieval_turns(
+def test_maps_outputs_remain_normalized_for_mixed_retrieval_turns(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -879,7 +879,7 @@ def test_s6_pr02_maps_outputs_remain_normalized_for_mixed_retrieval_turns(
         assert second_attempt["execution"]["status"] == "succeeded"
 
 
-def test_s6_pr02_maps_directions_walking_mode_omits_traffic_routing_preference(
+def test_maps_directions_walking_mode_omits_traffic_routing_preference(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -926,7 +926,7 @@ def test_s6_pr02_maps_directions_walking_mode_omits_traffic_routing_preference(
         assert output["results"][0]["snippet"] == "walking route"
 
 
-def test_s6_pr02_maps_directions_reports_uncertainty_when_no_route(
+def test_maps_directions_reports_uncertainty_when_no_route(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -963,7 +963,7 @@ def test_s6_pr02_maps_directions_reports_uncertainty_when_no_route(
         assert output["results"] == []
 
 
-def test_s6_pr02_maps_directions_multi_stop_routes_a_single_legged_trip(
+def test_maps_directions_multi_stop_routes_a_single_legged_trip(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1040,7 +1040,7 @@ def test_s6_pr02_maps_directions_multi_stop_routes_a_single_legged_trip(
         assert "optimizeWaypointOrder" not in routes_body
 
 
-def test_s6_pr02_maps_directions_optimize_order_reports_googles_chosen_stop_order(
+def test_maps_directions_optimize_order_reports_googles_chosen_stop_order(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1106,7 +1106,7 @@ def test_s6_pr02_maps_directions_optimize_order_reports_googles_chosen_stop_orde
         ]
 
 
-def test_s6_pr02_maps_directions_returns_alternative_routes_for_plain_query(
+def test_maps_directions_returns_alternative_routes_for_plain_query(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1179,7 +1179,7 @@ def test_s6_pr02_maps_directions_returns_alternative_routes_for_plain_query(
         assert calls[0]["json"]["computeAlternativeRoutes"] is True
 
 
-def test_s6_pr02_maps_directions_caps_alternatives_at_three_routes(
+def test_maps_directions_caps_alternatives_at_three_routes(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1224,7 +1224,7 @@ def test_s6_pr02_maps_directions_caps_alternatives_at_three_routes(
         assert [route["description"] for route in output["routes"]] == ["R1", "R2", "R3"]
 
 
-def test_s6_pr02_maps_search_places_reports_uncertainty_when_no_places(
+def test_maps_search_places_reports_uncertainty_when_no_places(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1261,7 +1261,7 @@ def test_s6_pr02_maps_search_places_reports_uncertainty_when_no_places(
         assert output["results"] == []
 
 
-def test_s6_pr02_maps_search_places_unresolvable_location_asks_clarification(
+def test_maps_search_places_unresolvable_location_asks_clarification(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1314,7 +1314,7 @@ def test_s6_pr02_maps_search_places_unresolvable_location_asks_clarification(
         ),
     ],
 )
-def test_s6_pr02_maps_search_places_geocoding_and_places_leg_failures_are_typed(
+def test_maps_search_places_geocoding_and_places_leg_failures_are_typed(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
     geocode_response: _FakeHTTPResponse,
@@ -1345,7 +1345,7 @@ def test_s6_pr02_maps_search_places_geocoding_and_places_leg_failures_are_typed(
         assert attempt["execution"]["error"] == expected_error
 
 
-def test_s6_pr02_maps_declared_egress_destinations_are_allowlisted() -> None:
+def test_maps_declared_egress_destinations_are_allowlisted() -> None:
     """Every destination the maps capabilities declare for egress must be a host
     on the capability's static allowlist. This is the real fail-closed contract;
     the deny path is exercised separately with an injected hostile destination."""
@@ -1396,7 +1396,7 @@ def test_s6_pr02_maps_declared_egress_destinations_are_allowlisted() -> None:
         ("cap.maps.search_places", {"query": "coffee", "unexpected": "x"}),
     ],
 )
-def test_s6_pr02_maps_input_validation_rejects_malformed_payloads(
+def test_maps_input_validation_rejects_malformed_payloads(
     capability_id: str,
     raw_input: dict[str, Any],
 ) -> None:
@@ -1409,7 +1409,7 @@ def test_s6_pr02_maps_input_validation_rejects_malformed_payloads(
     assert error == "schema_invalid"
 
 
-def test_s6_pr02_maps_search_places_radius_defaults_when_omitted() -> None:
+def test_maps_search_places_radius_defaults_when_omitted() -> None:
     """radius_meters has a single owner — the input validator — which defaults it
     to 2000 m when the caller omits it; execution trusts that normalized value."""
     capability = capability_registry_module.get_capability("cap.maps.search_places")

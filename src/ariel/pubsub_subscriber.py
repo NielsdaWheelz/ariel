@@ -123,6 +123,7 @@ def handle_message(
                     body_digest=hashlib.sha256(message.data).hexdigest(),
                     status="accepted",
                     error=None,
+                    created_at=now,
                     received_at=now,
                     processed_at=None,
                 )
@@ -146,10 +147,16 @@ def _write_heartbeat(
     now = _utcnow()
     with session_factory() as db:
         with db.begin():
-            row = db.get(SubscriberHeartbeatRecord, SUBSCRIBER_NAME)
+            row = db.scalar(
+                select(SubscriberHeartbeatRecord)
+                .where(SubscriberHeartbeatRecord.subscriber_name == SUBSCRIBER_NAME)
+                .with_for_update()
+                .limit(1)
+            )
             if row is None:
                 db.add(
                     SubscriberHeartbeatRecord(
+                        id=_new_id("shb"),
                         subscriber_name=SUBSCRIBER_NAME,
                         last_seen_at=now,
                         last_message_at=now if last_message else None,
@@ -157,6 +164,7 @@ def _write_heartbeat(
                         errors_in_window=0,
                         last_error_code=None,
                         last_error_at=None,
+                        created_at=now,
                         updated_at=now,
                     )
                 )

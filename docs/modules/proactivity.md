@@ -14,9 +14,7 @@ decision table.
 Proactivity follows [../ai-first.md](../ai-first.md): the model owns every
 judgment — whether an event matters, whether to interrupt, what to do, when to
 look again; deterministic code owns only rails — the queue, ingress
-normalization, provider auth, capability policy, approval, and delivery. The
-cutover that produced this design is recorded in
-[proactivity-cutover.md](proactivity-cutover.md).
+normalization, provider auth, capability policy, approval, and delivery.
 
 ## The wake model
 
@@ -37,37 +35,42 @@ Every wake is recorded as a session turn.
 
 ## Triggers
 
-Five triggers wake the agent, all through `_wake`:
+Wake sources reach `_wake` through the worker:
 
 - **A user message** — Discord or API.
-- **A provider push event** — a Gmail or Calendar `watch` callback, or an
-  Agency job event. The webhook verifies and normalizes the event and enqueues
-  a wake.
+- **A provider push event** — a Gmail or Calendar `watch` callback. The
+  webhook or Pub/Sub sidecar verifies and normalizes the event, enqueues
+  `provider_event_received`, and the worker may enqueue a wake after sync finds
+  new or changed data.
+- **An Agency job event** — the webhook verifies and normalizes the event,
+  enqueues `agency_event_received`, and the worker enqueues a wake for job
+  states the agent should review.
 - **A poll result** — the periodic provider reconcile sync finds new or changed
   data and enqueues a wake.
 - **A due scheduled task** — an `agent_wake` row whose `run_after` has arrived.
 - **A research completion** — when a `research_run` task finishes, the worker
-  enqueues an `agent_wake` carrying the typed `research_finding_v1`. The main
-  agent wakes with `trigger_kind = research_completion`, reads the finding
+  enqueues an `agent_wake` carrying the typed `research_finding` payload. The
+  main agent wakes with `trigger_kind = research_completion`, reads the finding
   (carried with tainted provenance), and answers the user.
 
 A Google connector error also enqueues a wake, so the user learns of a broken
-connector. There is no periodic sweep of internal tables for candidates; each
-event wakes the agent when it happens.
+connector. There is no periodic sweep of internal tables for candidates;
+external events enter durable ingestion tasks, and wakes are enqueued when the
+worker has actionable data or status for the agent.
 
 ## The scheduler (`background_tasks`)
 
-`background_tasks` is the one durable task queue. It is shared infrastructure:
-besides agent wakes it carries the memory rememberer and sweep, durable action
-execution, approval expiry, and Agency and provider ingestion tasks. It is not
-proactivity-exclusive.
+`background_tasks` is the one durable task queue. It is shared infrastructure,
+not proactivity-exclusive. This section documents the queue contract;
+`BackgroundTaskRecord` implements the row shape and allowed task types, and
+`worker.py` owns dispatch behavior. Module docs own module-specific task
+semantics.
 
 A row is `id`, `task_type`, `idempotency_key`, `provider_write_receipt_id`,
 `payload`, `attempts`, `recurrence_seconds`, `run_after`, `created_at`, and
-`updated_at`. `task_type` is the discriminator the worker dispatches on. An
-agent wake is a `task_type='agent_wake'` row whose `payload` carries the
-AI-authored note — the agent's message to its future self, no schema, the same
-kind of artifact as a memory fact.
+`updated_at`. Plain note wakes carry an `agent_wake` payload with `note`.
+Research-completion wakes carry `session_id` and a typed `research_finding`.
+The worker rejects any `agent_wake` payload that is neither shape.
 
 The single-threaded worker takes the earliest due row, dispatches by
 `task_type`, and on success deletes the row, or — when `recurrence_seconds` is
@@ -127,8 +130,8 @@ The worker performs two recurring maintenance tasks from connector state:
   independent of push.
 
 A stale delta cursor — a Gmail `404` or a Calendar `410` — clears the cursor
-and triggers a full resync. A provider push event and a sync that finds new
-data each enqueue an `agent_wake`.
+and triggers a full resync. A provider push event enqueues ingestion work. A
+sync that finds new data enqueues an `agent_wake`.
 
 ## Delivery
 
@@ -164,9 +167,10 @@ denies; it cannot act irreversibly on its own.
   no table of its own beyond `provider_watch_channels`.
 - The worker takes the earliest due row and deletes it on success. There is no
   claim protocol, heartbeat, dead-letter state, or reaper.
-- The agent's scheduling surface is `proactive.schedule`. The one other code
-  path that writes `agent_wake` rows is the research-run completion handler,
-  which enqueues the finding wake on behalf of the system — not the agent.
+- The agent's scheduling surface is `proactive.schedule`; it writes scheduled
+  `agent_wake` rows through the capability runtime. System-owned wake writers
+  are provider syncs that find new data, Google connector-error handling,
+  Agency job event handling, and research-run completion.
 - Recurrence is the agent re-scheduling itself; the syscall takes a one-shot
   timestamp.
 - Delivery is one code path: the worker posts the emitted message to Discord

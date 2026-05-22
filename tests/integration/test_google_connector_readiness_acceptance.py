@@ -8,7 +8,8 @@ from typing import Any, cast
 from fastapi.testclient import TestClient
 import pytest
 
-from ariel.app import ModelAdapter, create_app
+from ariel.app import ModelAdapter
+from tests.integration.app_helpers import create_migrated_app
 from ariel.google_connector import GOOGLE_CONNECTOR_ID, GoogleWorkspaceProvider
 from ariel.persistence import GoogleConnectorRecord
 from tests.integration.responses_helpers import (
@@ -31,8 +32,8 @@ GOOGLE_GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 
 @dataclass
 class ActionProposalAdapter:
-    provider: str = "provider.s4-pr03"
-    model: str = "model.s4-pr03-v1"
+    provider: str = "provider.google-readiness"
+    model: str = "model.google-readiness-v1"
     run_calls_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     assistant_text_by_message: dict[str, str] = field(default_factory=dict)
 
@@ -83,7 +84,7 @@ class ActionProposalAdapter:
             calls=run_calls,
             provider=self.provider,
             model=self.model,
-            provider_response_id="resp_s4_pr03_123",
+            provider_response_id="resp_google_readiness_123",
             input_tokens=31,
             output_tokens=20,
         )
@@ -388,10 +389,9 @@ class FakeGoogleWorkspaceProvider:
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
-    app = create_app(
+    app = create_migrated_app(
         database_url=postgres_url,
         model_adapter=adapter,
-        reset_database=True,
         sandbox=FakeSandboxRuntime(),
     )
     return TestClient(app)
@@ -475,7 +475,7 @@ def _connect_google(client: TestClient, *, code: str) -> dict[str, Any]:
         ("access_revoked", "connect-compose-expired", "invalid_grant", False, "access_revoked"),
     ],
 )
-def test_s4_pr03_blocking_auth_failures_remap_readiness_to_reconnect_required(
+def test_blocking_auth_failures_remap_readiness_to_reconnect_required(
     postgres_url: str,
     case_name: str,
     connect_code: str,
@@ -588,7 +588,7 @@ def test_s4_pr03_blocking_auth_failures_remap_readiness_to_reconnect_required(
         del turn
 
 
-def test_s4_pr03_transient_auth_failures_do_not_remap_connected_readiness(
+def test_transient_auth_failures_do_not_remap_connected_readiness(
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
@@ -632,7 +632,7 @@ def test_s4_pr03_transient_auth_failures_do_not_remap_connected_readiness(
         assert connector_payload["last_error_code"] == "token_expired"
 
 
-def test_s4_pr03_reconnect_required_persists_until_successful_reconnect(
+def test_reconnect_required_persists_until_successful_reconnect(
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
@@ -749,7 +749,7 @@ def test_s4_pr03_reconnect_required_persists_until_successful_reconnect(
         assert connector_payload["last_error_code"] is None
 
 
-def test_s4_pr03_blocking_readiness_state_is_not_downgraded_by_later_transient_failure(
+def test_blocking_readiness_state_is_not_downgraded_by_later_transient_failure(
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
@@ -842,7 +842,7 @@ def test_s4_pr03_blocking_readiness_state_is_not_downgraded_by_later_transient_f
         assert connector_payload["last_error_code"] == "scope_missing"
 
 
-def test_s4_pr03_attendee_reconnect_intent_requests_freebusy_and_closes_fallback_path(
+def test_attendee_reconnect_intent_requests_freebusy_and_restores_full_availability(
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(

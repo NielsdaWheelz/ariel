@@ -26,8 +26,8 @@ import sys
 from types import SimpleNamespace
 from typing import Any, Callable
 
-# Standard-library modules the program may import: the safe compute surface
-# named in the run-program cutover. No os, sys, socket, subprocess, importlib.
+# Standard-library modules the sandboxed run program may import: pure compute
+# helpers only. No os, sys, socket, subprocess, importlib.
 # Entries are matched as exact module paths in ``_restricted_import``, so
 # ``urllib`` listed here means the bare ``urllib`` package and not the
 # I/O-capable ``urllib.request``. The two dotted entries below

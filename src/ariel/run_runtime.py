@@ -34,18 +34,18 @@ _AGENT_SYSCALL_NAMES = (_AGENT_EMIT_MESSAGE, _AGENT_EMIT_VALUE, _AGENT_PAUSE_UNT
 
 # Non-main-loop terminal output syscalls. Always bound into the sandbox so a
 # misuse in the main loop surfaces as a typed host-callback error rather than an
-# AttributeError traceback. The gate is the host callback, keyed on
-# is_research_run. agent.emit_finding exits a retriever/researcher run;
+# AttributeError traceback. The gate is the host callback, keyed on the
+# main-agent loop. agent.emit_finding exits a retriever/researcher run;
 # agent.emit_done exits a rememberer run.
 _AGENT_EMIT_FINDING = "agent.emit_finding"
 _AGENT_EMIT_DONE = "agent.emit_done"
 
 _AGENT_EMIT_FINDING_MAIN_LOOP_ERROR = (
-    "agent.emit_finding is only available inside a research run; "
+    "agent.emit_finding is not available in the main agent loop; "
     "finish the main loop with agent.emit_message"
 )
 _AGENT_EMIT_DONE_MAIN_LOOP_ERROR = (
-    "agent.emit_done is only available inside memory subsystem runs; "
+    "agent.emit_done is not available in the main agent loop; "
     "finish the main loop with agent.emit_message"
 )
 
@@ -82,8 +82,7 @@ class RunProgramResult:
     """Outcome of one model-authored ``run`` program executed in the sandbox.
 
     ``program_ok`` is the sandbox ``ProgramResult.ok``: ``False`` means the
-    program did not complete cleanly. Per the cutover's "Program Failure", a
-    program that does not complete cleanly surfaces no proposals, so on failure
+    program did not complete cleanly. Failed programs surface no proposals, so
     ``emitted_message``/``emitted_values``/``emitted_finding``/``paused`` are
     scrubbed here and the staged ``ApprovalRequestRecord`` rows the syscalls
     wrote are left for the caller's transaction to roll back. ``action_attempts``
@@ -98,11 +97,11 @@ class RunProgramResult:
     even if a later syscall raised.
 
     ``emitted_finding`` is set only when the program was run with
-    ``is_research_run=True`` and the program called ``agent.emit_finding``; it is
+    ``is_main_agent_loop=False`` and the program called ``agent.emit_finding``; it is
     ``None`` in main-agent runs and on ``program_ok=False``.
 
     ``emitted_done`` is set only when the program was run with
-    ``is_research_run=True`` and the program called ``agent.emit_done``; it is
+    ``is_main_agent_loop=False`` and the program called ``agent.emit_done``; it is
     ``None`` in main-agent runs and on ``program_ok=False``.  When set, the value
     is the summary string the model passed (possibly empty string).
     """
@@ -252,17 +251,17 @@ def execute_run_program(
     settings: AppSettings | None,
     scratch: dict[str, ScratchEntry],
     model_adapter: Any | None = None,
-    is_research_run: bool = False,
+    is_main_agent_loop: bool = True,
 ) -> RunProgramResult:
     """Run one model-authored Python ``run`` program inside the sandbox.
 
     Each syscall is dispatched host-side: the three ``agent.*`` output syscalls
     are handled inline here; every other syscall is a capability call routed
-    through ``process_one_call`` — the same per-call lifecycle the flat-list path
-    used — so policy, taint, approval, egress, guardrails, and the action ledger
-    all still apply. Taint accumulates within the program: after a capability
-    syscall sets ``ctx.result_runtime_provenance``, that provenance is merged
-    into the threaded provenance so later syscalls in the same program see it.
+    through ``process_one_call``, which owns policy, taint, approval, egress,
+    guardrails, and the action ledger. Taint accumulates within the program:
+    after a capability syscall sets ``ctx.result_runtime_provenance``, that
+    provenance is merged into the threaded provenance so later syscalls in the
+    same program see it.
 
     ``proposal_index_start`` is the count of capability syscalls already made by
     earlier programs in this turn. Each capability syscall here is numbered
@@ -387,10 +386,10 @@ def execute_run_program(
 
         if name == _AGENT_EMIT_FINDING:
             # agent.emit_finding is the investigation run's terminal output. The
-            # syscall is bound regardless of is_research_run so a main-loop
+            # syscall is bound regardless of is_main_agent_loop so a main-loop
             # misuse surfaces here as a typed error the model can recover from
             # rather than an AttributeError traceback.
-            if not is_research_run:
+            if is_main_agent_loop:
                 callback_errors.append(_AGENT_EMIT_FINDING_MAIN_LOOP_ERROR)
                 return False, _AGENT_EMIT_FINDING_MAIN_LOOP_ERROR
             summary = syscall_input.get("summary")
@@ -419,9 +418,9 @@ def execute_run_program(
 
         if name == _AGENT_EMIT_DONE:
             # agent.emit_done is the rememberer's terminal output. Bound
-            # regardless of is_research_run; a main-loop misuse surfaces as a
+            # regardless of is_main_agent_loop; a main-loop misuse surfaces as a
             # typed error here.
-            if not is_research_run:
+            if is_main_agent_loop:
                 callback_errors.append(_AGENT_EMIT_DONE_MAIN_LOOP_ERROR)
                 return False, _AGENT_EMIT_DONE_MAIN_LOOP_ERROR
             if set(syscall_input.keys()) - {"summary"}:

@@ -9,7 +9,7 @@ end-to-end, with a public HTTPS callback, a Pub/Sub StreamingPull subscriber,
 exactly-once delivery, a dead-letter topic, and daily watch renewal."
 
 It owns the cutover only. The standing description of provider ingestion lives
-in [proactivity.md](proactivity.md), which Phase 5 updates. The plan inherits
+in [proactivity.md](proactivity.md). The plan inherits
 [../ai-first.md](../ai-first.md), [../simplicity.md](../simplicity.md),
 [../cleanliness.md](../cleanliness.md), [../boundaries.md](../boundaries.md),
 [../concurrency.md](../concurrency.md), [../correctness.md](../correctness.md),
@@ -20,10 +20,7 @@ in [proactivity.md](proactivity.md), which Phase 5 updates. The plan inherits
 of [proactivity-cutover.md](proactivity-cutover.md): delete the half-finished
 machinery, keep one trigger-agnostic agent loop and a thin rail.
 
-This document supersedes the "push notifications, if wanted later, ship as one
-whole cutover" line in
-[../schema-consolidation-cutover.md](../schema-consolidation-cutover.md) and
-the deferred Gmail-push half of
+This document supersedes the deferred Gmail-push half of
 [../north-star-cutover.md](../north-star-cutover.md).
 
 ## Cutover Policy
@@ -275,7 +272,7 @@ At startup:
 1. Resolve `ARIEL_GOOGLE_PUBSUB_SUBSCRIPTION` (a full resource path:
    `projects/{project}/subscriptions/{name}`) and
    `ARIEL_GOOGLE_APPLICATION_CREDENTIALS_PATH` (a filesystem path to the
-   service-account JSON, chmod 600, owned by user `niels`).
+   service-account JSON, mode 0600, owned by the runtime user).
 2. Set `GOOGLE_APPLICATION_CREDENTIALS` from the path so the Google SDK picks
    it up via ADC.
 3. Build a `SubscriberClient` and call
@@ -345,8 +342,7 @@ keys-and-identities.md compliance the cutover owes:
 User OAuth is preserved unchanged. Calendar push tokens go from "stored but
 unused" to "stored and required." Runtime SA is new for v2; it is the first
 "act as the app" credential in the codebase and it composes by living on the
-filesystem rather than in the encrypted-token table — the
-keys-and-identities.md update in P5 records this rule.
+filesystem rather than in the encrypted-token table.
 
 ### Dedup model — two layers
 
@@ -441,8 +437,8 @@ to validate `X-Goog-Channel-Token` instead.
 
 ### Process topology
 
-After the cutover, the box runs four user-mode systemd units, all as user
-`niels`, all under `Restart=always`:
+After the cutover, the box runs four systemd services, all as user `ariel`,
+all under `Restart=always`:
 
 | Unit | Role | Long-lived listener? |
 |---|---|---|
@@ -473,11 +469,12 @@ is ~30-50 MB resident (Python + gRPC + a small in-flight set bounded by
 | Auth | Global HMAC (`ARIEL_GOOGLE_PROVIDER_EVENT_TOKEN`) **AND** per-channel HMAC against `ProviderWatchChannelRecord.channel_token` looked up by `X-Goog-Channel-ID` |
 | Idempotency | Dedup on `sha256("google:calendar:{resource_id}:{channel_id}:{message_number}")`; duplicate returns `202 {"duplicate": true}`; conflicting payload returns `409 E_PROVIDER_EVENT_CONFLICT` |
 | Success | `202 Accepted` with `{"duplicate": bool, "provider_event_id": str}` |
-| Errors | `401` (either HMAC fails / channel unknown), `400` (missing required headers), `409` (conflict) |
+| Errors | `401` (either HMAC fails / channel unknown), `422` (invalid `resource_type` or missing required headers), `409` (conflict) |
 | Side effects | One `ProviderEventRecord` row, one enqueued `provider_event_received` task |
 
 `resource_type=gmail` and `resource_type=drive` on this route are **rejected
-with 400** after P2. Gmail never reaches the HTTP path; Drive is out of scope.
+at the FastAPI boundary with 422** after P2. Gmail never reaches the HTTP path;
+Drive is out of scope.
 
 ### Pub/Sub subscriber callback
 
@@ -527,30 +524,35 @@ in place.
 
 | Column | Type | Notes |
 |---|---|---|
-| `subscriber_name` | `varchar(64) PRIMARY KEY` | e.g., `"gmail_pubsub"` |
+| `id` | `varchar(32) PRIMARY KEY` | Standard `shb_` ULID |
+| `subscriber_name` | `varchar(64) NOT NULL UNIQUE` | e.g., `"gmail_pubsub"` |
 | `last_seen_at` | `timestamptz NOT NULL` | Updated every 30s regardless of message flow |
 | `last_message_at` | `timestamptz` | Updated on successful message ack |
-| `in_flight_count` | `integer NOT NULL DEFAULT 0` | Subscriber's view of leased messages |
-| `errors_in_window` | `integer NOT NULL DEFAULT 0` | Rolling 5-minute error count, reset on heartbeat tick |
+| `in_flight_count` | `integer NOT NULL DEFAULT 0` | Subscriber's nonnegative view of leased messages |
+| `errors_in_window` | `integer NOT NULL DEFAULT 0` | Nonnegative rolling 5-minute error count, reset on heartbeat tick |
 | `last_error_code` | `varchar(64)` | Free-form last-error tag |
 | `last_error_at` | `timestamptz` | When `last_error_code` was set |
+| `created_at` | `timestamptz NOT NULL` | Standard created_at |
 | `updated_at` | `timestamptz NOT NULL` | Standard updated_at |
 
-Migration: `alembic/versions/<timestamp>_subscriber_heartbeat.py`. Up creates
-the table; down drops it. No data backfill (the subscriber writes the row on
-first heartbeat tick).
+Migrations: `20260520_0055_subscriber_heartbeat.py` creates the table,
+`20260521_0058_subscriber_heartbeat_schema_rules.py` adds `created_at` and
+counter checks, and `20260522_0060_subscriber_heartbeat_identity.py` backfills
+`id`, moves the primary key to `id`, and keeps `subscriber_name` as the unique
+lookup key.
 
 ### Unchanged: `ProviderWatchChannelRecord`
 
 Stored at `persistence.py:~958-1003`. Schema already carries the per-channel
 `channel_token` field. P2 starts *reading* it; the schema does not move.
 
-### Unchanged: `ProviderEventRecord`
+### Existing: `ProviderEventRecord`
 
-Stored at `persistence.py`. The `dedupe_key` text column accepts any sha256
-hex string; the Gmail path uses
+Stored at `persistence.py`. The row has the standard `created_at` timestamp
+plus the provider-delivery `received_at` timestamp. The `dedupe_key` text column
+accepts any sha256 hex string; the Gmail path uses
 `sha256("google:gmail:{account_subject}:pubsub:{message_id}")`. No new
-columns.
+Gmail-only columns.
 
 ### Unchanged: `SyncCursorRecord`
 
@@ -618,11 +620,9 @@ ARIEL_GOOGLE_OAUTH_CLIENT_SECRET=...
 ARIEL_GOOGLE_PROVIDER_EVENT_TOKEN=<32+ url-safe random chars>
 ARIEL_GOOGLE_PUBSUB_TOPIC=projects/<project>/topics/ariel-gmail-watch
 ARIEL_GOOGLE_PUBSUB_SUBSCRIPTION=projects/<project>/subscriptions/ariel-gmail-watch-sub
-ARIEL_GOOGLE_APPLICATION_CREDENTIALS_PATH=/home/niels/src/personal/ariel/.secrets/gcp-pubsub-sa.json
+ARIEL_GOOGLE_APPLICATION_CREDENTIALS_PATH=/etc/ariel/secrets/gcp-pubsub-sa.json
 # … rest unchanged
 ```
-
-The legacy `ARIEL_GOOGLE_PROVIDER_EVENT_URL` line is removed.
 
 ## Files
 
@@ -649,16 +649,19 @@ The legacy `ARIEL_GOOGLE_PROVIDER_EVENT_URL` line is removed.
 - `src/ariel/pubsub_subscriber.py` — the sidecar entrypoint:
   `main()`, `_on_message(message)`, `_emit_heartbeat()`, `_run()`. ~250 lines
   estimated.
-- `alembic/versions/<timestamp>_subscriber_heartbeat.py` — adds the
+- `alembic/versions/20260520_0055_subscriber_heartbeat.py` — adds the
   `subscriber_heartbeat` table.
-- `tests/fake_pubsub.py` — `FakePubSubMessage`, `FakeSubscriberClient`,
-  `FakeStreamingPullFuture`, `FakeAckResponse`. Plain-Python in-memory fakes
-  matching the codebase's existing fake style
-  (`tests/integration/test_provider_ingestion_p3.py`'s `WatchRecordingProvider`).
+- `alembic/versions/20260521_0058_subscriber_heartbeat_schema_rules.py` —
+  adds `created_at` and heartbeat counter checks.
+- `alembic/versions/20260522_0060_subscriber_heartbeat_identity.py` —
+  standardizes heartbeat identity on `id` and keeps `subscriber_name` unique.
+- `tests/fake_pubsub.py` — `FakePubSubMessage`, `FakeAckResponse`.
+  Plain-Python in-memory fakes matching the codebase's existing fake style
+  (`tests/integration/test_google_provider_ingestion.py`'s `WatchRecordingProvider`).
 - `tests/integration/test_pubsub_subscriber.py` — end-to-end tests against
-  the fake: happy path (insert + enqueue + ack), redelivery (same messageId →
-  duplicate=true), malformed payload (nack path), unknown account (ack and
-  drop), subscriber-down → `/v1/health` returns 503.
+  the fake: happy path (insert + enqueue + ack), duplicate dedupe, malformed
+  payload (nack path), missing email field (nack path), unknown account (ack and
+  drop), heartbeat create/update.
 
 ### Edited
 
@@ -666,8 +669,9 @@ The legacy `ARIEL_GOOGLE_PROVIDER_EVENT_URL` line is removed.
   rename/deletion described in "Renamed → deleted". Validators wired.
 - `src/ariel/app.py`:
   - `POST /v1/providers/google/events` (`~3633-3795`) — per-channel HMAC
-    layered on top of the global gate; `resource_type=gmail|drive` rejected
-    with 400; channel-id lookup added; tests touched accordingly.
+    layered on top of the global gate; `resource_type=gmail|drive` rejected at
+    the FastAPI validation boundary with 422; channel-id lookup added; tests
+    touched accordingly.
   - `GET /v1/health` — read `subscriber_heartbeat` and project subscriber
     state into the response; return 503 on staleness.
   - The `app.state.google_provider_event_token` initialization is unchanged.
@@ -721,13 +725,13 @@ later phases consume the new settings.
   `google_application_credentials_path`,
   `subscriber_heartbeat_interval_seconds`,
   `subscriber_heartbeat_staleness_factor` to `AppSettings` with validators.
-- Add `subscriber_heartbeat` table + alembic migration.
+- Add `subscriber_heartbeat` table and identity/schema-rule migrations.
 - Add `SubscriberHeartbeatRecord` to `persistence.py`.
 - Add `deploy/caddy/Caddyfile`, `deploy/caddy/install.sh`,
   `scripts/gcp_provision_pubsub.sh`, `scripts/gcp_create_runtime_sa.sh`.
 - Rewrite the Google Workspace section of `docs/production-runbook.md` to the
   end-state runbook (DNS, Caddy, provisioning, env vars, smoke test).
-- Tests: validator tests (`tests/unit/test_config.py`) for the five new
+- Tests: validator tests (`tests/unit/test_app_config.py`) for the five new
   fields; migration up/down test.
 
 P1 is operator-ready for the box without changing any wire protocol.
@@ -740,7 +744,7 @@ The hard cutover of the inbound HTTP layer.
   look up `ProviderWatchChannelRecord` by `X-Goog-Channel-ID`; reject 401 if
   missing; `hmac.compare_digest` against `channel_token`; reject 401 if
   mismatch. This runs after the global-token gate, before the dedup logic.
-- Reject `resource_type=gmail|drive` on this endpoint with 400.
+- Reject `resource_type=gmail|drive` on this endpoint with 422.
 - Delete `google_provider_event_url` from `AppSettings`, `.env.example`, and
   every reference site.
 - Construct the Calendar watch `address` from
@@ -752,7 +756,7 @@ The hard cutover of the inbound HTTP layer.
   - Per-channel HMAC happy path, channel-not-found 401, wrong-token 401,
     cross-channel-token-replay 401 (channel A's token does not authenticate
     channel B).
-  - `resource_type=gmail` returns 400.
+  - `resource_type=gmail` returns 422.
   - All existing dedup + conflict tests stay green.
   - One acceptance test against `register_provider_watches` confirms the
     constructed `address` matches the expected pattern.
@@ -780,13 +784,14 @@ The Gmail live-push layer.
       one `provider_event_received` task; `ack_with_response()` was called
       and resolved SUCCESS.
     - Redelivery — the same messageId arrives twice; second insert dedups;
-      task enqueued once.
+      event and task are each written once, and both messages are acked.
     - Malformed payload — message data is not valid UTF-8 JSON; nack is
       called; no DB write.
+    - Missing email field — nack is called; no DB write.
     - Unknown account — `emailAddress` not in `GoogleConnectorRecord`; ack is
       called; no DB write.
-    - Heartbeat staleness → `/v1/health` returns 503.
-    - SIGTERM drain — pending callbacks complete before exit.
+    - Heartbeat create/update — one `subscriber_heartbeat` row is created and
+      then updated by `subscriber_name`.
 - The first `make verify` after P3 lands runs without the Pub/Sub SDK
   reaching real GCP; the fakes carry the test path.
 
@@ -799,7 +804,7 @@ Single-line behavioral change.
   pass renews any watch with less than 6 days remaining — i.e. the renewal
   runs daily under the 7-day expiry cap, matching Google's published
   recommendation.
-- Update the relevant test in `tests/integration/test_provider_ingestion_p3.py`
+- Update the relevant test in `tests/integration/test_google_provider_ingestion.py`
   (the "renewal scheduling when channel expires within 24h" test becomes
   "within 6 days").
 
@@ -815,10 +820,8 @@ Docs-only. Lands after P1–P4 have shipped.
   reference.
 - Add a "Cutover Status: completed YYYY-MM-DD (commit <sha>)" footer to this
   document.
-- Update `keys-and-identities.md` with the rule "service-account JSON files
-  live on the filesystem, chmod 600, owned by the runtime user; the
-  `ConnectorTokenCipher`-encrypted token table holds per-user OAuth refresh
-  tokens only." — codifying the new credential boundary.
+- Document the service-account JSON keyfile boundary in this cutover and
+  `docs/production-runbook.md`.
 
 ## Hard-Cutover Decisions
 
@@ -900,11 +903,9 @@ Docs-only. Lands after P1–P4 have shipped.
 ## Risks
 
 - **Pub/Sub SA leakage.** The runtime SA JSON file on disk is a high-value
-  credential. Mitigation: chmod 600, owned by `niels`, stored under a
-  gitignored path; the provisioning script grants the runtime SA only
-  Subscriber on the subscription and the DLQ subscription. P5's
-  `keys-and-identities.md` update names the file as a tracked sensitive
-  artifact.
+  credential. Mitigation: install it under the deployment secrets directory
+  with mode 0600 and runtime-user ownership; the provisioning script grants
+  the runtime SA only Subscriber on the subscription and the DLQ subscription.
 - **Public surface drift.** Caddy is the only thing standing between the
   public internet and the loopback app. A Caddyfile typo could expose more
   than intended. Mitigation: the Caddyfile has a default-404 `handle` block;
@@ -1018,12 +1019,11 @@ The plan also inherits repo-internal rules from `docs/ai-first.md`,
 `docs/simplicity.md`, `docs/boundaries.md`, `docs/concurrency.md`,
 `docs/correctness.md`, `docs/control-flow.md`, `docs/keys-and-identities.md`,
 `docs/operation-types.md`, `docs/mutation-ordering.md`,
-`docs/modules/proactivity.md`, `docs/modules/transport.md`, and the
-schema-consolidation cutover that deferred this work in the first place.
+`docs/modules/proactivity.md`, and `docs/modules/transport.md`.
 
 ## Departures From Spec During Implementation
 
-Two small spec sentences were not implemented as written, in favor of repo
+Some small spec sentences were not implemented as written, in favor of repo
 conventions cited inline:
 
 - The spec's `google_application_credentials_path` validator described
@@ -1038,10 +1038,6 @@ conventions cited inline:
   auto-derive; the operator sets both env vars explicitly, and the
   production runbook documents both. Rationale: minimalism — auto-derivation
   is a second code path that the operator-runbook step already covers.
-- Reject of `resource_type=gmail|drive` on the webhook is enforced by
-  narrowing the FastAPI query-param `Literal` to `["calendar"]`. FastAPI
-  returns `422` (validation error) instead of the spec's `400`. The
-  rejection semantics are unchanged; only the status code differs.
 - `docs/keys-and-identities.md` was not extended with the SA-on-disk rule.
   That document covers identifier *naming* conventions, not credential
   storage; the SA-on-disk boundary is documented in this cutover and in

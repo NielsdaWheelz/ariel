@@ -52,7 +52,7 @@ from ariel.capability_registry import (
     run_callable_signature,
 )
 from ariel.config import AppSettings
-from ariel.db import SchemaReadinessProbe, reset_schema_for_tests
+from ariel.db import SchemaReadinessProbe
 from ariel.google_connector import (
     DefaultGoogleOAuthClient,
     DefaultGoogleWorkspaceProvider,
@@ -2293,7 +2293,7 @@ def _wake(
         prompt_version=MAIN_AGENT_PROMPT_VERSION,
         budget_seconds=float(runtime.settings.main_turn_budget_seconds),
         max_model_calls=int(runtime.settings.agent_loop_max_model_calls),
-        is_research_run=False,
+        is_main_agent_loop=True,
         record_judgments=True,
         judgment_type="model_output",
         retry_on_model_error=True,
@@ -2320,7 +2320,7 @@ def _wake(
             "run program emitted internal values. They are not "
             "visible to the user. Continue with exactly one run call."
         ),
-        fallback_nudge=(
+        no_terminal_output_nudge=(
             "run program completed without user-visible output. Plain "
             "assistant text is audit-only and was not shown. Continue with "
             "exactly one run call whose program emits output through "
@@ -2549,7 +2549,6 @@ def create_app(
     database_url: str | None = None,
     model_adapter: ModelAdapter | None = None,
     sandbox: RunSandbox | None = None,
-    reset_database: bool = False,
 ) -> FastAPI:
     runtime, engine = build_runtime(
         database_url=database_url,
@@ -2557,22 +2556,19 @@ def create_app(
         sandbox=sandbox,
     )
     settings = runtime.settings
-    db_url = database_url or settings.database_url
     adapter = runtime.model_adapter
     run_sandbox = runtime.sandbox
     session_factory = runtime.session_factory
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        if reset_database:
-            reset_schema_for_tests(engine, db_url)
         # Prime the cache so the first health check is fast. A failure here does
         # not abort startup — health stays 503 until the probe's next refresh
-        # sees the schema cleared, so operators can run migrations against the
-        # live process and recover without a restart.
+        # sees no schema readiness issues, so operators can repair schema drift
+        # against the live process without a restart.
         probe = app.state.schema_probe
         probe.invalidate()
-        probe.missing_tables()
+        probe.schema_issues()
         if run_sandbox is not None:
             run_sandbox.start()
         try:
@@ -2582,7 +2578,7 @@ def create_app(
                 run_sandbox.close()
             engine.dispose()
 
-    app = FastAPI(title="Ariel Slice 0", lifespan=lifespan)
+    app = FastAPI(title="Ariel", lifespan=lifespan)
     app.state.runtime = runtime
     app.state.engine = engine
     app.state.session_factory = session_factory
@@ -2713,13 +2709,13 @@ def create_app(
 
     def _ensure_schema_ready() -> None:
         # Resolved from app.state so tests can inject a clock-controlled probe.
-        missing = app.state.schema_probe.missing_tables()
-        if missing:
+        schema_issues = app.state.schema_probe.schema_issues()
+        if schema_issues:
             raise ApiError(
                 status_code=503,
                 code="E_SCHEMA_NOT_READY",
-                message="database schema is not migrated",
-                details={"missing_tables": missing},
+                message="database schema is not ready",
+                details={"schema_issues": schema_issues},
                 retryable=False,
             )
 
@@ -2734,14 +2730,14 @@ def create_app(
 
     @app.get("/v1/health", response_model=None)
     def health() -> JSONResponse | dict[str, Any]:
-        missing = app.state.schema_probe.missing_tables()
-        if missing:
+        schema_issues = app.state.schema_probe.schema_issues()
+        if schema_issues:
             return _error_response(
                 ApiError(
                     status_code=503,
                     code="E_SCHEMA_NOT_READY",
-                    message="database schema is not migrated",
-                    details={"missing_tables": missing},
+                    message="database schema is not ready",
+                    details={"schema_issues": schema_issues},
                     retryable=False,
                 )
             )
@@ -2749,7 +2745,11 @@ def create_app(
             return {"ok": True}
 
         with session_factory() as db:
-            heartbeat = db.get(SubscriberHeartbeatRecord, "gmail_pubsub")
+            heartbeat = db.scalar(
+                select(SubscriberHeartbeatRecord)
+                .where(SubscriberHeartbeatRecord.subscriber_name == "gmail_pubsub")
+                .limit(1)
+            )
         staleness_threshold_seconds = (
             settings.subscriber_heartbeat_interval_seconds
             * settings.subscriber_heartbeat_staleness_factor
@@ -2916,6 +2916,7 @@ def create_app(
                     payload=stored_payload,
                     status="accepted",
                     error=None,
+                    created_at=now,
                     received_at=now,
                     processed_at=None,
                 )
@@ -3858,6 +3859,7 @@ def create_app(
                     body_digest=body_digest,
                     status="accepted",
                     error=None,
+                    created_at=now,
                     received_at=now,
                     processed_at=None,
                 )

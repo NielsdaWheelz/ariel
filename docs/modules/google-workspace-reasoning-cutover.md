@@ -42,11 +42,11 @@ Out of scope:
 - This is a hard cutover.
 - Do not preserve snippet-only Gmail read behavior for any path that claims to
   read email content.
-- Do not keep metadata-only Gmail reasoning as a fallback.
+- Do not keep metadata-only Gmail reasoning as an alternate path.
 - Do not keep old response fields for compatibility if they do not match the
   new typed contracts.
 - Do not dual-write old and new commitment stores.
-- Do not keep legacy ranking behavior for commitments once due-date-aware
+- Do not keep old ranking behavior for commitments once due-date-aware
   ranking lands.
 - Do not let model text mutate commitment, reminder, memory, or calendar state
   without a typed capability result and deterministic lifecycle validation.
@@ -216,27 +216,26 @@ The current implementation has useful foundations but must not remain as the
 final behavior:
 
 - `src/ariel/google_connector.py`
-  - `email_search` fetches Gmail metadata and returns title/source/snippet/date.
-  - `email_read` requests Gmail `format=full` but only surfaces subject, URL,
-    snippet, and date.
+  - `email_search` returns `google.gmail.message_refs.v1` message references:
+    ids, thread ids, bounded preview, provider URL, and `evidence_status`.
+  - `email_read` returns `google.gmail.message_evidence.v1`: bounded message
+    metadata, evidence blocks, body digest, HTML security diagnostics, and
+    `read_outcome`.
   - Calendar list and slot proposal paths are bounded but not connected to
     commitment state.
 - `src/ariel/action_runtime.py`
   - Retrieval artifacts are snippet-oriented.
   - Google read answer synthesis is generic and source-candidate based.
 - `src/ariel/sync_runtime.py`
-  - Gmail history sync stores generic message signals without subject, sender,
-    thread, body evidence, or commitment extraction.
-  - Calendar sync creates title-like workspace items and signals.
+  - Gmail and Calendar sync persist provider objects and provider evidence, then
+    wake the shared agent loop.
 - `src/ariel/memory.py`
-  - Commitments exist as memory assertions, but current extraction is turn-text
-    oriented and does not capture owner, counterparty, due windows, or provider
-    evidence anchors as required typed fields.
-- `src/ariel/proactivity.py`
-  - Active commitments produce broad signals without due-date semantics.
-- `src/ariel/attention_ranking.py`
-  - Commitment ranking is static and confidence-oriented. It does not compute
-    due-soon, overdue, waiting-on, stale, or snooze-aware urgency.
+  - The live memory substrate is `memory_log` and `memory_notes`; there is no
+    dedicated commitment store.
+- Deleted former proactivity, workspace-reasoning, and attention-ranking modules
+  are not live owners. Commitment lifecycle, follow-up, and delivery work must
+  land in concrete current owners before this cutover can claim those surfaces
+  are implemented.
 
 These are replacement targets, not compatibility promises.
 
@@ -378,7 +377,7 @@ Rules:
 - Store bounded body blocks, not prompt-ready raw corpus.
 - Store enough provider identity to rehydrate, cite, dedupe, and invalidate.
 - If full raw payload storage is introduced, it must be encrypted, access-gated,
-  retention-bound, and never used as a prompt fallback.
+  retention-bound, and never used to bypass bounded prompt evidence.
 - Evidence creation is idempotent by provider object id plus content digest.
 - Provider changes produce new evidence versions. They do not mutate old
   evidence into a misleading state.
@@ -506,7 +505,8 @@ Rules:
 
 Target files:
 
-- `src/ariel/workspace_reasoning.py`
+- `src/ariel/sync_runtime.py`
+- `src/ariel/google_workspace_normalization.py`
 - `src/ariel/memory.py`
 - `src/ariel/worker.py`
 - `src/ariel/response_contracts.py`
@@ -633,12 +633,15 @@ Rules:
 - Loop policy is versioned so old queued jobs can be evaluated safely after a
   policy change.
 
-Target files:
+Target owners:
 
-- `src/ariel/proactivity.py`
-- `src/ariel/attention_ranking.py`
 - `src/ariel/worker.py`
+- `src/ariel/app.py`
+- `src/ariel/memory.py`
 - `src/ariel/persistence.py`
+
+Deleted former proactivity and attention-ranking modules are not reintroduced.
+Delivery goes through the unified proactivity model in [proactivity.md](proactivity.md).
 
 ### Layer 9: Attention Ranking
 
@@ -784,7 +787,7 @@ Output:
 - labels
 - snippet for preview only
 - provider URL
-- evidence status: `metadata_only`, `body_available`, or `needs_read`
+- evidence status: `needs_read`
 
 Search never pretends snippets are full content.
 
@@ -840,46 +843,21 @@ These capabilities expose product objects, not raw database rows.
 
 ## Data Model
 
-Required durable state is implemented as dedicated tables that preserve these
-logical records:
+Current implemented durable state uses these live schema families:
 
-- `google_provider_objects`
-- `provider_evidence`
-- `provider_evidence_blocks`
-- `work_people`
-- `work_threads`
-- `work_commitments`
-- `work_commitment_sources`
-- `work_follow_up_loops`
-- `work_follow_up_events`
-- `provider_write_receipts`
-- `provider_sync_cursors`
-- `attention_signals`
-- `attention_items`
-- `memory_assertions` or successor semantic-memory records
+- Provider connection and sync: `google_connectors`, `google_oauth_states`,
+  `google_connector_events`, `sync_cursors`, `provider_watch_channels`,
+  `provider_events`, and `sync_runs`.
+- Provider evidence: `google_provider_objects`, `provider_evidence`, and
+  `provider_evidence_blocks`.
+- Provider writes and async work: `action_attempts`, `action_private_payloads`,
+  `approval_requests`, `provider_write_receipts`, and `background_tasks`.
+- Memory substrate: `memory_log` and `memory_notes`.
 
-Required indexes:
-
-- provider account plus external object id
-- Gmail thread id
-- Gmail message id
-- Calendar event id and iCal UID
-- commitment lifecycle state
-- owner plus lifecycle state
-- due window start/end
-- follow-up next check time
-- source evidence id
-- content digest
-- attention item next follow-up time
-
-Required constraints:
-
-- unique provider object identity per provider account
-- unique evidence version per provider object and digest
-- unique active commitment source tuple when action/due/owner are equivalent
-- loop belongs to exactly one commitment, thread, event, or connector case
-- follow-up scheduled task references loop id and loop version
-- provider write receipt unique by proposal id and idempotency key
+There are no dedicated retired work-graph, attention, or old memory-assertion
+tables in the live schema. Commitment, follow-up, or attention persistence must
+name concrete ORM tables, constraints, and indexes before this section lists
+them. A database with only table names present is not schema-ready.
 
 ## Prompt And AI Contracts
 
@@ -941,7 +919,7 @@ Required counters and events:
 - Gmail read success/failure by failure code
 - MIME decode failure by part type
 - body truncation counts
-- HTML sanitization fallback counts
+- HTML sanitization diagnostic counts
 - evidence records created
 - extraction candidates by kind
 - candidates rejected by validator reason
@@ -966,7 +944,7 @@ Required diagnostics:
 ## Failure Behavior
 
 - If Gmail body decoding fails, email read returns a typed failure and does not
-  answer from a snippet as a fallback.
+  answer from a snippet instead.
 - If evidence persistence fails, extraction and answers requiring evidence fail
   closed.
 - If due-date normalization fails, the candidate is review-only and cannot
@@ -1145,14 +1123,14 @@ Required work:
 - Remove deterministic answer synthesis that pretends snippets are full email
   content.
 - Remove old commitment ranking.
-- Remove tests that encode legacy behavior.
+- Remove tests that encode old behavior.
 - Update docs and acceptance suites.
 
 Acceptance:
 
-- `rg "snippet-only|metadata-only|legacy|fallback" src tests` has no surviving
-  product path references for Gmail read, commitment ranking, or follow-up
-  behavior.
+- Targeted scans have no surviving product path references to snippet-only or
+  metadata-only Gmail reads, old email read/search contracts, old commitment
+  ranking, or old follow-up behavior.
 - The old behavior is unreachable in production runtime.
 
 ## Acceptance Criteria
@@ -1219,7 +1197,7 @@ Regression:
 - Existing approval policy still gates sends and calendar creates.
 - Existing memory recall includes active commitments only through the new
   structured path.
-- Existing proactive attention flow still handles jobs, approvals, captures, and
+- The unified proactivity wake flow still handles jobs, approvals, captures, and
   connector status.
 
 ## File Ownership
@@ -1245,25 +1223,10 @@ Primary implementation files:
   - evidence creation jobs
   - cursor handling
 
-- `src/ariel/workspace_reasoning.py`
-  - extraction contracts
-  - validation
-  - commitment candidate creation
-  - follow-up loop evaluation helpers
-
 - `src/ariel/memory.py`
   - semantic memory integration
   - review lifecycle integration
   - recall context for active commitments
-
-- `src/ariel/proactivity.py`
-  - signal derivation from active commitments and follow-up loops
-  - no raw provider reads for ranking
-
-- `src/ariel/attention_ranking.py`
-  - structured commitment ranking
-  - delivery decisions
-  - follow-up scheduling
 
 - `src/ariel/action_runtime.py`
   - capability execution orchestration
@@ -1272,11 +1235,15 @@ Primary implementation files:
 
 - `src/ariel/capability_registry.py`
   - capability schemas and validators
-  - no legacy response shapes
+  - no removed response shapes
 
 - `src/ariel/app.py`
-  - route wiring and context assembly
+  - route wiring, context assembly, and unified wake delivery
   - no provider parsing or lifecycle rules
+
+- `src/ariel/agent_loop.py`
+  - shared reason-act-observe loop
+  - AI judgment recording
 
 - `src/ariel/worker.py`
   - evidence extraction jobs
@@ -1286,15 +1253,11 @@ Primary implementation files:
 Primary tests:
 
 - `tests/unit/test_google_workspace_normalization.py`
-- `tests/unit/test_workspace_reasoning.py`
-- `tests/unit/test_commitment_lifecycle.py`
-- `tests/unit/test_follow_up_loops.py`
-- `tests/unit/test_attention_ranking_commitments.py`
-- `tests/integration/test_google_workspace_evidence_acceptance.py`
-- `tests/integration/test_email_commitment_follow_up_acceptance.py`
-- `tests/integration/test_calendar_scheduling_commitment_acceptance.py`
-- `tests/integration/test_provider_write_receipts_acceptance.py`
-- `tests/integration/test_workspace_prompt_injection_acceptance.py`
+- `tests/integration/test_sync_runtime_provider_ingestion.py`
+- `tests/integration/test_google_connector_read_acceptance.py`
+- `tests/integration/test_google_connector_write_acceptance.py`
+- `tests/integration/test_google_connector_readiness_acceptance.py`
+- `tests/integration/test_email_decluttering_action_runtime.py`
 
 ## Rollout Sequence
 
@@ -1307,10 +1270,10 @@ This is a hard cutover, but implementation can be staged on the branch:
 5. Add commitment lifecycle and review.
 6. Add follow-up loops and attention integration.
 7. Replace provider write receipts and approval coupling.
-8. Remove legacy response shapes and tests.
+8. Remove old response shapes and tests.
 9. Run full verification and inspect audit/log output.
 
-No stage is considered production-shippable until the final legacy removal step
+No stage is considered production-shippable until the final removed-path cleanup step
 is complete.
 
 ## Product Completion Checklist

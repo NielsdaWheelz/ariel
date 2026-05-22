@@ -26,7 +26,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from ariel.app import create_app
+from tests.integration.app_helpers import create_migrated_app
 from ariel.persistence import MemoryLogRecord
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.responses_helpers import (
@@ -58,7 +58,7 @@ def _run_response(source: str, *, provider: str, model: str, rid: str) -> dict[s
 
 
 _EMIT_FINDING_MAIN_ERROR = (
-    "agent.emit_finding is only available inside a research run; "
+    "agent.emit_finding is not available in the main agent loop; "
     "finish the main loop with agent.emit_message"
 )
 
@@ -68,10 +68,9 @@ _VALID_MESSAGE_SOURCE = "agent.emit_message(text='Hello, here is the answer.')\n
 
 
 def _build_client(postgres_url: str, adapter: Any) -> TestClient:
-    app = create_app(
+    app = create_migrated_app(
         database_url=postgres_url,
         model_adapter=adapter,
-        reset_database=True,
         sandbox=FakeSandboxRuntime(),
     )
     return TestClient(app)

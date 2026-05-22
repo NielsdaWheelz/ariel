@@ -9,7 +9,7 @@ from ariel.google_connector import (
 )
 from ariel.run_runtime import run_tool_definitions
 
-FINAL_EMAIL_CAPABILITY_IDS = {
+EMAIL_CAPABILITY_IDS = {
     "cap.email.search",
     "cap.email.read",
     "cap.email.draft",
@@ -22,9 +22,9 @@ FINAL_EMAIL_CAPABILITY_IDS = {
 BROAD_GMAIL_SCOPE = "https://mail.google.com/"
 
 
-def test_email_registry_contains_final_decluttering_family_but_model_gets_only_run() -> None:
+def test_email_registry_contains_current_family_but_model_gets_only_run() -> None:
     assert [tool["name"] for tool in run_tool_definitions()] == ["run"]
-    for capability_id in FINAL_EMAIL_CAPABILITY_IDS:
+    for capability_id in EMAIL_CAPABILITY_IDS:
         assert get_capability(capability_id) is not None
 
 
@@ -60,7 +60,7 @@ def test_email_mutations_require_idempotency_and_narrow_gmail_modify_scope() -> 
 
 
 def test_email_capabilities_do_not_request_broad_gmail_scope() -> None:
-    for capability_id in FINAL_EMAIL_CAPABILITY_IDS:
+    for capability_id in EMAIL_CAPABILITY_IDS:
         capability = get_capability(capability_id)
         assert capability is not None
         assert BROAD_GMAIL_SCOPE not in capability.contract_metadata.get("required_scopes", [])
@@ -76,7 +76,7 @@ def test_email_draft_requires_approval_like_other_write_surfaces() -> None:
     assert draft.policy_decision == "requires_approval"
 
 
-def test_email_capability_input_contracts_remain_final() -> None:
+def test_email_capability_input_contracts_accept_current_shapes() -> None:
     archive = get_capability("cap.email.archive")
     trash = get_capability("cap.email.trash")
     draft = get_capability("cap.email.draft")

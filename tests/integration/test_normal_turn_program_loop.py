@@ -11,7 +11,8 @@ from sqlalchemy.orm import sessionmaker
 
 import ariel.run_runtime as run_runtime_module
 from ariel.action_runtime import RuntimeProvenance
-from ariel.app import ModelAdapter, create_app
+from ariel.app import ModelAdapter
+from tests.integration.app_helpers import create_migrated_app
 from ariel.persistence import (
     ActionAttemptRecord,
     AIJudgmentRecord,
@@ -32,11 +33,10 @@ from tests.integration.responses_helpers import (
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
-    app = create_app(
+    app = create_migrated_app(
         database_url=postgres_url,
         model_adapter=adapter,
         sandbox=FakeSandboxRuntime(),
-        reset_database=True,
     )
     return TestClient(app)
 
@@ -100,8 +100,8 @@ def _direct_function_response(
 
 @dataclass
 class CapturingRunAdapter:
-    provider: str = "provider.single-run"
-    model: str = "model.single-run-v1"
+    provider: str = "provider.program-loop"
+    model: str = "model.program-loop-v1"
     responses: list[dict[str, Any]] = field(default_factory=list)
     tools_seen: list[list[dict[str, Any]]] = field(default_factory=list)
     input_items_seen: list[list[dict[str, Any]]] = field(default_factory=list)
@@ -130,8 +130,8 @@ def test_normal_turn_exposes_only_strict_run_tool(postgres_url: str) -> None:
         responses=[
             responses_run_message(
                 assistant_text="done",
-                provider="provider.single-run",
-                model="model.single-run-v1",
+                provider="provider.program-loop",
+                model="model.program-loop-v1",
                 provider_response_id="resp_run_only",
             )
         ]
@@ -148,6 +148,16 @@ def test_normal_turn_exposes_only_strict_run_tool(postgres_url: str) -> None:
     # The run tool's source is described to the model as a Python program.
     assert "Python program" in rendered_input or "run program" in rendered_input
     assert "memory.recall" in rendered_input
+    assert "memory.remember" in rendered_input
+    assert "memory.remember(note: str) -> {'status': 'queued', 'encode_id': str}" in rendered_input
+    assert "memory.remember(note: str) -> {'task_id': str}" not in rendered_input
+    assert "proactive.schedule" in rendered_input
+    assert "research.investigate" in rendered_input
+    assert "agency.run" not in rendered_input
+    assert "- attachment.read(" not in rendered_input
+    assert "search.web" not in rendered_input
+    assert "maps.directions" not in rendered_input
+    assert "weather.forecast" not in rendered_input
     assert "runtime facts:" in rendered_input
     assert "private AI butler-operator" in rendered_input
     assert "Reliability outranks personality" in rendered_input
@@ -162,8 +172,8 @@ def test_main_agent_prompt_is_static_prefix_before_dynamic_context(postgres_url:
         responses=[
             responses_run_message(
                 assistant_text="done",
-                provider="provider.single-run",
-                model="model.single-run-v1",
+                provider="provider.program-loop",
+                model="model.program-loop-v1",
                 provider_response_id="resp_prompt_prefix",
             )
         ]
@@ -191,14 +201,14 @@ def test_plain_assistant_text_is_protocol_feedback_not_visible(postgres_url: str
         responses=[
             responses_message(
                 assistant_text="this must stay hidden",
-                provider="provider.single-run",
-                model="model.single-run-v1",
+                provider="provider.program-loop",
+                model="model.program-loop-v1",
                 provider_response_id="resp_plain_text",
             ),
             responses_run_message(
                 assistant_text="visible through run",
-                provider="provider.single-run",
-                model="model.single-run-v1",
+                provider="provider.program-loop",
+                model="model.program-loop-v1",
                 provider_response_id="resp_retry_visible",
             ),
         ]
@@ -243,8 +253,8 @@ def test_plain_assistant_text_is_protocol_feedback_not_visible(postgres_url: str
                     "status": "completed",
                 }
             ],
-            provider="provider.single-run",
-            model="model.single-run-v1",
+            provider="provider.program-loop",
+            model="model.program-loop-v1",
             provider_response_id="resp_wrong_direct_tool",
         ),
         _direct_function_response(
@@ -266,8 +276,8 @@ def test_plain_assistant_text_is_protocol_feedback_not_visible(postgres_url: str
                     "status": "completed",
                 },
             ],
-            provider="provider.single-run",
-            model="model.single-run-v1",
+            provider="provider.program-loop",
+            model="model.program-loop-v1",
             provider_response_id="resp_multiple_direct_tools",
         ),
         _direct_function_response(
@@ -281,8 +291,8 @@ def test_plain_assistant_text_is_protocol_feedback_not_visible(postgres_url: str
                     "status": "completed",
                 }
             ],
-            provider="provider.single-run",
-            model="model.single-run-v1",
+            provider="provider.program-loop",
+            model="model.program-loop-v1",
             provider_response_id="resp_invalid_run_arguments",
         ),
     ],
@@ -295,8 +305,8 @@ def test_invalid_direct_tool_protocol_retries_without_executing(
             first_response,
             responses_run_message(
                 assistant_text="recovered",
-                provider="provider.single-run",
-                model="model.single-run-v1",
+                provider="provider.program-loop",
+                model="model.program-loop-v1",
                 provider_response_id="resp_protocol_recovered",
             ),
         ]
@@ -321,14 +331,14 @@ def test_program_that_raises_is_a_program_failure(postgres_url: str) -> None:
         responses=[
             _program_response(
                 source="raise ValueError('deliberate program failure')\n",
-                provider="provider.single-run",
-                model="model.single-run-v1",
+                provider="provider.program-loop",
+                model="model.program-loop-v1",
                 provider_response_id="resp_program_raises",
             ),
             responses_run_message(
                 assistant_text="recovered",
-                provider="provider.single-run",
-                model="model.single-run-v1",
+                provider="provider.program-loop",
+                model="model.program-loop-v1",
                 provider_response_id="resp_program_recovered",
             ),
         ]
@@ -353,14 +363,14 @@ def test_program_with_syntax_error_is_a_program_failure(postgres_url: str) -> No
         responses=[
             _program_response(
                 source="this is not valid python\n",
-                provider="provider.single-run",
-                model="model.single-run-v1",
+                provider="provider.program-loop",
+                model="model.program-loop-v1",
                 provider_response_id="resp_program_syntax",
             ),
             responses_run_message(
                 assistant_text="recovered",
-                provider="provider.single-run",
-                model="model.single-run-v1",
+                provider="provider.program-loop",
+                model="model.program-loop-v1",
                 provider_response_id="resp_syntax_recovered",
             ),
         ]
@@ -381,8 +391,8 @@ def test_pause_until_input_ends_turn_without_visible_output(postgres_url: str) -
         responses=[
             _program_response(
                 source="agent.pause_until_input()\n",
-                provider="provider.single-run",
-                model="model.single-run-v1",
+                provider="provider.program-loop",
+                model="model.program-loop-v1",
                 provider_response_id="resp_pause",
             )
         ]
@@ -401,14 +411,14 @@ def test_emit_value_is_internal_feedback_with_digest_surface(postgres_url: str) 
         responses=[
             _program_response(
                 source="agent.emit_value(value={'answer': 42})\n",
-                provider="provider.single-run",
-                model="model.single-run-v1",
+                provider="provider.program-loop",
+                model="model.program-loop-v1",
                 provider_response_id="resp_value",
             ),
             responses_run_message(
                 assistant_text="value handled",
-                provider="provider.single-run",
-                model="model.single-run-v1",
+                provider="provider.program-loop",
+                model="model.program-loop-v1",
                 provider_response_id="resp_value_final",
             ),
         ]
@@ -521,7 +531,7 @@ def test_emit_value_eviction_discards_prior_round(postgres_url: str) -> None:
 
 def test_program_composes_a_mechanical_answer_in_one_turn(postgres_url: str) -> None:
     """A program may use control flow to compose a mechanical emit_message in
-    the same turn -- the program-model relaxation of the flat-list rule."""
+    the same turn when it does not summarize freshly fetched external data."""
 
     source = (
         "items = [1, 2, 3]\n"
@@ -534,8 +544,8 @@ def test_program_composes_a_mechanical_answer_in_one_turn(postgres_url: str) -> 
         responses=[
             _program_response(
                 source=source,
-                provider="provider.single-run",
-                model="model.single-run-v1",
+                provider="provider.program-loop",
+                model="model.program-loop-v1",
                 provider_response_id="resp_mechanical",
             )
         ]
@@ -558,14 +568,14 @@ def test_run_program_emitting_no_output_retries(postgres_url: str) -> None:
             responses_with_run_calls(
                 assistant_text="",
                 calls=[{"name": "agent.emit_value", "input": {"value": 1}}],
-                provider="provider.single-run",
-                model="model.single-run-v1",
+                provider="provider.program-loop",
+                model="model.program-loop-v1",
                 provider_response_id="resp_no_visible",
             ),
             responses_run_message(
                 assistant_text="now visible",
-                provider="provider.single-run",
-                model="model.single-run-v1",
+                provider="provider.program-loop",
+                model="model.program-loop-v1",
                 provider_response_id="resp_now_visible",
             ),
         ]
@@ -650,14 +660,14 @@ def test_taint_threads_across_two_programs_in_one_turn(
         responses=[
             _program_response(
                 source=program_one,
-                provider="provider.single-run",
-                model="model.single-run-v1",
+                provider="provider.program-loop",
+                model="model.program-loop-v1",
                 provider_response_id="resp_taint_program_one",
             ),
             _program_response(
                 source=program_two,
-                provider="provider.single-run",
-                model="model.single-run-v1",
+                provider="provider.program-loop",
+                model="model.program-loop-v1",
                 provider_response_id="resp_taint_program_two",
             ),
         ]
@@ -693,14 +703,14 @@ def test_memory_remember_enqueues_background_task(
 
     program = (
         "result = memory.remember(note='the user prefers tea')\n"
-        "agent.emit_message(text='status:' + result['status'])\n"
+        "agent.emit_message(text='status:' + result['status'] + ':encode:' + result['encode_id'][:4])\n"
     )
     adapter = CapturingRunAdapter(
         responses=[
             _program_response(
                 source=program,
-                provider="provider.single-run",
-                model="model.single-run-v1",
+                provider="provider.program-loop",
+                model="model.program-loop-v1",
                 provider_response_id="resp_remember_enqueue",
             )
         ]
@@ -709,7 +719,7 @@ def test_memory_remember_enqueues_background_task(
         session_id = _session_id(client)
         turn = post_message_and_drain(client, session_id, message="remember tea preference")
 
-    assert turn.assistant_message == "status:queued"
+    assert turn.assistant_message == "status:queued:encode:tsk_"
 
     engine = create_engine(postgres_url, future=True)
     factory = sessionmaker(bind=engine, future=True, expire_on_commit=False)
@@ -756,14 +766,14 @@ def test_two_programs_with_capability_syscalls_get_distinct_proposal_index(
         responses=[
             _program_response(
                 source=program_one,
-                provider="provider.single-run",
-                model="model.single-run-v1",
+                provider="provider.program-loop",
+                model="model.program-loop-v1",
                 provider_response_id="resp_two_caps_program_one",
             ),
             _program_response(
                 source=program_two,
-                provider="provider.single-run",
-                model="model.single-run-v1",
+                provider="provider.program-loop",
+                model="model.program-loop-v1",
                 provider_response_id="resp_two_caps_program_two",
             ),
         ]

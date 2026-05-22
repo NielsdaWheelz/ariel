@@ -1,9 +1,9 @@
 """Real-gVisor tests for the run-program sandbox runtime.
 
 These run actual model-style Python programs inside a real ``runsc`` sandbox:
-the second test layer the run-program cutover requires. They are skipped when
-``runsc`` is unavailable so the unit suite still runs on any host; CI provides
-``runsc`` and the Systrap platform needs no special host capability.
+the host/sandbox boundary that the fake runtime cannot exercise. They are
+skipped when ``runsc`` is unavailable so the unit suite still runs on any host;
+CI provides ``runsc`` and the Systrap platform needs no special host capability.
 """
 
 from __future__ import annotations

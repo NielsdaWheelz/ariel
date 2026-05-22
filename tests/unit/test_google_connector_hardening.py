@@ -45,20 +45,21 @@ def test_connector_token_cipher_round_trip_uses_aead_envelope_format() -> None:
     assert cipher.decrypt(encrypted) == plaintext
 
 
-def test_connector_token_cipher_supports_key_rotation_decrypt_of_older_versions() -> None:
+def test_connector_token_cipher_decrypts_tokens_from_previous_key_version() -> None:
     key_v1 = os.urandom(32)
     key_v2 = os.urandom(32)
-    old_cipher = ConnectorTokenCipher(
+    previous_key_cipher = ConnectorTokenCipher(
         active_key_version="v1",
         keys_by_version={"v1": key_v1},
     )
-    ciphertext = old_cipher.encrypt("tok_before_rotation")
+    token = "tok_previous_key"
+    ciphertext = previous_key_cipher.encrypt(token)
 
     rotated_cipher = ConnectorTokenCipher(
         active_key_version="v2",
         keys_by_version={"v1": key_v1, "v2": key_v2},
     )
-    assert rotated_cipher.decrypt(ciphertext) == "tok_before_rotation"
+    assert rotated_cipher.decrypt(ciphertext) == token
 
 
 def test_connector_token_cipher_allows_single_secret_dev_key_version_relabel() -> None:
@@ -77,7 +78,7 @@ def test_connector_token_cipher_allows_single_secret_dev_key_version_relabel() -
     assert v2_cipher.decrypt(ciphertext) == "tok_single_secret"
 
 
-def test_connector_token_cipher_rejects_pre_aead_ciphertext() -> None:
+def test_connector_token_cipher_rejects_non_aead_ciphertext() -> None:
     cipher = ConnectorTokenCipher.from_config(
         active_key_version="v1",
         configured_keys=None,
@@ -85,7 +86,7 @@ def test_connector_token_cipher_rejects_pre_aead_ciphertext() -> None:
     )
 
     with pytest.raises(RuntimeError, match="encrypted value is malformed"):
-        cipher.decrypt("legacy:v1")
+        cipher.decrypt("not-aead:v1")
 
 
 def test_google_calendar_capability_validators_reject_inverted_windows() -> None:

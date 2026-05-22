@@ -9,9 +9,9 @@ waypoint-order optimization, alternative routes, per-leg breakdown, and
 free-flow (no-traffic) durations. Its contract is replaced, not extended — the
 v1 input/output schemas are deleted.
 
-It supersedes the s6-pr02 non-goals "traffic-aware route optimization" and
-"multi-stop planning" recorded in `docs/modules/maps.md`. Those were
-initial-slice scoping; this doc removes them.
+It supersedes earlier non-goals for traffic-aware route optimization and
+multi-stop planning recorded in `docs/modules/maps.md`. Those were temporary
+scoping notes; this doc removes them.
 
 This doc originally also specified a leave-by reminder subsystem. That
 subsystem was implemented and then deleted by the proactivity crystallization
@@ -30,14 +30,15 @@ not a new maps side effect.
 
 ## Cutover Policy
 
-Inherits `docs/schema-consolidation-cutover.md`'s policy.
+Inherits [../ai-first.md](../ai-first.md), [../simplicity.md](../simplicity.md),
+[../cleanliness.md](../cleanliness.md), and [../database.md](../database.md).
 
 - `ruff`, `ruff format --check`, `mypy src tests`, and the full `pytest` suite
   are green at every PR.
 - No legacy, no fallbacks, no backward compatibility, no feature flags, no
   dual code paths. The `cap.maps.directions` contract is replaced outright:
   `maps_directions_query_v1` / `maps_directions_result_v1` and the
-  single-route output shape are deleted, and `test_s6_pr02_acceptance.py`'s
+  single-route output shape are deleted, and `test_maps_acceptance.py`'s
   directions tests are rewritten to the v2 contract, not appended to.
 - Every capability change cites the rule it satisfies: `ai-first.md`,
   `simplicity.md`, `cleanliness.md`, `database.md`.
@@ -207,7 +208,7 @@ capability.
 **Edited**
 
 - `src/ariel/capability_registry.py` — the functions in A.5.
-- `tests/integration/test_s6_pr02_acceptance.py` — directions tests rewritten to
+- `tests/integration/test_maps_acceptance.py` — directions tests rewritten to
   the v2 contract; new tests for multi-stop, `optimize_order`, alternative
   routes, per-leg breakdown, `static_duration_seconds`, and `waypoints`
   validation rejection.
@@ -244,7 +245,7 @@ no-traffic figure.
 # Implementation
 
 One PR: the A.5 capability changes; the directions tests in
-`test_s6_pr02_acceptance.py` rewritten to the v2 contract with new multi-stop,
+`test_maps_acceptance.py` rewritten to the v2 contract with new multi-stop,
 `optimize_order`, alternatives, legs, `static_duration`, and
 waypoint-validation tests; `docs/modules/maps.md` and `README.md` updated.
 `ruff`, `mypy src tests`, and the full `pytest` suite are green. The change is

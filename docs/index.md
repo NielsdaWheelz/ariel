@@ -43,9 +43,6 @@ This directory is the canonical home for repository documentation.
 - [agent-loop-cutover.md](agent-loop-cutover.md): hard cutover — async
   worker-run turns, the long adaptive loop, the scratch store, and the research
   subagent
-- [memory-substrate-cutover.md](memory-substrate-cutover.md): hard cutover —
-  two-layer memory substrate (raw log + curated notes), agentic recall, and
-  unified rememberer
 - [main-agent-jarvis-prompt-cutover.md](main-agent-jarvis-prompt-cutover.md):
   hard cutover to a versioned, code-owned Jarvis prompt for the main agent
 - [simplicity.md](simplicity.md): fewer code paths, no speculative surface
@@ -57,8 +54,6 @@ This directory is the canonical home for repository documentation.
 
 - [codebase.md](codebase.md): tech stack, repo structure, imports, and module boundaries
 - [database.md](database.md): PostgreSQL schema, queries, and transactions
-- [schema-consolidation-cutover.md](schema-consolidation-cutover.md): phased plan to consolidate the schema from 86 tables toward ~72
-- [schema-cross-cutting-cutover.md](schema-cross-cutting-cutover.md): Phase 4 of the consolidation — job queues, write ledgers, event logs
 
 ### Product operations
 

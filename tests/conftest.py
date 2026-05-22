@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from testcontainers.postgres import PostgresContainer
 
 from ariel.config import AppSettings
-from ariel.db import reset_schema_for_tests
+from tests.db_helpers import reset_postgres_schema
 
 
 @pytest.fixture(autouse=True)
@@ -89,7 +89,7 @@ def unmigrated_postgres_url(postgres_container_url: str) -> Generator[str, None,
 @pytest.fixture
 def session_factory(postgres_url: str) -> Generator[sessionmaker[Session], None, None]:
     engine = create_engine(postgres_url, future=True, pool_pre_ping=True)
-    reset_schema_for_tests(engine, postgres_url)
+    reset_postgres_schema(engine, postgres_url)
     try:
         yield sessionmaker(bind=engine, future=True, expire_on_commit=False)
     finally:

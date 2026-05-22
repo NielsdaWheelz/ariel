@@ -140,8 +140,9 @@ ranks, scores, summarises, or makes any memory judgment. See
 
 Read-only investigation is a third named subagent: the research subagent. The
 main agent dispatches it with the `research.investigate` syscall; it runs the
-same agent loop in a read-only configuration, in one of two mutually exclusive
-modes (web XOR personal), and returns a typed, tainted `research_finding_v1`.
+same agent loop in a read-only configuration, in one of three mutually exclusive
+modes (web XOR personal XOR memories), and returns a typed, tainted
+`research_finding_v1`.
 The main agent owns synthesis; the research subagent owns breadth-first,
 read-heavy, independent investigation whose context is discarded once the
 finding returns.

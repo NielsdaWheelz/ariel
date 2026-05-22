@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 from typing import Any, cast
 
 import pytest
 from pydantic import ValidationError
 
 from ariel.app import create_app
-from ariel.config import AppSettings, _DEFAULT_ENV_FILES, _ENV_FILES, _resolve_env_files
+from ariel.config import AppSettings
+from ariel.persistence import MEMORY_EMBEDDING_DIMENSIONS
 
 STRONG_LOCAL_AUTH_TOKEN = "test_local_auth_token_0123456789abcdef"
 CONNECTOR_KEYRING = '{"v1":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}'
@@ -18,42 +23,48 @@ def _app_settings_without_env_files() -> AppSettings:
 
 
 @pytest.mark.uses_real_env_files
-def test_app_settings_load_from_project_env_files() -> None:
-    assert {path.name for path in _DEFAULT_ENV_FILES} == {".env", ".env.local"}
-    assert AppSettings.model_config["env_file"] == _ENV_FILES
+def test_app_settings_honors_ariel_env_file_override(tmp_path: Path) -> None:
+    env_file = tmp_path / "ariel.env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "ARIEL_DATABASE_URL=postgresql+psycopg://dev-user:dev-pass@localhost/dev-db",
+                "ARIEL_BIND_PORT=8123",
+                "ARIEL_MODEL_NAME=env-file-model",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    env = {key: value for key, value in os.environ.items() if not key.startswith("ARIEL_")}
+    env["ARIEL_ENV_FILE"] = str(env_file)
 
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json\n"
+                "from ariel.config import AppSettings\n"
+                "settings = AppSettings()\n"
+                "print(json.dumps({\n"
+                "    'database_url': settings.database_url,\n"
+                "    'bind_port': settings.bind_port,\n"
+                "    'model_name': settings.model_name,\n"
+                "}))\n"
+            ),
+        ],
+        check=True,
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
 
-def test_resolve_env_files_defaults_to_env_and_env_local(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("ARIEL_ENV_FILE", raising=False)
-
-    resolved = _resolve_env_files()
-
-    assert resolved == _DEFAULT_ENV_FILES
-
-
-def test_resolve_env_files_honors_ariel_env_file_override(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("ARIEL_ENV_FILE", ".env.dev")
-
-    resolved = _resolve_env_files()
-
-    assert len(resolved) == 1
-    assert resolved[0].name == ".env.dev"
-    assert resolved[0].is_absolute()
-
-
-def test_resolve_env_files_accepts_absolute_path(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    absolute = "/tmp/ariel.test.env"
-    monkeypatch.setenv("ARIEL_ENV_FILE", absolute)
-
-    resolved = _resolve_env_files()
-
-    assert resolved == (Path(absolute),)
+    assert json.loads(result.stdout) == {
+        "database_url": "postgresql+psycopg://dev-user:dev-pass@localhost/dev-db",
+        "bind_port": 8123,
+        "model_name": "env-file-model",
+    }
 
 
 def test_create_app_uses_ariel_database_url_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -88,7 +99,7 @@ def test_bind_host_rejects_public_interfaces(monkeypatch: pytest.MonkeyPatch) ->
         AppSettings()
 
 
-def test_slice1_turn_budget_defaults_are_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_turn_budget_defaults_are_configured(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("ARIEL_AUTO_ROTATE_MAX_TURNS", raising=False)
     monkeypatch.delenv("ARIEL_AUTO_ROTATE_MAX_AGE_SECONDS", raising=False)
     monkeypatch.delenv("ARIEL_MAX_RESPONSE_TOKENS", raising=False)
@@ -195,7 +206,6 @@ def test_turn_budget_env_overrides_are_loaded(monkeypatch: pytest.MonkeyPatch) -
 def test_memory_runtime_settings_load_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ARIEL_MEMORY_EMBEDDING_PROVIDER", "local")
     monkeypatch.setenv("ARIEL_MEMORY_EMBEDDING_MODEL", "fixture-embedding")
-    monkeypatch.setenv("ARIEL_MEMORY_EMBEDDING_DIMENSIONS", "1536")
     monkeypatch.setenv("ARIEL_MEMORY_RECALL_BUDGET_SECONDS", "30.0")
     monkeypatch.setenv("ARIEL_MEMORY_ENCODE_BUDGET_SECONDS", "45.0")
     monkeypatch.setenv("ARIEL_MEMORY_DREAM_BUDGET_SECONDS", "1200.0")
@@ -204,7 +214,6 @@ def test_memory_runtime_settings_load_from_env(monkeypatch: pytest.MonkeyPatch) 
     settings = AppSettings()
     assert settings.memory_embedding_provider == "local"
     assert settings.memory_embedding_model == "fixture-embedding"
-    assert settings.memory_embedding_dimensions == 1536
     assert settings.memory_recall_budget_seconds == 30.0
     assert settings.memory_encode_budget_seconds == 45.0
     assert settings.memory_dream_budget_seconds == 1200.0
@@ -212,9 +221,23 @@ def test_memory_runtime_settings_load_from_env(monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_memory_embedding_dimensions_must_match_schema(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ARIEL_MEMORY_EMBEDDING_DIMENSIONS", "3072")
+    monkeypatch.setenv("ARIEL_MEMORY_EMBEDDING_DIMENSIONS", str(MEMORY_EMBEDDING_DIMENSIONS + 1))
 
     with pytest.raises(ValidationError):
+        AppSettings()
+
+
+@pytest.mark.parametrize(
+    "env_name",
+    ["ARIEL_MEMORY_EMBEDDING_PROVIDER", "ARIEL_MEMORY_EMBEDDING_MODEL"],
+)
+def test_memory_embedding_text_settings_reject_blank_values(
+    monkeypatch: pytest.MonkeyPatch,
+    env_name: str,
+) -> None:
+    monkeypatch.setenv(env_name, "   ")
+
+    with pytest.raises(ValidationError, match="memory embedding settings must not be blank"):
         AppSettings()
 
 

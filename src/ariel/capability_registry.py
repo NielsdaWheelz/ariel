@@ -1211,12 +1211,10 @@ def _looks_like_research_status_poll(question: str) -> bool:
     """True if the question is a status-poll attempt rather than an investigation.
 
     ``cap.research.investigate`` is async — it returns ``{status: "queued",
-    research_id}`` and the finding arrives later via an ``agent_wake``. Smoke
-    evidence: the model has been observed treating the queued response as
-    something to poll by re-issuing
-    ``investigate({question: "status:tsk_01ks4...", mode: "personal"})``
-    repeatedly, building up dozens of stuck wakes. Reject these here so a
-    malformed poll never enqueues another research run.
+    research_id}`` and the finding arrives later via an ``agent_wake``. A model
+    re-issuing that handle as a fresh question would enqueue another research
+    run instead of observing the original result. Reject poll-shaped questions
+    here before they reach the worker.
 
     Two precise shapes:
     - prefixed ``status:`` (case-insensitive) — the model's literal poll form.
@@ -3699,7 +3697,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
     "cap.memory.recall": CapabilityDefinition(
         capability_id="cap.memory.recall",
         version="1.0",
-        impact_level="write_reversible",
+        impact_level="read",
         policy_decision="allow_inline",
         contract_metadata={
             "input_schema": "memory_recall_v1",
@@ -3970,7 +3968,7 @@ RUN_CALLABLE_SIGNATURES: dict[str, str] = {
     "memory.search": "(query: str, limit: int = 24, since: str | None = None, kinds: list[Literal['user_message','agent_round','assistant_message','tool_observation','proactive_trigger','note_create','note_edit','note_delete','recall','research_finding']] | None = None) -> {'hits': list[{'id', 'layer', 'kind', 'created_at', 'snippet', 'taint'}], 'status': 'succeeded'}",
     "memory.read": "(id: str) -> {'id', 'layer', 'kind', 'created_at', 'content', 'taint'}",
     "memory.recall": "(query: str) -> {'summary', 'items': list, 'status'}",
-    "memory.remember": "(note: str) -> {'task_id': str}",
+    "memory.remember": "(note: str) -> {'status': 'queued', 'encode_id': str}",
     "memory.note.create": "(content: str) -> {'id', 'status'}",
     "memory.note.edit": "(id: str, content: str) -> {'id', 'status'}",
     "memory.note.delete": "(id: str) -> {'id', 'status'}",

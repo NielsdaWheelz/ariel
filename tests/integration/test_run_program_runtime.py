@@ -191,7 +191,7 @@ def test_approval_gated_syscall_returns_a_pending_value(
 ) -> None:
     """An approval-gated capability stages a proposal and returns a pending value.
 
-    Memory's two syscalls are ``allow_inline`` after the cutover, so the
+    Memory syscalls used by the run-program path are ``allow_inline``, so the
     approval-gated path is exercised with ``agency.run`` -- an approval-gated
     capability whose proposal stages without executing the runtime.
     """

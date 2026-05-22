@@ -1,22 +1,22 @@
-"""The shared agent loop — one body, three output-mode configurations.
+"""The shared agent loop — one body, configured by each driver.
 
 ``run_agent_loop`` is the single while-True loop that drives every
 configuration of the agent: the main conversational turn (``_wake``), the
-read-only research subagent (``run_research``), and the future rememberer
-(``output_mode="operations"``).
+read-only research subagent (``run_research``), the memory retriever
+(``run_retriever``), and the memory rememberer (``run_rememberer``).
 
 A **configuration** is a ``LoopConfig`` frozen dataclass that captures every
-axis on which the three configurations differ: the output mode (what terminal
+axis on which drivers differ: the output mode (what terminal
 result exits the loop), the wall-clock budget, the model-call backstop, the
-is-research flag, the judgment-recording flag and type, the retry policy, and
-the system-message strings emitted on each non-terminal branch.
+main-agent-loop flag, the judgment-recording flag and type, the retry policy,
+and the system-message strings emitted on each non-terminal branch.
 
-The callers — ``_wake`` and ``run_research`` — build their configuration, call
-``run_agent_loop``, and map the ``LoopResult`` to their own post-loop
-behaviour.  All per-round work (budget check, budget-signal update, model call,
-protocol parsing, stuck-detection, ``execute_run_program``, per-program commit,
-emit_value eviction, round-history eviction, judgment recording, retry) lives
-inside ``run_agent_loop`` and does not appear in either driver.
+The callers build their configuration, call ``run_agent_loop``, and map the
+``LoopResult`` to their own post-loop behaviour.  All per-round work (budget
+check, budget-signal update, model call, protocol parsing, stuck-detection,
+``execute_run_program``, per-program commit, emit_value eviction,
+round-history eviction, judgment recording, retry) lives inside
+``run_agent_loop`` and does not appear in the drivers.
 
 This module imports only ``config``, ``persistence``, ``run_runtime``,
 ``ai_judgments``, ``sandbox_runtime``, ``google_connector``,
@@ -98,7 +98,7 @@ class ResearchFinding:
 
 @dataclass(slots=True, frozen=True)
 class LoopConfig:
-    """All axes on which the three loop configurations differ.
+    """All axes on which loop configurations differ.
 
     Pass one ``LoopConfig`` instance to ``run_agent_loop``; the loop reads only
     this object — it never inspects the caller's local state.
@@ -112,8 +112,9 @@ class LoopConfig:
         ``emitted_finding``.  ``"operations"`` exits on ``emitted_operations``
         (the summary string from ``agent.emit_done``).
     finding_mode:
-        The research mode string (e.g. ``"web"``, ``"personal"``) embedded in
-        the returned ``ResearchFinding`` when ``output_mode="finding"``.
+        The research mode string (``"web"``, ``"personal"``, or ``"memories"``)
+        embedded in the returned ``ResearchFinding`` when
+        ``output_mode="finding"``.
         Ignored for other output modes.
     prompt_version:
         The semantic version of the system prompt for this loop configuration.
@@ -122,9 +123,9 @@ class LoopConfig:
         Wall-clock budget for the loop.
     max_model_calls:
         Backstop on the number of model calls before graceful exhaustion.
-    is_research_run:
-        Passed through to ``execute_run_program``; enables ``agent.emit_finding``
-        and ``agent.emit_done`` in the sandbox's syscall whitelist.
+    is_main_agent_loop:
+        Passed through to ``execute_run_program``; main-agent loops reject
+        subsystem-only outputs and append clean program rounds to memory.
     record_judgments:
         When True, the loop records an ``ai_judgments`` row on protocol failure
         and on program failure (the ``_wake`` behaviour).  When False it does
@@ -146,7 +147,7 @@ class LoopConfig:
     emit_value_nudge:
         The system-message text appended when the program emitted internal
         values via ``agent.emit_value``.
-    fallback_nudge:
+    no_terminal_output_nudge:
         The system-message text appended when the program completed but
         produced no visible output and no other branch matched.
     void_failed_program_approvals:
@@ -162,18 +163,16 @@ class LoopConfig:
     prompt_version: str
     budget_seconds: float
     max_model_calls: int
-    is_research_run: bool
+    is_main_agent_loop: bool
     record_judgments: bool
-    judgment_type: (
-        Literal["memory_recall", "memory_encode", "memory_dream", "model_output", "research"] | None
-    )
+    judgment_type: Literal["memory_recall", "memory_encode", "memory_dream", "model_output"] | None
     retry_on_model_error: bool
     void_failed_program_approvals: bool
     protocol_nudge: str
     program_failure_nudge: str
     action_trace_nudge: str
     emit_value_nudge: str
-    fallback_nudge: str
+    no_terminal_output_nudge: str
 
 
 @dataclass(slots=True, frozen=True)
@@ -486,7 +485,7 @@ def run_agent_loop(
             settings=settings,
             scratch=scratch,
             model_adapter=model_adapter,
-            is_research_run=cfg.is_research_run,
+            is_main_agent_loop=cfg.is_main_agent_loop,
         )
         created_action_attempt_count += len(run_program_result.action_attempts)
         # Thread taint across programs in the same turn.
@@ -558,14 +557,14 @@ def run_agent_loop(
                 )
             nudge = cfg.program_failure_nudge
             for err in program_errors:
-                if "agent.emit_finding is only available inside a research run" in err:
+                if "agent.emit_finding is not available in the main agent loop" in err:
                     nudge = (
                         "agent.emit_finding is not available in this loop. "
                         "Continue with one run call that ends by calling "
                         "agent.emit_message(text=...) to reply to the user."
                     )
                     break
-                if "agent.emit_done is only available inside memory subsystem runs" in err:
+                if "agent.emit_done is not available in the main agent loop" in err:
                     nudge = (
                         "agent.emit_done is not available in this loop. "
                         "Continue with one run call that ends by calling "
@@ -636,11 +635,11 @@ def run_agent_loop(
         db.commit()
 
         # Append an agent_round event to the raw memory log for main-agent
-        # turns (not research/retriever runs).  This is the within-turn
+        # program rounds. This is the within-turn
         # round-eviction complement: evicted rounds live in the log and can
         # be recalled by memory.recall if a later round needs them.
         # Imported lazily to avoid the agent_loop ↔ memory circular import.
-        if not cfg.is_research_run:
+        if cfg.is_main_agent_loop:
             from .memory import append_log_event  # noqa: PLC0415
 
             action_summary = [
@@ -683,14 +682,14 @@ def run_agent_loop(
         # round the program cannot both perform a read capability call and
         # emit a user-visible message, because the model authored that program
         # (and the message text in it) before observing the call's result.
-        # See run-program-cutover.md: emit_message "cannot carry a
-        # model-authored prose summary of fetched content, because the model
-        # wrote the program before seeing that content."  Writes and
-        # approval-gated actions are exempt — the model has full knowledge of
-        # what it staged or attempted, so an accompanying "drafted X for
-        # review" message is grounded.  When the rail fires the message is
-        # dropped, the syscall trace is fed back, and the loop continues; the
-        # next round reasons over the observed results before answering.
+        # emit_message cannot carry a model-authored prose summary of fetched
+        # content in the same first-round program, because the model wrote the
+        # message before seeing the fetched content. Writes and approval-gated
+        # actions are exempt: the model has full knowledge of what it staged or
+        # attempted, so an accompanying "drafted X for review" message is
+        # grounded. When the rail fires the message is dropped, the syscall
+        # trace is fed back, and the loop continues; the next round reasons over
+        # the observed results before answering.
         premature_synthesis = (
             cfg.output_mode == "message"
             and model_call_count == 1
@@ -917,8 +916,8 @@ def run_agent_loop(
             )
             continue
 
-        # Fallback: the program ran but produced no terminal output.
-        responses_input_items.append({"role": "system", "content": cfg.fallback_nudge})
+        # The program ran but produced no terminal output.
+        responses_input_items.append({"role": "system", "content": cfg.no_terminal_output_nudge})
         add_event(
             "evt.model.protocol_failed",
             {
@@ -1341,12 +1340,11 @@ def _void_approvals(
 ) -> None:
     """Void approval proposals staged by a program that did not complete cleanly.
 
-    Per the cutover's "Program Failure", a program that fails commits no
-    proposals.  Any approval the failed program staged must never surface as a
-    live pending action: the approval and its action attempt move to
-    ``"expired"`` so nothing is left ``"pending"`` for the user to act on.
-    The syscall trace (the ``action_attempts`` rows) is preserved as the audit
-    record.
+    A program that fails commits no proposals. Any approval the failed program
+    staged must never surface as a live pending action: the approval and its
+    action attempt move to ``"expired"`` so nothing is left ``"pending"`` for
+    the user to act on. The syscall trace (the ``action_attempts`` rows) is
+    preserved as the audit record.
     """
     now = now_fn()
     for action_attempt in action_attempts:

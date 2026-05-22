@@ -69,12 +69,16 @@ def test_handle_message_happy_path(session_factory: sessionmaker[Session]) -> No
 
     with session_factory() as db:
         events = db.scalars(select(ProviderEventRecord)).all()
+        heartbeat = db.scalar(
+            select(SubscriberHeartbeatRecord).where(
+                SubscriberHeartbeatRecord.subscriber_name == SUBSCRIBER_NAME
+            )
+        )
         tasks = db.scalars(
             select(BackgroundTaskRecord).where(
                 BackgroundTaskRecord.task_type == "provider_event_received"
             )
         ).all()
-        heartbeat = db.get(SubscriberHeartbeatRecord, SUBSCRIBER_NAME)
 
     assert len(events) == 1
     event = events[0]
@@ -83,11 +87,13 @@ def test_handle_message_happy_path(session_factory: sessionmaker[Session]) -> No
     assert event.resource_id == "sub_user"
     assert event.event_type == "pubsub_notification"
     assert event.dedupe_key.startswith("google:")
+    assert event.created_at is not None
     assert len(tasks) == 1
     assert tasks[0].payload == {"provider_event_id": event.id}
     assert len(message.ack_calls) == 1
     assert message.nack_calls == []
     assert heartbeat is not None
+    assert heartbeat.created_at is not None
     assert heartbeat.last_message_at is not None
 
 
@@ -197,7 +203,10 @@ def test_write_heartbeat_creates_then_updates(session_factory: sessionmaker[Sess
         rows = db.scalars(select(SubscriberHeartbeatRecord)).all()
     assert len(rows) == 1
     first_row = rows[0]
+    assert first_row.id.startswith("shb_")
+    assert len(first_row.id) <= 32
     assert first_row.subscriber_name == SUBSCRIBER_NAME
+    assert first_row.created_at is not None
     assert first_row.last_seen_at is not None
     assert first_row.last_message_at is None
     first_seen_at = first_row.last_seen_at
@@ -208,5 +217,6 @@ def test_write_heartbeat_creates_then_updates(session_factory: sessionmaker[Sess
         rows = db.scalars(select(SubscriberHeartbeatRecord)).all()
     assert len(rows) == 1
     second_row = rows[0]
+    assert second_row.id == first_row.id
     assert second_row.last_message_at is None
     assert second_row.last_seen_at >= first_seen_at

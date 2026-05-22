@@ -48,8 +48,8 @@ The prompt improves behavior. It is not a security boundary.
 
 - Move the production main-agent static system instructions to
   `src/ariel/prompts.py`.
-- Give the main prompt an explicit immutable version:
-  `MAIN_AGENT_PROMPT_VERSION = "main-agent-jarvis-v2"`.
+- Give the main prompt an explicit immutable version through
+  `MAIN_AGENT_PROMPT_VERSION`.
 - Remove the inline `_POLICY_SYSTEM_INSTRUCTIONS` constant from
   `src/ariel/app.py`.
 - Preserve the current dynamic context assembly model: static policy first,
@@ -86,16 +86,16 @@ The prompt improves behavior. It is not a security boundary.
   effect boundaries.
 - Do not add live model calls to the normal pytest suite.
 
-## Current State To Replace
+## Replaced State
 
 ### Main Agent Prompt
 
-`src/ariel/app.py` defines `_POLICY_SYSTEM_INSTRUCTIONS` inline. The tuple is
-copied into `context_bundle["policy_system_instructions"]` by
-`_build_turn_context_bundle` and rendered first by
-`_build_responses_input_items`.
+Before this cutover, `src/ariel/app.py` defined `_POLICY_SYSTEM_INSTRUCTIONS`
+inline. The tuple was copied into
+`context_bundle["policy_system_instructions"]` by `_build_turn_context_bundle`
+and rendered first by `_build_responses_input_items`.
 
-The live prompt is short and operational. It lacks the Jarvis identity, voice,
+That prompt was short and operational. It lacked the Jarvis identity, voice,
 service posture, explicit anti-sycophancy posture, proactivity policy, failure
 register, and exemplar-based voice anchoring captured in
 `docs/jarvis-system-prompt.md`.
@@ -118,10 +118,10 @@ This order is directionally correct. The cutover preserves it.
 
 ### Prompt Versioning
 
-Memory prompt versions exist as constants in `src/ariel/memory.py`, but the
-shared loop judgment record currently writes a generic prompt version. The main
-agent has no first-class production prompt version in the context bundle,
-audit metadata, or judgment record.
+Before this cutover, memory prompt versions existed as constants in
+`src/ariel/memory.py`, but the shared loop judgment record wrote a generic prompt
+version. The main agent had no first-class production prompt version in the
+context bundle, audit metadata, or judgment record.
 
 ### Design Artifact
 
@@ -198,7 +198,7 @@ Add `src/ariel/prompts.py`.
 The module owns production prompt constants:
 
 ```python
-MAIN_AGENT_PROMPT_VERSION = "main-agent-jarvis-v2"
+MAIN_AGENT_PROMPT_VERSION = "main-agent-jarvis-v7"
 
 MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS: tuple[str, ...] = (
     "<identity>...</identity>",
@@ -308,7 +308,7 @@ all shared-loop configurations, because the shared loop owns judgment recording.
 ```json
 {
   "schema_version": "1.0",
-  "prompt_version": "main-agent-jarvis-v2",
+  "prompt_version": "<MAIN_AGENT_PROMPT_VERSION>",
   "section_order": [...],
   "policy_instruction_count": N,
   "current_turn_id": "trn_...",
@@ -492,8 +492,8 @@ Changing production behavior requires editing code.
 
 ### Version String, Not Dynamic Hash As Version
 
-The prompt version is a deliberate string such as
-`main-agent-jarvis-v2`. It changes when the product contract changes.
+The prompt version is the deliberate string owned by
+`MAIN_AGENT_PROMPT_VERSION`. It changes when the product contract changes.
 
 A hash may be useful for audit, but it is not the semantic version. Formatting
 or refactoring that preserves the contract can keep the version if the owner
@@ -570,10 +570,10 @@ finding, or attachment cannot acquire tool authority by text alone.
 - `tests/unit/test_prompt_context_rendering.py`
   - new unit tests for context bundle and input item order
 
-- `tests/integration/test_pr01_acceptance.py`
+- `tests/integration/test_prompt_context_acceptance.py`
   - update context audit assertions for prompt version
 
-- `tests/integration/test_single_run_cutover.py`
+- `tests/integration/test_normal_turn_program_loop.py`
   - assert production path includes Jarvis prompt anchors and still exposes
     exactly one strict `run` tool
   - assert retry/protocol-nudge paths preserve the static prompt
@@ -627,7 +627,7 @@ finding, or attachment cannot acquire tool authority by text alone.
 
 ### Integration Tests
 
-`tests/integration/test_single_run_cutover.py`
+`tests/integration/test_normal_turn_program_loop.py`
 
 - normal turn exposes exactly one strict `run` tool
 - first model input contains core Jarvis anchors:
@@ -640,7 +640,7 @@ finding, or attachment cannot acquire tool authority by text alone.
 - protocol failure retry keeps the static prompt in the prefix and appends the
   protocol nudge rather than replacing the prompt
 
-`tests/integration/test_pr01_acceptance.py`
+`tests/integration/test_prompt_context_acceptance.py`
 
 - context audit metadata includes `prompt_version`
 - section order remains stable
@@ -672,7 +672,7 @@ If the full suite is too slow during development, run the targeted tests first:
 
 ```bash
 uv run pytest tests/unit/test_responses_tool_contract.py tests/unit/test_prompt_context_rendering.py
-uv run pytest tests/integration/test_single_run_cutover.py tests/integration/test_pr01_acceptance.py
+uv run pytest tests/integration/test_normal_turn_program_loop.py tests/integration/test_prompt_context_acceptance.py
 ```
 
 The final cutover is not accepted until `make verify` passes.
@@ -691,8 +691,8 @@ The final cutover is not accepted until `make verify` passes.
 - The production prompt excludes research notes, eval checklist, V1 appendix,
   and markdown source commentary.
 - No model-facing prompt text leaks internal `cap.*` ids.
-- Main-agent context audit metadata records `main-agent-jarvis-v2`.
-- Main-agent AI judgment records use `main-agent-jarvis-v2`.
+- Main-agent context audit metadata records `MAIN_AGENT_PROMPT_VERSION`.
+- Main-agent AI judgment records use `MAIN_AGENT_PROMPT_VERSION`.
 - Shared-loop non-main configurations no longer record the generic
   `model-output-v1` prompt version.
 - Unit and integration tests cover prompt assembly and invariants.

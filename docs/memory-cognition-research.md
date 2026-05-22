@@ -1,8 +1,9 @@
 # Memory & Cognition — Research Synthesis
 
 > **Status:** research pass, May 2026. No code, no cutover. This document is the
-> deliverable of a "survey first" phase ([research-first SME workflow]); it
-> feeds a later design decision. It does not propose an implementation.
+> deliverable of a "survey first" phase: research, plan, confirm forks, then
+> implement. It feeds a later design decision. It does not propose an
+> implementation.
 >
 > **Method:** nine parallel research subagents, ~150 sources, covering the
 > neuroscience of memory, cognitive psychology, spreading-activation models,
@@ -24,7 +25,7 @@ The bottom line, stated up front so a skim catches it:
 - **Most of the neuroscience-grounded SOTA is machinery** — spreading-activation
   graphs, activation/decay scoring, bi-temporal validity, consolidation
   schedulers, episodic projection tables. Ariel's memory subsystem was
-  *crystallized two days ago* (`memory-cutover.md`, migration `0042`) by
+  *crystallized two days ago* by
   deliberately deleting a 9,400-line engine containing almost exactly that
   machinery, on the principle that **code owns no judgment** (`ai-first.md`).
 - So the honest finding is not "build HippoRAG." It is: the neuroscience splits
@@ -478,8 +479,8 @@ well-judged:
 Here is the finding that matters most, and the reason this is a research
 document and not a cutover plan.
 
-Ariel **crystallized** its memory subsystem two days ago. `memory-cutover.md`
-deleted a 31-table, ~9,400-line "SOTA memory engine" and, with it,
+Ariel **crystallized** its memory subsystem two days ago. That cutover deleted a
+31-table, ~9,400-line "SOTA memory engine" and, with it,
 **deliberately and by name**: the predicate registry, the conflict-set
 lifecycle, RRF retrieval fusion and its seven signals, **bi-temporal validity**,
 the **entity/relationship graph**, projection tables, topics, the
@@ -641,6 +642,3 @@ The gold-standard sources, curated — what an SME would actually point to.
 spreading activation, cognitive architectures, consciousness, agent memory,
 long-context, frontier architectures, graph/temporal memory — are preserved
 verbatim in [`memory-cognition-research-appendix.md`](memory-cognition-research-appendix.md).*
-
-[research-first SME workflow]: the May 2026 survey-first practice — research →
-plan → confirm forks → implement.

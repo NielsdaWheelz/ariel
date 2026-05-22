@@ -5,7 +5,7 @@
 configuration only where a research run must differ:
 
 - ``output_mode="finding"`` — terminates on ``agent.emit_finding``;
-- ``is_research_run=True`` — enables ``agent.emit_finding`` in the sandbox whitelist;
+- ``is_main_agent_loop=False`` — allows ``agent.emit_finding``;
 - the eligible capabilities are exactly one mode whitelist: ``web``,
   ``personal``, or ``memories``;
 - ``research_run_budget_seconds`` budget;
@@ -230,8 +230,8 @@ def run_research(
     ``ResearchFinding(status="complete"|"partial"|"failed", ...)``;
     never raises.
 
-    ``google_runtime`` is always required: web mode ignores it; personal mode
-    uses it to execute the Google Workspace capabilities in
+    ``google_runtime`` is always required. ``web`` and ``memories`` modes ignore
+    it; ``personal`` mode uses it to execute the Google Workspace capabilities in
     ``RESEARCH_PERSONAL_CAPABILITY_IDS``.
     """
 
@@ -295,7 +295,7 @@ def run_research(
         prompt_version=RESEARCH_PROMPT_VERSION,
         budget_seconds=float(settings.research_run_budget_seconds),
         max_model_calls=int(settings.agent_loop_max_model_calls),
-        is_research_run=True,
+        is_main_agent_loop=False,
         record_judgments=False,
         judgment_type=None,
         retry_on_model_error=False,
@@ -317,7 +317,7 @@ def run_research(
             "run program emitted internal values. Continue with "
             "exactly one run call; finish by calling agent.emit_finding."
         ),
-        fallback_nudge=(
+        no_terminal_output_nudge=(
             "run program completed without a finding. Continue with "
             "exactly one run call; finish by calling agent.emit_finding."
         ),

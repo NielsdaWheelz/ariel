@@ -162,7 +162,7 @@ test: check-venv
 verify: lint format-check typecheck test
 
 e2e: check-venv
-	.venv/bin/python -m pytest tests/integration/test_pr01_acceptance.py -k "pr01_turn_context_is_bounded_ordered_and_auditable or pr01_context_audit_is_stable_even_if_adapter_mutates_context_bundle"
+	.venv/bin/python -m pytest tests/integration/test_prompt_context_acceptance.py -k "test_turn_context_section_order_and_audit_metadata or test_context_audit_is_stable_even_if_adapter_mutates_context_bundle"
 
 # ── Isolated dev env (ARIEL_ENV_FILE=.env.dev) ─────────────────────────
 # These targets never read .env.local; they operate against a parallel

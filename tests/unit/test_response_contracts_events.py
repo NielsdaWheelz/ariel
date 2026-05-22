@@ -20,7 +20,7 @@ def _raw_event(event_type: str, payload: dict[str, object]) -> dict[str, object]
     }
 
 
-def test_single_run_protocol_events_are_surfaceable() -> None:
+def test_run_protocol_events_are_surfaceable() -> None:
     assert _project_surface_event_payload(
         "evt.model.protocol_failed",
         {"reason": "run_protocol_requires_run_tool", "model_call_count": 1},
@@ -156,6 +156,42 @@ def test_research_events_reject_unknown_mode(
     with pytest.raises(ResponseContractViolation) as excinfo:
         _project_surface_event(_raw_event(event_type, payload))
     assert excinfo.value.contract == f"surface_event_payload.{event_type}"
+
+
+def test_ai_judgment_events_accept_only_persisted_judgment_types() -> None:
+    assert _project_surface_event_payload(
+        "evt.ai_judgment.completed",
+        {"judgment_type": "memory_dream"},
+    ) == {
+        "judgment_type": "memory_dream",
+        "parse_status": None,
+        "validation_status": None,
+        "code": None,
+        "failure_code": None,
+        "failure_reason": None,
+        "prompt_version": None,
+        "source_id": None,
+        "source_turn_ids": None,
+        "input_refs": None,
+        "retryable": None,
+        "provider": None,
+        "model": None,
+        "usage": None,
+        "provider_response_id": None,
+        "response_output_shape": None,
+        "reason_codes": None,
+        "model_call_count": None,
+        "agent_loop_max_model_calls": None,
+        "omitted_turn_count": None,
+        "eligible_capability_count": None,
+    }
+
+    with pytest.raises(ResponseContractViolation) as excinfo:
+        _project_surface_event_payload(
+            "evt.ai_judgment.completed",
+            {"judgment_type": "research"},
+        )
+    assert excinfo.value.contract == "surface_event_payload.evt.ai_judgment.completed"
 
 
 def test_action_proposed_rejects_unknown_evidence_kind() -> None:

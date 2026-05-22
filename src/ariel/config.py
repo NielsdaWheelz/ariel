@@ -11,10 +11,10 @@ from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from ariel.google_connector import ConnectorTokenCipher
+from ariel.persistence import MEMORY_EMBEDDING_DIMENSIONS
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-MEMORY_EMBEDDING_DIMENSIONS = 1536
 _LOCAL_AUTH_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,}$")
 _PUBSUB_SUBSCRIPTION_PATTERN = re.compile(
     r"^projects/[a-z][a-z0-9-]{4,28}[a-z0-9]/subscriptions/[A-Za-z][A-Za-z0-9_.~+%-]{2,254}$"
@@ -316,10 +316,10 @@ class AppSettings(BaseSettings):
         "memory_embedding_model",
     )
     @classmethod
-    def _memory_projection_text_settings_must_not_be_blank(cls, value: str) -> str:
+    def _memory_embedding_text_settings_must_not_be_blank(cls, value: str) -> str:
         normalized = value.strip()
         if not normalized:
-            raise ValueError("memory projection settings must not be blank")
+            raise ValueError("memory embedding settings must not be blank")
         return normalized
 
     @field_validator("memory_embedding_dimensions")

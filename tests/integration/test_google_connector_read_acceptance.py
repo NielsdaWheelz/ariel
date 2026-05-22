@@ -9,7 +9,8 @@ from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import text
 
-from ariel.app import ModelAdapter, build_google_runtime, create_app
+from ariel.app import ModelAdapter, build_google_runtime
+from tests.integration.app_helpers import create_migrated_app
 from ariel.google_connector import GoogleWorkspaceProvider
 from tests.integration.responses_helpers import (
     empty_recall_response,
@@ -28,8 +29,8 @@ GOOGLE_GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 
 @dataclass
 class ActionProposalAdapter:
-    provider: str = "provider.s4-pr01"
-    model: str = "model.s4-pr01-v1"
+    provider: str = "provider.google-read"
+    model: str = "model.google-read-v1"
     run_calls_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     assistant_text_by_message: dict[str, str] = field(default_factory=dict)
 
@@ -76,7 +77,7 @@ class ActionProposalAdapter:
                 ),
                 provider=self.provider,
                 model=self.model,
-                provider_response_id="resp_s4_pr01_interpreter",
+                provider_response_id="resp_google_read_interpreter",
                 input_tokens=31,
                 output_tokens=20,
             )
@@ -103,7 +104,7 @@ class ActionProposalAdapter:
             calls=run_calls,
             provider=self.provider,
             model=self.model,
-            provider_response_id="resp_s4_pr01_123",
+            provider_response_id="resp_google_read_123",
             input_tokens=31,
             output_tokens=20,
         )
@@ -422,6 +423,7 @@ class FakeGoogleWorkspaceProvider:
         message_id = normalized_input["message_id"]
         return {
             "schema_version": "google.gmail.message_evidence.v1",
+            "mode": "message",
             "message": {
                 "provider_account_id": "google",
                 "message_id": message_id,
@@ -463,14 +465,14 @@ class FakeGoogleWorkspaceProvider:
             },
             "read_outcome": {"status": "ok", "reason_code": None, "recovery": None},
             "retrieved_at": "2026-03-03T12:00:00Z",
+            "status": "succeeded",
         }
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
-    app = create_app(
+    app = create_migrated_app(
         database_url=postgres_url,
         model_adapter=adapter,
-        reset_database=True,
         sandbox=FakeSandboxRuntime(),
     )
     return TestClient(app)
@@ -522,7 +524,7 @@ def _connect_google(client: TestClient, *, code: str) -> dict[str, Any]:
     return callback.json()
 
 
-def test_s4_pr01_google_connector_lifecycle_endpoints_are_complete_secure_and_auditable(
+def test_google_connector_lifecycle_endpoints_are_complete_secure_and_auditable(
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter()
@@ -651,7 +653,7 @@ def test_s4_pr01_google_connector_lifecycle_endpoints_are_complete_secure_and_au
         assert len(oauth_client.revoke_calls) >= 1
 
 
-def test_s4_pr01_connector_state_is_durable_and_token_material_is_not_persisted_in_plaintext(
+def test_connector_state_is_durable_and_token_material_is_not_persisted_in_plaintext(
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter()
@@ -692,7 +694,7 @@ def test_s4_pr01_connector_state_is_durable_and_token_material_is_not_persisted_
             assert "tok_refresh_plain_encryption_check" not in refresh_token_enc
 
 
-def test_s4_pr01_calendar_and_email_read_caps_execute_allowlisted_without_approval(
+def test_calendar_and_email_read_caps_execute_allowlisted_without_approval(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -784,7 +786,7 @@ def test_s4_pr01_calendar_and_email_read_caps_execute_allowlisted_without_approv
                 assert "email msg-1" in rendered_message
 
 
-def test_s4_pr01_attendee_slot_fallback_is_explicit_and_recoverable_without_freebusy_scope(
+def test_attendee_slots_are_limited_scope_and_recoverable_without_freebusy_scope(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -866,7 +868,7 @@ def test_s4_pr01_attendee_slot_fallback_is_explicit_and_recoverable_without_free
         ("access_revoked", "connect-gmail-expired", "invalid_grant", None, "access_revoked"),
     ],
 )
-def test_s4_pr01_typed_auth_scope_failures_are_deterministic_and_recoverable(
+def test_typed_auth_scope_failures_are_deterministic_and_recoverable(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
     case_name: str,

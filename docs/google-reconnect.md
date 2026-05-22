@@ -13,10 +13,10 @@ How to (re)connect Ariel's Google integration — including granting new scopes 
 
 All Google connector flows are HTTP endpoints on the API (loopback `127.0.0.1:8000` on the VPS). There is no Discord slash command — run these from a shell on the host.
 
-If `ARIEL_LOCAL_AUTH_REQUIRED=true` (the prod default), every request needs `Authorization: Bearer <ARIEL_LOCAL_AUTH_TOKEN>`. Source it from `.env.local` for the curl calls below:
+If `ARIEL_LOCAL_AUTH_REQUIRED=true` (the prod default), every request needs `Authorization: Bearer <ARIEL_LOCAL_AUTH_TOKEN>`. Source it from the production env file for the curl calls below:
 
 ```bash
-set -a; . /home/niels/src/personal/ariel/.env.local; set +a
+set -a; . /etc/ariel/ariel.env; set +a
 auth=( -H "Authorization: Bearer $ARIEL_LOCAL_AUTH_TOKEN" )
 ```
 
@@ -106,7 +106,7 @@ Reconnect always unions the requested set with what you have. Granted scopes nev
 - **`access_denied` from Google** — you clicked Cancel on the consent screen, or your email isn't in the test-users list.
 - **`invalid_scope` from Google** — the scope you requested isn't enabled on the OAuth client. Open Cloud Console → OAuth consent screen → **Add or Remove Scopes**.
 - **Granted scopes still don't include the new one after Allow** — verify the callback succeeded: check `curl "${auth[@]}" http://127.0.0.1:8000/v1/connectors/google/events | jq '.events[0:5]'` for a recent `evt.connector.google.reconnect.succeeded`.
-- **`E_LOCAL_AUTH_TOKEN_INVALID`** — you didn't load the `auth=(…)` array, or `.env.local` doesn't have `ARIEL_LOCAL_AUTH_TOKEN`. Sanity-check with `echo "$ARIEL_LOCAL_AUTH_TOKEN" | wc -c` (≥33 chars including newline).
+- **`E_LOCAL_AUTH_TOKEN_INVALID`** — you didn't load the `auth=(…)` array, or `/etc/ariel/ariel.env` doesn't have `ARIEL_LOCAL_AUTH_TOKEN`. Sanity-check with `echo "$ARIEL_LOCAL_AUTH_TOKEN" | wc -c` (≥33 chars including newline).
 
 ## Disconnect
 

@@ -271,7 +271,7 @@ def responses_with_run_calls(
 
 def _detect_memory_subsystem(input_items: list[dict[str, Any]]) -> str | None:
     """Inspect input_items for a memory-subsystem system prompt; return the
-    configuration name (``retriever`` | ``encoder`` | ``dreamer``) or ``None``."""
+    prompt kind (``retriever`` | ``encoder`` | ``dreamer``) or ``None``."""
     for item in input_items:
         if item.get("role") != "system":
             continue
@@ -288,13 +288,10 @@ def _detect_memory_subsystem(input_items: list[dict[str, Any]]) -> str | None:
 def is_memory_subsystem_call(input_items: list[dict[str, Any]]) -> bool:
     """Detects a memory subsystem model call by its system prompt.
 
-    Catches all three memory configurations of ``run_agent_loop``: the
-    pre-turn retriever (``Ariel's memory retriever``), the agent-invoked
-    encoder (``Ariel's memory encoder``), and the scheduled dreamer
-    (``Ariel's memory dreamer``). Tests that filter memory subsystem calls
-    need to cover all three, because the worker's ``memory_dream`` task is
-    enqueued by ``enqueue_due_memory_dream`` on every ``process_one_task``
-    and runs in the same drain loop as ``user_message`` tasks.
+    Catches the three memory model-call prompts used by the two memory drivers:
+    the pre-turn retriever (``Ariel's memory retriever``), the agent-invoked
+    rememberer encode prompt (``Ariel's memory encoder``), and the scheduled
+    rememberer dream prompt (``Ariel's memory dreamer``).
     """
     return _detect_memory_subsystem(input_items) is not None
 
@@ -303,21 +300,20 @@ def empty_recall_response(
     *,
     provider: str,
     model: str,
+    input_items: list[dict[str, Any]],
     provider_response_id: str | None = None,
-    input_items: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """A canned response that exits a memory-subsystem loop immediately.
 
     For the retriever (``output_mode='finding'``) the program emits an empty
     ``recall_v1`` finding; for the encoder / dreamer (``output_mode='operations'``)
-    it calls ``agent.emit_done``. The configuration is sniffed from
-    ``input_items`` when supplied; the retriever finding is the safe default
-    for the original callers that pre-date the rememberer.
+    it calls ``agent.emit_done``. The memory prompt kind is sniffed from
+    ``input_items``.
 
     Lets tests' canned-response queues stay focused on the main agent.
     """
     rid = provider_response_id or "resp_retriever_empty"
-    config = _detect_memory_subsystem(input_items) if input_items is not None else "retriever"
+    config = _detect_memory_subsystem(input_items)
     if config in ("encoder", "dreamer"):
         program = "agent.emit_done(summary='')"
     else:

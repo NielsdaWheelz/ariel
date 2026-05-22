@@ -1,10 +1,10 @@
-"""Phase 1 contract tests for the memory substrate cutover.
+"""Memory substrate contract tests.
 
-These tests fail against the pre-cutover ``main`` and define the target.
+These tests define the memory subsystem's required behavior.
 Contracts: ``memory_log``/``memory_notes`` schema; append-only trigger;
-capability surface; pre-turn retrieval; recall non-fatality; no profile/digest;
-``memory.remember`` enqueueing; worker dispatch; ai_judgments types; log event
-accumulation; note mutability; append-only via SQLAlchemy session.
+capability surface; pre-turn retrieval; recall non-fatality; ``memory.remember``
+enqueueing; worker dispatch; ai_judgments types; log event accumulation; note
+mutability; append-only via SQLAlchemy session.
 
 Every canned response is a structural fixture and every assertion is structural.
 No test asserts that the model "chose correctly."
@@ -24,17 +24,13 @@ from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 from sqlalchemy.orm import Session, sessionmaker
 
-from ariel.agent_loop import run_agent_loop
-from ariel.app import ModelAdapter, create_app
+from ariel.app import ModelAdapter
+from tests.integration.app_helpers import create_migrated_app
 from ariel.capability_registry import capability_id_for_run_callable, get_capability
 from ariel.persistence import BackgroundTaskRecord, MemoryLogRecord, MemoryNoteRecord
-from ariel.worker import UnsupportedTaskType, process_one_task
+from ariel.worker import process_one_task
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.responses_helpers import post_message_and_drain
-
-# ---------------------------------------------------------------------------
-# Shared helpers
-# ---------------------------------------------------------------------------
 
 _id_counter = count(1)
 
@@ -45,21 +41,18 @@ def _new_id(prefix: str) -> str:
 
 NOW = datetime(2026, 5, 19, 12, 0, tzinfo=UTC)
 
-# Canned retriever program: emits a finding immediately.
 _RETRIEVER_PROGRAM = "agent.emit_finding(summary='no memories',claims=[],gaps=[],sources=[])\n"
 
-# Canned main-agent program: emits a message.
 _EMIT_MSG = "agent.emit_message(text='hello')\n"
 
 
 def _app(postgres_url: str, adapter: ModelAdapter, monkeypatch: pytest.MonkeyPatch) -> Any:
-    """Build a ``create_app`` instance with embed_text stubbed out."""
+    """Build a migrated app with embed_text stubbed out."""
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
     monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
-    return create_app(
+    return create_migrated_app(
         database_url=postgres_url,
         model_adapter=adapter,
-        reset_database=True,
         sandbox=FakeSandboxRuntime(),
     )
 
@@ -137,8 +130,6 @@ class _FailingRetrieverAdapter:
     ) -> dict[str, Any]:
         del tools, user_message, history, context_bundle, input_items
         self.call_count += 1
-        # Calls 1 and 2: retriever stuck-detection (same source twice → exits).
-        # Call 3: main agent emits a message.
         source = self._stuck_source if self.call_count <= 2 else _EMIT_MSG
         return _run_response(source, idx=self.call_count)
 
@@ -173,8 +164,7 @@ def test_schema_memory_tables_are_only_log_and_notes(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``memory_log`` and ``memory_notes`` are the only ``memory_*`` tables;
-    ``memory_facts`` and ``memory_profile`` do not exist."""
+    """``memory_log`` and ``memory_notes`` are the only ``memory_*`` tables."""
     engine = create_engine(postgres_url, future=True)
     with TestClient(_app(postgres_url, cast(ModelAdapter, _TwoPhaseAdapter()), monkeypatch)):
         table_names = set(inspect(engine).get_table_names())
@@ -182,28 +172,10 @@ def test_schema_memory_tables_are_only_log_and_notes(
     assert memory_tables == {"memory_log", "memory_notes"}, (
         f"unexpected memory_* tables: {memory_tables}"
     )
-    assert "memory_facts" not in table_names
-    assert "memory_profile" not in table_names
 
 
 # ===========================================================================
-# 1b. Schema — sessions has no digest column
-# ===========================================================================
-
-
-def test_schema_sessions_has_no_digest_column(
-    postgres_url: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``sessions`` table has no ``digest`` column."""
-    engine = create_engine(postgres_url, future=True)
-    with TestClient(_app(postgres_url, cast(ModelAdapter, _TwoPhaseAdapter()), monkeypatch)):
-        cols = {c["name"] for c in inspect(engine).get_columns("sessions")}
-    assert "digest" not in cols
-
-
-# ===========================================================================
-# 1c. Schema — memory_log is append-only (UPDATE raises)
+# 1b. Schema — memory_log is append-only (UPDATE raises)
 # ===========================================================================
 
 
@@ -262,16 +234,6 @@ def test_schema_memory_log_append_only_delete_raises(
 
 
 # ===========================================================================
-# 2. run_agent_loop exists and is callable
-# ===========================================================================
-
-
-def test_run_agent_loop_is_callable() -> None:
-    """``run_agent_loop`` is exported from ``ariel.agent_loop`` and is callable."""
-    assert callable(run_agent_loop)
-
-
-# ===========================================================================
 # 3a. Capability surface — memory.* run-callables resolve correctly
 # ===========================================================================
 
@@ -284,57 +246,34 @@ _EXPECTED_MEMORY_CALLABLES = {
     "memory.note.edit",
     "memory.note.delete",
 }
-_RETIRED_MEMORY_CALLABLES = {
-    "memory.consolidate",
-    "memory.propose",
-    "memory.delete",
-    "memory.inspect",
-    "memory.extract",
-    "memory.sweep",
-}
 
 
 def test_capability_surface_memory_callables_resolve() -> None:
-    """Expected callables resolve to registered capabilities; retired ones do not."""
+    """Expected memory callables resolve to registered capabilities."""
     for name in _EXPECTED_MEMORY_CALLABLES:
         cap_id = capability_id_for_run_callable(name)
         assert cap_id is not None, f"{name!r} must resolve to a capability_id"
         assert get_capability(cap_id) is not None, f"capability {cap_id!r} must be registered"
-    for name in _RETIRED_MEMORY_CALLABLES:
-        assert capability_id_for_run_callable(name) is None, (
-            f"retired callable {name!r} must not resolve"
-        )
+
+
+def test_memory_recall_capability_is_inline_read() -> None:
+    """``memory.recall`` reads memory; side effects motivated by it escalate later."""
+    capability = get_capability("cap.memory.recall")
+    assert capability is not None
+    assert capability.policy_decision == "allow_inline"
+    assert capability.impact_level == "read"
 
 
 # ===========================================================================
-# 3b. research.investigate mode enum includes "memories"
+# 4. Retriever fires pre-turn; injects recall_v1
 # ===========================================================================
 
 
-def test_research_investigate_mode_includes_memories() -> None:
-    """``research.investigate`` accepts ``mode='memories'``, ``'web'``, and
-    ``'personal'``; invalid modes are rejected."""
-    cap = get_capability(capability_id_for_run_callable("research.investigate") or "")
-    assert cap is not None
-    for mode in ("memories", "web", "personal"):
-        ok, err = cap.validate_input({"question": "q", "mode": mode})
-        assert err is None, f"mode={mode!r} must be valid; got {err!r}"
-    _, bad = cap.validate_input({"question": "q", "mode": "hybrid"})
-    assert bad is not None
-
-
-# ===========================================================================
-# 4. Retriever fires pre-turn; injects recall_v1; no profile or digest
-# ===========================================================================
-
-
-def test_retriever_fires_preturn_and_no_profile_or_digest_injected(
+def test_retriever_fires_preturn_and_injects_recall_context(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The main agent's context includes ``memory recall:`` (the recall_v1
-    reconstruction) and does NOT include a ``user profile`` or ``session digest``
-    block."""
+    """The main agent's context includes the ``recall_v1`` reconstruction."""
     adapter = _TwoPhaseAdapter()
     with TestClient(_app(postgres_url, cast(ModelAdapter, adapter), monkeypatch)) as client:
         sid = _session_id(client)
@@ -343,8 +282,6 @@ def test_retriever_fires_preturn_and_no_profile_or_digest_injected(
     assert adapter.call_count >= 2, "expected retriever + main agent calls"
     rendered = json.dumps(adapter.snapshots[1])  # main-agent snapshot
     assert "memory recall:" in rendered
-    assert "user profile" not in rendered.lower()
-    assert "session digest" not in rendered.lower()
 
 
 # ===========================================================================
@@ -394,23 +331,16 @@ def test_memory_remember_enqueues_memory_encode_task(
 
 
 # ===========================================================================
-# 7b. Retriever+main proposal_index regression
+# 7b. Retriever and main proposal_index sharing
 # ===========================================================================
 
 
 @dataclass
 class _RetrieverSearchesThenMainSearchesAdapter:
-    """Retriever calls ``memory.search``; main agent then calls ``memory.search``.
+    """Retriever and main-agent calls share one parent-turn proposal index space.
 
-    Both syscalls create ``ActionAttemptRecord`` rows on the same parent turn.
-    Pre-fix: both loops started ``proposal_index_start=0`` so the main loop's
-    first call collided on the ``(turn_id, proposal_index)`` unique index.
-
-    The main agent's search and message are split across two rounds so the
-    premature-synthesis rail in ``run_agent_loop`` does not drop the message
-    (the rail forbids ``read capability + emit_message`` in the very first
-    main-agent round, because the message would have been authored before the
-    capability's result was observed).
+    The main-agent search and message are split across two rounds because
+    ``run_agent_loop`` rejects messages authored before read observations.
     """
 
     provider: str = "provider.test"
@@ -423,16 +353,13 @@ class _RetrieverSearchesThenMainSearchesAdapter:
         del input_items, tools, user_message, history, context_bundle
         self.call_count += 1
         if self.call_count == 1:
-            # Retriever loop: emit finding.
             source = (
                 "memory.search(query='ping', limit=3)\n"
                 "agent.emit_finding(summary='ok',claims=[],gaps=[],sources=[])\n"
             )
         elif self.call_count == 2:
-            # Main agent round 1: search only — round 1 cannot also emit.
             source = "memory.search(query='ping', limit=3)\n"
         else:
-            # Main agent round 2: emit the message after the round-1 observation.
             source = _EMIT_MSG
         return _run_response(source, idx=self.call_count)
 
@@ -453,7 +380,7 @@ def test_retriever_and_main_loop_action_attempts_do_not_collide(
 
 
 # ===========================================================================
-# 8. Worker accepts memory_encode and memory_dream; rejects retired task_types
+# 8. Worker runs memory_encode and memory_dream
 # ===========================================================================
 
 
@@ -461,16 +388,14 @@ def test_worker_accepts_memory_encode_and_memory_dream(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``memory_encode`` and ``memory_dream`` are dispatched without raising
-    ``UnsupportedTaskType`` (other errors for missing runtime config are fine)."""
-    from ariel.persistence import enqueue_background_task
+    """``memory_encode`` and ``memory_dream`` dispatch to the rememberer."""
+    from ariel.persistence import TurnRecord, enqueue_background_task
 
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
     monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
-    app = create_app(
+    app = create_migrated_app(
         database_url=postgres_url,
-        model_adapter=cast(ModelAdapter, _TwoPhaseAdapter()),
-        reset_database=True,
+        model_adapter=cast(ModelAdapter, _DreamCompleteAdapter()),
         sandbox=FakeSandboxRuntime(),
     )
     with TestClient(app) as client:
@@ -482,35 +407,39 @@ def test_worker_accepts_memory_encode_and_memory_dream(
         ]:
             with sf() as db:
                 with db.begin():
-                    enqueue_background_task(db, task_type=task_type, payload=payload, now=NOW)
-            try:
-                process_one_task(session_factory=sf, settings=runtime.settings, runtime=runtime)
-            except UnsupportedTaskType:
-                pytest.fail(f"{task_type} raised UnsupportedTaskType")
-            except Exception:
-                pass  # missing runtime config etc. is fine
+                    task = enqueue_background_task(
+                        db, task_type=task_type, payload=payload, now=NOW
+                    )
+                    task_id = task.id
+
+            assert process_one_task(session_factory=sf, settings=runtime.settings, runtime=runtime)
+
+            with sf() as db:
+                assert db.get(BackgroundTaskRecord, task_id) is None
+                turns = db.scalars(select(TurnRecord).where(TurnRecord.kind == task_type)).all()
+            assert len(turns) == 1, f"expected one {task_type} turn"
+            assert turns[0].status == "completed"
 
 
-def test_retired_task_types_rejected_by_check_constraint(
+def test_background_tasks_rejects_unknown_task_type(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """``memory_remember`` and ``memory_sweep`` violate the CHECK constraint."""
-    for bad in ("memory_remember", "memory_sweep"):
-        with pytest.raises(IntegrityError):
-            with session_factory() as db:
-                with db.begin():
-                    db.execute(
-                        text(
-                            "INSERT INTO background_tasks"
-                            " (id,task_type,payload,attempts,run_after,created_at,updated_at)"
-                            " VALUES (:id,:tt,'{}',0,now(),now(),now())"
-                        ),
-                        {"id": _new_id("bgt"), "tt": bad},
-                    )
+    """Unknown task types violate the CHECK constraint."""
+    with pytest.raises(IntegrityError):
+        with session_factory() as db:
+            with db.begin():
+                db.execute(
+                    text(
+                        "INSERT INTO background_tasks"
+                        " (id,task_type,payload,attempts,run_after,created_at,updated_at)"
+                        " VALUES (:id,:tt,'{}',0,now(),now(),now())"
+                    ),
+                    {"id": _new_id("bgt"), "tt": "not_a_task_type"},
+                )
 
 
 # ===========================================================================
-# 9. ai_judgments CHECK accepts new types; rejects memory_remember
+# 9. ai_judgments CHECK accepts persisted types and rejects unknown types
 # ===========================================================================
 
 _AJ_INSERT = text(
@@ -521,10 +450,10 @@ _AJ_INSERT = text(
 )
 
 
-def test_ai_judgments_accepts_new_types_and_rejects_memory_remember(
+def test_ai_judgments_accepts_persisted_types_and_rejects_unknown_type(
     session_factory: sessionmaker[Session],
 ) -> None:
-    """New judgment types insert cleanly; ``memory_remember`` raises ``IntegrityError``."""
+    """Persisted judgment types insert cleanly; unknown types violate the CHECK constraint."""
     for jt in ("memory_recall", "memory_encode", "memory_dream", "model_output"):
         with session_factory() as db:
             with db.begin():
@@ -533,7 +462,7 @@ def test_ai_judgments_accepts_new_types_and_rejects_memory_remember(
     with pytest.raises(IntegrityError):
         with session_factory() as db:
             with db.begin():
-                db.execute(_AJ_INSERT, {"id": _new_id("ajg"), "jt": "memory_remember"})
+                db.execute(_AJ_INSERT, {"id": _new_id("ajg"), "jt": "not_a_judgment_type"})
 
 
 # ===========================================================================
@@ -648,11 +577,6 @@ def test_memory_log_append_only_via_sqlalchemy_session(
                 )
 
 
-# ===========================================================================
-# 13. System session row exists after migrations; supports background turns
-# ===========================================================================
-
-
 def test_system_session_row_seeded_by_migration(
     session_factory: sessionmaker[Session],
 ) -> None:
@@ -680,13 +604,11 @@ def test_ensure_system_session_is_idempotent(
 
     now = datetime.now(tz=UTC)
 
-    # Idempotent on a DB where the row was already seeded by the migration.
     with session_factory() as db:
         with db.begin():
             sid = ensure_system_session(db, now=now)
         assert sid == SYSTEM_SESSION_ID
 
-    # Self-heal: wipe the row, ensure_system_session re-creates it.
     with session_factory() as db:
         with db.begin():
             db.execute(text("DELETE FROM sessions WHERE id = :id"), {"id": SYSTEM_SESSION_ID})
@@ -721,10 +643,7 @@ def test_run_rememberer_dream_succeeds_with_no_user_session(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A fresh DB (no user session, never had one) accepts a ``dream`` run:
-    the ``TurnRecord`` is inserted against the system session, status reaches
-    ``completed``, no ``ForeignKeyViolation`` is raised. Regression for the
-    production ``turns_session_id_fkey`` failure."""
+    """A fresh DB with no user session accepts a ``dream`` run against the system session."""
     from ariel.config import AppSettings
     from ariel.capability_registry import REMEMBERER_CAPABILITY_IDS
     from ariel.memory import run_rememberer
@@ -735,9 +654,9 @@ def test_run_rememberer_dream_succeeds_with_no_user_session(
     settings = AppSettings()
 
     engine = create_engine(postgres_url, future=True, pool_pre_ping=True)
-    from ariel.db import reset_schema_for_tests
+    from tests.db_helpers import reset_postgres_schema
 
-    reset_schema_for_tests(engine, postgres_url)
+    reset_postgres_schema(engine, postgres_url)
     sf = sessionmaker(bind=engine, future=True, expire_on_commit=False)
 
     sandbox = FakeSandboxRuntime()
@@ -799,9 +718,9 @@ def test_run_rememberer_dream_self_heals_if_system_session_missing(
     settings = AppSettings()
 
     engine = create_engine(postgres_url, future=True, pool_pre_ping=True)
-    from ariel.db import reset_schema_for_tests
+    from tests.db_helpers import reset_postgres_schema
 
-    reset_schema_for_tests(engine, postgres_url)
+    reset_postgres_schema(engine, postgres_url)
     sf = sessionmaker(bind=engine, future=True, expire_on_commit=False)
 
     sandbox = FakeSandboxRuntime()
@@ -857,9 +776,7 @@ def test_worker_memory_dream_task_inserts_turn_against_system_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """End-to-end via ``process_one_task``: a queued ``memory_dream`` task runs
-    cleanly on a fresh DB, the turn row is attached to the system session, and
-    no ``ForeignKeyViolation`` marks it failed. Regression for the production
-    ``turns_session_id_fkey`` failure where the dream task looped on retries.
+    cleanly on a fresh DB and the turn row is attached to the system session.
 
     ``process_one_task`` is called repeatedly until a ``memory_dream`` turn
     exists; each call processes at most one task and the worker also seeds
@@ -869,10 +786,9 @@ def test_worker_memory_dream_task_inserts_turn_against_system_session(
 
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
     monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
-    app = create_app(
+    app = create_migrated_app(
         database_url=postgres_url,
         model_adapter=cast(ModelAdapter, _DreamCompleteAdapter()),
-        reset_database=True,
         sandbox=FakeSandboxRuntime(),
     )
     with TestClient(app) as client:
@@ -889,16 +805,9 @@ def test_worker_memory_dream_task_inserts_turn_against_system_session(
         # the test environment (missing google connector, etc.) which is fine.
         dream_turn_present = False
         for _ in range(6):
-            try:
-                processed = process_one_task(
-                    session_factory=sf, settings=runtime.settings, runtime=runtime
-                )
-            except Exception:
-                # The worker arms its own failure path; some tasks (e.g. the
-                # google provider maintenance ones) have no configured runtime
-                # in this test and the worker marks them failed without
-                # raising. A surprise raise here is itself a regression.
-                pytest.fail("process_one_task must never raise")
+            processed = process_one_task(
+                session_factory=sf, settings=runtime.settings, runtime=runtime
+            )
             with sf() as db:
                 dream_turn = db.scalar(select(TurnRecord).where(TurnRecord.kind == "memory_dream"))
             if dream_turn is not None:
@@ -924,15 +833,14 @@ def test_worker_memory_dream_task_inserts_turn_against_system_session(
 
 
 # ===========================================================================
-# Error-fallback assistant_message filter — these messages poison retrieval
+# Assistant failure-message filter — these messages poison retrieval
 # when they live in ``memory_log``: the retriever surfaces them as evidence
 # of failure even when the capability is now succeeding with real data.
-# Filter at the WRITE site so the log never contains them.
 # ===========================================================================
 
 
 @pytest.mark.parametrize(
-    "fallback_text",
+    "failure_text",
     [
         "Calendar fetch failed",
         "Calendar query failed",
@@ -943,16 +851,15 @@ def test_worker_memory_dream_task_inserts_turn_against_system_session(
         "Inbox unavailable",
         "Memory query failed",
         "Email errored — please re-link in settings.",
-        # Pure "re-link in settings" should also filter.
         "Try to re-link in settings and retry.",
     ],
 )
-def test_append_log_event_skips_error_fallback_assistant_messages(
+def test_append_log_event_skips_assistant_failure_messages(
     session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
-    fallback_text: str,
+    failure_text: str,
 ) -> None:
-    """An ``assistant_message`` whose text matches the error-fallback regex is
+    """An ``assistant_message`` whose text matches the failure-message regex is
     skipped at the write site: ``append_log_event`` returns ``None`` and no
     row is inserted into ``memory_log``."""
     from ariel.config import AppSettings
@@ -969,7 +876,7 @@ def test_append_log_event_skips_error_fallback_assistant_messages(
             result = append_log_event(
                 db,
                 kind="assistant_message",
-                content=fallback_text,
+                content=failure_text,
                 session_id=None,
                 turn_id=None,
                 taint="clean",
@@ -978,13 +885,13 @@ def test_append_log_event_skips_error_fallback_assistant_messages(
                 now=now,
                 new_id_fn=_new_id,
             )
-        assert result is None, f"expected fallback {fallback_text!r} to be filtered"
+        assert result is None, f"expected failure message {failure_text!r} to be filtered"
 
     with session_factory() as db:
         rows = db.scalars(
-            select(MemoryLogRecord).where(MemoryLogRecord.content == fallback_text)
+            select(MemoryLogRecord).where(MemoryLogRecord.content == failure_text)
         ).all()
-    assert rows == [], f"fallback {fallback_text!r} must not be written to memory_log"
+    assert rows == [], f"failure message {failure_text!r} must not be written to memory_log"
 
 
 @pytest.mark.parametrize(
@@ -1006,7 +913,7 @@ def test_append_log_event_preserves_legitimate_assistant_messages(
     monkeypatch: pytest.MonkeyPatch,
     legitimate_text: str,
 ) -> None:
-    """An ``assistant_message`` that does not match the error-fallback regex
+    """An ``assistant_message`` that does not match the failure-message regex
     is written normally: ``append_log_event`` returns the row, and the row
     exists in ``memory_log``."""
     from ariel.config import AppSettings
@@ -1060,7 +967,7 @@ def test_append_log_event_filter_applies_only_to_assistant_messages(
     monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
     settings = AppSettings()
     now = datetime.now(tz=UTC)
-    fallback_text = "Calendar fetch failed"
+    failure_text = "Calendar fetch failed"
 
     with session_factory() as db:
         with db.begin():
@@ -1073,7 +980,7 @@ def test_append_log_event_filter_applies_only_to_assistant_messages(
                 result = append_log_event(
                     db,
                     kind=kind,  # type: ignore[arg-type]
-                    content=fallback_text,
+                    content=failure_text,
                     session_id=None,
                     turn_id=None,
                     taint="clean",
@@ -1086,17 +993,15 @@ def test_append_log_event_filter_applies_only_to_assistant_messages(
 
     with session_factory() as db:
         rows = db.scalars(
-            select(MemoryLogRecord).where(MemoryLogRecord.content == fallback_text)
+            select(MemoryLogRecord).where(MemoryLogRecord.content == failure_text)
         ).all()
     kinds = {r.kind for r in rows}
     assert kinds == {"user_message", "agent_round", "tool_observation", "proactive_trigger"}
 
 
 # ===========================================================================
-# Retrieval-side filter — legacy polluting rows that pre-date the write-site
-# filter (and which ``memory_log``'s append-only trigger keeps us from
-# deleting) must NOT surface from ``search_memory``. The same regex applies
-# symmetrically on both sides.
+# Retrieval-side filter — directly inserted polluting rows must NOT surface
+# from ``search_memory``. The same regex applies symmetrically on both sides.
 # ===========================================================================
 
 
@@ -1110,9 +1015,8 @@ def _insert_log_row_directly(
     """Insert a ``memory_log`` row via the ORM, bypassing ``append_log_event``.
 
     The append-only trigger only blocks UPDATE/DELETE; raw INSERTs go through.
-    This is how we seed legacy polluting rows in tests: they were written
-    before the write-time filter existed, so they're sitting in the log
-    waiting to poison retrieval.
+    This seeds rows that bypass ``append_log_event`` so the retrieval filter is
+    exercised against stored data already present in the append-only log.
     """
     row_id = _new_id("mev")
     with session_factory() as db:
@@ -1133,14 +1037,14 @@ def _insert_log_row_directly(
     return row_id
 
 
-def test_search_memory_skips_legacy_error_assistant_messages(
+def test_search_memory_skips_directly_inserted_error_assistant_messages(
     session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A legacy ``assistant_message`` whose content matches the error regex
-    is seeded directly into ``memory_log`` (simulating rows that pre-date the
-    write-site filter) and ``search_memory`` must not return it. A legitimate
-    ``assistant_message`` ("No emails today") seeded the same way is returned.
+    """An ``assistant_message`` whose content matches the error regex is seeded
+    directly into ``memory_log`` and ``search_memory`` must not return it. A
+    legitimate ``assistant_message`` ("No emails today") seeded the same way is
+    returned.
     """
     from ariel.config import AppSettings
     from ariel.memory import search_memory
@@ -1173,7 +1077,7 @@ def test_search_memory_skips_legacy_error_assistant_messages(
     email_ids = {h["id"] for h in email_hits}
 
     assert polluting_id not in calendar_ids, (
-        f"polluting legacy row must not surface; got hits={calendar_hits!r}"
+        f"polluting failure-message row must not surface; got hits={calendar_hits!r}"
     )
     assert legitimate_id in email_ids, (
         f"legitimate 'no emails today' row must surface; got hits={email_hits!r}"
@@ -1212,14 +1116,3 @@ def test_search_memory_does_not_filter_non_assistant_kinds(
     assert user_id in {h["id"] for h in hits}, (
         f"user_message with matching text must surface; got hits={hits!r}"
     )
-
-
-def test_is_assistant_error_fallback_is_module_public() -> None:
-    """The predicate is exposed at module scope so the projection layer can
-    reuse the same vocabulary the write site uses."""
-    from ariel.memory import is_assistant_error_fallback
-
-    assert is_assistant_error_fallback("Calendar fetch failed")
-    assert is_assistant_error_fallback("Email errored — re-link in settings.")
-    assert not is_assistant_error_fallback("No emails from today.")
-    assert not is_assistant_error_fallback("Calendar — no events in the next 7 days.")

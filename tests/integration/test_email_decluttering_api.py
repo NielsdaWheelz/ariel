@@ -7,7 +7,7 @@ from typing import Any, cast
 import pytest
 from fastapi.testclient import TestClient
 
-from ariel.app import create_app
+from tests.integration.app_helpers import create_migrated_app
 from tests.integration.responses_helpers import empty_recall_response, is_memory_subsystem_call
 from ariel.persistence import (
     ActionAttemptRecord,
@@ -47,10 +47,9 @@ class NoopModelAdapter:
 
 @pytest.fixture
 def client(postgres_url: str) -> Generator[TestClient, None, None]:
-    app = create_app(
+    app = create_migrated_app(
         database_url=postgres_url,
         model_adapter=NoopModelAdapter(),
-        reset_database=True,
         sandbox=FakeSandboxRuntime(),
     )
     with TestClient(app) as test_client:

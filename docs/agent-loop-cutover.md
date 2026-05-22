@@ -7,8 +7,8 @@ asynchronous and durable, makes the loop long and adaptive, fixes the
 cross-program context leak, wires worker-run delivery, and adds a read-only
 research subagent.
 
-It owns the cutover only. The standing design lands in
-[modules/agent-loop.md](modules/agent-loop.md), written by P4. The plan inherits
+It owns the cutover only. The standing design lives in
+[modules/agent-loop.md](modules/agent-loop.md). The plan inherits
 [ai-first.md](ai-first.md), [cleanliness.md](cleanliness.md), and
 [simplicity.md](simplicity.md), and follows the precedent of the proactivity
 crystallization ([modules/proactivity-cutover.md](modules/proactivity-cutover.md)):
@@ -17,8 +17,8 @@ keep one model loop and a thin rail; delete everything that is not that.
 It narrows [run-program-cutover.md](run-program-cutover.md) and
 [modules/proactivity.md](modules/proactivity.md): the synchronous request/response
 turn and the 2-attempt model-call cap are removed. Where this document conflicts
-with turn-lifecycle language in those docs, this document wins; P4 reconciles
-them.
+with turn-lifecycle language in those docs, this document wins for the cutover
+plan and the standing docs describe the current design.
 
 The cutover is hard. There is no compatibility layer, no dual turn path, no
 feature flag, and no fallback. Work is sequenced across phases — P0 and P1 stand
@@ -29,14 +29,11 @@ data-migration step.
 
 ## Thesis
 
-> **Reconciliation note (P4).** The plan below proposed extracting the loop body
-> into a single shared `run_agent_loop` function. The implementation did not do
-> that. The two agents are **two separate reason→act→observe loops** — `_wake`
-> in `app.py` and `run_research` in `research_runtime.py` — that share the
-> run-program model and `execute_run_program` (one program's sandboxed
-> execution and the syscall rails), not an outer-loop function. Every claim of
-> a shared `run_agent_loop` below is superseded; the standing design is
-> [modules/agent-loop.md](modules/agent-loop.md).
+> **Reconciliation note.** The implementation now uses the extracted shared
+> `run_agent_loop` in `agent_loop.py`. `_wake`, `run_research`,
+> `run_retriever`, and `run_rememberer` build `LoopConfig`, call the shared
+> loop, and map `LoopResult` to their own persistence and delivery contracts.
+> The standing design is [modules/agent-loop.md](modules/agent-loop.md).
 
 There is one run-program loop pattern. It runs as two agents — the **main
 agent** and a **research subagent** — reached through `_wake` and the
@@ -107,8 +104,8 @@ These are replacement targets, not compatibility promises.
   every trigger; the research loop is a worker-task handler, not a trigger.
 - No recursive delegation. The research subagent cannot call
   `research.investigate`; it is single-level.
-- No research run that combines private-data reads with open-web reach. The two
-  research modes are mutually exclusive per run.
+- No research run that combines open-web reach with personal or memory reads.
+  The research modes are mutually exclusive per run.
 - No free-text-only finding. A finding is a typed, structured object carried
   with tainted provenance.
 - No durable syscall journaling or program replay. A program runs once; a
@@ -123,13 +120,12 @@ These are replacement targets, not compatibility promises.
 
 ## Target Architecture
 
-### One loop pattern, two agents
+### One shared loop, configured drivers
 
-> **Reconciliation note (P4).** No shared `run_agent_loop` function was
-> extracted. `_wake` and `run_research` are two separate loops; they share the
-> run-program model, `execute_run_program`, and the `run_runtime.py` helpers —
-> the per-program executor, not an outer-loop function. The two "configurations"
-> below are the real differences between the two loops.
+> **Reconciliation note.** `run_agent_loop` is the shared outer loop. Drivers
+> supply the configuration below; the shared loop owns model calls,
+> run-protocol parsing, execution, budget checks, stuck detection, scratch,
+> per-program commit, and retry.
 
 The loop is the existing `run`-program loop: the model authors a `run` program,
 `execute_run_program` runs it in the gVisor sandbox, syscalls round-trip through
@@ -253,9 +249,9 @@ main agent treats it as untrusted content, exactly like a fetched web page — a
 the main agent answers the user. Because the finding is tainted, any action it
 motivates is evaluated tainted and routes through `requires_approval`.
 
-### The two research modes
+### The three research modes
 
-A research run is in exactly one of two mutually exclusive modes. This is the
+A research run is in exactly one of three mutually exclusive modes. This is the
 "Rule of Two": a run is exposed to at most two of {untrusted input, private
 data, outbound reach}, never all three — the precondition for silent data
 exfiltration.
@@ -268,10 +264,12 @@ exfiltration.
   `cap.drive.search`, `cap.drive.read`, `cap.calendar.list`. Private data and
   untrusted input (the user's mailbox is attacker-influenced); no outbound web
   reach.
+- **`memories`** — whitelist `cap.memory.search`, `cap.memory.read`. Ariel-owned
+  memory substrate only; no outbound web reach or live provider reads.
 
-A run never holds both. A task that needs both web and personal evidence is two
-runs; the main agent combines their findings — coupled synthesis stays with the
-single main thread.
+A run never holds multiple whitelists. A task that needs more than one mode is
+split into separate runs; the main agent combines their findings — coupled
+synthesis stays with the single main thread.
 
 ## Target Behaviour
 
@@ -381,15 +379,16 @@ A new `CapabilityDefinition` in `capability_registry.py`:
 - run-callable alias — `research.investigate` (in `_RUN_CALLABLE_ALIASES`)
 
 `research_investigate_v1` (input): `question: str` (required, non-empty),
-`mode: "web" | "personal"` (required).
+`mode: "web" | "personal" | "memories"` (required).
 
 `research_task_start_v1` (output): `status: "queued"`, `research_id: str`.
 
-The two mode whitelists are module-level frozensets in `capability_registry.py`,
+The mode whitelists are module-level frozensets in `capability_registry.py`,
 beside the existing `*_CAPABILITY_IDS` constants:
 `RESEARCH_WEB_CAPABILITY_IDS = {cap.search.web, cap.search.news, cap.web.extract}`
 and `RESEARCH_PERSONAL_CAPABILITY_IDS = {cap.email.search, cap.email.read,
-cap.drive.search, cap.drive.read, cap.calendar.list}`.
+cap.drive.search, cap.drive.read, cap.calendar.list}`, and
+`RESEARCH_MEMORIES_CAPABILITY_IDS = {cap.memory.search, cap.memory.read}`.
 
 ### The scratch syscalls
 
@@ -439,9 +438,9 @@ The research loop's terminal output and the payload the completion `agent_wake`
 carries:
 
 - `question: str` — the question investigated
-- `mode: "web" | "personal"`
+- `mode: "web" | "personal" | "memories"`
 - `status: "complete" | "partial" | "failed"` — `complete` when the run called
-  `research.finding`; `partial` when the budget, the model-call backstop, or
+  `agent.emit_finding`; `partial` when the budget, the model-call backstop, or
   stuck-detection ended the run first; `failed` when a model call raised
 - `summary: str` — a bounded synthesis (host-enforced max length)
 - `claims: list` — model-shaped as `{ statement, sources, confidence }`
@@ -476,10 +475,11 @@ absence of prose.
   is the same loop with a different whitelist, budget, output mode, and prompt.
   There is no router and no manager. The main agent delegates by calling a
   syscall. This is the 2026 SOTA consensus and the repo's own subagent rule.
-- **Two mutually-exclusive research modes.** A subagent reading both private
-  data and the open web in one run is the lethal trifecta; "read-only" does not
-  close the exfiltration channel of its own web fetches. The mode split is the
-  Rule of Two; it preserves both capabilities while closing the trifecta.
+- **Mutually-exclusive research modes.** A subagent reading private or memory
+  data while reaching the open web in one run is the lethal trifecta; "read-only"
+  does not close the exfiltration channel of its own web fetches. The mode split
+  is the Rule of Two; it preserves those capabilities while closing the
+  trifecta.
 - **The finding is typed and tainted.** A typed structure bounds the finding; a
   tainted provenance makes the main agent treat it as untrusted, so a
   prompt-injected finding cannot authorize an unapproved action.
@@ -497,7 +497,7 @@ absence of prose.
   pacing; runaway behavior is caught deterministically, host-side, by
   stuck-detection the model cannot reason around.
 - **Reuse `TurnRecord` for research runs.** A `kind` discriminator on `turns`
-  avoids a new table — consistent with the schema-consolidation direction.
+  avoids speculative schema surface.
 
 ## The Cutover
 
@@ -554,14 +554,13 @@ Make every turn worker-run and delete the synchronous path.
 
 Make the loop long.
 
-> **Reconciliation note (P4).** The `run_agent_loop` extraction below was not
-> done. The long adaptive loop lives in `_wake` in `app.py`; P3 added a
-> structurally mirrored sibling loop in `run_research`. The remaining P2 work —
-> the budget, stuck-detection, the budget signal, the scratch store,
-> `emit_value` eviction, prompt-prefix stability — all landed.
+> **Reconciliation note.** The long adaptive loop now lives in `run_agent_loop`;
+> `_wake`, `run_research`, and the memory drivers provide configurations. The
+> budget, stuck-detection, budget signal, scratch store, `emit_value` eviction,
+> and prompt-prefix stability all landed.
 
-- Make the `_wake` loop long: it runs as many reason→act→observe rounds as the
-  task needs (no shared `run_agent_loop` function was extracted).
+- Make the shared loop long: it runs as many reason→act→observe rounds as the
+  task needs.
 - Remove `max_model_attempts` and `max_turn_wall_time_ms`. Add
   `main_turn_budget_seconds`, `research_run_budget_seconds`, and
   `agent_loop_max_model_calls` to `config.py`, validated and documented in
@@ -587,12 +586,12 @@ Make the loop long.
 Add the research subagent and its dispatch.
 
 - Add `cap.research.investigate`, its validator, its `execute` (enqueue a
-  `research_run` task), its run-callable alias, and the two mode-whitelist
+  `research_run` task), its run-callable alias, and the mode-whitelist
   constants to `capability_registry.py`.
 - Add `run_research` in `research_runtime.py`: the research loop — a sibling of
   the `_wake` loop, structurally mirrored — driven on the mode whitelist,
   bounded by `research_run_budget_seconds`, with the research prompt and the
-  plan step, ending on `research.finding`.
+  plan step, ending on `agent.emit_finding`.
 - The worker gains a `research_run` dispatch arm: it calls `run_research`,
   records the run as a `kind = research` `TurnRecord`, and enqueues an
   `agent_wake` carrying the `research_finding_v1`.
@@ -612,14 +611,14 @@ Add the research subagent and its dispatch.
   `task_type` enum gains `research_run`; `turns` gains `kind`).
 - **Acceptance:** the main agent dispatches `research.investigate` and gets a
   handle; the worker runs the research loop read-only in the requested mode; a
-  `web` run cannot reach private-data capabilities and a `personal` run cannot
-  reach the web; the finding returns via an `agent_wake` with tainted
-  provenance; `make verify` passes; the migrations run up and down.
+  `web` run cannot reach private-data capabilities, and `personal` and
+  `memories` runs cannot reach the web; the finding returns via an `agent_wake`
+  with tainted provenance; `make verify` passes; the migrations run up and down.
 
 ### P4 — Doc reconciliation
 
 Write [modules/agent-loop.md](modules/agent-loop.md), the standing doc: the loop,
-the two configurations, async turns, the scratch store, the research subagent,
+the loop drivers, async turns, the scratch store, the research subagent,
 delivery, and the rules. Reconcile `modules/proactivity.md` (delivery is wired;
 the trigger list gains research completion), `ai-first.md` (the research
 subagent joins the retriever and rememberer as a named subagent),
@@ -645,7 +644,7 @@ Touched by the cutover, by module:
   `emit_value` eviction.
 - `discord_bot.py` — fire-and-forget submit; the blocking reply path deleted.
 - `capability_registry.py` — `cap.research.investigate`, its run-callable alias,
-  the two mode-whitelist constants.
+  the mode-whitelist constants.
 - `action_runtime.py` — the `cap.research.investigate` execute path.
 - `persistence.py` — the `user_message` and `research_run` task types; the
   `turns.kind` column.
@@ -679,9 +678,9 @@ Configuration (`config.py`, `ARIEL_` env prefix, documented in `.env.example`):
 
 ## Rules
 
-- There are two agent loops — `_wake` and `run_research` — each its own
-  reason→act→observe loop, sharing `execute_run_program` and the run-program
-  model. There is no third loop and no shared `run_agent_loop` function.
+- `run_agent_loop` is the one shared reason→act→observe loop. `_wake`,
+  `run_research`, `run_retriever`, and `run_rememberer` configure it and own
+  their domain-specific setup and post-loop handling.
 - `_wake` is the one trigger entrypoint. The research loop is a worker-task
   handler, not a trigger.
 - The model's tool surface is exactly `run`. Delegation is a syscall, never a
@@ -693,7 +692,7 @@ Configuration (`config.py`, `ARIEL_` env prefix, documented in `.env.example`):
 - Every delivered message goes through the one worker-side Discord delivery
   path.
 - The research subagent is strictly read-only, single-level, and runs in exactly
-  one mode per run; a run never holds both private-data reads and open-web
+  one mode per run; a run never combines personal or memory reads with open-web
   reach.
 - A research finding is typed and is carried with tainted provenance.
 - Large per-turn data lives in the scratch store; only keys and deliberate
@@ -735,8 +734,8 @@ The cutover is complete only when all are true:
 - `cap.research.investigate` exists, is `allow_inline` and `read`, and dispatches
   a `research_run` task.
 - A research run executes the `run_research` loop, read-only, in one mode; a
-  `web` run cannot reach private-data capabilities and a `personal` run cannot
-  reach the web.
+  `web` run cannot reach private-data capabilities, and `personal` and
+  `memories` runs cannot reach the web.
 - A research run terminates on a typed `research_finding_v1`; the completion
   `agent_wake` carries it; it enters the main agent's context with tainted
   provenance.
@@ -757,14 +756,14 @@ The cutover is complete only when all are true:
 - **Long-transaction contention is replaced, not eliminated.** Per-program
   commits bound each transaction to one program. A `statement_timeout` should be
   added to the engine as a backstop; none is configured today.
-- **The research subagent reads untrusted content** — web pages, and the user's
-  own mailbox. The two-mode split plus the typed, tainted finding contains it: a
-  `web` run has outbound reach but no private data; a `personal` run has private
-  data but no outbound reach; the finding cannot smuggle an instruction past the
-  taint rail. Residual exposure — a `web` run steered to fetch attacker URLs —
-  leaks only the research topic; the `cap.web.extract` host-safety check and
-  egress controls, and the `action_attempts` ledger that records every fetch,
-  bound it.
+- **The research subagent reads untrusted content** — web pages, the user's own
+  mailbox, and memory substrate entries. The mode split plus the typed, tainted
+  finding contains it: a `web` run has outbound reach but no private data;
+  `personal` and `memories` runs have private-derived data but no outbound web
+  reach; the finding cannot smuggle an instruction past the taint rail. Residual
+  exposure — a `web` run steered to fetch attacker URLs — leaks only the research
+  topic; the `cap.web.extract` host-safety check and egress controls, and the
+  `action_attempts` ledger that records every fetch, bound it.
 - **A long loop is not free.** Agent reliability degrades super-linearly with
   turn length. Mitigation: the wall-clock budget is moderate, not unbounded;
   stuck-detection halts runaway loops; the model sees its budget.
@@ -807,5 +806,5 @@ context engineering, the code-execution tool interface, deep-research agents,
 multi-agent consensus, personal-assistant products, proactive agents, agent-loop
 design, agent security, and practitioner consensus). The verification found the
 direction validated and in places ahead of the field; its one material finding —
-the research subagent's lethal-trifecta exposure — is resolved by the two-mode
+the research subagent's lethal-trifecta exposure — is resolved by the three-mode
 split specified above.

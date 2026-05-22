@@ -1,17 +1,17 @@
 """Ariel's memory substrate — a two-layer append-only raw log plus an editable
 curated note layer, with agentic retrieval and encoding/dreaming.
 
-Three functions drive the substrate, all of them ``run_agent_loop`` in a
-different configuration:
+Two model-loop drivers operate on the substrate:
 
 - ``run_retriever`` — fires every wake; reconstructs the working context
   agentically by searching and reading the substrate, then returns a
   ``recall_v1`` finding.
 - ``run_rememberer`` — writes the curated layer on ``encode`` (agent-invoked)
   or ``dream`` (scheduled) triggers; never the raw log.
-- The raw log is written only by ``append_log_event`` (a rail); the curated
-  layer only by ``create_note`` / ``edit_note`` / ``delete_note`` (rails that
-  also append ``note_*`` events to the log).
+
+The raw log is written only by ``append_log_event`` (a rail); the curated layer
+only by ``create_note`` / ``edit_note`` / ``delete_note`` (rails that also append
+``note_*`` events to the log).
 
 Deterministic code here does exactly five things, all rails: durable substrate
 storage, embedding computation, hybrid search, loop configuration, and
@@ -250,20 +250,13 @@ _LogKind = Literal[
 ]
 
 
-# Error-fallback messages the agent emits when it's stuck — "Calendar fetch
-# failed", "Email query unavailable", "Drive errored", "re-link in settings",
-# etc. Writing these to ``memory_log`` poisons future retrieval: the
-# retriever surfaces them as authoritative evidence of failure even when the
-# capability is now succeeding with real data, so the model re-emits the
-# same fallback and reinforces the pattern. Filter at the WRITE site so the
-# log never contains them, AND at the retrieval site so legacy rows written
-# before the write-time filter (and any rows ``memory_log``'s append-only
-# trigger keeps us from deleting) never surface to the model. Deliberately
-# tight: only matches the failure-vocabulary the agent emits when stuck.
-# "no events found" is NOT matched — that can be legitimate. Note the
-# explicit failure word at the tail is what discriminates this from valid
-# "no X found" content. Module-public so the projection layer can reuse it.
-ASSISTANT_ERROR_FALLBACK_RE = re.compile(
+# Assistant failure messages such as "Calendar fetch failed", "Email query
+# unavailable", and "Drive errored" poison future retrieval if they enter
+# ``memory_log``. The retriever can surface them as authoritative evidence of
+# failure even after the capability is succeeding again, so filter them at both
+# the write and retrieval sites. Deliberately tight: "no events found" can be a
+# legitimate result and must not match.
+_ASSISTANT_FAILURE_MESSAGE_RE = re.compile(
     r"^(calendar|email|drive|memory|inbox)\s*"
     r"(fetch|query|search|request)?\s*(failed|unavailable|errored)\b"
     r"|re-link in settings",
@@ -271,14 +264,8 @@ ASSISTANT_ERROR_FALLBACK_RE = re.compile(
 )
 
 
-def is_assistant_error_fallback(content: str) -> bool:
-    """True iff ``content`` matches the error-fallback vocabulary.
-
-    See ``ASSISTANT_ERROR_FALLBACK_RE`` for the rationale. Used at both the
-    write site (``append_log_event``) and the retrieval site (``search_memory``)
-    so the same vocabulary is filtered on both sides.
-    """
-    return ASSISTANT_ERROR_FALLBACK_RE.search(content) is not None
+def _is_assistant_failure_message(content: str) -> bool:
+    return _ASSISTANT_FAILURE_MESSAGE_RE.search(content) is not None
 
 
 def append_log_event(
@@ -300,11 +287,10 @@ def append_log_event(
     failure) inserts with ``embedding=None`` (null = pending, to be backfilled).
 
     Returns ``None`` when the row is skipped by an inbound filter — currently
-    only ``assistant_message`` rows whose content matches
-    ``ASSISTANT_ERROR_FALLBACK_RE`` (error-fallback prose the agent emits
-    when stuck; see the regex docstring for why these poison the log).
+    only ``assistant_message`` rows whose content matches the assistant-failure
+    vocabulary above.
     """
-    if kind == "assistant_message" and is_assistant_error_fallback(content):
+    if kind == "assistant_message" and _is_assistant_failure_message(content):
         return None
 
     try:
@@ -480,12 +466,11 @@ def search_memory(
     (transport order — the model ranks, code does not).
 
     Skips ``assistant_message`` log rows whose content matches the
-    error-fallback vocabulary (``is_assistant_error_fallback``).  The same
-    filter applies at the write site (``append_log_event``); the retrieval-side
-    filter handles legacy rows that pre-date the write-site filter and which
-    ``memory_log``'s append-only trigger keeps us from deleting.  Filter-
-    after-LIMIT: the cap is honoured as a cap, no overfetching, and surfacing
-    fewer hits is more honest to the model than padding with noise.
+    assistant-failure vocabulary. The same filter applies at the write site
+    (``append_log_event``); the retrieval-side filter also protects rows already
+    present in the append-only log. Filter-after-LIMIT: the cap is honoured as a
+    cap, no overfetching, and surfacing fewer hits is more honest to the model
+    than padding with noise.
 
     Returns ``[{"id", "layer", "kind", "created_at", "snippet", "taint"}, ...]``.
     ``"kind"`` is ``None`` for note-layer hits.
@@ -505,7 +490,7 @@ def search_memory(
         if kinds is not None:
             stmt = stmt.where(MemoryLogRecord.kind.in_(kinds))
         for row in db.scalars(stmt.order_by(MemoryLogRecord.created_at.desc()).limit(limit)).all():
-            if row.kind == "assistant_message" and is_assistant_error_fallback(row.content):
+            if row.kind == "assistant_message" and _is_assistant_failure_message(row.content):
                 continue
             hits[row.id] = {
                 "id": row.id,
@@ -527,7 +512,7 @@ def search_memory(
                 vec_stmt = vec_stmt.where(MemoryLogRecord.kind.in_(kinds))
             distance = MemoryLogRecord.embedding.cosine_distance(query_embedding)
             for row in db.scalars(vec_stmt.order_by(distance.asc()).limit(limit)).all():
-                if row.kind == "assistant_message" and is_assistant_error_fallback(row.content):
+                if row.kind == "assistant_message" and _is_assistant_failure_message(row.content):
                     continue
                 if row.id not in hits:
                     hits[row.id] = {
@@ -592,7 +577,7 @@ def _utcnow() -> datetime:
 
 
 # ---------------------------------------------------------------------------
-# The retriever — run_agent_loop in investigation/memories/lite config
+# The retriever — memory_recall loop driver
 # ---------------------------------------------------------------------------
 
 
@@ -618,9 +603,9 @@ def run_retriever(
 ) -> dict[str, Any]:
     """Run the retriever and return a ``recall_v1`` dict.
 
-    Fires the shared loop in ``investigation``/``memories``/``lite``
-    configuration.  The retriever builds its own input items — context
-    firewall: its rounds never enter the main agent's context.  On any
+    Runs the shared loop as the retriever driver. The retriever builds
+    its own input items — context firewall: its rounds never enter the main
+    agent's context. On any
     failure (budget, model error, contract violation) returns a minimal
     partial dict rather than raising; recall failure is non-fatal.
     """
@@ -658,7 +643,7 @@ def run_retriever(
         prompt_version=RETRIEVER_PROMPT_VERSION,
         budget_seconds=float(settings.memory_recall_budget_seconds),
         max_model_calls=int(settings.agent_loop_max_model_calls),
-        is_research_run=True,
+        is_main_agent_loop=False,
         record_judgments=True,
         judgment_type="memory_recall",
         retry_on_model_error=False,
@@ -676,7 +661,7 @@ def run_retriever(
         emit_value_nudge=(
             "Values emitted. Continue with one run call; finish by calling agent.emit_finding."
         ),
-        fallback_nudge=(
+        no_terminal_output_nudge=(
             "Program completed without a finding. Continue with one run call; "
             "finish by calling agent.emit_finding."
         ),
@@ -727,7 +712,7 @@ def run_retriever(
 
 
 # ---------------------------------------------------------------------------
-# The rememberer — run_agent_loop in rememberer/encode|dream config
+# The rememberer — memory_encode/memory_dream loop driver
 # ---------------------------------------------------------------------------
 
 
@@ -754,7 +739,7 @@ def run_rememberer(
     """Run the rememberer (encode or dream) as a background task.
 
     Builds its own ``TurnRecord`` (kind ``memory_encode`` or ``memory_dream``),
-    calls ``run_agent_loop`` in the rememberer configuration, and returns
+    calls ``run_agent_loop`` as the rememberer driver, and returns
     ``None``.  The loop applies note mutations via ``memory.note.*`` syscalls
     (which call ``create_note`` / ``edit_note`` / ``delete_note`` above, which
     also log the events).  Never raises.
@@ -840,7 +825,7 @@ def run_rememberer(
         prompt_version=prompt_version,
         budget_seconds=budget,
         max_model_calls=int(settings.agent_loop_max_model_calls),
-        is_research_run=True,
+        is_main_agent_loop=False,
         record_judgments=True,
         judgment_type=judgment_type,
         retry_on_model_error=False,
@@ -858,7 +843,7 @@ def run_rememberer(
         emit_value_nudge=(
             "Values emitted. Continue with one run call; finish by calling agent.emit_done."
         ),
-        fallback_nudge=(
+        no_terminal_output_nudge=(
             "Program completed without finishing. Continue with one run call; "
             "finish by calling agent.emit_done."
         ),

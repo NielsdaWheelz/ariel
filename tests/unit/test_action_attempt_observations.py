@@ -34,12 +34,7 @@ _NOW = datetime(2026, 5, 20, 12, 0, tzinfo=UTC)
 
 
 def _fat_calendar_event() -> dict[str, Any]:
-    """A realistic ``cap.calendar.list`` event payload that overflows 4KB.
-
-    Mirrors the structure of the production smoke that surfaced this bug: 38
-    attendees, description_blocks, conference_data, raw_payload_digest. The
-    event is 8KB+ encoded; the projection must drop it to <2KB.
-    """
+    """Return a calendar event large enough to exercise projection behavior."""
     attendees = [
         {
             "email": f"attendee{i}@example.com",

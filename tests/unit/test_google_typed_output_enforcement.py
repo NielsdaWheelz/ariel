@@ -167,40 +167,6 @@ def _calendar_event() -> dict[str, Any]:
 
 
 @pytest.mark.parametrize(
-    "capability_id",
-    [
-        "cap.calendar.list",
-        "cap.calendar.propose_slots",
-        "cap.calendar.create_event",
-        "cap.calendar.update_event",
-        "cap.calendar.respond_to_event",
-        "cap.email.search",
-        "cap.email.read",
-        "cap.drive.search",
-        "cap.drive.read",
-    ],
-)
-def test_google_cutover_read_outputs_reject_legacy_results_shape(capability_id: str) -> None:
-    status, output, error = _execute(
-        capability_id,
-        {
-            "results": [
-                {
-                    "title": "legacy result",
-                    "source": "google://legacy",
-                    "snippet": "old output shape",
-                }
-            ],
-            "retrieved_at": "2026-03-03T12:00:00Z",
-        },
-    )
-
-    assert status == "failed"
-    assert output is None
-    assert error == "invalid_provider_output"
-
-
-@pytest.mark.parametrize(
     ("capability_id", "typed_output"),
     [
         (
@@ -382,7 +348,7 @@ def test_google_cutover_read_outputs_reject_legacy_results_shape(capability_id: 
         ),
     ],
 )
-def test_google_cutover_read_outputs_accept_typed_shapes(
+def test_google_read_outputs_accept_typed_shapes(
     capability_id: str,
     typed_output: dict[str, Any],
 ) -> None:
@@ -393,7 +359,7 @@ def test_google_cutover_read_outputs_accept_typed_shapes(
     assert error is None
 
 
-def test_google_cutover_gmail_search_accepts_message_refs_that_need_read() -> None:
+def test_gmail_search_accepts_message_refs_that_need_read() -> None:
     status, output, error = _execute(
         "cap.email.search",
         {
@@ -426,7 +392,7 @@ def test_google_cutover_gmail_search_accepts_message_refs_that_need_read() -> No
     assert error is None
 
 
-def test_google_cutover_gmail_search_rejects_thin_message_refs() -> None:
+def test_gmail_search_rejects_thin_message_refs() -> None:
     status, output, error = _execute(
         "cap.email.search",
         {
@@ -448,7 +414,7 @@ def test_google_cutover_gmail_search_rejects_thin_message_refs() -> None:
     assert error == "invalid_provider_output"
 
 
-def test_google_cutover_gmail_read_rejects_unbounded_message_body_fields() -> None:
+def test_gmail_read_rejects_unbounded_message_body_fields() -> None:
     status, output, error = _execute(
         "cap.email.read",
         {
@@ -484,7 +450,7 @@ def test_google_cutover_gmail_read_rejects_unbounded_message_body_fields() -> No
     assert error == "invalid_provider_output"
 
 
-def test_google_cutover_gmail_read_rejects_unknown_raw_body_fields() -> None:
+def test_gmail_read_rejects_unknown_raw_body_fields() -> None:
     status, output, error = _execute(
         "cap.email.read",
         {
@@ -520,7 +486,7 @@ def test_google_cutover_gmail_read_rejects_unknown_raw_body_fields() -> None:
     assert error == "invalid_provider_output"
 
 
-def test_google_cutover_invalid_non_ok_gmail_read_returns_no_provider_payload() -> None:
+def test_invalid_non_ok_gmail_read_returns_no_provider_payload() -> None:
     status, output, error = _execute(
         "cap.email.read",
         {
@@ -553,7 +519,7 @@ def test_google_cutover_invalid_non_ok_gmail_read_returns_no_provider_payload() 
     assert error == "invalid_provider_output"
 
 
-def test_google_cutover_calendar_list_rejects_raw_description_fields() -> None:
+def test_calendar_list_rejects_raw_description_fields() -> None:
     event = _calendar_event()
     event["raw_description"] = "private calendar description"
 
@@ -564,7 +530,7 @@ def test_google_cutover_calendar_list_rejects_raw_description_fields() -> None:
     assert error == "invalid_provider_output"
 
 
-def test_google_cutover_calendar_list_rejects_unbounded_description_blocks() -> None:
+def test_calendar_list_rejects_unbounded_description_blocks() -> None:
     event = _calendar_event()
     event["description_blocks"] = [
         {
@@ -585,7 +551,7 @@ def test_google_cutover_calendar_list_rejects_unbounded_description_blocks() -> 
     assert error == "invalid_provider_output"
 
 
-def test_google_cutover_gmail_read_accepts_typed_non_ok_body_read() -> None:
+def test_gmail_read_accepts_typed_non_ok_body_read() -> None:
     status, output, error = _execute(
         "cap.email.read",
         {
@@ -624,7 +590,7 @@ def test_google_cutover_gmail_read_accepts_typed_non_ok_body_read() -> None:
         ({"message_id": "msg_1", "thread_id": "thr_1"}, "other_thr"),
     ],
 )
-def test_google_cutover_gmail_read_requires_message_thread_id(
+def test_gmail_read_requires_message_thread_id(
     message: dict[str, Any],
     evidence_thread_id: str | None,
 ) -> None:
@@ -662,7 +628,7 @@ def test_google_cutover_gmail_read_requires_message_thread_id(
     assert error == "invalid_provider_output"
 
 
-def test_google_cutover_gmail_read_accepts_thread_evidence_shape() -> None:
+def test_gmail_read_accepts_thread_evidence_shape() -> None:
     status, output, error = _execute(
         "cap.email.read",
         {
@@ -746,7 +712,7 @@ def test_google_cutover_gmail_read_accepts_thread_evidence_shape() -> None:
         },
     ],
 )
-def test_google_cutover_gmail_read_requires_persistable_body_evidence(
+def test_gmail_read_requires_persistable_body_evidence(
     evidence: dict[str, Any],
 ) -> None:
     status, output, error = _execute(
@@ -789,7 +755,7 @@ def test_google_cutover_gmail_read_requires_persistable_body_evidence(
         ],
     ],
 )
-def test_google_cutover_gmail_read_rejects_unbounded_evidence_blocks(
+def test_gmail_read_rejects_unbounded_evidence_blocks(
     blocks: list[dict[str, Any]],
 ) -> None:
     status, output, error = _execute(

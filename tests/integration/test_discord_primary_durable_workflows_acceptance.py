@@ -12,7 +12,8 @@ from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import text
 
-from ariel.app import ModelAdapter, create_app
+from ariel.app import ModelAdapter
+from tests.integration.app_helpers import create_migrated_app
 from tests.integration.responses_helpers import (
     empty_recall_response,
     is_memory_subsystem_call,
@@ -68,10 +69,9 @@ class FrozenClock:
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
-    app = create_app(
+    app = create_migrated_app(
         database_url=postgres_url,
         model_adapter=adapter,
-        reset_database=True,
         sandbox=FakeSandboxRuntime(),
     )
     return TestClient(app)
@@ -122,7 +122,7 @@ def test_agency_event_ingress_is_signed_idempotent_and_rejects_conflicts(
         "event_id": "agency-event-001",
         "event_type": "job.completed",
         "external_job_id": "agency-job-001",
-        "title": "Discord-primary cutover",
+        "title": "Discord primary workflow",
         "summary": "Implementation finished.",
         "payload": {"branch": "main"},
     }
@@ -233,7 +233,7 @@ def test_google_provider_event_ingress_is_token_bound_deduped_and_conflict_safe(
                 task_type = db.execute(
                     text(
                         "SELECT task_type FROM background_tasks "
-                        "WHERE task_type NOT IN ('memory_sweep', "
+                        "WHERE task_type NOT IN ('memory_dream', "
                         "'provider_watch_renew_due', 'provider_reconcile_sync_due') "
                         "ORDER BY created_at DESC LIMIT 1"
                     )
@@ -422,11 +422,5 @@ def test_google_calendar_sync_persists_provider_evidence_without_ambient_case(
                     .mappings()
                     .all()
                 )
-                # The calendar sync found new data, so it wakes the agent;
-                # there is no commitment-extraction or ambient pipeline task.
+                # The calendar sync found new data, so it wakes the agent.
                 assert any(task["task_type"] == "agent_wake" for task in pending_tasks)
-                assert all(
-                    task["task_type"]
-                    not in {"workspace_commitment_extraction_due", "ambient_interpretation_due"}
-                    for task in pending_tasks
-                )

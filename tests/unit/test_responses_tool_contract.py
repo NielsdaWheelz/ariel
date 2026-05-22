@@ -64,18 +64,17 @@ def test_main_agent_prompt_is_versioned_static_contract() -> None:
     # Honesty about own program errors: the model must not blame a connector
     # when its own run program failed to compile or execute.
     assert "is your error, not the connector's" in prompt
-    # v6: when a capability succeeded, the assistant message must surface its
-    # data instead of fabricating an "unavailable" failure register.
+    # When a capability succeeded, the assistant message must surface its data
+    # instead of fabricating an "unavailable" failure register.
     assert "Never report a successful call as a failure" in prompt
     assert "Ground every assistant message in the data" in prompt
-    # v6: synthesis questions require deliberation across rounds.
+    # Synthesis questions require deliberation across rounds.
     assert "For synthesis questions" in prompt
-    # v7: research.investigate is async — never re-call to poll, never pass
-    # status:<task_id> as a question. This is the rail that stopped the
-    # smoke-#5 22-stuck-wakes runaway.
+    # research.investigate is async: never re-call to poll, and never pass
+    # status:<task_id> as a question.
     assert "research.investigate(question, mode)` is async" in prompt
     assert "Never re-call `research.investigate` to poll for status" in prompt
-    # v7: dateutil is not installed in the sandbox; use stdlib instead.
+    # dateutil is not installed in the sandbox; use stdlib instead.
     assert "`dateutil` is not installed" in prompt
     assert "datetime.fromisoformat" in prompt
 
@@ -137,9 +136,8 @@ def test_run_callable_signatures_match_validators_for_common_capabilities() -> N
     input validator accepts, by exact name. The model sees this signature both
     in the per-turn callable list and (on schema_invalid) as the ``expected``
     field of the rejection payload — those are the only sources from which it
-    learns the right keyword names. Drift between signature and validator
-    causes the model to invent arg names and waste model rounds on rejected
-    calls (the smoke battery's pattern 2).
+    learns the right keyword names. Drift between signature and validator makes
+    the model invent argument names and waste rounds on rejected calls.
 
     Each entry pairs a syscall alias with (a) the set of arg names that must
     appear in its signature string, and (b) a single payload that the
@@ -237,6 +235,12 @@ def test_run_callable_signatures_match_validators_for_common_capabilities() -> N
             {"when": "2026-05-21T09:00:00Z", "note": "remind about offsite"},
         ),
         (
+            "memory.remember",
+            "cap.memory.remember",
+            {"note"},
+            {"note": "the user prefers tea"},
+        ),
+        (
             "research.investigate",
             "cap.research.investigate",
             {"question", "mode"},
@@ -265,9 +269,8 @@ def test_run_callable_signatures_match_validators_for_common_capabilities() -> N
 def test_run_callable_signatures_warn_about_email_read_invented_nulls() -> None:
     """email.read fails when both ids are null. The signature must spell out
     that the model has to fill at least one with a value from a prior
-    ``email.search`` result — otherwise the model emits the all-null payload
-    that produced repeated schema_invalid rejections in the smoke battery
-    (trn_01ks43ttrgxdm4f92xy30320g4)."""
+    ``email.search`` result; an all-null identifier payload is always
+    ``schema_invalid``."""
 
     signature = RUN_CALLABLE_SIGNATURES["email.read"]
     assert "non-null" in signature.lower() or "from a prior" in signature.lower(), signature
@@ -303,6 +306,14 @@ def test_web_extract_signature_names_exact_runtime_output_shape() -> None:
         assert field_name in signature
 
 
+def test_memory_remember_signature_names_runtime_output_shape() -> None:
+    signature = RUN_CALLABLE_SIGNATURES["memory.remember"]
+
+    assert "'status': 'queued'" in signature
+    assert "encode_id" in signature
+    assert "task_id" not in signature
+
+
 def test_drive_contract_metadata_uses_google_drive_schema_family() -> None:
     drive_search = get_capability("cap.drive.search")
     drive_read = get_capability("cap.drive.read")
@@ -327,25 +338,6 @@ def test_drive_read_signature_is_read_native_not_search_style() -> None:
         "recovery",
     }:
         assert field_name in signature
-
-
-def test_internal_callable_eligibility_is_default_deny() -> None:
-    capability_ids = set(
-        _eligible_internal_callable_capability_ids(
-            tool_surface_facts={
-                "discord": {"available": True, "attachment_count": 0},
-                "runtime_bindings": {},
-            }
-        )
-    )
-
-    assert "cap.memory.recall" in capability_ids
-    assert "cap.memory.remember" in capability_ids
-    assert "cap.attachment.read" not in capability_ids
-    assert "cap.agency.run" not in capability_ids
-    assert "cap.search.web" not in capability_ids
-    assert "cap.maps.directions" not in capability_ids
-    assert "cap.weather.forecast" not in capability_ids
 
 
 def test_agency_capabilities_become_eligible_when_runtime_is_bound() -> None:

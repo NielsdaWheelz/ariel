@@ -46,6 +46,7 @@ REQUIRED_TABLES: Final[tuple[str, ...]] = (
     "provider_evidence",
     "provider_evidence_blocks",
     "provider_write_receipts",
+    "subscriber_heartbeat",
     "background_tasks",
     "agency_events",
     "jobs",
@@ -127,9 +128,45 @@ REQUIRED_COLUMNS: Final[dict[str, tuple[str, ...]]] = {
         "created_at",
         "updated_at",
     ),
+    "provider_events": (
+        "id",
+        "provider",
+        "resource_type",
+        "resource_id",
+        "external_event_id",
+        "dedupe_key",
+        "event_type",
+        "headers",
+        "payload",
+        "status",
+        "created_at",
+        "received_at",
+    ),
+    "subscriber_heartbeat": (
+        "id",
+        "subscriber_name",
+        "last_seen_at",
+        "last_message_at",
+        "in_flight_count",
+        "errors_in_window",
+        "last_error_code",
+        "last_error_at",
+        "created_at",
+        "updated_at",
+    ),
     "jobs": (
         "agency_sandbox_policy",
         "agency_egress_policy",
+    ),
+    "agency_events": (
+        "id",
+        "source",
+        "external_event_id",
+        "event_type",
+        "payload",
+        "status",
+        "created_at",
+        "received_at",
     ),
     "action_private_payloads": (
         "payload_kind",
@@ -160,6 +197,16 @@ REQUIRED_COLUMNS: Final[dict[str, tuple[str, ...]]] = {
     ),
 }
 
+REQUIRED_PRIMARY_KEYS: Final[dict[str, tuple[str, ...]]] = {
+    "subscriber_heartbeat": ("id",),
+}
+
+REQUIRED_UNIQUE_CONSTRAINTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
+    "subscriber_heartbeat": {
+        "uq_subscriber_heartbeat_subscriber_name": ("subscriber_name",),
+    },
+}
+
 REQUIRED_CONSTRAINTS: Final[dict[str, tuple[str, ...]]] = {
     "sessions": (
         "ck_session_rotation_reason",
@@ -167,6 +214,7 @@ REQUIRED_CONSTRAINTS: Final[dict[str, tuple[str, ...]]] = {
         "ck_session_lifecycle_matches_is_active",
         "ck_session_rotation_fields_paired",
     ),
+    "session_rotations": ("ck_session_rotation_reason_type",),
     "ai_judgments": (
         "ck_ai_judgment_type",
         "ck_ai_judgment_status",
@@ -207,6 +255,10 @@ REQUIRED_CONSTRAINTS: Final[dict[str, tuple[str, ...]]] = {
         "ck_provider_write_receipt_undo_fields_paired",
         "ck_provider_write_receipt_succeeded_mutation_has_undo",
     ),
+    "subscriber_heartbeat": (
+        "ck_subscriber_heartbeat_in_flight_count_nonnegative",
+        "ck_subscriber_heartbeat_errors_in_window_nonnegative",
+    ),
     "jobs": (
         "ck_jobs_agency_sandbox_policy_object",
         "ck_jobs_agency_egress_policy_object",
@@ -224,10 +276,21 @@ REQUIRED_CONSTRAINTS: Final[dict[str, tuple[str, ...]]] = {
 
 REQUIRED_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
     "sessions": {
-        "ck_session_rotation_reason": ("'threshold_context_pressure'",),
+        "ck_session_rotation_reason": (
+            "'user_initiated'",
+            "'threshold_turn_count'",
+            "'threshold_age'",
+        ),
         "ck_session_lifecycle_state": ("'active'", "'rotating'", "'recovery_needed'"),
         "ck_session_lifecycle_matches_is_active": ("is_active", "lifecycle_state"),
         "ck_session_rotation_fields_paired": ("rotation_reason", "rotated_from_session_id"),
+    },
+    "session_rotations": {
+        "ck_session_rotation_reason_type": (
+            "'user_initiated'",
+            "'threshold_turn_count'",
+            "'threshold_age'",
+        ),
     },
     "ai_judgments": {
         "ck_ai_judgment_type": (
@@ -281,6 +344,18 @@ REQUIRED_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
             "undo_token_hash IS NOT NULL",
         ),
     },
+    "subscriber_heartbeat": {
+        "ck_subscriber_heartbeat_in_flight_count_nonnegative": (
+            "in_flight_count",
+            ">=",
+            "0",
+        ),
+        "ck_subscriber_heartbeat_errors_in_window_nonnegative": (
+            "errors_in_window",
+            ">=",
+            "0",
+        ),
+    },
     "jobs": {
         "ck_jobs_agency_sandbox_policy_object": ("jsonb_typeof", "agency_sandbox_policy"),
         "ck_jobs_agency_egress_policy_object": ("jsonb_typeof", "agency_egress_policy"),
@@ -329,6 +404,12 @@ REQUIRED_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
 }
 
 FORBIDDEN_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
+    "sessions": {
+        "ck_session_rotation_reason": ("'threshold_context_pressure'",),
+    },
+    "session_rotations": {
+        "ck_session_rotation_reason_type": ("'threshold_context_pressure'",),
+    },
     "ai_judgments": {
         "ck_ai_judgment_type": (
             "'tool_strategy'",
@@ -521,38 +602,53 @@ def run_migrations(database_url: str, *, revision: str = "head") -> None:
     command.upgrade(_alembic_config(database_url), revision)
 
 
-def reset_schema_for_tests(engine: Engine, database_url: str) -> None:
-    if engine.dialect.name != "postgresql":
-        msg = "test schema reset only supports postgresql"
-        raise RuntimeError(msg)
-    with engine.begin() as connection:
-        connection.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
-        connection.execute(text("CREATE SCHEMA public"))
-    run_migrations(database_url)
-
-
-def missing_required_tables(engine: Engine) -> list[str]:
+def schema_readiness_issues(engine: Engine) -> list[str]:
     inspector = inspect(engine)
-    missing = [
+    issues = [
         f"missing_table:{table_name}"
         for table_name in REQUIRED_TABLES
         if not inspector.has_table(table_name)
     ]
-    if missing:
-        return missing
+    if issues:
+        return issues
 
     with engine.connect() as connection:
         current_revision = connection.execute(text("SELECT version_num FROM alembic_version"))
         current_revisions = {str(row[0]) for row in current_revision}
     heads = set(ScriptDirectory.from_config(_alembic_config(str(engine.url))).get_heads())
     for head in sorted(heads - current_revisions):
-        missing.append(f"missing_alembic_head:{head}")
+        issues.append(f"missing_alembic_head:{head}")
 
     for table_name, column_names in REQUIRED_COLUMNS.items():
         existing_columns = {column["name"] for column in inspector.get_columns(table_name)}
         for column_name in column_names:
             if column_name not in existing_columns:
-                missing.append(f"missing_column:{table_name}.{column_name}")
+                issues.append(f"missing_column:{table_name}.{column_name}")
+
+    for table_name, primary_key_columns in REQUIRED_PRIMARY_KEYS.items():
+        reflected_primary_key = inspector.get_pk_constraint(table_name)
+        existing_primary_key = tuple(
+            str(column_name)
+            for column_name in reflected_primary_key.get("constrained_columns") or ()
+        )
+        if existing_primary_key != primary_key_columns:
+            issues.append(f"wrong_primary_key:{table_name}")
+
+    for table_name, unique_constraints in REQUIRED_UNIQUE_CONSTRAINTS.items():
+        existing_unique_constraints = {
+            str(constraint["name"]): tuple(
+                str(column_name) for column_name in constraint.get("column_names") or ()
+            )
+            for constraint in inspector.get_unique_constraints(table_name)
+            if isinstance(constraint.get("name"), str)
+        }
+        for constraint_name, expected_columns in unique_constraints.items():
+            actual_columns = existing_unique_constraints.get(constraint_name)
+            if actual_columns is None:
+                issues.append(f"missing_unique_constraint:{table_name}.{constraint_name}")
+                continue
+            if actual_columns != expected_columns:
+                issues.append(f"wrong_unique_constraint:{table_name}.{constraint_name}")
 
     for table_name, constraint_names in REQUIRED_CONSTRAINTS.items():
         existing_constraints = {
@@ -562,7 +658,7 @@ def missing_required_tables(engine: Engine) -> list[str]:
         }
         for constraint_name in constraint_names:
             if constraint_name not in existing_constraints:
-                missing.append(f"missing_constraint:{table_name}.{constraint_name}")
+                issues.append(f"missing_constraint:{table_name}.{constraint_name}")
                 continue
             sql_text = existing_constraints[constraint_name]
             for fragment in REQUIRED_CHECK_SQL_FRAGMENTS.get(table_name, {}).get(
@@ -570,14 +666,14 @@ def missing_required_tables(engine: Engine) -> list[str]:
                 (),
             ):
                 if fragment not in sql_text:
-                    missing.append(f"missing_constraint_fragment:{table_name}.{constraint_name}")
+                    issues.append(f"missing_constraint_fragment:{table_name}.{constraint_name}")
                     break
             for fragment in FORBIDDEN_CHECK_SQL_FRAGMENTS.get(table_name, {}).get(
                 constraint_name,
                 (),
             ):
                 if fragment in sql_text:
-                    missing.append(f"forbidden_constraint_fragment:{table_name}.{constraint_name}")
+                    issues.append(f"forbidden_constraint_fragment:{table_name}.{constraint_name}")
                     break
 
     for table_name, foreign_keys in REQUIRED_FOREIGN_KEYS.items():
@@ -593,10 +689,10 @@ def missing_required_tables(engine: Engine) -> list[str]:
             expected_table, expected_ondelete = expected
             existing_foreign_key = existing_foreign_keys.get(column_name)
             if existing_foreign_key is None:
-                missing.append(f"missing_foreign_key:{table_name}.{column_name}")
+                issues.append(f"missing_foreign_key:{table_name}.{column_name}")
                 continue
             if existing_foreign_key.get("referred_table") != expected_table:
-                missing.append(f"wrong_foreign_key_table:{table_name}.{column_name}")
+                issues.append(f"wrong_foreign_key_table:{table_name}.{column_name}")
             options = existing_foreign_key.get("options")
             actual_ondelete = (
                 str(options.get("ondelete")).upper()
@@ -604,7 +700,7 @@ def missing_required_tables(engine: Engine) -> list[str]:
                 else ""
             )
             if actual_ondelete != expected_ondelete:
-                missing.append(f"wrong_foreign_key_ondelete:{table_name}.{column_name}")
+                issues.append(f"wrong_foreign_key_ondelete:{table_name}.{column_name}")
 
     for table_name, index_names in REQUIRED_INDEXES.items():
         existing_indexes = {
@@ -614,11 +710,11 @@ def missing_required_tables(engine: Engine) -> list[str]:
         }
         for index_name in index_names:
             if index_name not in existing_indexes:
-                missing.append(f"missing_index:{table_name}.{index_name}")
+                issues.append(f"missing_index:{table_name}.{index_name}")
                 continue
             if index_name in REQUIRED_UNIQUE_INDEXES.get(table_name, ()):
                 if existing_indexes[index_name].get("unique") is not True:
-                    missing.append(f"missing_unique_index:{table_name}.{index_name}")
+                    issues.append(f"missing_unique_index:{table_name}.{index_name}")
             expected_columns = REQUIRED_INDEX_COLUMNS.get(table_name, {}).get(index_name)
             if expected_columns is not None:
                 actual_columns = tuple(
@@ -626,23 +722,23 @@ def missing_required_tables(engine: Engine) -> list[str]:
                     for column_name in existing_indexes[index_name].get("column_names") or ()
                 )
                 if actual_columns != expected_columns:
-                    missing.append(f"missing_index_columns:{table_name}.{index_name}")
+                    issues.append(f"missing_index_columns:{table_name}.{index_name}")
             dialect_options = existing_indexes[index_name].get("dialect_options")
             dialect_text = str(dialect_options or "")
             for fragment in REQUIRED_INDEX_SQL_FRAGMENTS.get(table_name, {}).get(index_name, ()):
                 if fragment not in dialect_text:
-                    missing.append(f"missing_index_fragment:{table_name}.{index_name}")
+                    issues.append(f"missing_index_fragment:{table_name}.{index_name}")
                     break
 
-    return missing
+    return issues
 
 
 class SchemaReadinessProbe:
     """TTL-cached schema readiness check shared by /v1/health and every protected handler.
 
-    Re-runs `missing_required_tables(engine)` at most once per `ttl_seconds` so a
+    Re-runs `schema_readiness_issues(engine)` at most once per `ttl_seconds` so a
     burst of health checks does not slam the DB inspector, while a post-startup
-    migration becomes visible within the TTL window. Lock-coalesces concurrent
+    schema repair becomes visible within the TTL window. Lock-coalesces concurrent
     re-checks so only one thread reflects against the DB at a time."""
 
     def __init__(
@@ -658,35 +754,35 @@ class SchemaReadinessProbe:
         self._ttl_seconds = float(ttl_seconds)
         self._clock = clock if clock is not None else time.monotonic
         self._lock = threading.Lock()
-        self._cached_missing: list[str] | None = None
+        self._cached_issues: list[str] | None = None
         self._cached_at: float | None = None
 
-    def missing_tables(self) -> list[str]:
+    def schema_issues(self) -> list[str]:
         now = self._clock()
-        cached_missing = self._cached_missing
+        cached_issues = self._cached_issues
         cached_at = self._cached_at
         if (
-            cached_missing is not None
+            cached_issues is not None
             and cached_at is not None
             and (now - cached_at) < self._ttl_seconds
         ):
-            return list(cached_missing)
+            return list(cached_issues)
         with self._lock:
             now = self._clock()
-            cached_missing = self._cached_missing
+            cached_issues = self._cached_issues
             cached_at = self._cached_at
             if (
-                cached_missing is not None
+                cached_issues is not None
                 and cached_at is not None
                 and (now - cached_at) < self._ttl_seconds
             ):
-                return list(cached_missing)
-            fresh = missing_required_tables(self._engine)
-            self._cached_missing = list(fresh)
+                return list(cached_issues)
+            fresh = schema_readiness_issues(self._engine)
+            self._cached_issues = list(fresh)
             self._cached_at = self._clock()
             return list(fresh)
 
     def invalidate(self) -> None:
         with self._lock:
-            self._cached_missing = None
+            self._cached_issues = None
             self._cached_at = None

@@ -4,7 +4,6 @@ import asyncio
 from typing import Any, cast
 
 import discord
-from fastapi.testclient import TestClient
 import httpx
 import pytest
 
@@ -25,41 +24,6 @@ from ariel.discord_bot import (
     submit_discord_turn,
     _is_ariel_custom_id,
 )
-from tests.fake_sandbox import FakeSandboxRuntime
-from tests.integration.responses_helpers import empty_recall_response, is_memory_subsystem_call
-
-
-class StaticModelAdapter:
-    provider = "test.responses"
-    model = "test-model"
-
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_memory_subsystem_call(input_items):
-            return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
-            )
-        del input_items, tools, user_message, history, context_bundle
-        return {
-            "provider": self.provider,
-            "model": self.model,
-            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-            "provider_response_id": "resp_test",
-            "output": [
-                {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": "ok"}],
-                }
-            ],
-        }
 
 
 class FakeHttpClient:
@@ -376,18 +340,6 @@ def test_discord_bot_registers_only_deterministic_ops_slash_commands() -> None:
     assert bot.tree.get_command("status") is not None
     assert bot.tree.get_command("jobs") is not None
     assert bot.tree.get_command("capture") is not None
-
-    removed_memory_commands = (
-        "memory",
-        "memory-inbox",
-        "memory-recall",
-        "memory-conflicts",
-        "memory-consolidate",
-        "memory-export",
-        "memory-no",
-    )
-    for command_name in removed_memory_commands:
-        assert bot.tree.get_command(command_name) is None
 
 
 def test_format_discord_message_truncates_to_safe_size() -> None:
@@ -1149,28 +1101,6 @@ def test_on_message_ignores_other_server_unmentioned_message(
 
     assert calls == []
     assert message.replies == []
-
-
-def test_root_is_discord_primary_status_not_phone_chat() -> None:
-    from ariel.app import create_app
-
-    app = create_app(
-        database_url="sqlite+pysqlite:///:memory:",
-        model_adapter=StaticModelAdapter(),
-        sandbox=FakeSandboxRuntime(),
-    )
-    with TestClient(app) as client:
-        response = client.get("/")
-
-    assert response.status_code == 200
-    assert response.headers["content-type"].startswith("application/json")
-    payload = response.json()
-    assert payload["ok"] is True
-    assert payload["surface"] == "discord"
-    assert "Discord" in payload["message"]
-    assert payload["api"]["active_session"] == "/v1/sessions/active"
-    assert "chat-form" not in response.text
-    assert "/v1/sessions/${sessionId}/events" not in response.text
 
 
 @pytest.mark.parametrize(

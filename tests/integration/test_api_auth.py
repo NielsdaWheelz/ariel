@@ -11,7 +11,7 @@ from typing import Any, cast
 from fastapi.testclient import TestClient
 import pytest
 
-from ariel.app import create_app
+from tests.integration.app_helpers import create_migrated_app
 from ariel.persistence import ProviderWatchChannelRecord
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.responses_helpers import empty_recall_response, is_memory_subsystem_call
@@ -48,10 +48,9 @@ def test_local_auth_guards_authority_routes(
     monkeypatch.setenv("ARIEL_LOCAL_AUTH_REQUIRED", "true")
     monkeypatch.setenv("ARIEL_LOCAL_AUTH_TOKEN", LOCAL_AUTH_TOKEN)
 
-    app = create_app(
+    app = create_migrated_app(
         database_url=postgres_url,
         model_adapter=NoModelAdapter(),
-        reset_database=True,
         sandbox=FakeSandboxRuntime(),
     )
     with TestClient(app) as client:
@@ -80,10 +79,9 @@ def test_provider_callback_auth_is_owned_by_provider_verification(
     monkeypatch.setenv("ARIEL_GOOGLE_PROVIDER_EVENT_TOKEN", "provider-token")
     monkeypatch.setenv("ARIEL_AGENCY_EVENT_SECRET", "agency-secret")
 
-    app = create_app(
+    app = create_migrated_app(
         database_url=postgres_url,
         model_adapter=NoModelAdapter(),
-        reset_database=True,
         sandbox=FakeSandboxRuntime(),
     )
     with TestClient(app) as client:

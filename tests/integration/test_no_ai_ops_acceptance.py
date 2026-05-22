@@ -7,7 +7,8 @@ from typing import Any, cast
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
-from ariel.app import ModelAdapter, create_app
+from ariel.app import ModelAdapter
+from tests.integration.app_helpers import create_migrated_app
 from ariel.persistence import JobRecord
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.responses_helpers import empty_recall_response, is_memory_subsystem_call
@@ -47,10 +48,9 @@ class CaptureStorageRow:
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
-    app = create_app(
+    app = create_migrated_app(
         database_url=postgres_url,
         model_adapter=adapter,
-        reset_database=True,
         sandbox=FakeSandboxRuntime(),
     )
     return TestClient(app)

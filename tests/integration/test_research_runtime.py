@@ -2,9 +2,9 @@
 
 These drive ``run_research`` directly with a fake model adapter and the
 ``FakeSandboxRuntime``, in the style of ``test_run_runtime_research_finding.py``
-and ``test_single_run_cutover.py``. They cover:
+and the normal-turn program-loop integration tests. They cover:
 
-- the complete path (``research.finding`` ends the run →
+- the complete path (``agent.emit_finding`` ends the run →
   ``ResearchFinding(status="complete", ...)``);
 - graceful non-convergence (stuck-detection and the model-call backstop end the
   run without a finding → ``ResearchFinding(status="partial", ...)``);
@@ -128,7 +128,7 @@ def _seed_session(session_factory: Any, session_id: str) -> None:
 
 
 def test_run_research_completed_returns_finding(session_factory: Any) -> None:
-    """A run whose program calls research.finding returns a complete finding."""
+    """A run whose program calls agent.emit_finding returns a complete finding."""
     _seed_session(session_factory, "ses_research_ok")
     sandbox = FakeSandboxRuntime()
     sandbox.start()
@@ -201,7 +201,7 @@ def test_run_research_persists_research_kind_turn(session_factory: Any) -> None:
 
 
 def test_run_research_continues_then_finishes(session_factory: Any) -> None:
-    """A run may emit values over rounds, then finish with research.finding."""
+    """A run may emit values over rounds, then finish with agent.emit_finding."""
     _seed_session(session_factory, "ses_research_multi")
     sandbox = FakeSandboxRuntime()
     sandbox.start()
@@ -336,9 +336,11 @@ def test_run_research_web_mode_exposes_only_web_capabilities(session_factory: An
 
     rendered = json.dumps(adapter.snapshots[0])
     # The web whitelist's run callables are advertised to the model.
-    assert "search.web" in rendered
-    assert "search.news" in rendered
-    assert "web.extract" in rendered
+    assert "- search.web(query: str)" in rendered
+    assert "- search.news(query: str)" in rendered
+    assert "- web.extract(url: str)" in rendered
+    assert "max_results" not in rendered
+    assert "topn" not in rendered
     # No personal-mode capability is advertised — the lethal-trifecta defense.
     assert "email.search" not in rendered
     assert "email.read" not in rendered
@@ -377,10 +379,45 @@ def test_run_research_personal_mode_exposes_only_personal_capabilities(
     assert "email.read" in rendered
     assert "drive.search" in rendered
     assert "drive.read" in rendered
-    assert "calendar.list" in rendered
+    assert "- calendar.list(window_start: str, window_end: str, calendar_id: str = 'primary')" in (
+        rendered
+    )
     # No web-mode capability is advertised — the lethal-trifecta defense.
     assert "search.web" not in rendered
     assert "web.extract" not in rendered
+
+
+def test_run_research_memories_mode_exposes_only_memory_capabilities(
+    session_factory: Any,
+) -> None:
+    """A memories run's eligible callables are the memory read capabilities."""
+    _seed_session(session_factory, "ses_research_memories")
+    sandbox = FakeSandboxRuntime()
+    sandbox.start()
+    settings = _settings()
+    adapter = SnapshotAdapter(
+        responses=[_program_response(source=_FINDING_PROGRAM, provider_response_id="rmemo1")]
+    )
+    with session_factory() as db:
+        run_research(
+            sandbox=sandbox,
+            db=db,
+            session_factory=session_factory,
+            settings=settings,
+            model_adapter=adapter,
+            google_runtime=build_google_runtime(settings),
+            session_id="ses_research_memories",
+            question="A memories-mode question.",
+            mode="memories",
+        )
+    sandbox.close()
+
+    rendered = json.dumps(adapter.snapshots[0])
+    assert "- memory.search(query: str" in rendered
+    assert "- memory.read(id: str)" in rendered
+    assert "search.web" not in rendered
+    assert "email.search" not in rendered
+    assert "calendar.list" not in rendered
 
 
 def test_run_research_web_mode_program_cannot_call_personal_capability(

@@ -13,7 +13,8 @@ from sqlalchemy import select
 import ariel.action_runtime as action_runtime_module
 import ariel.capability_registry as capability_registry_module
 import ariel.policy_engine as policy_engine_module
-from ariel.app import ModelAdapter, create_app
+from ariel.app import ModelAdapter
+from tests.integration.app_helpers import create_migrated_app
 from tests.integration.responses_helpers import (
     empty_recall_response,
     is_memory_subsystem_call,
@@ -31,8 +32,8 @@ from tests.fake_sandbox import FakeSandboxRuntime
 
 @dataclass
 class ActionRunAdapter:
-    provider: str = "provider.s7-pr01"
-    model: str = "model.s7-pr01-v1"
+    provider: str = "provider.web-extract"
+    model: str = "model.web-extract-v1"
     run_calls_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     assistant_text_by_message: dict[str, str] = field(default_factory=dict)
 
@@ -79,7 +80,7 @@ class ActionRunAdapter:
                 ),
                 provider=self.provider,
                 model=self.model,
-                provider_response_id="resp_s7_pr01_interpreter",
+                provider_response_id="resp_web_extract_interpreter",
                 input_tokens=47,
                 output_tokens=31,
             )
@@ -107,7 +108,7 @@ class ActionRunAdapter:
             calls=copy.deepcopy(run_calls),
             provider=self.provider,
             model=self.model,
-            provider_response_id="resp_s7_pr01_123",
+            provider_response_id="resp_web_extract_123",
             input_tokens=47,
             output_tokens=31,
         )
@@ -135,10 +136,9 @@ def _web_extract_provider_bound(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
-    app = create_app(
+    app = create_migrated_app(
         database_url=postgres_url,
         model_adapter=adapter,
-        reset_database=True,
         sandbox=FakeSandboxRuntime(),
     )
     return TestClient(app)
@@ -248,7 +248,7 @@ def _provider_payload(
     }
 
 
-def test_s7_pr01_capability_contract_registers_web_extract_as_allowlisted_read() -> None:
+def test_capability_contract_registers_web_extract_as_allowlisted_read() -> None:
     capability = registry_get_capability("cap.web.extract")
     assert capability is not None
     assert capability.impact_level == "read"
@@ -256,7 +256,7 @@ def test_s7_pr01_capability_contract_registers_web_extract_as_allowlisted_read()
     assert capability.allowed_egress_destinations
 
 
-def test_s7_pr01_web_extract_executes_inline_with_structured_output_citations_and_provenance(
+def test_web_extract_executes_inline_with_structured_output_citations_and_provenance(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -371,7 +371,7 @@ def test_s7_pr01_web_extract_executes_inline_with_structured_output_citations_an
         ("https://example.com:invalid-port/path", "url_invalid", "valid"),
     ],
 )
-def test_s7_pr01_url_safety_preflight_fails_closed_before_provider_dispatch(
+def test_url_safety_preflight_fails_closed_before_provider_dispatch(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
     input_url: str,
@@ -415,7 +415,7 @@ def test_s7_pr01_url_safety_preflight_fails_closed_before_provider_dispatch(
         ("undeclared", "egress_preflight_undeclared_intent"),
     ],
 )
-def test_s7_pr01_web_extract_egress_contract_failures_block_before_execute(
+def test_web_extract_egress_contract_failures_block_before_execute(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
     intent_case: str,
@@ -465,7 +465,7 @@ def test_s7_pr01_web_extract_egress_contract_failures_block_before_execute(
         assert execute_attempts == 0
 
 
-def test_s7_pr01_non_allowlisted_egress_is_blocked_before_web_extract_execution(
+def test_non_allowlisted_egress_is_blocked_before_web_extract_execution(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -513,7 +513,7 @@ def test_s7_pr01_non_allowlisted_egress_is_blocked_before_web_extract_execution(
         assert execute_attempts == 0
 
 
-def test_s7_pr01_transient_provider_failure_retries_are_bounded_and_single_outcome(
+def test_transient_provider_failure_retries_are_bounded_and_single_outcome(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -560,7 +560,7 @@ def test_s7_pr01_transient_provider_failure_retries_are_bounded_and_single_outco
         assert event_types.count("evt.action.execution.failed") == 0
 
 
-def test_s7_pr01_provider_retry_exhaustion_fails_once_with_typed_error(
+def test_provider_retry_exhaustion_fails_once_with_typed_error(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -610,7 +610,7 @@ def test_s7_pr01_provider_retry_exhaustion_fails_once_with_typed_error(
         ("invalid_payload", "provider_invalid_payload", "retry"),
     ],
 )
-def test_s7_pr01_typed_url_extraction_failures_are_actionable_and_auditable(
+def test_typed_url_extraction_failures_are_actionable_and_auditable(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
     failure_mode: str,
@@ -651,7 +651,7 @@ def test_s7_pr01_typed_url_extraction_failures_are_actionable_and_auditable(
         assert expected_hint in rendered_message
 
 
-def test_s7_pr01_provider_malformed_final_url_is_fail_closed(
+def test_provider_malformed_final_url_is_fail_closed(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -687,7 +687,7 @@ def test_s7_pr01_provider_malformed_final_url_is_fail_closed(
         assert "provider_invalid_payload" in turn_data["assistant_message"]
 
 
-def test_s7_pr01_public_ipv6_urls_remain_allowed_and_canonical(
+def test_public_ipv6_urls_remain_allowed_and_canonical(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -740,7 +740,7 @@ def test_s7_pr01_public_ipv6_urls_remain_allowed_and_canonical(
         assert outbound_urls == ["https://[2606:4700:4700::1111]/research/article"]
 
 
-def test_s7_pr01_large_pages_are_bounded_and_partial_disclosure_is_explicit(
+def test_large_pages_are_bounded_and_partial_disclosure_is_explicit(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -783,7 +783,7 @@ def test_s7_pr01_large_pages_are_bounded_and_partial_disclosure_is_explicit(
         assert "narrow" in message or "focus" in message
 
 
-def test_s7_pr01_web_extract_preserves_grounding_and_lifecycle_inspectability(
+def test_web_extract_preserves_grounding_and_lifecycle_inspectability(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

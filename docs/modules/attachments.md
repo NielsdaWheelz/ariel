@@ -342,7 +342,7 @@ Implementation should touch these files deliberately:
 - `alembic/versions/`: hard-cutover schema migration
 - `tests/unit/test_discord_bot.py`: reference capture and no blind ingestion
 - `tests/unit/test_responses_tool_contract.py`: strict tool schema
-- `tests/integration/test_pr01_acceptance.py`: Discord message behavior
+- `tests/integration/test_discord_message_acceptance.py`: Discord message behavior
 - New integration tests for image, document, audio, failure, and taint cases
 
 ## Key Decisions

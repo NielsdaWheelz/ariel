@@ -8,7 +8,8 @@ from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import select
 
-from ariel.app import ModelAdapter, create_app
+from ariel.app import ModelAdapter
+from tests.integration.app_helpers import create_migrated_app
 from ariel.persistence import ProviderWriteReceiptRecord
 from tests.integration.responses_helpers import (
     empty_recall_response,
@@ -30,8 +31,8 @@ GOOGLE_GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 
 @dataclass
 class ActionProposalAdapter:
-    provider: str = "provider.s4-pr02"
-    model: str = "model.s4-pr02-v1"
+    provider: str = "provider.google-write"
+    model: str = "model.google-write-v1"
     run_calls_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     assistant_text_by_message: dict[str, str] = field(default_factory=dict)
 
@@ -82,7 +83,7 @@ class ActionProposalAdapter:
             calls=run_calls,
             provider=self.provider,
             model=self.model,
-            provider_response_id="resp_s4_pr02_123",
+            provider_response_id="resp_google_write_123",
             input_tokens=31,
             output_tokens=20,
         )
@@ -370,10 +371,9 @@ class FakeGoogleWorkspaceProvider:
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
-    app = create_app(
+    app = create_migrated_app(
         database_url=postgres_url,
         model_adapter=adapter,
-        reset_database=True,
         sandbox=FakeSandboxRuntime(),
     )
     return TestClient(app)
@@ -438,7 +438,7 @@ def _connect_google(client: TestClient, *, code: str) -> dict[str, Any]:
     return callback.json()
 
 
-def test_s4_pr02_write_scope_remediation_reconnect_is_capability_intent_driven_and_least_privilege(
+def test_write_scope_remediation_reconnect_is_capability_intent_driven_and_least_privilege(
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
@@ -460,15 +460,15 @@ def test_s4_pr02_write_scope_remediation_reconnect_is_capability_intent_driven_a
     oauth_client = FakeGoogleOAuthClient(
         tokens_by_code={
             "connect-read-only": FakeTokenBundle(
-                account_subject="sub_pr02",
-                account_email="pr02@example.com",
+                account_subject="sub_write",
+                account_email="write@example.com",
                 granted_scopes=[GOOGLE_CALENDAR_READ_SCOPE, GOOGLE_GMAIL_READ_SCOPE],
                 access_token="tok_access_read_only",
                 refresh_token="tok_refresh_read_only",
             ),
             "reconnect-calendar-write": FakeTokenBundle(
-                account_subject="sub_pr02",
-                account_email="pr02@example.com",
+                account_subject="sub_write",
+                account_email="write@example.com",
                 granted_scopes=[
                     GOOGLE_CALENDAR_READ_SCOPE,
                     GOOGLE_GMAIL_READ_SCOPE,
@@ -534,7 +534,7 @@ def test_s4_pr02_write_scope_remediation_reconnect_is_capability_intent_driven_a
         assert succeeded_attempt["execution"]["output"]["status"] == "created"
 
 
-def test_s4_pr02_calendar_create_requires_approval_and_executes_exactly_once(
+def test_calendar_create_requires_approval_and_executes_exactly_once(
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
@@ -628,7 +628,7 @@ def test_s4_pr02_calendar_create_requires_approval_and_executes_exactly_once(
             assert receipt.response_payload["updated"] == "2026-03-03T12:00:00Z"
 
 
-def test_s4_pr02_email_draft_queues_then_executes_as_draft_only_without_send_side_effect(
+def test_email_draft_queues_then_executes_as_draft_only_without_send_side_effect(
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
@@ -714,7 +714,7 @@ def test_s4_pr02_email_draft_queues_then_executes_as_draft_only_without_send_sid
         assert len(workspace_provider.email_send_calls) == 0
 
 
-def test_s4_pr02_user_instruction_authority_requires_real_turn_id(
+def test_user_instruction_authority_requires_real_turn_id(
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
@@ -779,7 +779,7 @@ def test_s4_pr02_user_instruction_authority_requires_real_turn_id(
         assert len(workspace_provider.email_draft_calls) == 0
 
 
-def test_s4_pr02_email_send_requires_approval_and_executes_exactly_once(
+def test_email_send_requires_approval_and_executes_exactly_once(
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
@@ -860,7 +860,7 @@ def test_s4_pr02_email_send_requires_approval_and_executes_exactly_once(
         assert len(workspace_provider.email_send_calls) == 1
 
 
-def test_s4_pr02_draft_and_send_are_distinct_lifecycle_units_with_independent_histories(
+def test_draft_and_send_are_distinct_lifecycle_units_with_independent_histories(
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
@@ -1015,7 +1015,7 @@ def test_s4_pr02_draft_and_send_are_distinct_lifecycle_units_with_independent_hi
         ),
     ],
 )
-def test_s4_pr02_write_paths_return_typed_auth_failures_with_recovery_guidance(
+def test_write_paths_return_typed_auth_failures_with_recovery_guidance(
     postgres_url: str,
     case_name: str,
     capability_id: str,

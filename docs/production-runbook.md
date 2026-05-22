@@ -141,12 +141,7 @@ Required memory settings:
 ARIEL_MEMORY_EMBEDDING_PROVIDER=openai
 ARIEL_MEMORY_EMBEDDING_MODEL=text-embedding-3-small
 ARIEL_MEMORY_EMBEDDING_DIMENSIONS=1536
-ARIEL_MEMORY_IMPORT_CUTOVER_ENABLED=false
 ```
-
-Keep `ARIEL_MEMORY_IMPORT_CUTOVER_ENABLED=false` outside an explicit one-time
-cutover window. Routine memory creation, correction, deletion, scope policy, and
-consolidation are handled through audited AI memory capabilities.
 
 Required Discord settings:
 

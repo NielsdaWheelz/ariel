@@ -1,12 +1,12 @@
-"""S5 PR02 session-management acceptance tests.
+"""Session-management acceptance tests.
 
 Pure session management: message idempotency, auto-rotation thresholds, the
 event-timeline cursor, the turn lock, and the context-bundle constitution.
 
-The agent-loop cutover (P1) made ``post_message`` async: it enqueues a
-``user_message`` background task and returns ``202 {"status": "accepted",
-"task_id": ...}``. Tests drain the enqueued task via ``post_message_and_drain``
-or ``drain_task`` before asserting outcomes. Idempotency lives in
+``post_message`` is async: it enqueues a ``user_message`` background task and
+returns ``202 {"status": "accepted", "task_id": ...}``. Tests drain the
+enqueued task via ``post_message_and_drain`` or ``drain_task`` before asserting
+outcomes. Idempotency lives in
 ``enqueue_background_task``'s key dedup: a duplicate key returns the existing
 task (same ``task_id``), regardless of payload, while the task is still
 pending; there is no 409 conflict.
@@ -23,9 +23,10 @@ from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import select
 
-from ariel.app import ModelAdapter, create_app
+from ariel.app import ModelAdapter
 from ariel.persistence import SessionRecord
 from tests.fake_sandbox import FakeSandboxRuntime
+from tests.integration.app_helpers import create_migrated_app
 from tests.integration.responses_helpers import (
     drain_task,
     empty_recall_response,
@@ -38,8 +39,8 @@ from tests.integration.responses_helpers import (
 
 @dataclass
 class SessionManagementProbeAdapter:
-    provider: str = "provider.s5-pr02"
-    model: str = "model.s5-pr02-v1"
+    provider: str = "provider.session-management"
+    model: str = "model.session-management-v1"
     context_bundles: list[dict[str, Any]] = field(default_factory=list)
     history_lengths_by_message: dict[str, int] = field(default_factory=dict)
     message_delays_seconds: dict[str, float] = field(default_factory=dict)
@@ -81,7 +82,7 @@ class SessionManagementProbeAdapter:
                 calls=copy.deepcopy(run_calls),
                 provider=self.provider,
                 model=self.model,
-                provider_response_id="resp_s5_pr02_123",
+                provider_response_id="resp_session_management_123",
                 input_tokens=17,
                 output_tokens=12,
             )
@@ -89,7 +90,7 @@ class SessionManagementProbeAdapter:
             assistant_text=f"assistant::{user_message}",
             provider=self.provider,
             model=self.model,
-            provider_response_id="resp_s5_pr02_123",
+            provider_response_id="resp_session_management_123",
             input_tokens=17,
             output_tokens=12,
         )
@@ -99,13 +100,11 @@ def _build_client(
     postgres_url: str,
     adapter: ModelAdapter,
     *,
-    reset_database: bool,
     raise_server_exceptions: bool = True,
 ) -> TestClient:
-    app = create_app(
+    app = create_migrated_app(
         database_url=postgres_url,
         model_adapter=adapter,
-        reset_database=reset_database,
         sandbox=FakeSandboxRuntime(),
     )
     return TestClient(app, raise_server_exceptions=raise_server_exceptions)
@@ -124,7 +123,7 @@ def _timeline(client: TestClient, session_id: str, *, after: str | None = None) 
     return timeline.json()
 
 
-def test_s5_pr02_message_idempotency_key_replays_same_task_id(
+def test_message_idempotency_key_replays_same_task_id(
     postgres_url: str,
 ) -> None:
     """A duplicate Idempotency-Key with the same payload returns 202 with the
@@ -133,7 +132,7 @@ def test_s5_pr02_message_idempotency_key_replays_same_task_id(
     by key regardless of payload. After the task is drained (deleted), only one turn
     is recorded."""
     adapter = SessionManagementProbeAdapter()
-    with _build_client(postgres_url, adapter, reset_database=True) as client:
+    with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
 
         first = client.post(
@@ -169,14 +168,14 @@ def test_s5_pr02_message_idempotency_key_replays_same_task_id(
         assert len(timeline["turns"]) == 1
 
 
-def test_s5_pr02_idempotency_replay_survives_auto_rotation_when_retrying_new_session_id(
+def test_idempotency_replay_survives_auto_rotation_when_retrying_new_session_id(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("ARIEL_AUTO_ROTATE_MAX_TURNS", "1")
     monkeypatch.setenv("ARIEL_AUTO_ROTATE_MAX_AGE_SECONDS", "999999")
     adapter = SessionManagementProbeAdapter()
-    with _build_client(postgres_url, adapter, reset_database=True) as client:
+    with _build_client(postgres_url, adapter) as client:
         initial_session_id = _session_id(client)
         post_message_and_drain(client, initial_session_id, message="seed prior turn")
 
@@ -209,11 +208,11 @@ def test_s5_pr02_idempotency_replay_survives_auto_rotation_when_retrying_new_ses
         assert len(timeline_rotated["turns"]) == 1
 
 
-def test_s5_pr02_rotate_rejects_overlong_idempotency_key_with_typed_validation_error(
+def test_rotate_rejects_overlong_idempotency_key_with_typed_validation_error(
     postgres_url: str,
 ) -> None:
     adapter = SessionManagementProbeAdapter()
-    with _build_client(postgres_url, adapter, reset_database=True) as client:
+    with _build_client(postgres_url, adapter) as client:
         response = client.post("/v1/sessions/rotate", headers={"Idempotency-Key": "k" * 129})
         assert response.status_code == 422
         payload = response.json()["error"]
@@ -223,7 +222,7 @@ def test_s5_pr02_rotate_rejects_overlong_idempotency_key_with_typed_validation_e
         assert payload["details"]["max_length"] == 128
 
 
-def test_s5_pr02_rotation_follows_turn_count_threshold_with_typed_reason(
+def test_rotation_follows_turn_count_threshold_with_typed_reason(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -231,7 +230,7 @@ def test_s5_pr02_rotation_follows_turn_count_threshold_with_typed_reason(
     monkeypatch.setenv("ARIEL_AUTO_ROTATE_MAX_AGE_SECONDS", "999999")
     adapter = SessionManagementProbeAdapter()
 
-    with _build_client(postgres_url, adapter, reset_database=True) as client:
+    with _build_client(postgres_url, adapter) as client:
         initial_session_id = _session_id(client)
         post_message_and_drain(client, initial_session_id, message="first message in session")
 
@@ -271,12 +270,12 @@ def test_s5_pr02_rotation_follows_turn_count_threshold_with_typed_reason(
             assert active_new.is_active is True
 
 
-def test_s5_pr02_timeline_supports_after_cursor_for_incremental_sync(
+def test_timeline_supports_after_cursor_for_incremental_sync(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     adapter = SessionManagementProbeAdapter()
-    with _build_client(postgres_url, adapter, reset_database=True) as client:
+    with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
         post_message_and_drain(client, session_id, message="first timeline turn")
         post_message_and_drain(client, session_id, message="second timeline turn")
@@ -304,7 +303,7 @@ def test_s5_pr02_timeline_supports_after_cursor_for_incremental_sync(
         assert missing.json()["error"]["code"] == "E_EVENT_CURSOR_NOT_FOUND"
 
 
-def test_s5_pr02_timeline_after_cursor_omits_turns_with_action_attempts_and_no_new_events(
+def test_timeline_after_cursor_omits_turns_with_action_attempts_and_no_new_events(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -319,7 +318,7 @@ def test_s5_pr02_timeline_after_cursor_omits_turns_with_action_attempts_and_no_n
             ]
         }
     )
-    with _build_client(postgres_url, adapter, reset_database=True) as client:
+    with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
         first_turn = post_message_and_drain(client, session_id, message=first_message)
         post_message_and_drain(client, session_id, message="plain follow-up turn")

@@ -1,4 +1,4 @@
-"""Integration tests for the research subagent wiring — P3 end to end.
+"""Integration tests for research dispatch, worker execution, and completion wakes.
 
 These cover the three coupled pieces that connect ``cap.research.investigate``
 to the research loop and its finding back to the main agent:
@@ -32,7 +32,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 import ariel.memory as memory
 from ariel.action_runtime import RuntimeProvenance
-from ariel.app import create_app
+from tests.integration.app_helpers import create_migrated_app
 from ariel.persistence import (
     BackgroundTaskRecord,
     SessionRecord,
@@ -113,7 +113,7 @@ def _seed_turn(session_factory: sessionmaker[Session], *, session_id: str, turn_
 # ===========================================================================
 
 
-@pytest.mark.parametrize("mode", ["web", "personal"])
+@pytest.mark.parametrize("mode", ["web", "personal", "memories"])
 def test_research_investigate_syscall_enqueues_a_research_run_task(
     session_factory: sessionmaker[Session],
     mode: str,
@@ -252,7 +252,7 @@ _FINDING_PROGRAM = (
 
 @dataclass
 class _ResearchRunAdapter:
-    """A model adapter whose single ``run`` program calls ``research.finding``.
+    """A model adapter whose single ``run`` program calls ``agent.emit_finding``.
 
     Records the ``input_items`` of every call so a test can assert what the
     research loop and the completion wake placed in the model's context."""
@@ -308,11 +308,10 @@ def test_worker_research_run_arm_runs_research_and_enqueues_completion_wake(
     _stub_memory_retriever(monkeypatch)
     monkeypatch.setattr("ariel.worker._utcnow", lambda: NOW)
     adapter = _ResearchRunAdapter()
-    app = create_app(
+    app = create_migrated_app(
         database_url=postgres_url,
         model_adapter=adapter,
         sandbox=FakeSandboxRuntime(),
-        reset_database=True,
     )
     with TestClient(app) as client:
         runtime = client.app.state.runtime  # type: ignore[attr-defined]
@@ -407,11 +406,10 @@ def test_worker_research_run_arm_rejects_a_bad_payload(
 
     _stub_memory_retriever(monkeypatch)
     monkeypatch.setattr("ariel.worker._utcnow", lambda: NOW)
-    app = create_app(
+    app = create_migrated_app(
         database_url=postgres_url,
         model_adapter=_ResearchRunAdapter(),
         sandbox=FakeSandboxRuntime(),
-        reset_database=True,
     )
     with TestClient(app) as client:
         runtime = client.app.state.runtime  # type: ignore[attr-defined]
@@ -563,11 +561,10 @@ def test_worker_completion_wake_renders_finding_into_main_agent_context(
             }
 
     adapter = _MainAgentAdapter()
-    app = create_app(
+    app = create_migrated_app(
         database_url=postgres_url,
         model_adapter=adapter,
         sandbox=FakeSandboxRuntime(),
-        reset_database=True,
     )
     with TestClient(app) as client:
         runtime = client.app.state.runtime  # type: ignore[attr-defined]

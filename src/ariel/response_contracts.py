@@ -418,9 +418,7 @@ class SurfaceEventProviderWriteReceiptReconciledPayloadContract(BaseModel):
 class SurfaceEventAIJudgmentPayloadContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    judgment_type: Literal[
-        "memory_recall", "memory_encode", "memory_dream", "model_output", "research"
-    ]
+    judgment_type: Literal["memory_recall", "memory_encode", "memory_dream", "model_output"]
     parse_status: (
         Literal[
             "parsed",
@@ -1211,7 +1209,6 @@ def build_surface_message_response(
             "ok": True,
             "session": _project_surface_session(session),
             "turn": _project_surface_turn(turn),
-            # PR-06 deprecates assistant.provider/model for surfaced responses.
             "assistant": {
                 "message": assistant_message,
                 "sources": sources_payload,

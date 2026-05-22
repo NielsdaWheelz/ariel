@@ -8,7 +8,8 @@ from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import select
 
-from ariel.app import ModelAdapter, create_app
+from ariel.app import ModelAdapter
+from tests.integration.app_helpers import create_migrated_app
 from ariel.google_connector import GoogleWorkspaceProvider
 from ariel.persistence import ArtifactRecord, ProviderWriteReceiptRecord
 from tests.integration.responses_helpers import (
@@ -37,8 +38,8 @@ GOOGLE_USERINFO_PROFILE_SCOPE = "https://www.googleapis.com/auth/userinfo.profil
 
 @dataclass
 class ActionProposalAdapter:
-    provider: str = "provider.s6-pr01"
-    model: str = "model.s6-pr01-v1"
+    provider: str = "provider.google-drive"
+    model: str = "model.google-drive-v1"
     run_calls_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     assistant_text_by_message: dict[str, str] = field(default_factory=dict)
 
@@ -89,7 +90,7 @@ class ActionProposalAdapter:
             calls=run_calls,
             provider=self.provider,
             model=self.model,
-            provider_response_id="resp_s6_pr01_123",
+            provider_response_id="resp_google_drive_123",
             input_tokens=37,
             output_tokens=22,
         )
@@ -463,10 +464,9 @@ class FakeGoogleWorkspaceProvider:
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
-    app = create_app(
+    app = create_migrated_app(
         database_url=postgres_url,
         model_adapter=adapter,
-        reset_database=True,
         sandbox=FakeSandboxRuntime(),
     )
     return TestClient(app)
@@ -576,7 +576,7 @@ def _connect_google(client: TestClient, *, code: str) -> dict[str, Any]:
     return callback.json()
 
 
-def test_s6_pr01_drive_search_and_read_execute_inline_with_retrieval_citations(
+def test_drive_search_and_read_execute_inline_with_retrieval_citations(
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
@@ -672,7 +672,7 @@ def test_s6_pr01_drive_search_and_read_execute_inline_with_retrieval_citations(
         ("read unavailable file", "drv_unavailable", "unavailable", "verify"),
     ],
 )
-def test_s6_pr01_drive_read_typed_outcomes_are_explicit_and_recoverable(
+def test_drive_read_typed_outcomes_are_explicit_and_recoverable(
     postgres_url: str,
     message: str,
     file_id: str,
@@ -731,7 +731,7 @@ def test_s6_pr01_drive_read_typed_outcomes_are_explicit_and_recoverable(
         assert len(_turn_sources(client, turn_data["id"])) == 1
 
 
-def test_s6_pr01_drive_reconnect_intent_is_capability_scoped_and_least_privilege(
+def test_drive_reconnect_intent_is_capability_scoped_and_least_privilege(
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter()
@@ -801,7 +801,7 @@ def test_s6_pr01_drive_reconnect_intent_is_capability_scoped_and_least_privilege
             assert GOOGLE_USERINFO_PROFILE_SCOPE in scopes
 
 
-def test_s6_pr01_drive_share_is_approval_gated_exact_payload_and_exactly_once(
+def test_drive_share_is_approval_gated_exact_payload_and_exactly_once(
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
@@ -913,7 +913,7 @@ def test_s6_pr01_drive_share_is_approval_gated_exact_payload_and_exactly_once(
         )
 
 
-def test_s6_pr01_drive_share_denial_blocks_the_provider_write(
+def test_drive_share_denial_blocks_the_provider_write(
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
@@ -989,7 +989,7 @@ def test_s6_pr01_drive_share_denial_blocks_the_provider_write(
         ("access_revoked", "connect-drive-read-expired", "invalid_grant", False, "access_revoked"),
     ],
 )
-def test_s6_pr01_drive_auth_scope_failures_are_typed_and_recoverable(
+def test_drive_auth_scope_failures_are_typed_and_recoverable(
     postgres_url: str,
     case_name: str,
     connect_code: str | None,
@@ -1093,7 +1093,7 @@ def test_s6_pr01_drive_auth_scope_failures_are_typed_and_recoverable(
         ("google_forbidden", "provider_permission_denied", "permission"),
     ],
 )
-def test_s6_pr01_drive_provider_failures_are_typed_and_recoverable(
+def test_drive_provider_failures_are_typed_and_recoverable(
     postgres_url: str,
     provider_error: str,
     expected_class: str,

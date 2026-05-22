@@ -6,10 +6,9 @@ This document owns Ariel's hard cutover from the flat-JSON `run` call list
 executed in-process to a sandboxed Python program executed in a gVisor sandbox,
 with capabilities exposed as typed syscall host functions.
 
-It supersedes `single-run-tool-cutover.md`, which it deletes. It narrows
-[north-star-cutover.md](north-star-cutover.md): where this document conflicts
-with `run`-source or terminal language in `north-star-cutover.md`, this
-document wins.
+It narrows [north-star-cutover.md](north-star-cutover.md): where this document
+conflicts with `run`-source or terminal language in `north-star-cutover.md`,
+this document wins.
 
 The cutover is incompatible with the flat-JSON `{"calls":[...]}` source format
 and with in-process host-function execution. There is no compatibility layer, no
@@ -80,23 +79,24 @@ workspace-machine executor, or billing.
   workflows live in procedural memory.
 - Do not add capabilities, syscalls, or program features speculatively.
 
-## Current State To Replace
+## Replaced State
 
-- `src/ariel/run_runtime.py` — `unpack_run_source()` parses `source` as JSON
-  `{"calls":[...]}`, at most 20 calls, each `{name, input}`. There is no control
-  flow, no variable binding, and no call can consume another call's output.
-- `src/ariel/executor.py`, `src/ariel/action_runtime.py` — host functions
-  execute in-process: `capability.execute(normalized_input)` runs in the Ariel
-  host process. There is no isolation boundary between model-chosen work and the
-  host.
-- `src/ariel/terminal_runtime.py`, `src/ariel/terminal_safety.py` — the terminal
-  subsystem: `terminal.run`, `terminal.run_background`, `terminal.status`,
-  `terminal.read_output`, `terminal.cancel`, the `policy_engine.py` terminal
-  block, `TerminalCommandRecord`, and the `terminal_commands` table.
-- `src/ariel/app.py` — the per-turn taint snapshot is computed once from prior
-  turns; a syscall proposed after a same-turn untrusted read is evaluated clean.
+Before this cutover:
 
-These are replacement targets, not compatibility promises.
+- `src/ariel/run_runtime.py` parsed `source` as JSON `{"calls":[...]}`, at most
+  20 calls, each `{name, input}`. There was no control flow, no variable binding,
+  and no call could consume another call's output.
+- `src/ariel/executor.py` and `src/ariel/action_runtime.py` executed host
+  functions in-process: `capability.execute(normalized_input)` ran in the Ariel
+  host process. There was no isolation boundary between model-chosen work and
+  the host.
+- The old terminal subsystem let the model run shell commands through
+  `terminal.*` capabilities. Agency had not yet become the only code-execution
+  path.
+- `src/ariel/app.py` computed the per-turn taint snapshot once from prior turns;
+  a syscall proposed after a same-turn untrusted read was evaluated clean.
+
+These were replacement targets, not compatibility promises.
 
 ## Target Behavior
 
@@ -260,10 +260,11 @@ A program that does not complete cleanly commits no proposals.
 
 ### Procedural Memory
 
-Repeated workflows are not a separate skills system. A procedure is an ordinary
-plain-language fact in `memory_facts` — there is no separate procedure memory
-type. The retriever surfaces relevant procedures as context and the model
-applies them when authoring a `run` program. This cutover adds no skills
+Repeated workflows are not a separate skills system. A procedure is ordinary
+plain-language memory content in `memory_notes`, grounded by the append-only
+`memory_log` — there is no separate procedure memory type. The retriever
+surfaces relevant procedures as context and the model applies them when
+authoring a `run` program. This cutover adds no skills
 runtime, no skills store, and no skill-loading syscall.
 
 ### Proactivity
@@ -358,9 +359,9 @@ including the bulk of `policy_engine.py`.
 
 ## Implementation Plan
 
-### Phase 1: Failing Contract Tests
+### Phase 1: Run-Program Contract Coverage
 
-Add tests that fail against current behavior:
+Current run-program contract checkpoints:
 
 - flat-JSON `run` source is rejected; Python-program `run` source is accepted
 - a program with a conditional and a loop executes and dispatches syscalls in
@@ -376,14 +377,14 @@ Add tests that fail against current behavior:
 These run against the mocked sandbox boundary, except a small real-sandbox
 suite; see the two-layer test decision.
 
-Acceptance: the tests fail against current `main` and define the target.
+Acceptance: the tests pass and guard the run-program contract.
 
 ### Phase 2: Remove the Terminal Subsystem
 
-Delete `terminal_runtime.py`, `terminal_safety.py`, the five terminal
-capabilities and their validators, the `policy_engine.py` terminal block,
-`TerminalCommandRecord`, the terminal config, and the terminal tests. Add a
-migration that drops `terminal_commands`.
+Remove the terminal subsystem: no `terminal.*` callable or capability, terminal
+config, or terminal tests remain. Coding and repository execution route through
+`agency.*`; `run` programs orchestrate Ariel syscalls and do not run shell
+commands.
 
 Acceptance: no terminal callable or capability exists; `policy_engine.py` has no
 terminal branch; `make verify` passes.
@@ -521,10 +522,8 @@ The cutover is complete only when all are true:
 This spec is based on a read-only survey of:
 
 - `src/ariel/run_runtime.py`, `capability_registry.py`, `action_runtime.py`,
-  `policy_engine.py`, `executor.py`, `terminal_runtime.py`,
-  `terminal_safety.py`, `persistence.py`, `app.py`
-- `docs/single-run-tool-cutover.md`, `north-star-cutover.md`,
-  `agent-tooling.md`, `ai-first.md`, `simplicity.md`, `index.md`
+  `policy_engine.py`, `executor.py`, `persistence.py`, `app.py`
+- `docs/north-star-cutover.md`, `ai-first.md`, `simplicity.md`, `index.md`
 - `/home/niels/src/work/codapt2` — the run tool, the Lua and Firecracker
   sandboxes, the durable-execution model, and the host-function registry
 - Web research on Firecracker host requirements, Hetzner Cloud

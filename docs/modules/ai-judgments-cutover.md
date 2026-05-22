@@ -7,9 +7,10 @@ This cutover finishes `ai_judgments` now that the proactivity crystallisation
 `ai_judgments` is a **standalone, purely write-only audit log**: `proactivity.py`
 and `leave_by.py` are deleted, `proactive_decisions` — the one table that held a
 foreign key into `ai_judgments` — is dropped, and all three former readers (two
-dedup guards, one feedback lookup) went with `proactivity.py`. The only
-remaining writers are `memory.py` (`memory_recall`, `memory_remember`) and
-`app.py`'s turn loop (`model_output`).
+dedup guards, one feedback lookup) went with `proactivity.py`. The current
+judgment-producing runtime paths are the memory retriever (`memory_recall`),
+the memory rememberer (`memory_encode`, `memory_dream`), and the main agent
+loop (`model_output`).
 
 This cutover does three things and nothing else:
 
@@ -17,8 +18,9 @@ This cutover does three things and nothing else:
    `rationale`, `uncertainty`, `confidence`, `updated_at`, and the index
    `ix_ai_judgments_updated_at`.
 2. **Narrow two CHECK enums to the live set** — `ck_ai_judgment_type` from nine
-   values to three (`memory_recall`, `memory_remember`, `model_output`), and
-   `ck_ai_judgment_parse_status` from five to four (drop `not_required_no_candidates`).
+   values to four (`memory_recall`, `memory_encode`, `memory_dream`,
+   `model_output`), and `ck_ai_judgment_parse_status` from five to four (drop
+   `not_required_no_candidates`).
 3. **Consolidate the writer** — replace `memory._write_judgment` and
    `app.add_ai_judgment` with one owner: `record_ai_judgment` in a new
    `src/ariel/ai_judgments.py`.
@@ -66,7 +68,8 @@ cutover could not have been correct or green before P4.
 
 ## Cutover policy
 
-Inherits `../schema-consolidation-cutover.md` and `proactive-consolidation-cutover.md`.
+Inherits [../ai-first.md](../ai-first.md), [../simplicity.md](../simplicity.md),
+[../cleanliness.md](../cleanliness.md), and [../database.md](../database.md).
 One PR: one Alembic migration, the `persistence.py` model change, the new
 `ai_judgments.py` module, the writer conversions, the `db.py` and contract
 adjustments. No compatibility shim, no dual-write, no feature flag, no fallback,
@@ -78,8 +81,7 @@ up and down.
 
 - `ai_judgments` carries only columns with a load-bearing audit role. The trim
   is information-lossless.
-- The two CHECK enums advertise exactly the values the one writer can emit —
-  the DB constraint and the writer are provably aligned.
+- The two CHECK enums advertise exactly the values the persisted schema accepts.
 - Exactly one writer. No code constructs `AIJudgmentRecord` outside
   `ai_judgments.py`.
 - The four outcome columns — `status`, `parse_status`, `validation_status`,
@@ -110,7 +112,7 @@ up and down.
 | Column | Type | Notes |
 |---|---|---|
 | `id` | `String(32)` PK | client-generated, `ajg_…` |
-| `judgment_type` | `String(64)`, indexed | CHECK `ck_ai_judgment_type` — 3 values |
+| `judgment_type` | `String(64)`, indexed | CHECK `ck_ai_judgment_type` — 4 values |
 | `source_type` | `String(64)`, indexed | provenance |
 | `source_id` | `String(128)`, indexed | provenance |
 | `status` | `String(32)` | CHECK; writer-derived |
@@ -130,7 +132,7 @@ Indexes: `judgment_type`, `source_type`, `source_id`, `created_at` (4; was 5).
 
 CHECK constraints after the cutover:
 
-- `ck_ai_judgment_type`: `judgment_type IN ('memory_recall', 'memory_remember', 'model_output')`
+- `ck_ai_judgment_type`: `judgment_type IN ('memory_recall', 'memory_encode', 'memory_dream', 'model_output')`
 - `ck_ai_judgment_parse_status`: `parse_status IN ('parsed', 'invalid_json', 'missing_output', 'schema_invalid')`
 - `ck_ai_judgment_status`, `ck_ai_judgment_validation_status`,
   `ck_ai_judgment_failure_code` — unchanged.
@@ -139,22 +141,22 @@ CHECK constraints after the cutover:
 
 One module, `src/ariel/ai_judgments.py`, owns everything write-side: the
 `AIJudgmentRecord` constructor call, `record_ai_judgment`, and the
-`AIJudgmentFailure` type. Both producers — `memory.py` and `app.py` — call
-`record_ai_judgment`. `memory._write_judgment` and `app.add_ai_judgment` are
-deleted. `grep -rn 'AIJudgmentRecord(' src/` returns exactly one hit, inside
-`ai_judgments.py`.
+`AIJudgmentFailure` type. Runtime paths record through `agent_loop.py`;
+`memory.py` configures the retriever and rememberer loop modes.
+`memory._write_judgment` and `app.add_ai_judgment` are deleted. `grep -rn
+'AIJudgmentRecord(' src/` returns exactly one hit, inside `ai_judgments.py`.
 
 ## Architecture
 
 `ai_judgments.py` imports `AIJudgmentRecord` from `persistence.py` and is
-imported by `memory.py` and `app.py` — no import cycle:
+imported by `agent_loop.py` — no import cycle:
 
 ```
 persistence.py
    ↑
 ai_judgments.py
    ↑
-memory.py · app.py
+agent_loop.py
 ```
 
 It is a small module, and that is correct: the owner of "write an `ai_judgments`
@@ -164,9 +166,8 @@ importing it into `app.py` would be the cross-module private-helper import that
 owns ORM models, not logic.
 
 `AIJudgmentFailure` (a `RuntimeError` subclass) moves from `memory.py` to
-`ai_judgments.py` — it is a judgment concept, not a memory concept, and `app.py`
-needs it too. `memory.py` imports it back; its `_schema_failure` /
-`_validation_failure` / `_call_subagent` still construct and raise it unchanged.
+`ai_judgments.py` — it is a judgment concept, not a memory concept. It is used
+by `agent_loop.py` when recording failed bounded loop attempts.
 
 ## Capability contract & API design
 
@@ -176,7 +177,7 @@ The one writer:
 def record_ai_judgment(
     db: Session,
     *,
-    judgment_type: Literal["memory_recall", "memory_remember", "model_output"],
+    judgment_type: Literal["memory_recall", "memory_encode", "memory_dream", "model_output"],
     source_type: str,
     source_id: str,
     model: str | None,
@@ -207,8 +208,8 @@ transaction (no flush, no commit).
 
 `AIJudgmentFailure` is the failure descriptor — a `RuntimeError` subclass
 carrying `code`, `safe_reason`, `retryable`, `parse_status`, `validation_status`,
-`provider_response_id`. `memory`'s subagents raise it (they fail closed);
-`app.py` constructs one for each of its three `model_output` failure cases.
+`provider_response_id`. `agent_loop.py` constructs one for validation failures
+it records.
 
 **Why `failure: AIJudgmentFailure | None` and not a discriminated
 `AIJudgmentOutcome` union.** An earlier draft of this spec proposed a four-variant
@@ -258,9 +259,9 @@ The trim is **information-lossless**.
 
 ## The enum narrowing
 
-`ck_ai_judgment_type` drops to `('memory_recall', 'memory_remember', 'model_output')`.
-The other six values have no producer — `tool_result_interpretation` since
-`b026bfa`, the rest with `proactivity.py` and `leave_by.py`.
+`ck_ai_judgment_type` drops to
+`('memory_recall', 'memory_encode', 'memory_dream', 'model_output')`.
+Retired judgment types have no producer and are rejected.
 `ck_ai_judgment_parse_status` drops `not_required_no_candidates`. `../cleanliness.md`:
 delete surface "kept only for … storage formats that no longer exist."
 
@@ -283,30 +284,28 @@ every `not_required_no_candidates` row, since those were all `ambient_interpreta
   six columns (NOT NULL ones via a `server_default` then cleared) and the index.
 - **`src/ariel/db.py`** — schema-verification constants: `REQUIRED_COLUMNS`
   drops `confidence`/`updated_at`; `REQUIRED_CHECK_SQL_FRAGMENTS` for
-  `ck_ai_judgment_type` becomes the three live values;
-  `FORBIDDEN_CHECK_SQL_FRAGMENTS` gains the six retired types (guarding re-entry,
-  matching the existing `tool_strategy` entry).
-- **`src/ariel/memory.py`** — `_write_judgment` and the `AIJudgmentFailure`
-  class definition deleted; `record_ai_judgment` / `AIJudgmentFailure` imported
-  from `ai_judgments`; the four call sites converted; the selected/touched fact
-  ids folded into `output`.
-- **`src/ariel/app.py`** — the nested `add_ai_judgment` helper deleted; the four
-  `model_output` call sites converted to `record_ai_judgment`, the three failure
-  sites constructing an `AIJudgmentFailure`.
+  `ck_ai_judgment_type` becomes the four live DB values;
+  `FORBIDDEN_CHECK_SQL_FRAGMENTS` includes the retired types, including
+  `memory_remember`.
+- **`src/ariel/memory.py` / `src/ariel/agent_loop.py`** — memory configures
+  `memory_recall`, `memory_encode`, and `memory_dream` loop modes; `agent_loop.py`
+  owns the runtime call to `record_ai_judgment`.
+- **`src/ariel/app.py`** — the nested `add_ai_judgment` helper deleted; the main
+  loop configures `model_output` judgments.
 - **`src/ariel/response_contracts.py`** — `SurfaceEventAIJudgmentPayloadContract`:
-  `judgment_type` `Literal` narrowed to the three live values, `parse_status`
+  `judgment_type` `Literal` narrowed to the four persisted DB values, `parse_status`
   `Literal` drops `not_required_no_candidates`, the dead
   `last_tool_result_interpreter_judgment_id` field removed.
 - **`tests/integration/test_memory.py`** — the `_judgment_row` helper drops the
-  six removed columns; the `ck_ai_judgment_type` test updated to the three live
-  / three retired types and renamed.
+  six removed columns; the `ck_ai_judgment_type` test asserts the four live DB
+  types insert and an unknown type is rejected.
 
 ## Acceptance criteria
 
 All met:
 
 - `ai_judgments` has 16 columns; the six columns and `ix_ai_judgments_updated_at`
-  are gone. `ck_ai_judgment_type` has three values; `ck_ai_judgment_parse_status`
+  are gone. `ck_ai_judgment_type` has four values; `ck_ai_judgment_parse_status`
   has four. The other three CHECK constraints and the absence of foreign keys
   are unchanged.
 - `grep -rn 'AIJudgmentRecord(' src/` returns exactly one constructor, in

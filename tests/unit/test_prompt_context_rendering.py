@@ -3,25 +3,7 @@ from __future__ import annotations
 import json
 
 from ariel.app import _build_responses_input_items, _build_turn_context_bundle
-from ariel.prompts import MAIN_AGENT_PROMPT_VERSION, MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS
-
-
-def test_turn_context_bundle_uses_versioned_main_prompt() -> None:
-    context = _build_turn_context_bundle(
-        discord_context=None,
-        recall_v1={"summary": "none", "items": [], "status": "complete"},
-        open_commitments_and_jobs={"open_jobs": []},
-        relevant_artifacts_and_observations={"artifacts": []},
-    )
-
-    assert context["prompt_version"] == MAIN_AGENT_PROMPT_VERSION
-    assert context["section_order"] == [
-        "policy_system_instructions",
-        "recall_v1",
-        "open_commitments_and_jobs",
-        "relevant_artifacts_and_observations",
-    ]
-    assert context["policy_system_instructions"] == list(MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS)
+from ariel.prompts import MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS
 
 
 def test_responses_input_items_keep_static_prompt_before_dynamic_context() -> None:

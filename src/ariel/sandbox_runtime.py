@@ -6,8 +6,8 @@ it. It owns the host side of the line-delimited JSON syscall channel and is the
 ingress trust boundary for everything the in-sandbox guest worker sends back.
 
 The runtime is a clean seam: it receives a parsed ``{name, input}`` syscall and
-calls a host-provided ``syscall_callback`` to actually run it. Phase 4/5 inject
-the real capability-execution callback; this module never imports the
+calls a host-provided ``syscall_callback`` to actually run it. The agent loop
+injects the capability-execution callback; this module never imports the
 capability registry, the action runtime, or the run runtime.
 
 Design — persistent sandbox, fresh process per program:
@@ -28,7 +28,6 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
-import sys
 import tempfile
 import threading
 from dataclasses import dataclass, field
@@ -77,7 +76,7 @@ class _Syscall:
 
 
 # A syscall callback returns (ok, value_or_error): ok True carries a JSON value,
-# ok False carries a typed error string. Phase 4/5 supply the real one.
+# ok False carries a typed error string.
 SyscallCallback = Callable[[str, dict[str, Any]], "tuple[bool, Any]"]
 
 
@@ -280,8 +279,8 @@ class SandboxRuntime:
         ``syscall_names`` are the eligible syscalls exposed to the program as
         namespaced callables. ``syscall_callback`` is invoked for each guest
         syscall: it receives the validated ``(name, input)`` and returns
-        ``(ok, value_or_error)``. This is the seam Phase 4/5 use to inject the
-        real capability-derived syscall surface and capability execution.
+        ``(ok, value_or_error)``. This is where the host path injects the
+        capability-derived syscall surface and capability execution.
         """
 
         with self._lock:
@@ -382,7 +381,7 @@ def _drive_program(
     """Own the host side of the channel for one program: send, dispatch, finish.
 
     The channel conversation — and therefore ``syscall_callback`` — runs on the
-    CALLER's thread. Phase 4 syscalls do DB work on the caller's SQLAlchemy
+    CALLER's thread. Capability syscalls do DB work on the caller's SQLAlchemy
     session, which is not safe to touch off-thread, so the callback must never
     be driven from a worker thread. The wall-clock backstop is a
     ``threading.Timer`` watchdog that only calls ``process.kill()`` on overrun;
@@ -492,17 +491,3 @@ def _drive_program(
         error=outcome["error"],
         syscall_count=syscall_count,
     )
-
-
-if __name__ == "__main__":  # pragma: no cover - manual smoke entry point
-    runtime = SandboxRuntime()
-    runtime.start()
-    try:
-        outcome = runtime.run_program(
-            source="x = 1 + 1\n",
-            syscall_names=(),
-            syscall_callback=lambda _name, _input: (False, "no syscalls in phase 3"),
-        )
-        sys.stdout.write(f"{outcome}\n")
-    finally:
-        runtime.close()

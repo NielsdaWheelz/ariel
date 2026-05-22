@@ -16,20 +16,13 @@ from typing import Any
 
 import pytest
 
-from ariel.sandbox_guest_worker import _ALLOWED_IMPORTS, _build_safe_builtins, _run
+from ariel.sandbox_guest_worker import _build_safe_builtins, _run
 
 
 def _exec_program(source: str) -> dict[str, Any]:
     program_globals: dict[str, Any] = {"__builtins__": _build_safe_builtins()}
     exec(compile(source, "<test-program>", "exec"), program_globals)  # noqa: S102
     return program_globals
-
-
-def test_time_is_in_the_program_import_allowlist() -> None:
-    # The model frequently reaches for ``time.time`` and ``time.strftime`` to
-    # compute "today" boundaries.  Both are benign reads; CPU and wall-clock
-    # limits already bound the program even against ``time.sleep``.
-    assert "time" in _ALLOWED_IMPORTS
 
 
 def test_program_can_import_time_and_call_a_safe_function() -> None:
@@ -57,10 +50,8 @@ def test_program_cannot_import_os_even_through_the_import_builtin() -> None:
 
 def test_program_can_import_urllib_parse_for_url_text_parsing() -> None:
     # ``urllib.parse`` is pure-text URL parsing — no network, no I/O. The
-    # model reached for it on a web-research run (smoke-B personal-research
-    # finding), where the sandbox rejected ``import urllib.parse`` and the
-    # program aborted. Pure-text utilities should not block normal use.
-    assert "urllib.parse" in _ALLOWED_IMPORTS
+    # model uses it to inspect source URLs; pure-text utilities should not block
+    # normal use.
     program_globals = _exec_program(
         "from urllib.parse import urlparse\n"
         "parsed = urlparse('https://example.com/path?q=1')\n"
@@ -71,9 +62,7 @@ def test_program_can_import_urllib_parse_for_url_text_parsing() -> None:
 
 def test_program_can_import_email_utils_for_rfc2822_dates() -> None:
     # ``email.utils`` is pure-text RFC2822 date and address parsing. The
-    # model reached for ``parsedate_to_datetime`` on a personal research run
-    # (smoke-B), where the sandbox rejected it.
-    assert "email.utils" in _ALLOWED_IMPORTS
+    # model uses ``parsedate_to_datetime`` when reasoning over message metadata.
     program_globals = _exec_program(
         "from email.utils import parsedate_to_datetime\n"
         "dt = parsedate_to_datetime('Tue, 20 May 2026 12:00:00 +0000')\n"
@@ -118,8 +107,7 @@ def _drive_run(source: str, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
 def test_program_clean_systemexit(monkeypatch: pytest.MonkeyPatch) -> None:
     # ``raise SystemExit()`` is the natural Python idiom for "end here, all
-    # good". A live smoke turn crashed because ``SystemExit`` was not in the
-    # builtin allowlist and the program errored with NameError.
+    # good"; it must produce a clean program result, not ``NameError``.
     result = _drive_run("raise SystemExit()\n", monkeypatch)
     assert result == {"type": "program-result", "ok": True, "error": None}
 

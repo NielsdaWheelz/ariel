@@ -9,7 +9,8 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from ariel.app import ModelAdapter, create_app
+from ariel.app import ModelAdapter
+from tests.integration.app_helpers import create_migrated_app
 from tests.integration.responses_helpers import empty_recall_response, is_memory_subsystem_call
 from ariel.config import AppSettings
 from ariel.google_connector import (
@@ -55,7 +56,7 @@ def _settings() -> AppSettings:
 
 
 # --------------------------------------------------------------------------
-# PART 2: watch registration fires on connect and persists a row
+# Watch registration fires on connect and persists a row.
 # --------------------------------------------------------------------------
 
 
@@ -172,10 +173,9 @@ def test_connect_registers_gmail_and_calendar_watches_and_persists_rows(
     monkeypatch.setenv("ARIEL_PUBLIC_WEBHOOK_BASE_URL", PUBLIC_WEBHOOK_BASE_URL)
     provider = WatchRecordingProvider()
     oauth_client = ConnectOAuthClient(granted_scopes=[GMAIL_READ_SCOPE, CALENDAR_READ_SCOPE])
-    app = create_app(
+    app = create_migrated_app(
         database_url=postgres_url,
         model_adapter=cast(ModelAdapter, _NoCallAdapter()),
-        reset_database=True,
         sandbox=FakeSandboxRuntime(),
     )
     with TestClient(app) as client:
@@ -233,10 +233,9 @@ def test_connect_watch_registration_failure_is_non_fatal(
             raise RuntimeError("google_upstream_timeout")
 
     oauth_client = ConnectOAuthClient(granted_scopes=[GMAIL_READ_SCOPE, CALENDAR_READ_SCOPE])
-    app = create_app(
+    app = create_migrated_app(
         database_url=postgres_url,
         model_adapter=cast(ModelAdapter, _NoCallAdapter()),
-        reset_database=True,
         sandbox=FakeSandboxRuntime(),
     )
     with TestClient(app) as client:
@@ -260,7 +259,7 @@ def test_connect_watch_registration_failure_is_non_fatal(
 
 
 # --------------------------------------------------------------------------
-# PART 3: the renewal handler re-arms a near-expiry channel
+# The renewal handler re-arms a near-expiry channel.
 # --------------------------------------------------------------------------
 
 
@@ -422,7 +421,7 @@ def test_watch_renew_handler_skips_when_no_channel_near_expiry(
 
 
 # --------------------------------------------------------------------------
-# PART 3: the reconcile handler enqueues provider_sync_due per cursor
+# The reconcile handler enqueues provider_sync_due per cursor.
 # --------------------------------------------------------------------------
 
 
@@ -507,7 +506,7 @@ def test_seed_provider_maintenance_tasks_creates_recurring_rows_once(
 
 
 # --------------------------------------------------------------------------
-# PART 4: a stale Calendar cursor clears state and re-enqueues a full sync
+# A stale Calendar cursor clears state and re-enqueues a full sync.
 # --------------------------------------------------------------------------
 
 
@@ -653,7 +652,7 @@ def test_gmail_404_clears_cursor_and_reenqueues_full_sync(
 
 
 # --------------------------------------------------------------------------
-# PART 5: a sync that finds new items enqueues an agent_wake
+# A sync that finds new items enqueues an agent_wake.
 # --------------------------------------------------------------------------
 
 

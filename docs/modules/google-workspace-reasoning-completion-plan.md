@@ -9,7 +9,7 @@ into concrete remediation work.
 
 The current branch has a strong vertical slice, but it is not the final
 production design. The remaining work is correctness, privacy, security,
-schema, lifecycle, and legacy-removal work. It is not polish.
+schema, lifecycle, and removed-path guardrails. It is not polish.
 
 ## Authority
 
@@ -60,16 +60,14 @@ Blocking gaps:
   email draft/send.
 - Ambiguous provider-write reconciliation is not implemented.
 - Persistence constraints and indexes do not match runtime semantics.
-- Google sync still writes legacy `workspace_items` and queues ambient
-  interpretation.
 - Required edge-case and security acceptance suites are incomplete.
 
 ## Cutover Rules
 
 - This remains a hard cutover.
 - Remove old Google Workspace reasoning paths instead of preserving them.
-- Do not dual-write Google email/calendar reasoning into legacy workspace item
-  and ambient interpretation paths.
+- Keep Google email/calendar reasoning out of workspace-item and ambient
+  interpretation paths.
 - Do not expose old snippet-shaped Gmail read contracts.
 - Do not treat snippets, summaries, Calendar titles, or provider metadata as
   body evidence.
@@ -153,7 +151,7 @@ objects and decide whether body evidence is needed:
   same state
 - `messagesDeleted`: provider object deletion and evidence lifecycle update
 
-No Gmail sync path writes Google reasoning into legacy `workspace_items` or
+No Gmail sync path writes Google reasoning outside provider evidence or enqueues
 ambient interpretation tasks.
 
 ### Gmail HTML Security
@@ -195,7 +193,7 @@ missing required event identity and reasoning fields:
 
 Calendar sync creates provider objects and evidence for changed events, including
 all-day, cancelled, recurring, attendee-status, timezone, and description-block
-cases. It does not write the legacy workspace item path.
+cases. It does not write workspace-item rows.
 
 Slot proposals return typed availability with:
 
@@ -494,11 +492,11 @@ Owns provider sync orchestration:
 - hydrate changed objects as required
 - persist provider objects and evidence
 - mark evidence lifecycle on deletion/redaction/supersession
-- enqueue extraction tasks from evidence
+- wake the agent when provider data changes
 
 Rules:
 
-- no Google `workspace_items`
+- no Google workspace-item writes
 - no Google ambient interpretation task creation
 - no provider calls inside DB transactions
 - sync non-OK read outcomes are typed sync observations, not silent success
@@ -525,7 +523,7 @@ object-kind specific. A single direct writer per source kind is acceptable:
 
 Do not introduce a generic evidence builder, manifest, adapter, or DSL.
 
-### `src/ariel/workspace_reasoning.py`
+### Work graph mutation owner
 
 Owns deterministic work-graph rules:
 
@@ -536,7 +534,7 @@ Owns deterministic work-graph rules:
 - source evidence freshness checks
 - work graph mutation functions used by routes and workers
 
-This file may contain direct functions such as:
+Direct owner functions may include:
 
 - approve commitment
 - edit commitment
@@ -548,8 +546,10 @@ This file may contain direct functions such as:
 - evaluate follow-up loop
 
 Each function must have an obvious lifecycle payoff. Do not add a service class.
+Do not reintroduce a speculative workspace-reasoning bucket; create a new module
+only when concrete lifecycle code needs one owner.
 
-### `src/ariel/proactivity.py`
+### Proactivity and delivery owner
 
 Owns AI-owned proactive deliberation and task dispatch:
 
@@ -563,18 +563,8 @@ Rules:
 
 - no raw provider body text in ranking or deliberation prompts
 - no deterministic delivery scoring
-- no lifecycle mutation outside `workspace_reasoning.py` functions
-
-### `src/ariel/attention_ranking.py`
-
-Either remove this file or reduce it to feature-packet construction.
-
-It must not return:
-
-- semantic rank score
-- priority judgment
-- urgency judgment
-- delivery decision
+- no lifecycle mutation outside direct work-graph mutation functions
+- no resurrection of deleted former proactivity or attention-ranking modules
 - interruption decision
 
 If kept, it returns deterministic facts only.
@@ -646,7 +636,7 @@ Rules:
 ## Key Decisions
 
 - Provider evidence is the canonical bridge from Google to reasoning.
-- Google sync produces evidence and work graph state, not workspace items.
+- Google sync produces evidence and work graph state, not workspace-item rows.
 - Private provider text stays in evidence blocks and controlled inspection
   endpoints only.
 - AI owns interruption and usefulness decisions.
@@ -660,8 +650,8 @@ Rules:
 
 ## Implementation Sequence
 
-The implementation can be staged on the branch. The final merged state has no
-legacy behavior.
+The implementation can be staged on the branch. The final merged state keeps
+removed behavior unreachable.
 
 1. Fix schema foundations.
    - Add missing evidence columns and indexes.
@@ -670,10 +660,10 @@ legacy behavior.
    - Add schema readiness checks for head, constraints, and indexes.
    - Add reversible migration tests.
 
-2. Remove legacy Google sync surfaces.
-   - Delete Google sync writes to `workspace_items`.
-   - Delete Google sync ambient interpretation enqueueing.
-   - Update tests to assert the legacy path is unreachable.
+2. Guard removed Google sync surfaces.
+   - Keep Google sync writes out of workspace-item tables.
+   - Keep Google sync from enqueueing ambient interpretation.
+   - Keep tests asserting those paths are unreachable.
 
 3. Finish provider normalization.
    - Reject missing required provider ids at boundary.
@@ -692,13 +682,12 @@ legacy behavior.
    - Wire email scheduling evidence into slot proposal input.
 
 6. Centralize work graph mutation.
-   - Move route and worker lifecycle mutation into direct functions in
-     `workspace_reasoning.py`.
+   - Move route and worker lifecycle mutation into direct owner functions.
    - Make every loop timing/suppression/resolution mutation increment version.
    - Recheck evidence lifecycle before notification.
 
 7. Replace deterministic ranking.
-   - Remove delivery decisions from `attention_ranking.py`.
+   - Remove deterministic delivery decisions.
    - Build deterministic feature packets only.
    - Add AI proactive deliberation for notify/wait/ask/propose/no-op.
    - Preserve hard deterministic suppression for safety and correctness.
@@ -738,7 +727,7 @@ legacy behavior.
     - full integration suite
     - Alembic upgrade/downgrade/upgrade
     - targeted privacy text-leak scan
-    - targeted legacy path scan
+    - targeted removed-path scan
 
 ## Acceptance Criteria
 
@@ -774,10 +763,10 @@ The cutover is complete only when all criteria pass:
 - Ambiguous writes cannot be retried until reconciliation completes.
 - Schema readiness validates Alembic head, tables, columns, constraints, and
   indexes.
-- Google sync no longer writes `workspace_items` or queues ambient interpretation.
+- Google sync writes no workspace-item rows and queues no ambient interpretation.
 - Prompt-injection tests cover body text, quoted text, forwarded text, Calendar
   descriptions, hidden HTML text, and link text versus URL conflicts.
-- `rg` scans for legacy Google Workspace product paths are clean or covered by a
+- `rg` scans for removed Google Workspace product paths are clean or covered by a
   narrow documented test-only allowlist.
 - `make verify` passes.
 
@@ -838,7 +827,7 @@ Security:
 The work is not done when the tests first pass. It is done when:
 
 - all acceptance criteria pass
-- the legacy Google workspace item and ambient paths are deleted
+- the Google workspace-item and ambient paths remain deleted
 - the implementation follows the file ownership rules above
 - every remaining abstraction has an obvious current payoff
 - maintainers can trace a Google fact from provider object to evidence block to

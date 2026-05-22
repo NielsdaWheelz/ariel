@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 import ariel.memory as memory
 from ariel.action_runtime import RuntimeProvenance
-from ariel.app import create_app
+from tests.integration.app_helpers import create_migrated_app
 from ariel.persistence import (
     BackgroundTaskRecord,
     SessionRecord,
@@ -266,11 +266,10 @@ def test_worker_agent_wake_arm_invokes_wake_for_a_due_task(
     now = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
     monkeypatch.setattr("ariel.worker._utcnow", lambda: now)
     adapter = _WakeAdapter()
-    app = create_app(
+    app = create_migrated_app(
         database_url=postgres_url,
         model_adapter=adapter,
         sandbox=FakeSandboxRuntime(),
-        reset_database=True,
     )
     with TestClient(app) as client:
         runtime = client.app.state.runtime  # type: ignore[attr-defined]
@@ -321,11 +320,10 @@ def test_worker_user_message_arm_invokes_wake_for_target_session(
     now = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
     monkeypatch.setattr("ariel.worker._utcnow", lambda: now)
     adapter = _WakeAdapter()
-    app = create_app(
+    app = create_migrated_app(
         database_url=postgres_url,
         model_adapter=adapter,
         sandbox=FakeSandboxRuntime(),
-        reset_database=True,
     )
     with TestClient(app) as client:
         runtime = client.app.state.runtime  # type: ignore[attr-defined]

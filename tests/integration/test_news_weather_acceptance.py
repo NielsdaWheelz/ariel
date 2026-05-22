@@ -12,7 +12,8 @@ from sqlalchemy import select
 
 import ariel.action_runtime as action_runtime_module
 import ariel.policy_engine as policy_engine_module
-from ariel.app import ModelAdapter, create_app
+from ariel.app import ModelAdapter
+from tests.integration.app_helpers import create_migrated_app
 from tests.integration.responses_helpers import (
     empty_recall_response,
     is_memory_subsystem_call,
@@ -31,8 +32,8 @@ from tests.fake_sandbox import FakeSandboxRuntime
 
 @dataclass
 class ActionRunAdapter:
-    provider: str = "provider.s3-pr02"
-    model: str = "model.s3-pr02-v1"
+    provider: str = "provider.news-weather"
+    model: str = "model.news-weather-v1"
     run_calls_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
     def create_response(
@@ -78,7 +79,7 @@ class ActionRunAdapter:
                 ),
                 provider=self.provider,
                 model=self.model,
-                provider_response_id="resp_s3_pr02_interpreter",
+                provider_response_id="resp_news_weather_interpreter",
                 input_tokens=34,
                 output_tokens=19,
             )
@@ -104,7 +105,7 @@ class ActionRunAdapter:
             calls=copy.deepcopy(run_calls),
             provider=self.provider,
             model=self.model,
-            provider_response_id="resp_s3_pr02_123",
+            provider_response_id="resp_news_weather_123",
             input_tokens=34,
             output_tokens=19,
         )
@@ -117,10 +118,9 @@ def _provider_bindings(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
-    app = create_app(
+    app = create_migrated_app(
         database_url=postgres_url,
         model_adapter=adapter,
-        reset_database=True,
         sandbox=FakeSandboxRuntime(),
     )
     return TestClient(app)
@@ -221,7 +221,7 @@ def _weather_output(
     }
 
 
-def test_s3_pr02_news_results_have_sources_citations_and_allowlisted_read_lifecycle(
+def test_news_results_have_sources_citations_and_allowlisted_read_lifecycle(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -292,7 +292,7 @@ def test_s3_pr02_news_results_have_sources_citations_and_allowlisted_read_lifecy
             assert artifact_payload["published_at"] == source["published_at"]
 
 
-def test_s3_pr02_news_egress_fails_closed_before_execute(
+def test_news_egress_fails_closed_before_execute(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -343,7 +343,7 @@ def test_s3_pr02_news_egress_fails_closed_before_execute(
         assert capability_execute_attempts == 0
 
 
-def test_s3_pr02_news_recency_discloses_stale_and_ambiguous_timing(
+def test_news_recency_discloses_stale_and_ambiguous_timing(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -397,7 +397,7 @@ def test_s3_pr02_news_recency_discloses_stale_and_ambiguous_timing(
         assert any(source["published_at"] is None for source in sources)
 
 
-def test_s3_pr02_weather_explicit_location_wins_and_response_contains_location_timeframe_and_timestamps(
+def test_weather_explicit_location_wins_and_response_contains_location_timeframe_and_timestamps(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -464,7 +464,7 @@ def test_s3_pr02_weather_explicit_location_wins_and_response_contains_location_t
         }
 
 
-def test_s3_pr02_weather_default_location_is_canonical_state_with_env_bootstrap_once_only(
+def test_weather_default_location_is_canonical_state_with_env_bootstrap_once_only(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -518,7 +518,7 @@ def test_s3_pr02_weather_default_location_is_canonical_state_with_env_bootstrap_
         assert captured_inputs[0]["location"] == "Portland, OR"
 
 
-def test_s3_pr02_weather_without_resolvable_location_asks_clarification_instead_of_guessing(
+def test_weather_without_resolvable_location_asks_clarification_instead_of_guessing(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -568,7 +568,7 @@ def test_s3_pr02_weather_without_resolvable_location_asks_clarification_instead_
         assert attempt["execution"]["status"] in {"failed", "not_executed"}
 
 
-def test_s3_pr02_weather_upstream_failure_is_explicit_and_recoverable(
+def test_weather_upstream_failure_is_explicit_and_recoverable(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -606,7 +606,7 @@ def test_s3_pr02_weather_upstream_failure_is_explicit_and_recoverable(
         assert "weather provider timed out" in (attempt["execution"]["error"] or "")
 
 
-def test_s3_pr02_weather_egress_fails_closed_before_execute(
+def test_weather_egress_fails_closed_before_execute(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

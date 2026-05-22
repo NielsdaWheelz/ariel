@@ -642,7 +642,7 @@ def _execute_memory_capability(
     ``cap.memory.recall`` runs the retriever subagent inline (firewalled context,
     bounded budget) and returns a ``recall_v1`` dict.
     ``cap.memory.remember`` enqueues a ``memory_encode`` background task and
-    returns the task id — fire-and-forget.
+    returns ``{"status": "queued", "encode_id": ...}`` — fire-and-forget.
     ``cap.memory.search`` / ``.read`` / ``.note.*`` execute directly against the
     substrate inside their own short transaction.
 
