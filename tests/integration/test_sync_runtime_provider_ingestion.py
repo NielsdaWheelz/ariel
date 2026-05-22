@@ -107,6 +107,7 @@ def gmail_message_read_output(
         },
         "read_outcome": {"status": "ok", "reason_code": None, "recovery": None},
         "retrieved_at": published_at,
+        "status": "succeeded",
     }
 
 
@@ -271,6 +272,7 @@ class FakeFullBodyGmailProvider:
             },
             "read_outcome": {"status": "ok", "reason_code": None, "recovery": None},
             "retrieved_at": "2026-05-07T09:01:00Z",
+            "status": "succeeded",
         }
 
 

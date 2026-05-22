@@ -13,7 +13,7 @@ from ariel.google_connector import GoogleWorkspaceProvider
 from ariel.persistence import ArtifactRecord, ProviderWriteReceiptRecord
 from tests.integration.responses_helpers import (
     empty_recall_response,
-    is_retriever_call,
+    is_memory_subsystem_call,
     post_message_and_drain,
     process_queued_action_execution,
     responses_with_run_calls,
@@ -51,7 +51,7 @@ class ActionProposalAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+        if is_memory_subsystem_call(input_items):
             return empty_recall_response(
                 provider=self.provider, model=self.model, input_items=input_items
             )
@@ -336,6 +336,7 @@ class FakeGoogleWorkspaceProvider:
         )
         query = normalized_input["query"]
         return {
+            "schema_version": "google.drive.search_results.v1",
             "query": query,
             "retrieved_at": "2026-03-06T12:00:00Z",
             "results": [
@@ -349,6 +350,7 @@ class FakeGoogleWorkspaceProvider:
                     "published_at": "2026-03-05T09:30:00Z",
                 }
             ],
+            "status": "succeeded",
         }
 
     def drive_read(
@@ -369,8 +371,12 @@ class FakeGoogleWorkspaceProvider:
         outcome = self.drive_read_outcomes_by_file_id.get(file_id, "ok")
         if outcome == "unsupported":
             return {
+                "schema_version": "google.drive.read_result.v1",
                 "file_id": file_id,
                 "retrieved_at": "2026-03-06T12:00:00Z",
+                "title": f"Drive file {file_id}",
+                "source": base_source,
+                "published_at": "2026-03-05T09:30:00Z",
                 "content_excerpt": "",
                 "truncated": False,
                 "read_outcome": {
@@ -378,22 +384,16 @@ class FakeGoogleWorkspaceProvider:
                     "reason_code": "drive_read_unsupported",
                     "recovery": "Export this file to Google Docs or plain text, then retry.",
                 },
-                "results": [
-                    {
-                        "title": f"Drive file {file_id}",
-                        "source": base_source,
-                        "snippet": (
-                            "Unsupported content format. Export this file to Google Docs "
-                            "or plain text, then retry."
-                        ),
-                        "published_at": "2026-03-05T09:30:00Z",
-                    }
-                ],
+                "status": "succeeded",
             }
         if outcome == "too_large":
             return {
+                "schema_version": "google.drive.read_result.v1",
                 "file_id": file_id,
                 "retrieved_at": "2026-03-06T12:00:00Z",
+                "title": f"Drive file {file_id}",
+                "source": base_source,
+                "published_at": "2026-03-05T09:30:00Z",
                 "content_excerpt": "",
                 "truncated": False,
                 "read_outcome": {
@@ -401,21 +401,16 @@ class FakeGoogleWorkspaceProvider:
                     "reason_code": "drive_read_too_large",
                     "recovery": "Open the file and request a smaller section, then retry.",
                 },
-                "results": [
-                    {
-                        "title": f"Drive file {file_id}",
-                        "source": base_source,
-                        "snippet": (
-                            "File exceeds read budget. Request a smaller section and retry."
-                        ),
-                        "published_at": "2026-03-05T09:30:00Z",
-                    }
-                ],
+                "status": "succeeded",
             }
         if outcome == "unavailable":
             return {
+                "schema_version": "google.drive.read_result.v1",
                 "file_id": file_id,
                 "retrieved_at": "2026-03-06T12:00:00Z",
+                "title": f"Drive file {file_id}",
+                "source": base_source,
+                "published_at": "2026-03-05T09:30:00Z",
                 "content_excerpt": "",
                 "truncated": False,
                 "read_outcome": {
@@ -423,20 +418,15 @@ class FakeGoogleWorkspaceProvider:
                     "reason_code": "drive_read_unavailable",
                     "recovery": "Verify file access and file ID, then retry.",
                 },
-                "results": [
-                    {
-                        "title": f"Drive file {file_id}",
-                        "source": base_source,
-                        "snippet": (
-                            "File is unavailable. Verify file access and file ID, then retry."
-                        ),
-                        "published_at": "2026-03-05T09:30:00Z",
-                    }
-                ],
+                "status": "succeeded",
             }
         return {
+            "schema_version": "google.drive.read_result.v1",
             "file_id": file_id,
             "retrieved_at": "2026-03-06T12:00:00Z",
+            "title": "Q3 Launch Plan",
+            "source": base_source,
+            "published_at": "2026-03-05T09:30:00Z",
             "content_excerpt": (
                 "launch plan excerpt: phase 1 closes security review by mar 12; "
                 "phase 2 starts staged rollout by mar 18."
@@ -447,17 +437,7 @@ class FakeGoogleWorkspaceProvider:
                 "reason_code": None,
                 "recovery": None,
             },
-            "results": [
-                {
-                    "title": "Q3 Launch Plan",
-                    "source": base_source,
-                    "snippet": (
-                        "launch plan excerpt: phase 1 closes security review by mar 12; "
-                        "phase 2 starts staged rollout by mar 18."
-                    ),
-                    "published_at": "2026-03-05T09:30:00Z",
-                }
-            ],
+            "status": "succeeded",
         }
 
     def drive_share(
@@ -643,6 +623,7 @@ def test_s6_pr01_drive_search_and_read_execute_inline_with_retrieval_citations(
         assert search_attempt["approval"]["status"] == "not_requested"
         assert search_attempt["execution"]["status"] == "succeeded"
         search_output = search_attempt["execution"]["output"]
+        assert search_output["provider_account_id"] == "sub_drive_read"
         assert isinstance(search_output["results"], list)
         assert search_output["results"][0]["title"] == "Q3 Launch Plan"
         assert "mime_type=" in search_output["results"][0]["snippet"]
@@ -657,6 +638,22 @@ def test_s6_pr01_drive_search_and_read_execute_inline_with_retrieval_citations(
         assert read_attempt["approval"]["status"] == "not_requested"
         assert read_attempt["execution"]["status"] == "succeeded"
         read_output = read_attempt["execution"]["output"]
+        assert set(read_output.keys()) == {
+            "schema_version",
+            "file_id",
+            "provider_account_id",
+            "retrieved_at",
+            "title",
+            "source",
+            "published_at",
+            "content_excerpt",
+            "truncated",
+            "read_outcome",
+            "status",
+        }
+        assert read_output["provider_account_id"] == "sub_drive_read"
+        assert read_output["title"] == "Q3 Launch Plan"
+        assert "drive.google.com" in read_output["source"]
         assert read_output["read_outcome"]["status"] == "ok"
         assert "launch plan excerpt" in read_output["content_excerpt"]
         assert read_output["truncated"] is False
@@ -724,6 +721,10 @@ def test_s6_pr01_drive_read_typed_outcomes_are_explicit_and_recoverable(
         attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "succeeded"
         output = attempt["execution"]["output"]
+        assert output["provider_account_id"] == "sub_drive_read"
+        assert "results" not in output
+        assert output["title"] == f"Drive file {file_id}"
+        assert "drive.google.com" in output["source"]
         assert output["read_outcome"]["status"] == expected_status
         assert expected_hint in output["read_outcome"]["recovery"].lower()
         assert expected_hint in turn_data["assistant_message"].lower()

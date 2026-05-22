@@ -366,14 +366,26 @@ def _email_advisory_lock_id(*parts: str) -> int:
     return int.from_bytes(digest[:8], "big") & 0x7FFF_FFFF_FFFF_FFFF
 
 
-def _acquire_email_advisory_lock(db: Session, *parts: str) -> None:
-    bind = db.get_bind()
+def _acquire_email_mutation_lock(
+    session_factory: sessionmaker[Session], *parts: str
+) -> tuple[Session | None, int | None]:
+    lock_db = session_factory()
+    bind = lock_db.get_bind()
     if bind is None or bind.dialect.name != "postgresql":
+        lock_db.close()
+        return None, None
+    lock_id = _email_advisory_lock_id(*parts)
+    lock_db.execute(text("SELECT pg_advisory_lock(:lock_id)"), {"lock_id": lock_id})
+    lock_db.commit()
+    return lock_db, lock_id
+
+
+def _release_email_mutation_lock(lock_db: Session | None, lock_id: int | None) -> None:
+    if lock_db is None or lock_id is None:
         return
-    db.execute(
-        text("SELECT pg_advisory_xact_lock(:lock_id)"),
-        {"lock_id": _email_advisory_lock_id(*parts)},
-    )
+    lock_db.execute(text("SELECT pg_advisory_unlock(:lock_id)"), {"lock_id": lock_id})
+    lock_db.commit()
+    lock_db.close()
 
 
 def _email_receipt_result_payload(
@@ -1056,6 +1068,64 @@ def _extract_search_source_candidates(
     retrieved_at = _parse_rfc3339_timestamp(output_payload.get("retrieved_at")) or now_fn()
     candidates: list[GroundedSourceCandidate] = []
 
+    raw_document = output_payload.get("document")
+    if isinstance(raw_document, dict):
+        title_raw = raw_document.get("title")
+        title = (
+            title_raw.strip() if isinstance(title_raw, str) and title_raw.strip() else "document"
+        )
+        source_raw = raw_document.get("canonical_source")
+        source = source_raw.strip() if isinstance(source_raw, str) and source_raw.strip() else None
+        raw_blocks = raw_document.get("content_blocks")
+        blocks = raw_blocks if isinstance(raw_blocks, list) else []
+        snippet_parts: list[str] = []
+        for block in blocks[:2]:
+            if not isinstance(block, dict):
+                continue
+            text_raw = block.get("text")
+            if isinstance(text_raw, str) and text_raw.strip():
+                snippet_parts.append(text_raw.strip())
+        snippet = _truncate_snippet(" ".join(snippet_parts))
+        if source is not None and snippet:
+            candidates.append(
+                GroundedSourceCandidate(
+                    title=title,
+                    source=source,
+                    snippet=snippet,
+                    retrieved_at=_parse_rfc3339_timestamp(raw_document.get("retrieved_at"))
+                    or retrieved_at,
+                    published_at=_parse_rfc3339_timestamp(raw_document.get("published_at")),
+                )
+            )
+            return candidates
+
+    raw_forecast = output_payload.get("forecast")
+    if isinstance(raw_forecast, dict):
+        summary_raw = raw_forecast.get("summary")
+        source_raw = raw_forecast.get("source")
+        summary = (
+            summary_raw.strip() if isinstance(summary_raw, str) and summary_raw.strip() else None
+        )
+        source = source_raw.strip() if isinstance(source_raw, str) and source_raw.strip() else None
+        location_raw = output_payload.get("location")
+        timeframe_raw = output_payload.get("timeframe")
+        title_parts = ["weather forecast"]
+        if isinstance(location_raw, str) and location_raw.strip():
+            title_parts.append(location_raw.strip())
+        if isinstance(timeframe_raw, str) and timeframe_raw.strip():
+            title_parts.append(timeframe_raw.strip())
+        if summary is not None and source is not None:
+            candidates.append(
+                GroundedSourceCandidate(
+                    title=" - ".join(title_parts),
+                    source=source,
+                    snippet=_truncate_snippet(summary),
+                    retrieved_at=retrieved_at,
+                    published_at=_parse_rfc3339_timestamp(raw_forecast.get("timestamp")),
+                )
+            )
+            return candidates
+
     raw_message = output_payload.get("message")
     if isinstance(raw_message, dict):
         subject_raw = raw_message.get("subject")
@@ -1207,6 +1277,32 @@ def _extract_search_source_candidates(
                     snippet=_truncate_snippet(" ".join(snippet_parts)),
                     retrieved_at=retrieved_at,
                     published_at=_parse_rfc3339_timestamp(updated_raw),
+                )
+            )
+        return candidates
+
+    if output_payload.get("schema_version") == "google.drive.read_result.v1":
+        title_raw = output_payload.get("title")
+        source_raw = output_payload.get("source")
+        excerpt_raw = output_payload.get("content_excerpt")
+        read_outcome = output_payload.get("read_outcome")
+        recovery_raw = read_outcome.get("recovery") if isinstance(read_outcome, dict) else None
+        reason_raw = read_outcome.get("reason_code") if isinstance(read_outcome, dict) else None
+        title = title_raw.strip() if isinstance(title_raw, str) and title_raw.strip() else ""
+        source = source_raw.strip() if isinstance(source_raw, str) and source_raw.strip() else ""
+        snippet_raw = excerpt_raw if isinstance(excerpt_raw, str) and excerpt_raw.strip() else None
+        if snippet_raw is None and isinstance(recovery_raw, str) and recovery_raw.strip():
+            snippet_raw = recovery_raw
+        if snippet_raw is None and isinstance(reason_raw, str) and reason_raw.strip():
+            snippet_raw = reason_raw
+        if title and source and snippet_raw is not None:
+            candidates.append(
+                GroundedSourceCandidate(
+                    title=title,
+                    source=source,
+                    snippet=_truncate_snippet(snippet_raw),
+                    retrieved_at=retrieved_at,
+                    published_at=_parse_rfc3339_timestamp(output_payload.get("published_at")),
                 )
             )
         return candidates
@@ -4696,7 +4792,6 @@ def process_action_execution_task(
                     provider_account_id,
                     ",".join(sorted(provider_message_ids)),
                 )
-                _acquire_email_advisory_lock(db, *email_lock_parts)
                 receipt = _record_provider_write_receipt(
                     db=db,
                     action_attempt=action_attempt,
@@ -5022,17 +5117,9 @@ def process_action_execution_task(
         assert google_runtime is not None
         lock_db: Session | None = None
         lock_id: int | None = None
-        if email_lock_parts is not None:
-            lock_db = session_factory()
-            bind = lock_db.get_bind()
-            if bind is not None and bind.dialect.name == "postgresql":
-                lock_id = _email_advisory_lock_id(*email_lock_parts)
-                lock_db.execute(text("SELECT pg_advisory_lock(:lock_id)"), {"lock_id": lock_id})
-                lock_db.commit()
-            else:
-                lock_db.close()
-                lock_db = None
         try:
+            if email_lock_parts is not None:
+                lock_db, lock_id = _acquire_email_mutation_lock(session_factory, *email_lock_parts)
             if capability_id != "cap.email.undo" and "before_state" not in normalized_input:
                 message_ids = normalized_input["message_ids"]
                 before_state_output = (
@@ -5083,13 +5170,7 @@ def process_action_execution_task(
                 provider_account_id=provider_account_id,
             )
         finally:
-            if lock_db is not None and lock_id is not None:
-                lock_db.execute(
-                    text("SELECT pg_advisory_unlock(:lock_id)"),
-                    {"lock_id": lock_id},
-                )
-                lock_db.commit()
-                lock_db.close()
+            _release_email_mutation_lock(lock_db, lock_id)
     elif provider_call is not None:
         capability_id, normalized_input, access_token, granted_scopes, provider_account_id = (
             provider_call

@@ -285,19 +285,16 @@ def _detect_memory_subsystem(input_items: list[dict[str, Any]]) -> str | None:
     return None
 
 
-def is_retriever_call(input_items: list[dict[str, Any]]) -> bool:
+def is_memory_subsystem_call(input_items: list[dict[str, Any]]) -> bool:
     """Detects a memory subsystem model call by its system prompt.
 
     Catches all three memory configurations of ``run_agent_loop``: the
     pre-turn retriever (``Ariel's memory retriever``), the agent-invoked
     encoder (``Ariel's memory encoder``), and the scheduled dreamer
-    (``Ariel's memory dreamer``). Tests that filter retriever calls also need
-    to filter rememberer calls, because the worker's ``memory_dream`` task is
+    (``Ariel's memory dreamer``). Tests that filter memory subsystem calls
+    need to cover all three, because the worker's ``memory_dream`` task is
     enqueued by ``enqueue_due_memory_dream`` on every ``process_one_task``
     and runs in the same drain loop as ``user_message`` tasks.
-
-    The name remains ``is_retriever_call`` for callsite compatibility; the
-    contract is "memory-subsystem call, return a synthesized done response."
     """
     return _detect_memory_subsystem(input_items) is not None
 

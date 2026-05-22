@@ -4,8 +4,20 @@ import pytest
 
 from ariel.response_contracts import (
     ResponseContractViolation,
+    _project_surface_event,
     _project_surface_event_payload,
 )
+
+
+def _raw_event(event_type: str, payload: dict[str, object]) -> dict[str, object]:
+    return {
+        "id": "evn_1",
+        "turn_id": "trn_1",
+        "sequence": 1,
+        "event_type": event_type,
+        "payload": payload,
+        "created_at": "2026-05-21T00:00:00Z",
+    }
 
 
 def test_single_run_protocol_events_are_surfaceable() -> None:
@@ -93,6 +105,57 @@ def test_action_proposed_accepts_research_finding_evidence() -> None:
             "research_status": "partial",
         }
     ]
+
+
+def test_research_started_round_trips_research_shape_payload() -> None:
+    """``evt.research.started`` is the research subagent's turn-open event;
+    its payload carries the research question and mode and round-trips through
+    the projector."""
+
+    projected = _project_surface_event(
+        _raw_event(
+            "evt.research.started",
+            {"research_question": "What is the capital of France?", "research_mode": "web"},
+        )
+    )
+    assert projected["payload"] == {
+        "research_question": "What is the capital of France?",
+        "research_mode": "web",
+    }
+
+
+def test_research_terminal_events_round_trip() -> None:
+    """The three research terminal events (``finding_emitted``, ``failed``,
+    ``partial``) all carry ``{"mode": str}`` and round-trip through the projector.
+    Without these branches the read endpoint 500s on any session that contains a
+    completed/failed/partial research turn."""
+
+    for event_type in (
+        "evt.research.finding_emitted",
+        "evt.research.failed",
+        "evt.research.partial",
+    ):
+        assert _project_surface_event(_raw_event(event_type, {"mode": "web"}))["payload"] == {
+            "mode": "web"
+        }
+
+
+@pytest.mark.parametrize(
+    ("event_type", "payload"),
+    [
+        ("evt.research.started", {"research_question": "q", "research_mode": "other"}),
+        ("evt.research.finding_emitted", {"mode": "other"}),
+        ("evt.research.failed", {"mode": "other"}),
+        ("evt.research.partial", {"mode": "other"}),
+    ],
+)
+def test_research_events_reject_unknown_mode(
+    event_type: str,
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(ResponseContractViolation) as excinfo:
+        _project_surface_event(_raw_event(event_type, payload))
+    assert excinfo.value.contract == f"surface_event_payload.{event_type}"
 
 
 def test_action_proposed_rejects_unknown_evidence_kind() -> None:

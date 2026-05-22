@@ -13,7 +13,7 @@ from ariel.app import ModelAdapter, build_google_runtime, create_app
 from ariel.google_connector import GoogleWorkspaceProvider
 from tests.integration.responses_helpers import (
     empty_recall_response,
-    is_retriever_call,
+    is_memory_subsystem_call,
     post_message_and_drain,
     responses_message,
     responses_with_run_calls,
@@ -42,7 +42,7 @@ class ActionProposalAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+        if is_memory_subsystem_call(input_items):
             return empty_recall_response(
                 provider=self.provider, model=self.model, input_items=input_items
             )

@@ -23,7 +23,7 @@ from ariel.worker import process_one_task
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.responses_helpers import (
     empty_recall_response,
-    is_retriever_call,
+    is_memory_subsystem_call,
     responses_run_message,
     run_function_calls,
 )
@@ -240,7 +240,7 @@ class _WakeAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+        if is_memory_subsystem_call(input_items):
             return empty_recall_response(
                 provider=self.provider, model=self.model, input_items=input_items
             )

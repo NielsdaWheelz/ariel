@@ -26,7 +26,7 @@ from ariel.discord_bot import (
     _is_ariel_custom_id,
 )
 from tests.fake_sandbox import FakeSandboxRuntime
-from tests.integration.responses_helpers import empty_recall_response, is_retriever_call
+from tests.integration.responses_helpers import empty_recall_response, is_memory_subsystem_call
 
 
 class StaticModelAdapter:
@@ -42,7 +42,7 @@ class StaticModelAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+        if is_memory_subsystem_call(input_items):
             return empty_recall_response(
                 provider=self.provider, model=self.model, input_items=input_items
             )
@@ -1024,7 +1024,7 @@ def test_on_message_answers_attachment_only_home_guild_message(
     assert message.replies == []
 
 
-def test_on_message_sends_legacy_approval_text_as_prompt(
+def test_on_message_forwards_approval_decision_text_as_prompt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = _stub_discord_turn(monkeypatch)

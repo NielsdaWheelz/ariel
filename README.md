@@ -308,8 +308,9 @@ approval boundaries:
   - `unsupported` (`drive_read_unsupported`)
   - `too_large` (`drive_read_too_large`)
   - `unavailable` (`drive_read_unavailable`)
-- drive read/search outputs stay retrieval-style with inline citations and `assistant.sources[]`,
-  preserving grounded answer synthesis behavior.
+- drive search outputs stay retrieval-style with `results[]`; drive read outputs are read-native
+  (`title`, `source`, `published_at`, bounded `content_excerpt`, typed `read_outcome`) and still
+  preserve grounded answer synthesis via `assistant.sources[]`.
 
 ## slice-6 pr-02 maps read vertical (directions + nearby places)
 
@@ -422,7 +423,7 @@ google connector runtime config:
 - `ARIEL_GOOGLE_OAUTH_TIMEOUT_SECONDS` (default `10.0`)
 - `ARIEL_CONNECTOR_ENCRYPTION_KEY_VERSION` (default `v1`)
 - `ARIEL_CONNECTOR_ENCRYPTION_KEYS` (required in production; active version must be present)
-- `ARIEL_CONNECTOR_ENCRYPTION_SECRET` (legacy fallback/dev secret path only; dev default is rejected in production)
+- `ARIEL_CONNECTOR_ENCRYPTION_SECRET` (dev single-secret key source; dev default is rejected in production)
 
 `ARIEL_CONNECTOR_ENCRYPTION_KEYS` accepts either:
 
@@ -455,7 +456,7 @@ policy, egress preflight, and the `search_results_v1` output mapping.
 
 weather capability runtime config:
 
-- `ARIEL_WEATHER_PROVIDER_MODE` (`production` default, `dev_fallback` optional)
+- `ARIEL_WEATHER_PROVIDER_MODE` (`production` default, `dev` optional)
 - `ARIEL_WEATHER_PRODUCTION_ENDPOINT` (optional; defaults to Tomorrow.io forecast endpoint)
 - `ARIEL_WEATHER_PRODUCTION_API_KEY` (required for production weather backend)
 - `ARIEL_WEATHER_PRODUCTION_TIMEOUT_SECONDS` (optional; defaults to `8.0`)

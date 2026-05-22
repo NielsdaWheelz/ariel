@@ -25,9 +25,20 @@ def _hermetic_app_settings(request: pytest.FixtureRequest, monkeypatch: pytest.M
     monkeypatch.setitem(AppSettings.model_config, "env_file", None)
 
 
+def _localhost_only_postgres(image: str) -> PostgresContainer:
+    """PostgresContainer bound to 127.0.0.1 only.
+
+    testcontainers-python publishes container ports to 0.0.0.0 by default,
+    which goes around UFW via Docker's iptables chain.
+    """
+    container = PostgresContainer(image)
+    container.ports = {"5432/tcp": ("127.0.0.1", None)}
+    return container
+
+
 @pytest.fixture(scope="session")
 def postgres_container_url() -> Generator[str, None, None]:
-    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
+    with _localhost_only_postgres("pgvector/pgvector:pg16") as postgres:
         yield postgres.get_connection_url().replace("psycopg2", "psycopg")
 
 

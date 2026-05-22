@@ -31,7 +31,7 @@ from ariel.persistence import MemoryLogRecord
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.responses_helpers import (
     empty_recall_response,
-    is_retriever_call,
+    is_memory_subsystem_call,
     post_message_and_drain,
     responses_message,
 )
@@ -100,7 +100,7 @@ class _FindingThenMessageAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+        if is_memory_subsystem_call(input_items):
             return empty_recall_response(
                 provider=self.provider, model=self.model, input_items=input_items
             )
@@ -189,7 +189,7 @@ class _WhitespaceVariantFindingAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+        if is_memory_subsystem_call(input_items):
             return empty_recall_response(
                 provider=self.provider, model=self.model, input_items=input_items
             )
@@ -273,7 +273,7 @@ class _BudgetExhaustedSummaryAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+        if is_memory_subsystem_call(input_items):
             return empty_recall_response(
                 provider=self.provider, model=self.model, input_items=input_items
             )
@@ -349,7 +349,7 @@ class _BudgetExhaustedEmptySummaryAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+        if is_memory_subsystem_call(input_items):
             return empty_recall_response(
                 provider=self.provider, model=self.model, input_items=input_items
             )
@@ -439,7 +439,7 @@ class _SyscallThenMessageAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+        if is_memory_subsystem_call(input_items):
             return empty_recall_response(
                 provider=self.provider, model=self.model, input_items=input_items
             )
@@ -612,7 +612,7 @@ class _PrematureSynthesisAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+        if is_memory_subsystem_call(input_items):
             return empty_recall_response(
                 provider=self.provider, model=self.model, input_items=input_items
             )
@@ -712,7 +712,7 @@ class _GreetingOnlyAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+        if is_memory_subsystem_call(input_items):
             return empty_recall_response(
                 provider=self.provider, model=self.model, input_items=input_items
             )
@@ -790,7 +790,7 @@ class _SearchThenRaiseAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+        if is_memory_subsystem_call(input_items):
             return empty_recall_response(
                 provider=self.provider, model=self.model, input_items=input_items
             )

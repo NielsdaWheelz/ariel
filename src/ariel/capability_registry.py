@@ -13,6 +13,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
 import httpx
 from .config import AppSettings
+from .research_modes import RESEARCH_MODE_VALUES
 from web_search_tool.brave import BraveSearchProvider
 from web_search_tool.types import (
     WebSearchError,
@@ -130,12 +131,6 @@ def _validate_exact_text_input(
     return {field_name: normalized}, None
 
 
-def _validate_search_web_input(
-    raw_input: dict[str, Any],
-) -> tuple[dict[str, Any] | None, str | None]:
-    return _validate_exact_text_input(raw_input, field_name="query", max_length=1000)
-
-
 def _validate_attachment_read_input(
     raw_input: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
@@ -160,7 +155,7 @@ def _validate_attachment_read_input(
     return {"attachment_ref": normalized_ref, "intent": normalized_intent}, None
 
 
-def _validate_search_news_input(
+def _validate_search_query_input(
     raw_input: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
     return _validate_exact_text_input(raw_input, field_name="query", max_length=1000)
@@ -1209,7 +1204,7 @@ def _validate_proactive_schedule_input(
 
 
 _RESEARCH_INVESTIGATE_MAX_QUESTION_LENGTH = 4000
-_RESEARCH_INVESTIGATE_ALLOWED_MODES = {"web", "personal", "memories"}
+_RESEARCH_INVESTIGATE_ALLOWED_MODES = RESEARCH_MODE_VALUES
 
 
 def _looks_like_research_status_poll(question: str) -> bool:
@@ -1421,18 +1416,6 @@ def _search_brave_base_url() -> str:
     return f"https://{normalized.lstrip('/')}"
 
 
-def _search_web_endpoint() -> str:
-    return f"{_search_brave_base_url()}/web/search"
-
-
-def _search_web_timeout_seconds() -> float:
-    return AppSettings().search_web_timeout_seconds
-
-
-def _search_web_api_key() -> str | None:
-    return AppSettings().search_web_api_key
-
-
 def _endpoint_host(endpoint: str) -> str | None:
     parsed = urlparse(endpoint)
     if parsed.hostname:
@@ -1491,12 +1474,11 @@ def _normalize_web_search_response(response: WebSearchResponse, *, query: str) -
         "retrieved_at": _normalize_optional_timestamp(response.retrieved_at)
         or datetime.now(tz=UTC).isoformat().replace("+00:00", "Z"),
         "results": normalized_results,
+        "status": "succeeded",
     }
 
 
-def _raise_web_search_runtime_error(exc: BaseException, *, prefix: str) -> None:
-    if not isinstance(exc, WebSearchError):
-        raise RuntimeError(f"{prefix} provider failure") from exc
+def _raise_web_search_runtime_error(exc: WebSearchError, *, prefix: str) -> None:
     if exc.code == WebSearchErrorCode.TIMEOUT:
         raise RuntimeError(f"{prefix} provider timeout") from exc
     if exc.code == WebSearchErrorCode.RATE_LIMITED:
@@ -1529,91 +1511,89 @@ async def _run_brave_search(
         )
 
 
-def _execute_search_web(input_payload: dict[str, Any]) -> dict[str, Any]:
-    api_key = _search_web_api_key()
+def _search_endpoint(result_type: WebSearchResultType) -> str:
+    path = "news/search" if result_type == WebSearchResultType.NEWS else "web/search"
+    return f"{_search_brave_base_url()}/{path}"
+
+
+def _search_timeout_seconds(result_type: WebSearchResultType) -> float:
+    settings = AppSettings()
+    if result_type == WebSearchResultType.NEWS:
+        return settings.search_news_timeout_seconds
+    return settings.search_web_timeout_seconds
+
+
+def _search_api_key(result_type: WebSearchResultType) -> str | None:
+    settings = AppSettings()
+    if result_type == WebSearchResultType.NEWS:
+        return settings.search_news_api_key or settings.search_web_api_key
+    return settings.search_web_api_key
+
+
+def _search_error_prefix(result_type: WebSearchResultType) -> str:
+    return "news" if result_type == WebSearchResultType.NEWS else "search"
+
+
+def _execute_search(
+    input_payload: dict[str, Any],
+    *,
+    result_type: WebSearchResultType,
+) -> dict[str, Any]:
+    api_key = _search_api_key(result_type)
+    error_prefix = _search_error_prefix(result_type)
     if api_key is None:
+        if result_type == WebSearchResultType.NEWS:
+            raise RuntimeError("news search credentials are not configured")
         raise RuntimeError("search credentials are not configured")
-    endpoint_parsed = urlparse(_search_web_endpoint())
+    endpoint_parsed = urlparse(_search_endpoint(result_type))
     if endpoint_parsed.hostname is None or endpoint_parsed.scheme.lower() not in {"http", "https"}:
-        raise RuntimeError("search endpoint invalid")
+        raise RuntimeError(f"{error_prefix} endpoint invalid")
     try:
         response = asyncio.run(
             _run_brave_search(
                 api_key=api_key,
                 query=input_payload["query"],
-                result_type=WebSearchResultType.WEB,
-                timeout_seconds=_search_web_timeout_seconds(),
+                result_type=result_type,
+                timeout_seconds=_search_timeout_seconds(result_type),
             )
         )
     except WebSearchError as exc:
-        _raise_web_search_runtime_error(exc, prefix="search")
+        _raise_web_search_runtime_error(exc, prefix=error_prefix)
 
     return _normalize_web_search_response(response, query=input_payload["query"])
 
 
-def _declare_search_web_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
-    return [
-        {
-            "destination": _search_web_endpoint(),
-            "payload": {"query": input_payload["query"]},
-        }
-    ]
-
-
-def _search_web_allowed_destinations() -> tuple[str, ...]:
-    endpoint = _search_web_endpoint()
-    host = _endpoint_host(endpoint)
-    if host is not None:
-        return (host,)
-    return ("api.search.brave.com",)
-
-
-def _search_news_endpoint() -> str:
-    return f"{_search_brave_base_url()}/news/search"
-
-
-def _search_news_timeout_seconds() -> float:
-    return AppSettings().search_news_timeout_seconds
-
-
-def _search_news_api_key() -> str | None:
-    settings = AppSettings()
-    return settings.search_news_api_key or settings.search_web_api_key
+def _execute_search_web(input_payload: dict[str, Any]) -> dict[str, Any]:
+    return _execute_search(input_payload, result_type=WebSearchResultType.WEB)
 
 
 def _execute_search_news(input_payload: dict[str, Any]) -> dict[str, Any]:
-    api_key = _search_news_api_key()
-    if api_key is None:
-        raise RuntimeError("news search credentials are not configured")
-    endpoint_parsed = urlparse(_search_news_endpoint())
-    if endpoint_parsed.hostname is None or endpoint_parsed.scheme.lower() not in {"http", "https"}:
-        raise RuntimeError("news search endpoint invalid")
-    try:
-        response = asyncio.run(
-            _run_brave_search(
-                api_key=api_key,
-                query=input_payload["query"],
-                result_type=WebSearchResultType.NEWS,
-                timeout_seconds=_search_news_timeout_seconds(),
-            )
-        )
-    except WebSearchError as exc:
-        _raise_web_search_runtime_error(exc, prefix="news")
-
-    return _normalize_web_search_response(response, query=input_payload["query"])
+    return _execute_search(input_payload, result_type=WebSearchResultType.NEWS)
 
 
-def _declare_search_news_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
+def _declare_search_egress_intent(
+    input_payload: dict[str, Any],
+    *,
+    result_type: WebSearchResultType,
+) -> list[dict[str, Any]]:
     return [
         {
-            "destination": _search_news_endpoint(),
+            "destination": _search_endpoint(result_type),
             "payload": {"query": input_payload["query"]},
         }
     ]
 
 
-def _search_news_allowed_destinations() -> tuple[str, ...]:
-    endpoint = _search_news_endpoint()
+def _declare_search_web_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return _declare_search_egress_intent(input_payload, result_type=WebSearchResultType.WEB)
+
+
+def _declare_search_news_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return _declare_search_egress_intent(input_payload, result_type=WebSearchResultType.NEWS)
+
+
+def _search_allowed_destinations(result_type: WebSearchResultType) -> tuple[str, ...]:
+    endpoint = _search_endpoint(result_type)
     host = _endpoint_host(endpoint)
     if host is not None:
         return (host,)
@@ -1864,20 +1844,6 @@ def _normalize_web_extract_blocks(
     return normalized_blocks, truncated, total_chars
 
 
-def _web_extract_snippet(content_blocks: list[dict[str, Any]]) -> str:
-    candidate_parts: list[str] = []
-    for block in content_blocks[:2]:
-        text = block.get("text")
-        if isinstance(text, str) and text.strip():
-            candidate_parts.append(text.strip())
-    if not candidate_parts:
-        return "extracted evidence available"
-    snippet = " ".join(candidate_parts).strip()
-    if len(snippet) <= 500:
-        return snippet
-    return snippet[:500].rstrip() + "..."
-
-
 def _execute_web_extract(input_payload: dict[str, Any]) -> dict[str, Any]:
     raw_url = input_payload.get("url")
     if not isinstance(raw_url, str):
@@ -2015,8 +1981,7 @@ def _execute_web_extract(input_payload: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "url": normalized_url,
-        "canonical_url": canonical_url,
-        "retrieved_at": retrieved_at,
+        "status": "succeeded",
         "extract_outcome": {
             "status": "partial" if is_partial else "ok",
             "reason_code": reason_code,
@@ -2029,24 +1994,13 @@ def _execute_web_extract(input_payload: dict[str, Any]) -> dict[str, Any]:
             "retrieved_at": retrieved_at,
             "published_at": published_at,
             "language": language,
-            "truncated": is_partial,
-            "truncation_reason": reason_code,
             "content_chars": content_chars,
             "content_blocks": normalized_blocks,
         },
         "provider": {
             "endpoint": endpoint,
             "attempt_count": attempt_count,
-            "retry_count": attempt_count - 1,
         },
-        "results": [
-            {
-                "title": title,
-                "source": canonical_url,
-                "snippet": _web_extract_snippet(normalized_blocks),
-                "published_at": published_at,
-            }
-        ],
     }
 
 
@@ -2461,6 +2415,7 @@ def _execute_maps_directions(input_payload: dict[str, Any]) -> dict[str, Any]:
         "uncertainty": "insufficient_evidence" if not routes else None,
         "routes": routes,
         "results": results,
+        "status": "succeeded",
     }
 
 
@@ -2563,6 +2518,7 @@ def _execute_maps_search_places(input_payload: dict[str, Any]) -> dict[str, Any]
         "retrieved_at": retrieved_at,
         "uncertainty": uncertainty,
         "results": results,
+        "status": "succeeded",
     }
 
 
@@ -2923,7 +2879,7 @@ def _weather_production_endpoint() -> str:
     return f"https://{normalized.lstrip('/')}"
 
 
-def _weather_dev_fallback_endpoint() -> str:
+def _weather_dev_endpoint() -> str:
     default_endpoint = "https://wttr.in"
     normalized = AppSettings().weather_dev_endpoint.strip()
     if not normalized:
@@ -2956,32 +2912,25 @@ def _weather_timesteps_for_timeframe(timeframe: str) -> str:
 
 def _build_weather_output(
     *,
-    provider_id: str,
     source: str,
     location: str,
     timeframe: str,
     summary: str,
-    forecast_timestamp: str | None,
+    forecast_time: str | None,
 ) -> dict[str, Any]:
     retrieved_at = datetime.now(tz=UTC).isoformat().replace("+00:00", "Z")
-    normalized_forecast_timestamp = (
-        _normalize_optional_timestamp(forecast_timestamp) or retrieved_at
-    )
+    normalized_forecast_time = _normalize_optional_timestamp(forecast_time) or retrieved_at
     normalized_summary = summary.strip() or "forecast data available"
     return {
-        "provider": provider_id,
         "location": location,
         "timeframe": timeframe,
-        "forecast_timestamp": normalized_forecast_timestamp,
         "retrieved_at": retrieved_at,
-        "results": [
-            {
-                "title": f"{provider_id} forecast for {location}",
-                "source": source,
-                "snippet": normalized_summary,
-                "published_at": normalized_forecast_timestamp,
-            }
-        ],
+        "forecast": {
+            "summary": normalized_summary,
+            "source": source,
+            "timestamp": normalized_forecast_time,
+        },
+        "status": "succeeded",
     }
 
 
@@ -3095,14 +3044,13 @@ class _TomorrowIoWeatherAdapter:
         if wind_speeds:
             summary_parts.append(f"wind {max(wind_speeds)} m/s")
         summary = ", ".join(summary_parts) or "forecast data available"
-        forecast_timestamp = intervals[0].get("time") if intervals else payload.get("updatedTime")
+        forecast_time = intervals[0].get("time") if intervals else payload.get("updatedTime")
         return _build_weather_output(
-            provider_id=self.provider_id,
             source=self.endpoint,
             location=location,
             timeframe=timeframe,
             summary=summary,
-            forecast_timestamp=forecast_timestamp if isinstance(forecast_timestamp, str) else None,
+            forecast_time=forecast_time if isinstance(forecast_time, str) else None,
         )
 
 
@@ -3182,7 +3130,7 @@ class _WttrDevWeatherAdapter:
                 summary_parts.append(f"{temp_c.strip()}C")
         summary = ", ".join(summary_parts) or "forecast data available"
 
-        forecast_timestamp: str | None = None
+        forecast_time: str | None = None
         weather_payload = payload.get("weather")
         if (
             isinstance(weather_payload, list)
@@ -3191,21 +3139,20 @@ class _WttrDevWeatherAdapter:
         ):
             date_value = weather_payload[0].get("date")
             if isinstance(date_value, str) and date_value.strip():
-                forecast_timestamp = f"{date_value.strip()}T00:00:00Z"
+                forecast_time = f"{date_value.strip()}T00:00:00Z"
         return _build_weather_output(
-            provider_id=self.provider_id,
             source=self.endpoint,
             location=location,
             timeframe=timeframe,
             summary=summary,
-            forecast_timestamp=forecast_timestamp,
+            forecast_time=forecast_time,
         )
 
 
 def _weather_provider_adapter() -> _WeatherProviderAdapter:
-    if _weather_provider_mode() == "dev_fallback":
+    if _weather_provider_mode() == "dev":
         return _WttrDevWeatherAdapter(
-            endpoint=_weather_dev_fallback_endpoint(),
+            endpoint=_weather_dev_endpoint(),
             timeout_seconds=_weather_dev_timeout_seconds(),
         )
     return _TomorrowIoWeatherAdapter(
@@ -3216,8 +3163,8 @@ def _weather_provider_adapter() -> _WeatherProviderAdapter:
 
 
 def _weather_allowed_destinations() -> tuple[str, ...]:
-    if _weather_provider_mode() == "dev_fallback":
-        dev_host = _endpoint_host(_weather_dev_fallback_endpoint())
+    if _weather_provider_mode() == "dev":
+        dev_host = _endpoint_host(_weather_dev_endpoint())
         return (dev_host,) if dev_host is not None else ("wttr.in",)
     production_host = _endpoint_host(_weather_production_endpoint())
     return (production_host,) if production_host is not None else ("api.tomorrow.io",)
@@ -3374,7 +3321,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         policy_decision="allow_inline",
         contract_metadata={
             "input_schema": "drive_search_query_v1",
-            "output_schema": "drive_search_results_v1",
+            "output_schema": "google_drive_search_results_v1",
             "idempotency": "deterministic_read",
             "required_scopes": [_GOOGLE_DRIVE_METADATA_READ_SCOPE],
         },
@@ -3390,7 +3337,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         policy_decision="allow_inline",
         contract_metadata={
             "input_schema": "drive_read_v1",
-            "output_schema": "drive_read_result_v1",
+            "output_schema": "google_drive_read_result_v1",
             "idempotency": "deterministic_read",
             "required_scopes": [_GOOGLE_DRIVE_READ_SCOPE],
             "bounded_output": "excerpt_and_typed_outcome",
@@ -3633,7 +3580,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
             "idempotency": "deterministic_read",
         },
         allowed_egress_destinations=("api.search.brave.com",),
-        validate_input=_validate_search_web_input,
+        validate_input=_validate_search_query_input,
         execute=_execute_search_web,
         declare_egress_intent=_declare_search_web_egress_intent,
     ),
@@ -3648,7 +3595,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
             "idempotency": "deterministic_read",
         },
         allowed_egress_destinations=("api.search.brave.com",),
-        validate_input=_validate_search_news_input,
+        validate_input=_validate_search_query_input,
         execute=_execute_search_news,
         declare_egress_intent=_declare_search_news_egress_intent,
     ),
@@ -3663,7 +3610,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
             "idempotency": "deterministic_read",
             "provider_mode": {
                 "default": "production",
-                "fallback": "dev_fallback",
+                "allowed": ["production", "dev"],
             },
         },
         allowed_egress_destinations=("api.tomorrow.io",),
@@ -3892,9 +3839,15 @@ def get_capability(capability_id: str) -> CapabilityDefinition | None:
     if capability is None:
         return None
     if capability_id == "cap.search.web":
-        return replace(capability, allowed_egress_destinations=_search_web_allowed_destinations())
+        return replace(
+            capability,
+            allowed_egress_destinations=_search_allowed_destinations(WebSearchResultType.WEB),
+        )
     if capability_id == "cap.search.news":
-        return replace(capability, allowed_egress_destinations=_search_news_allowed_destinations())
+        return replace(
+            capability,
+            allowed_egress_destinations=_search_allowed_destinations(WebSearchResultType.NEWS),
+        )
     if capability_id == "cap.weather.forecast":
         return replace(capability, allowed_egress_destinations=_weather_allowed_destinations())
     if capability_id == "cap.web.extract":
@@ -4026,7 +3979,7 @@ RUN_CALLABLE_SIGNATURES: dict[str, str] = {
     # ``topn``, ``count``, ``limit``) are rejected as schema_invalid.
     "search.web": "(query: str) -> {'query': str, 'retrieved_at': str, 'results': list[{'title', 'source', 'snippet', 'published_at'}], 'status': 'succeeded'}",
     "search.news": "(query: str) -> {'query': str, 'retrieved_at': str, 'results': list[{'title', 'source', 'snippet', 'published_at'}], 'status': 'succeeded'}",
-    "web.extract": "(url: str) -> {'url': str, 'retrieved_at': str, 'title': str | None, 'text': str, 'status': 'succeeded'}",
+    "web.extract": "(url: str) -> {'url': str, 'status': 'succeeded', 'extract_outcome': {'status': Literal['ok', 'partial'], 'reason_code': str | None, 'recovery': str | None}, 'document': {'title': str, 'canonical_source': str, 'resolved_url': str, 'retrieved_at': str, 'published_at': str | None, 'language': str | None, 'content_chars': int, 'content_blocks': list[{'index': int, 'text': str}]}, 'provider': {'endpoint': str, 'attempt_count': int}}",
     # research
     "research.investigate": "(question: str, mode: Literal['web', 'personal', 'memories']) -> {'status': 'queued', 'research_id': str}",
     # calendar (read)
@@ -4055,14 +4008,14 @@ RUN_CALLABLE_SIGNATURES: dict[str, str] = {
     # provided and non-null. Use a value from a prior ``email.search`` result;
     # never invent ids and never pass both as None. ``mode`` defaults to
     # ``"message"`` when ``message_id`` is given, else ``"thread"``.
-    "email.read": "(message_id: str | None = None, thread_id: str | None = None, mode: Literal['message', 'thread', 'thread_context'] | None = None)  # at least one id must be non-null, from a prior email.search result -> {'schema_version': 'google.gmail.message_evidence.v1', 'message': {'subject', 'sender', 'recipients', 'internal_date', ...}, 'evidence_blocks': list[{'kind', 'text', ...}], 'status': 'succeeded'}",
+    "email.read": "(message_id: str | None = None, thread_id: str | None = None, mode: Literal['message', 'thread', 'thread_context'] | None = None)  # at least one id must be non-null, from a prior email.search result -> {'schema_version': 'google.gmail.message_evidence.v1', 'mode': Literal['message', 'thread', 'thread_context'], 'message': {'subject', 'sender', 'recipients', 'internal_date', ...} | None, 'thread': {'thread_id', 'message_count', ...} | None, 'messages': list[dict] | None, 'evidence': {'blocks': list[{'kind', 'text', ...}], 'source_kind': str, ...}, 'read_outcome': {'status': Literal['ok', 'body_too_large', 'decode_failed', 'no_body'], ...}, 'retrieved_at': str, 'status': 'succeeded'}",
     # drive (read)
-    "drive.search": "(query: str) -> {'schema_version': 'drive_search_results_v1', 'files': list, 'status': 'succeeded'}",
-    "drive.read": "(file_id: str) -> {'schema_version': 'drive_read_result_v1', 'file': dict, 'status': 'succeeded'}",
+    "drive.search": "(query: str) -> {'schema_version': 'google.drive.search_results.v1', 'query': str, 'provider_account_id': str, 'results': list[{'title', 'source', 'snippet', 'published_at'}], 'retrieved_at': str, 'status': 'succeeded'}",
+    "drive.read": "(file_id: str) -> {'schema_version': 'google.drive.read_result.v1', 'file_id': str, 'provider_account_id': str, 'title': str, 'source': str, 'published_at': str | None, 'content_excerpt': str, 'truncated': bool, 'read_outcome': {'status': Literal['ok', 'unsupported', 'too_large', 'unavailable'], 'reason_code': str | None, 'recovery': str | None}, 'retrieved_at': str, 'status': 'succeeded'}",
     # maps
     # maps.search_places: ``query`` is required. ``radius_meters`` is in
     # [100, 50000] (default 2000). No other arg names are accepted.
-    "maps.search_places": "(query: str, location_context: str | None = None, radius_meters: int = 2000) -> {'query': str, 'places': list[{'name', 'address', 'place_ref', ...}], 'retrieved_at': str, 'status': 'succeeded'}",
+    "maps.search_places": "(query: str, location_context: str | None = None, radius_meters: int = 2000) -> {'query': str, 'results': list[{'title', 'source', 'snippet', 'address', 'distance_meters', 'rating', 'open_now', ...}], 'retrieved_at': str, 'status': 'succeeded'}",
     # maps.directions: ``travel_mode`` is one of the four below (default
     # ``"driving"``). ``waypoints`` is a list of place strings (max 10).
     "maps.directions": "(origin: str | None = None, destination: str | None = None, travel_mode: Literal['driving', 'walking', 'bicycling', 'transit'] = 'driving', waypoints: list[str] = [], optimize_order: bool = False) -> {'origin', 'destination', 'routes': list, 'retrieved_at': str, 'status': 'succeeded'}",

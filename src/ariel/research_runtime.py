@@ -6,10 +6,8 @@ configuration only where a research run must differ:
 
 - ``output_mode="finding"`` — terminates on ``agent.emit_finding``;
 - ``is_research_run=True`` — enables ``agent.emit_finding`` in the sandbox whitelist;
-- the eligible capabilities are exactly one mode whitelist —
-  ``RESEARCH_WEB_CAPABILITY_IDS`` for ``mode == "web"`` or
-  ``RESEARCH_PERSONAL_CAPABILITY_IDS`` for ``mode == "personal"``, never both:
-  the lethal-trifecta defence (a run touches web XOR personal);
+- the eligible capabilities are exactly one mode whitelist: ``web``,
+  ``personal``, or ``memories``;
 - ``research_run_budget_seconds`` budget;
 - the prompt is research-framed — question, mode, eligible callables, and the
   instruction to call ``agent.emit_finding`` once;
@@ -58,6 +56,7 @@ from .capability_registry import (
 from .config import AppSettings
 from .google_connector import GoogleConnectorRuntime
 from .persistence import EventRecord, TurnRecord
+from .research_modes import ResearchMode
 from .run_runtime import ScratchEntry, run_tool_definitions
 from .sandbox_runtime import RunSandbox
 
@@ -125,7 +124,7 @@ def render_finding(finding: ResearchFinding) -> str:
     )
 
 
-def _research_capability_ids(mode: str) -> frozenset[str]:
+def _research_capability_ids(mode: ResearchMode) -> frozenset[str]:
     """The mode's read-capability whitelist — web XOR personal XOR memories, never mixed."""
     if mode == "web":
         return RESEARCH_WEB_CAPABILITY_IDS
@@ -139,7 +138,7 @@ def _research_capability_ids(mode: str) -> frozenset[str]:
 def _build_research_input_items(
     *,
     question: str,
-    mode: str,
+    mode: ResearchMode,
     eligible_callables: list[str],
 ) -> list[dict[str, Any]]:
     """The research prompt: the run-program syscall framing plus research framing.
@@ -218,7 +217,7 @@ def run_research(
     google_runtime: GoogleConnectorRuntime,
     session_id: str,
     question: str,
-    mode: str,
+    mode: ResearchMode,
     now_fn: Callable[[], datetime] | None = None,
 ) -> ResearchFinding:
     """Drive the read-only research loop and return a typed finding.
@@ -279,7 +278,7 @@ def run_research(
         if name is not None
     )
     add_event(
-        "evt.turn.started",
+        "evt.research.started",
         {"research_question": question, "research_mode": mode},
     )
 

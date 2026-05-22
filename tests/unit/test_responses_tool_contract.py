@@ -278,6 +278,57 @@ def test_run_callable_signatures_warn_about_email_read_invented_nulls() -> None:
     assert error == "schema_invalid"
 
 
+def test_web_extract_signature_names_exact_runtime_output_shape() -> None:
+    signature = RUN_CALLABLE_SIGNATURES["web.extract"]
+
+    assert "..." not in signature
+    for field_name in {
+        "url",
+        "status",
+        "extract_outcome",
+        "reason_code",
+        "recovery",
+        "document",
+        "canonical_source",
+        "resolved_url",
+        "retrieved_at",
+        "published_at",
+        "language",
+        "content_chars",
+        "content_blocks",
+        "provider",
+        "endpoint",
+        "attempt_count",
+    }:
+        assert field_name in signature
+
+
+def test_drive_contract_metadata_uses_google_drive_schema_family() -> None:
+    drive_search = get_capability("cap.drive.search")
+    drive_read = get_capability("cap.drive.read")
+
+    assert drive_search is not None
+    assert drive_read is not None
+    assert drive_search.contract_metadata["output_schema"] == "google_drive_search_results_v1"
+    assert drive_read.contract_metadata["output_schema"] == "google_drive_read_result_v1"
+
+
+def test_drive_read_signature_is_read_native_not_search_style() -> None:
+    signature = RUN_CALLABLE_SIGNATURES["drive.read"]
+
+    assert "results" not in signature
+    for field_name in {
+        "title",
+        "source",
+        "published_at",
+        "content_excerpt",
+        "read_outcome",
+        "reason_code",
+        "recovery",
+    }:
+        assert field_name in signature
+
+
 def test_internal_callable_eligibility_is_default_deny() -> None:
     capability_ids = set(
         _eligible_internal_callable_capability_ids(
@@ -436,7 +487,7 @@ def test_process_one_call_default_denies_without_turn_scope() -> None:
         db=cast(Session, Db()),
         function_call_raw={
             "call_id": "call_1",
-            "capability_id": "cap.legacy.no_response",
+            "capability_id": "cap.unscoped.no_response",
             "input": {"reason": "nothing useful to add"},
         },
         turn=turn,
@@ -453,7 +504,7 @@ def test_process_one_call_default_denies_without_turn_scope() -> None:
     assert function_call_output["call_id"] == "call_1"
     assert json.loads(function_call_output["output"]) == {
         "status": "denied",
-        "capability_id": "cap.legacy.no_response",
+        "capability_id": "cap.unscoped.no_response",
         "error": "tool_not_in_turn_scope",
     }
     assert events == [
@@ -462,8 +513,8 @@ def test_process_one_call_default_denies_without_turn_scope() -> None:
             {
                 "call_index": 1,
                 "call_id": "call_1",
-                "tool_name": "cap.legacy.no_response",
-                "capability_id": "cap.legacy.no_response",
+                "tool_name": "cap.unscoped.no_response",
+                "capability_id": "cap.unscoped.no_response",
                 "reason": "tool_not_in_turn_scope",
             },
         )
@@ -497,7 +548,7 @@ def test_process_one_call_denies_unscoped_tools() -> None:
         db=cast(Session, Db()),
         function_call_raw={
             "call_id": "call_1",
-            "capability_id": "cap.legacy.no_response",
+            "capability_id": "cap.unscoped.no_response",
             "input": {"reason": "nothing useful to add"},
         },
         turn=turn,
@@ -511,7 +562,7 @@ def test_process_one_call_denies_unscoped_tools() -> None:
     assert ctx.created_action_attempts == []
     assert json.loads(ctx.function_call_outputs[0]["output"]) == {
         "status": "denied",
-        "capability_id": "cap.legacy.no_response",
+        "capability_id": "cap.unscoped.no_response",
         "error": "tool_not_in_turn_scope",
     }
 

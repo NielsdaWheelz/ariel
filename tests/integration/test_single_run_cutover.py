@@ -23,7 +23,7 @@ from ariel.prompts import MAIN_AGENT_PROMPT_VERSION, MAIN_AGENT_STATIC_SYSTEM_IN
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.responses_helpers import (
     empty_recall_response,
-    is_retriever_call,
+    is_memory_subsystem_call,
     post_message_and_drain,
     responses_message,
     responses_run_message,
@@ -115,7 +115,7 @@ class CapturingRunAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+        if is_memory_subsystem_call(input_items):
             return empty_recall_response(
                 provider=self.provider, model=self.model, input_items=input_items
             )
@@ -460,7 +460,7 @@ def test_emit_value_eviction_discards_prior_round(postgres_url: str) -> None:
             history: list[dict[str, Any]],
             context_bundle: dict[str, Any],
         ) -> dict[str, Any]:
-            if is_retriever_call(input_items):
+            if is_memory_subsystem_call(input_items):
                 return empty_recall_response(
                     provider=self.provider, model=self.model, input_items=input_items
                 )

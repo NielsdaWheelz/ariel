@@ -223,8 +223,8 @@ class AppSettings(BaseSettings):
     @classmethod
     def _weather_provider_mode_must_be_supported(cls, value: str) -> str:
         normalized = value.strip().lower()
-        if normalized not in {"production", "dev_fallback"}:
-            raise ValueError("weather_provider_mode must be production or dev_fallback")
+        if normalized not in {"production", "dev"}:
+            raise ValueError("weather_provider_mode must be production or dev")
         return normalized
 
     @field_validator(
@@ -280,7 +280,7 @@ class AppSettings(BaseSettings):
                 ConnectorTokenCipher.from_config(
                     active_key_version=self.connector_encryption_key_version,
                     configured_keys=self.connector_encryption_keys,
-                    fallback_secret=self.connector_encryption_secret,
+                    single_secret=self.connector_encryption_secret,
                 )
             except RuntimeError as exc:
                 raise ValueError(str(exc)) from exc

@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from ariel.app import ModelAdapter, create_app
-from tests.integration.responses_helpers import empty_recall_response, is_retriever_call
+from tests.integration.responses_helpers import empty_recall_response, is_memory_subsystem_call
 from ariel.config import AppSettings
 from ariel.google_connector import (
     GOOGLE_CONNECTOR_ID,
@@ -157,7 +157,7 @@ class _NoCallAdapter:
         input_items: list[dict[str, Any]],
         **_: Any,
     ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+        if is_memory_subsystem_call(input_items):
             return empty_recall_response(
                 provider=self.provider, model=self.model, input_items=input_items
             )

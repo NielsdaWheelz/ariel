@@ -76,6 +76,24 @@ class _FakeGoogleProvider:
         del access_token, normalized_input
         return self.output
 
+    def drive_search(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]:
+        del access_token, normalized_input
+        return self.output
+
+    def drive_read(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]:
+        del access_token, normalized_input
+        return self.output
+
 
 def _runtime(output: dict[str, Any]) -> GoogleConnectorRuntime:
     return GoogleConnectorRuntime(
@@ -158,6 +176,8 @@ def _calendar_event() -> dict[str, Any]:
         "cap.calendar.respond_to_event",
         "cap.email.search",
         "cap.email.read",
+        "cap.drive.search",
+        "cap.drive.read",
     ],
 )
 def test_google_cutover_read_outputs_reject_legacy_results_shape(capability_id: str) -> None:
@@ -357,6 +377,7 @@ def test_google_cutover_read_outputs_reject_legacy_results_shape(capability_id: 
                 },
                 "read_outcome": {"status": "ok", "reason_code": None, "recovery": None},
                 "retrieved_at": "2026-03-03T12:00:00Z",
+                "status": "succeeded",
             },
         ),
     ],
@@ -454,6 +475,7 @@ def test_google_cutover_gmail_read_rejects_unbounded_message_body_fields() -> No
             },
             "read_outcome": {"status": "ok", "reason_code": None, "recovery": None},
             "retrieved_at": "2026-03-03T12:00:00Z",
+            "status": "succeeded",
         },
     )
 
@@ -489,6 +511,7 @@ def test_google_cutover_gmail_read_rejects_unknown_raw_body_fields() -> None:
             },
             "read_outcome": {"status": "ok", "reason_code": None, "recovery": None},
             "retrieved_at": "2026-03-03T12:00:00Z",
+            "status": "succeeded",
         },
     )
 
@@ -521,6 +544,7 @@ def test_google_cutover_invalid_non_ok_gmail_read_returns_no_provider_payload() 
                 "recovery": "Use narrower context.",
             },
             "retrieved_at": "2026-03-03T12:00:00Z",
+            "status": "succeeded",
         },
     )
 
@@ -581,6 +605,7 @@ def test_google_cutover_gmail_read_accepts_typed_non_ok_body_read() -> None:
                 "recovery": "Use narrower message context.",
             },
             "retrieved_at": "2026-03-03T12:00:00Z",
+            "status": "succeeded",
         },
     )
 
@@ -628,6 +653,7 @@ def test_google_cutover_gmail_read_requires_message_thread_id(
             "evidence": evidence,
             "read_outcome": {"status": "ok", "reason_code": None, "recovery": None},
             "retrieved_at": "2026-03-03T12:00:00Z",
+            "status": "succeeded",
         },
     )
 
@@ -659,6 +685,7 @@ def test_google_cutover_gmail_read_accepts_thread_evidence_shape() -> None:
             },
             "read_outcome": {"status": "ok", "reason_code": None, "recovery": None},
             "retrieved_at": "2026-03-03T12:00:00Z",
+            "status": "succeeded",
         },
     )
 
@@ -726,9 +753,12 @@ def test_google_cutover_gmail_read_requires_persistable_body_evidence(
         "cap.email.read",
         {
             "schema_version": "google.gmail.message_evidence.v1",
+            "mode": "message",
             "message": {"message_id": "msg_1", "thread_id": "thr_1"},
             "evidence": evidence,
+            "read_outcome": {"status": "ok", "reason_code": None, "recovery": None},
             "retrieved_at": "2026-03-03T12:00:00Z",
+            "status": "succeeded",
         },
     )
 
@@ -766,6 +796,7 @@ def test_google_cutover_gmail_read_rejects_unbounded_evidence_blocks(
         "cap.email.read",
         {
             "schema_version": "google.gmail.message_evidence.v1",
+            "mode": "message",
             "message": {"message_id": "msg_1", "thread_id": "thr_1"},
             "evidence": {
                 "source_kind": "gmail_message",
@@ -774,7 +805,9 @@ def test_google_cutover_gmail_read_rejects_unbounded_evidence_blocks(
                 "body_digest": "b" * 64,
                 "blocks": blocks,
             },
+            "read_outcome": {"status": "ok", "reason_code": None, "recovery": None},
             "retrieved_at": "2026-03-03T12:00:00Z",
+            "status": "succeeded",
         },
     )
 

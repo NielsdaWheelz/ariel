@@ -44,7 +44,7 @@ from ariel.worker import _agent_wake_context, process_one_task
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.responses_helpers import (
     empty_recall_response,
-    is_retriever_call,
+    is_memory_subsystem_call,
     run_function_calls,
 )
 
@@ -271,7 +271,7 @@ class _ResearchRunAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+        if is_memory_subsystem_call(input_items):
             return empty_recall_response(
                 provider=self.provider, model=self.model, input_items=input_items
             )
@@ -538,7 +538,7 @@ def test_worker_completion_wake_renders_finding_into_main_agent_context(
             history: list[dict[str, Any]],
             context_bundle: dict[str, Any],
         ) -> dict[str, Any]:
-            if is_retriever_call(input_items):
+            if is_memory_subsystem_call(input_items):
                 return empty_recall_response(
                     provider=self.provider, model=self.model, input_items=input_items
                 )

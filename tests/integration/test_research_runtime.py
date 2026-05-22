@@ -39,7 +39,7 @@ from ariel.google_connector import (
 from ariel.persistence import SessionRecord, TurnRecord
 from ariel.research_runtime import ResearchFinding, run_research
 from tests.fake_sandbox import FakeSandboxRuntime
-from tests.integration.responses_helpers import empty_recall_response, is_retriever_call
+from tests.integration.responses_helpers import empty_recall_response, is_memory_subsystem_call
 
 NOW = datetime(2026, 5, 20, 10, 0, tzinfo=UTC)
 
@@ -101,7 +101,7 @@ class SnapshotAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+        if is_memory_subsystem_call(input_items):
             return empty_recall_response(
                 provider=self.provider, model=self.model, input_items=input_items
             )
@@ -449,7 +449,7 @@ def test_run_research_model_call_failure_returns_failed_finding(
             history: list[dict[str, Any]],
             context_bundle: dict[str, Any],
         ) -> dict[str, Any]:
-            if is_retriever_call(input_items):
+            if is_memory_subsystem_call(input_items):
                 return empty_recall_response(
                     provider=self.provider, model=self.model, input_items=input_items
                 )

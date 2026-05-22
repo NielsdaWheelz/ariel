@@ -4,6 +4,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from .research_modes import ResearchMode
+
 
 class ResponseContractViolation(Exception):
     def __init__(self, *, contract: str, errors: list[Any]) -> None:
@@ -24,6 +26,10 @@ class SurfaceSessionContract(BaseModel):
 
 SurfaceEventType = Literal[
     "evt.turn.started",
+    "evt.research.started",
+    "evt.research.finding_emitted",
+    "evt.research.failed",
+    "evt.research.partial",
     "evt.memory.recalled",
     "evt.memory.recall_failed",
     "evt.ai_judgment.failed",
@@ -137,7 +143,7 @@ class SurfaceTaintEvidenceContract(BaseModel):
     attachment_ref: str | None = None
     filename: str | None = None
     modality: str | None = None
-    research_mode: Literal["web", "personal", "memories"] | None = None
+    research_mode: ResearchMode | None = None
     research_status: Literal["complete", "partial", "failed"] | None = None
 
 
@@ -168,6 +174,19 @@ class SurfaceEventTurnStartedPayloadContract(BaseModel):
 
     message: str
     discord: dict[str, Any] | None
+
+
+class SurfaceEventResearchStartedPayloadContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    research_question: str
+    research_mode: ResearchMode
+
+
+class SurfaceEventResearchModePayloadContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: ResearchMode
 
 
 class SurfaceEventMemoryRecalledPayloadContract(BaseModel):
@@ -907,6 +926,30 @@ def _project_surface_event_payload(
         return _validate_contract(
             "surface_event_payload.evt.turn.started",
             SurfaceEventTurnStartedPayloadContract,
+            payload,
+        )
+    if event_type == "evt.research.started":
+        return _validate_contract(
+            "surface_event_payload.evt.research.started",
+            SurfaceEventResearchStartedPayloadContract,
+            payload,
+        )
+    if event_type == "evt.research.finding_emitted":
+        return _validate_contract(
+            "surface_event_payload.evt.research.finding_emitted",
+            SurfaceEventResearchModePayloadContract,
+            payload,
+        )
+    if event_type == "evt.research.failed":
+        return _validate_contract(
+            "surface_event_payload.evt.research.failed",
+            SurfaceEventResearchModePayloadContract,
+            payload,
+        )
+    if event_type == "evt.research.partial":
+        return _validate_contract(
+            "surface_event_payload.evt.research.partial",
+            SurfaceEventResearchModePayloadContract,
             payload,
         )
     if event_type == "evt.memory.recalled":

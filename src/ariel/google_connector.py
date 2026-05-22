@@ -8,7 +8,6 @@ from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage
 import json
 import hashlib
-import hmac
 import secrets
 from typing import Any, Literal, Protocol
 from urllib.parse import quote, urlencode
@@ -1279,6 +1278,7 @@ class DefaultGoogleWorkspaceProvider:
             },
             "read_outcome": read_outcome,
             "retrieved_at": to_rfc3339(_utcnow()),
+            "status": "succeeded",
         }
 
     def _gmail_read_thread_output(
@@ -1414,6 +1414,7 @@ class DefaultGoogleWorkspaceProvider:
                 decode_notes=decode_notes,
             ),
             "retrieved_at": to_rfc3339(_utcnow()),
+            "status": "succeeded",
         }
 
     def email_list_history(
@@ -2459,26 +2460,23 @@ class DefaultGoogleWorkspaceProvider:
         status: Literal["unsupported", "too_large", "unavailable"],
         reason_code: str,
         recovery: str,
-        snippet: str,
     ) -> dict[str, Any]:
+        read_outcome = {
+            "status": status,
+            "reason_code": reason_code,
+            "recovery": recovery,
+        }
         return {
+            "schema_version": "google.drive.read_result.v1",
             "file_id": file_id,
             "retrieved_at": to_rfc3339(_utcnow()),
+            "title": title,
+            "source": source,
+            "published_at": published_at,
             "content_excerpt": "",
             "truncated": False,
-            "read_outcome": {
-                "status": status,
-                "reason_code": reason_code,
-                "recovery": recovery,
-            },
-            "results": [
-                {
-                    "title": title,
-                    "source": source,
-                    "snippet": snippet,
-                    "published_at": published_at,
-                }
-            ],
+            "read_outcome": read_outcome,
+            "status": "succeeded",
         }
 
     def drive_search(
@@ -2537,9 +2535,11 @@ class DefaultGoogleWorkspaceProvider:
                 }
             )
         return {
+            "schema_version": "google.drive.search_results.v1",
             "query": query,
             "retrieved_at": to_rfc3339(_utcnow()),
             "results": results,
+            "status": "succeeded",
         }
 
     def drive_read(
@@ -2574,7 +2574,6 @@ class DefaultGoogleWorkspaceProvider:
                     status="unavailable",
                     reason_code="drive_read_unavailable",
                     recovery="Verify file access and file ID, then retry.",
-                    snippet="File is unavailable. Verify file access and file ID, then retry.",
                 )
             raise
 
@@ -2602,7 +2601,6 @@ class DefaultGoogleWorkspaceProvider:
                 status="too_large",
                 reason_code="drive_read_too_large",
                 recovery="Open the file and request a smaller section, then retry.",
-                snippet="File exceeds read budget. Request a smaller section and retry.",
             )
 
         try:
@@ -2632,10 +2630,6 @@ class DefaultGoogleWorkspaceProvider:
                     status="unsupported",
                     reason_code="drive_read_unsupported",
                     recovery="Export this file to Google Docs or plain text, then retry.",
-                    snippet=(
-                        "Unsupported content format. Export this file to Google Docs or plain text, "
-                        "then retry."
-                    ),
                 )
         except RuntimeError as exc:
             if (
@@ -2650,7 +2644,6 @@ class DefaultGoogleWorkspaceProvider:
                     status="unavailable",
                     reason_code="drive_read_unavailable",
                     recovery="Verify file access and file ID, then retry.",
-                    snippet="File is unavailable. Verify file access and file ID, then retry.",
                 )
             raise
 
@@ -2661,24 +2654,22 @@ class DefaultGoogleWorkspaceProvider:
         content_excerpt = normalized_content[:_MAX_DRIVE_READ_CHARS].rstrip()
         if truncated:
             content_excerpt = f"{content_excerpt}..."
+        read_outcome = {
+            "status": "ok",
+            "reason_code": None,
+            "recovery": None,
+        }
         return {
+            "schema_version": "google.drive.read_result.v1",
             "file_id": file_id,
             "retrieved_at": to_rfc3339(_utcnow()),
+            "title": title,
+            "source": source,
+            "published_at": published_at,
             "content_excerpt": content_excerpt,
             "truncated": truncated,
-            "read_outcome": {
-                "status": "ok",
-                "reason_code": None,
-                "recovery": None,
-            },
-            "results": [
-                {
-                    "title": title,
-                    "source": source,
-                    "snippet": content_excerpt,
-                    "published_at": published_at,
-                }
-            ],
+            "read_outcome": read_outcome,
+            "status": "succeeded",
         }
 
     def drive_get_start_page_token(
@@ -3338,6 +3329,7 @@ def _gmail_message_unavailable_output(
             "recovery": recovery,
         },
         "retrieved_at": to_rfc3339(_utcnow()),
+        "status": "succeeded",
     }
 
 
@@ -3376,6 +3368,7 @@ def _gmail_thread_unavailable_output(
             "recovery": recovery,
         },
         "retrieved_at": to_rfc3339(_utcnow()),
+        "status": "succeeded",
     }
 
 
@@ -3993,8 +3986,11 @@ def _is_google_gmail_message_evidence_output(payload: dict[str, Any]) -> bool:
             "evidence",
             "read_outcome",
             "retrieved_at",
+            "status",
         },
     ):
+        return False
+    if payload.get("status") != "succeeded":
         return False
     if not _has_non_empty_string(payload.get("retrieved_at")):
         return False
@@ -4159,6 +4155,17 @@ def _is_google_email_send_output(payload: dict[str, Any]) -> bool:
 
 
 def _is_google_drive_search_output(payload: dict[str, Any]) -> bool:
+    if payload.get("schema_version") != "google.drive.search_results.v1":
+        return False
+    if not _has_only_keys(
+        payload,
+        {"schema_version", "query", "provider_account_id", "retrieved_at", "results", "status"},
+    ):
+        return False
+    if not _has_non_empty_string(payload.get("provider_account_id")):
+        return False
+    if payload.get("status") != "succeeded":
+        return False
     if not _has_non_empty_string(payload.get("query")):
         return False
     if not _has_non_empty_string(payload.get("retrieved_at")):
@@ -4167,9 +4174,38 @@ def _is_google_drive_search_output(payload: dict[str, Any]) -> bool:
 
 
 def _is_google_drive_read_output(payload: dict[str, Any]) -> bool:
+    if payload.get("schema_version") != "google.drive.read_result.v1":
+        return False
+    if not _has_only_keys(
+        payload,
+        {
+            "schema_version",
+            "file_id",
+            "provider_account_id",
+            "retrieved_at",
+            "title",
+            "source",
+            "published_at",
+            "content_excerpt",
+            "truncated",
+            "read_outcome",
+            "status",
+        },
+    ):
+        return False
+    if not _has_non_empty_string(payload.get("provider_account_id")):
+        return False
+    if payload.get("status") != "succeeded":
+        return False
     if not _has_non_empty_string(payload.get("file_id")):
         return False
     if not _has_non_empty_string(payload.get("retrieved_at")):
+        return False
+    if not _has_non_empty_string(payload.get("title")):
+        return False
+    if not _has_non_empty_string(payload.get("source")):
+        return False
+    if not _is_string_or_none(payload.get("published_at")):
         return False
     if not isinstance(payload.get("content_excerpt"), str):
         return False
@@ -4178,13 +4214,15 @@ def _is_google_drive_read_output(payload: dict[str, Any]) -> bool:
     read_outcome = payload.get("read_outcome")
     if not isinstance(read_outcome, dict):
         return False
+    if not _has_only_keys(read_outcome, {"status", "reason_code", "recovery"}):
+        return False
     if read_outcome.get("status") not in {"ok", "unsupported", "too_large", "unavailable"}:
         return False
     if not _is_string_or_none(read_outcome.get("reason_code")):
         return False
     if not _is_string_or_none(read_outcome.get("recovery")):
         return False
-    return _is_result_list(payload.get("results"))
+    return True
 
 
 def _is_google_drive_share_output(payload: dict[str, Any]) -> bool:
@@ -4355,8 +4393,7 @@ def _decode_aead_key(raw_value: str) -> bytes:
 class ConnectorTokenCipher:
     active_key_version: str
     keys_by_version: dict[str, bytes]
-    legacy_secret: str | None = None
-    allow_legacy_key_alias: bool = False
+    single_secret_key: bytes | None = None
 
     def __post_init__(self) -> None:
         active = self.active_key_version.strip()
@@ -4371,8 +4408,16 @@ class ConnectorTokenCipher:
             if len(key_bytes) not in {16, 24, 32}:
                 raise RuntimeError("aead key length must be 16, 24, or 32 bytes")
             copied[version] = bytes(key_bytes)
+        single_secret_key = self.single_secret_key
+        if single_secret_key is not None and len(single_secret_key) not in {16, 24, 32}:
+            raise RuntimeError("aead key length must be 16, 24, or 32 bytes")
         object.__setattr__(self, "active_key_version", active)
         object.__setattr__(self, "keys_by_version", copied)
+        object.__setattr__(
+            self,
+            "single_secret_key",
+            bytes(single_secret_key) if single_secret_key is not None else None,
+        )
 
     @classmethod
     def from_config(
@@ -4380,24 +4425,24 @@ class ConnectorTokenCipher:
         *,
         active_key_version: str,
         configured_keys: str | None,
-        fallback_secret: str,
+        single_secret: str,
     ) -> ConnectorTokenCipher:
         keys: dict[str, bytes] = {}
         if configured_keys is not None:
             entries = _parse_connector_key_entries(configured_keys)
             keys = {version: _decode_aead_key(raw_key) for version, raw_key in entries.items()}
-        has_configured_keyring = bool(keys)
         active = active_key_version.strip() or "v1"
+        single_secret_key: bytes | None = None
         if not keys:
-            keys[active] = _derive_secret_bytes(fallback_secret)
+            single_secret_key = _derive_secret_bytes(single_secret)
+            keys[active] = single_secret_key
         if active not in keys:
             msg = "active connector encryption key version is missing from configured keyring"
             raise RuntimeError(msg)
         return cls(
             active_key_version=active,
             keys_by_version=keys,
-            legacy_secret=fallback_secret,
-            allow_legacy_key_alias=not has_configured_keyring,
+            single_secret_key=single_secret_key,
         )
 
     def encrypt(self, plaintext: str) -> str:
@@ -4417,10 +4462,7 @@ class ConnectorTokenCipher:
                 _, version, nonce_b64, payload_b64 = ciphertext.split(":", maxsplit=3)
             except ValueError as exc:
                 raise RuntimeError("encrypted value is malformed") from exc
-            key_bytes = self.keys_by_version.get(version)
-            if key_bytes is None and self.allow_legacy_key_alias and self.legacy_secret is not None:
-                # Compatibility path for single-secret environments during key-version relabeling.
-                key_bytes = _derive_secret_bytes(self.legacy_secret)
+            key_bytes = self.keys_by_version.get(version) or self.single_secret_key
             if key_bytes is None:
                 raise RuntimeError("unknown encryption key version")
             nonce = _urlsafe_b64decode(nonce_b64)
@@ -4433,37 +4475,7 @@ class ConnectorTokenCipher:
             except InvalidTag as exc:
                 raise RuntimeError("encrypted value integrity check failed") from exc
             return plaintext.decode("utf-8")
-        if self.legacy_secret is None:
-            raise RuntimeError("legacy secret not configured")
-        return _decrypt_secret_legacy(ciphertext=ciphertext, secret=self.legacy_secret)
-
-
-def _decrypt_secret_legacy(*, ciphertext: str, secret: str) -> str:
-    prefix, sep, encoded = ciphertext.partition(":")
-    if not sep or not prefix.strip():
         raise RuntimeError("encrypted value is malformed")
-    payload = _urlsafe_b64decode(encoded)
-    if len(payload) < 16 + 32:
-        raise RuntimeError("encrypted value length is invalid")
-    secret_bytes = _derive_secret_bytes(secret)
-    nonce = payload[:16]
-    mac = payload[-32:]
-    body = payload[16:-32]
-    expected_mac = hmac.new(secret_bytes, nonce + body, hashlib.sha256).digest()
-    if not hmac.compare_digest(mac, expected_mac):
-        raise RuntimeError("encrypted value integrity check failed")
-    # Legacy stream-cipher compatibility for pre-hardening ciphertext.
-    chunks: list[bytes] = []
-    counter = 0
-    total = 0
-    while total < len(body):
-        digest = hashlib.sha256(secret_bytes + nonce + counter.to_bytes(4, "big")).digest()
-        chunks.append(digest)
-        total += len(digest)
-        counter += 1
-    stream = b"".join(chunks)[: len(body)]
-    plaintext_bytes = bytes(a ^ b for a, b in zip(body, stream, strict=False))
-    return plaintext_bytes.decode("utf-8")
 
 
 def _encrypt_secret(
@@ -4476,7 +4488,7 @@ def _encrypt_secret(
     cipher = ConnectorTokenCipher.from_config(
         active_key_version=key_version,
         configured_keys=encryption_keys,
-        fallback_secret=secret,
+        single_secret=secret,
     )
     return cipher.encrypt(plaintext)
 
@@ -4491,7 +4503,7 @@ def _decrypt_secret(
     cipher = ConnectorTokenCipher.from_config(
         active_key_version=expected_key_version,
         configured_keys=encryption_keys,
-        fallback_secret=secret,
+        single_secret=secret,
     )
     return cipher.decrypt(ciphertext)
 

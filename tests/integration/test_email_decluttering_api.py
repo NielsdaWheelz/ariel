@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from ariel.app import create_app
-from tests.integration.responses_helpers import empty_recall_response, is_retriever_call
+from tests.integration.responses_helpers import empty_recall_response, is_memory_subsystem_call
 from ariel.persistence import (
     ActionAttemptRecord,
     ProviderWriteReceiptRecord,
@@ -31,7 +31,7 @@ class NoopModelAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+        if is_memory_subsystem_call(input_items):
             return empty_recall_response(
                 provider=self.provider, model=self.model, input_items=input_items
             )

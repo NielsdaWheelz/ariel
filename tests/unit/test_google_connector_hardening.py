@@ -61,20 +61,31 @@ def test_connector_token_cipher_supports_key_rotation_decrypt_of_older_versions(
     assert rotated_cipher.decrypt(ciphertext) == "tok_before_rotation"
 
 
-def test_connector_token_cipher_allows_single_secret_version_relabel_compatibility() -> None:
+def test_connector_token_cipher_allows_single_secret_dev_key_version_relabel() -> None:
     v1_cipher = ConnectorTokenCipher.from_config(
         active_key_version="v1",
         configured_keys=None,
-        fallback_secret="shared-dev-secret",
+        single_secret="shared-dev-secret",
     )
     ciphertext = v1_cipher.encrypt("tok_single_secret")
 
     v2_cipher = ConnectorTokenCipher.from_config(
         active_key_version="v2",
         configured_keys=None,
-        fallback_secret="shared-dev-secret",
+        single_secret="shared-dev-secret",
     )
     assert v2_cipher.decrypt(ciphertext) == "tok_single_secret"
+
+
+def test_connector_token_cipher_rejects_pre_aead_ciphertext() -> None:
+    cipher = ConnectorTokenCipher.from_config(
+        active_key_version="v1",
+        configured_keys=None,
+        single_secret="shared-dev-secret",
+    )
+
+    with pytest.raises(RuntimeError, match="encrypted value is malformed"):
+        cipher.decrypt("legacy:v1")
 
 
 def test_google_calendar_capability_validators_reject_inverted_windows() -> None:
@@ -672,6 +683,10 @@ def test_default_workspace_provider_drive_read_enforces_size_boundary(
     )
 
     assert output["read_outcome"]["status"] == expected_status
+    assert "results" not in output
+    assert output["title"] == "Boundary Doc"
+    assert output["source"] == "https://drive.google.com/file/d/drv_boundary/view"
+    assert output["published_at"] == "2026-03-06T12:00:00Z"
     assert len(calls) == expected_calls
     assert calls[0]["params"]["supportsAllDrives"] == "true"
     if expected_status == "ok":
@@ -1531,6 +1546,7 @@ def test_gmail_message_evidence_validator_accepts_message_mode_ok_and_degraded_p
         },
         "read_outcome": {"status": "ok", "reason_code": None, "recovery": None},
         "retrieved_at": "2026-05-20T12:00:00Z",
+        "status": "succeeded",
     }
     assert is_typed_google_read_output(capability_id="cap.email.read", payload=ok_payload)
 
@@ -1577,6 +1593,7 @@ def test_gmail_message_evidence_validator_accepts_message_mode_ok_and_degraded_p
             "recovery": "Use narrower message context or ask for metadata only.",
         },
         "retrieved_at": "2026-05-20T12:00:00Z",
+        "status": "succeeded",
     }
     assert is_typed_google_read_output(capability_id="cap.email.read", payload=degraded_payload)
 
@@ -1608,6 +1625,7 @@ def test_gmail_message_evidence_validator_accepts_thread_mode_degraded_outcome()
             "recovery": "Use narrower thread context or ask for metadata only.",
         },
         "retrieved_at": "2026-05-20T12:00:00Z",
+        "status": "succeeded",
     }
     assert is_typed_google_read_output(capability_id="cap.email.read", payload=payload)
 
@@ -1651,6 +1669,7 @@ def test_gmail_message_evidence_validator_accepts_thread_mode_payload() -> None:
         },
         "read_outcome": {"status": "ok", "reason_code": None, "recovery": None},
         "retrieved_at": "2026-05-20T12:00:00Z",
+        "status": "succeeded",
     }
     assert is_typed_google_read_output(capability_id="cap.email.read", payload=payload)
 
@@ -1675,6 +1694,7 @@ def test_gmail_message_evidence_validator_rejects_forbidden_text_key_in_evidence
         },
         "read_outcome": {"status": "ok", "reason_code": None, "recovery": None},
         "retrieved_at": "2026-05-20T12:00:00Z",
+        "status": "succeeded",
     }
     assert not is_typed_google_read_output(capability_id="cap.email.read", payload=poisoned)
 
@@ -1785,86 +1805,159 @@ def test_email_send_validator_rejects_missing_message_id() -> None:
 
 def test_drive_search_validator_accepts_empty_and_populated_results() -> None:
     empty: dict[str, Any] = {
+        "schema_version": "google.drive.search_results.v1",
         "query": "ops plan",
+        "provider_account_id": "google",
         "retrieved_at": "2026-05-20T12:00:00Z",
         "results": [],
+        "status": "succeeded",
     }
     assert is_typed_google_read_output(capability_id="cap.drive.search", payload=empty)
 
+    files = [
+        {
+            "title": "Q2 ops plan",
+            "source": "https://drive.google.com/file/d/drv_1/view",
+            "snippet": "mime_type=text/plain owner=ops@example.com",
+            "published_at": "2026-05-19T11:00:00Z",
+        }
+    ]
     populated: dict[str, Any] = {
+        "schema_version": "google.drive.search_results.v1",
         "query": "ops plan",
+        "provider_account_id": "google",
         "retrieved_at": "2026-05-20T12:00:00Z",
-        "results": [
-            {
-                "title": "Q2 ops plan",
-                "source": "https://drive.google.com/file/d/drv_1/view",
-                "snippet": "mime_type=text/plain owner=ops@example.com",
-                "published_at": "2026-05-19T11:00:00Z",
-            }
-        ],
+        "results": files,
+        "status": "succeeded",
     }
     assert is_typed_google_read_output(capability_id="cap.drive.search", payload=populated)
 
 
 def test_drive_search_validator_rejects_missing_query() -> None:
     payload: dict[str, Any] = {
+        "schema_version": "google.drive.search_results.v1",
         "query": "",
+        "provider_account_id": "google",
         "retrieved_at": "2026-05-20T12:00:00Z",
         "results": [],
+        "status": "succeeded",
     }
     assert not is_typed_google_read_output(capability_id="cap.drive.search", payload=payload)
 
 
-def test_drive_read_validator_accepts_ok_and_degraded_outcomes() -> None:
-    ok_payload: dict[str, Any] = {
+def test_drive_validators_reject_missing_provider_account_id() -> None:
+    search_payload: dict[str, Any] = {
+        "schema_version": "google.drive.search_results.v1",
+        "query": "ops plan",
+        "retrieved_at": "2026-05-20T12:00:00Z",
+        "results": [],
+        "status": "succeeded",
+    }
+    assert not is_typed_google_read_output(capability_id="cap.drive.search", payload=search_payload)
+
+    read_payload: dict[str, Any] = {
+        "schema_version": "google.drive.read_result.v1",
         "file_id": "drv_1",
         "retrieved_at": "2026-05-20T12:00:00Z",
+        "title": "Q2 ops plan",
+        "source": "https://drive.google.com/file/d/drv_1/view",
+        "published_at": "2026-05-19T11:00:00Z",
         "content_excerpt": "Boundary text.",
         "truncated": False,
         "read_outcome": {"status": "ok", "reason_code": None, "recovery": None},
-        "results": [
-            {
-                "title": "Q2 ops plan",
-                "source": "https://drive.google.com/file/d/drv_1/view",
-                "snippet": "Boundary text.",
-                "published_at": "2026-05-19T11:00:00Z",
-            }
-        ],
+        "status": "succeeded",
+    }
+    assert not is_typed_google_read_output(capability_id="cap.drive.read", payload=read_payload)
+
+
+def test_drive_read_validator_accepts_ok_and_degraded_outcomes() -> None:
+    ok_read_outcome = {"status": "ok", "reason_code": None, "recovery": None}
+    ok_payload: dict[str, Any] = {
+        "schema_version": "google.drive.read_result.v1",
+        "file_id": "drv_1",
+        "provider_account_id": "google",
+        "retrieved_at": "2026-05-20T12:00:00Z",
+        "title": "Q2 ops plan",
+        "source": "https://drive.google.com/file/d/drv_1/view",
+        "published_at": "2026-05-19T11:00:00Z",
+        "content_excerpt": "Boundary text.",
+        "truncated": False,
+        "read_outcome": ok_read_outcome,
+        "status": "succeeded",
     }
     assert is_typed_google_read_output(capability_id="cap.drive.read", payload=ok_payload)
 
+    too_large_outcome = {
+        "status": "too_large",
+        "reason_code": "drive_read_too_large",
+        "recovery": "Open the file and request a smaller section, then retry.",
+    }
     too_large: dict[str, Any] = {
+        "schema_version": "google.drive.read_result.v1",
         "file_id": "drv_big",
+        "provider_account_id": "google",
         "retrieved_at": "2026-05-20T12:00:00Z",
+        "title": "Big Doc",
+        "source": "https://drive.google.com/file/d/drv_big/view",
+        "published_at": None,
         "content_excerpt": "",
         "truncated": False,
-        "read_outcome": {
-            "status": "too_large",
-            "reason_code": "drive_read_too_large",
-            "recovery": "Open the file and request a smaller section, then retry.",
-        },
-        "results": [
-            {
-                "title": "Big Doc",
-                "source": "https://drive.google.com/file/d/drv_big/view",
-                "snippet": "File exceeds read budget. Request a smaller section and retry.",
-                "published_at": None,
-            }
-        ],
+        "read_outcome": too_large_outcome,
+        "status": "succeeded",
     }
     assert is_typed_google_read_output(capability_id="cap.drive.read", payload=too_large)
 
 
 def test_drive_read_validator_rejects_unknown_read_outcome_status() -> None:
     payload: dict[str, Any] = {
+        "schema_version": "google.drive.read_result.v1",
         "file_id": "drv_1",
+        "provider_account_id": "google",
         "retrieved_at": "2026-05-20T12:00:00Z",
+        "title": "Q2 ops plan",
+        "source": "https://drive.google.com/file/d/drv_1/view",
+        "published_at": "2026-05-19T11:00:00Z",
         "content_excerpt": "",
         "truncated": False,
         "read_outcome": {"status": "exploded", "reason_code": None, "recovery": None},
-        "results": [],
+        "status": "succeeded",
     }
     assert not is_typed_google_read_output(capability_id="cap.drive.read", payload=payload)
+
+
+def test_drive_validators_reject_duplicate_aliases_and_extra_fields() -> None:
+    search_payload: dict[str, Any] = {
+        "schema_version": "google.drive.search_results.v1",
+        "query": "ops plan",
+        "provider_account_id": "google",
+        "retrieved_at": "2026-05-20T12:00:00Z",
+        "files": [],
+        "results": [],
+        "status": "succeeded",
+    }
+    assert not is_typed_google_read_output(capability_id="cap.drive.search", payload=search_payload)
+
+    read_payload: dict[str, Any] = {
+        "schema_version": "google.drive.read_result.v1",
+        "file_id": "drv_1",
+        "provider_account_id": "google",
+        "retrieved_at": "2026-05-20T12:00:00Z",
+        "title": "Q2 ops plan",
+        "source": "https://drive.google.com/file/d/drv_1/view",
+        "published_at": "2026-05-19T11:00:00Z",
+        "content_excerpt": "",
+        "truncated": False,
+        "read_outcome": {"status": "ok", "reason_code": None, "recovery": None},
+        "file": {
+            "file_id": "drv_1",
+            "content_excerpt": "",
+            "truncated": False,
+            "read_outcome": {"status": "ok", "reason_code": None, "recovery": None},
+        },
+        "results": [],
+        "status": "succeeded",
+    }
+    assert not is_typed_google_read_output(capability_id="cap.drive.read", payload=read_payload)
 
 
 def test_drive_share_validator_accepts_canonical_share_output() -> None:

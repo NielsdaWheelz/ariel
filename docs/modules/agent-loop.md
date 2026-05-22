@@ -196,9 +196,9 @@ run is persisted as a `TurnRecord` with `kind="research"` — no new table. Its
 read syscalls write `action_attempts` rows like any turn; it stages no
 approvals.
 
-**The two modes.** A research run is in exactly one of two mutually exclusive
-modes — the "Rule of Two": a run is exposed to at most two of {untrusted input,
-private data, outbound reach}, never all three.
+**The modes.** A research run is in exactly one mutually exclusive mode. It is
+exposed to at most two of {untrusted input, private data, outbound reach}, never
+all three.
 
 - **`web`** — whitelist `RESEARCH_WEB_CAPABILITY_IDS`: `cap.search.web`,
   `cap.search.news`, `cap.web.extract`. Untrusted input and outbound reach; no
@@ -207,8 +207,12 @@ private data, outbound reach}, never all three.
   `cap.email.search`, `cap.email.read`, `cap.drive.search`, `cap.drive.read`,
   `cap.calendar.list`. Private data and untrusted input (the mailbox is
   attacker-influenced); no outbound web reach.
+- **`memories`** — whitelist `RESEARCH_MEMORIES_CAPABILITY_IDS`:
+  `cap.memory.search`, `cap.memory.read`. Ariel-owned memory substrate only; no
+  outbound web reach or live provider reads.
 
-A run never holds both whitelists. A task needing both is two runs; the main
+A run never holds multiple whitelists. A task needing more than one mode is split
+into separate runs; the main
 agent combines their findings — coupled synthesis stays with the single main
 thread.
 

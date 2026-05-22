@@ -15,7 +15,7 @@ import ariel.policy_engine as policy_engine_module
 from ariel.app import ModelAdapter, create_app
 from tests.integration.responses_helpers import (
     empty_recall_response,
-    is_retriever_call,
+    is_memory_subsystem_call,
     post_message_and_drain,
     responses_message,
     responses_with_run_calls,
@@ -44,7 +44,7 @@ class ActionRunAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+        if is_memory_subsystem_call(input_items):
             return empty_recall_response(
                 provider=self.provider, model=self.model, input_items=input_items
             )
@@ -199,6 +199,26 @@ def _assert_source_contract(source: dict[str, Any]) -> None:
     assert isinstance(source["source"], str)
     assert isinstance(source["retrieved_at"], str)
     assert source["published_at"] is None or isinstance(source["published_at"], str)
+
+
+def _weather_output(
+    input_payload: dict[str, Any],
+    *,
+    forecast_time: str,
+    retrieved_at: str,
+    summary: str,
+) -> dict[str, Any]:
+    return {
+        "location": input_payload["location"],
+        "timeframe": input_payload["timeframe"],
+        "retrieved_at": retrieved_at,
+        "forecast": {
+            "summary": summary,
+            "source": "https://weather.example/forecast",
+            "timestamp": forecast_time,
+        },
+        "status": "succeeded",
+    }
 
 
 def test_s3_pr02_news_results_have_sources_citations_and_allowlisted_read_lifecycle(
@@ -386,20 +406,12 @@ def test_s3_pr02_weather_explicit_location_wins_and_response_contains_location_t
     def mutate(capability: CapabilityDefinition) -> CapabilityDefinition:
         def execute(input_payload: dict[str, Any]) -> dict[str, Any]:
             captured_inputs.append(dict(input_payload))
-            return {
-                "location": input_payload["location"],
-                "timeframe": input_payload["timeframe"],
-                "forecast_timestamp": "2026-03-03T13:00:00Z",
-                "retrieved_at": "2026-03-03T12:59:30Z",
-                "results": [
-                    {
-                        "title": f"Forecast for {input_payload['location']}",
-                        "source": "https://weather.example/forecast",
-                        "snippet": "Light rain expected, highs near 14C.",
-                        "published_at": "2026-03-03T12:58:00Z",
-                    }
-                ],
-            }
+            return _weather_output(
+                input_payload,
+                forecast_time="2026-03-03T13:00:00Z",
+                retrieved_at="2026-03-03T12:59:30Z",
+                summary="Light rain expected, highs near 14C.",
+            )
 
         return replace(capability, execute=execute)
 
@@ -443,6 +455,13 @@ def test_s3_pr02_weather_explicit_location_wins_and_response_contains_location_t
         assert attempt["proposal"]["capability_id"] == "cap.weather.forecast"
         assert attempt["policy"]["decision"] == "allow_inline"
         assert attempt["execution"]["status"] == "succeeded"
+        output = attempt["execution"]["output"]
+        assert set(output) == {"location", "timeframe", "retrieved_at", "forecast", "status"}
+        assert output["forecast"] == {
+            "summary": "Light rain expected, highs near 14C.",
+            "source": "https://weather.example/forecast",
+            "timestamp": "2026-03-03T13:00:00Z",
+        }
 
 
 def test_s3_pr02_weather_default_location_is_canonical_state_with_env_bootstrap_once_only(
@@ -455,20 +474,12 @@ def test_s3_pr02_weather_default_location_is_canonical_state_with_env_bootstrap_
     def mutate(capability: CapabilityDefinition) -> CapabilityDefinition:
         def execute(input_payload: dict[str, Any]) -> dict[str, Any]:
             captured_inputs.append(dict(input_payload))
-            return {
-                "location": input_payload["location"],
-                "timeframe": input_payload["timeframe"],
-                "forecast_timestamp": "2026-03-03T17:00:00Z",
-                "retrieved_at": "2026-03-03T16:59:00Z",
-                "results": [
-                    {
-                        "title": f"Forecast for {input_payload['location']}",
-                        "source": "https://weather.example/forecast",
-                        "snippet": "Cloudy with occasional sun breaks.",
-                        "published_at": "2026-03-03T16:58:00Z",
-                    }
-                ],
-            }
+            return _weather_output(
+                input_payload,
+                forecast_time="2026-03-03T17:00:00Z",
+                retrieved_at="2026-03-03T16:59:00Z",
+                summary="Cloudy with occasional sun breaks.",
+            )
 
         return replace(capability, execute=execute)
 
@@ -517,13 +528,12 @@ def test_s3_pr02_weather_without_resolvable_location_asks_clarification_instead_
         def execute(input_payload: dict[str, Any]) -> dict[str, Any]:
             if input_payload.get("location") is None:
                 raise RuntimeError("weather_location_required")
-            return {
-                "location": input_payload["location"],
-                "timeframe": input_payload["timeframe"],
-                "forecast_timestamp": "2026-03-03T13:00:00Z",
-                "retrieved_at": "2026-03-03T12:59:30Z",
-                "results": [],
-            }
+            return _weather_output(
+                input_payload,
+                forecast_time="2026-03-03T13:00:00Z",
+                retrieved_at="2026-03-03T12:59:30Z",
+                summary="Weather forecast available.",
+            )
 
         return replace(capability, execute=execute)
 

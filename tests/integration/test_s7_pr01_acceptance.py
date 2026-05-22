@@ -16,7 +16,7 @@ import ariel.policy_engine as policy_engine_module
 from ariel.app import ModelAdapter, create_app
 from tests.integration.responses_helpers import (
     empty_recall_response,
-    is_retriever_call,
+    is_memory_subsystem_call,
     post_message_and_drain,
     responses_message,
     responses_with_run_calls,
@@ -45,7 +45,7 @@ class ActionRunAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+        if is_memory_subsystem_call(input_items):
             return empty_recall_response(
                 provider=self.provider, model=self.model, input_items=input_items
             )
@@ -314,12 +314,30 @@ def test_s7_pr01_web_extract_executes_inline_with_structured_output_citations_an
         assert attempt["execution"]["status"] == "succeeded"
 
         output = attempt["execution"]["output"]
+        assert set(output) == {"url", "status", "extract_outcome", "document", "provider"}
+        assert output["status"] == "succeeded"
+        assert output["url"] == "https://example.com/research/article?utm_source=rss"
         assert output["extract_outcome"]["status"] == "ok"
-        assert output["canonical_url"] == "https://example.com/research/article"
+        assert output["extract_outcome"]["reason_code"] is None
+        assert output["extract_outcome"]["recovery"] is None
+        assert set(output["document"]) == {
+            "title",
+            "canonical_source",
+            "resolved_url",
+            "retrieved_at",
+            "published_at",
+            "language",
+            "content_chars",
+            "content_blocks",
+        }
         assert output["document"]["canonical_source"] == "https://example.com/research/article"
-        assert output["document"]["truncated"] is False
+        assert output["document"]["retrieved_at"] == "2026-03-07T05:00:00Z"
         assert isinstance(output["document"]["content_blocks"], list)
         assert output["document"]["content_blocks"]
+        assert output["provider"] == {
+            "endpoint": "https://extract.provider.test/v1/extract",
+            "attempt_count": 1,
+        }
 
         assert len(outbound_calls) == 1
         assert outbound_calls[0]["url"] == "https://extract.provider.test/v1/extract"
@@ -711,7 +729,6 @@ def test_s7_pr01_public_ipv6_urls_remain_allowed_and_canonical(
         attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "succeeded"
         output = attempt["execution"]["output"]
-        assert output["canonical_url"] == "https://[2606:4700:4700::1111]/research/article"
         assert (
             output["document"]["canonical_source"]
             == "https://[2606:4700:4700::1111]/research/article"
@@ -760,8 +777,6 @@ def test_s7_pr01_large_pages_are_bounded_and_partial_disclosure_is_explicit(
         output = attempt["execution"]["output"]
         assert output["extract_outcome"]["status"] == "partial"
         assert output["extract_outcome"]["reason_code"] == "content_truncated"
-        assert output["document"]["truncated"] is True
-        assert output["document"]["truncation_reason"] == "content_truncated"
         assert output["document"]["content_chars"] <= 4000
         message = turn_data["assistant_message"].lower()
         assert "partial" in message

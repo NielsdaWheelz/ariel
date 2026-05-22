@@ -12,7 +12,7 @@ from ariel.app import ModelAdapter, create_app
 from ariel.persistence import ProviderWriteReceiptRecord
 from tests.integration.responses_helpers import (
     empty_recall_response,
-    is_retriever_call,
+    is_memory_subsystem_call,
     post_message_and_drain,
     process_queued_action_execution,
     responses_with_run_calls,
@@ -44,7 +44,7 @@ class ActionProposalAdapter:
         history: list[dict[str, Any]],
         context_bundle: dict[str, Any],
     ) -> dict[str, Any]:
-        if is_retriever_call(input_items):
+        if is_memory_subsystem_call(input_items):
             return empty_recall_response(
                 provider=self.provider, model=self.model, input_items=input_items
             )

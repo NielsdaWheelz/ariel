@@ -1723,7 +1723,7 @@ def _tool_surface_facts(
             "search_web": search_web_bound,
             "search_news": settings.search_news_api_key is not None or search_web_bound,
             "maps": settings.maps_api_key is not None,
-            "weather": settings.weather_provider_mode == "dev_fallback"
+            "weather": settings.weather_provider_mode == "dev"
             or settings.weather_production_api_key is not None,
         },
     }
