@@ -60,9 +60,9 @@ def load_local_env(
     """Merge env-file values with the process environment, honoring ``ARIEL_ENV_FILE``.
 
     When ``ARIEL_ENV_FILE`` is set in ``environ`` (e.g., ``.env.dev``), only that
-    file is read — the prod ``.env.local`` is bypassed entirely. When unset, the
-    default ``.env`` then ``.env.local`` stack is used so prod/systemd behavior
-    is unchanged. The process environment always wins last.
+    file is read — the default ``.env.local`` is bypassed entirely. When unset,
+    the default ``.env`` then ``.env.local`` stack is used. The process
+    environment always wins last.
     """
     proc_env = dict(environ or os.environ)
     override = proc_env.get("ARIEL_ENV_FILE", "").strip()

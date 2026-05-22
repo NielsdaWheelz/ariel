@@ -19,9 +19,9 @@ _LOCAL_AUTH_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,}$")
 _PUBSUB_SUBSCRIPTION_PATTERN = re.compile(
     r"^projects/[a-z][a-z0-9-]{4,28}[a-z0-9]/subscriptions/[A-Za-z][A-Za-z0-9_.~+%-]{2,254}$"
 )
-# Default env-file stack: `.env` for shared local defaults, `.env.local` for the
-# production env that systemd reads. Dev workflows set `ARIEL_ENV_FILE` (e.g.,
-# to `.env.dev`) to swap in an isolated env file without touching the prod one.
+# Default env-file stack: `.env` for shared local defaults, `.env.local` for
+# local secrets and overrides. Dev workflows set `ARIEL_ENV_FILE` (e.g., to
+# `.env.dev`) to swap in an isolated env file without touching local defaults.
 _DEFAULT_ENV_FILES = (_PROJECT_ROOT / ".env", _PROJECT_ROOT / ".env.local")
 
 

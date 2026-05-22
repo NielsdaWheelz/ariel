@@ -13,13 +13,13 @@ Two parallel stacks coexist on the host:
 
 | Concern             | Production (systemd)                 | Dev (`make dev-*`)                          |
 | ------------------- | ------------------------------------ | ------------------------------------------- |
-| Env file            | `.env.local`                         | `.env.dev`                                  |
-| Env-file selector   | (default — `.env` + `.env.local`)    | `ARIEL_ENV_FILE=.env.dev`                   |
+| Env file            | `/etc/ariel/ariel.env`               | `.env.dev`                                  |
+| Env-file selector   | systemd `EnvironmentFile`            | `ARIEL_ENV_FILE=.env.dev`                   |
 | Postgres container  | `ariel-postgres`                     | `ariel-postgres-dev`                        |
 | Postgres port       | `127.0.0.1:5433`                     | `127.0.0.1:5435`                            |
 | Postgres volume     | `ariel-postgres-data`                | `ariel-postgres-dev-data`                   |
 | API bind            | `127.0.0.1:8000`                     | `127.0.0.1:8001`                            |
-| Discord bot token   | prod token in `.env.local`           | (operator paste a separate dev bot token)   |
+| Discord bot token   | prod token in `/etc/ariel/ariel.env` | (operator paste a separate dev bot token)   |
 | Process supervisor  | `systemd` (`ariel-api`, `-worker`, `-discord`, `-pubsub`) | foreground `make dev-api`, `dev-worker`, `dev-discord` |
 
 The two stacks share nothing at runtime: different DB, different port, different
@@ -32,7 +32,8 @@ A single env var, `ARIEL_ENV_FILE`, controls which env file the app and dev
 helpers load. Both [`src/ariel/config.py`](../src/ariel/config.py) (`AppSettings`
 via pydantic-settings) and [`src/ariel/dev_db.py`](../src/ariel/dev_db.py)
 honor it: when set, only that file is read; when unset, the default
-`.env` + `.env.local` stack is used so prod/systemd behavior is unchanged.
+`.env` + `.env.local` stack is used by local commands. Production systemd units
+load `/etc/ariel/ariel.env` via `EnvironmentFile`.
 
 `alembic upgrade head` inherits the same selection because
 [`alembic/env.py`](../alembic/env.py) builds `AppSettings()` to discover the
@@ -71,9 +72,10 @@ without retyping the env var.
 ## Coexistence with prod
 
 Prod runs as four systemd units (`ariel-api`, `ariel-worker`, `ariel-discord`,
-`ariel-pubsub`) backed by `.env.local` and the `ariel-postgres` container on
-`:5433`. Dev runs as foreground `make` targets backed by `.env.dev` and the
-`ariel-postgres-dev` container on `:5435`. Confirm both are healthy at once:
+`ariel-pubsub`) backed by `/etc/ariel/ariel.env` and the `ariel-postgres`
+container on `:5433`. Dev runs as foreground `make` targets backed by
+`.env.dev` and the `ariel-postgres-dev` container on `:5435`. Confirm both are
+healthy at once:
 
 ```sh
 systemctl is-active ariel-api ariel-worker ariel-discord ariel-pubsub
@@ -85,9 +87,9 @@ curl -fsS http://127.0.0.1:8001/v1/health  # dev (only while `make dev-api` is r
 
 ## Discord in dev
 
-The prod bot connects to Discord with the token in `.env.local`. Reusing that
-same token from `make dev-discord` would race the prod bot — both processes
-would receive every owner DM and the user would see duplicate replies.
+The prod bot connects to Discord with the token in `/etc/ariel/ariel.env`.
+Reusing that same token from `make dev-discord` would race the prod bot — both
+processes would receive every owner DM and the user would see duplicate replies.
 
 Two options:
 
@@ -141,9 +143,9 @@ removes both. Neither touches the prod container.
 
 - `make dev-*` targets never read `.env.local`.
 - `make db-*` targets continue to operate against whatever `ARIEL_DATABASE_URL`
-  resolves to in `.env` + `.env.local` (i.e., the prod container while
-  `.env.local` points at `:5433`). Do not run them while you want dev
-  isolation — use `make dev-*` instead.
+  resolves to in `.env` + `.env.local` (which may be the prod container in a
+  local checkout). Do not run them while you want dev isolation — use
+  `make dev-*` instead.
 - The prod systemd units inherit no shell env, so a developer exporting
   `ARIEL_ENV_FILE=.env.dev` in their interactive shell cannot accidentally
   redirect a prod systemd restart at the dev DB.

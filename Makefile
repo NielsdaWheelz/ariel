@@ -10,7 +10,7 @@ UVICORN_CMD := .venv/bin/uvicorn ariel.app:create_app --factory --host 127.0.0.1
 
 # Isolated local dev environment. Every dev-* target sets ARIEL_ENV_FILE so the
 # app, dev_db helper, and alembic all resolve config from `.env.dev` instead of
-# `.env.local` (which systemd reads for prod). Dev defaults to a separate
+# the default `.env` + `.env.local` stack. Dev defaults to a separate
 # container `ariel-postgres-dev` on port 5435 and a separate API on port 8001 —
 # see docs/dev-environment.md.
 DEV_ENV_FILE := .env.dev
@@ -167,7 +167,7 @@ e2e: check-venv
 # ── Isolated dev env (ARIEL_ENV_FILE=.env.dev) ─────────────────────────
 # These targets never read .env.local; they operate against a parallel
 # container (ariel-postgres-dev on 127.0.0.1:5435) and a parallel API on
-# 127.0.0.1:8001. The prod systemd services keep using .env.local.
+# 127.0.0.1:8001. The prod systemd services are unaffected.
 
 dev-init:
 	@if [ ! -f "$(DEV_ENV_FILE)" ]; then \

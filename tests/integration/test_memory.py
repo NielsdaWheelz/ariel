@@ -30,7 +30,7 @@ from ariel.capability_registry import capability_id_for_run_callable, get_capabi
 from ariel.persistence import BackgroundTaskRecord, MemoryLogRecord, MemoryNoteRecord
 from ariel.worker import process_one_task
 from tests.fake_sandbox import FakeSandboxRuntime
-from tests.integration.responses_helpers import post_message_and_drain
+from tests.integration.responses_helpers import drain_task, post_message_and_drain
 
 _id_counter = count(1)
 
@@ -775,13 +775,8 @@ def test_worker_memory_dream_task_inserts_turn_against_system_session(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """End-to-end via ``process_one_task``: a queued ``memory_dream`` task runs
-    cleanly on a fresh DB and the turn row is attached to the system session.
-
-    ``process_one_task`` is called repeatedly until a ``memory_dream`` turn
-    exists; each call processes at most one task and the worker also seeds
-    provider-maintenance tasks alongside the dream, so the dream may not be
-    the first task popped on a single iteration."""
+    """A queued ``memory_dream`` task runs cleanly on a fresh DB and attaches
+    the turn row to the system session."""
     from ariel.persistence import SYSTEM_SESSION_ID, TurnRecord, enqueue_background_task
 
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
@@ -797,30 +792,17 @@ def test_worker_memory_dream_task_inserts_turn_against_system_session(
 
         with sf() as db:
             with db.begin():
-                enqueue_background_task(db, task_type="memory_dream", payload={}, now=NOW)
+                task = enqueue_background_task(
+                    db, task_type="memory_dream", payload={}, now=NOW
+                )
+                task_id = task.id
 
-        # Drain at most a handful of tasks; on a fresh DB the queue is small
-        # (memory_dream + the provider-maintenance seeds). The dream is the
-        # only task that creates a memory_dream turn; other tasks may fail in
-        # the test environment (missing google connector, etc.) which is fine.
-        dream_turn_present = False
-        for _ in range(6):
-            processed = process_one_task(
-                session_factory=sf, settings=runtime.settings, runtime=runtime
-            )
-            with sf() as db:
-                dream_turn = db.scalar(select(TurnRecord).where(TurnRecord.kind == "memory_dream"))
-            if dream_turn is not None:
-                dream_turn_present = True
-                break
-            if not processed:
-                break
-
-        assert dream_turn_present, "memory_dream task must produce a memory_dream turn"
+        drain_task(client, task_id)
         with sf() as db:
             dream_turns = db.scalars(
                 select(TurnRecord).where(TurnRecord.kind == "memory_dream")
             ).all()
+        assert dream_turns, "memory_dream task must produce a memory_dream turn"
         assert all(t.session_id == SYSTEM_SESSION_ID for t in dream_turns), (
             "every memory_dream turn must reference the system session"
         )

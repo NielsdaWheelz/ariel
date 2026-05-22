@@ -610,7 +610,7 @@ Validators:
 `provider_reconcile_sync_interval_seconds`, all OAuth client id/secret
 settings.
 
-### `.env.local` end state for the prod VPS
+### `/etc/ariel/ariel.env` end state for the prod VPS
 
 ```
 ARIEL_DEPLOYMENT_MODE=production
@@ -641,7 +641,8 @@ ARIEL_GOOGLE_APPLICATION_CREDENTIALS_PATH=/etc/ariel/secrets/gcp-pubsub-sa.json
   `gmail-api-push@system.gserviceaccount.com`, Publisher on DLQ for the
   Pub/Sub service agent, Subscriber + Viewer on source sub for the runtime SA,
   Subscriber on DLQ sub for the runtime SA). Inputs: `GCP_PROJECT`,
-  `RUNTIME_SA_EMAIL`. Outputs: full resource paths to paste into `.env.local`.
+  `RUNTIME_SA_EMAIL`. Outputs: full resource paths to paste into
+  `/etc/ariel/ariel.env`.
 - `scripts/gcp_create_runtime_sa.sh` — `gcloud`-based: creates the runtime
   service account, creates a key, writes it to
   `~/.ariel-secrets/gcp-pubsub-sa.json` with `chmod 600`. Re-running rotates
@@ -954,7 +955,7 @@ Docs-only. Lands after P1–P4 have shipped.
    - `bash scripts/gcp_provision_pubsub.sh` → prints the topic and
      subscription full resource paths.
 
-4. **Configure `.env.local`**
+4. **Configure `/etc/ariel/ariel.env`**
    - Fill in `ARIEL_PUBLIC_WEBHOOK_BASE_URL`,
      `ARIEL_GOOGLE_OAUTH_CLIENT_ID/SECRET`,
      `ARIEL_GOOGLE_PROVIDER_EVENT_TOKEN` (`python -c 'import secrets;

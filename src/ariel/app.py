@@ -1490,18 +1490,14 @@ class Runtime:
     session_factory: sessionmaker[Session]
 
 
-def _open_jobs_context(*, db: Session) -> list[dict[str, Any]]:
+def _open_commitments_and_jobs_context(*, db: Session) -> dict[str, Any]:
     jobs = db.scalars(
         select(JobRecord)
         .where(JobRecord.status.in_(("queued", "running", "waiting_approval")))
         .order_by(JobRecord.updated_at.desc(), JobRecord.id.desc())
         .limit(12)
     ).all()
-    return [serialize_job(job) for job in jobs]
-
-
-def _open_commitments_and_jobs_context(*, db: Session) -> dict[str, Any]:
-    return {"open_jobs": _open_jobs_context(db=db)}
+    return {"open_jobs": [serialize_job(job) for job in jobs]}
 
 
 def _relevant_artifacts_and_observations_context(

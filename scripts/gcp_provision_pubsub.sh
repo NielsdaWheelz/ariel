@@ -88,6 +88,6 @@ gcloud pubsub subscriptions add-iam-policy-binding "$DLQ_SUB" --project="$GCP_PR
 ok "$DLQ_SUB: $RUNTIME_SA → roles/pubsub.subscriber"
 
 # ── 7. Print env var lines ─────────────────────────────────────────────
-info "Paste these into .env.local"
+info "Paste these into /etc/ariel/ariel.env"
 printf '  ARIEL_GOOGLE_PUBSUB_TOPIC=projects/%s/topics/%s\n' "$GCP_PROJECT" "$TOPIC"
 printf '  ARIEL_GOOGLE_PUBSUB_SUBSCRIPTION=projects/%s/subscriptions/%s\n\n' "$GCP_PROJECT" "$SUB"
