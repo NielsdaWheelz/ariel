@@ -382,6 +382,23 @@ def test_provider_runtime_settings_load_from_env(monkeypatch: pytest.MonkeyPatch
     assert settings.weather_default_location == "Austin, TX"
 
 
+def test_attachment_scanner_mode_normalizes_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARIEL_ATTACHMENT_SCANNER_MODE", " FAIL_CLOSED ")
+
+    settings = _app_settings_without_env_files()
+
+    assert settings.attachment_scanner_mode == "fail_closed"
+
+
+def test_attachment_scanner_mode_rejects_unknown_env_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARIEL_ATTACHMENT_SCANNER_MODE", "permissive")
+
+    with pytest.raises(ValidationError, match="attachment_scanner_mode"):
+        _app_settings_without_env_files()
+
+
 @pytest.mark.parametrize(
     "env_name",
     [

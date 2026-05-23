@@ -4,13 +4,13 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 
-from ariel.attachment_content import AttachmentContentRuntime
+from ariel.attachment_content import AttachmentContentRuntime, AttachmentScannerMode
 from ariel.ids import new_id
 from ariel.persistence import SessionRecord, TurnRecord
 
@@ -22,7 +22,7 @@ ATTACHMENT_REF = "discord:131415"
 DOWNLOAD_URL = "https://cdn.discordapp.com/attachments/report.txt"
 
 
-def _runtime(tmp_path: Path, *, scanner_mode: str) -> AttachmentContentRuntime:
+def _runtime(tmp_path: Path, *, scanner_mode: AttachmentScannerMode) -> AttachmentContentRuntime:
     return AttachmentContentRuntime(
         blob_store_path=str(tmp_path / "attachments"),
         max_bytes=25 * 1024 * 1024,
@@ -37,6 +37,24 @@ def _runtime(tmp_path: Path, *, scanner_mode: str) -> AttachmentContentRuntime:
         encryption_key_version="v1",
         encryption_keys=None,
     )
+
+
+def test_attachment_runtime_rejects_unknown_scanner_mode(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="scanner_mode must be one of: disabled, fail_closed"):
+        AttachmentContentRuntime(
+            blob_store_path=str(tmp_path / "attachments"),
+            max_bytes=25 * 1024 * 1024,
+            fetch_timeout_seconds=10.0,
+            handle_ttl_seconds=86_400,
+            scanner_mode=cast(Any, "permissive"),
+            openai_api_key=None,
+            openai_model="gpt-5.5",
+            openai_audio_model="gpt-4o-transcribe",
+            openai_timeout_seconds=30.0,
+            encryption_secret="test-attachment-secret",
+            encryption_key_version="v1",
+            encryption_keys=None,
+        )
 
 
 def _patch_discord_download(monkeypatch: pytest.MonkeyPatch, *, body: bytes) -> None:

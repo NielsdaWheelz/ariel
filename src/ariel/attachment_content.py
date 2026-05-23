@@ -30,6 +30,7 @@ _MAX_BLOCKS = 4
 _MAX_BLOCK_CHARS = 2000
 _MAX_TOTAL_CHARS = 6000
 _EXTRACTOR_VERSION = "1.0"
+AttachmentScannerMode = Literal["disabled", "fail_closed"]
 _ATTACHMENT_RECOVERY: dict[str, str] = {
     "unsupported_type": "Upload a text, PDF, image, or audio attachment.",
     "too_large": "Upload a smaller attachment or share the relevant excerpt as text.",
@@ -56,7 +57,7 @@ class AttachmentContentRuntime:
     max_bytes: int
     fetch_timeout_seconds: float
     handle_ttl_seconds: int
-    scanner_mode: str
+    scanner_mode: AttachmentScannerMode
     openai_api_key: str | None
     openai_model: str
     openai_audio_model: str
@@ -64,6 +65,10 @@ class AttachmentContentRuntime:
     encryption_secret: str
     encryption_key_version: str
     encryption_keys: str | None
+
+    def __post_init__(self) -> None:
+        if self.scanner_mode not in ("disabled", "fail_closed"):
+            raise ValueError("scanner_mode must be one of: disabled, fail_closed")
 
     def record_discord_sources(
         self,

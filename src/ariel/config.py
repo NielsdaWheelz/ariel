@@ -4,7 +4,7 @@ import os
 from ipaddress import ip_address
 from pathlib import Path
 import re
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from pydantic import field_validator, model_validator
@@ -102,7 +102,7 @@ class AppSettings(BaseSettings):
     attachment_max_bytes: int = 25 * 1024 * 1024
     attachment_fetch_timeout_seconds: float = 10.0
     attachment_handle_ttl_seconds: int = 3600
-    attachment_scanner_mode: str = "fail_closed"
+    attachment_scanner_mode: Literal["disabled", "fail_closed"] = "fail_closed"
     attachment_openai_model: str = "gpt-5.5"
     attachment_openai_audio_model: str = "gpt-4o-transcribe"
     attachment_openai_timeout_seconds: float = 30.0
@@ -556,10 +556,12 @@ class AppSettings(BaseSettings):
             raise ValueError("attachment settings must not be blank")
         return normalized
 
-    @field_validator("attachment_scanner_mode")
+    @field_validator("attachment_scanner_mode", mode="before")
     @classmethod
-    def _attachment_scanner_mode_must_be_supported(cls, value: str) -> str:
-        normalized = value.strip().lower()
+    def _attachment_scanner_mode_must_be_supported(
+        cls, value: object
+    ) -> Literal["disabled", "fail_closed"]:
+        normalized = value.strip().lower() if isinstance(value, str) else ""
         if normalized not in {"disabled", "fail_closed"}:
             raise ValueError("attachment_scanner_mode must be one of: disabled, fail_closed")
-        return normalized
+        return "disabled" if normalized == "disabled" else "fail_closed"

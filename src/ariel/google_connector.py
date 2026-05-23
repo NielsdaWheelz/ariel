@@ -47,8 +47,7 @@ GOOGLE_DRIVE_METADATA_READ_SCOPE = "https://www.googleapis.com/auth/drive.metada
 GOOGLE_DRIVE_READ_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
 GOOGLE_DRIVE_SHARE_SCOPE = "https://www.googleapis.com/auth/drive"
 # OpenID Connect identity scopes let /oauth2/v3/userinfo return the account
-# identity required for new OAuth callbacks. Older persisted connectors may
-# still lack identity metadata until reconnect.
+# identity used for readiness, sync, provider-object ownership, and audit.
 GOOGLE_OPENID_SCOPE = "openid"
 GOOGLE_USERINFO_EMAIL_SCOPE = "https://www.googleapis.com/auth/userinfo.email"
 GOOGLE_USERINFO_PROFILE_SCOPE = "https://www.googleapis.com/auth/userinfo.profile"
@@ -89,20 +88,44 @@ def _non_empty_provider_account_id(provider_account_id: str) -> str:
     return normalized
 
 
+def google_account_subject(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if not normalized or normalized == "unknown-subject":
+        return None
+    return normalized
+
+
+def google_account_email(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if not normalized or normalized == "unknown-email":
+        return None
+    return normalized
+
+
+def google_connector_has_account_identity(connector: GoogleConnectorRecord) -> bool:
+    return (
+        google_account_subject(connector.account_subject) is not None
+        and google_account_email(connector.account_email) is not None
+    )
+
+
 GOOGLE_CAPABILITY_IDS = frozenset(GOOGLE_CAPABILITY_SCOPES.keys())
 GOOGLE_RECONNECT_INTENT_EXTRA_SCOPES: dict[str, set[str]] = {
     "cap.calendar.propose_slots": {GOOGLE_CALENDAR_FREEBUSY_SCOPE},
 }
 
 _GOOGLE_MINIMUM_READ_SCOPES = {GOOGLE_CALENDAR_READ_SCOPE, GOOGLE_GMAIL_READ_SCOPE}
-# Identity scopes are required for successful new OAuth callbacks, but not for
-# readiness of already-persisted pre-identity connectors.
 _GOOGLE_DEFAULT_REQUESTED_SCOPES = _GOOGLE_MINIMUM_READ_SCOPES | {
     GOOGLE_OPENID_SCOPE,
     GOOGLE_USERINFO_EMAIL_SCOPE,
     GOOGLE_USERINFO_PROFILE_SCOPE,
 }
 _READINESS_BLOCKING_FAILURE_CODES = {
+    "account_identity_missing",
     "consent_required",
     "scope_missing",
     "access_revoked",
@@ -118,6 +141,7 @@ _READINESS_TRANSIENT_FAILURE_CODES = {
 
 TypedAuthFailureClass = Literal[
     "not_connected",
+    "account_identity_missing",
     "consent_required",
     "scope_missing",
     "token_expired",
@@ -155,6 +179,7 @@ OAuthRevokeFailureCode = Literal[
 
 _AUTH_FAILURE_RECOVERY: dict[TypedAuthFailureClass, str] = {
     "not_connected": "Connect Google to continue.",
+    "account_identity_missing": "Reconnect Google to refresh account identity.",
     "consent_required": "Reconnect Google and grant the requested scope.",
     "scope_missing": "Reconnect Google and re-consent to required scopes.",
     "token_expired": "Retry once; if it still fails, reconnect Google.",
@@ -3553,11 +3578,8 @@ def _resolve_reconnect_scopes(
     granted_scopes: list[str],
     capability_intent: str | None,
 ) -> tuple[list[str], str | None]:
-    # Always request at least the current default set so that scopes added to
-    # the default after a user first connected (e.g. identity scopes) reach
-    # them on reconnect — without this union an existing user with only
-    # gmail.readonly + calendar.readonly granted would re-grant the same
-    # narrow set and never pick up openid/email/profile.
+    # Reconnect preserves existing grants while always requesting the current
+    # baseline read and identity scopes.
     requested_scopes = set(_normalize_scope_list(granted_scopes)) | set(
         _GOOGLE_DEFAULT_REQUESTED_SCOPES
     )
@@ -4555,6 +4577,8 @@ def _readiness(connector: GoogleConnectorRecord | None) -> str:
         return "not_connected"
     if connector.status != "connected":
         return "reconnect_required"
+    if not google_connector_has_account_identity(connector):
+        return "reconnect_required"
     if _is_blocking_readiness_failure(connector.last_error_code):
         return "reconnect_required"
     granted_scopes = set(_normalize_scope_list(connector.granted_scopes))
@@ -5094,7 +5118,7 @@ class GoogleConnectorRuntime:
                 db=db,
                 access_token=access_token,
                 granted_scopes=granted_scopes,
-                account_subject=connector.account_subject or connector.id,
+                account_subject=account_subject,
                 now_fn=now_fn,
                 new_id_fn=new_id_fn,
             )
@@ -5834,9 +5858,15 @@ class GoogleConnectorRuntime:
             return None, set(), None, self._typed_failure(failure_class="not_connected")
         if connector.status == "revoked":
             return None, set(), None, self._typed_failure(failure_class="access_revoked")
-        provider_account_id = connector.account_subject
-        if provider_account_id is None or not provider_account_id.strip():
-            return None, set(), None, self._typed_failure(failure_class="not_connected")
+        provider_account_id = google_account_subject(connector.account_subject)
+        if provider_account_id is None or google_account_email(connector.account_email) is None:
+            _set_connector_error(
+                connector=connector,
+                error_code="account_identity_missing",
+                now_fn=now_fn,
+                preserve_existing_blocking=True,
+            )
+            return None, set(), None, self._typed_failure(failure_class="account_identity_missing")
         granted_scopes = set(_normalize_scope_list(connector.granted_scopes))
         if not required_scopes.issubset(granted_scopes):
             _set_connector_error(
@@ -5914,9 +5944,15 @@ class GoogleConnectorRuntime:
             return None, set(), None, self._typed_failure(failure_class="not_connected")
         if connector.status == "revoked":
             return None, set(), None, self._typed_failure(failure_class="access_revoked")
-        provider_account_id = connector.account_subject
-        if provider_account_id is None or not provider_account_id.strip():
-            return None, set(), None, self._typed_failure(failure_class="not_connected")
+        provider_account_id = google_account_subject(connector.account_subject)
+        if provider_account_id is None or google_account_email(connector.account_email) is None:
+            _set_connector_error(
+                connector=connector,
+                error_code="account_identity_missing",
+                now_fn=now_fn,
+                preserve_existing_blocking=True,
+            )
+            return None, set(), None, self._typed_failure(failure_class="account_identity_missing")
         granted_scopes = set(_normalize_scope_list(connector.granted_scopes))
         if not required_scopes.issubset(granted_scopes):
             _set_connector_error(
@@ -6159,6 +6195,14 @@ class GoogleConnectorRuntime:
             raise GoogleProviderRequestFailure("not_connected")
         if connector.status == "revoked":
             raise GoogleProviderRequestFailure("access_revoked")
+        if not google_connector_has_account_identity(connector):
+            _set_connector_error(
+                connector=connector,
+                error_code="account_identity_missing",
+                now_fn=now_fn,
+                preserve_existing_blocking=True,
+            )
+            raise GoogleProviderRequestFailure("account_identity_missing")
         access_token, refresh_failure = self._refresh_access_token_if_needed(
             db=db,
             connector=connector,
@@ -6182,6 +6226,14 @@ class GoogleConnectorRuntime:
             raise GoogleProviderRequestFailure("not_connected")
         if connector.status == "revoked":
             raise GoogleProviderRequestFailure("access_revoked")
+        if not google_connector_has_account_identity(connector):
+            _set_connector_error(
+                connector=connector,
+                error_code="account_identity_missing",
+                now_fn=now_fn,
+                preserve_existing_blocking=True,
+            )
+            raise GoogleProviderRequestFailure("account_identity_missing")
         if connector.access_token_enc is None:
             _set_connector_error(
                 connector=connector,
