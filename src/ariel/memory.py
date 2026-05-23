@@ -75,6 +75,22 @@ class MemoryRecallError(MemoryExecutionError):
     """Expected memory recall failure that should not fail the user turn."""
 
 
+class MemoryEmbeddingError(Exception):
+    pass
+
+
+class MemoryEmbeddingConfigurationError(MemoryEmbeddingError):
+    pass
+
+
+class MemoryEmbeddingResponseError(MemoryEmbeddingError):
+    pass
+
+
+class MemoryEmbeddingUnavailable(MemoryEmbeddingError):
+    pass
+
+
 # ---------------------------------------------------------------------------
 # System prompts
 # ---------------------------------------------------------------------------
@@ -199,47 +215,62 @@ Exactly one keyword argument — `summary`. Do NOT use `message=`, `result=`, \
 def embed_text(text: str, *, settings: AppSettings) -> list[float]:
     """Embed ``text`` with the configured OpenAI embedding model."""
     if settings.memory_embedding_provider != "openai":
-        raise RuntimeError(
+        raise MemoryEmbeddingConfigurationError(
             f"unsupported memory embedding provider: {settings.memory_embedding_provider}"
         )
     if settings.openai_api_key is None:
-        raise RuntimeError("ARIEL_OPENAI_API_KEY is required for memory embeddings")
+        raise MemoryEmbeddingUnavailable("ARIEL_OPENAI_API_KEY is required for memory embeddings")
 
-    response = httpx.post(
-        "https://api.openai.com/v1/embeddings",
-        headers={
-            "Authorization": f"Bearer {settings.openai_api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": settings.memory_embedding_model,
-            "input": " ".join(text.split()),
-            "dimensions": settings.memory_embedding_dimensions,
-            "encoding_format": "float",
-        },
-        timeout=settings.model_timeout_seconds,
-    )
     try:
+        response = httpx.post(
+            "https://api.openai.com/v1/embeddings",
+            headers={
+                "Authorization": f"Bearer {settings.openai_api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": settings.memory_embedding_model,
+                "input": " ".join(text.split()),
+                "dimensions": settings.memory_embedding_dimensions,
+                "encoding_format": "float",
+            },
+            timeout=settings.model_timeout_seconds,
+        )
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        raise RuntimeError(
-            f"memory embedding request failed: HTTP {exc.response.status_code}"
+        status_code = exc.response.status_code
+        raise MemoryEmbeddingUnavailable(
+            f"memory embedding request failed: HTTP {status_code}"
         ) from exc
+    except httpx.RequestError as exc:
+        raise MemoryEmbeddingUnavailable("memory embedding request failed") from exc
 
-    payload = response.json()
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise MemoryEmbeddingResponseError("memory embedding response must be JSON") from exc
     data = payload.get("data") if isinstance(payload, dict) else None
     first = data[0] if isinstance(data, list) and data else None
     vector = first.get("embedding") if isinstance(first, dict) else None
     if not isinstance(vector, list):
-        raise RuntimeError("memory embedding response missing vector")
+        raise MemoryEmbeddingResponseError("memory embedding response missing vector")
     if len(vector) != settings.memory_embedding_dimensions:
-        raise RuntimeError(
+        raise MemoryEmbeddingResponseError(
             "memory embedding response dimension mismatch: "
             f"expected {settings.memory_embedding_dimensions}, got {len(vector)}"
         )
     if not all(isinstance(item, int | float) for item in vector):
-        raise RuntimeError("memory embedding response vector must be numeric")
+        raise MemoryEmbeddingResponseError("memory embedding response vector must be numeric")
     return [float(item) for item in vector]
+
+
+def _embedding_or_none(text: str, *, settings: AppSettings) -> list[float] | None:
+    try:
+        return embed_text(text, settings=settings)
+    except MemoryEmbeddingUnavailable:
+        # justify-ignore-error: nullable embeddings are the documented pending state
+        # for transient embedding provider outages.
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -293,8 +324,9 @@ def append_log_event(
 ) -> MemoryLogRecord | None:
     """Append one event to the raw log inside the caller's transaction.
 
-    Computes the embedding via ``embed_text``; on ``RuntimeError`` (network
-    failure) inserts with ``embedding=None`` (null = pending, to be backfilled).
+    Computes the embedding via ``embed_text``; when the embedding provider is
+    unavailable, inserts with ``embedding=None`` (null = pending, to be
+    backfilled).
 
     Returns ``None`` when the row is skipped by an inbound filter — currently
     only ``assistant_message`` rows whose content matches the assistant-failure
@@ -303,10 +335,7 @@ def append_log_event(
     if kind == "assistant_message" and _is_assistant_failure_message(content):
         return None
 
-    try:
-        embedding: list[float] | None = embed_text(content, settings=settings)
-    except RuntimeError:
-        embedding = None
+    embedding = _embedding_or_none(content, settings=settings)
 
     record = MemoryLogRecord(
         id=new_id_fn("mev"),
@@ -349,10 +378,7 @@ def create_note(
     new_id_fn: Callable[[str], str],
 ) -> MemoryNoteRecord:
     """Insert a new curated note and append a ``note_create`` log event."""
-    try:
-        embedding: list[float] | None = embed_text(content, settings=settings)
-    except RuntimeError:
-        embedding = None
+    embedding = _embedding_or_none(content, settings=settings)
 
     note = MemoryNoteRecord(
         id=new_id_fn("mno"),
@@ -394,10 +420,7 @@ def edit_note(
     if note is None:
         raise MemoryExecutionError("memory_note_not_found")
 
-    try:
-        embedding: list[float] | None = embed_text(content, settings=settings)
-    except RuntimeError:
-        embedding = None
+    embedding = _embedding_or_none(content, settings=settings)
 
     note.content = content
     note.embedding = embedding
@@ -485,10 +508,7 @@ def search_memory(
     Returns ``[{"id", "layer", "kind", "created_at", "snippet", "taint"}, ...]``.
     ``"kind"`` is ``None`` for note-layer hits.
     """
-    try:
-        query_embedding: list[float] | None = embed_text(query, settings=settings)
-    except RuntimeError:
-        query_embedding = None
+    query_embedding = _embedding_or_none(query, settings=settings)
 
     hits: dict[str, dict[str, Any]] = {}
 

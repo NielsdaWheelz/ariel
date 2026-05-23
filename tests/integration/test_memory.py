@@ -1154,6 +1154,226 @@ def test_append_log_event_filter_applies_only_to_assistant_messages(
     assert kinds == {"user_message", "agent_round", "tool_observation", "proactive_trigger"}
 
 
+def test_embed_text_maps_network_failure_to_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+
+    from ariel.config import AppSettings
+    from ariel.memory import MemoryEmbeddingUnavailable, embed_text
+
+    def fail_post(*_: Any, **__: Any) -> httpx.Response:
+        request = httpx.Request("POST", "https://api.openai.com/v1/embeddings")
+        raise httpx.ConnectError("network down", request=request)
+
+    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr("ariel.memory.httpx.post", fail_post)
+
+    with pytest.raises(MemoryEmbeddingUnavailable):
+        embed_text("remember this", settings=AppSettings())
+
+
+def test_embed_text_maps_http_status_failure_to_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+
+    from ariel.config import AppSettings
+    from ariel.memory import MemoryEmbeddingUnavailable, embed_text
+
+    def reject_post(*_: Any, **__: Any) -> httpx.Response:
+        request = httpx.Request("POST", "https://api.openai.com/v1/embeddings")
+        return httpx.Response(401, request=request, json={"error": "unauthorized"})
+
+    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr("ariel.memory.httpx.post", reject_post)
+
+    with pytest.raises(MemoryEmbeddingUnavailable):
+        embed_text("remember this", settings=AppSettings())
+
+
+def test_append_log_event_records_pending_embedding_when_embedding_unavailable(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ariel.config import AppSettings
+    from ariel.memory import MemoryEmbeddingUnavailable, append_log_event
+
+    def unavailable(*_: Any, **__: Any) -> list[float]:
+        raise MemoryEmbeddingUnavailable("memory embedding request failed")
+
+    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr("ariel.memory.embed_text", unavailable)
+    settings = AppSettings()
+    now = datetime.now(tz=UTC)
+
+    with session_factory() as db:
+        with db.begin():
+            result = append_log_event(
+                db,
+                kind="user_message",
+                content="project phoenix update",
+                session_id=None,
+                turn_id=None,
+                taint="clean",
+                source_ref=None,
+                settings=settings,
+                now=now,
+                new_id_fn=_new_id,
+            )
+        assert result is not None
+        written_id = result.id
+
+    with session_factory() as db:
+        row = db.get(MemoryLogRecord, written_id)
+    assert row is not None
+    assert row.embedding is None
+
+
+def test_append_log_event_records_pending_embedding_without_api_key(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ariel.config import AppSettings
+    from ariel.memory import append_log_event
+
+    monkeypatch.delenv("ARIEL_OPENAI_API_KEY", raising=False)
+    settings = AppSettings()
+    now = datetime.now(tz=UTC)
+
+    with session_factory() as db:
+        with db.begin():
+            result = append_log_event(
+                db,
+                kind="user_message",
+                content="project phoenix update",
+                session_id=None,
+                turn_id=None,
+                taint="clean",
+                source_ref=None,
+                settings=settings,
+                now=now,
+                new_id_fn=_new_id,
+            )
+        assert result is not None
+        written_id = result.id
+
+    with session_factory() as db:
+        row = db.get(MemoryLogRecord, written_id)
+    assert row is not None
+    assert row.embedding is None
+
+
+def test_note_mutations_record_pending_embeddings_when_embedding_unavailable(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ariel.config import AppSettings
+    from ariel.memory import MemoryEmbeddingUnavailable, create_note, edit_note
+
+    def unavailable(*_: Any, **__: Any) -> list[float]:
+        raise MemoryEmbeddingUnavailable("memory embedding request failed")
+
+    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr("ariel.memory.embed_text", unavailable)
+    settings = AppSettings()
+    now = datetime.now(tz=UTC)
+
+    with session_factory() as db:
+        with db.begin():
+            note = create_note(
+                db,
+                content="initial note",
+                taint="clean",
+                settings=settings,
+                now=now,
+                new_id_fn=_new_id,
+            )
+            note_id = note.id
+        with db.begin():
+            edit_note(
+                db,
+                note_id=note_id,
+                content="updated note",
+                settings=settings,
+                now=now,
+                new_id_fn=_new_id,
+            )
+
+    with session_factory() as db:
+        stored_note = db.get(MemoryNoteRecord, note_id)
+        log_rows = db.scalars(
+            select(MemoryLogRecord)
+            .where(MemoryLogRecord.source_ref == note_id)
+            .order_by(MemoryLogRecord.kind.asc())
+        ).all()
+
+    assert stored_note is not None
+    assert stored_note.content == "updated note"
+    assert stored_note.embedding is None
+    assert {row.kind for row in log_rows} == {"note_create", "note_edit"}
+    assert all(row.embedding is None for row in log_rows)
+
+
+def test_search_memory_uses_keyword_hits_when_embedding_unavailable(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ariel.config import AppSettings
+    from ariel.memory import MemoryEmbeddingUnavailable, search_memory
+
+    def unavailable(*_: Any, **__: Any) -> list[float]:
+        raise MemoryEmbeddingUnavailable("memory embedding request failed")
+
+    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr("ariel.memory.embed_text", unavailable)
+    settings = AppSettings()
+    now = datetime.now(tz=UTC)
+    log_id = _insert_log_row_directly(
+        session_factory,
+        kind="user_message",
+        content="Project Phoenix launch notes",
+        created_at=now,
+    )
+
+    with session_factory() as db:
+        with db.begin():
+            hits = search_memory(db, query="project phoenix", settings=settings, limit=24)
+
+    assert log_id in {hit["id"] for hit in hits}
+
+
+def test_append_log_event_propagates_embedding_response_defect(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ariel.config import AppSettings
+    from ariel.memory import MemoryEmbeddingResponseError, append_log_event
+
+    def malformed(*_: Any, **__: Any) -> list[float]:
+        raise MemoryEmbeddingResponseError("memory embedding response missing vector")
+
+    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr("ariel.memory.embed_text", malformed)
+    settings = AppSettings()
+
+    with pytest.raises(MemoryEmbeddingResponseError):
+        with session_factory() as db:
+            with db.begin():
+                append_log_event(
+                    db,
+                    kind="user_message",
+                    content="project phoenix update",
+                    session_id=None,
+                    turn_id=None,
+                    taint="clean",
+                    source_ref=None,
+                    settings=settings,
+                    now=datetime.now(tz=UTC),
+                    new_id_fn=_new_id,
+                )
+
+
 # ===========================================================================
 # Retrieval-side filter — directly inserted polluting rows must NOT surface
 # from ``search_memory``. The same regex applies symmetrically on both sides.

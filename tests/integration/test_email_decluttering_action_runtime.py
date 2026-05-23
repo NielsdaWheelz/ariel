@@ -12,6 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from ariel.action_runtime import (
+    _EmailAfterStateMissing,
     process_action_execution_task,
 )
 from ariel.capability_registry import (
@@ -466,6 +467,111 @@ def test_email_action_malformed_before_state_fails_before_provider_mutation(
         assert receipt is not None
         assert receipt.status == "executing"
         assert receipt.before_state is None
+
+
+def test_email_action_recovers_missing_provider_before_state_from_captured_input(
+    session_factory: sessionmaker[Session],
+) -> None:
+    before_state = [{"message_id": "msg_1", "thread_id": "thr_1", "label_ids": ["INBOX"]}]
+    after_state = [{"message_id": "msg_1", "thread_id": "thr_1", "label_ids": []}]
+    runtime = FakeGoogleRuntime(
+        workspace_provider=FakeWorkspaceProvider(before_state=before_state),
+        execution_output={
+            "status": "archived",
+            "operation": "archive",
+            "message_ids": ["msg_1"],
+            "after_state": after_state,
+            "provider_result": {
+                "operation": "archive",
+                "provider": "gmail",
+                "mutated_message_ids": ["msg_1"],
+                "attempted_message_ids": ["msg_1"],
+            },
+        },
+    )
+    _seed_action_attempt(
+        session_factory,
+        action_attempt_id="act_missing_provider_before",
+        capability_id="cap.email.archive",
+        proposed_input={"message_ids": ["msg_1"], "idempotency_key": "archive-missing-before"},
+        proposal_index=1,
+    )
+
+    assert process_action_execution_task(
+        session_factory=session_factory,
+        action_attempt_id="act_missing_provider_before",
+        google_runtime=runtime,  # type: ignore[arg-type]
+        agency_runtime=None,
+        now_fn=lambda: NOW,
+        new_id_fn=_id_factory("missing_before"),
+    )
+
+    assert runtime.workspace_provider.state_reads == 1
+    assert runtime.executions[0]["before_state"] == before_state
+    with session_factory() as db:
+        action_attempt = db.get(ActionAttemptRecord, "act_missing_provider_before")
+        assert action_attempt is not None
+        assert action_attempt.status == "succeeded"
+        receipt = db.scalar(select(ProviderWriteReceiptRecord).limit(1))
+        assert receipt is not None
+        assert receipt.status == "succeeded"
+        assert receipt.before_state == {"messages": before_state}
+        assert receipt.after_state == {"messages": after_state}
+        provider_result = receipt.response_payload["provider_result"]
+        assert provider_result["before_state_error"] == "email_before_state_missing"
+
+
+@pytest.mark.parametrize("include_provider_before_state", [True, False])
+def test_email_action_missing_provider_after_state_is_not_recovered(
+    session_factory: sessionmaker[Session],
+    include_provider_before_state: bool,
+) -> None:
+    before_state = [{"message_id": "msg_1", "thread_id": "thr_1", "label_ids": ["INBOX"]}]
+    execution_output: dict[str, Any] = {
+        "status": "archived",
+        "operation": "archive",
+        "message_ids": ["msg_1"],
+        "provider_result": {
+            "operation": "archive",
+            "provider": "gmail",
+            "mutated_message_ids": ["msg_1"],
+            "attempted_message_ids": ["msg_1"],
+        },
+    }
+    if include_provider_before_state:
+        execution_output["before_state"] = before_state
+    runtime = FakeGoogleRuntime(
+        workspace_provider=FakeWorkspaceProvider(before_state=before_state),
+        execution_output=execution_output,
+    )
+    _seed_action_attempt(
+        session_factory,
+        action_attempt_id="act_missing_provider_after",
+        capability_id="cap.email.archive",
+        proposed_input={"message_ids": ["msg_1"], "idempotency_key": "archive-missing-after"},
+        proposal_index=1,
+    )
+
+    with pytest.raises(_EmailAfterStateMissing, match="email_after_state_missing"):
+        process_action_execution_task(
+            session_factory=session_factory,
+            action_attempt_id="act_missing_provider_after",
+            google_runtime=runtime,  # type: ignore[arg-type]
+            agency_runtime=None,
+            now_fn=lambda: NOW,
+            new_id_fn=_id_factory("missing_after"),
+        )
+
+    assert runtime.workspace_provider.state_reads == 1
+    with session_factory() as db:
+        action_attempt = db.get(ActionAttemptRecord, "act_missing_provider_after")
+        assert action_attempt is not None
+        assert action_attempt.status == "executing"
+        receipt = db.scalar(select(ProviderWriteReceiptRecord).limit(1))
+        assert receipt is not None
+        assert receipt.status == "executing"
+        assert receipt.before_state == {"messages": before_state}
+        assert receipt.after_state is None
 
 
 def test_email_action_provider_timeout_records_ambiguous_receipt_and_fails_closed(

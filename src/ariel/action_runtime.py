@@ -115,6 +115,18 @@ class ActionRuntimeError(Exception):
         self.retryable = retryable
 
 
+class _EmailProviderStateError(RuntimeError):
+    pass
+
+
+class _EmailBeforeStateMissing(_EmailProviderStateError):
+    pass
+
+
+class _EmailAfterStateMissing(_EmailProviderStateError):
+    pass
+
+
 @dataclass(slots=True)
 class _FunctionCallProcessingContext:
     """Cross-call mutable state shared by every `process_one_call` iteration."""
@@ -424,9 +436,9 @@ def _email_provider_state_lists(output: dict[str, Any]) -> tuple[dict[str, Any],
     before_state_raw = output.get("before_state")
     after_state_raw = output.get("after_state")
     if not isinstance(before_state_raw, list):
-        raise RuntimeError("email_before_state_missing")
+        raise _EmailBeforeStateMissing("email_before_state_missing")
     if not isinstance(after_state_raw, list):
-        raise RuntimeError("email_after_state_missing")
+        raise _EmailAfterStateMissing("email_after_state_missing")
     return {"messages": before_state_raw}, {"messages": after_state_raw}
 
 
@@ -5112,17 +5124,17 @@ def process_action_execution_task(
                 )
                 before_messages_raw = before_state_output.get("state")
                 if not isinstance(before_messages_raw, list):
-                    raise RuntimeError("email_before_state_missing")
+                    raise _EmailBeforeStateMissing("email_before_state_missing")
                 before_message_ids: list[str] = []
                 for before_message in before_messages_raw:
                     if not isinstance(before_message, dict):
-                        raise RuntimeError("email_before_state_missing")
+                        raise _EmailBeforeStateMissing("email_before_state_missing")
                     before_message_id = before_message.get("message_id")
                     if not isinstance(before_message_id, str) or not before_message_id:
-                        raise RuntimeError("email_before_state_missing")
+                        raise _EmailBeforeStateMissing("email_before_state_missing")
                     before_message_ids.append(before_message_id)
                 if sorted(before_message_ids) != sorted(message_ids):
-                    raise RuntimeError("email_before_state_missing")
+                    raise _EmailBeforeStateMissing("email_before_state_missing")
                 before_messages = before_messages_raw
                 normalized_input = {**normalized_input, "before_state": before_messages}
                 with session_factory() as db:
@@ -5304,17 +5316,15 @@ def process_action_execution_task(
                         before_state, after_state = _email_provider_state_lists(
                             execution_result.output
                         )
-                    except RuntimeError as exc:
-                        if str(exc) != "email_before_state_missing":
-                            raise
+                    except _EmailBeforeStateMissing as exc:
                         captured_before_messages = provider_input.get("before_state")
                         if not isinstance(captured_before_messages, list):
                             raise
                         before_state = {"messages": captured_before_messages}
                         after_state_raw = execution_result.output.get("after_state")
-                        after_state = {
-                            "messages": after_state_raw if isinstance(after_state_raw, list) else []
-                        }
+                        if not isinstance(after_state_raw, list):
+                            raise _EmailAfterStateMissing("email_after_state_missing") from exc
+                        after_state = {"messages": after_state_raw}
                         provider_result_raw = execution_result.output.get("provider_result")
                         if isinstance(provider_result_raw, dict):
                             provider_result_raw["before_state_error"] = str(exc)
