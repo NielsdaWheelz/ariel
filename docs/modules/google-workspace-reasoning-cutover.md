@@ -826,8 +826,7 @@ Rules:
 
 ### Commitment Review
 
-The cutover exposes or replaces these product-level commitment capabilities as
-part of the memory hard cutover:
+The cutover exposes or replaces these product-level commitment capabilities:
 
 - inspect commitments
 - inspect commitment source
@@ -1299,5 +1298,5 @@ is complete.
 - Update [../production-runbook.md](../production-runbook.md) with operational
   counters, repair workflows, and privacy deletion checks.
 - Update [../database.md](../database.md) with new table families and indexes.
-- Update [../ai-first-sota-gap-cutover.md](../ai-first-sota-gap-cutover.md) if
-  any intentional gap remains after implementation.
+- Update [../ai-first-sota-gaps.md](../ai-first-sota-gaps.md) when the active
+  gap inventory changes.

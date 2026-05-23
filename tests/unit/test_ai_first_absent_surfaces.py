@@ -88,9 +88,9 @@ def test_runtime_has_no_deterministic_tool_result_synthesis_or_fallback_prose(
     _assert_absent(pattern)
 
 
-def test_sota_gap_doc_lists_exact_typed_ai_judgment_failure_codes() -> None:
+def test_sota_gaps_doc_lists_exact_typed_ai_judgment_failure_codes() -> None:
     section = _section(
-        "docs/ai-first-sota-gap-cutover.md",
+        "docs/ai-first-sota-gaps.md",
         "### Failure Code And Status Vocabulary",
     )
 
@@ -118,7 +118,7 @@ def test_ai_judgment_failure_code_schema_uses_typed_vocabulary() -> None:
 
 def test_unconfigured_ambient_source_families_are_documented_as_absent() -> None:
     section = _section(
-        "docs/ai-first-sota-gap-cutover.md",
+        "docs/ai-first-sota-gaps.md",
         "### Ambient Source Coverage",
     )
     normalized = section.lower().replace("-", "_")

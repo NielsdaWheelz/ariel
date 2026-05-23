@@ -353,21 +353,22 @@ def _invoke_syscall_callback(
     """Run the host syscall callback and shape its outcome as a result message.
 
     A callback that raises is a host-side defect, not a guest error; it is
-    surfaced to the guest as a typed failure so the program can observe it,
-    while the runtime keeps a clean lifecycle.
+    allowed to propagate after the runtime closes the guest process.
     """
 
-    try:
-        ok, value_or_error = syscall_callback(syscall.name, syscall.input)
-    except Exception as exc:  # noqa: BLE001 - host callback faults must not crash the runtime
-        return {
-            "type": "syscall-result",
-            "ok": False,
-            "error": f"syscall_host_error: {type(exc).__name__}: {exc}",
-        }
+    ok, value_or_error = syscall_callback(syscall.name, syscall.input)
     if ok:
         return {"type": "syscall-result", "ok": True, "value": value_or_error}
     return {"type": "syscall-result", "ok": False, "error": str(value_or_error)}
+
+
+def _kill_and_wait(process: "subprocess.Popen[str]") -> int:
+    process.kill()
+    try:
+        return process.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        return process.wait()
 
 
 def _drive_program(
@@ -398,8 +399,16 @@ def _drive_program(
     watchdog = threading.Timer(wall_clock_seconds, _watchdog)
     watchdog.daemon = True
 
+    def _send_host_message(message: dict[str, Any]) -> None:
+        encoded = _encode_host_message(message)
+        try:
+            assert process.stdin is not None
+            process.stdin.write(encoded)
+            process.stdin.flush()
+        except (OSError, ValueError) as exc:
+            raise SandboxRuntimeError(f"channel failed: {exc}") from exc
+
     def _conversation() -> None:
-        assert process.stdin is not None
         assert process.stdout is not None
         run_program = {
             "type": "run-program",
@@ -413,12 +422,14 @@ def _drive_program(
                 "memory_bytes": SANDBOX_MEMORY_BYTES,
             },
         }
-        process.stdin.write(_encode_host_message(run_program))
-        process.stdin.flush()
+        _send_host_message(run_program)
 
         syscall_count = 0
         while True:
-            line = process.stdout.readline()
+            try:
+                line = process.stdout.readline()
+            except (OSError, ValueError) as exc:
+                raise SandboxRuntimeError(f"channel failed: {exc}") from exc
             if line == "":
                 outcome.update(closed_early=True, syscall_count=syscall_count)
                 return
@@ -427,8 +438,7 @@ def _drive_program(
                 syscall_count += 1
                 syscall = _Syscall(name=message["name"], input=message["input"])
                 result = _invoke_syscall_callback(syscall, syscall_callback)
-                process.stdin.write(_encode_host_message(result))
-                process.stdin.flush()
+                _send_host_message(result)
                 continue
             outcome.update(
                 ok=bool(message["ok"]),
@@ -443,10 +453,11 @@ def _drive_program(
         _conversation()
     except SandboxRuntimeError as exc:
         conversation_error.append(str(exc))
-    except (OSError, ValueError) as exc:
-        # A broken pipe or decode fault means the guest died mid-channel — which
-        # is also how a watchdog kill surfaces while a read or write is blocked.
-        conversation_error.append(f"channel failed: {exc}")
+    except Exception:
+        # justify-defect: unexpected host-side defects must close the guest
+        # process before propagating beyond the sandbox runtime.
+        _kill_and_wait(process)
+        raise
     finally:
         watchdog.cancel()
 
@@ -461,8 +472,7 @@ def _drive_program(
     try:
         return_code = process.wait(timeout=2.0)
     except subprocess.TimeoutExpired:
-        process.kill()
-        return_code = process.wait()
+        return_code = _kill_and_wait(process)
     syscall_count = int(outcome.get("syscall_count", 0))
 
     if conversation_error:

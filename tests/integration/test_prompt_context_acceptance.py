@@ -164,7 +164,7 @@ def test_turn_context_section_order_and_audit_metadata(
         turns = timeline["turns"]
         assert len(turns) == 2
 
-        # The retriever's evt.model.started carries the empty sentinel (section_order=[]).
+        # Retriever evt.model.started events happen before the turn context is built.
         # The main agent's evt.model.started is the last one; it carries the real snapshot.
         for turn_data in turns:
             model_started_events = [
@@ -203,10 +203,10 @@ def test_context_audit_is_stable_even_if_adapter_mutates_context_bundle(
 
         timeline = _timeline(client, session_id)
         turns = timeline["turns"]
-        # The retriever fires first; its model.started carries the empty sentinel
-        # context meta. The main agent's model.started is the last evt.model.started
-        # in the turn; it carries the real pre-call snapshot, stable even though
-        # MutatingContextAdapter appends "mutated" to section_order after the fact.
+        # The retriever fires before the turn context is built. The main agent's
+        # model.started is the last evt.model.started in the turn; it carries the
+        # real pre-call snapshot, stable even though MutatingContextAdapter appends
+        # "mutated" to section_order after the fact.
         model_started_events = [
             event for event in turns[1]["events"] if event["event_type"] == "evt.model.started"
         ]

@@ -1216,8 +1216,9 @@ def _wake(
     created_events: list[EventRecord] = []
     assistant_sources: list[dict[str, Any]] = []
 
-    # Mutable cell: populated after context_bundle is built; pre-turn retriever
-    # rounds get the empty sentinel (still contract-valid).
+    # Mutable cell: populated after context_bundle is built; retriever model
+    # calls before that point use zero-valued context metadata valid for
+    # evt.model.started.
     _context_meta: list[dict[str, Any]] = [_make_empty_context_meta()]
 
     def add_event(event_type: str, payload_data: dict[str, Any]) -> None:

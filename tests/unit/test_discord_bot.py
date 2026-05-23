@@ -515,7 +515,7 @@ def test_refresh_job_fetches_job_and_events(monkeypatch: pytest.MonkeyPatch) -> 
                         "job": {
                             "id": "job_123",
                             "status": "completed",
-                            "title": "Agency bridge",
+                            "title": "Draft release notes",
                             "summary": "done",
                         },
                     },
@@ -543,7 +543,7 @@ def test_refresh_job_fetches_job_and_events(monkeypatch: pytest.MonkeyPatch) -> 
     message = refresh_job(ariel_base_url="http://127.0.0.1:8000", job_id="job_123")
 
     assert "Job job_123: completed" in message
-    assert "Agency bridge" in message
+    assert "Draft release notes" in message
     assert "- completed at 2026-04-27T12:00:00Z" in message
     assert fake_clients[0].calls[:2] == [
         {"method": "GET", "url": "http://127.0.0.1:8000/v1/jobs/job_123"},
@@ -608,7 +608,13 @@ def test_jobs_command_fetches_job_list(monkeypatch: pytest.MonkeyPatch) -> None:
                     200,
                     json={
                         "ok": True,
-                        "jobs": [{"id": "job_123", "status": "running", "title": "Agency bridge"}],
+                        "jobs": [
+                            {
+                                "id": "job_123",
+                                "status": "running",
+                                "title": "Draft release notes",
+                            }
+                        ],
                     },
                 )
             ]
@@ -620,7 +626,7 @@ def test_jobs_command_fetches_job_list(monkeypatch: pytest.MonkeyPatch) -> None:
 
     message = list_jobs(ariel_base_url="http://127.0.0.1:8000")
 
-    assert message == "Recent jobs:\n- job_123: running: Agency bridge"
+    assert message == "Recent jobs:\n- job_123: running: Draft release notes"
     assert fake_clients[0].calls == [
         {"method": "GET", "url": "http://127.0.0.1:8000/v1/jobs?limit=10"}
     ]

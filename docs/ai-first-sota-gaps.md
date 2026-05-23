@@ -1,9 +1,10 @@
-# AI-First SOTA Gap Cutover
+# AI-First SOTA Gaps
 
 ## Scope
 
-This document records the active AI-first cutover gaps that must stay explicit in
-docs and tests. It is not a compatibility promise for removed runtime surfaces.
+This document records active AI-first gaps that must stay explicit in docs and
+tests. It is the current inventory for intentionally absent surfaces, not a
+historical migration plan.
 
 ### Failure Code And Status Vocabulary
 

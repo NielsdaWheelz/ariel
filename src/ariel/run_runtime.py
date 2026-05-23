@@ -227,8 +227,9 @@ def _capability_syscall_value(function_call_output: dict[str, Any]) -> tuple[boo
         return False, str(payload.get("reason") or payload.get("error") or status)
     if status == "failed":
         return False, str(payload.get("error") or payload.get("reason") or status)
-    # process_one_call only emits the statuses above; an unknown one is a defect.
-    return False, f"unknown_call_status: {status}"
+    # justify-defect: process_one_call owns this finite status channel; an
+    # unknown status means the producer contract changed without this consumer.
+    raise RuntimeError(f"unknown_call_status: {status}")
 
 
 def execute_run_program(
@@ -485,11 +486,10 @@ def execute_run_program(
 
         new_outputs = ctx.function_call_outputs[outputs_before:]
         if len(new_outputs) != 1:
-            # process_one_call appends exactly one output per call; anything
-            # else (e.g. a no-call_id path) is unreachable here since call_id
-            # is always set, but fail closed rather than guess.
-            callback_errors.append(f"{name}: missing_call_output")
-            return False, "missing_call_output"
+            # justify-defect: process_one_call appends exactly one output per
+            # call; this path always supplies call_id, so any other count means
+            # the action runtime contract broke.
+            raise RuntimeError(f"{name}: process_one_call_output_count:{len(new_outputs)}")
         return _capability_syscall_value(new_outputs[0])
 
     program_result: ProgramResult = sandbox.run_program(

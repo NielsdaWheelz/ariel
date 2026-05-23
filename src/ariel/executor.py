@@ -32,8 +32,6 @@ _UNSAFE_OUTPUT_PATTERNS: tuple[tuple[str, str], ...] = (
     ("javascript_uri", "javascript:"),
 )
 
-_EGRESS_SENTINEL_KEY = "__egress__"
-
 
 def _iter_nested_strings(value: Any) -> list[str]:
     if isinstance(value, str):
@@ -285,13 +283,6 @@ def execute_capability(
             safe_reason=f"unexpected {exc.__class__.__name__}",
         )
         return ExecutionResult(status="failed", output=None, error=error_reason)
-
-    if isinstance(raw_output, dict) and _EGRESS_SENTINEL_KEY in raw_output:
-        return ExecutionResult(
-            status="failed",
-            output=None,
-            error="egress_preflight_undeclared_intent",
-        )
 
     post_guardrail_error = _post_execution_guardrail_error(raw_output)
     if post_guardrail_error is not None:

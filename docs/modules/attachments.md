@@ -1,28 +1,27 @@
-# Attachment Content Hard Cutover
+# Attachments
 
 ## Scope
 
-This doc owns the target architecture for turning user-supplied attachment
+This doc owns attachment content handling: turning user-supplied attachment
 references into model-usable evidence. It covers Discord attachments first, but
-the product surface is transport-neutral: the assistant reads an attachment, not
-"a Discord CDN URL".
+the product surface is transport-neutral: the assistant reads an attachment,
+not "a Discord CDN URL".
 
-This doc supersedes the current metadata-only attachment behavior for any user
-intent that clearly requires attachment content.
+When user intent clearly requires attachment content, metadata-only context is
+only a pre-read reference surface; content-dependent answers go through the
+attachment-read capability.
 
 Attachment handling follows [../ai-first.md](../ai-first.md): the model decides
 whether attachment content is needed and how to use it; deterministic services
 own acquisition, authorization, scanning, extraction limits, taint, provenance,
 and typed failures.
 
-## Cutover Policy
+## Current Contract
 
-- Ship as a hard cutover.
-- Do not preserve the old behavior where Ariel can only mention attachment
-  filenames, sizes, content types, or URLs when content is required.
-- Do not add a legacy metadata-only fallback path.
-- Do not support old request aliases or compatibility fields once the cutover
-  lands.
+- Do not answer content-required requests using only attachment filenames,
+  sizes, content types, or URLs.
+- Do not add metadata-only fallback paths for content-required requests.
+- Keep the attachment-read input shape narrow: attachment reference plus intent.
 - Do not pass Discord attachment URLs or raw bytes directly to the model as
   ambient context.
 - Fail closed with a typed attachment-read outcome when acquisition, scanning,
@@ -197,7 +196,7 @@ does not accept user-provided URLs or filesystem paths.
 
 ### Layer 4: Acquisition and Storage
 
-New attachment-content code owns acquisition and persistence:
+Attachment-content code owns acquisition and persistence:
 
 - Resolve the reference to a permitted Discord attachment handle.
 - Verify the source message belongs to the active user/session boundary.
