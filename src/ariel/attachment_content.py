@@ -35,8 +35,14 @@ _ATTACHMENT_RECOVERY: dict[str, str] = {
     "too_large": "Upload a smaller attachment or share the relevant excerpt as text.",
     "expired": "Re-upload the attachment and ask again.",
     "unavailable": "Re-upload the attachment or verify that Discord still exposes it.",
-    "unsafe": "The attachment was blocked by safety scanning.",
-    "scan_failed": "Attachment scanning is not available. Ask the operator to configure scanning.",
+    "unsafe": (
+        "The attachment matched a blocked-file safety check. Upload a clean export or paste "
+        "the relevant text."
+    ),
+    "scan_failed": (
+        "Attachment reads are blocked by this deployment's fail-closed scanner mode. Paste "
+        "the relevant text or ask the operator to review the file outside Ariel."
+    ),
     "extract_failed": "The attachment could not be read. Try a clearer export or paste the text.",
     "provider_timeout": "The extraction provider timed out. Retry shortly.",
     "provider_unavailable": "The extraction provider is unavailable or not configured.",
@@ -166,10 +172,11 @@ class AttachmentContentRuntime:
         content: bytes | None = None
         blob: AttachmentBlobRecord | None = None
         if source.blob_id is not None:
-            blob = db.get(AttachmentBlobRecord, source.blob_id)
-            if blob is not None:
-                stored_path = Path(self.blob_store_path) / blob.storage_key
+            cached_blob = db.get(AttachmentBlobRecord, source.blob_id)
+            if cached_blob is not None and cached_blob.deleted_at is None:
+                stored_path = Path(self.blob_store_path) / cached_blob.storage_key
                 if stored_path.is_file():
+                    blob = cached_blob
                     content = stored_path.read_bytes()
 
         if content is None:
@@ -333,6 +340,19 @@ class AttachmentContentRuntime:
                 )
                 db.add(blob)
                 db.flush()
+            else:
+                stored_path = Path(self.blob_store_path) / blob.storage_key
+                stored_path.parent.mkdir(parents=True, exist_ok=True)
+                if not stored_path.exists():
+                    stored_path.write_bytes(content)
+                if blob.deleted_at is not None:
+                    blob.size_bytes = len(content)
+                    blob.sniffed_mime_type = sniffed_mime_type
+                    blob.scan_status = "clean"
+                    blob.scanner_version = "disabled-development"
+                    blob.deleted_at = None
+                    blob.updated_at = retrieved_at
+                    db.flush()
             source.blob_id = blob.id
             source.updated_at = retrieved_at
             db.flush()
@@ -344,6 +364,7 @@ class AttachmentContentRuntime:
                 AttachmentExtractionRecord.extractor_version == _EXTRACTOR_VERSION,
                 AttachmentExtractionRecord.modality == modality,
                 AttachmentExtractionRecord.status == "succeeded",
+                AttachmentExtractionRecord.created_at >= blob.updated_at,
             )
             .limit(1)
         )

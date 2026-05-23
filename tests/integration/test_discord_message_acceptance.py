@@ -37,6 +37,73 @@ def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
     return TestClient(app)
 
 
+def _patch_discord_attachment_download(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    url: str,
+    body: bytes,
+) -> None:
+    class FakeStreamResponse:
+        status_code = 200
+
+        def __init__(self) -> None:
+            self.headers = {"content-length": str(len(body))}
+
+        def __enter__(self) -> "FakeStreamResponse":
+            return self
+
+        def __exit__(self, *_: Any) -> None:
+            return None
+
+        def iter_bytes(self) -> list[bytes]:
+            return [body]
+
+    class FakeHttpClient:
+        def __init__(self, *_: Any, **__: Any) -> None:
+            return None
+
+        def __enter__(self) -> "FakeHttpClient":
+            return self
+
+        def __exit__(self, *_: Any) -> None:
+            return None
+
+        def stream(self, method: str, request_url: str) -> FakeStreamResponse:
+            assert method == "GET"
+            assert request_url == url
+            return FakeStreamResponse()
+
+    monkeypatch.setattr("ariel.attachment_content.httpx.Client", FakeHttpClient)
+
+
+def _post_report_attachment_read_request(client: TestClient, session_id: str) -> Any:
+    return post_message_and_drain(
+        client,
+        session_id,
+        message="please summarize this",
+        json_extra={
+            "discord": {
+                "guild_id": 123,
+                "channel_id": 456,
+                "message_id": 789,
+                "author_id": 101112,
+                "mentioned_bot": False,
+                "attachments": [
+                    {
+                        "source": "discord",
+                        "source_attachment_id": 131415,
+                        "filename": "report.txt",
+                        "content_type": "text/plain",
+                        "size_bytes": 28,
+                        "attachment_ref": "discord:131415",
+                        "download_url": "https://cdn.discordapp.com/attachments/report.txt",
+                    }
+                ],
+            }
+        },
+    )
+
+
 @dataclass
 class DiscordStatusAdapter:
     provider: str = "provider.discord-status"
@@ -372,66 +439,18 @@ def test_discord_attachment_read_tool_reads_text_attachment(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    class FakeStreamResponse:
-        status_code = 200
-        headers = {"content-length": "28"}
-
-        def __enter__(self) -> "FakeStreamResponse":
-            return self
-
-        def __exit__(self, *_: Any) -> None:
-            return None
-
-        def iter_bytes(self) -> list[bytes]:
-            return [b"quarterly revenue increased"]
-
-    class FakeHttpClient:
-        def __init__(self, *_: Any, **__: Any) -> None:
-            return None
-
-        def __enter__(self) -> "FakeHttpClient":
-            return self
-
-        def __exit__(self, *_: Any) -> None:
-            return None
-
-        def stream(self, method: str, url: str) -> FakeStreamResponse:
-            assert method == "GET"
-            assert url == "https://cdn.discordapp.com/attachments/report.txt"
-            return FakeStreamResponse()
-
     monkeypatch.setenv("ARIEL_ATTACHMENT_SCANNER_MODE", "disabled")
     monkeypatch.setenv("ARIEL_ATTACHMENT_BLOB_STORE_PATH", str(tmp_path / "attachments"))
-    monkeypatch.setattr("ariel.attachment_content.httpx.Client", FakeHttpClient)
+    _patch_discord_attachment_download(
+        monkeypatch,
+        url="https://cdn.discordapp.com/attachments/report.txt",
+        body=b"quarterly revenue increased",
+    )
 
     adapter = AttachmentReadAdapter()
     with _build_client(postgres_url, adapter) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        turn = post_message_and_drain(
-            client,
-            session_id,
-            message="please summarize this",
-            json_extra={
-                "discord": {
-                    "guild_id": 123,
-                    "channel_id": 456,
-                    "message_id": 789,
-                    "author_id": 101112,
-                    "mentioned_bot": False,
-                    "attachments": [
-                        {
-                            "source": "discord",
-                            "source_attachment_id": 131415,
-                            "filename": "report.txt",
-                            "content_type": "text/plain",
-                            "size_bytes": 28,
-                            "attachment_ref": "discord:131415",
-                            "download_url": "https://cdn.discordapp.com/attachments/report.txt",
-                        }
-                    ],
-                }
-            },
-        )
+        turn = _post_report_attachment_read_request(client, session_id)
 
         assert turn.assistant_message == "attachment content: quarterly revenue increased [1]"
 
