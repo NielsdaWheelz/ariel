@@ -12,9 +12,17 @@ from sqlalchemy.orm import Session, sessionmaker
 
 import ariel.memory as memory
 from ariel.action_runtime import RuntimeProvenance
-from tests.integration.app_helpers import create_migrated_app
+from ariel.capability_registry import (
+    canonical_action_payload,
+    capability_contract_hash,
+    get_capability,
+    payload_hash,
+)
+from tests.integration.app_helpers import create_test_app
 from ariel.persistence import (
+    ActionAttemptRecord,
     BackgroundTaskRecord,
+    MemoryLogRecord,
     SessionRecord,
     TurnRecord,
     enqueue_background_task,
@@ -216,6 +224,172 @@ def test_schedule_syscall_rejects_a_malformed_when(
         assert tasks == []
 
 
+def test_schedule_syscall_queue_defect_rolls_back_instead_of_failing_action(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with session_factory() as db:
+        with db.begin():
+            db.add(
+                SessionRecord(
+                    id="ses_sched_defect",
+                    is_active=True,
+                    lifecycle_state="active",
+                    rotated_from_session_id=None,
+                    rotation_reason=None,
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+            db.add(
+                TurnRecord(
+                    id="trn_sched_defect",
+                    session_id="ses_sched_defect",
+                    user_message="set a reminder",
+                    assistant_message=None,
+                    status="in_progress",
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+
+    def fail_enqueue(*_args: Any, **_kwargs: Any) -> BackgroundTaskRecord:
+        raise RuntimeError("queue bug")
+
+    monkeypatch.setattr("ariel.action_runtime.enqueue_background_task", fail_enqueue)
+
+    with pytest.raises(RuntimeError, match="queue bug"):
+        with session_factory() as db:
+            with db.begin():
+                turn = db.get(TurnRecord, "trn_sched_defect")
+                assert turn is not None
+                run_function_calls(
+                    db=db,
+                    session_id="ses_sched_defect",
+                    turn=turn,
+                    function_calls_raw=[
+                        {
+                            "call_id": "call_sched_defect",
+                            "capability_id": "cap.proactive.schedule",
+                            "input": {
+                                "when": "2026-06-02T09:00:00Z",
+                                "note": "check whether the PR landed",
+                            },
+                            "influenced_by_untrusted_content": False,
+                        }
+                    ],
+                    approval_ttl_seconds=300,
+                    approval_actor_id="usr_sched_defect",
+                    add_event=lambda _event_type, _payload: None,
+                    now_fn=lambda: NOW,
+                    new_id_fn=lambda prefix: f"{prefix}_sched_defect_1",
+                    allowed_capability_ids=["cap.proactive.schedule"],
+                    runtime_provenance=RuntimeProvenance(status="clean"),
+                )
+
+    with session_factory() as db:
+        attempts = db.scalars(select(ActionAttemptRecord)).all()
+        tasks = db.scalars(select(BackgroundTaskRecord)).all()
+    assert attempts == []
+    assert tasks == []
+
+
+def test_approved_schedule_queue_defect_retries_task_without_failing_action(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability = get_capability("cap.proactive.schedule")
+    assert capability is not None
+    normalized_input = {
+        "when": "2026-06-02T09:00:00Z",
+        "note": "check whether the PR landed",
+    }
+    action_payload = canonical_action_payload(
+        capability_id=capability.capability_id,
+        input_payload=normalized_input,
+    )
+    with session_factory() as db:
+        with db.begin():
+            db.add(
+                SessionRecord(
+                    id="ses_sched_approved_defect",
+                    is_active=True,
+                    lifecycle_state="active",
+                    rotated_from_session_id=None,
+                    rotation_reason=None,
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+            db.add(
+                TurnRecord(
+                    id="trn_sched_approved_defect",
+                    session_id="ses_sched_approved_defect",
+                    user_message="set a reminder",
+                    assistant_message=None,
+                    status="in_progress",
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+            db.add(
+                ActionAttemptRecord(
+                    id="aat_sched_approved_defect",
+                    session_id="ses_sched_approved_defect",
+                    turn_id="trn_sched_approved_defect",
+                    proposal_index=1,
+                    capability_id=capability.capability_id,
+                    capability_version=capability.version,
+                    capability_contract_hash=capability_contract_hash(capability),
+                    impact_level=capability.impact_level,
+                    proposed_input=normalized_input,
+                    payload_hash=payload_hash(action_payload),
+                    policy_decision="requires_approval",
+                    policy_reason=None,
+                    status="executing",
+                    approval_required=True,
+                    execution_output=None,
+                    execution_error=None,
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+            db.add(
+                BackgroundTaskRecord(
+                    id="tsk_sched_approved_defect",
+                    task_type="execute_action_attempt",
+                    idempotency_key=None,
+                    provider_write_receipt_id=None,
+                    payload={"action_attempt_id": "aat_sched_approved_defect"},
+                    attempts=0,
+                    recurrence_seconds=None,
+                    run_after=datetime(2026, 1, 1, tzinfo=UTC),
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+
+    def fail_enqueue(*_args: Any, **_kwargs: Any) -> BackgroundTaskRecord:
+        raise RuntimeError("queue bug")
+
+    monkeypatch.setattr("ariel.action_runtime.enqueue_background_task", fail_enqueue)
+
+    assert process_one_task(session_factory=session_factory) is True
+
+    with session_factory() as db:
+        action = db.get(ActionAttemptRecord, "aat_sched_approved_defect")
+        task = db.get(BackgroundTaskRecord, "tsk_sched_approved_defect")
+        agent_wakes = db.scalars(
+            select(BackgroundTaskRecord).where(BackgroundTaskRecord.task_type == "agent_wake")
+        ).all()
+    assert action is not None
+    assert action.status == "executing"
+    assert action.execution_error is None
+    assert task is not None
+    assert task.attempts == 1
+    assert agent_wakes == []
+
+
 # ===========================================================================
 # (c) The worker's agent_wake arm wakes the agent
 # ===========================================================================
@@ -264,9 +438,9 @@ def test_worker_agent_wake_arm_invokes_wake_for_a_due_task(
 
     _stub_memory_retriever(monkeypatch)
     now = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
-    monkeypatch.setattr("ariel.worker._utcnow", lambda: now)
+    monkeypatch.setattr("ariel.worker.utcnow", lambda: now)
     adapter = _WakeAdapter()
-    app = create_migrated_app(
+    app = create_test_app(
         database_url=postgres_url,
         model_adapter=adapter,
         sandbox=FakeSandboxRuntime(),
@@ -305,6 +479,15 @@ def test_worker_agent_wake_arm_invokes_wake_for_a_due_task(
             )
             assert turn is not None
             assert turn.status == "completed"
+            wake_log = db.scalar(
+                select(MemoryLogRecord).where(
+                    MemoryLogRecord.kind == "proactive_trigger",
+                    MemoryLogRecord.content == "follow up on the deploy",
+                    MemoryLogRecord.turn_id == turn.id,
+                )
+            )
+            assert wake_log is not None
+            assert wake_log.taint == "clean"
 
 
 def test_worker_user_message_arm_invokes_wake_for_target_session(
@@ -313,14 +496,14 @@ def test_worker_user_message_arm_invokes_wake_for_target_session(
 ) -> None:
     """A due ``user_message`` row targets the specified session: the worker builds a
     ``user_message`` wake-context from the payload and calls ``_wake`` on exactly
-    the session_id supplied in the task — without calling
-    ``_get_or_create_active_session``. The turn is recorded and the task deleted."""
+    the session_id supplied in the task — without creating or loading the active
+    session. The turn is recorded and the task deleted."""
 
     _stub_memory_retriever(monkeypatch)
     now = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
-    monkeypatch.setattr("ariel.worker._utcnow", lambda: now)
+    monkeypatch.setattr("ariel.worker.utcnow", lambda: now)
     adapter = _WakeAdapter()
-    app = create_migrated_app(
+    app = create_test_app(
         database_url=postgres_url,
         model_adapter=adapter,
         sandbox=FakeSandboxRuntime(),
@@ -329,8 +512,7 @@ def test_worker_user_message_arm_invokes_wake_for_target_session(
         runtime = client.app.state.runtime  # type: ignore[attr-defined]
         session_factory = runtime.session_factory
 
-        # Seed an active session by hitting the sessions endpoint, which calls
-        # _get_or_create_active_session and creates a row in the database.
+        # Seed an active session through the public session endpoint.
         session_response = client.get("/v1/sessions/active")
         assert session_response.status_code == 200
         session_id = session_response.json()["session"]["id"]

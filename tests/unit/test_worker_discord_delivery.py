@@ -82,6 +82,7 @@ def _outcome_with_approvals(
 def test_deliver_to_discord_posts_on_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     """A successful turn with a non-silent message POSTs to the Discord REST API."""
     posts: list[dict[str, Any]] = []
+    responses: list[MagicMock] = []
 
     def fake_post(
         url: str, *, headers: dict[str, str], json: dict[str, Any], timeout: float
@@ -89,6 +90,7 @@ def test_deliver_to_discord_posts_on_happy_path(monkeypatch: pytest.MonkeyPatch)
         posts.append({"url": url, "headers": headers, "json": json, "timeout": timeout})
         response = MagicMock()
         response.status_code = 200
+        responses.append(response)
         return response
 
     monkeypatch.setattr("ariel.worker.httpx.post", fake_post)
@@ -102,6 +104,7 @@ def test_deliver_to_discord_posts_on_happy_path(monkeypatch: pytest.MonkeyPatch)
     assert post["headers"] == {"Authorization": "Bot test-bot-token"}
     assert post["json"] == {"content": "Hello from Ariel"}
     assert post["timeout"] == settings.discord_notification_timeout_seconds
+    responses[0].raise_for_status.assert_called_once_with()
 
 
 def test_deliver_to_discord_silent_turn_does_not_post(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -210,18 +213,23 @@ def test_deliver_to_discord_http_error_does_not_raise(monkeypatch: pytest.Monkey
     _deliver_to_discord(outcome=_outcome(), settings=_settings())
 
 
-def test_deliver_to_discord_http_4xx_does_not_raise(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A 4xx response from Discord must be silently swallowed."""
+def test_deliver_to_discord_http_4xx_logs_and_does_not_raise(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A Discord rejection is logged, but the turn already committed."""
 
-    def fake_post(url: str, **kwargs: Any) -> MagicMock:
-        response = MagicMock()
-        response.status_code = 401
-        return response
+    def fake_post(url: str, **kwargs: Any) -> httpx.Response:
+        request = httpx.Request("POST", url)
+        return httpx.Response(status_code=401, request=request)
 
     monkeypatch.setattr("ariel.worker.httpx.post", fake_post)
 
-    # Must not raise
-    _deliver_to_discord(outcome=_outcome(), settings=_settings())
+    with caplog.at_level("WARNING", logger="ariel.worker"):
+        _deliver_to_discord(outcome=_outcome(), settings=_settings())
+
+    assert "discord delivery HTTP error" in caplog.text
+    assert "401 Unauthorized" in caplog.text
 
 
 def test_deliver_to_discord_truncates_long_message(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -391,6 +399,42 @@ def test_deliver_to_discord_approval_with_expires_at_includes_suffix(
     assert f"⏳ Send email — needs approval (expires <t:{expected_epoch}:R>)" in content
 
 
+def test_deliver_to_discord_invalid_approval_expiry_keeps_approval_controls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posted_bodies: list[dict[str, Any]] = []
+
+    def fake_post(
+        url: str, *, headers: dict[str, str], json: dict[str, Any], timeout: float
+    ) -> MagicMock:
+        posted_bodies.append(json)
+        response = MagicMock()
+        response.status_code = 200
+        return response
+
+    monkeypatch.setattr("ariel.worker.httpx.post", fake_post)
+
+    outcome = _outcome_with_approvals(
+        message="Action ready.",
+        approvals=[
+            {
+                "ref": "ref_expiring",
+                "capability_id": "cap.email.send",
+                "expires_at": "not-a-date",
+            }
+        ],
+    )
+    _deliver_to_discord(outcome=outcome, settings=_settings())
+
+    assert len(posted_bodies) == 1
+    body = posted_bodies[0]
+    assert "⏳ Send email — needs approval" in body["content"]
+    assert "expires <t:" not in body["content"]
+    assert body["components"][0]["components"][0]["custom_id"] == (
+        "ariel:approval:approve:ref_expiring"
+    )
+
+
 def test_deliver_to_discord_dm_posts_to_origin_channel_and_replies(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -443,7 +487,7 @@ def test_deliver_to_discord_dm_posts_to_origin_channel_and_replies(
     }
 
 
-def test_deliver_to_discord_no_context_falls_back_to_default_channel(
+def test_deliver_to_discord_no_context_uses_default_notification_channel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A wake without a Discord-origin (e.g. a scheduled task) posts to the
@@ -515,7 +559,7 @@ def test_deliver_to_discord_no_default_channel_with_origin_still_posts(
 ) -> None:
     """When ARIEL_DISCORD_CHANNEL_ID is unset but a Discord-origin message
     carries a channel_id, delivery still happens — the default channel is a
-    fallback, not a gate."""
+    default notification target, not a gate."""
     posts: list[dict[str, Any]] = []
 
     def fake_post(

@@ -15,8 +15,9 @@ from ariel.action_runtime import (
     process_action_execution_task,
     process_one_call,
 )
-from ariel.app import _new_id, _utcnow
+from ariel.clock import utcnow
 from ariel.google_connector import GoogleConnectorRuntime
+from ariel.ids import new_id
 from ariel.persistence import BackgroundTaskRecord, TurnRecord
 from ariel.worker import process_one_task
 
@@ -42,7 +43,7 @@ def post_message_and_drain(
     Queries TurnRecord without filtering by session_id so rotation tests work
     correctly (the new session's turn is still found).
     """
-    posted_at = _utcnow()
+    posted_at = utcnow()
     body: dict[str, Any] = {"message": message}
     if json_extra:
         body.update(json_extra)
@@ -56,19 +57,7 @@ def post_message_and_drain(
 
     app_state = cast(Any, client.app).state
     runtime = app_state.runtime
-
-    for _ in range(20):
-        process_one_task(
-            session_factory=runtime.session_factory,
-            settings=runtime.settings,
-            runtime=runtime,
-        )
-        with runtime.session_factory() as db:
-            still_pending = db.get(BackgroundTaskRecord, task_id)
-        if still_pending is None:
-            break
-    else:
-        raise AssertionError(f"task {task_id} was not consumed after 20 process_one_task calls")
+    drain_task(client, task_id)
 
     with runtime.session_factory() as db:
         turn = db.scalar(
@@ -201,7 +190,6 @@ def responses_run_message(
     output_tokens: int = 1,
 ) -> dict[str, Any]:
     return responses_with_run_calls(
-        assistant_text=assistant_text,
         calls=[{"name": "agent.emit_message", "input": {"text": assistant_text}}],
         provider=provider,
         model=model,
@@ -233,7 +221,6 @@ def run_program_source_from_calls(calls: list[dict[str, Any]]) -> str:
 
 def responses_with_run_calls(
     *,
-    assistant_text: str,
     calls: list[dict[str, Any]],
     provider: str,
     model: str,
@@ -241,7 +228,6 @@ def responses_with_run_calls(
     input_tokens: int = 1,
     output_tokens: int = 1,
 ) -> dict[str, Any]:
-    del assistant_text
     if not calls:
         raise AssertionError("responses_with_run_calls requires at least one run call")
     return {
@@ -358,6 +344,6 @@ def process_queued_action_execution(client: TestClient, approval_payload: dict[s
             ),
         ),
         agency_runtime=None,
-        now_fn=_utcnow,
-        new_id_fn=_new_id,
+        now_fn=utcnow,
+        new_id_fn=new_id,
     )

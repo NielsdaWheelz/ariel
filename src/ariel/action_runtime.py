@@ -9,7 +9,7 @@ import secrets
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
-    from ariel.app import ModelAdapter
+    from ariel.model_adapter import ModelAdapter
     from ariel.sandbox_runtime import RunSandbox
 
 from fastapi.encoders import jsonable_encoder
@@ -51,8 +51,6 @@ from ariel.google_connector import (
     GOOGLE_WRITE_CAPABILITY_IDS,
     GoogleCapabilityExecutionResult,
     GoogleConnectorRuntime,
-    _decrypt_secret,
-    _encrypt_secret,
 )
 from ariel.persistence import (
     ActionAttemptRecord,
@@ -71,6 +69,7 @@ from ariel.persistence import (
 )
 from ariel.policy_engine import evaluate_proposal
 from ariel.redaction import safe_failure_reason
+from ariel.secret_cipher import decrypt_secret, encrypt_secret
 from ariel.weather_state import resolve_weather_location
 
 _SIDE_EFFECT_EXECUTION_LOCK_ID = 24_310_002
@@ -264,7 +263,7 @@ def _store_action_private_payload(
             action_attempt_id=action_attempt.id,
             payload_kind="google_provider_write_input",
             payload_digest=_json_digest(private_payload),
-            payload_enc=_encrypt_secret(
+            payload_enc=encrypt_secret(
                 plaintext=json.dumps(
                     jsonable_encoder(private_payload),
                     sort_keys=True,
@@ -316,7 +315,7 @@ def _full_action_input_payload(
     if private_payload_record is None:
         return None, "private_action_payload_missing"
     try:
-        plaintext = _decrypt_secret(
+        plaintext = decrypt_secret(
             ciphertext=private_payload_record.payload_enc,
             secret=google_runtime.encryption_secret,
             expected_key_version=google_runtime.encryption_key_version,
@@ -705,16 +704,14 @@ def _execute_memory_capability(
 
     if capability_id == "cap.memory.search":
         query = str(normalized_input["query"])
-        limit_raw = normalized_input.get("limit")
-        limit = int(limit_raw) if limit_raw is not None else 24
-        since_raw = normalized_input.get("since")
-        since: datetime | None = None
-        if isinstance(since_raw, str) and since_raw:
-            try:
-                since = datetime.fromisoformat(since_raw.replace("Z", "+00:00"))
-            except ValueError:
-                raise RuntimeError("memory_search_since_invalid")
-        kinds_raw = normalized_input.get("kinds")
+        limit = int(normalized_input["limit"])
+        since_raw = normalized_input["since"]
+        since = (
+            datetime.fromisoformat(since_raw.replace("Z", "+00:00"))
+            if since_raw is not None
+            else None
+        )
+        kinds_raw = normalized_input["kinds"]
         kinds: tuple[str, ...] | None = tuple(kinds_raw) if kinds_raw is not None else None
         with session_factory() as db:
             with db.begin():
@@ -2644,7 +2641,7 @@ def process_provider_write_reconcile_due(
     except AgencyDaemonError as exc:
         indeterminate_reason = safe_failure_reason(
             str(exc),
-            fallback="agency_reconcile_probe_failed",
+            safe_reason="agency_reconcile_probe_failed",
         )
         with session_factory() as db:
             with db.begin():
@@ -3289,41 +3286,45 @@ def process_one_call(
         ):
             db.flush()
             db.commit()
-            google_runtime.refresh_access_token_for_capability(
+            refresh_failure = google_runtime.refresh_access_token_for_capability(
                 session_factory=session_factory,
                 capability_id=capability_id,
                 now_fn=now_fn,
                 new_id_fn=new_id_fn,
             )
-            with session_factory() as access_db:
-                with access_db.begin():
-                    (
-                        access_token,
-                        granted_scopes,
-                        provider_account_id,
-                        access_failure,
-                    ) = google_runtime.prepare_capability_access_without_refresh(
-                        db=access_db,
-                        capability_id=capability_id,
-                        now_fn=now_fn,
-                    )
-            if access_failure is not None:
-                google_execution_result = access_failure
-            elif access_token is None:
-                google_execution_result = GoogleCapabilityExecutionResult(
-                    status="failed",
-                    output=None,
-                    auth_failure=None,
-                    error="token_expired",
-                )
+            if refresh_failure is not None:
+                google_execution_result = refresh_failure
             else:
-                google_execution_result = google_runtime.execute_provider_capability(
-                    capability_id=capability_id,
-                    normalized_input=evaluation.normalized_input,
-                    access_token=access_token,
-                    granted_scopes=granted_scopes,
-                    provider_account_id=provider_account_id,
-                )
+                with session_factory() as access_db:
+                    with access_db.begin():
+                        (
+                            access_token,
+                            granted_scopes,
+                            provider_account_id,
+                            access_failure,
+                        ) = google_runtime.prepare_capability_access_without_refresh(
+                            db=access_db,
+                            capability_id=capability_id,
+                            now_fn=now_fn,
+                        )
+                if access_failure is not None:
+                    google_execution_result = access_failure
+                elif access_token is None:
+                    google_execution_result = GoogleCapabilityExecutionResult(
+                        status="failed",
+                        output=None,
+                        auth_failure=None,
+                        error="token_expired",
+                    )
+                else:
+                    assert provider_account_id is not None
+                    google_execution_result = google_runtime.execute_provider_capability(
+                        capability_id=capability_id,
+                        normalized_input=evaluation.normalized_input,
+                        access_token=access_token,
+                        granted_scopes=granted_scopes,
+                        provider_account_id=provider_account_id,
+                    )
         else:
             _acquire_side_effect_execution_lock(
                 db=db,
@@ -3424,6 +3425,8 @@ def process_one_call(
     elif is_memory_capability_call:
         # The prior branch handles a missing session_factory; here it is bound.
         assert session_factory is not None
+        from ariel.memory import MemoryExecutionError
+
         try:
             memory_output = _execute_memory_capability(
                 session_factory=session_factory,
@@ -3444,14 +3447,11 @@ def process_one_call(
                 approval_actor_id=approval_actor_id,
                 add_event=add_event,
             )
-        except Exception as exc:  # noqa: BLE001
+        except MemoryExecutionError as exc:
             execution_result = ExecutionResult(
                 status="failed",
                 output=None,
-                error=safe_failure_reason(
-                    str(exc),
-                    fallback=f"unexpected {exc.__class__.__name__}",
-                ),
+                error=exc.safe_reason,
             )
         else:
             execution_result = ExecutionResult(
@@ -3462,56 +3462,34 @@ def process_one_call(
     elif is_proactive_capability_call:
         # The schedule syscall writes one agent_wake row to the caller's
         # transaction and returns the task identity into the program.
-        try:
-            proactive_output = _execute_proactive_capability(
-                db=db,
-                capability_id=capability_id,
-                normalized_input=evaluation.normalized_input,
-                now_fn=now_fn,
-            )
-        except Exception as exc:  # noqa: BLE001
-            execution_result = ExecutionResult(
-                status="failed",
-                output=None,
-                error=safe_failure_reason(
-                    str(exc),
-                    fallback=f"unexpected {exc.__class__.__name__}",
-                ),
-            )
-        else:
-            execution_result = ExecutionResult(
-                status="succeeded",
-                output=proactive_output,
-                error=None,
-            )
+        proactive_output = _execute_proactive_capability(
+            db=db,
+            capability_id=capability_id,
+            normalized_input=evaluation.normalized_input,
+            now_fn=now_fn,
+        )
+        execution_result = ExecutionResult(
+            status="succeeded",
+            output=proactive_output,
+            error=None,
+        )
     elif is_research_capability_call:
         # The investigate syscall is a read capability that executes inline: it
         # writes one immediate research_run row to the caller's transaction and
         # returns the research task identity into the program. The research run
         # itself executes in the worker.
-        try:
-            research_output = _execute_research_capability(
-                db=db,
-                capability_id=capability_id,
-                normalized_input=evaluation.normalized_input,
-                session_id=session_id,
-                now_fn=now_fn,
-            )
-        except Exception as exc:  # noqa: BLE001
-            execution_result = ExecutionResult(
-                status="failed",
-                output=None,
-                error=safe_failure_reason(
-                    str(exc),
-                    fallback=f"unexpected {exc.__class__.__name__}",
-                ),
-            )
-        else:
-            execution_result = ExecutionResult(
-                status="succeeded",
-                output=research_output,
-                error=None,
-            )
+        research_output = _execute_research_capability(
+            db=db,
+            capability_id=capability_id,
+            normalized_input=evaluation.normalized_input,
+            session_id=session_id,
+            now_fn=now_fn,
+        )
+        execution_result = ExecutionResult(
+            status="succeeded",
+            output=research_output,
+            error=None,
+        )
     else:
         _acquire_side_effect_execution_lock(
             db=db,
@@ -4166,6 +4144,7 @@ def process_action_execution_task(
     retryable_provider_error: str | None = None
     provider_write_failure_payload: dict[str, Any] | None = None
     provider_write_failure_status: ProviderWriteReceiptStatus | None = None
+    preflight_google_refresh_failure: GoogleCapabilityExecutionResult | None = None
 
     if google_runtime is not None:
         with session_factory() as db:
@@ -4179,7 +4158,7 @@ def process_action_execution_task(
                     else None
                 )
         if google_capability_id is not None:
-            google_runtime.refresh_access_token_for_capability(
+            preflight_google_refresh_failure = google_runtime.refresh_access_token_for_capability(
                 session_factory=session_factory,
                 capability_id=google_capability_id,
                 now_fn=now_fn,
@@ -4244,7 +4223,10 @@ def process_action_execution_task(
                             new_id_fn=new_id_fn,
                         )
                         return True
-                    if existing_receipt is not None and existing_receipt.status == "succeeded":
+                    if existing_receipt is not None and existing_receipt.status in {
+                        "succeeded",
+                        "undone",
+                    }:
                         action_attempt.status = "succeeded"
                         action_attempt.execution_output = existing_receipt.response_payload
                         action_attempt.execution_error = None
@@ -4271,15 +4253,28 @@ def process_action_execution_task(
                         and isinstance(existing_receipt.response_payload, dict)
                         else None
                     )
-                    if (
+                    retry_failed_email_receipt = (
                         action_attempt.capability_id in EMAIL_MUTATION_CAPABILITY_IDS
                         and existing_receipt is not None
                         and existing_receipt.status == "failed"
                         and isinstance(existing_error, str)
                         and _email_provider_error_is_retryable(existing_error)
+                    )
+                    if (
+                        existing_receipt is not None
+                        and existing_receipt.status == "failed"
+                        and isinstance(existing_error, str)
+                        and not retry_failed_email_receipt
                     ):
-                        pass
-                    else:
+                        _fail_action_execution(
+                            db=db,
+                            action_attempt=action_attempt,
+                            error=existing_error,
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        return True
+                    if not retry_failed_email_receipt:
                         receipt = existing_receipt
                         if receipt is None or receipt.status != "ambiguous":
                             receipt = _record_provider_write_receipt(
@@ -4427,6 +4422,20 @@ def process_action_execution_task(
                     )
                     return True
 
+            if preflight_google_refresh_failure is not None:
+                _fail_action_execution(
+                    db=db,
+                    action_attempt=action_attempt,
+                    error=(
+                        preflight_google_refresh_failure.auth_failure.failure_class
+                        if preflight_google_refresh_failure.auth_failure is not None
+                        else (preflight_google_refresh_failure.error or "google_refresh_failed")
+                    ),
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
+                return True
+
             capability = get_capability(action_attempt.capability_id)
             if capability is None:
                 _fail_action_execution(
@@ -4489,6 +4498,8 @@ def process_action_execution_task(
                 return True
 
             if action_attempt.capability_id in MEMORY_CAPABILITY_IDS:
+                from ariel.memory import MemoryExecutionError
+
                 try:
                     memory_output = _execute_memory_capability(
                         session_factory=session_factory,
@@ -4499,14 +4510,11 @@ def process_action_execution_task(
                         new_id_fn=new_id_fn,
                         settings=settings,
                     )
-                except Exception as exc:  # noqa: BLE001
+                except MemoryExecutionError as exc:
                     _fail_action_execution(
                         db=db,
                         action_attempt=action_attempt,
-                        error=safe_failure_reason(
-                            str(exc),
-                            fallback=f"unexpected {exc.__class__.__name__}",
-                        ),
+                        error=exc.safe_reason,
                         now_fn=now_fn,
                         new_id_fn=new_id_fn,
                     )
@@ -4532,25 +4540,12 @@ def process_action_execution_task(
                 # proactive.* is allow_inline but taint can escalate it; on
                 # approval the action re-executes through this path. Mirror
                 # the inline dispatch so the agent_wake row gets written.
-                try:
-                    proactive_output = _execute_proactive_capability(
-                        db=db,
-                        capability_id=action_attempt.capability_id,
-                        normalized_input=normalized_input,
-                        now_fn=now_fn,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    _fail_action_execution(
-                        db=db,
-                        action_attempt=action_attempt,
-                        error=safe_failure_reason(
-                            str(exc),
-                            fallback=f"unexpected {exc.__class__.__name__}",
-                        ),
-                        now_fn=now_fn,
-                        new_id_fn=new_id_fn,
-                    )
-                    return True
+                proactive_output = _execute_proactive_capability(
+                    db=db,
+                    capability_id=action_attempt.capability_id,
+                    normalized_input=normalized_input,
+                    now_fn=now_fn,
+                )
                 action_attempt.status = "succeeded"
                 action_attempt.execution_output = proactive_output
                 action_attempt.execution_error = None
@@ -4571,26 +4566,13 @@ def process_action_execution_task(
             if action_attempt.capability_id in RESEARCH_CAPABILITY_IDS:
                 # research.* enqueues a research_run task in the inline path.
                 # On approval, the same dispatch must happen here.
-                try:
-                    research_output = _execute_research_capability(
-                        db=db,
-                        capability_id=action_attempt.capability_id,
-                        normalized_input=normalized_input,
-                        session_id=action_attempt.session_id,
-                        now_fn=now_fn,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    _fail_action_execution(
-                        db=db,
-                        action_attempt=action_attempt,
-                        error=safe_failure_reason(
-                            str(exc),
-                            fallback=f"unexpected {exc.__class__.__name__}",
-                        ),
-                        now_fn=now_fn,
-                        new_id_fn=new_id_fn,
-                    )
-                    return True
+                research_output = _execute_research_capability(
+                    db=db,
+                    capability_id=action_attempt.capability_id,
+                    normalized_input=normalized_input,
+                    session_id=action_attempt.session_id,
+                    now_fn=now_fn,
+                )
                 action_attempt.status = "succeeded"
                 action_attempt.execution_output = research_output
                 action_attempt.execution_error = None
@@ -5162,6 +5144,7 @@ def process_action_execution_task(
                 granted_scopes,
                 provider_account_id,
             )
+            assert provider_account_id is not None
             execution_result = google_runtime.execute_provider_capability(
                 capability_id=capability_id,
                 normalized_input=normalized_input,
@@ -5176,6 +5159,7 @@ def process_action_execution_task(
             provider_call
         )
         assert google_runtime is not None
+        assert provider_account_id is not None
         execution_result = google_runtime.execute_provider_capability(
             capability_id=capability_id,
             normalized_input=normalized_input,

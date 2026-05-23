@@ -5,7 +5,7 @@ How to (re)connect Ariel's Google integration — including granting new scopes 
 ## When you need this
 
 - **First-time setup**: connect Google so Ariel can read your Mail/Calendar/Drive.
-- **Account email shows as `unknown-email`**: your connector predates the identity-scope addition. Reconnecting will request `openid + email + profile` and populate `account_email`.
+- **Account email shows as `unknown-email`**: your connector predates the identity-scope addition. Reconnecting will request `openid + email + profile` and populate `account_email`; current connect/reconnect callbacks reject missing userinfo identity instead of creating this value.
 - **Bot says "I can't send mail / create events / share files"**: the relevant write scope was never granted. Reconnect with a `capability_intent`.
 - **Google revoked the refresh token** (you removed access from [https://myaccount.google.com/permissions](https://myaccount.google.com/permissions), or it expired due to inactivity): reconnect to mint a fresh refresh token.
 
@@ -37,7 +37,7 @@ Each `start` / `reconnect` returns an `authorization_url`. You open that URL in 
 You are an existing user (`gmail.readonly + calendar.readonly` already granted). You want everything else (identity scopes + the common write capabilities). Run these one at a time. Each step opens one browser consent screen; you approve, Google redirects back, and the next step's request unions in more scopes (existing grants always carry forward).
 
 ```bash
-# Step 1: identity scopes (openid + email + profile) — fixes "unknown-email"
+# Step 1: identity scopes (openid + email + profile) — fixes historical "unknown-email"
 curl -s "${auth[@]}" -X POST http://127.0.0.1:8000/v1/connectors/google/reconnect | jq -r '.oauth.authorization_url'
 # → open the URL in a browser, click Allow
 
@@ -105,6 +105,7 @@ Reconnect always unions the requested set with what you have. Granted scopes nev
 - **`E_CONNECTOR_RECONNECT_INVALID_INTENT`** — the `capability_intent` value doesn't match the table above. Check for typos.
 - **`access_denied` from Google** — you clicked Cancel on the consent screen, or your email isn't in the test-users list.
 - **`invalid_scope` from Google** — the scope you requested isn't enabled on the OAuth client. Open Cloud Console → OAuth consent screen → **Add or Remove Scopes**.
+- **`E_CONNECTOR_CALLBACK_FAILED` with `provider_invalid_payload`** — Google did not return usable userinfo identity. Confirm the OAuth consent screen includes `openid`, `userinfo.email`, and `userinfo.profile`, then retry the reconnect.
 - **Granted scopes still don't include the new one after Allow** — verify the callback succeeded: check `curl "${auth[@]}" http://127.0.0.1:8000/v1/connectors/google/events | jq '.events[0:5]'` for a recent `evt.connector.google.reconnect.succeeded`.
 - **`E_LOCAL_AUTH_TOKEN_INVALID`** — you didn't load the `auth=(…)` array, or `/etc/ariel/ariel.env` doesn't have `ARIEL_LOCAL_AUTH_TOKEN`. Sanity-check with `echo "$ARIEL_LOCAL_AUTH_TOKEN" | wc -c` (≥33 chars including newline).
 

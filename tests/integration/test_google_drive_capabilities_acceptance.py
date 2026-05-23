@@ -8,9 +8,13 @@ from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import select
 
-from ariel.app import ModelAdapter
-from tests.integration.app_helpers import create_migrated_app
-from ariel.google_connector import GoogleWorkspaceProvider
+from ariel.model_adapter import ModelAdapter
+from tests.integration.app_helpers import create_test_app
+from ariel.google_connector import (
+    GoogleOAuthRefreshFailure,
+    GoogleProviderRequestFailure,
+    GoogleWorkspaceProvider,
+)
 from ariel.persistence import ArtifactRecord, ProviderWriteReceiptRecord
 from tests.integration.responses_helpers import (
     empty_recall_response,
@@ -86,7 +90,6 @@ class ActionProposalAdapter:
         if not run_calls:
             run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
         return responses_with_run_calls(
-            assistant_text=assistant_text,
             calls=run_calls,
             provider=self.provider,
             model=self.model,
@@ -161,9 +164,9 @@ class FakeGoogleOAuthClient:
 
     def refresh_access_token(self, *, refresh_token: str) -> dict[str, Any]:
         if self.refresh_mode == "invalid_grant":
-            raise RuntimeError("invalid_grant")
+            raise GoogleOAuthRefreshFailure(code="access_revoked")
         if self.refresh_mode == "transient_failure":
-            raise RuntimeError("google_upstream_timeout")
+            raise GoogleOAuthRefreshFailure(code="provider_timeout")
         return {
             "access_token": f"refreshed::{refresh_token}",
             "refresh_token": refresh_token,
@@ -185,18 +188,19 @@ class FakeGoogleWorkspaceProvider:
 
     def _raise_if_configured(self, capability_id: str) -> None:
         if capability_id in self.fail_scope_missing_for:
-            raise RuntimeError("insufficient_permissions")
+            raise GoogleProviderRequestFailure("insufficient_permissions")
         provider_error = self.provider_error_by_capability.get(capability_id)
         if provider_error is not None:
-            raise RuntimeError(provider_error)
+            raise GoogleProviderRequestFailure(provider_error)
 
     def calendar_list(
         self,
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]:
-        del access_token
+        del access_token, provider_account_id
         return {
             "schema_version": "google.calendar.events.v1",
             "status": "succeeded",
@@ -211,11 +215,13 @@ class FakeGoogleWorkspaceProvider:
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
         attendee_intersection_enabled: bool,
     ) -> dict[str, Any]:
         del access_token, normalized_input, attendee_intersection_enabled
         return {
             "schema_version": "google.calendar.slot_options.v1",
+            "provider_account_id": provider_account_id,
             "slots": [],
             "retrieved_at": "2026-03-06T12:00:00Z",
             "window_start": "2026-03-06T00:00:00Z",
@@ -237,8 +243,9 @@ class FakeGoogleWorkspaceProvider:
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]:
-        del access_token, normalized_input
+        del access_token, normalized_input, provider_account_id
         return {
             "schema_version": "google.gmail.message_refs.v1",
             "status": "succeeded",
@@ -252,8 +259,9 @@ class FakeGoogleWorkspaceProvider:
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]:
-        del access_token
+        del access_token, provider_account_id
         message_id = normalized_input["message_id"]
         return {
             "schema_version": "google.gmail.message_evidence.v1",
@@ -327,6 +335,7 @@ class FakeGoogleWorkspaceProvider:
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]:
         self._raise_if_configured("cap.drive.search")
         self.drive_search_calls.append(
@@ -339,6 +348,7 @@ class FakeGoogleWorkspaceProvider:
         return {
             "schema_version": "google.drive.search_results.v1",
             "query": query,
+            "provider_account_id": provider_account_id,
             "retrieved_at": "2026-03-06T12:00:00Z",
             "results": [
                 {
@@ -359,6 +369,7 @@ class FakeGoogleWorkspaceProvider:
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]:
         self._raise_if_configured("cap.drive.read")
         self.drive_read_calls.append(
@@ -374,6 +385,7 @@ class FakeGoogleWorkspaceProvider:
             return {
                 "schema_version": "google.drive.read_result.v1",
                 "file_id": file_id,
+                "provider_account_id": provider_account_id,
                 "retrieved_at": "2026-03-06T12:00:00Z",
                 "title": f"Drive file {file_id}",
                 "source": base_source,
@@ -391,6 +403,7 @@ class FakeGoogleWorkspaceProvider:
             return {
                 "schema_version": "google.drive.read_result.v1",
                 "file_id": file_id,
+                "provider_account_id": provider_account_id,
                 "retrieved_at": "2026-03-06T12:00:00Z",
                 "title": f"Drive file {file_id}",
                 "source": base_source,
@@ -408,6 +421,7 @@ class FakeGoogleWorkspaceProvider:
             return {
                 "schema_version": "google.drive.read_result.v1",
                 "file_id": file_id,
+                "provider_account_id": provider_account_id,
                 "retrieved_at": "2026-03-06T12:00:00Z",
                 "title": f"Drive file {file_id}",
                 "source": base_source,
@@ -424,6 +438,7 @@ class FakeGoogleWorkspaceProvider:
         return {
             "schema_version": "google.drive.read_result.v1",
             "file_id": file_id,
+            "provider_account_id": provider_account_id,
             "retrieved_at": "2026-03-06T12:00:00Z",
             "title": "Q3 Launch Plan",
             "source": base_source,
@@ -464,7 +479,7 @@ class FakeGoogleWorkspaceProvider:
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
-    app = create_migrated_app(
+    app = create_test_app(
         database_url=postgres_url,
         model_adapter=adapter,
         sandbox=FakeSandboxRuntime(),
@@ -980,11 +995,11 @@ def test_drive_share_denial_blocks_the_provider_write(
         ("consent_required", "connect-baseline", "ok", False, "consent_required"),
         ("scope_missing", "connect-drive-read", "ok", True, "scope_missing"),
         (
-            "token_expired",
+            "provider_timeout",
             "connect-drive-read-expired",
             "transient_failure",
             False,
-            "token_expired",
+            "provider_timeout",
         ),
         ("access_revoked", "connect-drive-read-expired", "invalid_grant", False, "access_revoked"),
     ],
@@ -1076,10 +1091,6 @@ def test_drive_auth_scope_failures_are_typed_and_recoverable(
             return
         if expected_class in {"consent_required", "scope_missing", "access_revoked"}:
             assert "reconnect" in rendered_message
-        if expected_class == "token_expired":
-            assert "retry" in rendered_message
-            assert "reconnect" in rendered_message
-
         attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"
         assert attempt["execution"]["error"] == expected_class

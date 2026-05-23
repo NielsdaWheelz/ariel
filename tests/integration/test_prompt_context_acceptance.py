@@ -5,10 +5,10 @@ from typing import Any
 
 from fastapi.testclient import TestClient
 
-from ariel.app import ModelAdapter
+from ariel.model_adapter import ModelAdapter
 from ariel.prompts import MAIN_AGENT_PROMPT_VERSION, MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS
 from tests.fake_sandbox import FakeSandboxRuntime
-from tests.integration.app_helpers import create_migrated_app
+from tests.integration.app_helpers import create_test_app
 from tests.integration.responses_helpers import (
     empty_recall_response,
     is_memory_subsystem_call,
@@ -98,7 +98,7 @@ class MutatingContextAdapter:
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
-    app = create_migrated_app(
+    app = create_test_app(
         database_url=postgres_url,
         model_adapter=adapter,
         sandbox=FakeSandboxRuntime(),

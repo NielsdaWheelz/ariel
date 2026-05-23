@@ -11,7 +11,7 @@ from typing import Any, cast
 from fastapi.testclient import TestClient
 import pytest
 
-from tests.integration.app_helpers import create_migrated_app
+from tests.integration.app_helpers import create_test_app
 from ariel.persistence import ProviderWatchChannelRecord
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.responses_helpers import empty_recall_response, is_memory_subsystem_call
@@ -48,7 +48,7 @@ def test_local_auth_guards_authority_routes(
     monkeypatch.setenv("ARIEL_LOCAL_AUTH_REQUIRED", "true")
     monkeypatch.setenv("ARIEL_LOCAL_AUTH_TOKEN", LOCAL_AUTH_TOKEN)
 
-    app = create_migrated_app(
+    app = create_test_app(
         database_url=postgres_url,
         model_adapter=NoModelAdapter(),
         sandbox=FakeSandboxRuntime(),
@@ -76,10 +76,9 @@ def test_provider_callback_auth_is_owned_by_provider_verification(
 ) -> None:
     monkeypatch.setenv("ARIEL_LOCAL_AUTH_REQUIRED", "true")
     monkeypatch.setenv("ARIEL_LOCAL_AUTH_TOKEN", LOCAL_AUTH_TOKEN)
-    monkeypatch.setenv("ARIEL_GOOGLE_PROVIDER_EVENT_TOKEN", "provider-token")
     monkeypatch.setenv("ARIEL_AGENCY_EVENT_SECRET", "agency-secret")
 
-    app = create_migrated_app(
+    app = create_test_app(
         database_url=postgres_url,
         model_adapter=NoModelAdapter(),
         sandbox=FakeSandboxRuntime(),
@@ -99,11 +98,11 @@ def test_provider_callback_auth_is_owned_by_provider_verification(
                         resource_type="calendar",
                         resource_id="primary",
                         channel_id="chan_1",
-                        channel_token="provider-token",
+                        channel_token="channel-token",
                         provider_resource_id="res_chan_1",
                         cursor_seed=None,
                         status="active",
-                        expires_at=datetime(2026, 5, 26, 12, 0, tzinfo=UTC),
+                        expires_at=datetime(2030, 1, 1, 12, 0, tzinfo=UTC),
                         created_at=now,
                         updated_at=now,
                     )
@@ -112,7 +111,7 @@ def test_provider_callback_auth_is_owned_by_provider_verification(
         provider_event = client.post(
             "/v1/providers/google/events?resource_type=calendar&resource_id=primary",
             headers={
-                "X-Goog-Channel-Token": "provider-token",
+                "X-Goog-Channel-Token": "channel-token",
                 "X-Goog-Channel-ID": "chan_1",
                 "X-Goog-Message-Number": "1",
                 "X-Goog-Resource-State": "exists",
@@ -132,7 +131,7 @@ def test_provider_callback_auth_is_owned_by_provider_verification(
             json={},
         )
         assert rejected_provider_event.status_code == 401
-        assert rejected_provider_event.json()["error"]["code"] == "E_PROVIDER_EVENT_TOKEN_INVALID"
+        assert rejected_provider_event.json()["error"]["code"] == "E_PROVIDER_EVENT_CHANNEL_INVALID"
 
         body = json.dumps(
             {

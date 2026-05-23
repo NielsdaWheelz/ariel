@@ -12,6 +12,7 @@ from typing import Any, Literal, Protocol
 from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
 import httpx
+from .clock import utcnow
 from .config import AppSettings
 from .research_modes import RESEARCH_MODE_VALUES
 from web_search_tool.brave import BraveSearchProvider
@@ -97,6 +98,10 @@ REMEMBERER_CAPABILITY_IDS: frozenset[str] = frozenset(
         "cap.memory.note.delete",
     }
 )
+
+
+class CapabilityExecutionError(Exception):
+    """Expected capability execution failure safe to surface as an action error."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1119,10 +1124,10 @@ def _validate_memory_search_input(
     query = query_raw.strip()
     if not query or len(query) > 12_000:
         return None, "schema_invalid"
-    limit_raw = raw_input.get("limit")
-    if limit_raw is None:
-        limit = None
-    elif isinstance(limit_raw, int) and not isinstance(limit_raw, bool):
+    if "limit" not in raw_input:
+        limit = 24
+    elif isinstance(raw_input["limit"], int) and not isinstance(raw_input["limit"], bool):
+        limit_raw = raw_input["limit"]
         if limit_raw < 1 or limit_raw > 100:
             return None, "schema_invalid"
         limit = limit_raw
@@ -1131,15 +1136,17 @@ def _validate_memory_search_input(
     since_raw = raw_input.get("since")
     if since_raw is None:
         since = None
-    elif isinstance(since_raw, str):
-        since = since_raw.strip() or None
     else:
-        return None, "schema_invalid"
+        since = _normalize_rfc3339_like(since_raw)
+        if since is None:
+            return None, "schema_invalid"
     kinds_raw = raw_input.get("kinds")
     kinds: list[str] | None = None
     if kinds_raw is None:
-        pass
+        kinds = None
     elif isinstance(kinds_raw, list):
+        if not kinds_raw:
+            return None, "schema_invalid"
         kinds = []
         for k in kinds_raw:
             if not isinstance(k, str) or k not in _MEMORY_LOG_KINDS:
@@ -1470,24 +1477,24 @@ def _normalize_web_search_response(response: WebSearchResponse, *, query: str) -
     return {
         "query": query,
         "retrieved_at": _normalize_optional_timestamp(response.retrieved_at)
-        or datetime.now(tz=UTC).isoformat().replace("+00:00", "Z"),
+        or utcnow().isoformat().replace("+00:00", "Z"),
         "results": normalized_results,
         "status": "succeeded",
     }
 
 
-def _raise_web_search_runtime_error(exc: WebSearchError, *, prefix: str) -> None:
+def _raise_web_search_execution_error(exc: WebSearchError, *, prefix: str) -> None:
     if exc.code == WebSearchErrorCode.TIMEOUT:
-        raise RuntimeError(f"{prefix} provider timeout") from exc
+        raise CapabilityExecutionError(f"{prefix} provider timeout") from exc
     if exc.code == WebSearchErrorCode.RATE_LIMITED:
-        raise RuntimeError(f"{prefix} provider rate limited") from exc
+        raise CapabilityExecutionError(f"{prefix} provider rate limited") from exc
     if exc.code == WebSearchErrorCode.PROVIDER_DOWN:
-        raise RuntimeError(f"{prefix} provider upstream failure") from exc
+        raise CapabilityExecutionError(f"{prefix} provider upstream failure") from exc
     if exc.code in {WebSearchErrorCode.INVALID_KEY, WebSearchErrorCode.INVALID_REQUEST}:
-        raise RuntimeError(f"{prefix} provider request rejected") from exc
+        raise CapabilityExecutionError(f"{prefix} provider request rejected") from exc
     if exc.code == WebSearchErrorCode.BAD_RESPONSE:
-        raise RuntimeError(f"{prefix} provider returned invalid payload") from exc
-    raise RuntimeError(f"{prefix} provider failure") from exc
+        raise CapabilityExecutionError(f"{prefix} provider returned invalid payload") from exc
+    raise CapabilityExecutionError(f"{prefix} provider failure") from exc
 
 
 async def _run_brave_search(
@@ -1541,11 +1548,11 @@ def _execute_search(
     error_prefix = _search_error_prefix(result_type)
     if api_key is None:
         if result_type == WebSearchResultType.NEWS:
-            raise RuntimeError("news search credentials are not configured")
-        raise RuntimeError("search credentials are not configured")
+            raise CapabilityExecutionError("news search credentials are not configured")
+        raise CapabilityExecutionError("search credentials are not configured")
     endpoint_parsed = urlparse(_search_endpoint(result_type))
     if endpoint_parsed.hostname is None or endpoint_parsed.scheme.lower() not in {"http", "https"}:
-        raise RuntimeError(f"{error_prefix} endpoint invalid")
+        raise CapabilityExecutionError(f"{error_prefix} endpoint invalid")
     try:
         response = asyncio.run(
             _run_brave_search(
@@ -1556,7 +1563,7 @@ def _execute_search(
             )
         )
     except WebSearchError as exc:
-        _raise_web_search_runtime_error(exc, prefix=error_prefix)
+        _raise_web_search_execution_error(exc, prefix=error_prefix)
 
     return _normalize_web_search_response(response, query=input_payload["query"])
 
@@ -1845,17 +1852,17 @@ def _normalize_web_extract_blocks(
 def _execute_web_extract(input_payload: dict[str, Any]) -> dict[str, Any]:
     raw_url = input_payload.get("url")
     if not isinstance(raw_url, str):
-        raise RuntimeError("url_invalid")
+        raise CapabilityExecutionError("url_invalid")
 
     normalized_url, url_error = _normalize_web_extract_url(raw_url)
     if url_error is not None or normalized_url is None:
-        raise RuntimeError(url_error or "url_invalid")
+        raise CapabilityExecutionError(url_error or "url_invalid")
 
     endpoint = _web_extract_provider_endpoint()
     endpoint_host = _endpoint_host(endpoint)
     endpoint_parsed = urlparse(endpoint)
     if endpoint_host is None or endpoint_parsed.scheme.lower() not in {"http", "https"}:
-        raise RuntimeError("provider_unreachable")
+        raise CapabilityExecutionError("provider_unreachable")
 
     headers: dict[str, str] = {
         "accept": "application/json",
@@ -1883,37 +1890,37 @@ def _execute_web_extract(input_payload: dict[str, Any]) -> dict[str, Any]:
         except httpx.TimeoutException as exc:
             if attempt_index < max_retries:
                 continue
-            raise RuntimeError("provider_timeout") from exc
+            raise CapabilityExecutionError("provider_timeout") from exc
         except httpx.HTTPError as exc:
             if attempt_index < max_retries:
                 continue
-            raise RuntimeError("provider_network_failure") from exc
+            raise CapabilityExecutionError("provider_network_failure") from exc
 
         if response.status_code == 429:
             if attempt_index < max_retries:
                 continue
-            raise RuntimeError("provider_rate_limited")
+            raise CapabilityExecutionError("provider_rate_limited")
         if response.status_code in {401, 403, 451}:
-            raise RuntimeError("access_restricted")
+            raise CapabilityExecutionError("access_restricted")
         if response.status_code == 415:
-            raise RuntimeError("unsupported_format")
+            raise CapabilityExecutionError("unsupported_format")
         if response.status_code >= 500:
             if attempt_index < max_retries:
                 continue
-            raise RuntimeError("provider_upstream_failure")
+            raise CapabilityExecutionError("provider_upstream_failure")
         if response.status_code >= 400:
-            raise RuntimeError("provider_request_rejected")
+            raise CapabilityExecutionError("provider_request_rejected")
         break
 
     if response is None:
-        raise RuntimeError("provider_upstream_failure")
+        raise CapabilityExecutionError("provider_upstream_failure")
 
     try:
         payload = response.json()
     except ValueError as exc:
-        raise RuntimeError("provider_invalid_payload") from exc
+        raise CapabilityExecutionError("provider_invalid_payload") from exc
     if not isinstance(payload, dict):
-        raise RuntimeError("provider_invalid_payload")
+        raise CapabilityExecutionError("provider_invalid_payload")
 
     document_payload_raw = payload.get("document")
     document_payload = document_payload_raw if isinstance(document_payload_raw, dict) else payload
@@ -1927,21 +1934,21 @@ def _execute_web_extract(input_payload: dict[str, Any]) -> dict[str, Any]:
         normalized_final_url, final_url_error = _normalize_web_extract_url(final_url_raw)
         if final_url_error is not None or normalized_final_url is None:
             if final_url_error == "url_destination_unsafe":
-                raise RuntimeError("url_destination_unsafe")
-            raise RuntimeError("provider_invalid_payload")
+                raise CapabilityExecutionError("url_destination_unsafe")
+            raise CapabilityExecutionError("provider_invalid_payload")
         resolved_url = normalized_final_url
 
     canonical_url = _canonicalize_web_extract_source_identity(resolved_url)
     if canonical_url is None:
-        raise RuntimeError("provider_invalid_payload")
+        raise CapabilityExecutionError("provider_invalid_payload")
 
     canonical_host = urlparse(canonical_url).hostname
     if canonical_host is None or _is_unsafe_web_extract_host(canonical_host):
-        raise RuntimeError("url_destination_unsafe")
+        raise CapabilityExecutionError("url_destination_unsafe")
 
     retrieved_at = _normalize_optional_timestamp(
         document_payload.get("retrieved_at")
-    ) or datetime.now(tz=UTC).isoformat().replace("+00:00", "Z")
+    ) or utcnow().isoformat().replace("+00:00", "Z")
     published_at = _normalize_optional_timestamp(document_payload.get("published_at"))
 
     title_raw = document_payload.get("title")
@@ -1954,7 +1961,7 @@ def _execute_web_extract(input_payload: dict[str, Any]) -> dict[str, Any]:
         raw_blocks = _web_extract_content_blocks(payload)
     normalized_blocks, content_truncated, content_chars = _normalize_web_extract_blocks(raw_blocks)
     if not normalized_blocks:
-        raise RuntimeError("unsupported_format")
+        raise CapabilityExecutionError("unsupported_format")
 
     status_raw = document_payload.get("status")
     provider_marked_partial = (
@@ -2051,7 +2058,7 @@ _EARTH_RADIUS_METERS = 6_371_000.0
 def _maps_api_key() -> str:
     api_key = AppSettings().maps_api_key
     if api_key is None:
-        raise RuntimeError("provider_credentials_missing")
+        raise CapabilityExecutionError("provider_credentials_missing")
     return api_key
 
 
@@ -2095,11 +2102,11 @@ def _maps_request_with_retry(
             )
         except httpx.TimeoutException as exc:
             if is_final_attempt:
-                raise RuntimeError("provider_timeout") from exc
+                raise CapabilityExecutionError("provider_timeout") from exc
             continue
         except httpx.HTTPError as exc:
             if is_final_attempt:
-                raise RuntimeError("provider_network_failure") from exc
+                raise CapabilityExecutionError("provider_network_failure") from exc
             continue
         if response.status_code in _MAPS_TRANSIENT_STATUS_CODES and not is_final_attempt:
             continue
@@ -2112,21 +2119,21 @@ def _raise_for_maps_status(response: httpx.Response) -> None:
     if status_code < 400:
         return
     if status_code == 429:
-        raise RuntimeError("provider_rate_limited")
+        raise CapabilityExecutionError("provider_rate_limited")
     if status_code >= 500:
-        raise RuntimeError("provider_upstream_failure")
+        raise CapabilityExecutionError("provider_upstream_failure")
     if status_code in {401, 403}:
-        raise RuntimeError("provider_permission_denied")
-    raise RuntimeError("provider_request_rejected")
+        raise CapabilityExecutionError("provider_permission_denied")
+    raise CapabilityExecutionError("provider_request_rejected")
 
 
 def _maps_response_json(response: httpx.Response) -> dict[str, Any]:
     try:
         payload = response.json()
     except ValueError as exc:
-        raise RuntimeError("provider_invalid_payload") from exc
+        raise CapabilityExecutionError("provider_invalid_payload") from exc
     if not isinstance(payload, dict):
-        raise RuntimeError("provider_invalid_payload")
+        raise CapabilityExecutionError("provider_invalid_payload")
     return payload
 
 
@@ -2346,9 +2353,9 @@ def _execute_maps_directions(input_payload: dict[str, Any]) -> dict[str, Any]:
     origin = input_payload["origin"]
     destination = input_payload["destination"]
     if origin is None:
-        raise RuntimeError("maps_origin_required")
+        raise CapabilityExecutionError("maps_origin_required")
     if destination is None:
-        raise RuntimeError("maps_destination_required")
+        raise CapabilityExecutionError("maps_destination_required")
     travel_mode = input_payload["travel_mode"]
     waypoints: tuple[str, ...] = input_payload["waypoints"]
     optimize_order = input_payload["optimize_order"]
@@ -2382,7 +2389,7 @@ def _execute_maps_directions(input_payload: dict[str, Any]) -> dict[str, Any]:
     _raise_for_maps_status(response)
     payload = _maps_response_json(response)
 
-    retrieved_at = datetime.now(tz=UTC).isoformat().replace("+00:00", "Z")
+    retrieved_at = utcnow().isoformat().replace("+00:00", "Z")
     routes: list[dict[str, Any]] = []
     results: list[dict[str, Any]] = []
     for route_payload in _maps_route_candidates(payload):
@@ -2447,19 +2454,19 @@ def _maps_geocode_location(location_context: str) -> tuple[float, float]:
                     and not isinstance(lng, bool)
                 ):
                     return float(lat), float(lng)
-        raise RuntimeError("provider_invalid_payload")
+        raise CapabilityExecutionError("provider_invalid_payload")
     if status == "ZERO_RESULTS":
         # The location text is well-formed but Google resolved no place for it.
         # This is a clarification condition, not a provider fault: the assistant
         # must ask for a clearer location rather than retry the same string.
-        raise RuntimeError("maps_location_not_found")
+        raise CapabilityExecutionError("maps_location_not_found")
     if status == "INVALID_REQUEST":
-        raise RuntimeError("provider_request_rejected")
+        raise CapabilityExecutionError("provider_request_rejected")
     if status == "OVER_QUERY_LIMIT":
-        raise RuntimeError("provider_rate_limited")
+        raise CapabilityExecutionError("provider_rate_limited")
     if status in {"REQUEST_DENIED", "OVER_DAILY_LIMIT"}:
-        raise RuntimeError("provider_permission_denied")
-    raise RuntimeError("provider_upstream_failure")
+        raise CapabilityExecutionError("provider_permission_denied")
+    raise CapabilityExecutionError("provider_upstream_failure")
 
 
 def _execute_maps_search_places(input_payload: dict[str, Any]) -> dict[str, Any]:
@@ -2468,7 +2475,7 @@ def _execute_maps_search_places(input_payload: dict[str, Any]) -> dict[str, Any]
     query = input_payload["query"]
     location_context = input_payload["location_context"]
     if location_context is None:
-        raise RuntimeError("maps_location_context_required")
+        raise CapabilityExecutionError("maps_location_context_required")
     radius_meters = input_payload["radius_meters"]
 
     center_lat, center_lng = _maps_geocode_location(location_context)
@@ -2496,7 +2503,7 @@ def _execute_maps_search_places(input_payload: dict[str, Any]) -> dict[str, Any]
     _raise_for_maps_status(response)
     payload = _maps_response_json(response)
 
-    retrieved_at = datetime.now(tz=UTC).isoformat().replace("+00:00", "Z")
+    retrieved_at = utcnow().isoformat().replace("+00:00", "Z")
     results: list[dict[str, Any]] = []
     for candidate in _maps_places_candidates(payload):
         normalized = _build_maps_place_result(
@@ -2916,7 +2923,7 @@ def _build_weather_output(
     summary: str,
     forecast_time: str | None,
 ) -> dict[str, Any]:
-    retrieved_at = datetime.now(tz=UTC).isoformat().replace("+00:00", "Z")
+    retrieved_at = utcnow().isoformat().replace("+00:00", "Z")
     normalized_forecast_time = _normalize_optional_timestamp(forecast_time) or retrieved_at
     normalized_summary = summary.strip() or "forecast data available"
     return {
@@ -2953,11 +2960,11 @@ class _TomorrowIoWeatherAdapter:
 
     def fetch_forecast(self, *, location: str, timeframe: str) -> dict[str, Any]:
         if self.api_key is None:
-            raise RuntimeError("weather provider credentials are not configured")
+            raise CapabilityExecutionError("weather provider credentials are not configured")
         endpoint_host = _endpoint_host(self.endpoint)
         endpoint_parsed = urlparse(self.endpoint)
         if endpoint_host is None or endpoint_parsed.scheme.lower() not in {"http", "https"}:
-            raise RuntimeError("weather provider endpoint invalid")
+            raise CapabilityExecutionError("weather provider endpoint invalid")
 
         try:
             response = httpx.get(
@@ -2970,23 +2977,23 @@ class _TomorrowIoWeatherAdapter:
                 timeout=self.timeout_seconds,
             )
         except httpx.TimeoutException as exc:
-            raise RuntimeError("weather provider timed out") from exc
+            raise CapabilityExecutionError("weather provider timed out") from exc
         except httpx.HTTPError as exc:
-            raise RuntimeError("weather provider network failure") from exc
+            raise CapabilityExecutionError("weather provider network failure") from exc
 
         if response.status_code == 429:
-            raise RuntimeError("weather provider rate limited")
+            raise CapabilityExecutionError("weather provider rate limited")
         if response.status_code >= 500:
-            raise RuntimeError("weather provider upstream failure")
+            raise CapabilityExecutionError("weather provider upstream failure")
         if response.status_code >= 400:
-            raise RuntimeError("weather provider request rejected")
+            raise CapabilityExecutionError("weather provider request rejected")
 
         try:
             payload = response.json()
         except ValueError as exc:
-            raise RuntimeError("weather provider returned invalid json") from exc
+            raise CapabilityExecutionError("weather provider returned invalid json") from exc
         if not isinstance(payload, dict):
-            raise RuntimeError("weather provider returned invalid payload")
+            raise CapabilityExecutionError("weather provider returned invalid payload")
 
         timelines = payload.get("timelines")
         intervals: list[dict[str, Any]] = []
@@ -3074,7 +3081,7 @@ class _WttrDevWeatherAdapter:
         endpoint_host = _endpoint_host(self.endpoint)
         endpoint_parsed = urlparse(self.endpoint)
         if endpoint_host is None or endpoint_parsed.scheme.lower() not in {"http", "https"}:
-            raise RuntimeError("weather provider endpoint invalid")
+            raise CapabilityExecutionError("weather provider endpoint invalid")
 
         encoded_location = quote(location.strip(), safe="")
         request_url = f"{self.endpoint.rstrip('/')}/{encoded_location}"
@@ -3085,23 +3092,23 @@ class _WttrDevWeatherAdapter:
                 timeout=self.timeout_seconds,
             )
         except httpx.TimeoutException as exc:
-            raise RuntimeError("weather provider timed out") from exc
+            raise CapabilityExecutionError("weather provider timed out") from exc
         except httpx.HTTPError as exc:
-            raise RuntimeError("weather provider network failure") from exc
+            raise CapabilityExecutionError("weather provider network failure") from exc
 
         if response.status_code == 429:
-            raise RuntimeError("weather provider rate limited")
+            raise CapabilityExecutionError("weather provider rate limited")
         if response.status_code >= 500:
-            raise RuntimeError("weather provider upstream failure")
+            raise CapabilityExecutionError("weather provider upstream failure")
         if response.status_code >= 400:
-            raise RuntimeError("weather provider request rejected")
+            raise CapabilityExecutionError("weather provider request rejected")
 
         try:
             payload = response.json()
         except ValueError as exc:
-            raise RuntimeError("weather provider returned invalid json") from exc
+            raise CapabilityExecutionError("weather provider returned invalid json") from exc
         if not isinstance(payload, dict):
-            raise RuntimeError("weather provider returned invalid payload")
+            raise CapabilityExecutionError("weather provider returned invalid payload")
 
         current = None
         current_condition = payload.get("current_condition")
@@ -3180,7 +3187,7 @@ def _declare_weather_forecast_egress_intent(input_payload: dict[str, Any]) -> li
 def _execute_weather_forecast(input_payload: dict[str, Any]) -> dict[str, Any]:
     location_raw = input_payload.get("location")
     if not isinstance(location_raw, str) or not location_raw.strip():
-        raise RuntimeError("weather_location_required")
+        raise CapabilityExecutionError("weather_location_required")
     timeframe_raw = input_payload.get("timeframe")
     timeframe = (
         timeframe_raw if isinstance(timeframe_raw, str) and timeframe_raw.strip() else "today"
@@ -3192,7 +3199,7 @@ def _execute_weather_forecast(input_payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _execute_agency_runtime(_: dict[str, Any]) -> dict[str, Any]:
-    raise RuntimeError("agency_runtime_not_bound")
+    raise CapabilityExecutionError("agency_runtime_not_bound")
 
 
 def _declare_agency_run_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -3227,7 +3234,7 @@ def _declare_agency_request_pr_egress_intent(
 
 
 def _execute_attachment_runtime(_: dict[str, Any]) -> dict[str, Any]:
-    raise RuntimeError("attachment_runtime_not_bound")
+    raise CapabilityExecutionError("attachment_runtime_not_bound")
 
 
 _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
@@ -3851,6 +3858,84 @@ def get_capability(capability_id: str) -> CapabilityDefinition | None:
     if capability_id == "cap.web.extract":
         return replace(capability, allowed_egress_destinations=_web_extract_allowed_destinations())
     return capability
+
+
+def eligible_internal_callable_capability_ids(
+    *,
+    tool_surface_facts: dict[str, Any],
+) -> list[str]:
+    google_facts = tool_surface_facts.get("google")
+    google_connected = isinstance(google_facts, dict) and google_facts.get("connected") is True
+    granted_scopes_raw = (
+        google_facts.get("granted_scopes") if isinstance(google_facts, dict) else []
+    )
+    granted_scopes = (
+        {scope for scope in granted_scopes_raw if isinstance(scope, str)}
+        if isinstance(granted_scopes_raw, list)
+        else set()
+    )
+    discord_facts = tool_surface_facts.get("discord")
+    has_attachment_refs = (
+        isinstance(discord_facts, dict)
+        and isinstance(discord_facts.get("attachment_count"), int)
+        and discord_facts["attachment_count"] > 0
+    )
+    runtime_bindings = tool_surface_facts.get("runtime_bindings")
+    bindings = runtime_bindings if isinstance(runtime_bindings, dict) else {}
+
+    capability_ids: list[str] = []
+    for capability_id in internal_callable_capability_ids():
+        capability = get_capability(capability_id)
+        raw_required_scopes = (
+            capability.contract_metadata.get("required_scopes") if capability is not None else None
+        )
+        required_google_scopes = (
+            {scope for scope in raw_required_scopes if isinstance(scope, str)}
+            if isinstance(raw_required_scopes, list)
+            else set()
+        )
+        if required_google_scopes:
+            if google_connected and required_google_scopes.issubset(granted_scopes):
+                capability_ids.append(capability_id)
+            continue
+        if capability_id.startswith("cap.agency."):
+            if bindings.get("agency") is True:
+                capability_ids.append(capability_id)
+            continue
+        if capability_id == "cap.attachment.read":
+            if has_attachment_refs:
+                capability_ids.append(capability_id)
+            continue
+        if capability_id in MEMORY_CAPABILITY_IDS:
+            capability_ids.append(capability_id)
+            continue
+        if capability_id in PROACTIVE_CAPABILITY_IDS:
+            capability_ids.append(capability_id)
+            continue
+        if capability_id in RESEARCH_CAPABILITY_IDS:
+            capability_ids.append(capability_id)
+            continue
+        if capability_id == "cap.web.extract":
+            if bindings.get("web_extract") is True:
+                capability_ids.append(capability_id)
+            continue
+        if capability_id == "cap.search.web":
+            if bindings.get("search_web") is True:
+                capability_ids.append(capability_id)
+            continue
+        if capability_id == "cap.search.news":
+            if bindings.get("search_news") is True:
+                capability_ids.append(capability_id)
+            continue
+        if capability_id in MAPS_CAPABILITY_IDS:
+            if bindings.get("maps") is True:
+                capability_ids.append(capability_id)
+            continue
+        if capability_id == "cap.weather.forecast":
+            if bindings.get("weather") is True:
+                capability_ids.append(capability_id)
+            continue
+    return capability_ids
 
 
 _ACTION_LABELS_BY_CAPABILITY_ID = {

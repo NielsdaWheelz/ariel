@@ -8,8 +8,9 @@ from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import select
 
-from ariel.app import ModelAdapter
-from tests.integration.app_helpers import create_migrated_app
+from ariel.model_adapter import ModelAdapter
+from ariel.google_connector import GoogleOAuthRefreshFailure, GoogleProviderRequestFailure
+from tests.integration.app_helpers import create_test_app
 from ariel.persistence import ProviderWriteReceiptRecord
 from tests.integration.responses_helpers import (
     empty_recall_response,
@@ -79,7 +80,6 @@ class ActionProposalAdapter:
         if not run_calls:
             run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
         return responses_with_run_calls(
-            assistant_text=assistant_text,
             calls=run_calls,
             provider=self.provider,
             model=self.model,
@@ -154,9 +154,9 @@ class FakeGoogleOAuthClient:
 
     def refresh_access_token(self, *, refresh_token: str) -> dict[str, Any]:
         if self.refresh_mode == "invalid_grant":
-            raise RuntimeError("invalid_grant")
+            raise GoogleOAuthRefreshFailure(code="access_revoked")
         if self.refresh_mode == "transient_failure":
-            raise RuntimeError("upstream_timeout")
+            raise GoogleOAuthRefreshFailure(code="provider_timeout")
         return {
             "access_token": f"refreshed::{refresh_token}",
             "refresh_token": refresh_token,
@@ -179,6 +179,7 @@ class FakeGoogleWorkspaceProvider:
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]:
         del access_token
         return {
@@ -186,7 +187,7 @@ class FakeGoogleWorkspaceProvider:
             "status": "succeeded",
             "events": [
                 {
-                    "provider_account_id": "google",
+                    "provider_account_id": provider_account_id,
                     "calendar_id": "primary",
                     "event_id": "evt-team-sync",
                     "status": "confirmed",
@@ -220,11 +221,13 @@ class FakeGoogleWorkspaceProvider:
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
         attendee_intersection_enabled: bool,
     ) -> dict[str, Any]:
         del access_token, attendee_intersection_enabled
         return {
             "schema_version": "google.calendar.slot_options.v1",
+            "provider_account_id": provider_account_id,
             "slots": [
                 {
                     "slot_id": "slot_1",
@@ -264,7 +267,7 @@ class FakeGoogleWorkspaceProvider:
         normalized_input: dict[str, Any],
     ) -> dict[str, Any]:
         if "cap.calendar.create_event" in self.fail_scope_missing_for:
-            raise RuntimeError("insufficient_permissions")
+            raise GoogleProviderRequestFailure("insufficient_permissions")
         self.calendar_create_calls.append(
             {
                 "access_token": access_token,
@@ -292,8 +295,9 @@ class FakeGoogleWorkspaceProvider:
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]:
-        del access_token, normalized_input
+        del access_token, normalized_input, provider_account_id
         return {
             "schema_version": "google.gmail.message_refs.v1",
             "status": "succeeded",
@@ -307,8 +311,9 @@ class FakeGoogleWorkspaceProvider:
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]:
-        del access_token, normalized_input
+        del access_token, normalized_input, provider_account_id
         return {
             "schema_version": "google.gmail.message_evidence.v1",
             "message": {"message_id": "msg-1"},
@@ -336,7 +341,7 @@ class FakeGoogleWorkspaceProvider:
         normalized_input: dict[str, Any],
     ) -> dict[str, Any]:
         if "cap.email.draft" in self.fail_scope_missing_for:
-            raise RuntimeError("insufficient_permissions")
+            raise GoogleProviderRequestFailure("insufficient_permissions")
         self.email_draft_calls.append(
             {
                 "access_token": access_token,
@@ -354,7 +359,7 @@ class FakeGoogleWorkspaceProvider:
         normalized_input: dict[str, Any],
     ) -> dict[str, Any]:
         if "cap.email.send" in self.fail_scope_missing_for:
-            raise RuntimeError("insufficient_permissions")
+            raise GoogleProviderRequestFailure("insufficient_permissions")
         self.email_send_calls.append(
             {
                 "access_token": access_token,
@@ -371,7 +376,7 @@ class FakeGoogleWorkspaceProvider:
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
-    app = create_migrated_app(
+    app = create_test_app(
         database_url=postgres_url,
         model_adapter=adapter,
         sandbox=FakeSandboxRuntime(),
@@ -996,12 +1001,12 @@ def test_draft_and_send_are_distinct_lifecycle_units_with_independent_histories(
             True,
         ),
         (
-            "token_expired_send",
+            "provider_timeout_send",
             "cap.email.send",
             "connect-send-expired",
             "transient_failure",
             None,
-            "token_expired",
+            "provider_timeout",
             True,
         ),
         (

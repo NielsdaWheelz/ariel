@@ -92,7 +92,6 @@ burn, interruption fatigue, and weak support when automation breaks.
 Relevant Ariel standing docs:
 
 - [north-star-cutover.md](north-star-cutover.md)
-- [run-program-cutover.md](run-program-cutover.md)
 - [modules/agent-loop.md](modules/agent-loop.md)
 - [modules/proactivity.md](modules/proactivity.md)
 - [modules/memory.md](modules/memory.md)

@@ -24,10 +24,25 @@ from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 from sqlalchemy.orm import Session, sessionmaker
 
-from ariel.app import ModelAdapter
-from tests.integration.app_helpers import create_migrated_app
-from ariel.capability_registry import capability_id_for_run_callable, get_capability
-from ariel.persistence import BackgroundTaskRecord, MemoryLogRecord, MemoryNoteRecord
+from ariel.action_runtime import process_action_execution_task
+from ariel.config import AppSettings
+from ariel.model_adapter import ModelAdapter
+from tests.integration.app_helpers import create_test_app
+from ariel.capability_registry import (
+    canonical_action_payload,
+    capability_contract_hash,
+    capability_id_for_run_callable,
+    get_capability,
+    payload_hash,
+)
+from ariel.persistence import (
+    ActionAttemptRecord,
+    BackgroundTaskRecord,
+    MemoryLogRecord,
+    MemoryNoteRecord,
+    SessionRecord,
+    TurnRecord,
+)
 from ariel.worker import process_one_task
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.responses_helpers import drain_task, post_message_and_drain
@@ -50,7 +65,7 @@ def _app(postgres_url: str, adapter: ModelAdapter, monkeypatch: pytest.MonkeyPat
     """Build a migrated app with embed_text stubbed out."""
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
     monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
-    return create_migrated_app(
+    return create_test_app(
         database_url=postgres_url,
         model_adapter=adapter,
         sandbox=FakeSandboxRuntime(),
@@ -61,6 +76,68 @@ def _session_id(client: TestClient) -> str:
     r = client.get("/v1/sessions/active")
     assert r.status_code == 200
     return r.json()["session"]["id"]
+
+
+def _seed_executing_memory_action(
+    session_factory: sessionmaker[Session],
+    *,
+    action_attempt_id: str,
+    capability_id: str,
+    proposed_input: dict[str, Any],
+) -> None:
+    capability = get_capability(capability_id)
+    assert capability is not None
+    with session_factory() as db:
+        with db.begin():
+            db.add(
+                SessionRecord(
+                    id="ses_memory_action",
+                    is_active=True,
+                    lifecycle_state="active",
+                    rotated_from_session_id=None,
+                    rotation_reason=None,
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+            db.add(
+                TurnRecord(
+                    id="trn_memory_action",
+                    session_id="ses_memory_action",
+                    user_message="memory action",
+                    assistant_message=None,
+                    status="in_progress",
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+            db.add(
+                ActionAttemptRecord(
+                    id=action_attempt_id,
+                    session_id="ses_memory_action",
+                    turn_id="trn_memory_action",
+                    proposal_index=1,
+                    capability_id=capability_id,
+                    capability_version=capability.version,
+                    capability_contract_hash=capability_contract_hash(capability),
+                    impact_level=capability.impact_level,
+                    proposed_input=proposed_input,
+                    payload_hash=payload_hash(
+                        canonical_action_payload(
+                            capability_id=capability_id,
+                            input_payload=proposed_input,
+                        )
+                    ),
+                    policy_decision="requires_approval",
+                    policy_reason=None,
+                    status="executing",
+                    approval_required=True,
+                    execution_output=None,
+                    execution_error=None,
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
 
 
 def _sf(client: TestClient) -> sessionmaker[Session]:
@@ -131,6 +208,31 @@ class _FailingRetrieverAdapter:
         del tools, user_message, history, context_bundle, input_items
         self.call_count += 1
         source = self._stuck_source if self.call_count <= 2 else _EMIT_MSG
+        return _run_response(source, idx=self.call_count)
+
+
+@dataclass
+class _InvalidRecallAdapter:
+    """Retriever emits a malformed recall_v1 finding; main agent still answers."""
+
+    provider: str = "provider.test"
+    model: str = "model.test"
+    call_count: int = 0
+
+    def create_response(
+        self, *, input_items: Any, tools: Any, user_message: Any, history: Any, context_bundle: Any
+    ) -> dict[str, Any]:
+        del tools, user_message, history, context_bundle, input_items
+        self.call_count += 1
+        if self.call_count == 1:
+            source = (
+                "agent.emit_finding("
+                "summary='bad recall',"
+                "claims=[{'id':'missing required recall fields'}],"
+                "gaps=[],sources=[])\n"
+            )
+        else:
+            source = _EMIT_MSG
         return _run_response(source, idx=self.call_count)
 
 
@@ -303,6 +405,27 @@ def test_recall_failure_is_nonfatal(
     assert turn.assistant_message == "hello"
 
 
+def test_recall_contract_violation_is_typed_nonfatal(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed recall findings are classified, not silently converted inside
+    the retriever."""
+    adapter = _InvalidRecallAdapter()
+    with TestClient(_app(postgres_url, cast(ModelAdapter, adapter), monkeypatch)) as client:
+        sid = _session_id(client)
+        turn = post_message_and_drain(client, sid, message="ping")
+        timeline = client.get(f"/v1/sessions/{sid}/events").json()
+
+    assert turn.status == "completed"
+    assert turn.assistant_message == "hello"
+    assert adapter.call_count == 2
+    event_types = [
+        event["event_type"] for saved_turn in timeline["turns"] for event in saved_turn["events"]
+    ]
+    assert "evt.memory.recall_failed" in event_types
+
+
 # ===========================================================================
 # 7. memory.remember dispatches a memory_encode task
 # ===========================================================================
@@ -328,6 +451,72 @@ def test_memory_remember_enqueues_memory_encode_task(
 
     assert len(tasks) == 1, f"expected 1 memory_encode task, got {len(tasks)}"
     assert tasks[0].payload.get("note") == adapter.note_text
+
+
+def test_approved_memory_note_missing_fails_with_typed_memory_error(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
+    settings = AppSettings()
+    _seed_executing_memory_action(
+        session_factory,
+        action_attempt_id="act_memory_missing_note",
+        capability_id="cap.memory.note.edit",
+        proposed_input={"id": "mno_missing", "content": "updated note"},
+    )
+
+    processed = process_action_execution_task(
+        session_factory=session_factory,
+        action_attempt_id="act_memory_missing_note",
+        google_runtime=None,
+        agency_runtime=None,
+        settings=settings,
+        now_fn=lambda: NOW,
+        new_id_fn=lambda prefix: f"{prefix}_memory_missing_note",
+    )
+
+    assert processed is True
+    with session_factory() as db:
+        action_attempt = db.get(ActionAttemptRecord, "act_memory_missing_note")
+    assert action_attempt is not None
+    assert action_attempt.status == "failed"
+    assert action_attempt.execution_error == "memory_note_not_found"
+
+
+def test_approved_memory_action_unexpected_defect_propagates(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
+    settings = AppSettings()
+    _seed_executing_memory_action(
+        session_factory,
+        action_attempt_id="act_memory_defect",
+        capability_id="cap.memory.remember",
+        proposed_input={"note": "remember this"},
+    )
+
+    def fail_memory(**_: Any) -> dict[str, Any]:
+        raise RuntimeError("memory queue defect")
+
+    monkeypatch.setattr("ariel.action_runtime._execute_memory_capability", fail_memory)
+    with pytest.raises(RuntimeError, match="memory queue defect"):
+        process_action_execution_task(
+            session_factory=session_factory,
+            action_attempt_id="act_memory_defect",
+            google_runtime=None,
+            agency_runtime=None,
+            settings=settings,
+            now_fn=lambda: NOW,
+            new_id_fn=lambda prefix: f"{prefix}_memory_defect",
+        )
+
+    with session_factory() as db:
+        action_attempt = db.get(ActionAttemptRecord, "act_memory_defect")
+    assert action_attempt is not None
+    assert action_attempt.status == "executing"
+    assert action_attempt.execution_error is None
 
 
 # ===========================================================================
@@ -393,7 +582,7 @@ def test_worker_accepts_memory_encode_and_memory_dream(
 
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
     monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
-    app = create_migrated_app(
+    app = create_test_app(
         database_url=postgres_url,
         model_adapter=cast(ModelAdapter, _DreamCompleteAdapter()),
         sandbox=FakeSandboxRuntime(),
@@ -640,7 +829,7 @@ class _DreamCompleteAdapter:
 
 
 def test_run_rememberer_dream_succeeds_with_no_user_session(
-    postgres_url: str,
+    session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A fresh DB with no user session accepts a ``dream`` run against the system session."""
@@ -653,27 +842,21 @@ def test_run_rememberer_dream_succeeds_with_no_user_session(
     monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
     settings = AppSettings()
 
-    engine = create_engine(postgres_url, future=True, pool_pre_ping=True)
-    from tests.db_helpers import reset_postgres_schema
-
-    reset_postgres_schema(engine, postgres_url)
-    sf = sessionmaker(bind=engine, future=True, expire_on_commit=False)
-
     sandbox = FakeSandboxRuntime()
     sandbox.start()
     try:
         # No user session has ever existed — this is the production dream path.
-        with sf() as db:
+        with session_factory() as db:
             assert (
                 db.scalar(select(SessionRecord).where(SessionRecord.is_active.is_(True))) is None
             ), "fresh DB must have no active user session"
 
-        with sf() as db:
+        with session_factory() as db:
             run_rememberer(
                 trigger="dream",
                 sandbox=sandbox,
                 db=db,
-                session_factory=sf,
+                session_factory=session_factory,
                 session_id=None,
                 settings=settings,
                 model_adapter=cast(Any, _DreamCompleteAdapter()),
@@ -689,7 +872,7 @@ def test_run_rememberer_dream_succeeds_with_no_user_session(
                 new_id_fn=_new_id,
             )
 
-        with sf() as db:
+        with session_factory() as db:
             dream_turns = db.scalars(
                 select(TurnRecord).where(TurnRecord.kind == "memory_dream")
             ).all()
@@ -698,11 +881,10 @@ def test_run_rememberer_dream_succeeds_with_no_user_session(
         assert dream_turns[0].status == "completed"
     finally:
         sandbox.close()
-        engine.dispose()
 
 
 def test_run_rememberer_dream_self_heals_if_system_session_missing(
-    postgres_url: str,
+    session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """If the system session row is wiped, ``run_rememberer(trigger='dream')``
@@ -717,17 +899,11 @@ def test_run_rememberer_dream_self_heals_if_system_session_missing(
     monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
     settings = AppSettings()
 
-    engine = create_engine(postgres_url, future=True, pool_pre_ping=True)
-    from tests.db_helpers import reset_postgres_schema
-
-    reset_postgres_schema(engine, postgres_url)
-    sf = sessionmaker(bind=engine, future=True, expire_on_commit=False)
-
     sandbox = FakeSandboxRuntime()
     sandbox.start()
     try:
         # Wipe the system session row to simulate operator deletion.
-        with sf() as db:
+        with session_factory() as db:
             with db.begin():
                 db.execute(
                     text("DELETE FROM sessions WHERE id = :id"),
@@ -735,12 +911,12 @@ def test_run_rememberer_dream_self_heals_if_system_session_missing(
                 )
             assert db.get(SessionRecord, SYSTEM_SESSION_ID) is None
 
-        with sf() as db:
+        with session_factory() as db:
             run_rememberer(
                 trigger="dream",
                 sandbox=sandbox,
                 db=db,
-                session_factory=sf,
+                session_factory=session_factory,
                 session_id=None,
                 settings=settings,
                 model_adapter=cast(Any, _DreamCompleteAdapter()),
@@ -756,7 +932,7 @@ def test_run_rememberer_dream_self_heals_if_system_session_missing(
                 new_id_fn=_new_id,
             )
 
-        with sf() as db:
+        with session_factory() as db:
             assert db.get(SessionRecord, SYSTEM_SESSION_ID) is not None, (
                 "self-heal must re-create ses_system"
             )
@@ -768,7 +944,6 @@ def test_run_rememberer_dream_self_heals_if_system_session_missing(
         assert dream_turns[0].status == "completed"
     finally:
         sandbox.close()
-        engine.dispose()
 
 
 def test_worker_memory_dream_task_inserts_turn_against_system_session(
@@ -781,7 +956,7 @@ def test_worker_memory_dream_task_inserts_turn_against_system_session(
 
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
     monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
-    app = create_migrated_app(
+    app = create_test_app(
         database_url=postgres_url,
         model_adapter=cast(ModelAdapter, _DreamCompleteAdapter()),
         sandbox=FakeSandboxRuntime(),
@@ -792,9 +967,7 @@ def test_worker_memory_dream_task_inserts_turn_against_system_session(
 
         with sf() as db:
             with db.begin():
-                task = enqueue_background_task(
-                    db, task_type="memory_dream", payload={}, now=NOW
-                )
+                task = enqueue_background_task(db, task_type="memory_dream", payload={}, now=NOW)
                 task_id = task.id
 
         drain_task(client, task_id)

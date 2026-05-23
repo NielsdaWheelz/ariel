@@ -6,18 +6,17 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage
-import json
 import hashlib
 import secrets
 from typing import Any, Literal, Protocol
 from urllib.parse import quote, urlencode
 
-from cryptography.exceptions import InvalidTag
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
+from ariel.clock import utcnow
+from ariel.secret_cipher import SecretDecryptionFailure, decrypt_secret, encrypt_secret
 from ariel.persistence import (
     GoogleConnectorEventRecord,
     GoogleConnectorRecord,
@@ -47,9 +46,9 @@ GOOGLE_GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
 GOOGLE_DRIVE_METADATA_READ_SCOPE = "https://www.googleapis.com/auth/drive.metadata.readonly"
 GOOGLE_DRIVE_READ_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
 GOOGLE_DRIVE_SHARE_SCOPE = "https://www.googleapis.com/auth/drive"
-# OpenID Connect identity scopes — without them the /oauth2/v3/userinfo call
-# in ``_exchange_authorization_code`` returns no profile data and the
-# connector stores ``account_email = "unknown-email"``.
+# OpenID Connect identity scopes let /oauth2/v3/userinfo return the account
+# identity required for new OAuth callbacks. Older persisted connectors may
+# still lack identity metadata until reconnect.
 GOOGLE_OPENID_SCOPE = "openid"
 GOOGLE_USERINFO_EMAIL_SCOPE = "https://www.googleapis.com/auth/userinfo.email"
 GOOGLE_USERINFO_PROFILE_SCOPE = "https://www.googleapis.com/auth/userinfo.profile"
@@ -81,16 +80,23 @@ GOOGLE_CAPABILITY_SCOPES: dict[str, set[str]] = {
     **GOOGLE_READ_CAPABILITY_SCOPES,
     **GOOGLE_WRITE_CAPABILITY_SCOPES,
 }
+
+
+def _non_empty_provider_account_id(provider_account_id: str) -> str:
+    normalized = provider_account_id.strip()
+    if not normalized:
+        raise RuntimeError("provider_account_id_missing")
+    return normalized
+
+
 GOOGLE_CAPABILITY_IDS = frozenset(GOOGLE_CAPABILITY_SCOPES.keys())
 GOOGLE_RECONNECT_INTENT_EXTRA_SCOPES: dict[str, set[str]] = {
     "cap.calendar.propose_slots": {GOOGLE_CALENDAR_FREEBUSY_SCOPE},
 }
 
 _GOOGLE_MINIMUM_READ_SCOPES = {GOOGLE_CALENDAR_READ_SCOPE, GOOGLE_GMAIL_READ_SCOPE}
-# Identity scopes are requested by default at OAuth start so the userinfo
-# call returns account_email / account_subject — but they are not required
-# for "connected" readiness, because pre-identity-scopes connectors are
-# still functional for Gmail/Calendar reads.
+# Identity scopes are required for successful new OAuth callbacks, but not for
+# readiness of already-persisted pre-identity connectors.
 _GOOGLE_DEFAULT_REQUESTED_SCOPES = _GOOGLE_MINIMUM_READ_SCOPES | {
     GOOGLE_OPENID_SCOPE,
     GOOGLE_USERINFO_EMAIL_SCOPE,
@@ -101,7 +107,14 @@ _READINESS_BLOCKING_FAILURE_CODES = {
     "scope_missing",
     "access_revoked",
 }
-_READINESS_TRANSIENT_FAILURE_CODES = {"token_expired"}
+_READINESS_TRANSIENT_FAILURE_CODES = {
+    "token_expired",
+    "provider_timeout",
+    "provider_network_failure",
+    "provider_rate_limited",
+    "provider_upstream_failure",
+    "provider_invalid_payload",
+}
 
 TypedAuthFailureClass = Literal[
     "not_connected",
@@ -109,6 +122,35 @@ TypedAuthFailureClass = Literal[
     "scope_missing",
     "token_expired",
     "access_revoked",
+]
+
+OAuthStartFailureCode = Literal["oauth_client_not_configured"]
+
+OAuthRefreshFailureCode = Literal[
+    "access_revoked",
+    "provider_timeout",
+    "provider_network_failure",
+    "provider_rate_limited",
+    "provider_upstream_failure",
+    "provider_request_rejected",
+    "provider_invalid_payload",
+]
+
+OAuthExchangeFailureCode = Literal[
+    "provider_timeout",
+    "provider_network_failure",
+    "provider_rate_limited",
+    "provider_upstream_failure",
+    "provider_request_rejected",
+    "provider_invalid_payload",
+]
+
+OAuthRevokeFailureCode = Literal[
+    "provider_timeout",
+    "provider_network_failure",
+    "provider_rate_limited",
+    "provider_upstream_failure",
+    "provider_request_rejected",
 ]
 
 _AUTH_FAILURE_RECOVERY: dict[TypedAuthFailureClass, str] = {
@@ -175,10 +217,6 @@ _GMAIL_UNDO_MODIFY_BLOCKED_LABEL_IDS = (
 )
 
 
-def _utcnow() -> datetime:
-    return datetime.now(tz=UTC)
-
-
 class GoogleConnectorError(Exception):
     def __init__(
         self,
@@ -195,6 +233,42 @@ class GoogleConnectorError(Exception):
         self.message = message
         self.details = details
         self.retryable = retryable
+
+
+class GoogleProviderRequestFailure(RuntimeError):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+class GoogleOAuthStartFailure(RuntimeError):
+    def __init__(self, *, code: OAuthStartFailureCode) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+class GoogleOAuthRefreshFailure(RuntimeError):
+    def __init__(self, *, code: OAuthRefreshFailureCode) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+class GoogleOAuthExchangeFailure(RuntimeError):
+    def __init__(self, *, code: OAuthExchangeFailureCode) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+class GoogleOAuthRevokeFailure(RuntimeError):
+    def __init__(self, *, code: OAuthRevokeFailureCode) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+class GoogleWatchRegistrationFailure(RuntimeError):
+    def __init__(self, *, code: str) -> None:
+        super().__init__(code)
+        self.code = code
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,6 +316,7 @@ class GoogleWorkspaceProvider(Protocol):
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]: ...
 
     def calendar_list_calendars(
@@ -249,6 +324,7 @@ class GoogleWorkspaceProvider(Protocol):
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]: ...
 
     def calendar_list_event_deltas(
@@ -267,6 +343,7 @@ class GoogleWorkspaceProvider(Protocol):
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
         attendee_intersection_enabled: bool,
     ) -> dict[str, Any]: ...
 
@@ -275,6 +352,7 @@ class GoogleWorkspaceProvider(Protocol):
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]: ...
 
     def email_read(
@@ -282,6 +360,7 @@ class GoogleWorkspaceProvider(Protocol):
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]: ...
 
     def email_list_history(
@@ -371,6 +450,7 @@ class GoogleWorkspaceProvider(Protocol):
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]: ...
 
     def drive_read(
@@ -378,6 +458,7 @@ class GoogleWorkspaceProvider(Protocol):
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]: ...
 
     def drive_get_start_page_token(
@@ -454,7 +535,7 @@ class DefaultGoogleOAuthClient:
         prompt_consent: bool,
     ) -> str:
         if self.client_id is None or not self.client_id.strip():
-            raise RuntimeError("google oauth client id is not configured")
+            raise GoogleOAuthStartFailure(code="oauth_client_not_configured")
         params = {
             "client_id": self.client_id,
             "response_type": "code",
@@ -495,26 +576,23 @@ class DefaultGoogleOAuthClient:
                 timeout=self.timeout_seconds,
             )
         except httpx.TimeoutException as exc:
-            raise RuntimeError("oauth token exchange timeout") from exc
+            raise GoogleOAuthExchangeFailure(code="provider_timeout") from exc
         except httpx.HTTPError as exc:
-            raise RuntimeError("oauth token exchange network failure") from exc
+            raise GoogleOAuthExchangeFailure(code="provider_network_failure") from exc
 
         if token_response.status_code >= 400:
-            if token_response.status_code in {400, 401, 403}:
-                detail = safe_failure_reason(
-                    token_response.text,
-                    fallback=f"oauth token exchange rejected ({token_response.status_code})",
-                )
-                raise RuntimeError(detail)
-            raise RuntimeError(f"oauth token exchange failed ({token_response.status_code})")
+            raise GoogleOAuthExchangeFailure(code=_oauth_exchange_failure_code(token_response))
 
-        payload = token_response.json()
+        try:
+            payload = token_response.json()
+        except ValueError as exc:
+            raise GoogleOAuthExchangeFailure(code="provider_invalid_payload") from exc
         if not isinstance(payload, dict):
-            raise RuntimeError("oauth token exchange returned invalid payload")
+            raise GoogleOAuthExchangeFailure(code="provider_invalid_payload")
         access_token_raw = payload.get("access_token")
         refresh_token_raw = payload.get("refresh_token")
         if not isinstance(access_token_raw, str) or not access_token_raw.strip():
-            raise RuntimeError("oauth token exchange missing access token")
+            raise GoogleOAuthExchangeFailure(code="provider_invalid_payload")
         access_token = access_token_raw.strip()
         refresh_token = (
             refresh_token_raw.strip()
@@ -528,25 +606,32 @@ class DefaultGoogleOAuthClient:
         if expires_in_seconds <= 0:
             expires_in_seconds = 3600
 
-        account_subject = "unknown-subject"
-        account_email = "unknown-email"
         try:
             profile_response = httpx.get(
                 self.userinfo_url,
                 headers={"authorization": f"Bearer {access_token}"},
                 timeout=self.timeout_seconds,
             )
-            if profile_response.status_code < 400:
-                profile_payload = profile_response.json()
-                if isinstance(profile_payload, dict):
-                    subject = profile_payload.get("sub")
-                    email = profile_payload.get("email")
-                    if isinstance(subject, str) and subject.strip():
-                        account_subject = subject.strip()
-                    if isinstance(email, str) and email.strip():
-                        account_email = email.strip()
-        except httpx.HTTPError:
-            pass
+        except httpx.TimeoutException as exc:
+            raise GoogleOAuthExchangeFailure(code="provider_timeout") from exc
+        except httpx.HTTPError as exc:
+            raise GoogleOAuthExchangeFailure(code="provider_network_failure") from exc
+        if profile_response.status_code >= 400:
+            raise GoogleOAuthExchangeFailure(code=_oauth_exchange_failure_code(profile_response))
+        try:
+            profile_payload = profile_response.json()
+        except ValueError as exc:
+            raise GoogleOAuthExchangeFailure(code="provider_invalid_payload") from exc
+        if not isinstance(profile_payload, dict):
+            raise GoogleOAuthExchangeFailure(code="provider_invalid_payload")
+        subject_raw = profile_payload.get("sub")
+        email_raw = profile_payload.get("email")
+        if not isinstance(subject_raw, str) or not subject_raw.strip():
+            raise GoogleOAuthExchangeFailure(code="provider_invalid_payload")
+        if not isinstance(email_raw, str) or not email_raw.strip():
+            raise GoogleOAuthExchangeFailure(code="provider_invalid_payload")
+        account_subject = subject_raw.strip()
+        account_email = email_raw.strip()
 
         return {
             "account_subject": account_subject,
@@ -573,21 +658,20 @@ class DefaultGoogleOAuthClient:
                 timeout=self.timeout_seconds,
             )
         except httpx.TimeoutException as exc:
-            raise RuntimeError("oauth refresh timeout") from exc
+            raise GoogleOAuthRefreshFailure(code="provider_timeout") from exc
         except httpx.HTTPError as exc:
-            raise RuntimeError("oauth refresh network failure") from exc
+            raise GoogleOAuthRefreshFailure(code="provider_network_failure") from exc
         if token_response.status_code >= 400:
-            detail = safe_failure_reason(
-                token_response.text,
-                fallback=f"oauth refresh failed ({token_response.status_code})",
-            )
-            raise RuntimeError(detail)
-        payload = token_response.json()
+            raise GoogleOAuthRefreshFailure(code=_oauth_refresh_failure_code(token_response))
+        try:
+            payload = token_response.json()
+        except ValueError as exc:
+            raise GoogleOAuthRefreshFailure(code="provider_invalid_payload") from exc
         if not isinstance(payload, dict):
-            raise RuntimeError("oauth refresh returned invalid payload")
+            raise GoogleOAuthRefreshFailure(code="provider_invalid_payload")
         access_token_raw = payload.get("access_token")
         if not isinstance(access_token_raw, str) or not access_token_raw.strip():
-            raise RuntimeError("oauth refresh missing access token")
+            raise GoogleOAuthRefreshFailure(code="provider_invalid_payload")
         refreshed_refresh_token_raw = payload.get("refresh_token")
         expires_in_raw = payload.get("expires_in")
         expires_in_seconds = expires_in_raw if isinstance(expires_in_raw, int) else 3600
@@ -614,10 +698,12 @@ class DefaultGoogleOAuthClient:
                 headers={"content-type": "application/x-www-form-urlencoded"},
                 timeout=self.timeout_seconds,
             )
-        except httpx.HTTPError:
-            return
+        except httpx.TimeoutException as exc:
+            raise GoogleOAuthRevokeFailure(code="provider_timeout") from exc
+        except httpx.HTTPError as exc:
+            raise GoogleOAuthRevokeFailure(code="provider_network_failure") from exc
         if response.status_code >= 400:
-            return
+            raise GoogleOAuthRevokeFailure(code=_oauth_revoke_failure_code(response))
 
 
 @dataclass(slots=True, frozen=True)
@@ -659,41 +745,41 @@ class DefaultGoogleWorkspaceProvider:
             except httpx.TimeoutException as exc:
                 if attempt < attempts:
                     continue
-                raise RuntimeError("google_upstream_timeout") from exc
+                raise GoogleProviderRequestFailure("google_upstream_timeout") from exc
             except httpx.HTTPError as exc:
                 if attempt < attempts:
                     continue
-                raise RuntimeError("google_upstream_network_failure") from exc
+                raise GoogleProviderRequestFailure("google_upstream_network_failure") from exc
 
             status_code = response.status_code
             if status_code in _GOOGLE_TRANSIENT_STATUS_CODES and attempt < attempts:
                 continue
             if status_code == 401:
-                raise RuntimeError("token_expired")
+                raise GoogleProviderRequestFailure("token_expired")
             if status_code == 403:
                 if _is_google_scope_failure(response):
-                    raise RuntimeError("insufficient_permissions")
-                raise RuntimeError("google_forbidden")
+                    raise GoogleProviderRequestFailure("insufficient_permissions")
+                raise GoogleProviderRequestFailure("google_forbidden")
             if status_code in _GOOGLE_TRANSIENT_STATUS_CODES:
-                raise RuntimeError(f"google_upstream_{status_code}")
+                raise GoogleProviderRequestFailure(f"google_upstream_{status_code}")
             if status_code == 404:
-                raise RuntimeError("resource_not_found")
+                raise GoogleProviderRequestFailure("resource_not_found")
             if status_code == 410:
-                raise RuntimeError("sync_token_invalid")
+                raise GoogleProviderRequestFailure("sync_token_invalid")
             if status_code >= 400:
-                raise RuntimeError(f"google_request_failed:{status_code}")
+                raise GoogleProviderRequestFailure(f"google_request_failed:{status_code}")
             if allow_empty_response and (status_code in {204, 205} or not response.content):
                 return {}
             if max_response_bytes is not None and len(response.content) > max_response_bytes:
-                raise RuntimeError("google_response_too_large")
+                raise GoogleProviderRequestFailure("google_response_too_large")
             try:
                 payload = response.json()
             except ValueError as exc:
-                raise RuntimeError("google_invalid_payload") from exc
+                raise GoogleProviderRequestFailure("google_invalid_payload") from exc
             if not isinstance(payload, dict):
-                raise RuntimeError("google_invalid_payload")
+                raise GoogleProviderRequestFailure("google_invalid_payload")
             return payload
-        raise RuntimeError("google_request_unreachable")
+        raise GoogleProviderRequestFailure("google_request_unreachable")
 
     def _request_text(
         self,
@@ -716,31 +802,31 @@ class DefaultGoogleWorkspaceProvider:
             except httpx.TimeoutException as exc:
                 if attempt < attempts:
                     continue
-                raise RuntimeError("google_upstream_timeout") from exc
+                raise GoogleProviderRequestFailure("google_upstream_timeout") from exc
             except httpx.HTTPError as exc:
                 if attempt < attempts:
                     continue
-                raise RuntimeError("google_upstream_network_failure") from exc
+                raise GoogleProviderRequestFailure("google_upstream_network_failure") from exc
 
             status_code = response.status_code
             if status_code in _GOOGLE_TRANSIENT_STATUS_CODES and attempt < attempts:
                 continue
             if status_code == 401:
-                raise RuntimeError("token_expired")
+                raise GoogleProviderRequestFailure("token_expired")
             if status_code == 403:
                 if _is_google_scope_failure(response):
-                    raise RuntimeError("insufficient_permissions")
-                raise RuntimeError("google_forbidden")
+                    raise GoogleProviderRequestFailure("insufficient_permissions")
+                raise GoogleProviderRequestFailure("google_forbidden")
             if status_code in _GOOGLE_TRANSIENT_STATUS_CODES:
-                raise RuntimeError(f"google_upstream_{status_code}")
+                raise GoogleProviderRequestFailure(f"google_upstream_{status_code}")
             if status_code == 404:
-                raise RuntimeError("resource_not_found")
+                raise GoogleProviderRequestFailure("resource_not_found")
             if status_code == 410:
-                raise RuntimeError("sync_token_invalid")
+                raise GoogleProviderRequestFailure("sync_token_invalid")
             if status_code >= 400:
-                raise RuntimeError(f"google_request_failed:{status_code}")
+                raise GoogleProviderRequestFailure(f"google_request_failed:{status_code}")
             return response.text
-        raise RuntimeError("google_request_unreachable")
+        raise GoogleProviderRequestFailure("google_request_unreachable")
 
     def _calendar_events(
         self,
@@ -773,7 +859,9 @@ class DefaultGoogleWorkspaceProvider:
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]:
+        account_id = _non_empty_provider_account_id(provider_account_id)
         window_start = str(normalized_input["window_start"])
         window_end = str(normalized_input["window_end"])
         calendar_id = str(normalized_input.get("calendar_id", "primary"))
@@ -789,7 +877,7 @@ class DefaultGoogleWorkspaceProvider:
                 asdict(
                     normalize_calendar_event(
                         item,
-                        provider_account_id="google",
+                        provider_account_id=account_id,
                         calendar_id=calendar_id,
                     )
                 )
@@ -799,7 +887,7 @@ class DefaultGoogleWorkspaceProvider:
         return {
             "schema_version": "google.calendar.events.v1",
             "events": events,
-            "retrieved_at": to_rfc3339(_utcnow()),
+            "retrieved_at": to_rfc3339(utcnow()),
             "window_start": window_start,
             "window_end": window_end,
             "status": "succeeded",
@@ -810,8 +898,10 @@ class DefaultGoogleWorkspaceProvider:
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]:
         del normalized_input
+        account_id = _non_empty_provider_account_id(provider_account_id)
         payload = self._request_json(
             method="GET",
             url=f"{self.calendar_api_base_url}/users/me/calendarList",
@@ -834,6 +924,7 @@ class DefaultGoogleWorkspaceProvider:
                     "primary": bool(item.get("primary", False)),
                     "access_role": item.get("accessRole") or "reader",
                     "time_zone": item.get("timeZone"),
+                    "provider_account_id": account_id,
                 }
             )
             if len(calendars) >= _MAX_GOOGLE_RESULTS:
@@ -841,7 +932,7 @@ class DefaultGoogleWorkspaceProvider:
         return {
             "schema_version": "google.calendar.calendar_list.v1",
             "calendars": calendars,
-            "retrieved_at": to_rfc3339(_utcnow()),
+            "retrieved_at": to_rfc3339(utcnow()),
             "status": "succeeded",
         }
 
@@ -882,8 +973,10 @@ class DefaultGoogleWorkspaceProvider:
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
         attendee_intersection_enabled: bool,
     ) -> dict[str, Any]:
+        account_id = _non_empty_provider_account_id(provider_account_id)
         window_start = _parse_rfc3339(normalized_input.get("window_start"))
         window_end = _parse_rfc3339(normalized_input.get("window_end"))
         if window_start is None or window_end is None or window_end <= window_start:
@@ -971,8 +1064,9 @@ class DefaultGoogleWorkspaceProvider:
         constraints = constraints_raw if isinstance(constraints_raw, dict) else {}
         return {
             "schema_version": "google.calendar.slot_options.v1",
+            "provider_account_id": account_id,
             "slots": slot_options,
-            "retrieved_at": to_rfc3339(_utcnow()),
+            "retrieved_at": to_rfc3339(utcnow()),
             "window_start": to_rfc3339(window_start),
             "window_end": to_rfc3339(window_end),
             "duration_minutes": duration_minutes,
@@ -1072,7 +1166,9 @@ class DefaultGoogleWorkspaceProvider:
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]:
+        account_id = _non_empty_provider_account_id(provider_account_id)
         query = str(normalized_input["query"])
         payload = self._request_json(
             method="GET",
@@ -1112,7 +1208,7 @@ class DefaultGoogleWorkspaceProvider:
             )
             normalized = normalize_gmail_message(
                 message_payload,
-                provider_account_id="google",
+                provider_account_id=account_id,
             )
             snippet_raw = message_payload.get("snippet")
             preview = (
@@ -1122,6 +1218,7 @@ class DefaultGoogleWorkspaceProvider:
             )
             results.append(
                 {
+                    "provider_account_id": normalized.provider_account_id,
                     "message_id": normalized.message_id,
                     "thread_id": normalized.thread_id,
                     "history_id": normalized.history_id,
@@ -1142,7 +1239,7 @@ class DefaultGoogleWorkspaceProvider:
         return {
             "schema_version": "google.gmail.message_refs.v1",
             "messages": results,
-            "retrieved_at": to_rfc3339(_utcnow()),
+            "retrieved_at": to_rfc3339(utcnow()),
             "total_estimate": total_estimate,
             "status": "succeeded",
         }
@@ -1152,7 +1249,9 @@ class DefaultGoogleWorkspaceProvider:
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]:
+        account_id = _non_empty_provider_account_id(provider_account_id)
         mode_raw = normalized_input.get("mode")
         mode = mode_raw if mode_raw in {"message", "thread", "thread_context"} else "message"
         message_id = (
@@ -1173,6 +1272,7 @@ class DefaultGoogleWorkspaceProvider:
                 access_token=access_token,
                 message_id=message_id,
                 mode=mode,
+                provider_account_id=account_id,
             )
 
         if thread_id is not None:
@@ -1181,6 +1281,7 @@ class DefaultGoogleWorkspaceProvider:
                 thread_id=thread_id,
                 mode=mode,
                 anchor_message_id=message_id,
+                provider_account_id=account_id,
             )
 
         if message_id is None:
@@ -1189,15 +1290,17 @@ class DefaultGoogleWorkspaceProvider:
             access_token=access_token,
             message_id=message_id,
             mode=mode,
+            provider_account_id=account_id,
         )
         if payload.get("schema_version") == "google.gmail.message_evidence.v1":
             return payload
-        normalized = normalize_gmail_message(payload, provider_account_id="google")
+        normalized = normalize_gmail_message(payload, provider_account_id=account_id)
         return self._gmail_read_thread_output(
             access_token=access_token,
             thread_id=normalized.thread_id,
             mode=mode,
             anchor_message_id=message_id,
+            provider_account_id=account_id,
         )
 
     def _gmail_read_message_output(
@@ -1206,15 +1309,17 @@ class DefaultGoogleWorkspaceProvider:
         access_token: str,
         message_id: str,
         mode: str,
+        provider_account_id: str,
     ) -> dict[str, Any]:
         payload = self._gmail_message_payload_or_typed_unavailable(
             access_token=access_token,
             message_id=message_id,
             mode=mode,
+            provider_account_id=provider_account_id,
         )
         if payload.get("schema_version") == "google.gmail.message_evidence.v1":
             return payload
-        normalized = normalize_gmail_message(payload, provider_account_id="google")
+        normalized = normalize_gmail_message(payload, provider_account_id=provider_account_id)
         return self._gmail_message_evidence_output(
             normalized=normalized,
             payload=payload,
@@ -1227,6 +1332,7 @@ class DefaultGoogleWorkspaceProvider:
         access_token: str,
         message_id: str,
         mode: str,
+        provider_account_id: str,
     ) -> dict[str, Any]:
         try:
             return self._request_json(
@@ -1236,14 +1342,14 @@ class DefaultGoogleWorkspaceProvider:
                 params={"format": "full"},
                 max_response_bytes=_MAX_GMAIL_MESSAGE_RESPONSE_BYTES,
             )
-        except RuntimeError as exc:
-            reason = safe_failure_reason(str(exc), fallback="gmail_read_unavailable")
-            if reason != "google_response_too_large":
+        except GoogleProviderRequestFailure as exc:
+            if exc.code != "google_response_too_large":
                 raise
             return _gmail_message_unavailable_output(
                 message_id=message_id,
                 thread_id=None,
                 mode=mode,
+                provider_account_id=provider_account_id,
                 status="body_too_large",
                 reason_code="gmail_body_too_large",
                 recovery="Use narrower message context or ask for metadata only.",
@@ -1277,7 +1383,7 @@ class DefaultGoogleWorkspaceProvider:
                 "html_security": normalized.body.html_security,
             },
             "read_outcome": read_outcome,
-            "retrieved_at": to_rfc3339(_utcnow()),
+            "retrieved_at": to_rfc3339(utcnow()),
             "status": "succeeded",
         }
 
@@ -1288,6 +1394,7 @@ class DefaultGoogleWorkspaceProvider:
         thread_id: str,
         mode: str,
         anchor_message_id: str | None,
+        provider_account_id: str,
     ) -> dict[str, Any]:
         try:
             payload = self._request_json(
@@ -1300,14 +1407,14 @@ class DefaultGoogleWorkspaceProvider:
                 },
                 max_response_bytes=_MAX_GMAIL_THREAD_RESPONSE_BYTES,
             )
-        except RuntimeError as exc:
-            reason = safe_failure_reason(str(exc), fallback="gmail_read_unavailable")
-            if reason != "google_response_too_large":
+        except GoogleProviderRequestFailure as exc:
+            if exc.code != "google_response_too_large":
                 raise
             return _gmail_thread_unavailable_output(
                 thread_id=thread_id,
                 mode=mode,
                 anchor_message_id=anchor_message_id,
+                provider_account_id=provider_account_id,
                 status="body_too_large",
                 reason_code="gmail_body_too_large",
                 recovery="Use narrower thread context or ask for metadata only.",
@@ -1336,20 +1443,20 @@ class DefaultGoogleWorkspaceProvider:
                         max_response_bytes=_MAX_GMAIL_MESSAGE_RESPONSE_BYTES,
                     )
                 )
-            except RuntimeError as exc:
-                reason = safe_failure_reason(str(exc), fallback="gmail_read_unavailable")
-                if reason != "google_response_too_large":
+            except GoogleProviderRequestFailure as exc:
+                if exc.code != "google_response_too_large":
                     raise
                 return _gmail_thread_unavailable_output(
                     thread_id=thread_id,
                     mode=mode,
                     anchor_message_id=anchor_message_id,
+                    provider_account_id=provider_account_id,
                     status="body_too_large",
                     reason_code="gmail_body_too_large",
                     recovery="Use narrower thread context or ask for metadata only.",
                 )
         normalized_messages = [
-            normalize_gmail_message(message_payload, provider_account_id="google")
+            normalize_gmail_message(message_payload, provider_account_id=provider_account_id)
             for message_payload in full_message_payloads
         ]
         blocks: list[dict[str, Any]] = []
@@ -1375,6 +1482,7 @@ class DefaultGoogleWorkspaceProvider:
             "schema_version": "google.gmail.message_evidence.v1",
             "mode": mode,
             "thread": {
+                "provider_account_id": provider_account_id,
                 "thread_id": str(payload.get("id") or thread_id),
                 "history_id": str(payload.get("historyId"))
                 if payload.get("historyId") is not None
@@ -1413,7 +1521,7 @@ class DefaultGoogleWorkspaceProvider:
                 block_count=len(blocks),
                 decode_notes=decode_notes,
             ),
-            "retrieved_at": to_rfc3339(_utcnow()),
+            "retrieved_at": to_rfc3339(utcnow()),
             "status": "succeeded",
         }
 
@@ -1494,9 +1602,8 @@ class DefaultGoogleWorkspaceProvider:
                 ),
                 None,
             )
-        except Exception as exc:
-            reason = safe_failure_reason(str(exc), fallback=f"unexpected {exc.__class__.__name__}")
-            return [], reason
+        except GoogleProviderRequestFailure as exc:
+            return [], exc.code
 
     def _gmail_modify_message_labels(
         self,
@@ -1624,7 +1731,7 @@ class DefaultGoogleWorkspaceProvider:
             "message_ids": message_ids,
             "state": states,
             "labels": _gmail_label_map(states),
-            "retrieved_at": to_rfc3339(_utcnow()),
+            "retrieved_at": to_rfc3339(utcnow()),
         }
 
     def email_archive(
@@ -1679,8 +1786,8 @@ class DefaultGoogleWorkspaceProvider:
                         "removeLabelIds": ["INBOX"],
                     }
                 )
-        except Exception as exc:
-            error = safe_failure_reason(str(exc), fallback=f"unexpected {exc.__class__.__name__}")
+        except GoogleProviderRequestFailure as exc:
+            error = exc.code
             failed_provider_call = {
                 "api": "users.messages.batchModify"
                 if len(message_ids_to_archive) > 1
@@ -1751,11 +1858,8 @@ class DefaultGoogleWorkspaceProvider:
         for message_id in message_ids_to_trash:
             try:
                 self._gmail_trash_message(access_token=access_token, message_id=message_id)
-            except Exception as exc:
-                error = safe_failure_reason(
-                    str(exc),
-                    fallback=f"unexpected {exc.__class__.__name__}",
-                )
+            except GoogleProviderRequestFailure as exc:
+                error = exc.code
                 failed_provider_call = {
                     "api": "users.messages.trash",
                     "message_id": message_id,
@@ -1905,8 +2009,8 @@ class DefaultGoogleWorkspaceProvider:
                         "removeLabelIds": remove_label_ids,
                     }
                 )
-        except Exception as exc:
-            error = safe_failure_reason(str(exc), fallback=f"unexpected {exc.__class__.__name__}")
+        except GoogleProviderRequestFailure as exc:
+            error = exc.code
             failed_provider_call = {
                 "api": "users.messages.batchModify"
                 if len(message_ids_to_modify) > 1
@@ -2006,11 +2110,8 @@ class DefaultGoogleWorkspaceProvider:
             if "TRASH" in current_label_ids and "TRASH" not in target_label_ids:
                 try:
                     self._gmail_untrash_message(access_token=access_token, message_id=message_id)
-                except Exception as exc:
-                    error = safe_failure_reason(
-                        str(exc),
-                        fallback=f"unexpected {exc.__class__.__name__}",
-                    )
+                except GoogleProviderRequestFailure as exc:
+                    error = exc.code
                     failed_provider_call = {
                         "api": "users.messages.untrash",
                         "message_id": message_id,
@@ -2023,11 +2124,8 @@ class DefaultGoogleWorkspaceProvider:
                         access_token=access_token,
                         message_id=message_id,
                     )
-                except Exception as exc:
-                    error = safe_failure_reason(
-                        str(exc),
-                        fallback=f"unexpected {exc.__class__.__name__}",
-                    )
+                except GoogleProviderRequestFailure as exc:
+                    error = exc.code
                     failed_provider_call = {
                         "api": "users.messages.get",
                         "message_id": message_id,
@@ -2038,11 +2136,8 @@ class DefaultGoogleWorkspaceProvider:
             elif "TRASH" not in current_label_ids and "TRASH" in target_label_ids:
                 try:
                     self._gmail_trash_message(access_token=access_token, message_id=message_id)
-                except Exception as exc:
-                    error = safe_failure_reason(
-                        str(exc),
-                        fallback=f"unexpected {exc.__class__.__name__}",
-                    )
+                except GoogleProviderRequestFailure as exc:
+                    error = exc.code
                     failed_provider_call = {
                         "api": "users.messages.trash",
                         "message_id": message_id,
@@ -2055,11 +2150,8 @@ class DefaultGoogleWorkspaceProvider:
                         access_token=access_token,
                         message_id=message_id,
                     )
-                except Exception as exc:
-                    error = safe_failure_reason(
-                        str(exc),
-                        fallback=f"unexpected {exc.__class__.__name__}",
-                    )
+                except GoogleProviderRequestFailure as exc:
+                    error = exc.code
                     failed_provider_call = {
                         "api": "users.messages.get",
                         "message_id": message_id,
@@ -2091,11 +2183,8 @@ class DefaultGoogleWorkspaceProvider:
                         add_label_ids=add_label_ids,
                         remove_label_ids=remove_label_ids,
                     )
-                except Exception as exc:
-                    error = safe_failure_reason(
-                        str(exc),
-                        fallback=f"unexpected {exc.__class__.__name__}",
-                    )
+                except GoogleProviderRequestFailure as exc:
+                    error = exc.code
                     failed_provider_call = {
                         "api": "users.messages.modify",
                         "message_id": message_id,
@@ -2228,7 +2317,7 @@ class DefaultGoogleWorkspaceProvider:
             "provider_status": provider_status.strip()
             if isinstance(provider_status, str) and provider_status.strip()
             else None,
-            "executed_at": to_rfc3339(_utcnow()),
+            "executed_at": to_rfc3339(utcnow()),
         }
 
     def calendar_update_event(
@@ -2294,7 +2383,7 @@ class DefaultGoogleWorkspaceProvider:
             "provider_status": provider_status.strip()
             if isinstance(provider_status, str) and provider_status.strip()
             else None,
-            "executed_at": to_rfc3339(_utcnow()),
+            "executed_at": to_rfc3339(utcnow()),
         }
 
     def calendar_respond_to_event(
@@ -2345,7 +2434,7 @@ class DefaultGoogleWorkspaceProvider:
             "provider_status": provider_status.strip()
             if isinstance(provider_status, str) and provider_status.strip()
             else None,
-            "executed_at": to_rfc3339(_utcnow()),
+            "executed_at": to_rfc3339(utcnow()),
         }
 
     def email_create_draft(
@@ -2453,6 +2542,7 @@ class DefaultGoogleWorkspaceProvider:
     def _drive_read_outcome_output(
         self,
         *,
+        provider_account_id: str,
         file_id: str,
         title: str,
         source: str,
@@ -2469,7 +2559,8 @@ class DefaultGoogleWorkspaceProvider:
         return {
             "schema_version": "google.drive.read_result.v1",
             "file_id": file_id,
-            "retrieved_at": to_rfc3339(_utcnow()),
+            "provider_account_id": provider_account_id,
+            "retrieved_at": to_rfc3339(utcnow()),
             "title": title,
             "source": source,
             "published_at": published_at,
@@ -2484,7 +2575,9 @@ class DefaultGoogleWorkspaceProvider:
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]:
+        account_id = _non_empty_provider_account_id(provider_account_id)
         query = str(normalized_input["query"]).strip()
         escaped_query = query.replace("\\", "\\\\").replace("'", "\\'")
         drive_query = (
@@ -2537,7 +2630,8 @@ class DefaultGoogleWorkspaceProvider:
         return {
             "schema_version": "google.drive.search_results.v1",
             "query": query,
-            "retrieved_at": to_rfc3339(_utcnow()),
+            "provider_account_id": account_id,
+            "retrieved_at": to_rfc3339(utcnow()),
             "results": results,
             "status": "succeeded",
         }
@@ -2547,7 +2641,9 @@ class DefaultGoogleWorkspaceProvider:
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]:
+        account_id = _non_empty_provider_account_id(provider_account_id)
         file_id = str(normalized_input["file_id"]).strip()
         metadata_url = f"{self.drive_api_base_url}/files/{quote(file_id, safe='')}"
         try:
@@ -2560,16 +2656,16 @@ class DefaultGoogleWorkspaceProvider:
                     "supportsAllDrives": "true",
                 },
             )
-        except RuntimeError as exc:
-            if (
-                safe_failure_reason(str(exc), fallback="drive_read_unavailable").lower()
-                == "resource_not_found"
-            ):
-                fallback_source = f"https://drive.google.com/file/d/{quote(file_id, safe='')}/view"
+        except GoogleProviderRequestFailure as exc:
+            if exc.code == "resource_not_found":
+                unavailable_source = (
+                    f"https://drive.google.com/file/d/{quote(file_id, safe='')}/view"
+                )
                 return self._drive_read_outcome_output(
+                    provider_account_id=account_id,
                     file_id=file_id,
                     title=f"Drive file {file_id}",
-                    source=fallback_source,
+                    source=unavailable_source,
                     published_at=None,
                     status="unavailable",
                     reason_code="drive_read_unavailable",
@@ -2594,6 +2690,7 @@ class DefaultGoogleWorkspaceProvider:
         size_bytes = self._drive_size_bytes(metadata.get("size"))
         if size_bytes is not None and size_bytes > _MAX_DRIVE_READ_BYTES:
             return self._drive_read_outcome_output(
+                provider_account_id=account_id,
                 file_id=file_id,
                 title=title,
                 source=source,
@@ -2623,6 +2720,7 @@ class DefaultGoogleWorkspaceProvider:
                 )
             else:
                 return self._drive_read_outcome_output(
+                    provider_account_id=account_id,
                     file_id=file_id,
                     title=title,
                     source=source,
@@ -2631,12 +2729,10 @@ class DefaultGoogleWorkspaceProvider:
                     reason_code="drive_read_unsupported",
                     recovery="Export this file to Google Docs or plain text, then retry.",
                 )
-        except RuntimeError as exc:
-            if (
-                safe_failure_reason(str(exc), fallback="drive_read_unavailable").lower()
-                == "resource_not_found"
-            ):
+        except GoogleProviderRequestFailure as exc:
+            if exc.code == "resource_not_found":
                 return self._drive_read_outcome_output(
+                    provider_account_id=account_id,
                     file_id=file_id,
                     title=title,
                     source=source,
@@ -2662,7 +2758,8 @@ class DefaultGoogleWorkspaceProvider:
         return {
             "schema_version": "google.drive.read_result.v1",
             "file_id": file_id,
-            "retrieved_at": to_rfc3339(_utcnow()),
+            "provider_account_id": account_id,
+            "retrieved_at": to_rfc3339(utcnow()),
             "title": title,
             "source": source,
             "published_at": published_at,
@@ -2767,16 +2864,19 @@ class DefaultGoogleWorkspaceProvider:
         json_payload: dict[str, Any] = {"topicName": topic_name}
         if label_ids:
             json_payload["labelIds"] = label_ids
-        payload = self._request_json(
-            method="POST",
-            url=f"{self.gmail_api_base_url}/users/me/watch",
-            access_token=access_token,
-            json_payload=json_payload,
-        )
+        try:
+            payload = self._request_json(
+                method="POST",
+                url=f"{self.gmail_api_base_url}/users/me/watch",
+                access_token=access_token,
+                json_payload=json_payload,
+            )
+        except GoogleProviderRequestFailure as exc:
+            raise GoogleWatchRegistrationFailure(code=exc.code) from exc
         history_id = _payload_text_value(payload, "historyId")
         expiration = _parse_google_expiration_millis(payload.get("expiration"))
         if history_id is None or expiration is None:
-            raise RuntimeError("provider_result_unknown")
+            raise GoogleWatchRegistrationFailure(code="gmail_watch_response_invalid")
         return {"historyId": history_id, "expiration": expiration}
 
     def gmail_stop_watch(self, *, access_token: str) -> None:
@@ -2805,18 +2905,22 @@ class DefaultGoogleWorkspaceProvider:
         }
         if ttl_seconds is not None and ttl_seconds > 0:
             json_payload["params"] = {"ttl": str(ttl_seconds)}
-        payload = self._request_json(
-            method="POST",
-            url=(
-                f"{self.calendar_api_base_url}/calendars/{quote(calendar_id, safe='')}/events/watch"
-            ),
-            access_token=access_token,
-            json_payload=json_payload,
-        )
+        try:
+            payload = self._request_json(
+                method="POST",
+                url=(
+                    f"{self.calendar_api_base_url}/calendars/"
+                    f"{quote(calendar_id, safe='')}/events/watch"
+                ),
+                access_token=access_token,
+                json_payload=json_payload,
+            )
+        except GoogleProviderRequestFailure as exc:
+            raise GoogleWatchRegistrationFailure(code=exc.code) from exc
         provider_resource_id = _payload_text_value(payload, "resourceId")
         expiration = _parse_google_expiration_millis(payload.get("expiration"))
         if provider_resource_id is None or expiration is None:
-            raise RuntimeError("provider_result_unknown")
+            raise GoogleWatchRegistrationFailure(code="calendar_watch_response_invalid")
         return {"resourceId": provider_resource_id, "expiration": expiration}
 
     def calendar_stop_watch(
@@ -3051,7 +3155,7 @@ def _gmail_mutation_output(
         "after_labels": _gmail_label_map(after_state),
         "provider_result": provider_result,
         "undo_supported": True,
-        "executed_at": to_rfc3339(_utcnow()),
+        "executed_at": to_rfc3339(utcnow()),
     }
 
 
@@ -3132,7 +3236,7 @@ def _is_google_scope_failure(response: httpx.Response) -> bool:
 def _google_error_reason(response: httpx.Response) -> str:
     error_payload = _google_error_payload(response)
     if error_payload is None:
-        return safe_failure_reason(response.text, fallback="google_request_failed")
+        return safe_failure_reason(response.text, safe_reason="google_request_failed")
 
     message_raw = error_payload.get("message")
     if isinstance(message_raw, str) and message_raw.strip():
@@ -3145,7 +3249,49 @@ def _google_error_reason(response: httpx.Response) -> str:
             reason_raw = error_entry.get("reason")
             if isinstance(reason_raw, str) and reason_raw.strip():
                 return reason_raw.strip()
-    return safe_failure_reason(response.text, fallback="google_request_failed")
+    return safe_failure_reason(response.text, safe_reason="google_request_failed")
+
+
+def _oauth_error_reason(response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+    except ValueError:
+        return safe_failure_reason(response.text, safe_reason="oauth_refresh_failed")
+    if isinstance(payload, dict):
+        error_raw = payload.get("error")
+        if isinstance(error_raw, str) and error_raw.strip():
+            return error_raw.strip()
+        description_raw = payload.get("error_description")
+        if isinstance(description_raw, str) and description_raw.strip():
+            return description_raw.strip()
+    return safe_failure_reason(response.text, safe_reason="oauth_refresh_failed")
+
+
+def _oauth_refresh_failure_code(response: httpx.Response) -> OAuthRefreshFailureCode:
+    reason = _oauth_error_reason(response).lower()
+    if reason == "invalid_grant" or "revoked" in reason:
+        return "access_revoked"
+    if response.status_code == 429:
+        return "provider_rate_limited"
+    if response.status_code in {500, 502, 503, 504}:
+        return "provider_upstream_failure"
+    return "provider_request_rejected"
+
+
+def _oauth_exchange_failure_code(response: httpx.Response) -> OAuthExchangeFailureCode:
+    if response.status_code == 429:
+        return "provider_rate_limited"
+    if response.status_code in {500, 502, 503, 504}:
+        return "provider_upstream_failure"
+    return "provider_request_rejected"
+
+
+def _oauth_revoke_failure_code(response: httpx.Response) -> OAuthRevokeFailureCode:
+    if response.status_code == 429:
+        return "provider_rate_limited"
+    if response.status_code in {500, 502, 503, 504}:
+        return "provider_upstream_failure"
+    return "provider_request_rejected"
 
 
 def _merge_intervals(intervals: list[tuple[datetime, datetime]]) -> list[tuple[datetime, datetime]]:
@@ -3285,6 +3431,7 @@ def _gmail_message_unavailable_output(
     message_id: str,
     thread_id: str | None,
     mode: str,
+    provider_account_id: str,
     status: Literal["body_too_large", "decode_failed", "no_body"],
     reason_code: str,
     recovery: str,
@@ -3293,7 +3440,7 @@ def _gmail_message_unavailable_output(
         "schema_version": "google.gmail.message_evidence.v1",
         "mode": mode,
         "message": {
-            "provider_account_id": "google",
+            "provider_account_id": provider_account_id,
             "message_id": message_id,
             "thread_id": thread_id,
             "history_id": None,
@@ -3328,7 +3475,7 @@ def _gmail_message_unavailable_output(
             "reason_code": reason_code,
             "recovery": recovery,
         },
-        "retrieved_at": to_rfc3339(_utcnow()),
+        "retrieved_at": to_rfc3339(utcnow()),
         "status": "succeeded",
     }
 
@@ -3338,6 +3485,7 @@ def _gmail_thread_unavailable_output(
     thread_id: str,
     mode: str,
     anchor_message_id: str | None,
+    provider_account_id: str,
     status: Literal["body_too_large", "decode_failed", "no_body"],
     reason_code: str,
     recovery: str,
@@ -3346,6 +3494,7 @@ def _gmail_thread_unavailable_output(
         "schema_version": "google.gmail.message_evidence.v1",
         "mode": mode,
         "thread": {
+            "provider_account_id": provider_account_id,
             "thread_id": thread_id,
             "history_id": None,
             "message_count": 0,
@@ -3367,7 +3516,7 @@ def _gmail_thread_unavailable_output(
             "reason_code": reason_code,
             "recovery": recovery,
         },
-        "retrieved_at": to_rfc3339(_utcnow()),
+        "retrieved_at": to_rfc3339(utcnow()),
         "status": "succeeded",
     }
 
@@ -3676,7 +3825,7 @@ def _is_google_calendar_events_output(payload: dict[str, Any]) -> bool:
             return False
         if not _has_non_empty_string(event.get("raw_payload_digest")):
             return False
-        if not _is_string_or_none(event.get("provider_account_id")):
+        if not _has_non_empty_string(event.get("provider_account_id")):
             return False
         if not _is_string_or_none(event.get("ical_uid")):
             return False
@@ -3755,6 +3904,8 @@ def _is_google_calendar_write_result_output(
 
 def _is_google_calendar_slot_options_output(payload: dict[str, Any]) -> bool:
     if payload.get("schema_version") != "google.calendar.slot_options.v1" or "results" in payload:
+        return False
+    if not _has_non_empty_string(payload.get("provider_account_id")):
         return False
     for key in ("retrieved_at", "window_start", "window_end"):
         if not _has_non_empty_string(payload.get(key)):
@@ -3857,6 +4008,8 @@ def _is_google_gmail_message_refs_output(payload: dict[str, Any]) -> bool:
     for message in messages:
         if not isinstance(message, dict):
             return False
+        if not _has_non_empty_string(message.get("provider_account_id")):
+            return False
         if not _has_non_empty_string(message.get("message_id")):
             return False
         if not _has_non_empty_string(message.get("thread_id")):
@@ -3914,6 +4067,8 @@ def _gmail_message_metadata_is_bounded(message: dict[str, Any]) -> bool:
     if not _has_only_keys(message, allowed):
         return False
     if _has_forbidden_text_key(message, allowed=allowed):
+        return False
+    if not _has_non_empty_string(message.get("provider_account_id")):
         return False
     body = message.get("body")
     if body is None:
@@ -4064,8 +4219,10 @@ def _is_google_gmail_message_evidence_output(payload: dict[str, Any]) -> bool:
         return False
     if not _has_only_keys(
         thread,
-        {"thread_id", "history_id", "message_count", "anchor_message_id"},
+        {"provider_account_id", "thread_id", "history_id", "message_count", "anchor_message_id"},
     ):
+        return False
+    if not _has_non_empty_string(thread.get("provider_account_id")):
         return False
     thread_id = thread.get("thread_id")
     if not _has_non_empty_string(thread_id):
@@ -4326,188 +4483,6 @@ def _urlsafe_b64encode(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
 
 
-def _urlsafe_b64decode(value: str) -> bytes:
-    padding = "=" * (-len(value) % 4)
-    return base64.urlsafe_b64decode(value + padding)
-
-
-def _derive_secret_bytes(secret: str) -> bytes:
-    normalized = secret.strip()
-    if not normalized:
-        normalized = "dev-local-connector-secret"
-    return hashlib.sha256(normalized.encode("utf-8")).digest()
-
-
-def _parse_connector_key_entries(configured_keys: str) -> dict[str, str]:
-    normalized = configured_keys.strip()
-    if not normalized:
-        return {}
-    try:
-        payload = json.loads(normalized)
-    except ValueError:
-        entries: dict[str, str] = {}
-        for raw_item in normalized.split(","):
-            item = raw_item.strip()
-            if not item:
-                continue
-            version, sep, key_value = item.partition(":")
-            if not sep:
-                msg = "connector_encryption_keys entry must be version:key"
-                raise RuntimeError(msg)
-            version_normalized = version.strip()
-            key_normalized = key_value.strip()
-            if not version_normalized or not key_normalized:
-                msg = "connector_encryption_keys entry must not be blank"
-                raise RuntimeError(msg)
-            entries[version_normalized] = key_normalized
-        return entries
-    if not isinstance(payload, dict):
-        msg = "connector_encryption_keys must be JSON object or version:key list"
-        raise RuntimeError(msg)
-    entries = {}
-    for key, value in payload.items():
-        if not isinstance(key, str) or not isinstance(value, str):
-            msg = "connector_encryption_keys JSON must map string versions to string keys"
-            raise RuntimeError(msg)
-        key_normalized = key.strip()
-        value_normalized = value.strip()
-        if not key_normalized or not value_normalized:
-            msg = "connector_encryption_keys JSON entries must not be blank"
-            raise RuntimeError(msg)
-        entries[key_normalized] = value_normalized
-    return entries
-
-
-def _decode_aead_key(raw_value: str) -> bytes:
-    try:
-        decoded = _urlsafe_b64decode(raw_value.strip())
-    except Exception as exc:
-        raise RuntimeError("connector encryption key must be base64url encoded") from exc
-    if len(decoded) not in {16, 24, 32}:
-        msg = "connector encryption key length must be 16, 24, or 32 bytes"
-        raise RuntimeError(msg)
-    return decoded
-
-
-@dataclass(slots=True, frozen=True)
-class ConnectorTokenCipher:
-    active_key_version: str
-    keys_by_version: dict[str, bytes]
-    single_secret_key: bytes | None = None
-
-    def __post_init__(self) -> None:
-        active = self.active_key_version.strip()
-        if not active:
-            raise RuntimeError("active_key_version must not be blank")
-        if active not in self.keys_by_version:
-            raise RuntimeError("active_key_version is missing from keys_by_version")
-        copied: dict[str, bytes] = {}
-        for version, key_bytes in self.keys_by_version.items():
-            if not version.strip():
-                raise RuntimeError("key version must not be blank")
-            if len(key_bytes) not in {16, 24, 32}:
-                raise RuntimeError("aead key length must be 16, 24, or 32 bytes")
-            copied[version] = bytes(key_bytes)
-        single_secret_key = self.single_secret_key
-        if single_secret_key is not None and len(single_secret_key) not in {16, 24, 32}:
-            raise RuntimeError("aead key length must be 16, 24, or 32 bytes")
-        object.__setattr__(self, "active_key_version", active)
-        object.__setattr__(self, "keys_by_version", copied)
-        object.__setattr__(
-            self,
-            "single_secret_key",
-            bytes(single_secret_key) if single_secret_key is not None else None,
-        )
-
-    @classmethod
-    def from_config(
-        cls,
-        *,
-        active_key_version: str,
-        configured_keys: str | None,
-        single_secret: str,
-    ) -> ConnectorTokenCipher:
-        keys: dict[str, bytes] = {}
-        if configured_keys is not None:
-            entries = _parse_connector_key_entries(configured_keys)
-            keys = {version: _decode_aead_key(raw_key) for version, raw_key in entries.items()}
-        active = active_key_version.strip() or "v1"
-        single_secret_key: bytes | None = None
-        if not keys:
-            single_secret_key = _derive_secret_bytes(single_secret)
-            keys[active] = single_secret_key
-        if active not in keys:
-            msg = "active connector encryption key version is missing from configured keyring"
-            raise RuntimeError(msg)
-        return cls(
-            active_key_version=active,
-            keys_by_version=keys,
-            single_secret_key=single_secret_key,
-        )
-
-    def encrypt(self, plaintext: str) -> str:
-        key_bytes = self.keys_by_version[self.active_key_version]
-        nonce = secrets.token_bytes(12)
-        aad = f"ariel.connector.google:{self.active_key_version}".encode("utf-8")
-        cipher = AESGCM(key_bytes)
-        ciphertext = cipher.encrypt(nonce, plaintext.encode("utf-8"), aad)
-        return (
-            f"aeadv1:{self.active_key_version}:"
-            f"{_urlsafe_b64encode(nonce)}:{_urlsafe_b64encode(ciphertext)}"
-        )
-
-    def decrypt(self, ciphertext: str) -> str:
-        if ciphertext.startswith("aeadv1:"):
-            try:
-                _, version, nonce_b64, payload_b64 = ciphertext.split(":", maxsplit=3)
-            except ValueError as exc:
-                raise RuntimeError("encrypted value is malformed") from exc
-            key_bytes = self.keys_by_version.get(version) or self.single_secret_key
-            if key_bytes is None:
-                raise RuntimeError("unknown encryption key version")
-            nonce = _urlsafe_b64decode(nonce_b64)
-            if len(nonce) != 12:
-                raise RuntimeError("encrypted value nonce is invalid")
-            payload = _urlsafe_b64decode(payload_b64)
-            aad = f"ariel.connector.google:{version}".encode("utf-8")
-            try:
-                plaintext = AESGCM(key_bytes).decrypt(nonce, payload, aad)
-            except InvalidTag as exc:
-                raise RuntimeError("encrypted value integrity check failed") from exc
-            return plaintext.decode("utf-8")
-        raise RuntimeError("encrypted value is malformed")
-
-
-def _encrypt_secret(
-    *,
-    plaintext: str,
-    secret: str,
-    key_version: str,
-    encryption_keys: str | None = None,
-) -> str:
-    cipher = ConnectorTokenCipher.from_config(
-        active_key_version=key_version,
-        configured_keys=encryption_keys,
-        single_secret=secret,
-    )
-    return cipher.encrypt(plaintext)
-
-
-def _decrypt_secret(
-    *,
-    ciphertext: str,
-    secret: str,
-    expected_key_version: str,
-    encryption_keys: str | None = None,
-) -> str:
-    cipher = ConnectorTokenCipher.from_config(
-        active_key_version=expected_key_version,
-        configured_keys=encryption_keys,
-        single_secret=secret,
-    )
-    return cipher.decrypt(ciphertext)
-
-
 def _pkce_verifier() -> str:
     raw = secrets.token_urlsafe(64)
     return raw[:96]
@@ -4749,7 +4724,7 @@ class GoogleConnectorRuntime:
                     message="google reconnect capability intent is invalid",
                     details={
                         "reason": safe_failure_reason(
-                            str(exc), fallback="invalid_capability_intent"
+                            str(exc), safe_reason="invalid_capability_intent"
                         )
                     },
                     retryable=False,
@@ -4767,7 +4742,7 @@ class GoogleConnectorRuntime:
             state_handle=state_handle,
             flow="reconnect" if reconnect else "connect",
             requested_scopes=requested_scopes,
-            pkce_verifier_enc=_encrypt_secret(
+            pkce_verifier_enc=encrypt_secret(
                 plaintext=verifier,
                 secret=self.encryption_secret,
                 key_version=self.encryption_key_version,
@@ -4812,8 +4787,8 @@ class GoogleConnectorRuntime:
                 redirect_uri=self.redirect_uri,
                 prompt_consent=reconnect,
             )
-        except Exception as exc:
-            reason = safe_failure_reason(str(exc), fallback=f"unexpected {exc.__class__.__name__}")
+        except GoogleOAuthStartFailure as exc:
+            reason = exc.code
             _set_connector_error(
                 connector=connector,
                 error_code="oauth_start_failed",
@@ -4845,7 +4820,7 @@ class GoogleConnectorRuntime:
                 code="E_CONNECTOR_START_FAILED",
                 message="google connector start failed",
                 details={"reason": reason},
-                retryable=True,
+                retryable=False,
             ) from exc
 
         return {
@@ -4964,7 +4939,7 @@ class GoogleConnectorRuntime:
                 db=db,
                 connector=connector,
                 flow=flow,
-                reason=safe_failure_reason(error, fallback="oauth_provider_error"),
+                reason=safe_failure_reason(error, safe_reason="oauth_provider_error"),
                 now_fn=now_fn,
                 new_id_fn=new_id_fn,
             )
@@ -4981,21 +4956,18 @@ class GoogleConnectorRuntime:
         state_record.consumed_at = now
         state_record.updated_at = now
         try:
-            verifier = _decrypt_secret(
+            verifier = decrypt_secret(
                 ciphertext=state_record.pkce_verifier_enc,
                 secret=self.encryption_secret,
                 expected_key_version=self.encryption_key_version,
                 encryption_keys=self.encryption_keys,
             )
-        except Exception as exc:
+        except SecretDecryptionFailure as exc:
             raise self._callback_invalid(
                 db=db,
                 connector=connector,
                 flow=flow,
-                reason=safe_failure_reason(
-                    str(exc),
-                    fallback=f"unexpected {exc.__class__.__name__}",
-                ),
+                reason=exc.code,
                 now_fn=now_fn,
                 new_id_fn=new_id_fn,
             ) from exc
@@ -5007,11 +4979,8 @@ class GoogleConnectorRuntime:
                 redirect_uri=state_record.redirect_uri,
                 state=state_record.state_handle,
             )
-        except Exception as exc:
-            reason = safe_failure_reason(
-                str(exc),
-                fallback=f"unexpected {exc.__class__.__name__}",
-            )
+        except GoogleOAuthExchangeFailure as exc:
+            reason = exc.code
             failed_event_type = (
                 "evt.connector.google.reconnect.failed"
                 if flow == "reconnect"
@@ -5055,13 +5024,17 @@ class GoogleConnectorRuntime:
         expires_in_seconds = expires_in_raw if isinstance(expires_in_raw, int) else 3600
         if expires_in_seconds <= 0:
             expires_in_seconds = 0
+        account_subject = (
+            account_subject_raw.strip() if isinstance(account_subject_raw, str) else ""
+        )
+        account_email = account_email_raw.strip() if isinstance(account_email_raw, str) else ""
+        access_token = access_token_raw.strip() if isinstance(access_token_raw, str) else ""
         if (
-            not isinstance(account_subject_raw, str)
-            or not account_subject_raw.strip()
-            or not isinstance(account_email_raw, str)
-            or not account_email_raw.strip()
-            or not isinstance(access_token_raw, str)
-            or not access_token_raw.strip()
+            not account_subject
+            or account_subject == "unknown-subject"
+            or not account_email
+            or account_email == "unknown-email"
+            or not access_token
         ):
             raise self._callback_invalid(
                 db=db,
@@ -5077,7 +5050,7 @@ class GoogleConnectorRuntime:
             else None
         )
         if refresh_token is None and connector.refresh_token_enc is not None:
-            refresh_token = _decrypt_secret(
+            refresh_token = decrypt_secret(
                 ciphertext=connector.refresh_token_enc,
                 secret=self.encryption_secret,
                 expected_key_version=connector.encryption_key_version,
@@ -5094,16 +5067,16 @@ class GoogleConnectorRuntime:
             )
 
         connector.status = "connected"
-        connector.account_subject = account_subject_raw.strip()
-        connector.account_email = account_email_raw.strip()
+        connector.account_subject = account_subject
+        connector.account_email = account_email
         connector.granted_scopes = granted_scopes
-        connector.access_token_enc = _encrypt_secret(
-            plaintext=access_token_raw.strip(),
+        connector.access_token_enc = encrypt_secret(
+            plaintext=access_token,
             secret=self.encryption_secret,
             key_version=self.encryption_key_version,
             encryption_keys=self.encryption_keys,
         )
-        connector.refresh_token_enc = _encrypt_secret(
+        connector.refresh_token_enc = encrypt_secret(
             plaintext=refresh_token,
             secret=self.encryption_secret,
             key_version=self.encryption_key_version,
@@ -5115,6 +5088,49 @@ class GoogleConnectorRuntime:
         connector.last_error_code = None
         connector.last_error_at = None
         connector.updated_at = now_fn()
+
+        try:
+            self.register_provider_watches(
+                db=db,
+                access_token=access_token,
+                granted_scopes=granted_scopes,
+                account_subject=connector.account_subject or connector.id,
+                now_fn=now_fn,
+                new_id_fn=new_id_fn,
+            )
+        except GoogleWatchRegistrationFailure as exc:
+            connector.status = "error"
+            _set_connector_error(
+                connector=connector,
+                error_code=exc.code,
+                now_fn=now_fn,
+                preserve_existing_blocking=True,
+            )
+            failed_event_type = (
+                "evt.connector.google.reconnect.failed"
+                if flow == "reconnect"
+                else "evt.connector.google.connect.failed"
+            )
+            _append_connector_event(
+                db=db,
+                connector_id=connector.id,
+                event_type=failed_event_type,
+                payload_data={
+                    **_connector_event_payload(connector, scopes=granted_scopes),
+                    "requested_scopes": _normalize_scope_list(state_record.requested_scopes),
+                    "granted_scopes": granted_scopes,
+                    "failure_reason": exc.code,
+                },
+                now_fn=now_fn,
+                new_id_fn=new_id_fn,
+            )
+            raise GoogleConnectorError(
+                status_code=502,
+                code="E_CONNECTOR_CALLBACK_FAILED",
+                message="google connector callback failed",
+                details={"reason": exc.code},
+                retryable=True,
+            ) from exc
 
         succeeded_event_type = (
             "evt.connector.google.reconnect.succeeded"
@@ -5133,32 +5149,6 @@ class GoogleConnectorRuntime:
             now_fn=now_fn,
             new_id_fn=new_id_fn,
         )
-
-        # Arm the Gmail and Calendar push channels. Non-fatal: a failure here
-        # leaves the connector connected — the reconcile poll is the backstop.
-        try:
-            self.register_provider_watches(
-                db=db,
-                access_token=access_token_raw.strip(),
-                granted_scopes=granted_scopes,
-                account_subject=connector.account_subject or connector.id,
-                now_fn=now_fn,
-                new_id_fn=new_id_fn,
-            )
-        except Exception as exc:
-            _append_connector_event(
-                db=db,
-                connector_id=connector.id,
-                event_type="evt.connector.google.watch.registration_failed",
-                payload_data={
-                    **_connector_event_payload(connector, scopes=granted_scopes),
-                    "failure_reason": safe_failure_reason(
-                        str(exc), fallback=f"unexpected {exc.__class__.__name__}"
-                    ),
-                },
-                now_fn=now_fn,
-                new_id_fn=new_id_fn,
-            )
         return _connector_payload(connector)
 
     def disconnect(
@@ -5169,28 +5159,50 @@ class GoogleConnectorRuntime:
         new_id_fn: Callable[[str], str],
     ) -> dict[str, Any]:
         connector = self._ensure_connector(db=db, now_fn=now_fn)
-        tokens_to_revoke: list[str] = []
-        for encrypted in (connector.refresh_token_enc, connector.access_token_enc):
+        token_revoke_results: list[dict[str, str]] = []
+        token_slots = (
+            ("refresh_token", connector.refresh_token_enc),
+            ("access_token", connector.access_token_enc),
+        )
+        for slot, encrypted in token_slots:
             if encrypted is None:
                 continue
             try:
-                tokens_to_revoke.append(
-                    _decrypt_secret(
-                        ciphertext=encrypted,
-                        secret=self.encryption_secret,
-                        expected_key_version=connector.encryption_key_version,
-                        encryption_keys=self.encryption_keys,
-                    )
+                token = decrypt_secret(
+                    ciphertext=encrypted,
+                    secret=self.encryption_secret,
+                    expected_key_version=connector.encryption_key_version,
+                    encryption_keys=self.encryption_keys,
                 )
-            except Exception:
+            except SecretDecryptionFailure as exc:
+                token_revoke_results.append(
+                    {
+                        "slot": slot,
+                        "status": "failed",
+                        "stage": "decrypt",
+                        "reason": exc.code,
+                    }
+                )
                 continue
-        revoked_remote = False
-        for token in tokens_to_revoke:
             try:
                 self.oauth_client.revoke_token(token=token)
-                revoked_remote = True
-            except Exception:
+            except GoogleOAuthRevokeFailure as exc:
+                token_revoke_results.append(
+                    {
+                        "slot": slot,
+                        "status": "failed",
+                        "stage": "revoke",
+                        "reason": exc.code,
+                    }
+                )
                 continue
+            token_revoke_results.append(
+                {
+                    "slot": slot,
+                    "status": "succeeded",
+                    "stage": "revoke",
+                }
+            )
 
         connector.status = "not_connected"
         connector.granted_scopes = []
@@ -5208,7 +5220,7 @@ class GoogleConnectorRuntime:
             event_type="evt.connector.google.disconnected",
             payload_data={
                 **_connector_event_payload(connector, scopes=[]),
-                "revoked_remote": revoked_remote,
+                "token_revoke_results": token_revoke_results,
             },
             now_fn=now_fn,
             new_id_fn=new_id_fn,
@@ -5225,28 +5237,28 @@ class GoogleConnectorRuntime:
         now_fn: Callable[[], datetime],
         new_id_fn: Callable[[str], str],
     ) -> None:
-        # Re-arm the Gmail and Calendar push channels and persist their
-        # identity. Each provider call is non-fatal: a failure records an
-        # error on the channel row and leaves the reconcile poll as the
-        # backstop. Safe to call repeatedly — rows are replaced in place.
+        # Re-arm the Gmail and Calendar push channels and persist their identity.
+        # Failures record the channel error before raising so callers can retry
+        # or fail the enclosing connect flow with the provider cause intact.
         scopes = set(_normalize_scope_list(granted_scopes))
         now = now_fn()
+        failures: list[str] = []
         if self.pubsub_topic is not None and GOOGLE_GMAIL_READ_SCOPE in scopes:
             try:
                 result = self.workspace_provider.gmail_register_watch(
                     access_token=access_token,
                     topic_name=self.pubsub_topic,
                 )
-            except Exception as exc:
+            except GoogleWatchRegistrationFailure as exc:
+                error = exc.code
                 self._record_watch_failure(
                     db=db,
                     resource_type="gmail",
                     resource_id=account_subject,
-                    error=safe_failure_reason(
-                        str(exc), fallback=f"unexpected {exc.__class__.__name__}"
-                    ),
+                    error=error,
                     now=now,
                 )
+                failures.append(error)
             else:
                 history_id = result.get("historyId")
                 expiration = result.get("expiration")
@@ -5263,6 +5275,16 @@ class GoogleConnectorRuntime:
                         now=now,
                         new_id_fn=new_id_fn,
                     )
+                else:
+                    error = "gmail_watch_response_invalid"
+                    self._record_watch_failure(
+                        db=db,
+                        resource_type="gmail",
+                        resource_id=account_subject,
+                        error=error,
+                        now=now,
+                    )
+                    failures.append(error)
         if self.public_webhook_base_url is not None and GOOGLE_CALENDAR_READ_SCOPE in scopes:
             channel_id = new_id_fn("wch")
             channel_token = secrets.token_urlsafe(24)
@@ -5278,16 +5300,16 @@ class GoogleConnectorRuntime:
                     ),
                     ttl_seconds=_CALENDAR_WATCH_TTL_SECONDS,
                 )
-            except Exception as exc:
+            except GoogleWatchRegistrationFailure as exc:
+                error = exc.code
                 self._record_watch_failure(
                     db=db,
                     resource_type="calendar",
                     resource_id="primary",
-                    error=safe_failure_reason(
-                        str(exc), fallback=f"unexpected {exc.__class__.__name__}"
-                    ),
+                    error=error,
                     now=now,
                 )
+                failures.append(error)
             else:
                 provider_resource_id = result.get("resourceId")
                 expiration = result.get("expiration")
@@ -5304,6 +5326,18 @@ class GoogleConnectorRuntime:
                         now=now,
                         new_id_fn=new_id_fn,
                     )
+                else:
+                    error = "calendar_watch_response_invalid"
+                    self._record_watch_failure(
+                        db=db,
+                        resource_type="calendar",
+                        resource_id="primary",
+                        error=error,
+                        now=now,
+                    )
+                    failures.append(error)
+        if failures:
+            raise GoogleWatchRegistrationFailure(code=failures[0])
 
     def _upsert_watch_channel(
         self,
@@ -5434,6 +5468,48 @@ class GoogleConnectorRuntime:
             error=failure_class,
         )
 
+    def _refresh_failure_result(self, *, error_code: str) -> GoogleCapabilityExecutionResult:
+        if error_code == "access_revoked":
+            return self._typed_failure(failure_class="access_revoked")
+        return GoogleCapabilityExecutionResult(
+            status="failed",
+            output=None,
+            auth_failure=None,
+            error=error_code,
+        )
+
+    def _record_refresh_failure(
+        self,
+        *,
+        db: Session,
+        connector: GoogleConnectorRecord,
+        error_code: str,
+        now_fn: Callable[[], datetime],
+        new_id_fn: Callable[[str], str],
+    ) -> None:
+        if error_code == "access_revoked":
+            connector.status = "revoked"
+        _set_connector_error(
+            connector=connector,
+            error_code=error_code,
+            now_fn=now_fn,
+            preserve_existing_blocking=True,
+        )
+        _append_connector_event(
+            db=db,
+            connector_id=connector.id,
+            event_type="evt.connector.google.refresh.failed",
+            payload_data={
+                **_connector_event_payload(
+                    connector,
+                    scopes=_normalize_scope_list(connector.granted_scopes),
+                ),
+                "failure_reason": error_code,
+            },
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+
     def _refresh_access_token_if_needed(
         self,
         *,
@@ -5450,7 +5526,7 @@ class GoogleConnectorRuntime:
                 preserve_existing_blocking=True,
             )
             return None, self._typed_failure(failure_class="token_expired")
-        access_token = _decrypt_secret(
+        access_token = decrypt_secret(
             ciphertext=connector.access_token_enc,
             secret=self.encryption_secret,
             expected_key_version=connector.encryption_key_version,
@@ -5482,7 +5558,7 @@ class GoogleConnectorRuntime:
             )
             return None, self._typed_failure(failure_class="token_expired")
 
-        refresh_token = _decrypt_secret(
+        refresh_token = decrypt_secret(
             ciphertext=connector.refresh_token_enc,
             secret=self.encryption_secret,
             expected_key_version=connector.encryption_key_version,
@@ -5490,64 +5566,26 @@ class GoogleConnectorRuntime:
         )
         try:
             refreshed_payload = self.oauth_client.refresh_access_token(refresh_token=refresh_token)
-        except Exception as exc:
-            reason = safe_failure_reason(
-                str(exc), fallback=f"unexpected {exc.__class__.__name__}"
-            ).lower()
-            if "invalid_grant" in reason or "revoked" in reason:
-                connector.status = "revoked"
-                _set_connector_error(
-                    connector=connector,
-                    error_code="access_revoked",
-                    now_fn=now_fn,
-                    preserve_existing_blocking=True,
-                )
-                _append_connector_event(
-                    db=db,
-                    connector_id=connector.id,
-                    event_type="evt.connector.google.refresh.failed",
-                    payload_data={
-                        **_connector_event_payload(
-                            connector,
-                            scopes=_normalize_scope_list(connector.granted_scopes),
-                        ),
-                        "failure_reason": "access_revoked",
-                    },
-                    now_fn=now_fn,
-                    new_id_fn=new_id_fn,
-                )
-                return None, self._typed_failure(failure_class="access_revoked")
-            _set_connector_error(
-                connector=connector,
-                error_code="token_expired",
-                now_fn=now_fn,
-                preserve_existing_blocking=True,
-            )
-            _append_connector_event(
+        except GoogleOAuthRefreshFailure as exc:
+            self._record_refresh_failure(
                 db=db,
-                connector_id=connector.id,
-                event_type="evt.connector.google.refresh.failed",
-                payload_data={
-                    **_connector_event_payload(
-                        connector,
-                        scopes=_normalize_scope_list(connector.granted_scopes),
-                    ),
-                    "failure_reason": "token_expired",
-                },
+                connector=connector,
+                error_code=exc.code,
                 now_fn=now_fn,
                 new_id_fn=new_id_fn,
             )
-            return None, self._typed_failure(failure_class="token_expired")
+            return None, self._refresh_failure_result(error_code=exc.code)
 
         access_token_raw = refreshed_payload.get("access_token")
         if not isinstance(access_token_raw, str) or not access_token_raw.strip():
-            _set_connector_error(
+            self._record_refresh_failure(
+                db=db,
                 connector=connector,
-                error_code="token_expired",
+                error_code="provider_invalid_payload",
                 now_fn=now_fn,
-                preserve_existing_blocking=True,
+                new_id_fn=new_id_fn,
             )
-            return None, self._typed_failure(failure_class="token_expired")
+            return None, self._refresh_failure_result(error_code="provider_invalid_payload")
 
         refreshed_refresh_token_raw = refreshed_payload.get("refresh_token")
         refreshed_refresh_token = (
@@ -5559,13 +5597,13 @@ class GoogleConnectorRuntime:
         expires_in_seconds = expires_in_raw if isinstance(expires_in_raw, int) else 3600
         if expires_in_seconds <= 0:
             expires_in_seconds = 60
-        connector.access_token_enc = _encrypt_secret(
+        connector.access_token_enc = encrypt_secret(
             plaintext=access_token_raw.strip(),
             secret=self.encryption_secret,
             key_version=self.encryption_key_version,
             encryption_keys=self.encryption_keys,
         )
-        connector.refresh_token_enc = _encrypt_secret(
+        connector.refresh_token_enc = encrypt_secret(
             plaintext=refreshed_refresh_token,
             secret=self.encryption_secret,
             key_version=self.encryption_key_version,
@@ -5617,6 +5655,7 @@ class GoogleConnectorRuntime:
             return access_failure
         if access_token is None:
             return self._typed_failure(failure_class="token_expired")
+        assert provider_account_id is not None
         return self.execute_provider_capability(
             capability_id=capability_id,
             normalized_input=normalized_input,
@@ -5632,16 +5671,16 @@ class GoogleConnectorRuntime:
         capability_id: str,
         now_fn: Callable[[], datetime],
         new_id_fn: Callable[[str], str],
-    ) -> None:
+    ) -> GoogleCapabilityExecutionResult | None:
         required_scopes = GOOGLE_CAPABILITY_SCOPES.get(capability_id)
         if required_scopes is None:
-            return
+            return None
         refresh_token: str | None = None
         with session_factory() as db:
             with db.begin():
                 connector = self._connector_for_update(db=db)
                 if connector is None or connector.status != "connected":
-                    return
+                    return None
                 if not required_scopes.issubset(
                     set(_normalize_scope_list(connector.granted_scopes))
                 ):
@@ -5651,7 +5690,7 @@ class GoogleConnectorRuntime:
                         now_fn=now_fn,
                         preserve_existing_blocking=True,
                     )
-                    return
+                    return None
                 if connector.access_token_enc is None:
                     _set_connector_error(
                         connector=connector,
@@ -5659,12 +5698,12 @@ class GoogleConnectorRuntime:
                         now_fn=now_fn,
                         preserve_existing_blocking=True,
                     )
-                    return
+                    return None
                 if (
                     connector.access_token_expires_at is None
                     or connector.access_token_expires_at > now_fn()
                 ):
-                    return
+                    return None
                 if connector.refresh_token_enc is None:
                     _set_connector_error(
                         connector=connector,
@@ -5672,53 +5711,32 @@ class GoogleConnectorRuntime:
                         now_fn=now_fn,
                         preserve_existing_blocking=True,
                     )
-                    return
-                refresh_token = _decrypt_secret(
+                    return None
+                refresh_token = decrypt_secret(
                     ciphertext=connector.refresh_token_enc,
                     secret=self.encryption_secret,
                     expected_key_version=connector.encryption_key_version,
                     encryption_keys=self.encryption_keys,
                 )
         if refresh_token is None:
-            return
+            return None
 
         try:
             refreshed_payload = self.oauth_client.refresh_access_token(refresh_token=refresh_token)
-        except Exception as exc:
-            reason = safe_failure_reason(
-                str(exc), fallback=f"unexpected {exc.__class__.__name__}"
-            ).lower()
+        except GoogleOAuthRefreshFailure as exc:
             with session_factory() as db:
                 with db.begin():
                     connector = self._connector_for_update(db=db)
                     if connector is None:
-                        return
-                    if "invalid_grant" in reason or "revoked" in reason:
-                        connector.status = "revoked"
-                        error_code = "access_revoked"
-                    else:
-                        error_code = "token_expired"
-                    _set_connector_error(
-                        connector=connector,
-                        error_code=error_code,
-                        now_fn=now_fn,
-                        preserve_existing_blocking=True,
-                    )
-                    _append_connector_event(
+                        return None
+                    self._record_refresh_failure(
                         db=db,
-                        connector_id=connector.id,
-                        event_type="evt.connector.google.refresh.failed",
-                        payload_data={
-                            **_connector_event_payload(
-                                connector,
-                                scopes=_normalize_scope_list(connector.granted_scopes),
-                            ),
-                            "failure_reason": error_code,
-                        },
+                        connector=connector,
+                        error_code=exc.code,
                         now_fn=now_fn,
                         new_id_fn=new_id_fn,
                     )
-            return
+            return self._refresh_failure_result(error_code=exc.code)
 
         access_token_raw = refreshed_payload.get("access_token")
         if not isinstance(access_token_raw, str) or not access_token_raw.strip():
@@ -5726,13 +5744,14 @@ class GoogleConnectorRuntime:
                 with db.begin():
                     connector = self._connector_for_update(db=db)
                     if connector is not None:
-                        _set_connector_error(
+                        self._record_refresh_failure(
+                            db=db,
                             connector=connector,
-                            error_code="token_expired",
+                            error_code="provider_invalid_payload",
                             now_fn=now_fn,
-                            preserve_existing_blocking=True,
+                            new_id_fn=new_id_fn,
                         )
-            return
+            return self._refresh_failure_result(error_code="provider_invalid_payload")
         refreshed_refresh_token_raw = refreshed_payload.get("refresh_token")
         refreshed_refresh_token = (
             refreshed_refresh_token_raw.strip()
@@ -5748,19 +5767,19 @@ class GoogleConnectorRuntime:
             with db.begin():
                 connector = self._connector_for_update(db=db)
                 if connector is None or connector.status != "connected":
-                    return
+                    return None
                 if (
                     connector.access_token_expires_at is not None
                     and connector.access_token_expires_at > now_fn()
                 ):
-                    return
-                connector.access_token_enc = _encrypt_secret(
+                    return None
+                connector.access_token_enc = encrypt_secret(
                     plaintext=access_token_raw.strip(),
                     secret=self.encryption_secret,
                     key_version=self.encryption_key_version,
                     encryption_keys=self.encryption_keys,
                 )
-                connector.refresh_token_enc = _encrypt_secret(
+                connector.refresh_token_enc = encrypt_secret(
                     plaintext=refreshed_refresh_token,
                     secret=self.encryption_secret,
                     key_version=self.encryption_key_version,
@@ -5788,6 +5807,7 @@ class GoogleConnectorRuntime:
                     now_fn=now_fn,
                     new_id_fn=new_id_fn,
                 )
+        return None
 
     def prepare_capability_access_without_refresh(
         self,
@@ -5860,7 +5880,7 @@ class GoogleConnectorRuntime:
                 provider_account_id,
                 self._typed_failure(failure_class="token_expired"),
             )
-        access_token = _decrypt_secret(
+        access_token = decrypt_secret(
             ciphertext=connector.access_token_enc,
             secret=self.encryption_secret,
             expected_key_version=connector.encryption_key_version,
@@ -5912,26 +5932,12 @@ class GoogleConnectorRuntime:
                 self._typed_failure(failure_class="consent_required"),
             )
 
-        try:
-            access_token, refresh_failure = self._refresh_access_token_if_needed(
-                db=db,
-                connector=connector,
-                now_fn=now_fn,
-                new_id_fn=new_id_fn,
-            )
-        except Exception as exc:
-            reason = safe_failure_reason(str(exc), fallback=f"unexpected {exc.__class__.__name__}")
-            return (
-                None,
-                granted_scopes,
-                provider_account_id,
-                GoogleCapabilityExecutionResult(
-                    status="failed",
-                    output=None,
-                    auth_failure=None,
-                    error=reason,
-                ),
-            )
+        access_token, refresh_failure = self._refresh_access_token_if_needed(
+            db=db,
+            connector=connector,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
         if refresh_failure is not None:
             return None, granted_scopes, provider_account_id, refresh_failure
         if access_token is None:
@@ -5950,24 +5956,28 @@ class GoogleConnectorRuntime:
         normalized_input: dict[str, Any],
         access_token: str,
         granted_scopes: set[str],
-        provider_account_id: str | None = None,
+        provider_account_id: str,
     ) -> GoogleCapabilityExecutionResult:
+        account_id = _non_empty_provider_account_id(provider_account_id)
         attendee_intersection_enabled = GOOGLE_CALENDAR_FREEBUSY_SCOPE in granted_scopes
         try:
             if capability_id == "cap.calendar.list":
                 output_payload = self.workspace_provider.calendar_list(
                     access_token=access_token,
                     normalized_input=normalized_input,
+                    provider_account_id=account_id,
                 )
             elif capability_id == "cap.calendar.list_calendars":
                 output_payload = self.workspace_provider.calendar_list_calendars(
                     access_token=access_token,
                     normalized_input=normalized_input,
+                    provider_account_id=account_id,
                 )
             elif capability_id == "cap.calendar.propose_slots":
                 output_payload = self.workspace_provider.calendar_propose_slots(
                     access_token=access_token,
                     normalized_input=normalized_input,
+                    provider_account_id=account_id,
                     attendee_intersection_enabled=attendee_intersection_enabled,
                 )
             elif capability_id == "cap.calendar.create_event":
@@ -5989,11 +5999,13 @@ class GoogleConnectorRuntime:
                 output_payload = self.workspace_provider.email_search(
                     access_token=access_token,
                     normalized_input=normalized_input,
+                    provider_account_id=account_id,
                 )
             elif capability_id == "cap.email.read":
                 output_payload = self.workspace_provider.email_read(
                     access_token=access_token,
                     normalized_input=normalized_input,
+                    provider_account_id=account_id,
                 )
             elif capability_id == "cap.email.archive":
                 output_payload = self.workspace_provider.email_archive(
@@ -6029,11 +6041,13 @@ class GoogleConnectorRuntime:
                 output_payload = self.workspace_provider.drive_search(
                     access_token=access_token,
                     normalized_input=normalized_input,
+                    provider_account_id=account_id,
                 )
             elif capability_id == "cap.drive.read":
                 output_payload = self.workspace_provider.drive_read(
                     access_token=access_token,
                     normalized_input=normalized_input,
+                    provider_account_id=account_id,
                 )
             elif capability_id == "cap.drive.share":
                 output_payload = self.workspace_provider.drive_share(
@@ -6052,14 +6066,13 @@ class GoogleConnectorRuntime:
                     auth_failure=None,
                     error="unknown_capability",
                 )
-        except Exception as exc:
-            reason = safe_failure_reason(str(exc), fallback=f"unexpected {exc.__class__.__name__}")
-            lowered = reason.lower()
-            if "insufficient" in lowered or "permission" in lowered:
+        except GoogleProviderRequestFailure as exc:
+            reason = exc.code
+            if reason == "insufficient_permissions":
                 return self._typed_failure(failure_class="scope_missing")
-            if "invalid_grant" in lowered or "revoked" in lowered:
+            if reason == "access_revoked":
                 return self._typed_failure(failure_class="access_revoked")
-            if "token" in lowered and "expired" in lowered:
+            if reason == "token_expired":
                 return self._typed_failure(failure_class="token_expired")
             typed_provider_error = _classify_google_provider_failure(reason)
             if typed_provider_error is not None:
@@ -6090,49 +6103,11 @@ class GoogleConnectorRuntime:
         # tuples to lists here — once, at the provider boundary — instead of
         # widening every ``isinstance`` site downstream.
         output_payload = _tuples_to_lists(output_payload)
-        if provider_account_id is not None and provider_account_id.strip():
-            account_id = provider_account_id.strip()
-            if output_payload.get("schema_version") == "google.calendar.events.v1":
-                events = output_payload.get("events")
-                if isinstance(events, list):
-                    for event in events:
-                        if isinstance(event, dict):
-                            event["provider_account_id"] = account_id
-            elif output_payload.get("schema_version") == "google.gmail.message_refs.v1":
-                messages = output_payload.get("messages")
-                if isinstance(messages, list):
-                    for message in messages:
-                        if isinstance(message, dict):
-                            message["provider_account_id"] = account_id
-            elif output_payload.get("schema_version") == "google.gmail.message_evidence.v1":
-                message = output_payload.get("message")
-                if isinstance(message, dict):
-                    message["provider_account_id"] = account_id
-                messages = output_payload.get("messages")
-                if isinstance(messages, list):
-                    for thread_message in messages:
-                        if isinstance(thread_message, dict):
-                            thread_message["provider_account_id"] = account_id
-            elif output_payload.get("schema_version") == "google.calendar.calendar_list.v1":
-                calendars = output_payload.get("calendars")
-                if isinstance(calendars, list):
-                    for calendar in calendars:
-                        if isinstance(calendar, dict):
-                            calendar["provider_account_id"] = account_id
-            else:
-                output_payload["provider_account_id"] = account_id
         if not _is_typed_google_read_output(
             capability_id=capability_id,
             payload=output_payload,
         ):
-            try:
-                with open(f"/tmp/ariel-diag-{capability_id.replace('.', '_')}.json", "w") as _f:
-                    json.dump(output_payload, _f, default=str, indent=2)
-            except OSError:
-                pass
-            _log.warning(
-                "invalid_provider_output capability=%s (full payload in /tmp/)", capability_id
-            )
+            _log.warning("invalid_provider_output capability=%s", capability_id)
             return GoogleCapabilityExecutionResult(
                 status="failed",
                 output=None,
@@ -6181,9 +6156,9 @@ class GoogleConnectorRuntime:
     ) -> str:
         connector = self._connector_for_update(db=db)
         if connector is None or connector.status == "not_connected":
-            raise RuntimeError("not_connected")
+            raise GoogleProviderRequestFailure("not_connected")
         if connector.status == "revoked":
-            raise RuntimeError("access_revoked")
+            raise GoogleProviderRequestFailure("access_revoked")
         access_token, refresh_failure = self._refresh_access_token_if_needed(
             db=db,
             connector=connector,
@@ -6191,9 +6166,9 @@ class GoogleConnectorRuntime:
             new_id_fn=new_id_fn,
         )
         if refresh_failure is not None:
-            raise RuntimeError(refresh_failure.error or "token_refresh_failed")
+            raise GoogleProviderRequestFailure(refresh_failure.error or "token_refresh_failed")
         if access_token is None:
-            raise RuntimeError("token_expired")
+            raise GoogleProviderRequestFailure("token_expired")
         return access_token
 
     def access_token_for_background_sync_without_refresh(
@@ -6204,9 +6179,9 @@ class GoogleConnectorRuntime:
     ) -> str:
         connector = self._connector_for_update(db=db)
         if connector is None or connector.status == "not_connected":
-            raise RuntimeError("not_connected")
+            raise GoogleProviderRequestFailure("not_connected")
         if connector.status == "revoked":
-            raise RuntimeError("access_revoked")
+            raise GoogleProviderRequestFailure("access_revoked")
         if connector.access_token_enc is None:
             _set_connector_error(
                 connector=connector,
@@ -6214,7 +6189,7 @@ class GoogleConnectorRuntime:
                 now_fn=now_fn,
                 preserve_existing_blocking=True,
             )
-            raise RuntimeError("token_expired")
+            raise GoogleProviderRequestFailure("token_expired")
         if (
             connector.access_token_expires_at is not None
             and connector.access_token_expires_at <= now_fn()
@@ -6225,8 +6200,8 @@ class GoogleConnectorRuntime:
                 now_fn=now_fn,
                 preserve_existing_blocking=True,
             )
-            raise RuntimeError("token_expired")
-        return _decrypt_secret(
+            raise GoogleProviderRequestFailure("token_expired")
+        return decrypt_secret(
             ciphertext=connector.access_token_enc,
             secret=self.encryption_secret,
             expected_key_version=connector.encryption_key_version,

@@ -15,13 +15,13 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .executor import ExecutionResult
-from .google_connector import _decrypt_secret, _encrypt_secret
 from .persistence import (
     AttachmentBlobRecord,
     AttachmentExtractionRecord,
     AttachmentSourceRecord,
     to_rfc3339,
 )
+from .secret_cipher import decrypt_secret, encrypt_secret
 
 
 _DISCORD_ATTACHMENT_HOSTS = {"cdn.discordapp.com", "media.discordapp.net"}
@@ -113,7 +113,7 @@ class AttachmentContentRuntime:
                     filename=filename,
                     declared_content_type=declared_content_type,
                     declared_size_bytes=declared_size_bytes,
-                    acquisition_url_enc=_encrypt_secret(
+                    acquisition_url_enc=encrypt_secret(
                         plaintext=download_url,
                         secret=self.encryption_secret,
                         key_version=self.encryption_key_version,
@@ -207,7 +207,7 @@ class AttachmentContentRuntime:
                     error=None,
                 )
             try:
-                download_url = _decrypt_secret(
+                download_url = decrypt_secret(
                     ciphertext=source.acquisition_url_enc,
                     secret=self.encryption_secret,
                     expected_key_version=self.encryption_key_version,

@@ -581,34 +581,14 @@ class SurfaceApprovalContract(BaseModel):
     decided_at: str | None
 
 
-class SurfaceErrorContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    code: str
-    message: str
-    details: dict[str, Any]
-    retryable: bool
-
-
-class SurfaceCaptureIngestFailureContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    code: str
-    message: str
-    details: dict[str, Any]
-    retryable: bool
-
-
 class SurfaceCaptureContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
-    kind: Literal["text", "url", "shared_content", "unknown"]
-    terminal_state: Literal["turn_created", "ingest_failed"]
-    effective_session_id: str | None
-    turn_id: str | None
+    kind: Literal["text", "url", "shared_content"]
+    effective_session_id: str
+    turn_id: str
     idempotency_key: str | None
-    ingest_failure: SurfaceCaptureIngestFailureContract | None
     created_at: str
     updated_at: str
 
@@ -857,22 +837,11 @@ class SurfaceDiscordMessageEventListResponseContract(BaseModel):
     events: list[SurfaceDiscordMessageEventContract]
 
 
-class SurfaceCaptureSuccessResponseContract(BaseModel):
+class SurfaceCaptureRecordResponseContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     ok: Literal[True]
     capture: SurfaceCaptureContract
-    session: SurfaceSessionContract
-    turn: SurfaceTurnContract
-    assistant: SurfaceAssistantContract
-
-
-class SurfaceCaptureFailureResponseContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    ok: Literal[False]
-    capture: SurfaceCaptureContract
-    error: SurfaceErrorContract
 
 
 class MemoryRecallItemContract(BaseModel):
@@ -1188,11 +1157,6 @@ def _project_surface_capture(raw_capture: Any) -> dict[str, Any]:
     return _validate_contract("surface_capture", SurfaceCaptureContract, capture_payload)
 
 
-def _project_surface_error(raw_error: Any) -> dict[str, Any]:
-    error_payload = raw_error if isinstance(raw_error, dict) else {}
-    return _validate_contract("surface_error", SurfaceErrorContract, error_payload)
-
-
 def build_surface_message_response(
     *,
     session: Any,
@@ -1218,40 +1182,13 @@ def build_surface_message_response(
     )
 
 
-def build_surface_capture_success_response(
-    *,
-    capture: Any,
-    session: Any,
-    turn: Any,
-    assistant_message: Any,
-    assistant_sources: Any,
-) -> dict[str, Any]:
-    sources_payload = assistant_sources if isinstance(assistant_sources, list) else []
+def build_surface_capture_record_response(*, capture: Any) -> dict[str, Any]:
     return _validate_contract(
-        "surface_capture_success_response",
-        SurfaceCaptureSuccessResponseContract,
+        "surface_capture_record_response",
+        SurfaceCaptureRecordResponseContract,
         {
             "ok": True,
             "capture": _project_surface_capture(capture),
-            "session": _project_surface_session(session),
-            "turn": _project_surface_turn(turn),
-            "assistant": {"message": assistant_message, "sources": sources_payload},
-        },
-    )
-
-
-def build_surface_capture_failure_response(
-    *,
-    capture: Any,
-    error: Any,
-) -> dict[str, Any]:
-    return _validate_contract(
-        "surface_capture_failure_response",
-        SurfaceCaptureFailureResponseContract,
-        {
-            "ok": False,
-            "capture": _project_surface_capture(capture),
-            "error": _project_surface_error(error),
         },
     )
 

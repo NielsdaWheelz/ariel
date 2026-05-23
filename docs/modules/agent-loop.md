@@ -160,11 +160,10 @@ The store is bounded host-side — 64 entries, 512 KiB per value, 4 MiB total �
 and lives for the turn only; it is not memory.
 
 Large intermediate data — search results, fetched pages, mailbox extracts —
-lives in the scratch store as host-side values. Only keys, and the summaries
-the model deliberately surfaces with `agent.emit_value`, enter the model's
-context. `agent.emit_value` keeps its role — the model's deliberate channel for
-data it wants to reason over next round — but is no longer the only way to
-carry data forward. As a backstop, superseded `emit_value` rounds are evicted
+lives in the scratch store as host-side values. Capability outputs are not
+auto-echoed into later model rounds. The only values that enter later model
+context are the facts the program deliberately surfaces with
+`agent.emit_value`. As a backstop, superseded `emit_value` rounds are evicted
 from the model's input items: only the most recent `emit_value` round is
 retained.
 

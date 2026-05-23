@@ -1,589 +1,153 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
+import re
 import threading
 import time
-from typing import Any, Final
 
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
-from sqlalchemy import inspect, text
+from sqlalchemy import CheckConstraint, Index, inspect, text, UniqueConstraint
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.engine import Engine
+from sqlalchemy.schema import ColumnCollectionConstraint, Table
+
+from .persistence import Base
 
 
-REQUIRED_TABLES: Final[tuple[str, ...]] = (
-    "alembic_version",
-    "sessions",
-    "session_rotations",
-    "turns",
-    "turn_idempotency_keys",
-    "captures",
-    "events",
-    "ai_judgments",
-    "action_attempts",
-    "action_private_payloads",
-    "approval_requests",
-    "artifacts",
-    "attachment_blobs",
-    "attachment_sources",
-    "attachment_extractions",
-    "memory_log",
-    "memory_notes",
-    "project_state_snapshots",
-    "weather_default_locations",
-    "google_connectors",
-    "google_oauth_states",
-    "google_connector_events",
-    "sync_cursors",
-    "provider_watch_channels",
-    "provider_events",
-    "sync_runs",
-    "discord_messages",
-    "discord_message_events",
-    "google_provider_objects",
-    "provider_evidence",
-    "provider_evidence_blocks",
-    "provider_write_receipts",
-    "subscriber_heartbeat",
-    "background_tasks",
-    "agency_events",
-    "jobs",
-    "job_events",
-)
+_SQL_STRING_LITERAL_RE = re.compile(r"'((?:''|[^'])*)'")
 
-REQUIRED_COLUMNS: Final[dict[str, tuple[str, ...]]] = {
-    "sessions": (
-        "is_active",
-        "lifecycle_state",
-        "rotated_from_session_id",
-        "rotation_reason",
-        "created_at",
-        "updated_at",
-    ),
-    "ai_judgments": (
-        "judgment_type",
-        "source_type",
-        "source_id",
-        "status",
-        "prompt_version",
-        "provider_response_id",
-        "input_refs",
-        "output",
-        "parse_status",
-        "validation_status",
-        "failure_code",
-        "created_at",
-    ),
-    "google_provider_objects": (
-        "provider_account_id",
-        "object_type",
-        "external_id",
-        "thread_external_id",
-        "calendar_id",
-        "ical_uid",
-        "status",
-        "source_timestamp",
-        "observed_at",
-        "provider_url",
-        "metadata_json",
-        "content_digest",
-        "created_at",
-        "updated_at",
-    ),
-    "provider_evidence": (
-        "provider_object_id",
-        "content_digest",
-        "retention_policy",
-        "extraction_status",
-        "lifecycle_state",
-    ),
-    "background_tasks": (
-        "idempotency_key",
-        "provider_write_receipt_id",
-        "attempts",
-        "recurrence_seconds",
-        "run_after",
-    ),
-    "provider_write_receipts": (
-        "provider",
-        "provider_account_id",
-        "action_attempt_id",
-        "capability_id",
-        "idempotency_key",
-        "status",
-        "provider_object_ids",
-        "request_digest",
-        "response_payload",
-        "ambiguity_reason",
-        "provider_timestamp",
-        "provider_etag",
-        "provider_history_id",
-        "response_digest",
-        "before_state",
-        "after_state",
-        "undo_token_hash",
-        "undo_expires_at",
-        "created_at",
-        "updated_at",
-    ),
-    "provider_events": (
-        "id",
-        "provider",
-        "resource_type",
-        "resource_id",
-        "external_event_id",
-        "dedupe_key",
-        "event_type",
-        "headers",
-        "payload",
-        "status",
-        "created_at",
-        "received_at",
-    ),
-    "subscriber_heartbeat": (
-        "id",
-        "subscriber_name",
-        "last_seen_at",
-        "last_message_at",
-        "in_flight_count",
-        "errors_in_window",
-        "last_error_code",
-        "last_error_at",
-        "created_at",
-        "updated_at",
-    ),
-    "jobs": (
-        "agency_sandbox_policy",
-        "agency_egress_policy",
-    ),
-    "agency_events": (
-        "id",
-        "source",
-        "external_event_id",
-        "event_type",
-        "payload",
-        "status",
-        "created_at",
-        "received_at",
-    ),
-    "action_private_payloads": (
-        "payload_kind",
-        "payload_digest",
-        "payload_enc",
-        "encryption_key_version",
-    ),
-    "memory_log": (
-        "id",
-        "created_at",
-        "kind",
-        "content",
-        "embedding",
-        "search_vector",
-        "session_id",
-        "turn_id",
-        "taint",
-        "source_ref",
-    ),
-    "memory_notes": (
-        "id",
-        "content",
-        "embedding",
-        "search_vector",
-        "created_at",
-        "updated_at",
-        "taint",
-    ),
-}
 
-REQUIRED_PRIMARY_KEYS: Final[dict[str, tuple[str, ...]]] = {
-    "subscriber_heartbeat": ("id",),
-}
+@dataclass(frozen=True, slots=True)
+class ReflectedCheckConstraint:
+    name: str
+    sqltext: str
 
-REQUIRED_UNIQUE_CONSTRAINTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
-    "subscriber_heartbeat": {
-        "uq_subscriber_heartbeat_subscriber_name": ("subscriber_name",),
-    },
-}
 
-REQUIRED_CONSTRAINTS: Final[dict[str, tuple[str, ...]]] = {
-    "sessions": (
-        "ck_session_rotation_reason",
-        "ck_session_lifecycle_state",
-        "ck_session_lifecycle_matches_is_active",
-        "ck_session_rotation_fields_paired",
-    ),
-    "session_rotations": ("ck_session_rotation_reason_type",),
-    "ai_judgments": (
-        "ck_ai_judgment_type",
-        "ck_ai_judgment_status",
-        "ck_ai_judgment_parse_status",
-        "ck_ai_judgment_validation_status",
-        "ck_ai_judgment_failure_code",
-    ),
-    "google_provider_objects": (
-        "ck_google_provider_object_type",
-        "ck_google_provider_object_status",
-        "ck_google_provider_object_calendar_identity",
-    ),
-    "provider_evidence": (
-        "ck_provider_evidence_retention_policy",
-        "ck_provider_evidence_extraction_status",
-        "ck_provider_evidence_lifecycle_state",
-    ),
-    "provider_evidence_blocks": (
-        "ck_provider_evidence_block_index",
-        "ck_provider_evidence_block_kind",
-    ),
-    "provider_watch_channels": (
-        "ck_provider_watch_channels_provider",
-        "ck_provider_watch_channels_resource_type",
-        "ck_provider_watch_channels_status",
-    ),
-    "background_tasks": (
-        "ck_background_task_type",
-        "ck_background_task_provider_write_reconcile_shape",
-        "ck_background_task_attempts_nonnegative",
-    ),
-    "provider_write_receipts": (
-        "ck_provider_write_receipt_provider",
-        "ck_provider_write_receipt_capability",
-        "ck_provider_write_receipt_status",
-        "ck_provider_write_receipt_ambiguity_reason",
-        "ck_provider_write_receipt_undo_fields_email_only",
-        "ck_provider_write_receipt_undo_fields_paired",
-        "ck_provider_write_receipt_succeeded_mutation_has_undo",
-    ),
-    "subscriber_heartbeat": (
-        "ck_subscriber_heartbeat_in_flight_count_nonnegative",
-        "ck_subscriber_heartbeat_errors_in_window_nonnegative",
-    ),
-    "jobs": (
-        "ck_jobs_agency_sandbox_policy_object",
-        "ck_jobs_agency_egress_policy_object",
-    ),
-    "action_private_payloads": (
-        "ck_action_private_payload_kind",
-        "ck_action_private_payload_digest",
-    ),
-    "memory_log": (
-        "ck_memory_log_kind",
-        "ck_memory_log_taint",
-    ),
-    "memory_notes": ("ck_memory_notes_taint",),
-}
+@dataclass(frozen=True, slots=True)
+class ReflectedForeignKey:
+    constrained_columns: tuple[str, ...]
+    referred_table: str | None
+    ondelete: str
 
-REQUIRED_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
-    "sessions": {
-        "ck_session_rotation_reason": (
-            "'user_initiated'",
-            "'threshold_turn_count'",
-            "'threshold_age'",
-        ),
-        "ck_session_lifecycle_state": ("'active'", "'rotating'", "'recovery_needed'"),
-        "ck_session_lifecycle_matches_is_active": ("is_active", "lifecycle_state"),
-        "ck_session_rotation_fields_paired": ("rotation_reason", "rotated_from_session_id"),
-    },
-    "session_rotations": {
-        "ck_session_rotation_reason_type": (
-            "'user_initiated'",
-            "'threshold_turn_count'",
-            "'threshold_age'",
-        ),
-    },
-    "ai_judgments": {
-        "ck_ai_judgment_type": (
-            "'memory_recall'",
-            "'memory_encode'",
-            "'memory_dream'",
-            "'model_output'",
-        ),
-        "ck_ai_judgment_status": ("'succeeded'", "'failed'"),
-        "ck_ai_judgment_parse_status": ("'schema_invalid'",),
-        "ck_ai_judgment_validation_status": ("'valid'", "'not_validated'"),
-        "ck_ai_judgment_failure_code": ("'E_AI_JUDGMENT_BUDGET'",),
-    },
-    "google_provider_objects": {
-        "ck_google_provider_object_type": ("'gmail_message'", "'calendar_event'"),
-        "ck_google_provider_object_status": ("'active'", "'deleted'", "'stale'", "'unavailable'"),
-        "ck_google_provider_object_calendar_identity": ("calendar_id IS NOT NULL",),
-    },
-    "provider_evidence": {
-        "ck_provider_evidence_lifecycle_state": ("'stale'", "'unavailable'"),
-        "ck_provider_evidence_retention_policy": ("'provider_source'", "'short_lived'"),
-        "ck_provider_evidence_extraction_status": ("'pending'", "'failed'"),
-    },
-    "provider_evidence_blocks": {
-        "ck_provider_evidence_block_kind": ("'calendar_description'", "'availability'"),
-        "ck_provider_evidence_block_index": ("block_index", ">=", "0"),
-    },
-    "provider_write_receipts": {
-        "ck_provider_write_receipt_provider": ("'google'", "'agency'"),
-        "ck_provider_write_receipt_status": ("'executing'", "'ambiguous'", "'undone'"),
-        "ck_provider_write_receipt_capability": (
-            "'cap.email.draft'",
-            "'cap.calendar.respond_to_event'",
-            "'cap.drive.share'",
-            "'cap.agency.request_pr'",
-        ),
-        "ck_provider_write_receipt_ambiguity_reason": (
-            "'ambiguous'",
-            "ambiguity_reason IS NOT NULL",
-        ),
-        "ck_provider_write_receipt_undo_fields_email_only": (
-            "'cap.email.archive'",
-            "undo_token_hash IS NULL",
-        ),
-        "ck_provider_write_receipt_undo_fields_paired": (
-            "undo_token_hash IS NULL",
-            "undo_expires_at IS NULL",
-        ),
-        "ck_provider_write_receipt_succeeded_mutation_has_undo": (
-            "'cap.email.undo'",
-            "undo_token_hash IS NOT NULL",
-        ),
-    },
-    "subscriber_heartbeat": {
-        "ck_subscriber_heartbeat_in_flight_count_nonnegative": (
-            "in_flight_count",
-            ">=",
-            "0",
-        ),
-        "ck_subscriber_heartbeat_errors_in_window_nonnegative": (
-            "errors_in_window",
-            ">=",
-            "0",
-        ),
-    },
-    "jobs": {
-        "ck_jobs_agency_sandbox_policy_object": ("jsonb_typeof", "agency_sandbox_policy"),
-        "ck_jobs_agency_egress_policy_object": ("jsonb_typeof", "agency_egress_policy"),
-    },
-    "action_private_payloads": {
-        "ck_action_private_payload_kind": ("'google_provider_write_input'",),
-        "ck_action_private_payload_digest": ("length", "payload_digest", "64"),
-    },
-    "provider_watch_channels": {
-        "ck_provider_watch_channels_resource_type": ("'gmail'", "'calendar'"),
-        "ck_provider_watch_channels_status": ("'active'", "'expired'", "'failed'"),
-    },
-    "background_tasks": {
-        "ck_background_task_type": (
-            "'agent_wake'",
-            "'provider_write_reconcile_due'",
-            "'provider_watch_renew_due'",
-            "'provider_reconcile_sync_due'",
-            "'memory_encode'",
-            "'memory_dream'",
-        ),
-        "ck_background_task_provider_write_reconcile_shape": (
-            "provider_write_reconcile_due",
-            "provider_write_receipt_id IS NOT NULL",
-        ),
-        "ck_background_task_attempts_nonnegative": ("attempts", ">=", "0"),
-    },
-    "memory_log": {
-        "ck_memory_log_kind": (
-            "'user_message'",
-            "'agent_round'",
-            "'assistant_message'",
-            "'tool_observation'",
-            "'proactive_trigger'",
-            "'note_create'",
-            "'note_edit'",
-            "'note_delete'",
-            "'recall'",
-            "'research_finding'",
-        ),
-        "ck_memory_log_taint": ("taint",),
-    },
-    "memory_notes": {
-        "ck_memory_notes_taint": ("taint",),
-    },
-}
 
-FORBIDDEN_CHECK_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
-    "sessions": {
-        "ck_session_rotation_reason": ("'threshold_context_pressure'",),
-    },
-    "session_rotations": {
-        "ck_session_rotation_reason_type": ("'threshold_context_pressure'",),
-    },
-    "ai_judgments": {
-        "ck_ai_judgment_type": (
-            "'tool_strategy'",
-            "'tool_result_interpretation'",
-            "'feedback_learning'",
-            "'ambient_interpretation'",
-            "'proactive_deliberation'",
-            "'workspace_commitment_extraction'",
-            "'leave_by_evaluation'",
-            "'memory_remember'",
-        ),
-    },
-}
+@dataclass(frozen=True, slots=True)
+class ReflectedIndex:
+    name: str
+    unique: bool
+    column_names: tuple[str, ...]
+    dialect_options_text: str
 
-REQUIRED_FOREIGN_KEYS: Final[dict[str, dict[str, tuple[str, str]]]] = {
-    "action_attempts": {
-        "turn_id": ("turns", "RESTRICT"),
-    },
-    "turn_idempotency_keys": {
-        "session_id": ("sessions", "RESTRICT"),
-        "turn_id": ("turns", "RESTRICT"),
-    },
-}
 
-REQUIRED_INDEXES: Final[dict[str, tuple[str, ...]]] = {
-    "sessions": (
-        "ix_single_active_session",
-        "ix_sessions_rotated_from_session_id_unique",
-    ),
-    "ai_judgments": (
-        "ix_ai_judgments_judgment_type",
-        "ix_ai_judgments_source_type",
-        "ix_ai_judgments_source_id",
-    ),
-    "background_tasks": (
-        "ix_background_tasks_idempotency_key_unique",
-        "ix_background_tasks_provider_write_reconcile_unique",
-        "ix_background_tasks_run_after",
-    ),
-    "google_provider_objects": (
-        "ix_google_provider_object_identity_unique",
-        "ix_google_provider_objects_calendar_event_identity_unique",
-        "ix_google_provider_objects_thread",
-        "ix_google_provider_objects_calendar_id",
-        "ix_google_provider_objects_content_digest",
-    ),
-    "provider_evidence": (
-        "ix_provider_evidence_identity_digest_unique",
-        "ix_provider_evidence_source",
-    ),
-    "provider_evidence_blocks": ("ix_provider_evidence_blocks_unique",),
-    "provider_write_receipts": (
-        "ix_provider_write_receipts_idempotency_unique",
-        "ix_provider_write_receipts_attempt_idempotency_unique",
-        "ix_provider_write_receipts_action_attempt_id",
-        "ix_provider_write_receipts_provider_timestamp",
-        "ix_provider_write_receipts_undo_token_hash",
-    ),
-    "action_private_payloads": ("ix_action_private_payloads_action_attempt_id",),
-    "memory_log": (
-        "ix_memory_log_search_vector",
-        "ix_memory_log_session_created",
-        "ix_memory_log_embedding_hnsw",
-    ),
-    "memory_notes": (
-        "ix_memory_notes_search_vector",
-        "ix_memory_notes_embedding_hnsw",
-    ),
-}
+def _model_tables() -> tuple[Table, ...]:
+    return tuple(sorted(Base.metadata.tables.values(), key=lambda table: table.name))
 
-REQUIRED_UNIQUE_INDEXES: Final[dict[str, tuple[str, ...]]] = {
-    "sessions": (
-        "ix_single_active_session",
-        "ix_sessions_rotated_from_session_id_unique",
-    ),
-    "background_tasks": (
-        "ix_background_tasks_idempotency_key_unique",
-        "ix_background_tasks_provider_write_reconcile_unique",
-    ),
-    "google_provider_objects": (
-        "ix_google_provider_object_identity_unique",
-        "ix_google_provider_objects_calendar_event_identity_unique",
-    ),
-    "provider_evidence": ("ix_provider_evidence_identity_digest_unique",),
-    "provider_evidence_blocks": ("ix_provider_evidence_blocks_unique",),
-    "provider_write_receipts": (
-        "ix_provider_write_receipts_idempotency_unique",
-        "ix_provider_write_receipts_attempt_idempotency_unique",
-        "ix_provider_write_receipts_undo_token_hash",
-    ),
-    "action_private_payloads": ("ix_action_private_payloads_action_attempt_id",),
-}
 
-REQUIRED_INDEX_SQL_FRAGMENTS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
-    "sessions": {
-        "ix_single_active_session": ("is_active",),
-        "ix_sessions_rotated_from_session_id_unique": ("rotated_from_session_id IS NOT NULL",),
-    },
-    "background_tasks": {
-        "ix_background_tasks_idempotency_key_unique": ("idempotency_key IS NOT NULL",),
-        "ix_background_tasks_provider_write_reconcile_unique": ("provider_write_reconcile_due",),
-    },
-    "google_provider_objects": {
-        "ix_google_provider_object_identity_unique": ("calendar_event", "<>"),
-        "ix_google_provider_objects_calendar_event_identity_unique": ("calendar_event", "="),
-    },
-    "provider_write_receipts": {
-        "ix_provider_write_receipts_idempotency_unique": ("idempotency_key IS NOT NULL",),
-        "ix_provider_write_receipts_attempt_idempotency_unique": ("idempotency_key IS NOT NULL",),
-        "ix_provider_write_receipts_undo_token_hash": ("undo_token_hash IS NOT NULL",),
-    },
-}
+def _required_table_names() -> tuple[str, ...]:
+    return ("alembic_version", *(table.name for table in _model_tables()))
 
-REQUIRED_INDEX_COLUMNS: Final[dict[str, dict[str, tuple[str, ...]]]] = {
-    "sessions": {
-        "ix_single_active_session": ("is_active",),
-        "ix_sessions_rotated_from_session_id_unique": ("rotated_from_session_id",),
-    },
-    "ai_judgments": {
-        "ix_ai_judgments_judgment_type": ("judgment_type",),
-        "ix_ai_judgments_source_type": ("source_type",),
-        "ix_ai_judgments_source_id": ("source_id",),
-    },
-    "background_tasks": {
-        "ix_background_tasks_idempotency_key_unique": ("idempotency_key",),
-        "ix_background_tasks_provider_write_reconcile_unique": ("provider_write_receipt_id",),
-        "ix_background_tasks_run_after": ("run_after",),
-    },
-    "google_provider_objects": {
-        "ix_google_provider_object_identity_unique": (
-            "provider_account_id",
-            "object_type",
-            "external_id",
-        ),
-        "ix_google_provider_objects_calendar_event_identity_unique": (
-            "provider_account_id",
-            "object_type",
-            "calendar_id",
-            "external_id",
-        ),
-        "ix_google_provider_objects_thread": ("provider_account_id", "thread_external_id"),
-        "ix_google_provider_objects_calendar_id": ("calendar_id",),
-        "ix_google_provider_objects_content_digest": ("content_digest",),
-    },
-    "provider_evidence": {
-        "ix_provider_evidence_identity_digest_unique": ("provider_object_id", "content_digest"),
-        "ix_provider_evidence_source": (
-            "provider",
-            "provider_account_id",
-            "source_kind",
-            "external_id",
-        ),
-    },
-    "provider_evidence_blocks": {
-        "ix_provider_evidence_blocks_unique": ("evidence_id", "block_index"),
-    },
-    "provider_write_receipts": {
-        "ix_provider_write_receipts_idempotency_unique": (
-            "provider",
-            "provider_account_id",
-            "idempotency_key",
-        ),
-        "ix_provider_write_receipts_attempt_idempotency_unique": (
-            "action_attempt_id",
-            "idempotency_key",
-        ),
-        "ix_provider_write_receipts_action_attempt_id": ("action_attempt_id",),
-        "ix_provider_write_receipts_provider_timestamp": ("provider_timestamp",),
-        "ix_provider_write_receipts_undo_token_hash": ("undo_token_hash",),
-    },
-    "action_private_payloads": {
-        "ix_action_private_payloads_action_attempt_id": ("action_attempt_id",),
-    },
-}
+
+def _constraint_columns(constraint: ColumnCollectionConstraint) -> tuple[str, ...]:
+    return tuple(column.name for column in constraint.columns)
+
+
+def _sql_fragment(value: object) -> str:
+    compile_method = getattr(value, "compile", None)
+    if callable(compile_method):
+        return str(
+            compile_method(
+                dialect=postgresql.dialect(),
+                compile_kwargs={"literal_binds": True},
+            )
+        )
+    return str(value)
+
+
+def _sql_string_literals(sql_text: str) -> frozenset[str]:
+    return frozenset(
+        match.group(1).replace("''", "'") for match in _SQL_STRING_LITERAL_RE.finditer(sql_text)
+    )
+
+
+def _contains_identifier(sql_text: str, identifier: str) -> bool:
+    return (
+        re.search(rf"(?<![A-Za-z0-9_]){re.escape(identifier)}(?![A-Za-z0-9_])", sql_text)
+        is not None
+    )
+
+
+def _is_generated_not_null_constraint(name: str) -> bool:
+    return re.fullmatch(r"\d+_\d+_\d+_not_null", name) is not None
+
+
+def _index_column_names(index: Index) -> tuple[str, ...]:
+    column_names: list[str] = []
+    for expression in index.expressions:
+        column_name = getattr(expression, "name", None)
+        if isinstance(column_name, str):
+            column_names.append(column_name)
+    return tuple(column_names)
+
+
+def _string_sequence(value: object) -> tuple[str, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+        return ()
+    return tuple(item for item in value if isinstance(item, str))
+
+
+def _reflected_mapping(value: object) -> Mapping[str, object] | None:
+    return value if isinstance(value, Mapping) else None
+
+
+def _reflected_check_constraint(value: object) -> ReflectedCheckConstraint | None:
+    mapping = _reflected_mapping(value)
+    if mapping is None:
+        return None
+    name = mapping.get("name")
+    if not isinstance(name, str) or _is_generated_not_null_constraint(name):
+        return None
+    return ReflectedCheckConstraint(
+        name=name,
+        sqltext=str(mapping.get("sqltext") or ""),
+    )
+
+
+def _reflected_foreign_key(value: object) -> ReflectedForeignKey | None:
+    mapping = _reflected_mapping(value)
+    if mapping is None:
+        return None
+    constrained_columns = _string_sequence(mapping.get("constrained_columns"))
+    if not constrained_columns:
+        return None
+    referred_table = mapping.get("referred_table")
+    options = mapping.get("options")
+    return ReflectedForeignKey(
+        constrained_columns=constrained_columns,
+        referred_table=referred_table if isinstance(referred_table, str) else None,
+        ondelete=_ondelete(options.get("ondelete")) if isinstance(options, Mapping) else "",
+    )
+
+
+def _reflected_index(value: object) -> ReflectedIndex | None:
+    mapping = _reflected_mapping(value)
+    if mapping is None:
+        return None
+    name = mapping.get("name")
+    if not isinstance(name, str):
+        return None
+    return ReflectedIndex(
+        name=name,
+        unique=mapping.get("unique") is True,
+        column_names=_string_sequence(mapping.get("column_names")),
+        dialect_options_text=str(mapping.get("dialect_options") or ""),
+    )
+
+
+def _ondelete(option: object) -> str:
+    return str(option).upper() if option is not None else ""
 
 
 def _project_root() -> Path:
@@ -606,7 +170,7 @@ def schema_readiness_issues(engine: Engine) -> list[str]:
     inspector = inspect(engine)
     issues = [
         f"missing_table:{table_name}"
-        for table_name in REQUIRED_TABLES
+        for table_name in _required_table_names()
         if not inspector.has_table(table_name)
     ]
     if issues:
@@ -619,13 +183,17 @@ def schema_readiness_issues(engine: Engine) -> list[str]:
     for head in sorted(heads - current_revisions):
         issues.append(f"missing_alembic_head:{head}")
 
-    for table_name, column_names in REQUIRED_COLUMNS.items():
+    for table in _model_tables():
+        table_name = table.name
+        column_names = tuple(column.name for column in table.columns)
         existing_columns = {column["name"] for column in inspector.get_columns(table_name)}
         for column_name in column_names:
             if column_name not in existing_columns:
                 issues.append(f"missing_column:{table_name}.{column_name}")
+        for column_name in sorted(existing_columns - set(column_names)):
+            issues.append(f"unexpected_column:{table_name}.{column_name}")
 
-    for table_name, primary_key_columns in REQUIRED_PRIMARY_KEYS.items():
+        primary_key_columns = tuple(column.name for column in table.primary_key.columns)
         reflected_primary_key = inspector.get_pk_constraint(table_name)
         existing_primary_key = tuple(
             str(column_name)
@@ -634,7 +202,6 @@ def schema_readiness_issues(engine: Engine) -> list[str]:
         if existing_primary_key != primary_key_columns:
             issues.append(f"wrong_primary_key:{table_name}")
 
-    for table_name, unique_constraints in REQUIRED_UNIQUE_CONSTRAINTS.items():
         existing_unique_constraints = {
             str(constraint["name"]): tuple(
                 str(column_name) for column_name in constraint.get("column_names") or ()
@@ -642,7 +209,17 @@ def schema_readiness_issues(engine: Engine) -> list[str]:
             for constraint in inspector.get_unique_constraints(table_name)
             if isinstance(constraint.get("name"), str)
         }
-        for constraint_name, expected_columns in unique_constraints.items():
+        for unique_constraint in table.constraints:
+            if not isinstance(unique_constraint, UniqueConstraint):
+                continue
+            constraint_name = unique_constraint.name
+            expected_columns = _constraint_columns(unique_constraint)
+            if not isinstance(constraint_name, str):
+                if expected_columns not in existing_unique_constraints.values():
+                    issues.append(
+                        f"missing_unique_constraint:{table_name}.{','.join(expected_columns)}"
+                    )
+                continue
             actual_columns = existing_unique_constraints.get(constraint_name)
             if actual_columns is None:
                 issues.append(f"missing_unique_constraint:{table_name}.{constraint_name}")
@@ -650,85 +227,110 @@ def schema_readiness_issues(engine: Engine) -> list[str]:
             if actual_columns != expected_columns:
                 issues.append(f"wrong_unique_constraint:{table_name}.{constraint_name}")
 
-    for table_name, constraint_names in REQUIRED_CONSTRAINTS.items():
-        existing_constraints = {
-            constraint["name"]: str(constraint.get("sqltext") or "")
-            for constraint in inspector.get_check_constraints(table_name)
-            if isinstance(constraint.get("name"), str)
-        }
-        for constraint_name in constraint_names:
+        existing_constraints: dict[str, ReflectedCheckConstraint] = {}
+        for constraint in inspector.get_check_constraints(table_name):
+            reflected_constraint = _reflected_check_constraint(constraint)
+            if reflected_constraint is None:
+                continue
+            existing_constraints[reflected_constraint.name] = reflected_constraint
+        expected_constraint_names: set[str] = set()
+        for check_constraint in table.constraints:
+            if isinstance(check_constraint, CheckConstraint) and isinstance(
+                check_constraint.name, str
+            ):
+                expected_constraint_names.add(check_constraint.name)
+        for constraint_name in sorted(existing_constraints.keys() - expected_constraint_names):
+            issues.append(f"unexpected_constraint:{table_name}.{constraint_name}")
+        for check_constraint in table.constraints:
+            if not isinstance(check_constraint, CheckConstraint):
+                continue
+            constraint_name = check_constraint.name
+            if not isinstance(constraint_name, str):
+                continue
             if constraint_name not in existing_constraints:
                 issues.append(f"missing_constraint:{table_name}.{constraint_name}")
                 continue
-            sql_text = existing_constraints[constraint_name]
-            for fragment in REQUIRED_CHECK_SQL_FRAGMENTS.get(table_name, {}).get(
-                constraint_name,
-                (),
-            ):
-                if fragment not in sql_text:
-                    issues.append(f"missing_constraint_fragment:{table_name}.{constraint_name}")
-                    break
-            for fragment in FORBIDDEN_CHECK_SQL_FRAGMENTS.get(table_name, {}).get(
-                constraint_name,
-                (),
-            ):
-                if fragment in sql_text:
-                    issues.append(f"forbidden_constraint_fragment:{table_name}.{constraint_name}")
-                    break
-
-    for table_name, foreign_keys in REQUIRED_FOREIGN_KEYS.items():
-        existing_foreign_keys: dict[str, dict[str, Any]] = {}
-        for reflected_foreign_key in inspector.get_foreign_keys(table_name):
-            constrained_columns = reflected_foreign_key.get("constrained_columns")
-            if not isinstance(constrained_columns, list) or len(constrained_columns) != 1:
-                continue
-            column_name = constrained_columns[0]
-            if isinstance(column_name, str):
-                existing_foreign_keys[column_name] = dict(reflected_foreign_key)
-        for column_name, expected in foreign_keys.items():
-            expected_table, expected_ondelete = expected
-            existing_foreign_key = existing_foreign_keys.get(column_name)
-            if existing_foreign_key is None:
-                issues.append(f"missing_foreign_key:{table_name}.{column_name}")
-                continue
-            if existing_foreign_key.get("referred_table") != expected_table:
-                issues.append(f"wrong_foreign_key_table:{table_name}.{column_name}")
-            options = existing_foreign_key.get("options")
-            actual_ondelete = (
-                str(options.get("ondelete")).upper()
-                if isinstance(options, dict) and options.get("ondelete") is not None
-                else ""
+            reflected_constraint = existing_constraints[constraint_name]
+            expected_sql_text = _sql_fragment(check_constraint.sqltext)
+            expected_literals = _sql_string_literals(expected_sql_text)
+            actual_literals = _sql_string_literals(reflected_constraint.sqltext)
+            expected_column_fragments = tuple(
+                column.name
+                for column in table.columns
+                if _contains_identifier(expected_sql_text, column.name)
             )
-            if actual_ondelete != expected_ondelete:
-                issues.append(f"wrong_foreign_key_ondelete:{table_name}.{column_name}")
+            missing_literal = not expected_literals.issubset(actual_literals)
+            missing_column = any(
+                not _contains_identifier(reflected_constraint.sqltext, column_name)
+                for column_name in expected_column_fragments
+            )
+            if missing_literal or missing_column:
+                issues.append(f"missing_constraint_fragment:{table_name}.{constraint_name}")
+            if actual_literals - expected_literals:
+                issues.append(f"forbidden_constraint_fragment:{table_name}.{constraint_name}")
 
-    for table_name, index_names in REQUIRED_INDEXES.items():
-        existing_indexes = {
-            str(index["name"]): index
-            for index in inspector.get_indexes(table_name)
-            if isinstance(index.get("name"), str)
-        }
-        for index_name in index_names:
+        existing_foreign_keys: dict[tuple[str, ...], ReflectedForeignKey] = {}
+        for reflected_foreign_key in inspector.get_foreign_keys(table_name):
+            foreign_key_record = _reflected_foreign_key(reflected_foreign_key)
+            if foreign_key_record is None:
+                continue
+            existing_foreign_keys[foreign_key_record.constrained_columns] = foreign_key_record
+        for foreign_key in table.foreign_key_constraints:
+            expected_foreign_key_columns = _constraint_columns(foreign_key)
+            column_label = (
+                expected_foreign_key_columns[0]
+                if len(expected_foreign_key_columns) == 1
+                else ",".join(expected_foreign_key_columns)
+            )
+            existing_foreign_key = existing_foreign_keys.get(expected_foreign_key_columns)
+            if existing_foreign_key is None:
+                issues.append(f"missing_foreign_key:{table_name}.{column_label}")
+                continue
+            referred_tables = {element.column.table.name for element in foreign_key.elements}
+            if len(referred_tables) == 1:
+                expected_table = next(iter(referred_tables))
+                if existing_foreign_key.referred_table != expected_table:
+                    issues.append(f"wrong_foreign_key_table:{table_name}.{column_label}")
+            expected_ondelete = _ondelete(foreign_key.ondelete)
+            if expected_ondelete and existing_foreign_key.ondelete != expected_ondelete:
+                issues.append(f"wrong_foreign_key_ondelete:{table_name}.{column_label}")
+
+        existing_indexes: dict[str, ReflectedIndex] = {}
+        for reflected_index in inspector.get_indexes(table_name):
+            index_record = _reflected_index(reflected_index)
+            if index_record is not None:
+                existing_indexes[index_record.name] = index_record
+        for index in table.indexes:
+            index_name = index.name
+            if index_name is None:
+                continue
             if index_name not in existing_indexes:
                 issues.append(f"missing_index:{table_name}.{index_name}")
                 continue
-            if index_name in REQUIRED_UNIQUE_INDEXES.get(table_name, ()):
-                if existing_indexes[index_name].get("unique") is not True:
+            if index.unique:
+                if not existing_indexes[index_name].unique:
                     issues.append(f"missing_unique_index:{table_name}.{index_name}")
-            expected_columns = REQUIRED_INDEX_COLUMNS.get(table_name, {}).get(index_name)
-            if expected_columns is not None:
-                actual_columns = tuple(
-                    str(column_name)
-                    for column_name in existing_indexes[index_name].get("column_names") or ()
+            expected_index_columns = _index_column_names(index)
+            if existing_indexes[index_name].column_names != expected_index_columns:
+                issues.append(f"missing_index_columns:{table_name}.{index_name}")
+            expected_where = index.dialect_options["postgresql"].get("where")
+            if expected_where is not None:
+                dialect_text = existing_indexes[index_name].dialect_options_text
+                expected_where_text = _sql_fragment(expected_where)
+                expected_where_literals = _sql_string_literals(expected_where_text)
+                actual_where_literals = _sql_string_literals(dialect_text)
+                expected_column_fragments = tuple(
+                    column_name
+                    for column_name in expected_index_columns
+                    if _contains_identifier(expected_where_text, column_name)
                 )
-                if actual_columns != expected_columns:
-                    issues.append(f"missing_index_columns:{table_name}.{index_name}")
-            dialect_options = existing_indexes[index_name].get("dialect_options")
-            dialect_text = str(dialect_options or "")
-            for fragment in REQUIRED_INDEX_SQL_FRAGMENTS.get(table_name, {}).get(index_name, ()):
-                if fragment not in dialect_text:
+                missing_literal = not expected_where_literals.issubset(actual_where_literals)
+                missing_column = any(
+                    not _contains_identifier(dialect_text, column_name)
+                    for column_name in expected_column_fragments
+                )
+                if missing_literal or missing_column:
                     issues.append(f"missing_index_fragment:{table_name}.{index_name}")
-                    break
 
     return issues
 

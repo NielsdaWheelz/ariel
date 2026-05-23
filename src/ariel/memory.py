@@ -24,16 +24,16 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
-import ulid
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from .capability_registry import run_callable_signature
 from .config import AppSettings
+from .ids import new_id
 from .persistence import (
     BackgroundTaskRecord,
     MemoryLogRecord,
@@ -47,13 +47,13 @@ from .run_runtime import run_tool_definitions
 
 if TYPE_CHECKING:
     from .agency_daemon import AgencyRuntime
-    from .app import ModelAdapter
+    from .model_adapter import ModelAdapter
     from .attachment_content import AttachmentContentRuntime
     from .google_connector import GoogleConnectorRuntime
     from .sandbox_runtime import RunSandbox
 
 from .agent_loop import LoopConfig, LoopResult, run_agent_loop
-from .response_contracts import validate_memory_recall_v1
+from .response_contracts import ResponseContractViolation, validate_memory_recall_v1
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +63,16 @@ from .response_contracts import validate_memory_recall_v1
 RETRIEVER_PROMPT_VERSION = "memory-retriever-v4"
 REMEMBERER_ENCODE_PROMPT_VERSION = "memory-rememberer-encode-v3"
 REMEMBERER_DREAM_PROMPT_VERSION = "memory-rememberer-dream-v3"
+
+
+class MemoryExecutionError(Exception):
+    def __init__(self, safe_reason: str) -> None:
+        super().__init__(safe_reason)
+        self.safe_reason = safe_reason
+
+
+class MemoryRecallError(MemoryExecutionError):
+    """Expected memory recall failure that should not fail the user turn."""
 
 
 # ---------------------------------------------------------------------------
@@ -382,7 +392,7 @@ def edit_note(
     """Rewrite a note's content in place and append a ``note_edit`` log event."""
     note = db.scalar(select(MemoryNoteRecord).where(MemoryNoteRecord.id == note_id))
     if note is None:
-        raise RuntimeError(f"edit_note: note {note_id!r} does not exist")
+        raise MemoryExecutionError("memory_note_not_found")
 
     try:
         embedding: list[float] | None = embed_text(content, settings=settings)
@@ -421,7 +431,7 @@ def delete_note(
     """Delete a curated note and append a ``note_delete`` log event."""
     note = db.scalar(select(MemoryNoteRecord).where(MemoryNoteRecord.id == note_id))
     if note is None:
-        raise RuntimeError(f"delete_note: note {note_id!r} does not exist")
+        raise MemoryExecutionError("memory_note_not_found")
 
     note_taint: Literal["clean", "tainted"] = "tainted" if note.taint == "tainted" else "clean"
     db.delete(note)
@@ -564,19 +574,6 @@ def search_memory(
 
 
 # ---------------------------------------------------------------------------
-# Loop helpers shared by run_retriever / run_rememberer
-# ---------------------------------------------------------------------------
-
-
-def _new_id(prefix: str) -> str:
-    return f"{prefix}_{ulid.new().str.lower()}"
-
-
-def _utcnow() -> datetime:
-    return datetime.now(tz=UTC)
-
-
-# ---------------------------------------------------------------------------
 # The retriever — memory_recall loop driver
 # ---------------------------------------------------------------------------
 
@@ -605,9 +602,9 @@ def run_retriever(
 
     Runs the shared loop as the retriever driver. The retriever builds
     its own input items — context firewall: its rounds never enter the main
-    agent's context. On any
-    failure (budget, model error, contract violation) returns a minimal
-    partial dict rather than raising; recall failure is non-fatal.
+    agent's context. Budget/backstop exhaustion returns a minimal partial
+    recall. Model-provider recall failure raises ``MemoryRecallError`` so the
+    caller can keep recall non-fatal without swallowing internal defects.
     """
     eligible_callables = ["memory.search", "memory.read", "agent.emit_finding"]
     callable_lines = "\n".join(
@@ -696,19 +693,26 @@ def run_retriever(
         attachment_runtime=attachment_runtime,
     )
 
-    if loop_result.emitted_finding is not None:
-        raw = loop_result.emitted_finding
-        payload = {
-            "summary": raw.summary,
-            "items": raw.claims,  # finding carries items in claims for recall_v1
-            "status": raw.status,
-        }
-        try:
-            return validate_memory_recall_v1(payload)
-        except Exception:
-            pass
-
-    return {"summary": "", "items": [], "status": "partial"}
+    match loop_result.outcome:
+        case "finding":
+            assert loop_result.emitted_finding is not None
+            raw = loop_result.emitted_finding
+            payload = {
+                "summary": raw.summary,
+                "items": raw.claims,  # finding carries items in claims for recall_v1
+                "status": raw.status,
+            }
+            try:
+                return validate_memory_recall_v1(payload)
+            except ResponseContractViolation as exc:
+                raise MemoryRecallError("memory_recall_contract_invalid") from exc
+        case "budget_exhausted":
+            return {"summary": "", "items": [], "status": "partial"}
+        case "model_failed":
+            raise MemoryRecallError("memory_recall_model_failed")
+        case "message" | "approval" | "paused" | "operations" | "bounded_failure":
+            msg = f"unexpected memory recall loop outcome: {loop_result.outcome}"
+            raise AssertionError(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -904,7 +908,7 @@ def enqueue_memory_encode(
     now: datetime,
 ) -> str:
     """Enqueue a ``memory_encode`` background task. Returns the task id."""
-    stable_id = _new_id("enc")
+    stable_id = new_id("enc")
     task = enqueue_background_task(
         db,
         task_type="memory_encode",

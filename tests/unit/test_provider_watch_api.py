@@ -6,7 +6,7 @@ from typing import Any
 import httpx
 import pytest
 
-from ariel.google_connector import DefaultGoogleWorkspaceProvider
+from ariel.google_connector import DefaultGoogleWorkspaceProvider, GoogleWatchRegistrationFailure
 
 
 def _json_response(*, status_code: int, payload: dict[str, Any], url: str) -> httpx.Response:
@@ -81,6 +81,34 @@ def test_gmail_stop_watch_posts_stop_endpoint(monkeypatch: pytest.MonkeyPatch) -
     assert calls[0].startswith("POST ")
 
 
+def test_gmail_register_watch_maps_request_failure_to_watch_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_request(
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+        json: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        del method, headers, params, json, timeout
+        request = httpx.Request("POST", url)
+        return httpx.Response(503, json={"error": {"message": "try later"}}, request=request)
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    provider = DefaultGoogleWorkspaceProvider(timeout_seconds=5.0, max_attempts=1)
+
+    with pytest.raises(GoogleWatchRegistrationFailure) as exc_info:
+        provider.gmail_register_watch(
+            access_token="tok_live",
+            topic_name="projects/ariel/topics/gmail-watch",
+        )
+
+    assert exc_info.value.code == "google_upstream_503"
+
+
 def test_calendar_register_watch_posts_web_hook_channel_with_ttl(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -126,6 +154,40 @@ def test_calendar_register_watch_posts_web_hook_channel_with_ttl(
     }
     assert result["resourceId"] == "res_abc"
     assert result["expiration"] == datetime(2026, 5, 8, 16, 0, tzinfo=UTC)
+
+
+def test_calendar_register_watch_rejects_invalid_success_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_request(
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+        json: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        del method, headers, params, json, timeout
+        return _json_response(
+            status_code=200,
+            payload={"expiration": "1778256000000"},
+            url=url,
+        )
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    provider = DefaultGoogleWorkspaceProvider(timeout_seconds=5.0, max_attempts=1)
+
+    with pytest.raises(GoogleWatchRegistrationFailure) as exc_info:
+        provider.calendar_register_watch(
+            access_token="tok_live",
+            calendar_id="primary",
+            channel_id="wch_001",
+            channel_token="tok_channel",
+            address="https://ariel.example/v1/providers/google/events",
+        )
+
+    assert exc_info.value.code == "calendar_watch_response_invalid"
 
 
 def test_calendar_stop_watch_posts_channel_id_and_resource_id(

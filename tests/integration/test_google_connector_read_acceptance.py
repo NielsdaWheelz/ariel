@@ -9,9 +9,19 @@ from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import text
 
-from ariel.app import ModelAdapter, build_google_runtime
-from tests.integration.app_helpers import create_migrated_app
-from ariel.google_connector import GoogleWorkspaceProvider
+from ariel.app import build_google_runtime
+from ariel.clock import utcnow
+from ariel.model_adapter import ModelAdapter
+from tests.integration.app_helpers import create_test_app
+from ariel.google_connector import (
+    GOOGLE_CONNECTOR_ID,
+    GoogleOAuthExchangeFailure,
+    GoogleOAuthRefreshFailure,
+    GoogleOAuthRevokeFailure,
+    GoogleProviderRequestFailure,
+    GoogleWorkspaceProvider,
+)
+from ariel.secret_cipher import SecretDecryptionFailure
 from tests.integration.responses_helpers import (
     empty_recall_response,
     is_memory_subsystem_call,
@@ -25,6 +35,9 @@ from tests.fake_sandbox import FakeSandboxRuntime
 GOOGLE_CALENDAR_READ_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
 GOOGLE_CALENDAR_FREEBUSY_SCOPE = "https://www.googleapis.com/auth/calendar.freebusy"
 GOOGLE_GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+GOOGLE_OPENID_SCOPE = "openid"
+GOOGLE_USERINFO_EMAIL_SCOPE = "https://www.googleapis.com/auth/userinfo.email"
+GOOGLE_USERINFO_PROFILE_SCOPE = "https://www.googleapis.com/auth/userinfo.profile"
 
 
 @dataclass
@@ -100,7 +113,6 @@ class ActionProposalAdapter:
         if not run_calls:
             run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
         return responses_with_run_calls(
-            assistant_text=assistant_text,
             calls=run_calls,
             provider=self.provider,
             model=self.model,
@@ -123,7 +135,9 @@ class FakeTokenBundle:
 @dataclass
 class FakeGoogleOAuthClient:
     tokens_by_code: dict[str, FakeTokenBundle] = field(default_factory=dict)
+    exchange_errors_by_code: dict[str, Exception] = field(default_factory=dict)
     refresh_mode: str = "ok"
+    revoke_errors_by_token: dict[str, Exception] = field(default_factory=dict)
     revoke_calls: list[str] = field(default_factory=list)
     exchanged_states: list[str] = field(default_factory=list)
 
@@ -162,6 +176,9 @@ class FakeGoogleOAuthClient:
         assert len(code_verifier) >= 43
         assert redirect_uri
         self.exchanged_states.append(state)
+        exchange_error = self.exchange_errors_by_code.get(code)
+        if exchange_error is not None:
+            raise exchange_error
         token_bundle = self.tokens_by_code.get(code)
         if token_bundle is None:
             msg = f"unexpected_code:{code}"
@@ -177,9 +194,9 @@ class FakeGoogleOAuthClient:
 
     def refresh_access_token(self, *, refresh_token: str) -> dict[str, Any]:
         if self.refresh_mode == "invalid_grant":
-            raise RuntimeError("invalid_grant")
+            raise GoogleOAuthRefreshFailure(code="access_revoked")
         if self.refresh_mode == "transient_failure":
-            raise RuntimeError("upstream_timeout")
+            raise GoogleOAuthRefreshFailure(code="provider_timeout")
         return {
             "access_token": f"refreshed::{refresh_token}",
             "refresh_token": refresh_token,
@@ -188,27 +205,32 @@ class FakeGoogleOAuthClient:
 
     def revoke_token(self, *, token: str) -> None:
         self.revoke_calls.append(token)
+        revoke_error = self.revoke_errors_by_token.get(token)
+        if revoke_error is not None:
+            raise revoke_error
 
 
 @dataclass
 class FakeGoogleWorkspaceProvider:
     fail_scope_missing_for: set[str] = field(default_factory=set)
+    fail_token_expired_for: set[str] = field(default_factory=set)
 
     def calendar_list(
         self,
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]:
         del access_token
         if "cap.calendar.list" in self.fail_scope_missing_for:
-            raise RuntimeError("insufficient_permissions")
+            raise GoogleProviderRequestFailure("insufficient_permissions")
         return {
             "schema_version": "google.calendar.events.v1",
             "status": "succeeded",
             "events": [
                 {
-                    "provider_account_id": "google",
+                    "provider_account_id": provider_account_id,
                     "calendar_id": "primary",
                     "event_id": "evt-team-sync",
                     "status": "confirmed",
@@ -232,7 +254,7 @@ class FakeGoogleWorkspaceProvider:
                     "raw_payload_digest": "c" * 64,
                 },
                 {
-                    "provider_account_id": "google",
+                    "provider_account_id": provider_account_id,
                     "calendar_id": "primary",
                     "event_id": "evt-design-review",
                     "status": "confirmed",
@@ -266,15 +288,17 @@ class FakeGoogleWorkspaceProvider:
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
         attendee_intersection_enabled: bool,
     ) -> dict[str, Any]:
         del access_token
         if "cap.calendar.propose_slots" in self.fail_scope_missing_for:
-            raise RuntimeError("insufficient_permissions")
+            raise GoogleProviderRequestFailure("insufficient_permissions")
         attendees = normalized_input.get("attendees", [])
         if attendee_intersection_enabled:
             return {
                 "schema_version": "google.calendar.slot_options.v1",
+                "provider_account_id": provider_account_id,
                 "slots": [
                     {
                         "slot_id": "slot_1",
@@ -323,6 +347,7 @@ class FakeGoogleWorkspaceProvider:
             }
         return {
             "schema_version": "google.calendar.slot_options.v1",
+            "provider_account_id": provider_account_id,
             "slots": [
                 {
                     "slot_id": "slot_1",
@@ -377,16 +402,20 @@ class FakeGoogleWorkspaceProvider:
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]:
         del access_token
         if "cap.email.search" in self.fail_scope_missing_for:
-            raise RuntimeError("insufficient_permissions")
+            raise GoogleProviderRequestFailure("insufficient_permissions")
+        if "cap.email.search" in self.fail_token_expired_for:
+            raise GoogleProviderRequestFailure("token_expired")
         query = normalized_input["query"]
         return {
             "schema_version": "google.gmail.message_refs.v1",
             "status": "succeeded",
             "messages": [
                 {
+                    "provider_account_id": provider_account_id,
                     "message_id": "msg-1",
                     "thread_id": "thr-1",
                     "history_id": "hist-1",
@@ -416,16 +445,17 @@ class FakeGoogleWorkspaceProvider:
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]:
         del access_token
         if "cap.email.read" in self.fail_scope_missing_for:
-            raise RuntimeError("insufficient_permissions")
+            raise GoogleProviderRequestFailure("insufficient_permissions")
         message_id = normalized_input["message_id"]
         return {
             "schema_version": "google.gmail.message_evidence.v1",
             "mode": "message",
             "message": {
-                "provider_account_id": "google",
+                "provider_account_id": provider_account_id,
                 "message_id": message_id,
                 "thread_id": "thr-1",
                 "history_id": "hist-1",
@@ -470,7 +500,7 @@ class FakeGoogleWorkspaceProvider:
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
-    app = create_migrated_app(
+    app = create_test_app(
         database_url=postgres_url,
         model_adapter=adapter,
         sandbox=FakeSandboxRuntime(),
@@ -522,6 +552,68 @@ def _connect_google(client: TestClient, *, code: str) -> dict[str, Any]:
     )
     assert callback.status_code == 200
     return callback.json()
+
+
+def test_google_connector_start_reports_typed_oauth_misconfiguration(
+    postgres_url: str,
+) -> None:
+    with _build_client(postgres_url, ActionProposalAdapter()) as client:
+        started = client.post("/v1/connectors/google/start")
+        assert started.status_code == 503
+        error = started.json()["error"]
+        assert error["code"] == "E_CONNECTOR_START_FAILED"
+        assert error["details"]["reason"] == "oauth_client_not_configured"
+        assert error["retryable"] is False
+
+        with cast(Any, client.app).state.session_factory() as db:
+            connector = (
+                db.execute(
+                    text("SELECT status, last_error_code FROM google_connectors WHERE id = :id"),
+                    {"id": GOOGLE_CONNECTOR_ID},
+                )
+                .mappings()
+                .one()
+            )
+            event_types = [
+                row[0]
+                for row in db.execute(
+                    text(
+                        "SELECT event_type FROM google_connector_events "
+                        "WHERE connector_id = :id ORDER BY created_at ASC"
+                    ),
+                    {"id": GOOGLE_CONNECTOR_ID},
+                ).all()
+            ]
+    assert connector["status"] == "not_connected"
+    assert connector["last_error_code"] == "oauth_start_failed"
+    assert "evt.connector.google.connect.started" in event_types
+    assert "evt.connector.google.connect.failed" in event_types
+
+
+def test_google_connector_start_does_not_map_unexpected_authorization_exception(
+    postgres_url: str,
+) -> None:
+    class DefectiveOAuthClient:
+        def build_authorization_url(self, **_: Any) -> str:
+            raise RuntimeError("authorization url defect")
+
+    with _build_client(postgres_url, ActionProposalAdapter()) as client:
+        cast(Any, client.app).state.google_oauth_client = DefectiveOAuthClient()
+
+        with pytest.raises(RuntimeError, match="authorization url defect"):
+            client.post("/v1/connectors/google/start")
+
+        with cast(Any, client.app).state.session_factory() as db:
+            connector_count = db.scalar(
+                text("SELECT COUNT(*) FROM google_connectors WHERE id = :id"),
+                {"id": GOOGLE_CONNECTOR_ID},
+            )
+            event_count = db.scalar(
+                text("SELECT COUNT(*) FROM google_connector_events WHERE connector_id = :id"),
+                {"id": GOOGLE_CONNECTOR_ID},
+            )
+    assert connector_count == 0
+    assert event_count == 0
 
 
 def test_google_connector_lifecycle_endpoints_are_complete_secure_and_auditable(
@@ -576,6 +668,9 @@ def test_google_connector_lifecycle_endpoints_are_complete_secure_and_auditable(
         assert f"state={state}" in auth_url
         assert GOOGLE_CALENDAR_READ_SCOPE in auth_url
         assert GOOGLE_GMAIL_READ_SCOPE in auth_url
+        assert GOOGLE_OPENID_SCOPE in auth_url
+        assert GOOGLE_USERINFO_EMAIL_SCOPE in auth_url
+        assert GOOGLE_USERINFO_PROFILE_SCOPE in auth_url
         assert "calendar.events" not in auth_url
         assert "gmail.send" not in auth_url
 
@@ -646,11 +741,449 @@ def test_google_connector_lifecycle_endpoints_are_complete_secure_and_auditable(
         assert disconnected_connector["status"] in {"revoked", "not_connected"}
 
         events_after_disconnect = client.get("/v1/connectors/google/events")
+        events_after_disconnect_payload = events_after_disconnect.json()["events"]
         event_types_after_disconnect = [
-            event["event_type"] for event in events_after_disconnect.json()["events"]
+            event["event_type"] for event in events_after_disconnect_payload
         ]
         assert "evt.connector.google.disconnected" in event_types_after_disconnect
-        assert len(oauth_client.revoke_calls) >= 1
+        assert oauth_client.revoke_calls == [
+            "tok_refresh_plain_reconnect",
+            "tok_access_plain_reconnect",
+        ]
+        disconnected_event = [
+            event
+            for event in events_after_disconnect_payload
+            if event["event_type"] == "evt.connector.google.disconnected"
+        ][-1]
+        assert disconnected_event["payload"]["token_revoke_results"] == [
+            {"slot": "refresh_token", "status": "succeeded", "stage": "revoke"},
+            {"slot": "access_token", "status": "succeeded", "stage": "revoke"},
+        ]
+        assert "revoked_remote" not in disconnected_event["payload"]
+        assert "tok_access_plain_reconnect" not in events_after_disconnect.text
+        assert "tok_refresh_plain_reconnect" not in events_after_disconnect.text
+        with cast(Any, client.app).state.session_factory() as db:
+            tokens = (
+                db.execute(
+                    text(
+                        "SELECT access_token_enc, refresh_token_enc FROM google_connectors "
+                        "WHERE id = :connector_id"
+                    ),
+                    {"connector_id": GOOGLE_CONNECTOR_ID},
+                )
+                .mappings()
+                .one()
+            )
+        assert tokens["access_token_enc"] is None
+        assert tokens["refresh_token_enc"] is None
+
+
+def test_google_disconnect_records_revoke_failure_without_leaking_token_material(
+    postgres_url: str,
+) -> None:
+    oauth_client = FakeGoogleOAuthClient(
+        tokens_by_code={
+            "connect-code": FakeTokenBundle(
+                account_subject="sub_connect",
+                account_email="owner@example.com",
+                granted_scopes=[GOOGLE_CALENDAR_READ_SCOPE],
+                access_token="tok_access_plain_connect",
+                refresh_token="tok_refresh_plain_connect",
+            )
+        },
+        revoke_errors_by_token={
+            "tok_refresh_plain_connect": GoogleOAuthRevokeFailure(code="provider_timeout")
+        },
+    )
+    with _build_client(postgres_url, ActionProposalAdapter()) as client:
+        _bind_google_fakes(
+            client,
+            oauth_client=oauth_client,
+            workspace_provider=FakeGoogleWorkspaceProvider(),
+        )
+        _connect_google(client, code="connect-code")
+
+        disconnected = client.delete("/v1/connectors/google")
+
+        assert disconnected.status_code == 200
+        assert disconnected.json()["connector"]["readiness"] == "not_connected"
+        events = client.get("/v1/connectors/google/events")
+        disconnected_event = [
+            event
+            for event in events.json()["events"]
+            if event["event_type"] == "evt.connector.google.disconnected"
+        ][-1]
+        assert disconnected_event["payload"]["token_revoke_results"] == [
+            {
+                "slot": "refresh_token",
+                "status": "failed",
+                "stage": "revoke",
+                "reason": "provider_timeout",
+            },
+            {"slot": "access_token", "status": "succeeded", "stage": "revoke"},
+        ]
+        assert "tok_refresh_plain_connect" not in events.text
+        assert "tok_access_plain_connect" not in events.text
+        with cast(Any, client.app).state.session_factory() as db:
+            tokens = (
+                db.execute(
+                    text(
+                        "SELECT access_token_enc, refresh_token_enc FROM google_connectors "
+                        "WHERE id = :connector_id"
+                    ),
+                    {"connector_id": GOOGLE_CONNECTOR_ID},
+                )
+                .mappings()
+                .one()
+            )
+        assert tokens["access_token_enc"] is None
+        assert tokens["refresh_token_enc"] is None
+
+
+def test_google_disconnect_records_decrypt_failure_without_leaking_token_material(
+    postgres_url: str,
+) -> None:
+    oauth_client = FakeGoogleOAuthClient(
+        tokens_by_code={
+            "connect-code": FakeTokenBundle(
+                account_subject="sub_connect",
+                account_email="owner@example.com",
+                granted_scopes=[GOOGLE_CALENDAR_READ_SCOPE],
+                access_token="tok_access_plain_connect",
+                refresh_token="tok_refresh_plain_connect",
+            )
+        },
+    )
+    with _build_client(postgres_url, ActionProposalAdapter()) as client:
+        _bind_google_fakes(
+            client,
+            oauth_client=oauth_client,
+            workspace_provider=FakeGoogleWorkspaceProvider(),
+        )
+        _connect_google(client, code="connect-code")
+        with cast(Any, client.app).state.session_factory() as db:
+            with db.begin():
+                db.execute(
+                    text(
+                        "UPDATE google_connectors SET refresh_token_enc = :ciphertext "
+                        "WHERE id = :connector_id"
+                    ),
+                    {
+                        "ciphertext": "not-aead:v1",
+                        "connector_id": GOOGLE_CONNECTOR_ID,
+                    },
+                )
+
+        disconnected = client.delete("/v1/connectors/google")
+
+        assert disconnected.status_code == 200
+        assert oauth_client.revoke_calls == ["tok_access_plain_connect"]
+        events = client.get("/v1/connectors/google/events")
+        disconnected_event = [
+            event
+            for event in events.json()["events"]
+            if event["event_type"] == "evt.connector.google.disconnected"
+        ][-1]
+        assert disconnected_event["payload"]["token_revoke_results"] == [
+            {
+                "slot": "refresh_token",
+                "status": "failed",
+                "stage": "decrypt",
+                "reason": "malformed_envelope",
+            },
+            {"slot": "access_token", "status": "succeeded", "stage": "revoke"},
+        ]
+        assert "tok_access_plain_connect" not in events.text
+        assert "tok_refresh_plain_connect" not in events.text
+        with cast(Any, client.app).state.session_factory() as db:
+            tokens = (
+                db.execute(
+                    text(
+                        "SELECT access_token_enc, refresh_token_enc FROM google_connectors "
+                        "WHERE id = :connector_id"
+                    ),
+                    {"connector_id": GOOGLE_CONNECTOR_ID},
+                )
+                .mappings()
+                .one()
+            )
+        assert tokens["access_token_enc"] is None
+        assert tokens["refresh_token_enc"] is None
+
+
+def test_google_disconnect_unexpected_revoke_exception_propagates(
+    postgres_url: str,
+) -> None:
+    oauth_client = FakeGoogleOAuthClient(
+        tokens_by_code={
+            "connect-code": FakeTokenBundle(
+                account_subject="sub_connect",
+                account_email="owner@example.com",
+                granted_scopes=[GOOGLE_CALENDAR_READ_SCOPE],
+                access_token="tok_access_plain_connect",
+                refresh_token="tok_refresh_plain_connect",
+            )
+        },
+        revoke_errors_by_token={
+            "tok_refresh_plain_connect": RuntimeError("unexpected revoke defect")
+        },
+    )
+    with _build_client(postgres_url, ActionProposalAdapter()) as client:
+        _bind_google_fakes(
+            client,
+            oauth_client=oauth_client,
+            workspace_provider=FakeGoogleWorkspaceProvider(),
+        )
+        _connect_google(client, code="connect-code")
+
+        with pytest.raises(RuntimeError, match="unexpected revoke defect"):
+            client.delete("/v1/connectors/google")
+
+        status = client.get("/v1/connectors/google")
+        assert status.status_code == 200
+        assert status.json()["connector"]["status"] == "connected"
+        events = client.get("/v1/connectors/google/events")
+        event_types = [event["event_type"] for event in events.json()["events"]]
+        assert "evt.connector.google.disconnected" not in event_types
+
+
+def test_google_connector_callback_rejects_oauth_payload_without_account_identity(
+    postgres_url: str,
+) -> None:
+    adapter = ActionProposalAdapter()
+    oauth_client = FakeGoogleOAuthClient(
+        tokens_by_code={
+            "connect-code": FakeTokenBundle(
+                account_subject="unknown-subject",
+                account_email="unknown-email",
+                granted_scopes=[GOOGLE_CALENDAR_READ_SCOPE, GOOGLE_GMAIL_READ_SCOPE],
+                access_token="tok_access_plain_connect",
+                refresh_token="tok_refresh_plain_connect",
+            )
+        }
+    )
+    with _build_client(postgres_url, adapter) as client:
+        _bind_google_fakes(
+            client,
+            oauth_client=oauth_client,
+            workspace_provider=FakeGoogleWorkspaceProvider(),
+        )
+
+        started = client.post("/v1/connectors/google/start")
+        assert started.status_code == 200
+        state = started.json()["oauth"]["state"]
+        callback = client.get(
+            "/v1/connectors/google/callback",
+            params={"state": state, "code": "connect-code"},
+        )
+
+        assert callback.status_code == 400
+        error = callback.json()["error"]
+        assert error["code"] == "E_CONNECTOR_CALLBACK_INVALID"
+        assert error["details"]["reason"] == "oauth_payload_invalid"
+
+        status = client.get("/v1/connectors/google")
+        assert status.status_code == 200
+        connector = status.json()["connector"]
+        assert connector["status"] == "not_connected"
+        assert connector["last_error_code"] == "oauth_payload_invalid"
+        assert connector["account_subject"] is None
+        assert connector["account_email"] is None
+
+        events = client.get("/v1/connectors/google/events")
+        assert events.status_code == 200
+        event_types = [event["event_type"] for event in events.json()["events"]]
+        assert "evt.connector.google.connect.failed" in event_types
+        assert "evt.connector.google.connect.succeeded" not in event_types
+
+
+def test_google_connector_callback_maps_typed_pkce_decryption_failure(
+    postgres_url: str,
+) -> None:
+    oauth_client = FakeGoogleOAuthClient(
+        tokens_by_code={
+            "connect-code": FakeTokenBundle(
+                account_subject="sub_connect",
+                account_email="owner@example.com",
+                granted_scopes=[GOOGLE_CALENDAR_READ_SCOPE],
+                access_token="tok_access_plain_connect",
+                refresh_token="tok_refresh_plain_connect",
+            )
+        }
+    )
+    with _build_client(postgres_url, ActionProposalAdapter()) as client:
+        _bind_google_fakes(
+            client,
+            oauth_client=oauth_client,
+            workspace_provider=FakeGoogleWorkspaceProvider(),
+        )
+
+        started = client.post("/v1/connectors/google/start")
+        assert started.status_code == 200
+        state = started.json()["oauth"]["state"]
+        with cast(Any, client.app).state.session_factory() as db:
+            db.execute(
+                text(
+                    "UPDATE google_oauth_states SET pkce_verifier_enc = :ciphertext "
+                    "WHERE state_handle = :state"
+                ),
+                {"ciphertext": "not-aead", "state": state},
+            )
+            db.commit()
+
+        callback = client.get(
+            "/v1/connectors/google/callback",
+            params={"state": state, "code": "connect-code"},
+        )
+
+        assert callback.status_code == 400
+        error = callback.json()["error"]
+        assert error["code"] == "E_CONNECTOR_CALLBACK_INVALID"
+        assert error["details"]["reason"] == "malformed_envelope"
+        assert oauth_client.exchanged_states == []
+
+        with cast(Any, client.app).state.session_factory() as db:
+            consumed_at = db.scalar(
+                text("SELECT consumed_at FROM google_oauth_states WHERE state_handle = :state"),
+                {"state": state},
+            )
+            event_types = [
+                row[0]
+                for row in db.execute(
+                    text(
+                        "SELECT event_type FROM google_connector_events "
+                        "WHERE connector_id = :id ORDER BY created_at ASC"
+                    ),
+                    {"id": GOOGLE_CONNECTOR_ID},
+                ).all()
+            ]
+    assert consumed_at is not None
+    assert "evt.connector.google.connect.failed" in event_types
+    assert "evt.connector.google.connect.succeeded" not in event_types
+
+
+def test_google_connector_callback_does_not_map_unexpected_pkce_decryption_exception(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    oauth_client = FakeGoogleOAuthClient(
+        tokens_by_code={
+            "connect-code": FakeTokenBundle(
+                account_subject="sub_connect",
+                account_email="owner@example.com",
+                granted_scopes=[GOOGLE_CALENDAR_READ_SCOPE],
+                access_token="tok_access_plain_connect",
+                refresh_token="tok_refresh_plain_connect",
+            )
+        }
+    )
+    with _build_client(postgres_url, ActionProposalAdapter()) as client:
+        _bind_google_fakes(
+            client,
+            oauth_client=oauth_client,
+            workspace_provider=FakeGoogleWorkspaceProvider(),
+        )
+
+        started = client.post("/v1/connectors/google/start")
+        assert started.status_code == 200
+        state = started.json()["oauth"]["state"]
+
+        def fail_decrypt_secret(**_: Any) -> str:
+            raise RuntimeError("pkce decrypt defect")
+
+        monkeypatch.setattr("ariel.google_connector.decrypt_secret", fail_decrypt_secret)
+        with pytest.raises(RuntimeError, match="pkce decrypt defect"):
+            client.get(
+                "/v1/connectors/google/callback",
+                params={"state": state, "code": "connect-code"},
+            )
+
+        with cast(Any, client.app).state.session_factory() as db:
+            consumed_at = db.scalar(
+                text("SELECT consumed_at FROM google_oauth_states WHERE state_handle = :state"),
+                {"state": state},
+            )
+            event_types = [
+                row[0]
+                for row in db.execute(
+                    text(
+                        "SELECT event_type FROM google_connector_events "
+                        "WHERE connector_id = :id ORDER BY created_at ASC"
+                    ),
+                    {"id": GOOGLE_CONNECTOR_ID},
+                ).all()
+            ]
+    assert oauth_client.exchanged_states == []
+    assert consumed_at is None
+    assert "evt.connector.google.connect.failed" not in event_types
+    assert "evt.connector.google.connect.succeeded" not in event_types
+
+
+def test_google_connector_callback_maps_typed_oauth_exchange_failure(
+    postgres_url: str,
+) -> None:
+    adapter = ActionProposalAdapter()
+    oauth_client = FakeGoogleOAuthClient(
+        exchange_errors_by_code={
+            "connect-code": GoogleOAuthExchangeFailure(code="provider_timeout")
+        }
+    )
+    with _build_client(postgres_url, adapter) as client:
+        _bind_google_fakes(
+            client,
+            oauth_client=oauth_client,
+            workspace_provider=FakeGoogleWorkspaceProvider(),
+        )
+
+        started = client.post("/v1/connectors/google/start")
+        assert started.status_code == 200
+        state = started.json()["oauth"]["state"]
+        callback = client.get(
+            "/v1/connectors/google/callback",
+            params={"state": state, "code": "connect-code"},
+        )
+
+        assert callback.status_code == 502
+        error = callback.json()["error"]
+        assert error["code"] == "E_CONNECTOR_CALLBACK_FAILED"
+        assert error["details"]["reason"] == "provider_timeout"
+        assert error["retryable"] is True
+
+        status = client.get("/v1/connectors/google")
+        assert status.status_code == 200
+        connector = status.json()["connector"]
+        assert connector["status"] == "error"
+        assert connector["last_error_code"] == "oauth_exchange_failed"
+
+        events = client.get("/v1/connectors/google/events")
+        assert events.status_code == 200
+        event_types = [event["event_type"] for event in events.json()["events"]]
+        assert "evt.connector.google.connect.failed" in event_types
+        assert "evt.connector.google.connect.succeeded" not in event_types
+
+
+def test_google_connector_callback_does_not_map_unexpected_exchange_exception(
+    postgres_url: str,
+) -> None:
+    adapter = ActionProposalAdapter()
+    oauth_client = FakeGoogleOAuthClient(
+        exchange_errors_by_code={"connect-code": RuntimeError("config defect")}
+    )
+    with _build_client(postgres_url, adapter) as client:
+        _bind_google_fakes(
+            client,
+            oauth_client=oauth_client,
+            workspace_provider=FakeGoogleWorkspaceProvider(),
+        )
+
+        started = client.post("/v1/connectors/google/start")
+        assert started.status_code == 200
+        state = started.json()["oauth"]["state"]
+        with pytest.raises(RuntimeError, match="config defect"):
+            client.get(
+                "/v1/connectors/google/callback",
+                params={"state": state, "code": "connect-code"},
+            )
 
 
 def test_connector_state_is_durable_and_token_material_is_not_persisted_in_plaintext(
@@ -692,6 +1225,152 @@ def test_connector_state_is_durable_and_token_material_is_not_persisted_in_plain
             assert refresh_token_enc != "tok_refresh_plain_encryption_check"
             assert "tok_access_plain_encryption_check" not in access_token_enc
             assert "tok_refresh_plain_encryption_check" not in refresh_token_enc
+
+
+@pytest.mark.parametrize(
+    ("token_column", "connect_code"),
+    [
+        ("access_token_enc", "connect-token-corrupt"),
+        ("refresh_token_enc", "connect-token-corrupt-expired"),
+    ],
+)
+def test_prepare_capability_access_propagates_token_decryption_defects(
+    postgres_url: str,
+    token_column: str,
+    connect_code: str,
+) -> None:
+    oauth_client = FakeGoogleOAuthClient(
+        tokens_by_code={
+            "connect-token-corrupt": FakeTokenBundle(
+                account_subject="sub_token_corrupt",
+                account_email="token-corrupt@example.com",
+                granted_scopes=[GOOGLE_GMAIL_READ_SCOPE],
+                access_token="tok_access_corrupt",
+                refresh_token="tok_refresh_corrupt",
+            ),
+            "connect-token-corrupt-expired": FakeTokenBundle(
+                account_subject="sub_token_corrupt_expired",
+                account_email="token-corrupt-expired@example.com",
+                granted_scopes=[GOOGLE_GMAIL_READ_SCOPE],
+                access_token="tok_access_corrupt_expired",
+                refresh_token="tok_refresh_corrupt_expired",
+                expires_in_seconds=-5,
+            ),
+        }
+    )
+    workspace_provider = FakeGoogleWorkspaceProvider()
+    with _build_client(postgres_url, ActionProposalAdapter()) as client:
+        _bind_google_fakes(
+            client,
+            oauth_client=oauth_client,
+            workspace_provider=workspace_provider,
+        )
+        _connect_google(client, code=connect_code)
+        with cast(Any, client.app).state.session_factory() as db:
+            db.execute(
+                text(f"UPDATE google_connectors SET {token_column} = :ciphertext WHERE id = :id"),
+                {"ciphertext": "not-aead:v1", "id": GOOGLE_CONNECTOR_ID},
+            )
+            db.commit()
+
+        runtime = build_google_runtime(
+            cast(Any, client.app).state.runtime.settings,
+            oauth_client=oauth_client,
+            workspace_provider=cast(GoogleWorkspaceProvider, workspace_provider),
+        )
+        with pytest.raises(SecretDecryptionFailure) as raised:
+            with cast(Any, client.app).state.session_factory() as db:
+                with db.begin():
+                    runtime.prepare_capability_access(
+                        db=db,
+                        capability_id="cap.email.search",
+                        now_fn=utcnow,
+                        new_id_fn=lambda prefix: f"{prefix}_decrypt_defect",
+                    )
+
+        with cast(Any, client.app).state.session_factory() as db:
+            last_error_code = db.scalar(
+                text("SELECT last_error_code FROM google_connectors WHERE id = :id"),
+                {"id": GOOGLE_CONNECTOR_ID},
+            )
+    assert raised.value.code == "malformed_envelope"
+    assert last_error_code is None
+
+
+def test_prepare_capability_access_returns_typed_failure_when_refresh_token_missing(
+    postgres_url: str,
+) -> None:
+    oauth_client = FakeGoogleOAuthClient(
+        tokens_by_code={
+            "connect-refresh-missing": FakeTokenBundle(
+                account_subject="sub_refresh_missing",
+                account_email="refresh-missing@example.com",
+                granted_scopes=[GOOGLE_GMAIL_READ_SCOPE],
+                access_token="tok_access_refresh_missing",
+                refresh_token="tok_refresh_missing",
+                expires_in_seconds=-5,
+            )
+        }
+    )
+    workspace_provider = FakeGoogleWorkspaceProvider()
+    with _build_client(postgres_url, ActionProposalAdapter()) as client:
+        _bind_google_fakes(
+            client,
+            oauth_client=oauth_client,
+            workspace_provider=workspace_provider,
+        )
+        _connect_google(client, code="connect-refresh-missing")
+        with cast(Any, client.app).state.session_factory() as db:
+            db.execute(
+                text("UPDATE google_connectors SET refresh_token_enc = NULL WHERE id = :id"),
+                {"id": GOOGLE_CONNECTOR_ID},
+            )
+            db.commit()
+
+        runtime = build_google_runtime(
+            cast(Any, client.app).state.runtime.settings,
+            oauth_client=oauth_client,
+            workspace_provider=cast(GoogleWorkspaceProvider, workspace_provider),
+        )
+        with cast(Any, client.app).state.session_factory() as db:
+            with db.begin():
+                access_token, granted_scopes, provider_account_id, access_failure = (
+                    runtime.prepare_capability_access(
+                        db=db,
+                        capability_id="cap.email.search",
+                        now_fn=utcnow,
+                        new_id_fn=lambda prefix: f"{prefix}_refresh_missing",
+                    )
+                )
+
+        with cast(Any, client.app).state.session_factory() as db:
+            connector = (
+                db.execute(
+                    text("SELECT last_error_code FROM google_connectors WHERE id = :id"),
+                    {"id": GOOGLE_CONNECTOR_ID},
+                )
+                .mappings()
+                .one()
+            )
+            refresh_failed_events = db.execute(
+                text(
+                    "SELECT payload FROM google_connector_events "
+                    "WHERE connector_id = :id "
+                    "AND event_type = 'evt.connector.google.refresh.failed'"
+                ),
+                {"id": GOOGLE_CONNECTOR_ID},
+            ).all()
+
+    assert access_token is None
+    assert granted_scopes == {GOOGLE_GMAIL_READ_SCOPE}
+    assert provider_account_id == "sub_refresh_missing"
+    assert access_failure is not None
+    assert access_failure.error == "token_expired"
+    assert access_failure.auth_failure is not None
+    assert access_failure.auth_failure.failure_class == "token_expired"
+    assert connector["last_error_code"] == "refresh_missing"
+    assert len(refresh_failed_events) == 1
+    assert refresh_failed_events[0][0]["failure_reason"] == "token_expired"
 
 
 def test_calendar_and_email_read_caps_execute_allowlisted_without_approval(
@@ -772,16 +1451,23 @@ def test_calendar_and_email_read_caps_execute_allowlisted_without_approval(
             assert attempt["policy"]["decision"] == "allow_inline"
             assert attempt["approval"]["status"] == "not_requested"
             assert attempt["execution"]["status"] == "succeeded"
+            output = attempt["execution"]["output"]
 
             rendered_message = turn_data["assistant_message"].lower()
             assert "approval required" not in rendered_message
             if message == "show schedule":
+                assert {event["provider_account_id"] for event in output["events"]} == {"sub_reads"}
                 assert "schedule" in rendered_message
             if message == "propose slots":
+                assert output["provider_account_id"] == "sub_reads"
                 assert "availability" in rendered_message
             if message == "search inbox":
+                assert {
+                    message_ref["provider_account_id"] for message_ref in output["messages"]
+                } == {"sub_reads"}
                 assert "invoice" in rendered_message
             if message == "open inbox item":
+                assert output["message"]["provider_account_id"] == "sub_reads"
                 assert "payment confirmed" not in rendered_message
                 assert "email msg-1" in rendered_message
 
@@ -864,7 +1550,13 @@ def test_attendee_slots_are_limited_scope_and_recoverable_without_freebusy_scope
         ("not_connected", None, "ok", None, "not_connected"),
         ("consent_required", "connect-calendar-only", "ok", None, "consent_required"),
         ("scope_missing", "connect-gmail-only", "ok", "cap.email.search", "scope_missing"),
-        ("token_expired", "connect-gmail-expired", "transient_failure", None, "token_expired"),
+        (
+            "provider_timeout",
+            "connect-gmail-expired",
+            "transient_failure",
+            None,
+            "provider_timeout",
+        ),
         ("access_revoked", "connect-gmail-expired", "invalid_grant", None, "access_revoked"),
     ],
 )
@@ -941,10 +1633,6 @@ def test_typed_auth_scope_failures_are_deterministic_and_recoverable(
             assert "connect" in rendered_message
         if expected_class in {"consent_required", "scope_missing", "access_revoked"}:
             assert "reconnect" in rendered_message
-        if expected_class == "token_expired":
-            assert "retry" in rendered_message
-            assert "reconnect" in rendered_message
-
         if expected_class == "not_connected":
             assert turn_data["surface_action_lifecycle"] == []
             assert all(
@@ -971,3 +1659,50 @@ def test_typed_auth_scope_failures_are_deterministic_and_recoverable(
             if event["event_type"] == "evt.action.execution.failed"
         )
         assert failed_event_payload["error"] == expected_class
+
+
+def test_bearer_token_rejection_remains_token_expired(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = ActionProposalAdapter(
+        run_calls_by_message={
+            "read emails": [{"name": "email.search", "input": {"query": "latest invoice"}}]
+        },
+        assistant_text_by_message={"read emails": "token_expired retry reconnect"},
+    )
+    oauth_client = FakeGoogleOAuthClient(
+        tokens_by_code={
+            "connect-gmail": FakeTokenBundle(
+                account_subject="sub_gmail",
+                account_email="gmail@example.com",
+                granted_scopes=[GOOGLE_GMAIL_READ_SCOPE],
+                access_token="tok_access_gmail",
+                refresh_token="tok_refresh_gmail",
+            ),
+        },
+    )
+    workspace_provider = FakeGoogleWorkspaceProvider(fail_token_expired_for={"cap.email.search"})
+    monkeypatch.setattr(
+        "ariel.worker.build_google_runtime",
+        lambda settings: build_google_runtime(
+            settings,
+            oauth_client=oauth_client,
+            workspace_provider=cast(GoogleWorkspaceProvider, workspace_provider),
+        ),
+    )
+    with _build_client(postgres_url, adapter) as client:
+        _bind_google_fakes(
+            client,
+            oauth_client=oauth_client,
+            workspace_provider=workspace_provider,
+        )
+        _connect_google(client, code="connect-gmail")
+
+        session_id = _session_id(client)
+        post_message_and_drain(client, session_id, message="read emails")
+        turn_data = _turn_data(client, session_id)
+
+        attempt = _surface_attempt(turn_data)
+        assert attempt["execution"]["status"] == "failed"
+        assert attempt["execution"]["error"] == "token_expired"

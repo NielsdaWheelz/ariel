@@ -7,8 +7,8 @@ from typing import Any, cast
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
-from ariel.app import ModelAdapter
-from tests.integration.app_helpers import create_migrated_app
+from ariel.model_adapter import ModelAdapter
+from tests.integration.app_helpers import create_test_app
 from ariel.persistence import JobRecord
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.responses_helpers import empty_recall_response, is_memory_subsystem_call
@@ -40,15 +40,13 @@ class NoAiOpsAdapter:
 
 @dataclass(frozen=True)
 class CaptureStorageRow:
-    terminal_state: str
-    turn_id: str | None
-    effective_session_id: str | None
-    status_code: int
-    normalized_turn_input: str | None
+    turn_id: str
+    effective_session_id: str
+    normalized_turn_input: str
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
-    app = create_migrated_app(
+    app = create_test_app(
         database_url=postgres_url,
         model_adapter=adapter,
         sandbox=FakeSandboxRuntime(),
@@ -67,14 +65,33 @@ def _turn_count(client: TestClient) -> int:
             return int(result["count"])
 
 
+def _capture_count(client: TestClient) -> int:
+    with _session_factory(client)() as db:
+        with db.begin():
+            result = db.execute(text("SELECT COUNT(*) AS count FROM captures")).mappings().one()
+            return int(result["count"])
+
+
+def _capture_columns(client: TestClient) -> set[str]:
+    with _session_factory(client)() as db:
+        with db.begin():
+            rows = db.execute(
+                text(
+                    "SELECT column_name "
+                    "FROM information_schema.columns "
+                    "WHERE table_name = 'captures'"
+                )
+            ).all()
+    return {str(row.column_name) for row in rows}
+
+
 def _capture_storage_row(client: TestClient, capture_id: str) -> CaptureStorageRow:
     with _session_factory(client)() as db:
         with db.begin():
             row = (
                 db.execute(
                     text(
-                        "SELECT terminal_state, turn_id, effective_session_id, status_code, "
-                        "normalized_turn_input "
+                        "SELECT turn_id, effective_session_id, normalized_turn_input "
                         "FROM captures WHERE id = :capture_id"
                     ),
                     {"capture_id": capture_id},
@@ -83,11 +100,9 @@ def _capture_storage_row(client: TestClient, capture_id: str) -> CaptureStorageR
                 .one()
             )
     return CaptureStorageRow(
-        terminal_state=str(row["terminal_state"]),
-        turn_id=cast(str | None, row["turn_id"]),
-        effective_session_id=cast(str | None, row["effective_session_id"]),
-        status_code=int(row["status_code"]),
-        normalized_turn_input=cast(str | None, row["normalized_turn_input"]),
+        turn_id=str(row["turn_id"]),
+        effective_session_id=str(row["effective_session_id"]),
+        normalized_turn_input=str(row["normalized_turn_input"]),
     )
 
 
@@ -169,19 +184,20 @@ def test_capture_record_creates_durable_capture_without_model(postgres_url: str)
         capture = first_payload["capture"]
         assert capture["id"].startswith("cpt_")
         assert capture["kind"] == "text"
-        assert capture["terminal_state"] == "turn_created"
         assert capture["idempotency_key"] == "capture-record-001"
-        assert capture["ingest_failure"] is None
         assert isinstance(capture["effective_session_id"], str)
         assert isinstance(capture["turn_id"], str)
+        assert "terminal_state" not in capture
+        assert "ingest_failure" not in capture
 
         row = _capture_storage_row(client, capture["id"])
-        assert row.terminal_state == "turn_created"
         assert row.turn_id == capture["turn_id"]
         assert row.effective_session_id == capture["effective_session_id"]
-        assert row.status_code == 200
-        assert row.normalized_turn_input is not None
         assert "capture ingress" in row.normalized_turn_input
+        capture_columns = _capture_columns(client)
+        assert "original_payload" not in capture_columns
+        assert "terminal_state" not in capture_columns
+        assert "ingest_error_code" not in capture_columns
 
         timeline = client.get(f"/v1/sessions/{capture['effective_session_id']}/events")
         assert timeline.status_code == 200
@@ -206,6 +222,66 @@ def test_capture_record_creates_durable_capture_without_model(postgres_url: str)
         assert replay.status_code == 200
         assert replay.json()["capture"]["id"] == capture["id"]
         assert _turn_count(client) == 1
+        assert adapter.calls == 0
+
+
+def test_capture_record_supports_shared_content_without_model(postgres_url: str) -> None:
+    adapter = NoAiOpsAdapter()
+    with _build_client(postgres_url, adapter) as client:
+        response = client.post(
+            "/v1/captures/record",
+            json={
+                "kind": "shared_content",
+                "shared_content": {
+                    "text": "link preview text",
+                    "urls": ["https://example.com/brief"],
+                },
+                "note": "read later",
+                "source": {"app": "mobile", "url": "https://example.com/share"},
+            },
+        )
+
+        assert response.status_code == 200
+        capture = response.json()["capture"]
+        assert capture["kind"] == "shared_content"
+        row = _capture_storage_row(client, capture["id"])
+        assert "capture_kind: shared_content" in row.normalized_turn_input
+        assert "shared_source_text:" in row.normalized_turn_input
+        assert "https://example.com/brief" in row.normalized_turn_input
+        assert _turn_count(client) == 1
+        assert adapter.calls == 0
+
+
+def test_capture_record_rejects_loose_payload_shapes_without_side_effects(
+    postgres_url: str,
+) -> None:
+    adapter = NoAiOpsAdapter()
+    invalid_payloads = [
+        {"kind": "TEXT", "text": "save this"},
+        {"kind": "text", "text": "save this", "url": ""},
+        {"kind": "url", "url": "https://example.com", "text": ""},
+        {
+            "kind": "shared_content",
+            "shared_content": {"text": "preview"},
+            "text": "",
+        },
+        {"kind": "text", "text": "save this", "note": ""},
+        {"kind": "text", "text": "save this", "source": {"app": ""}},
+        {
+            "kind": "shared_content",
+            "shared_content": {
+                "urls": ["https://example.com/a", "https://example.com/a"],
+            },
+        },
+    ]
+    with _build_client(postgres_url, adapter) as client:
+        for payload in invalid_payloads:
+            response = client.post("/v1/captures/record", json=payload)
+            assert response.status_code == 422
+            assert response.json()["ok"] is False
+
+        assert _turn_count(client) == 0
+        assert _capture_count(client) == 0
         assert adapter.calls == 0
 
 

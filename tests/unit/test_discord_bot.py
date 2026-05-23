@@ -639,7 +639,7 @@ def test_capture_command_records_capture_without_message_endpoint(
                     200,
                     json={
                         "ok": True,
-                        "capture": {"id": "cpt_123", "terminal_state": "turn_created"},
+                        "capture": {"id": "cpt_123"},
                     },
                 )
             ]
@@ -655,7 +655,7 @@ def test_capture_command_records_capture_without_message_endpoint(
         discord_interaction_id=987,
     )
 
-    assert message == "Capture recorded: cpt_123 (turn_created)"
+    assert message == "Capture recorded: cpt_123"
     assert fake_clients[0].calls == [
         {
             "method": "POST",
@@ -719,7 +719,7 @@ def test_slash_capture_sends_ephemeral_deterministic_response(
                 "discord_interaction_id": discord_interaction_id,
             }
         )
-        return "Capture recorded: cpt_123 (turn_created)"
+        return "Capture recorded: cpt_123"
 
     monkeypatch.setattr("ariel.discord_bot.record_capture", fake_record_capture)
     bot = _bot()
@@ -736,7 +736,7 @@ def test_slash_capture_sends_ephemeral_deterministic_response(
         }
     ]
     assert interaction.response.deferrals == [{"thinking": True, "ephemeral": True}]
-    assert interaction.followup.messages[0]["content"] == "Capture recorded: cpt_123 (turn_created)"
+    assert interaction.followup.messages[0]["content"] == "Capture recorded: cpt_123"
     assert interaction.followup.messages[0]["ephemeral"] is True
 
 

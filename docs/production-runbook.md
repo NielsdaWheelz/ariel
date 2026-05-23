@@ -185,7 +185,6 @@ Required Google Workspace push settings when Gmail/Calendar push is enabled:
 
 ```sh
 ARIEL_PUBLIC_WEBHOOK_BASE_URL=https://<your-fqdn>
-ARIEL_GOOGLE_PROVIDER_EVENT_TOKEN=<shared-google-callback-token>
 ARIEL_GOOGLE_PUBSUB_TOPIC=projects/<gcp-project>/topics/ariel-gmail-watch
 ARIEL_GOOGLE_PUBSUB_SUBSCRIPTION=projects/<gcp-project>/subscriptions/ariel-gmail-watch-sub
 ARIEL_GOOGLE_APPLICATION_CREDENTIALS_PATH=/etc/ariel/secrets/gcp-pubsub-sa.json
@@ -193,7 +192,9 @@ ARIEL_GOOGLE_APPLICATION_CREDENTIALS_PATH=/etc/ariel/secrets/gcp-pubsub-sa.json
 
 `ARIEL_PUBLIC_WEBHOOK_BASE_URL` is required in production; the Calendar
 `events.watch` `address` and the Google OAuth redirect URI are derived from
-it. `ARIEL_GOOGLE_PUBSUB_SUBSCRIPTION` and
+it. Calendar push callbacks are authenticated by the per-watch
+`X-Goog-Channel-Token` values stored with active watch-channel records.
+`ARIEL_GOOGLE_PUBSUB_SUBSCRIPTION` and
 `ARIEL_GOOGLE_APPLICATION_CREDENTIALS_PATH` must be set together: both for
 Gmail push on, neither for off.
 
@@ -231,25 +232,16 @@ Restrict `ARIEL_MAPS_API_KEY` in the Google Cloud console to the Routes API, Pla
 (New), and Geocoding API, and to this deployment's egress IP address. An unrestricted Maps
 key is a direct billing liability if it leaks.
 
-Optional home-address setting:
-
-```sh
-ARIEL_HOME_ADDRESS=<street address>
-```
-
-`ARIEL_HOME_ADDRESS` is an optional maps origin fallback used when no preceding
-located calendar event resolves a trip origin; with it unset, those trips are
-skipped. There is no leave-by subsystem: a "leave by HH:MM" reminder is now an
-ordinary agent behavior — the agent uses calendar access, the maps capability,
-and `proactive.schedule` on a normal wake. See
+There is no leave-by subsystem or configured home origin. A "leave by HH:MM"
+reminder is ordinary agent behavior: the agent uses calendar access, the maps
+capability, and `proactive.schedule` on a normal wake. See
 [modules/proactivity.md](modules/proactivity.md).
 
 ## Google Workspace Push
 
 Live Gmail and Calendar push run alongside the reconcile poll. The poll is
 the backstop; push is the live path. See
-[modules/google-workspace-push-cutover.md](modules/google-workspace-push-cutover.md)
-for the design.
+[modules/proactivity.md](modules/proactivity.md) for the standing design.
 
 ### Prerequisites
 

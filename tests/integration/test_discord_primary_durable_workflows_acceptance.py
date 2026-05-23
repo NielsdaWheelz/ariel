@@ -5,15 +5,15 @@ import hmac
 import json
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import text
 
-from ariel.app import ModelAdapter
-from tests.integration.app_helpers import create_migrated_app
+from ariel.model_adapter import ModelAdapter
+from tests.integration.app_helpers import create_test_app
 from tests.integration.responses_helpers import (
     empty_recall_response,
     is_memory_subsystem_call,
@@ -69,7 +69,7 @@ class FrozenClock:
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
-    app = create_migrated_app(
+    app = create_test_app(
         database_url=postgres_url,
         model_adapter=adapter,
         sandbox=FakeSandboxRuntime(),
@@ -157,6 +157,9 @@ def _seed_calendar_watch_channel(
     channel_id: str,
     channel_token: str,
     resource_id: str = "primary",
+    provider_resource_id: str | None = None,
+    status: str = "active",
+    expires_at: datetime | None = None,
 ) -> None:
     now = datetime(2026, 5, 19, 12, 0, tzinfo=UTC)
     with _session_factory(client)() as db:
@@ -169,10 +172,10 @@ def _seed_calendar_watch_channel(
                     resource_id=resource_id,
                     channel_id=channel_id,
                     channel_token=channel_token,
-                    provider_resource_id=f"res-{channel_id}",
+                    provider_resource_id=provider_resource_id or f"res-{channel_id}",
                     cursor_seed=None,
-                    status="active",
-                    expires_at=datetime(2026, 5, 26, 12, 0, tzinfo=UTC),
+                    status=status,
+                    expires_at=expires_at or datetime.now(UTC) + timedelta(days=7),
                     created_at=now,
                     updated_at=now,
                 )
@@ -181,13 +184,11 @@ def _seed_calendar_watch_channel(
 
 def test_google_provider_event_ingress_is_token_bound_deduped_and_conflict_safe(
     postgres_url: str,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("ARIEL_GOOGLE_PROVIDER_EVENT_TOKEN", "provider-token")
     with _build_client(postgres_url, DurableWorkflowAdapter()) as client:
-        _seed_calendar_watch_channel(client, channel_id="channel-1", channel_token="provider-token")
+        _seed_calendar_watch_channel(client, channel_id="channel-1", channel_token="channel-token")
         headers = {
-            "X-Goog-Channel-Token": "provider-token",
+            "X-Goog-Channel-Token": "channel-token",
             "X-Goog-Channel-ID": "channel-1",
             "X-Goog-Message-Number": "42",
             "X-Goog-Resource-State": "exists",
@@ -243,9 +244,7 @@ def test_google_provider_event_ingress_is_token_bound_deduped_and_conflict_safe(
 
 def test_google_provider_event_rejects_unknown_channel_id(
     postgres_url: str,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("ARIEL_GOOGLE_PROVIDER_EVENT_TOKEN", "provider-token")
     with _build_client(postgres_url, DurableWorkflowAdapter()) as client:
         response = client.post(
             "/v1/providers/google/events?resource_type=calendar&resource_id=primary",
@@ -264,9 +263,7 @@ def test_google_provider_event_rejects_unknown_channel_id(
 
 def test_google_provider_event_rejects_wrong_channel_token(
     postgres_url: str,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("ARIEL_GOOGLE_PROVIDER_EVENT_TOKEN", "provider-token")
     with _build_client(postgres_url, DurableWorkflowAdapter()) as client:
         _seed_calendar_watch_channel(
             client, channel_id="channel-1", channel_token="real-channel-token"
@@ -288,9 +285,7 @@ def test_google_provider_event_rejects_wrong_channel_token(
 
 def test_google_provider_event_rejects_cross_channel_token_replay(
     postgres_url: str,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("ARIEL_GOOGLE_PROVIDER_EVENT_TOKEN", "provider-token")
     with _build_client(postgres_url, DurableWorkflowAdapter()) as client:
         _seed_calendar_watch_channel(client, channel_id="channel-a", channel_token="token-a")
         _seed_calendar_watch_channel(
@@ -311,11 +306,70 @@ def test_google_provider_event_rejects_cross_channel_token_replay(
         assert response.status_code == 401
 
 
+@pytest.mark.parametrize(
+    ("channel_status", "expires_at"),
+    [
+        ("failed", None),
+        ("active", datetime(2026, 5, 18, 12, 0, tzinfo=UTC)),
+    ],
+)
+def test_google_provider_event_rejects_inactive_or_expired_channel(
+    postgres_url: str,
+    channel_status: str,
+    expires_at: datetime | None,
+) -> None:
+    with _build_client(postgres_url, DurableWorkflowAdapter()) as client:
+        _seed_calendar_watch_channel(
+            client,
+            channel_id="channel-1",
+            channel_token="channel-token",
+            status=channel_status,
+            expires_at=expires_at,
+        )
+        response = client.post(
+            "/v1/providers/google/events?resource_type=calendar&resource_id=primary",
+            headers={
+                "X-Goog-Channel-Token": "channel-token",
+                "X-Goog-Channel-ID": "channel-1",
+                "X-Goog-Message-Number": "1",
+                "X-Goog-Resource-State": "exists",
+                "content-type": "application/json",
+            },
+            content=b"{}",
+        )
+        assert response.status_code == 401
+        assert response.json()["error"]["code"] == "E_PROVIDER_EVENT_CHANNEL_INVALID"
+
+
+def test_google_provider_event_rejects_provider_resource_id_mismatch(
+    postgres_url: str,
+) -> None:
+    with _build_client(postgres_url, DurableWorkflowAdapter()) as client:
+        _seed_calendar_watch_channel(
+            client,
+            channel_id="channel-1",
+            channel_token="channel-token",
+            provider_resource_id="provider-resource-1",
+        )
+        response = client.post(
+            "/v1/providers/google/events?resource_type=calendar&resource_id=primary",
+            headers={
+                "X-Goog-Channel-Token": "channel-token",
+                "X-Goog-Channel-ID": "channel-1",
+                "X-Goog-Message-Number": "1",
+                "X-Goog-Resource-ID": "provider-resource-2",
+                "X-Goog-Resource-State": "exists",
+                "content-type": "application/json",
+            },
+            content=b"{}",
+        )
+        assert response.status_code == 401
+        assert response.json()["error"]["code"] == "E_PROVIDER_EVENT_CHANNEL_INVALID"
+
+
 def test_google_provider_event_rejects_gmail_resource_type(
     postgres_url: str,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("ARIEL_GOOGLE_PROVIDER_EVENT_TOKEN", "provider-token")
     with _build_client(postgres_url, DurableWorkflowAdapter()) as client:
         response = client.post(
             "/v1/providers/google/events?resource_type=gmail&resource_id=primary",

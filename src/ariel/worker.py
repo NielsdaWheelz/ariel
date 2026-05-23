@@ -3,11 +3,10 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 import httpx
-import ulid
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -21,15 +20,16 @@ from .app import (
     Runtime,
     TurnExecutionOutcome,
     WakeContext,
-    _get_or_create_active_session,
     _wake,
     build_agency_runtime,
     build_google_runtime,
     build_runtime,
 )
 from .capability_registry import REMEMBERER_CAPABILITY_IDS, capability_action_label
+from .clock import utcnow
 from .config import AppSettings
-from .google_connector import GOOGLE_CONNECTOR_ID
+from .google_connector import GOOGLE_CONNECTOR_ID, GoogleWatchRegistrationFailure
+from .ids import new_id
 from .persistence import (
     AgencyEventRecord,
     BackgroundTaskRecord,
@@ -40,9 +40,11 @@ from .persistence import (
     SessionRecord,
     SyncCursorRecord,
     enqueue_background_task,
+    get_or_create_active_session,
 )
 from .memory import enqueue_due_memory_dream, run_rememberer
 from .redaction import safe_failure_reason
+from .research_modes import ResearchMode
 from .research_runtime import ResearchFinding, render_finding, run_research
 from .sandbox_runtime import RunSandbox, SandboxRuntime
 from .sync_runtime import (
@@ -64,14 +66,6 @@ class UnsupportedTaskType(RuntimeError):
 MAX_TASK_ATTEMPTS = 5
 
 
-def _utcnow() -> datetime:
-    return datetime.now(tz=UTC)
-
-
-def _new_id(prefix: str) -> str:
-    return f"{prefix}_{ulid.new().str.lower()}"
-
-
 def _deliver_to_discord(
     *,
     outcome: TurnExecutionOutcome,
@@ -91,8 +85,8 @@ def _deliver_to_discord(
 
     # A wake that originates from a Discord message replies to it in its own
     # channel; a wake without an originating message posts to the default
-    # notification channel. discord_channel_id is therefore a fallback, not a
-    # gate — see docs/production-runbook.md and docs/modules/proactivity.md.
+    # notification channel. discord_channel_id is therefore the default channel,
+    # not a gate — see docs/production-runbook.md and docs/modules/proactivity.md.
     target_channel_id: int | str | None = None
     reply_to_message_id: int | None = None
     if isinstance(discord_context, dict):
@@ -150,6 +144,8 @@ def _deliver_to_discord(
                     )
                     line = f"{line} (expires <t:{epoch}:R>)"
                 except ValueError:
+                    # justify-ignore-error: optional display metadata must not
+                    # suppress the approval prompt or buttons.
                     pass
             approval_lines.append(line)
         content = "\n".join([content, "", *approval_lines])
@@ -188,12 +184,13 @@ def _deliver_to_discord(
         ]
 
     try:
-        httpx.post(
+        response = httpx.post(
             f"https://discord.com/api/v10/channels/{target_channel_id}/messages",
             headers={"Authorization": f"Bot {settings.discord_bot_token}"},
             json=body,
             timeout=settings.discord_notification_timeout_seconds,
         )
+        response.raise_for_status()
     except httpx.HTTPError as exc:
         _log.warning(
             "discord delivery HTTP error (channel_id=%s, turn_id=%s): %s",
@@ -266,9 +263,9 @@ def process_provider_watch_renew_due(
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
 ) -> None:
-    # Re-arm any push channel approaching expiry. register_provider_watches
-    # is idempotent and absorbs per-watch failures, so renewing all eligible
-    # watches once a near-expiry row exists is the whole handler.
+    # Re-arm any push channel approaching expiry. register_provider_watches is
+    # idempotent and records per-channel failures before raising, so the worker
+    # task retry budget owns transient provider failures.
     #
     # A token-refresh failure here is a connector error the user must see:
     # access_token_for_background_sync records the connector error state on
@@ -276,6 +273,7 @@ def process_provider_watch_renew_due(
     # block commits, so the wake and the connector error commit together.
     now = now_fn()
     runtime = build_google_runtime(settings)
+    watch_registration_failure: GoogleWatchRegistrationFailure | None = None
     with session_factory() as db:
         with db.begin():
             renew_horizon = now + timedelta(seconds=_PROVIDER_WATCH_RENEW_LEAD_SECONDS)
@@ -303,7 +301,7 @@ def process_provider_watch_renew_due(
                     new_id_fn=new_id_fn,
                 )
             except RuntimeError as exc:
-                error_code = safe_failure_reason(str(exc), fallback="token_refresh_failed")
+                error_code = safe_failure_reason(str(exc), safe_reason="token_refresh_failed")
                 enqueue_background_task(
                     db,
                     task_type="agent_wake",
@@ -316,14 +314,19 @@ def process_provider_watch_renew_due(
                     now=now,
                 )
                 return
-            runtime.register_provider_watches(
-                db=db,
-                access_token=access_token,
-                granted_scopes=list(connector.granted_scopes),
-                account_subject=connector.account_subject or connector.id,
-                now_fn=now_fn,
-                new_id_fn=new_id_fn,
-            )
+            try:
+                runtime.register_provider_watches(
+                    db=db,
+                    access_token=access_token,
+                    granted_scopes=list(connector.granted_scopes),
+                    account_subject=connector.account_subject or connector.id,
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
+            except GoogleWatchRegistrationFailure as exc:
+                watch_registration_failure = exc
+    if watch_registration_failure is not None:
+        raise watch_registration_failure
 
 
 def process_provider_reconcile_sync_due(
@@ -376,20 +379,19 @@ def process_one_task(
     *,
     session_factory: sessionmaker[Session],
     settings: AppSettings | None = None,
-    model_adapter: Any | None = None,
     runtime: Runtime | None = None,
 ) -> bool:
-    resolved_settings = settings or AppSettings()
+    resolved_settings = runtime.settings if runtime is not None else settings or AppSettings()
 
     with session_factory() as db:
         with db.begin():
-            now = _utcnow()
+            now = utcnow()
             enqueue_due_memory_dream(db, settings=resolved_settings, now=now)
             seed_provider_maintenance_tasks(db, settings=resolved_settings, now=now)
 
     with session_factory() as db:
         with db.begin():
-            task = select_next_task(db, now=_utcnow())
+            task = select_next_task(db, now=utcnow())
             if task is None:
                 return False
             task_id = task.id
@@ -431,7 +433,9 @@ def process_one_task(
                 with session_factory() as db:
                     # A research-completion wake targets the session that
                     # dispatched the run; a plain note wake uses the active one.
-                    request_session_id = research_session_id or _get_or_create_active_session(db).id
+                    request_session_id = (
+                        research_session_id or get_or_create_active_session(db, now=utcnow()).id
+                    )
                     outcome = _wake(
                         runtime=runtime,
                         db=db,
@@ -488,8 +492,8 @@ def process_one_task(
                     action_attempt_id=action_attempt_id,
                     google_runtime=build_google_runtime(resolved_settings),
                     agency_runtime=build_agency_runtime(resolved_settings),
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
+                    now_fn=utcnow,
+                    new_id_fn=new_id,
                     settings=resolved_settings,
                 )
             case "provider_write_reconcile_due":
@@ -500,8 +504,8 @@ def process_one_task(
                     session_factory=session_factory,
                     task_payload=task_payload,
                     agency_runtime=build_agency_runtime(resolved_settings),
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
+                    now_fn=utcnow,
+                    new_id_fn=new_id,
                 )
             case "expire_approvals":
                 _expire_approvals(session_factory=session_factory, task_payload=task_payload)
@@ -509,15 +513,15 @@ def process_one_task(
                 process_provider_event_received(
                     session_factory=session_factory,
                     task_payload=task_payload,
-                    now_fn=_utcnow,
+                    now_fn=utcnow,
                 )
             case "provider_sync_due":
                 process_provider_sync_due(
                     session_factory=session_factory,
                     task_payload=task_payload,
                     settings=resolved_settings,
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
+                    now_fn=utcnow,
+                    new_id_fn=new_id,
                 )
             case "memory_encode":
                 if runtime is None:
@@ -543,8 +547,8 @@ def process_one_task(
                         approval_ttl_seconds=int(runtime.settings.approval_ttl_seconds),
                         approval_actor_id=str(runtime.settings.approval_actor_id),
                         add_event=lambda *_args, **_kwargs: None,
-                        now_fn=_utcnow,
-                        new_id_fn=_new_id,
+                        now_fn=utcnow,
+                        new_id_fn=new_id,
                     )
             case "memory_dream":
                 if runtime is None:
@@ -566,21 +570,21 @@ def process_one_task(
                         approval_ttl_seconds=int(runtime.settings.approval_ttl_seconds),
                         approval_actor_id=str(runtime.settings.approval_actor_id),
                         add_event=lambda *_args, **_kwargs: None,
-                        now_fn=_utcnow,
-                        new_id_fn=_new_id,
+                        now_fn=utcnow,
+                        new_id_fn=new_id,
                     )
             case "provider_watch_renew_due":
                 process_provider_watch_renew_due(
                     session_factory=session_factory,
                     settings=resolved_settings,
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
+                    now_fn=utcnow,
+                    new_id_fn=new_id,
                 )
             case "provider_reconcile_sync_due":
                 process_provider_reconcile_sync_due(
                     session_factory=session_factory,
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
+                    now_fn=utcnow,
+                    new_id_fn=new_id,
                 )
             case _:
                 raise UnsupportedTaskType(f"unsupported task type: {task_type}")
@@ -610,7 +614,7 @@ def process_one_task(
                 # A recurring task is re-armed in place to its next occurrence;
                 # a one-shot is deleted. A row is deleted only on success.
                 if task.recurrence_seconds is not None:
-                    now = _utcnow()
+                    now = utcnow()
                     task.run_after = now + timedelta(seconds=task.recurrence_seconds)
                     task.attempts = 0
                     task.updated_at = now
@@ -655,7 +659,7 @@ def _mark_task_failed(
             task = db.get(BackgroundTaskRecord, task_id)
             if task is None:
                 return
-            now = _utcnow()
+            now = utcnow()
             task.attempts += 1
             task.updated_at = now
             if task.attempts >= MAX_TASK_ATTEMPTS:
@@ -769,10 +773,16 @@ def _process_research_run(*, runtime: Runtime, task_payload: dict[str, Any]) -> 
     ``kind="research"`` ``TurnRecord`` and never raises; its typed
     ``ResearchFinding`` becomes the completion wake's payload."""
     question = _payload_text(task_payload, "question")
-    mode = _payload_text(task_payload, "mode")
+    payload_mode = _payload_text(task_payload, "mode")
     session_id = _payload_text(task_payload, "session_id")
-    if question is None or mode is None or session_id is None:
+    if question is None or payload_mode is None or session_id is None:
         raise RuntimeError("research_run task payload invalid")
+    mode: ResearchMode
+    match payload_mode:
+        case "web" | "personal" | "memories":
+            mode = payload_mode
+        case _:
+            raise RuntimeError("research_run task payload invalid")
 
     with runtime.session_factory() as db:
         finding = run_research(
@@ -785,7 +795,7 @@ def _process_research_run(*, runtime: Runtime, task_payload: dict[str, Any]) -> 
             session_id=session_id,
             question=question,
             mode=mode,
-            now_fn=_utcnow,
+            now_fn=utcnow,
         )
 
     with runtime.session_factory() as db:
@@ -805,7 +815,7 @@ def _process_research_run(*, runtime: Runtime, task_payload: dict[str, Any]) -> 
                     },
                     "session_id": session_id,
                 },
-                now=_utcnow(),
+                now=utcnow(),
             )
 
 
@@ -851,7 +861,7 @@ def _process_agency_event_received(
             if agency_event.processed_at is not None:
                 return
 
-            now = _utcnow()
+            now = utcnow()
             if agency_event.event_type == "heartbeat":
                 agency_event.status = "processed"
                 agency_event.processed_at = now
@@ -876,7 +886,7 @@ def _process_agency_event_received(
             )
             if job is None:
                 job = JobRecord(
-                    id=_new_id("job"),
+                    id=new_id("job"),
                     source=agency_event.source,
                     external_job_id=agency_event.external_job_id,
                     title=_payload_text(payload, "title"),
@@ -897,7 +907,7 @@ def _process_agency_event_received(
 
             db.add(
                 JobEventRecord(
-                    id=_new_id("jev"),
+                    id=new_id("jev"),
                     job_id=job.id,
                     agency_event_id=agency_event.id,
                     event_type=agency_event.event_type,
@@ -944,8 +954,8 @@ def _expire_approvals(
                 reconcile_expired_approvals_for_session(
                     db=db,
                     session_id=session_id,
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
+                    now_fn=utcnow,
+                    new_id_fn=new_id,
                 )
                 return
             session_ids = db.scalars(select(SessionRecord.id)).all()
@@ -953,8 +963,8 @@ def _expire_approvals(
                 reconcile_expired_approvals_for_session(
                     db=db,
                     session_id=existing_session_id,
-                    now_fn=_utcnow,
-                    new_id_fn=_new_id,
+                    now_fn=utcnow,
+                    new_id_fn=new_id,
                 )
 
 

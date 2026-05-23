@@ -16,6 +16,7 @@ from ariel.google_connector import (
     DefaultGoogleWorkspaceProvider,
     GOOGLE_CONNECTOR_ID,
     GoogleConnectorRuntime,
+    GoogleProviderRequestFailure,
     is_typed_google_read_output,
 )
 from ariel.google_workspace_normalization import normalize_calendar_event
@@ -40,6 +41,12 @@ def _provider_sync_lock_id(*parts: str) -> int:
 def _json_digest(payload: dict[str, Any]) -> str:
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+class ProviderSyncFailure(RuntimeError):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
 
 
 def _acquire_provider_sync_lock(
@@ -138,16 +145,16 @@ def process_provider_sync_due(
     lock_id: int | None = None
     if provider_event_id is not None:
         with session_factory() as db:
-            event = db.scalar(
+            source_event = db.scalar(
                 select(ProviderEventRecord)
                 .where(ProviderEventRecord.id == provider_event_id)
                 .limit(1)
             )
-            if event is None:
+            if source_event is None:
                 raise RuntimeError("provider event not found")
-            provider = event.provider
-            resource_type = event.resource_type
-            resource_id = event.resource_id
+            provider = source_event.provider
+            resource_type = source_event.resource_type
+            resource_id = source_event.resource_id
             if provider != "google":
                 raise RuntimeError("unsupported provider sync")
             if resource_type not in {"calendar", "gmail", "drive"}:
@@ -322,7 +329,7 @@ def process_provider_sync_due(
                         access_token=access_token,
                     )
                     if history_id is None:
-                        raise RuntimeError("gmail_sync_cursor_missing")
+                        raise ProviderSyncFailure("gmail_sync_cursor_missing")
                     outputs.append({"historyId": history_id, "history": []})
                 else:
                     page_token = None
@@ -353,8 +360,8 @@ def process_provider_sync_due(
                         page_token = _payload_text(output, "nextPageToken")
                         if page_token is None:
                             break
-        except Exception as exc:
-            error = str(exc)
+        except (GoogleProviderRequestFailure, ProviderSyncFailure) as exc:
+            error = exc.code
             if _is_stale_cursor_error(resource_type=resource_type, error=error):
                 # A stale delta cursor — Gmail 404 or Calendar 410. Clear the
                 # cursor and re-enqueue a full sync; the next run bootstraps.
@@ -411,9 +418,10 @@ def process_provider_sync_due(
                                             "thread_id": None,
                                             "mode": "message",
                                         },
+                                        provider_account_id=sync_provider_account_id,
                                     )
-                                except RuntimeError as exc:
-                                    reason = str(exc).strip()
+                                except GoogleProviderRequestFailure as exc:
+                                    reason = exc.code
                                     if reason == "resource_not_found":
                                         reason_code = "gmail_message_unavailable"
                                         status = "no_body"
@@ -478,23 +486,17 @@ def process_provider_sync_due(
                                         "retrieved_at": to_rfc3339(now_fn()),
                                         "status": "succeeded",
                                     }
-                                    if isinstance(read_output, dict):
-                                        read_message = read_output.get("message")
-                                        if isinstance(read_message, dict):
-                                            read_message["provider_account_id"] = (
-                                                sync_provider_account_id
-                                            )
                                 if not _gmail_sync_read_output_valid(read_output):
                                     raise RuntimeError("gmail_sync_read_output_invalid")
                                 gmail_read_outputs[message_id] = read_output
-        except Exception as exc:
+        except GoogleProviderRequestFailure as exc:
             _mark_sync_failed(
                 session_factory=session_factory,
                 provider_event_id=provider_event_id,
                 sync_run_id=sync_run_id,
                 resource_type=resource_type,
                 resource_id=resource_id,
-                error=str(exc),
+                error=exc.code,
                 now=now_fn(),
             )
             raise
@@ -643,7 +645,8 @@ def _sync_calendar_item(
     if external_id is None:
         return False
     status = "deleted" if item.get("status") == "cancelled" else "active"
-    updated = _payload_text(item, "updated") or to_rfc3339(now)
+    updated = _payload_text(item, "updated")
+    source_timestamp = _parse_provider_timestamp(updated)
     normalized = normalize_calendar_event(
         item,
         provider_account_id=provider_account_id,
@@ -692,7 +695,7 @@ def _sync_calendar_item(
             calendar_id=resource_id,
             ical_uid=normalized.ical_uid,
             status=status,
-            source_timestamp=_parse_provider_timestamp(updated),
+            source_timestamp=source_timestamp,
             observed_at=now,
             provider_url=normalized.provider_url,
             metadata_json=metadata,
@@ -704,7 +707,7 @@ def _sync_calendar_item(
         db.flush()
     else:
         provider_object.status = status
-        provider_object.source_timestamp = _parse_provider_timestamp(updated)
+        provider_object.source_timestamp = source_timestamp
         provider_object.observed_at = now
         provider_object.provider_url = normalized.provider_url
         provider_object.metadata_json = metadata
@@ -743,7 +746,7 @@ def _sync_calendar_item(
                 thread_external_id=None,
                 calendar_id=resource_id,
                 source_uri=normalized.provider_url,
-                source_timestamp=_parse_provider_timestamp(updated),
+                source_timestamp=source_timestamp,
                 content_digest=content_digest,
                 metadata_json=metadata,
                 taint="provider_untrusted",
@@ -795,7 +798,7 @@ def _sync_calendar_item(
             thread_external_id=None,
             calendar_id=resource_id,
             source_uri=normalized.provider_url,
-            source_timestamp=_parse_provider_timestamp(updated),
+            source_timestamp=source_timestamp,
             content_digest=content_digest,
             metadata_json=metadata,
             taint="provider_untrusted",
@@ -901,7 +904,7 @@ def _sync_gmail_history(
             if message_id is None:
                 continue
             thread_id = _payload_text(message, "threadId")
-            message_received_at = _gmail_message_received_at(message, fallback=now)
+            message_received_at = _gmail_message_received_at(message)
             label_ids_raw = message.get("labelIds")
             label_ids = (
                 [label_id for label_id in label_ids_raw if isinstance(label_id, str)]
@@ -1196,16 +1199,16 @@ def _sync_gmail_history(
     return item_count, observation_count
 
 
-def _gmail_message_received_at(message: dict[str, Any], *, fallback: datetime) -> datetime:
+def _gmail_message_received_at(message: dict[str, Any]) -> datetime | None:
     internal_date_raw = message.get("internalDate")
     if isinstance(internal_date_raw, str) and internal_date_raw.strip():
         try:
             millis = int(internal_date_raw.strip())
         except ValueError:
-            return fallback
+            return None
         if millis >= 0:
             return datetime.fromtimestamp(millis / 1000, tz=UTC)
-    return fallback
+    return None
 
 
 def _sync_drive_change(

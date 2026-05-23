@@ -8,9 +8,14 @@ from typing import Any, cast
 from fastapi.testclient import TestClient
 import pytest
 
-from ariel.app import ModelAdapter
-from tests.integration.app_helpers import create_migrated_app
-from ariel.google_connector import GOOGLE_CONNECTOR_ID, GoogleWorkspaceProvider
+from ariel.model_adapter import ModelAdapter
+from tests.integration.app_helpers import create_test_app
+from ariel.google_connector import (
+    GOOGLE_CONNECTOR_ID,
+    GoogleOAuthRefreshFailure,
+    GoogleProviderRequestFailure,
+    GoogleWorkspaceProvider,
+)
 from ariel.persistence import GoogleConnectorRecord
 from tests.integration.responses_helpers import (
     empty_recall_response,
@@ -80,7 +85,6 @@ class ActionProposalAdapter:
         if not run_calls:
             run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
         return responses_with_run_calls(
-            assistant_text=assistant_text,
             calls=run_calls,
             provider=self.provider,
             model=self.model,
@@ -155,9 +159,9 @@ class FakeGoogleOAuthClient:
 
     def refresh_access_token(self, *, refresh_token: str) -> dict[str, Any]:
         if self.refresh_mode == "invalid_grant":
-            raise RuntimeError("invalid_grant")
+            raise GoogleOAuthRefreshFailure(code="access_revoked")
         if self.refresh_mode == "transient_failure":
-            raise RuntimeError("upstream_timeout")
+            raise GoogleOAuthRefreshFailure(code="provider_timeout")
         return {
             "access_token": f"refreshed::{refresh_token}",
             "refresh_token": refresh_token,
@@ -177,6 +181,7 @@ class FakeGoogleWorkspaceProvider:
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]:
         del access_token
         return {
@@ -184,7 +189,7 @@ class FakeGoogleWorkspaceProvider:
             "status": "succeeded",
             "events": [
                 {
-                    "provider_account_id": "google",
+                    "provider_account_id": provider_account_id,
                     "calendar_id": "primary",
                     "event_id": "evt-team-sync",
                     "status": "confirmed",
@@ -218,6 +223,7 @@ class FakeGoogleWorkspaceProvider:
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
         attendee_intersection_enabled: bool,
     ) -> dict[str, Any]:
         del access_token
@@ -225,6 +231,7 @@ class FakeGoogleWorkspaceProvider:
         if attendee_intersection_enabled:
             return {
                 "schema_version": "google.calendar.slot_options.v1",
+                "provider_account_id": provider_account_id,
                 "slots": [
                     {
                         "slot_id": "slot_1",
@@ -258,6 +265,7 @@ class FakeGoogleWorkspaceProvider:
             }
         return {
             "schema_version": "google.calendar.slot_options.v1",
+            "provider_account_id": provider_account_id,
             "slots": [
                 {
                     "slot_id": "slot_1",
@@ -297,8 +305,9 @@ class FakeGoogleWorkspaceProvider:
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]:
-        del access_token, normalized_input
+        del access_token, normalized_input, provider_account_id
         return {
             "schema_version": "google.gmail.message_refs.v1",
             "status": "succeeded",
@@ -312,8 +321,9 @@ class FakeGoogleWorkspaceProvider:
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]:
-        del access_token, normalized_input
+        del access_token, normalized_input, provider_account_id
         return {
             "schema_version": "google.gmail.message_evidence.v1",
             "message": {"message_id": "msg-1"},
@@ -342,7 +352,7 @@ class FakeGoogleWorkspaceProvider:
     ) -> dict[str, Any]:
         del access_token, normalized_input
         if "cap.email.draft" in self.fail_scope_missing_for:
-            raise RuntimeError("insufficient_permissions")
+            raise GoogleProviderRequestFailure("insufficient_permissions")
         return {"provider_draft_ref": "gmail://draft/1"}
 
     def email_send(
@@ -353,7 +363,7 @@ class FakeGoogleWorkspaceProvider:
     ) -> dict[str, Any]:
         del access_token, normalized_input
         if "cap.email.send" in self.fail_scope_missing_for:
-            raise RuntimeError("insufficient_permissions")
+            raise GoogleProviderRequestFailure("insufficient_permissions")
         return {
             "status": "sent",
             "message_id": "msg_1",
@@ -370,7 +380,7 @@ class FakeGoogleWorkspaceProvider:
     ) -> dict[str, Any]:
         del access_token, normalized_input
         if "cap.calendar.create_event" in self.fail_scope_missing_for:
-            raise RuntimeError("insufficient_permissions")
+            raise GoogleProviderRequestFailure("insufficient_permissions")
         return {
             "schema_version": "google.calendar.create_result.v1",
             "status": "created",
@@ -389,7 +399,7 @@ class FakeGoogleWorkspaceProvider:
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
-    app = create_migrated_app(
+    app = create_test_app(
         database_url=postgres_url,
         model_adapter=adapter,
         sandbox=FakeSandboxRuntime(),
@@ -622,14 +632,14 @@ def test_transient_auth_failures_do_not_remap_connected_readiness(
         turn_data = _turn_data(client, session_id)
         attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"
-        assert attempt["execution"]["error"] == "token_expired"
+        assert attempt["execution"]["error"] == "provider_timeout"
 
         connector = client.get("/v1/connectors/google")
         assert connector.status_code == 200
         connector_payload = connector.json()["connector"]
         assert connector_payload["status"] == "connected"
         assert connector_payload["readiness"] == "connected"
-        assert connector_payload["last_error_code"] == "token_expired"
+        assert connector_payload["last_error_code"] == "provider_timeout"
 
 
 def test_reconnect_required_persists_until_successful_reconnect(
@@ -832,7 +842,7 @@ def test_blocking_readiness_state_is_not_downgraded_by_later_transient_failure(
         post_message_and_drain(client, session_id, message="show schedule")
         transient_turn_data = _turn_data(client, session_id)
         transient_attempt = _surface_attempt(transient_turn_data)
-        assert transient_attempt["execution"]["error"] == "token_expired"
+        assert transient_attempt["execution"]["error"] == "provider_timeout"
 
         connector = client.get("/v1/connectors/google")
         assert connector.status_code == 200

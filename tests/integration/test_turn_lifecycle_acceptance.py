@@ -7,8 +7,9 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from ariel.app import ModelAdapter, create_app
-from tests.integration.app_helpers import create_migrated_app
+from ariel.app import create_app
+from ariel.model_adapter import ModelAdapter, ModelAdapterError
+from tests.integration.app_helpers import create_test_app
 from tests.integration.responses_helpers import (
     empty_recall_response,
     is_memory_subsystem_call,
@@ -51,7 +52,13 @@ class DeterministicModelAdapter:
             )
         del tools, history, context_bundle
         if self.fail:
-            raise RuntimeError("simulated provider failure")
+            raise ModelAdapterError(
+                safe_reason="simulated provider failure",
+                status_code=502,
+                code="E_MODEL_FAILURE",
+                message="model provider request failed",
+                retryable=False,
+            )
         return responses_run_message(
             assistant_text=f"assistant::{user_message}",
             provider=self.provider,
@@ -63,7 +70,7 @@ class DeterministicModelAdapter:
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
-    app = create_migrated_app(
+    app = create_test_app(
         database_url=postgres_url,
         model_adapter=adapter,
         sandbox=FakeSandboxRuntime(),
@@ -174,9 +181,7 @@ def test_model_failure_is_auditable_and_turn_terminates_failed(postgres_url: str
         assert turn_data["status"] == "failed"
         event_types = [event["event_type"] for event in turn_data["events"]]
         # Retriever runs first (succeeds, emitting its model events); then the
-        # main agent call fails (DeterministicModelAdapter.fail=True raises plain
-        # RuntimeError, which the retriever guard short-circuits but the main
-        # agent raises on).
+        # main agent call fails with the typed model adapter error.
         assert event_types == [
             "evt.turn.started",
             "evt.model.started",  # retriever
@@ -188,7 +193,7 @@ def test_model_failure_is_auditable_and_turn_terminates_failed(postgres_url: str
         model_failed = next(
             event for event in turn_data["events"] if event["event_type"] == "evt.model.failed"
         )
-        assert "failure_reason" in model_failed["payload"]
+        assert model_failed["payload"]["failure_reason"] == "simulated provider failure"
         assert not any(saved_turn["status"] == "in_progress" for saved_turn in turns)
 
 
@@ -245,29 +250,6 @@ def test_whitespace_only_message_is_rejected_with_standard_error(postgres_url: s
 
 
 @dataclass
-class SecretLeakingFailureAdapter:
-    provider: str = "provider.leaky"
-    model: str = "model.leaky-v1"
-    secret_value: str = "sk-live-very-secret"
-
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_memory_subsystem_call(input_items):
-            return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
-            )
-        del tools, user_message, history, context_bundle
-        raise RuntimeError(f"provider rejected credential {self.secret_value}")
-
-
-@dataclass
 class NonSecretFailureAdapter:
     provider: str = "provider.non-secret"
     model: str = "model.non-secret-v1"
@@ -286,7 +268,13 @@ class NonSecretFailureAdapter:
                 provider=self.provider, model=self.model, input_items=input_items
             )
         del tools, user_message, history, context_bundle
-        raise RuntimeError("token limit exceeded for this request")
+        raise ModelAdapterError(
+            safe_reason="token limit exceeded for this request",
+            status_code=502,
+            code="E_MODEL_FAILURE",
+            message="model provider request failed",
+            retryable=False,
+        )
 
 
 def test_default_runtime_model_requires_server_secret_credentials(
@@ -296,7 +284,7 @@ def test_default_runtime_model_requires_server_secret_credentials(
     monkeypatch.setenv("ARIEL_MODEL_NAME", "gpt-5.5")
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "")
 
-    app = create_migrated_app(
+    app = create_test_app(
         database_url=postgres_url,
         model_adapter=None,
         sandbox=FakeSandboxRuntime(),
@@ -315,6 +303,7 @@ def test_default_runtime_model_requires_server_secret_credentials(
             "evt.turn.started",
             "evt.model.started",  # retriever (no API key)
             "evt.model.failed",  # retriever fails
+            "evt.memory.recall_failed",  # typed recall failure is non-fatal
             "evt.model.started",  # main agent (no API key)
             "evt.model.failed",  # main agent fails
             "evt.turn.failed",

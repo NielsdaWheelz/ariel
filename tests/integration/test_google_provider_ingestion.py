@@ -9,22 +9,25 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from ariel.app import ModelAdapter
-from tests.integration.app_helpers import create_migrated_app
+from ariel.model_adapter import ModelAdapter
+from tests.integration.app_helpers import create_test_app
 from tests.integration.responses_helpers import empty_recall_response, is_memory_subsystem_call
 from ariel.config import AppSettings
 from ariel.google_connector import (
     GOOGLE_CONNECTOR_ID,
     GoogleConnectorRuntime,
-    _encrypt_secret,
+    GoogleProviderRequestFailure,
+    GoogleWatchRegistrationFailure,
 )
 from ariel.persistence import (
     BackgroundTaskRecord,
     GoogleConnectorRecord,
+    GoogleConnectorEventRecord,
     ProviderWatchChannelRecord,
     SyncCursorRecord,
     SyncRunRecord,
 )
+from ariel.secret_cipher import encrypt_secret
 from ariel.sync_runtime import process_provider_sync_due
 from ariel.worker import (
     process_provider_reconcile_sync_due,
@@ -65,7 +68,7 @@ class WatchRecordingProvider:
     gmail_watch_calls: list[dict[str, Any]] = field(default_factory=list)
     calendar_watch_calls: list[dict[str, Any]] = field(default_factory=list)
     gmail_expiration: datetime = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
-    calendar_expiration: datetime = datetime(2026, 5, 25, 12, 0, tzinfo=UTC)
+    calendar_expiration: datetime = datetime(2030, 1, 1, 12, 0, tzinfo=UTC)
 
     def gmail_register_watch(
         self,
@@ -165,7 +168,7 @@ class _NoCallAdapter:
         raise AssertionError("model should not be called in this test")
 
 
-def test_connect_registers_gmail_and_calendar_watches_and_persists_rows(
+def test_connect_registers_watches_and_calendar_push_accepts_persisted_token(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -173,7 +176,7 @@ def test_connect_registers_gmail_and_calendar_watches_and_persists_rows(
     monkeypatch.setenv("ARIEL_PUBLIC_WEBHOOK_BASE_URL", PUBLIC_WEBHOOK_BASE_URL)
     provider = WatchRecordingProvider()
     oauth_client = ConnectOAuthClient(granted_scopes=[GMAIL_READ_SCOPE, CALENDAR_READ_SCOPE])
-    app = create_migrated_app(
+    app = create_test_app(
         database_url=postgres_url,
         model_adapter=cast(ModelAdapter, _NoCallAdapter()),
         sandbox=FakeSandboxRuntime(),
@@ -200,28 +203,48 @@ def test_connect_registers_gmail_and_calendar_watches_and_persists_rows(
                 )
             ).all()
 
-    assert len(provider.gmail_watch_calls) == 1
-    assert provider.gmail_watch_calls[0]["topic_name"] == PUBSUB_TOPIC
-    assert len(provider.calendar_watch_calls) == 1
-    assert provider.calendar_watch_calls[0]["address"] == EXPECTED_CALENDAR_WATCH_ADDRESS
-    assert provider.calendar_watch_calls[0]["calendar_id"] == "primary"
+        assert len(provider.gmail_watch_calls) == 1
+        assert provider.gmail_watch_calls[0]["topic_name"] == PUBSUB_TOPIC
+        assert len(provider.calendar_watch_calls) == 1
+        calendar_watch_call = provider.calendar_watch_calls[0]
+        assert calendar_watch_call["address"] == EXPECTED_CALENDAR_WATCH_ADDRESS
+        assert calendar_watch_call["calendar_id"] == "primary"
 
-    by_type = {channel.resource_type: channel for channel in channels}
-    assert set(by_type) == {"calendar", "gmail"}
-    gmail_channel = by_type["gmail"]
-    assert gmail_channel.status == "active"
-    assert gmail_channel.resource_id == "sub_watch"
-    assert gmail_channel.cursor_seed == "hist-watch-1"
-    assert gmail_channel.expires_at == datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
-    calendar_channel = by_type["calendar"]
-    assert calendar_channel.status == "active"
-    assert calendar_channel.resource_id == "primary"
-    assert calendar_channel.provider_resource_id == "res-watch-1"
-    assert calendar_channel.channel_id is not None
-    assert calendar_channel.channel_token is not None
+        by_type = {channel.resource_type: channel for channel in channels}
+        assert set(by_type) == {"calendar", "gmail"}
+        gmail_channel = by_type["gmail"]
+        assert gmail_channel.status == "active"
+        assert gmail_channel.resource_id == "sub_watch"
+        assert gmail_channel.cursor_seed == "hist-watch-1"
+        assert gmail_channel.expires_at == datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+        calendar_channel = by_type["calendar"]
+        assert calendar_channel.status == "active"
+        assert calendar_channel.resource_id == "primary"
+        assert calendar_channel.provider_resource_id == "res-watch-1"
+        calendar_channel_id = calendar_channel.channel_id
+        calendar_channel_token = calendar_channel.channel_token
+        assert calendar_channel_id is not None
+        assert calendar_channel_token is not None
+        assert calendar_watch_call["channel_id"] == calendar_channel_id
+        assert calendar_watch_call["channel_token"] == calendar_channel_token
+        assert calendar_channel_token != "provider-token"
+
+        provider_event = client.post(
+            "/v1/providers/google/events?resource_type=calendar&resource_id=primary",
+            headers={
+                "X-Goog-Channel-ID": calendar_channel_id,
+                "X-Goog-Channel-Token": calendar_channel_token,
+                "X-Goog-Message-Number": "1",
+                "X-Goog-Resource-ID": "res-watch-1",
+                "X-Goog-Resource-State": "exists",
+            },
+            json={},
+        )
+        assert provider_event.status_code == 202
+        assert provider_event.json()["duplicate"] is False
 
 
-def test_connect_watch_registration_failure_is_non_fatal(
+def test_connect_watch_registration_failure_fails_callback(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -230,10 +253,10 @@ def test_connect_watch_registration_failure_is_non_fatal(
     @dataclass
     class FailingWatchProvider:
         def gmail_register_watch(self, **_: Any) -> dict[str, Any]:
-            raise RuntimeError("google_upstream_timeout")
+            raise GoogleWatchRegistrationFailure(code="google_upstream_timeout")
 
     oauth_client = ConnectOAuthClient(granted_scopes=[GMAIL_READ_SCOPE, CALENDAR_READ_SCOPE])
-    app = create_migrated_app(
+    app = create_test_app(
         database_url=postgres_url,
         model_adapter=cast(ModelAdapter, _NoCallAdapter()),
         sandbox=FakeSandboxRuntime(),
@@ -249,13 +272,77 @@ def test_connect_watch_registration_failure_is_non_fatal(
             "/v1/connectors/google/callback",
             params={"state": state, "code": "connect-fail"},
         )
-        # The connector still connects — the reconcile poll is the backstop.
-        assert callback.status_code == 200
-        assert callback.json()["connector"]["status"] == "connected"
+        assert callback.status_code == 502
+        error = callback.json()["error"]
+        assert error["code"] == "E_CONNECTOR_CALLBACK_FAILED"
+        assert error["details"]["reason"] == "google_upstream_timeout"
 
         with cast(Any, client.app).state.session_factory() as db:
+            connector = db.get(GoogleConnectorRecord, GOOGLE_CONNECTOR_ID)
+            assert connector is not None
+            assert connector.status == "error"
+            assert connector.last_error_code == "google_upstream_timeout"
             channels = db.scalars(select(ProviderWatchChannelRecord)).all()
+            event_types = [
+                row[0]
+                for row in db.execute(
+                    select(GoogleConnectorEventRecord.event_type).order_by(
+                        GoogleConnectorEventRecord.created_at.asc()
+                    )
+                ).all()
+            ]
     assert channels == []
+    assert "evt.connector.google.connect.failed" in event_types
+    assert "evt.connector.google.connect.succeeded" not in event_types
+
+
+def test_connect_watch_registration_defect_propagates_without_connector_error(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARIEL_GOOGLE_PUBSUB_TOPIC", PUBSUB_TOPIC)
+
+    @dataclass
+    class DefectiveWatchProvider:
+        def gmail_register_watch(self, **_: Any) -> dict[str, Any]:
+            raise RuntimeError("google_upstream_timeout")
+
+    oauth_client = ConnectOAuthClient(granted_scopes=[GMAIL_READ_SCOPE, CALENDAR_READ_SCOPE])
+    app = create_test_app(
+        database_url=postgres_url,
+        model_adapter=cast(ModelAdapter, _NoCallAdapter()),
+        sandbox=FakeSandboxRuntime(),
+    )
+    with TestClient(app) as client:
+        app_state = cast(Any, client.app).state
+        app_state.google_oauth_client = oauth_client
+        app_state.google_workspace_provider = DefectiveWatchProvider()
+
+        started = client.post("/v1/connectors/google/start")
+        state = started.json()["oauth"]["state"]
+        with pytest.raises(RuntimeError, match="google_upstream_timeout"):
+            client.get(
+                "/v1/connectors/google/callback",
+                params={"state": state, "code": "connect-defect"},
+            )
+
+        with cast(Any, client.app).state.session_factory() as db:
+            connector = db.get(GoogleConnectorRecord, GOOGLE_CONNECTOR_ID)
+            assert connector is not None
+            assert connector.status == "not_connected"
+            assert connector.last_error_code is None
+            channels = db.scalars(select(ProviderWatchChannelRecord)).all()
+            event_types = [
+                row[0]
+                for row in db.execute(
+                    select(GoogleConnectorEventRecord.event_type).order_by(
+                        GoogleConnectorEventRecord.created_at.asc()
+                    )
+                ).all()
+            ]
+    assert channels == []
+    assert "evt.connector.google.connect.failed" not in event_types
+    assert "evt.connector.google.connect.succeeded" not in event_types
 
 
 # --------------------------------------------------------------------------
@@ -280,13 +367,13 @@ def _seed_connected_connector(
                     account_subject="sub_connected",
                     account_email="connected@example.com",
                     granted_scopes=granted_scopes,
-                    access_token_enc=_encrypt_secret(
+                    access_token_enc=encrypt_secret(
                         plaintext="tok_access_live",
                         secret=settings.connector_encryption_secret,
                         key_version=settings.connector_encryption_key_version,
                         encryption_keys=settings.connector_encryption_keys,
                     ),
-                    refresh_token_enc=_encrypt_secret(
+                    refresh_token_enc=encrypt_secret(
                         plaintext="tok_refresh_live",
                         secret=settings.connector_encryption_secret,
                         key_version=settings.connector_encryption_key_version,
@@ -363,6 +450,136 @@ def test_watch_renew_handler_rearms_near_expiry_channel(
             assert channel.status == "active"
             assert channel.cursor_seed == "hist-watch-1"
             assert channel.expires_at == datetime(2026, 6, 10, 12, 0, tzinfo=UTC)
+
+
+def test_watch_renew_handler_raises_after_recording_registration_failure(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 5, 18, 12, 0, tzinfo=UTC)
+    settings = _settings()
+    _seed_connected_connector(
+        session_factory, now=now, settings=settings, granted_scopes=[GMAIL_READ_SCOPE]
+    )
+    with session_factory() as db:
+        with db.begin():
+            db.add(
+                ProviderWatchChannelRecord(
+                    id="wch_failing",
+                    provider="google",
+                    resource_type="gmail",
+                    resource_id="sub_connected",
+                    channel_id=None,
+                    channel_token=None,
+                    provider_resource_id=None,
+                    cursor_seed="hist-old",
+                    status="active",
+                    expires_at=now + timedelta(hours=3),
+                    last_error_code=None,
+                    last_error_at=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
+    @dataclass
+    class FailingWatchProvider:
+        def gmail_register_watch(self, **_: Any) -> dict[str, Any]:
+            raise GoogleWatchRegistrationFailure(code="google_upstream_timeout")
+
+    runtime = GoogleConnectorRuntime(
+        oauth_client=ConnectOAuthClient(granted_scopes=[GMAIL_READ_SCOPE]),
+        workspace_provider=cast(Any, FailingWatchProvider()),
+        redirect_uri=settings.google_oauth_redirect_uri,
+        oauth_state_ttl_seconds=settings.google_oauth_state_ttl_seconds,
+        encryption_secret=settings.connector_encryption_secret,
+        encryption_key_version=settings.connector_encryption_key_version,
+        encryption_keys=settings.connector_encryption_keys,
+        pubsub_topic=PUBSUB_TOPIC,
+        public_webhook_base_url=None,
+    )
+    monkeypatch.setattr("ariel.worker.build_google_runtime", lambda _settings: runtime)
+
+    with pytest.raises(GoogleWatchRegistrationFailure, match="google_upstream_timeout"):
+        process_provider_watch_renew_due(
+            session_factory=session_factory,
+            settings=settings,
+            now_fn=lambda: now,
+            new_id_fn=IdFactory(),
+        )
+
+    with session_factory() as db:
+        with db.begin():
+            channel = db.get(ProviderWatchChannelRecord, "wch_failing")
+            assert channel is not None
+            assert channel.status == "failed"
+            assert channel.last_error_code == "google_upstream_timeout"
+            assert channel.last_error_at == now
+
+
+def test_watch_renew_handler_propagates_registration_defect_without_recording_failure(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 5, 18, 12, 0, tzinfo=UTC)
+    settings = _settings()
+    _seed_connected_connector(
+        session_factory, now=now, settings=settings, granted_scopes=[GMAIL_READ_SCOPE]
+    )
+    with session_factory() as db:
+        with db.begin():
+            db.add(
+                ProviderWatchChannelRecord(
+                    id="wch_defect",
+                    provider="google",
+                    resource_type="gmail",
+                    resource_id="sub_connected",
+                    channel_id=None,
+                    channel_token=None,
+                    provider_resource_id=None,
+                    cursor_seed="hist-old",
+                    status="active",
+                    expires_at=now + timedelta(hours=3),
+                    last_error_code=None,
+                    last_error_at=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
+    @dataclass
+    class DefectiveWatchProvider:
+        def gmail_register_watch(self, **_: Any) -> dict[str, Any]:
+            raise RuntimeError("google_upstream_timeout")
+
+    runtime = GoogleConnectorRuntime(
+        oauth_client=ConnectOAuthClient(granted_scopes=[GMAIL_READ_SCOPE]),
+        workspace_provider=cast(Any, DefectiveWatchProvider()),
+        redirect_uri=settings.google_oauth_redirect_uri,
+        oauth_state_ttl_seconds=settings.google_oauth_state_ttl_seconds,
+        encryption_secret=settings.connector_encryption_secret,
+        encryption_key_version=settings.connector_encryption_key_version,
+        encryption_keys=settings.connector_encryption_keys,
+        pubsub_topic=PUBSUB_TOPIC,
+        public_webhook_base_url=None,
+    )
+    monkeypatch.setattr("ariel.worker.build_google_runtime", lambda _settings: runtime)
+
+    with pytest.raises(RuntimeError, match="google_upstream_timeout"):
+        process_provider_watch_renew_due(
+            session_factory=session_factory,
+            settings=settings,
+            now_fn=lambda: now,
+            new_id_fn=IdFactory(),
+        )
+
+    with session_factory() as db:
+        with db.begin():
+            channel = db.get(ProviderWatchChannelRecord, "wch_defect")
+            assert channel is not None
+            assert channel.status == "active"
+            assert channel.last_error_code is None
+            assert channel.last_error_at is None
 
 
 def test_watch_renew_handler_skips_when_no_channel_near_expiry(
@@ -516,7 +733,7 @@ def test_calendar_410_clears_cursor_and_reenqueues_full_sync(
 ) -> None:
     class StaleCalendarProvider:
         def calendar_list_event_deltas(self, **_: Any) -> dict[str, Any]:
-            raise RuntimeError("sync_token_invalid")
+            raise GoogleProviderRequestFailure("sync_token_invalid")
 
     class FakeRuntime:
         def __init__(self, **_: Any) -> None:
@@ -592,7 +809,7 @@ def test_gmail_404_clears_cursor_and_reenqueues_full_sync(
             raise AssertionError("existing Gmail cursor should use history pages")
 
         def email_list_history(self, **_: Any) -> dict[str, Any]:
-            raise RuntimeError("resource_not_found")
+            raise GoogleProviderRequestFailure("resource_not_found")
 
     class FakeRuntime:
         def __init__(self, **_: Any) -> None:

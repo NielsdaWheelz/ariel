@@ -13,8 +13,8 @@ from sqlalchemy import select
 import ariel.action_runtime as action_runtime_module
 import ariel.capability_registry as capability_registry_module
 import ariel.policy_engine as policy_engine_module
-from ariel.app import ModelAdapter
-from tests.integration.app_helpers import create_migrated_app
+from ariel.model_adapter import ModelAdapter
+from tests.integration.app_helpers import create_test_app
 from tests.integration.responses_helpers import (
     empty_recall_response,
     is_memory_subsystem_call,
@@ -104,7 +104,6 @@ class ActionRunAdapter:
         if not run_calls:
             run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
         return responses_with_run_calls(
-            assistant_text=assistant_text,
             calls=copy.deepcopy(run_calls),
             provider=self.provider,
             model=self.model,
@@ -136,7 +135,7 @@ def _web_extract_provider_bound(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
-    app = create_migrated_app(
+    app = create_test_app(
         database_url=postgres_url,
         model_adapter=adapter,
         sandbox=FakeSandboxRuntime(),

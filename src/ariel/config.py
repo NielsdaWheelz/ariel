@@ -10,8 +10,8 @@ from urllib.parse import urlparse
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from ariel.google_connector import ConnectorTokenCipher
 from ariel.persistence import MEMORY_EMBEDDING_DIMENSIONS
+from ariel.secret_cipher import SecretCipher
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -82,7 +82,6 @@ class AppSettings(BaseSettings):
     google_oauth_redirect_uri: str = "http://127.0.0.1:8000/v1/connectors/google/callback"
     google_oauth_state_ttl_seconds: int = 600
     google_oauth_timeout_seconds: float = 10.0
-    google_provider_event_token: str | None = None
     google_pubsub_topic: str | None = None
     public_webhook_base_url: str | None = None
     google_pubsub_subscription: str | None = None
@@ -125,7 +124,6 @@ class AppSettings(BaseSettings):
     web_extract_api_key: str | None = None
     maps_api_key: str | None = None
     maps_timeout_seconds: float = 8.0
-    home_address: str | None = None
     weather_provider_mode: str = "production"
     weather_production_endpoint: str = "https://api.tomorrow.io/v4/weather/forecast"
     weather_production_timeout_seconds: float = 8.0
@@ -171,7 +169,6 @@ class AppSettings(BaseSettings):
         "maps_api_key",
         "weather_production_api_key",
         "weather_default_location",
-        "home_address",
         "google_pubsub_topic",
         "public_webhook_base_url",
         "google_pubsub_subscription",
@@ -239,13 +236,6 @@ class AppSettings(BaseSettings):
             raise ValueError("provider endpoint settings must be nonblank")
         return normalized
 
-    @field_validator("google_provider_event_token", mode="before")
-    @classmethod
-    def _blank_google_provider_event_token_is_unset(cls, value: Any) -> Any:
-        if isinstance(value, str) and not value.strip():
-            return None
-        return value
-
     @field_validator("local_auth_token", mode="before")
     @classmethod
     def _blank_local_auth_token_is_unset(cls, value: Any) -> Any:
@@ -277,7 +267,7 @@ class AppSettings(BaseSettings):
             if self.connector_encryption_keys is None or not self.connector_encryption_keys.strip():
                 raise ValueError("connector_encryption_keys is required in production")
             try:
-                ConnectorTokenCipher.from_config(
+                SecretCipher.from_config(
                     active_key_version=self.connector_encryption_key_version,
                     configured_keys=self.connector_encryption_keys,
                     single_secret=self.connector_encryption_secret,

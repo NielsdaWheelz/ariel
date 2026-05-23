@@ -23,10 +23,10 @@ from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import select
 
-from ariel.app import ModelAdapter
+from ariel.model_adapter import ModelAdapter
 from ariel.persistence import SessionRecord
 from tests.fake_sandbox import FakeSandboxRuntime
-from tests.integration.app_helpers import create_migrated_app
+from tests.integration.app_helpers import create_test_app
 from tests.integration.responses_helpers import (
     drain_task,
     empty_recall_response,
@@ -78,7 +78,6 @@ class SessionManagementProbeAdapter:
                     {"name": "agent.emit_message", "input": {"text": f"assistant::{user_message}"}}
                 ]
             return responses_with_run_calls(
-                assistant_text=f"assistant::{user_message}",
                 calls=copy.deepcopy(run_calls),
                 provider=self.provider,
                 model=self.model,
@@ -102,7 +101,7 @@ def _build_client(
     *,
     raise_server_exceptions: bool = True,
 ) -> TestClient:
-    app = create_migrated_app(
+    app = create_test_app(
         database_url=postgres_url,
         model_adapter=adapter,
         sandbox=FakeSandboxRuntime(),

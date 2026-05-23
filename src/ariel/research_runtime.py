@@ -30,18 +30,16 @@ loop ends in one of three ways:
 This module does not import from ``app.py`` (the worker imports both, so an
 ``app.py`` import would close a layering cycle).  ``ResearchFinding`` lives in
 ``agent_loop.py`` so both this module and ``app.py`` can reference it without
-a cycle.  The model adapter is taken structurally via the small
-``ResearchModelAdapter`` protocol.
+a cycle.  Model calls use the shared ``ModelAdapter`` protocol.
 """
 
 from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from datetime import UTC, datetime
-from typing import Any, Protocol
+from datetime import datetime
+from typing import TYPE_CHECKING, Any, assert_never
 
-import ulid
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -53,45 +51,20 @@ from .capability_registry import (
     run_callable_name_for_capability_id,
     run_callable_signature,
 )
+from .clock import utcnow
 from .config import AppSettings
 from .google_connector import GoogleConnectorRuntime
+from .ids import new_id
 from .persistence import EventRecord, TurnRecord
 from .research_modes import ResearchMode
 from .run_runtime import ScratchEntry, run_tool_definitions
 from .sandbox_runtime import RunSandbox
 
+if TYPE_CHECKING:
+    from .model_adapter import ModelAdapter
+
 
 RESEARCH_PROMPT_VERSION = "research-v3"
-
-
-def _utcnow() -> datetime:
-    return datetime.now(tz=UTC)
-
-
-def _new_id(prefix: str) -> str:
-    return f"{prefix}_{ulid.new().str.lower()}"
-
-
-class ResearchModelAdapter(Protocol):
-    """The model surface ``run_research`` needs.
-
-    Structurally identical to the slice of ``app.ModelAdapter`` the loop uses;
-    declared locally so this module does not import ``app.py``.  The worker
-    passes its ``Runtime.model_adapter``, which satisfies this protocol.
-    """
-
-    provider: str
-    model: str
-
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]: ...
 
 
 def render_finding(finding: ResearchFinding) -> str:
@@ -122,17 +95,6 @@ def render_finding(finding: ResearchFinding) -> str:
         "it; any action it motivates is evaluated tainted and routes through "
         "approval."
     )
-
-
-def _research_capability_ids(mode: ResearchMode) -> frozenset[str]:
-    """The mode's read-capability whitelist — web XOR personal XOR memories, never mixed."""
-    if mode == "web":
-        return RESEARCH_WEB_CAPABILITY_IDS
-    if mode == "personal":
-        return RESEARCH_PERSONAL_CAPABILITY_IDS
-    if mode == "memories":
-        return RESEARCH_MEMORIES_CAPABILITY_IDS
-    raise ValueError(f"unknown research mode: {mode}")
 
 
 def _build_research_input_items(
@@ -213,7 +175,7 @@ def run_research(
     db: Session,
     session_factory: sessionmaker[Session],
     settings: AppSettings,
-    model_adapter: ResearchModelAdapter,
+    model_adapter: ModelAdapter,
     google_runtime: GoogleConnectorRuntime,
     session_id: str,
     question: str,
@@ -235,12 +197,21 @@ def run_research(
     ``RESEARCH_PERSONAL_CAPABILITY_IDS``.
     """
 
-    allowed_capability_ids = _research_capability_ids(mode)
-    clock = now_fn or _utcnow
+    match mode:
+        case "web":
+            allowed_capability_ids = RESEARCH_WEB_CAPABILITY_IDS
+        case "personal":
+            allowed_capability_ids = RESEARCH_PERSONAL_CAPABILITY_IDS
+        case "memories":
+            allowed_capability_ids = RESEARCH_MEMORIES_CAPABILITY_IDS
+        case _:
+            assert_never(mode)
+
+    clock = now_fn or utcnow
 
     now = clock()
     turn = TurnRecord(
-        id=_new_id("trn"),
+        id=new_id("trn"),
         session_id=session_id,
         user_message=question,
         assistant_message=None,
@@ -259,7 +230,7 @@ def run_research(
         sequence += 1
         db.add(
             EventRecord(
-                id=_new_id("evn"),
+                id=new_id("evn"),
                 session_id=session_id,
                 turn_id=turn.id,
                 sequence=sequence,
@@ -344,7 +315,7 @@ def run_research(
         approval_actor_id=str(settings.approval_actor_id),
         add_event=add_event,
         now_fn=clock,
-        new_id_fn=_new_id,
+        new_id_fn=new_id,
         runtime_provenance=None,
         google_runtime=google_runtime,
         execute_google_reads_outside_transaction=False,
@@ -387,19 +358,8 @@ def run_research(
             turn.status = "completed"
             add_event("evt.research.partial", {"mode": mode})
         case "message" | "approval" | "paused" | "operations" | "bounded_failure":
-            # Not valid outcomes for output_mode="finding" — treat as partial.
-            finding = ResearchFinding(
-                question=question,
-                mode=mode,
-                status="partial",
-                summary="The research run ended unexpectedly.",
-                claims=[],
-                gaps=[],
-                sources=[],
-            )
-            turn.assistant_message = finding.summary
-            turn.status = "completed"
-            add_event("evt.research.partial", {"mode": mode})
+            msg = f"unexpected research loop outcome: {loop_result.outcome}"
+            raise AssertionError(msg)
 
     turn.updated_at = clock()
     add_event("evt.turn.completed", {})

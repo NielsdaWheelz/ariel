@@ -11,8 +11,8 @@ from sqlalchemy.orm import sessionmaker
 
 import ariel.run_runtime as run_runtime_module
 from ariel.action_runtime import RuntimeProvenance
-from ariel.app import ModelAdapter
-from tests.integration.app_helpers import create_migrated_app
+from ariel.model_adapter import ModelAdapter
+from tests.integration.app_helpers import create_test_app
 from ariel.persistence import (
     ActionAttemptRecord,
     AIJudgmentRecord,
@@ -33,7 +33,7 @@ from tests.integration.responses_helpers import (
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
-    app = create_migrated_app(
+    app = create_test_app(
         database_url=postgres_url,
         model_adapter=adapter,
         sandbox=FakeSandboxRuntime(),
@@ -566,7 +566,6 @@ def test_run_program_emitting_no_output_retries(postgres_url: str) -> None:
     adapter = CapturingRunAdapter(
         responses=[
             responses_with_run_calls(
-                assistant_text="",
                 calls=[{"name": "agent.emit_value", "input": {"value": 1}}],
                 provider="provider.program-loop",
                 model="model.program-loop-v1",

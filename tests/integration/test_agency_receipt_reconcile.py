@@ -70,7 +70,7 @@ class FakeAgencyClient:
         self.pr_sync_calls.append(client_request_id)
         if self.fail_pr_sync_once:
             self.fail_pr_sync_once = False
-            raise RuntimeError("agency_pr_sync_timeout")
+            raise AgencyDaemonError("agency_pr_sync_timeout")
         return {
             "pr_url": "https://github.test/acme/repo/pull/7",
             "pr_number": 7,
@@ -263,6 +263,9 @@ def test_agency_request_pr_ambiguous_receipt_reconciles_with_preserved_identity(
         assert receipt.provider_object_ids["invocation_id"] == "inv_1"
         assert receipt.provider_object_ids["worktree_id"] == "wt_1"
         assert action.status == "failed"
+        assert action.execution_error == "agency_pr_sync_timeout"
+        assert receipt.ambiguity_reason == "agency_pr_sync_timeout"
+        assert receipt.response_payload["error"] == "agency_pr_sync_timeout"
         receipt_id = receipt.id
 
     assert process_provider_write_reconcile_due(
@@ -313,7 +316,7 @@ def test_agency_request_pr_reconcile_probe_failure_retries(
         receipt_id = receipt.id
 
     client.fail_pr_sync_once = True
-    with pytest.raises(AgencyDaemonError):
+    with pytest.raises(AgencyDaemonError, match="agency_pr_sync_timeout"):
         process_provider_write_reconcile_due(
             session_factory=session_factory,
             task_payload={"provider_write_receipt_id": receipt_id},
@@ -332,7 +335,9 @@ def test_agency_request_pr_reconcile_probe_failure_retries(
         assert receipt is not None
         assert receipt.status == "ambiguous"
         assert receipt.response_payload["reconciliation"]["status"] == "indeterminate"
+        assert receipt.response_payload["reconciliation"]["reason"] == "agency_pr_sync_timeout"
         assert any(event.payload["reconcile_task_enqueued"] is False for event in events)
+        assert any(event.payload["reason"] == "agency_pr_sync_timeout" for event in events)
 
     assert process_provider_write_reconcile_due(
         session_factory=session_factory,

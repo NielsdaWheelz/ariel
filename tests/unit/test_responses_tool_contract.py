@@ -5,24 +5,27 @@ import json
 from pathlib import Path
 from typing import Any, cast
 
+import pytest
+from sqlalchemy.orm import Session
+
 from ariel.action_runtime import (
     RuntimeProvenance,
     _FunctionCallProcessingContext,
     process_one_call,
 )
-from ariel.app import _eligible_internal_callable_capability_ids
 from ariel.capability_registry import (
     RUN_CALLABLE_SIGNATURES,
     capability_id_for_run_callable,
+    eligible_internal_callable_capability_ids,
     get_capability,
     internal_callable_capability_ids,
     run_callable_name_for_capability_id,
 )
 from ariel.executor import ExecutionResult
+from ariel.memory import MemoryExecutionError
 from ariel.persistence import TurnRecord
 from ariel.prompts import MAIN_AGENT_PROMPT_VERSION, MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS
 from ariel.run_runtime import parse_run_function_call, run_tool_definitions
-from sqlalchemy.orm import Session
 
 
 def test_normal_response_tool_surface_is_single_strict_run_tool() -> None:
@@ -241,6 +244,17 @@ def test_run_callable_signatures_match_validators_for_common_capabilities() -> N
             {"note": "the user prefers tea"},
         ),
         (
+            "memory.search",
+            "cap.memory.search",
+            {"query", "limit", "since", "kinds"},
+            {
+                "query": "career meeting",
+                "limit": 3,
+                "since": "2026-05-20T12:00:00Z",
+                "kinds": ["user_message", "note_create"],
+            },
+        ),
+        (
             "research.investigate",
             "cap.research.investigate",
             {"question", "mode"},
@@ -264,6 +278,21 @@ def test_run_callable_signatures_match_validators_for_common_capabilities() -> N
             f"signature={signature!r} error={error!r}"
         )
         assert normalized is not None
+
+
+def test_memory_search_validator_defaults_match_signature() -> None:
+    capability = get_capability("cap.memory.search")
+    assert capability is not None
+
+    normalized, error = capability.validate_input({"query": "  career meeting  "})
+
+    assert error is None
+    assert normalized == {
+        "query": "career meeting",
+        "limit": 24,
+        "since": None,
+        "kinds": None,
+    }
 
 
 def test_run_callable_signatures_warn_about_email_read_invented_nulls() -> None:
@@ -348,7 +377,7 @@ def test_agency_capabilities_become_eligible_when_runtime_is_bound() -> None:
     become eligible. When off, none are."""
 
     on = set(
-        _eligible_internal_callable_capability_ids(
+        eligible_internal_callable_capability_ids(
             tool_surface_facts={
                 "discord": {"available": True, "attachment_count": 0},
                 "runtime_bindings": {"agency": True},
@@ -363,7 +392,7 @@ def test_agency_capabilities_become_eligible_when_runtime_is_bound() -> None:
     }.issubset(on)
 
     off = set(
-        _eligible_internal_callable_capability_ids(
+        eligible_internal_callable_capability_ids(
             tool_surface_facts={
                 "discord": {"available": True, "attachment_count": 0},
                 "runtime_bindings": {"agency": False},
@@ -371,6 +400,101 @@ def test_agency_capabilities_become_eligible_when_runtime_is_bound() -> None:
         )
     )
     assert not any(cap_id.startswith("cap.agency.") for cap_id in off)
+
+
+def test_google_capabilities_require_connection_and_granted_scopes() -> None:
+    missing_scope = set(
+        eligible_internal_callable_capability_ids(
+            tool_surface_facts={
+                "google": {
+                    "connected": True,
+                    "granted_scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
+                },
+                "discord": {"available": True, "attachment_count": 0},
+                "runtime_bindings": {},
+            }
+        )
+    )
+    assert "cap.email.read" in missing_scope
+    assert "cap.email.send" not in missing_scope
+
+    disconnected = set(
+        eligible_internal_callable_capability_ids(
+            tool_surface_facts={
+                "google": {
+                    "connected": False,
+                    "granted_scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
+                },
+                "discord": {"available": True, "attachment_count": 0},
+                "runtime_bindings": {},
+            }
+        )
+    )
+    assert "cap.email.read" not in disconnected
+
+
+def test_attachment_capability_requires_attachment_reference() -> None:
+    without_attachment = set(
+        eligible_internal_callable_capability_ids(
+            tool_surface_facts={
+                "discord": {"available": True, "attachment_count": 0},
+                "runtime_bindings": {},
+            }
+        )
+    )
+    with_attachment = set(
+        eligible_internal_callable_capability_ids(
+            tool_surface_facts={
+                "discord": {"available": True, "attachment_count": 1},
+                "runtime_bindings": {},
+            }
+        )
+    )
+
+    assert "cap.attachment.read" not in without_attachment
+    assert "cap.attachment.read" in with_attachment
+
+
+def test_provider_capabilities_follow_runtime_bindings() -> None:
+    off = set(
+        eligible_internal_callable_capability_ids(
+            tool_surface_facts={
+                "discord": {"available": True, "attachment_count": 0},
+                "runtime_bindings": {
+                    "web_extract": False,
+                    "search_web": False,
+                    "search_news": False,
+                    "maps": False,
+                    "weather": False,
+                },
+            }
+        )
+    )
+    on = set(
+        eligible_internal_callable_capability_ids(
+            tool_surface_facts={
+                "discord": {"available": True, "attachment_count": 0},
+                "runtime_bindings": {
+                    "web_extract": True,
+                    "search_web": True,
+                    "search_news": True,
+                    "maps": True,
+                    "weather": True,
+                },
+            }
+        )
+    )
+
+    gated_capabilities = {
+        "cap.web.extract",
+        "cap.search.web",
+        "cap.search.news",
+        "cap.maps.directions",
+        "cap.maps.search_places",
+        "cap.weather.forecast",
+    }
+    assert gated_capabilities.isdisjoint(off)
+    assert gated_capabilities.issubset(on)
 
 
 def test_run_source_is_a_python_program_string() -> None:
@@ -417,6 +541,10 @@ def _run_one_call(
     add_event: Any,
     runtime_provenance: RuntimeProvenance | None,
     attachment_runtime: Any | None = None,
+    session_factory: Any | None = None,
+    settings: Any | None = None,
+    sandbox: Any | None = None,
+    model_adapter: Any | None = None,
     allowed_capability_ids: set[str],
 ) -> _FunctionCallProcessingContext:
     """Run one capability syscall through ``process_one_call``.
@@ -432,7 +560,7 @@ def _run_one_call(
         function_call_index=1,
         function_call_raw=function_call_raw,
         db=db,
-        session_factory=None,
+        session_factory=session_factory,
         session_id="ses_1",
         turn=turn,
         approval_ttl_seconds=300,
@@ -446,7 +574,9 @@ def _run_one_call(
         agency_runtime=None,
         attachment_runtime=attachment_runtime,
         allowed_capability_id_set=allowed_capability_ids,
-        settings=None,
+        settings=settings,
+        sandbox=sandbox,
+        model_adapter=model_adapter,
     )
     return ctx
 
@@ -557,6 +687,119 @@ def test_process_one_call_denies_unscoped_tools() -> None:
         "capability_id": "cap.unscoped.no_response",
         "error": "tool_not_in_turn_scope",
     }
+
+
+def test_process_one_call_maps_expected_memory_execution_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixed_now = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    class Db:
+        def add(self, record: Any) -> None:
+            return None
+
+        def flush(self) -> None:
+            return None
+
+        def get_bind(self) -> None:
+            return None
+
+    def fail_memory(**_: Any) -> dict[str, Any]:
+        raise MemoryExecutionError("memory_recall_model_failed")
+
+    monkeypatch.setattr("ariel.action_runtime._execute_memory_capability", fail_memory)
+    turn = TurnRecord(
+        id="trn_1",
+        session_id="ses_1",
+        user_message="search memory",
+        assistant_message=None,
+        status="in_progress",
+        created_at=fixed_now,
+        updated_at=fixed_now,
+    )
+
+    ctx = _run_one_call(
+        db=cast(Session, Db()),
+        function_call_raw={
+            "call_id": "call_1",
+            "capability_id": "cap.memory.search",
+            "input": {"query": "project phoenix"},
+        },
+        turn=turn,
+        now=fixed_now,
+        new_id_fn=lambda prefix: f"{prefix}_1",
+        add_event=lambda event_type, payload: events.append((event_type, payload)),
+        runtime_provenance=RuntimeProvenance(status="clean"),
+        session_factory=object(),
+        settings=object(),
+        allowed_capability_ids={"cap.memory.search"},
+    )
+
+    attempt = ctx.created_action_attempts[0]
+    assert attempt.status == "failed"
+    assert attempt.execution_error == "memory_recall_model_failed"
+    assert json.loads(ctx.function_call_outputs[0]["output"]) == {
+        "status": "failed",
+        "capability_id": "cap.memory.search",
+        "error": "memory_recall_model_failed",
+    }
+    assert events[-1] == (
+        "evt.action.execution.failed",
+        {
+            "action_attempt_id": "aat_1",
+            "error": "memory_recall_model_failed",
+            "output": None,
+        },
+    )
+
+
+def test_process_one_call_propagates_unexpected_memory_execution_defect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixed_now = datetime(2026, 4, 27, 12, 0, tzinfo=UTC)
+
+    class Db:
+        def add(self, record: Any) -> None:
+            return None
+
+        def flush(self) -> None:
+            return None
+
+        def get_bind(self) -> None:
+            return None
+
+    def fail_memory(**_: Any) -> dict[str, Any]:
+        raise RuntimeError("memory substrate defect")
+
+    monkeypatch.setattr("ariel.action_runtime._execute_memory_capability", fail_memory)
+    turn = TurnRecord(
+        id="trn_1",
+        session_id="ses_1",
+        user_message="search memory",
+        assistant_message=None,
+        status="in_progress",
+        created_at=fixed_now,
+        updated_at=fixed_now,
+    )
+
+    with pytest.raises(RuntimeError, match="memory substrate defect"):
+        _run_one_call(
+            db=cast(Session, Db()),
+            function_call_raw={
+                "call_id": "call_1",
+                "capability_id": "cap.memory.search",
+                "input": {"query": "project phoenix"},
+            },
+            turn=turn,
+            now=fixed_now,
+            new_id_fn=lambda prefix: f"{prefix}_1",
+            add_event=lambda _event_type, _payload: None,
+            runtime_provenance=RuntimeProvenance(status="clean"),
+            session_factory=object(),
+            settings=object(),
+            allowed_capability_ids={"cap.memory.search"},
+        )
 
 
 def test_process_one_call_executes_attachment_read_runtime() -> None:

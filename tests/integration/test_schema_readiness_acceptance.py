@@ -106,7 +106,6 @@ def test_schema_readiness_recovers_when_migrations_land_after_startup(
 
 
 def test_schema_readiness_reports_missing_subscriber_heartbeat(postgres_url: str) -> None:
-    run_migrations(postgres_url)
     engine = create_engine(postgres_url, future=True, pool_pre_ping=True)
     try:
         with engine.begin() as connection:
@@ -118,7 +117,6 @@ def test_schema_readiness_reports_missing_subscriber_heartbeat(postgres_url: str
 
 
 def test_schema_readiness_reports_event_created_at_columns(postgres_url: str) -> None:
-    run_migrations(postgres_url)
     engine = create_engine(postgres_url, future=True, pool_pre_ping=True)
     try:
         with engine.begin() as connection:
@@ -135,7 +133,6 @@ def test_schema_readiness_reports_event_created_at_columns(postgres_url: str) ->
 def test_schema_readiness_reports_subscriber_heartbeat_identity_rules(
     postgres_url: str,
 ) -> None:
-    run_migrations(postgres_url)
     engine = create_engine(postgres_url, future=True, pool_pre_ping=True)
     try:
         with engine.begin() as connection:
@@ -165,11 +162,86 @@ def test_schema_readiness_reports_subscriber_heartbeat_identity_rules(
         engine.dispose()
 
 
-def test_subscriber_heartbeat_identity_migration_backfills_existing_rows(
+def test_schema_readiness_reports_wrong_foreign_key_ondelete(postgres_url: str) -> None:
+    engine = create_engine(postgres_url, future=True, pool_pre_ping=True)
+    try:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE events DROP CONSTRAINT events_turn_id_fkey"))
+            connection.execute(
+                text(
+                    "ALTER TABLE events "
+                    "ADD CONSTRAINT events_turn_id_fkey "
+                    "FOREIGN KEY (turn_id) REFERENCES turns(id) ON DELETE CASCADE"
+                )
+            )
+
+        assert "wrong_foreign_key_ondelete:events.turn_id" in schema_readiness_issues(engine)
+    finally:
+        engine.dispose()
+
+
+def test_schema_readiness_reports_missing_job_event_agency_event_unique_constraint(
     postgres_url: str,
 ) -> None:
-    run_migrations(postgres_url, revision="20260522_0059")
     engine = create_engine(postgres_url, future=True, pool_pre_ping=True)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text("ALTER TABLE job_events DROP CONSTRAINT job_events_agency_event_id_key")
+            )
+
+        assert "missing_unique_constraint:job_events.agency_event_id" in schema_readiness_issues(
+            engine
+        )
+    finally:
+        engine.dispose()
+
+
+def test_schema_readiness_reports_changed_partial_index_predicate(postgres_url: str) -> None:
+    engine = create_engine(postgres_url, future=True, pool_pre_ping=True)
+    try:
+        with engine.begin() as connection:
+            connection.execute(text("DROP INDEX ix_provider_write_receipts_idempotency_unique"))
+            connection.execute(
+                text(
+                    "CREATE UNIQUE INDEX ix_provider_write_receipts_idempotency_unique "
+                    "ON provider_write_receipts (provider, provider_account_id, idempotency_key)"
+                )
+            )
+
+        assert (
+            "missing_index_fragment:provider_write_receipts."
+            "ix_provider_write_receipts_idempotency_unique" in schema_readiness_issues(engine)
+        )
+    finally:
+        engine.dispose()
+
+
+def test_schema_readiness_reports_changed_check_constraint_column(postgres_url: str) -> None:
+    engine = create_engine(postgres_url, future=True, pool_pre_ping=True)
+    try:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE captures DROP CONSTRAINT ck_capture_kind"))
+            connection.execute(
+                text(
+                    "ALTER TABLE captures "
+                    "ADD CONSTRAINT ck_capture_kind "
+                    "CHECK (request_hash IN ('text', 'url', 'shared_content'))"
+                )
+            )
+
+        assert "missing_constraint_fragment:captures.ck_capture_kind" in schema_readiness_issues(
+            engine
+        )
+    finally:
+        engine.dispose()
+
+
+def test_subscriber_heartbeat_identity_migration_backfills_existing_rows(
+    unmigrated_postgres_url: str,
+) -> None:
+    run_migrations(unmigrated_postgres_url, revision="20260522_0059")
+    engine = create_engine(unmigrated_postgres_url, future=True, pool_pre_ping=True)
     try:
         with engine.begin() as connection:
             connection.execute(
@@ -180,7 +252,7 @@ def test_subscriber_heartbeat_identity_migration_backfills_existing_rows(
                 )
             )
 
-        run_migrations(postgres_url)
+        run_migrations(unmigrated_postgres_url)
 
         with engine.connect() as connection:
             row = connection.execute(
@@ -199,16 +271,14 @@ def test_subscriber_heartbeat_identity_migration_backfills_existing_rows(
 
 
 def test_schema_readiness_reports_context_pressure_rotation_reason(
-    postgres_url: str,
+    unmigrated_postgres_url: str,
 ) -> None:
-    run_migrations(postgres_url, revision="20260522_0060")
-    engine = create_engine(postgres_url, future=True, pool_pre_ping=True)
+    run_migrations(unmigrated_postgres_url, revision="20260522_0060")
+    engine = create_engine(unmigrated_postgres_url, future=True, pool_pre_ping=True)
     try:
         schema_issues = schema_readiness_issues(engine)
-        assert "missing_alembic_head:20260522_0061" in schema_issues
-        assert (
-            "forbidden_constraint_fragment:sessions.ck_session_rotation_reason" in schema_issues
-        )
+        assert "missing_alembic_head:20260522_0063" in schema_issues
+        assert "forbidden_constraint_fragment:sessions.ck_session_rotation_reason" in schema_issues
         assert (
             "forbidden_constraint_fragment:"
             "session_rotations.ck_session_rotation_reason_type" in schema_issues
@@ -218,10 +288,10 @@ def test_schema_readiness_reports_context_pressure_rotation_reason(
 
 
 def test_rotation_reason_schema_migration_rejects_context_pressure_rows(
-    postgres_url: str,
+    unmigrated_postgres_url: str,
 ) -> None:
-    run_migrations(postgres_url, revision="20260522_0060")
-    engine = create_engine(postgres_url, future=True, pool_pre_ping=True)
+    run_migrations(unmigrated_postgres_url, revision="20260522_0060")
+    engine = create_engine(unmigrated_postgres_url, future=True, pool_pre_ping=True)
     try:
         with engine.begin() as connection:
             connection.execute(
@@ -242,7 +312,98 @@ def test_rotation_reason_schema_migration_rejects_context_pressure_rows(
             )
 
         with pytest.raises(RuntimeError, match="rotation rows must be repaired first"):
-            run_migrations(postgres_url)
+            run_migrations(unmigrated_postgres_url)
+    finally:
+        engine.dispose()
+
+
+def test_schema_readiness_reports_stale_capture_ingress_schema(
+    unmigrated_postgres_url: str,
+) -> None:
+    run_migrations(unmigrated_postgres_url, revision="20260522_0062")
+    engine = create_engine(unmigrated_postgres_url, future=True, pool_pre_ping=True)
+    try:
+        schema_issues = schema_readiness_issues(engine)
+        assert "missing_alembic_head:20260522_0063" in schema_issues
+        assert "unexpected_column:captures.original_payload" in schema_issues
+        assert "unexpected_column:captures.terminal_state" in schema_issues
+        assert "unexpected_constraint:captures.ck_capture_terminal_state" in schema_issues
+        assert "unexpected_constraint:captures.ck_capture_terminal_linkage" in schema_issues
+        assert "forbidden_constraint_fragment:captures.ck_capture_kind" in schema_issues
+    finally:
+        engine.dispose()
+
+
+def test_capture_schema_migration_rejects_rows_outside_durable_record_shape(
+    unmigrated_postgres_url: str,
+) -> None:
+    run_migrations(unmigrated_postgres_url, revision="20260522_0062")
+    engine = create_engine(unmigrated_postgres_url, future=True, pool_pre_ping=True)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO captures "
+                    "(id, capture_kind, idempotency_key, request_hash, original_payload, "
+                    "normalized_turn_input, effective_session_id, turn_id, terminal_state, "
+                    "ingest_error_code, ingest_error_message, ingest_error_details, "
+                    "ingest_error_retryable, status_code, response_payload, created_at, updated_at) "
+                    "VALUES ('cpt_bad', 'unknown', NULL, :request_hash, '{}'::jsonb, "
+                    "NULL, NULL, NULL, 'ingest_failed', 'bad_capture', "
+                    "'bad capture', '{}'::jsonb, false, 422, '{}'::jsonb, now(), now())"
+                ),
+                {"request_hash": "0" * 64},
+            )
+
+        with pytest.raises(
+            RuntimeError,
+            match="capture rows must be repaired before capture schema narrowing",
+        ):
+            run_migrations(unmigrated_postgres_url)
+    finally:
+        engine.dispose()
+
+
+def test_capture_schema_migration_removes_raw_payload_and_dead_state(
+    unmigrated_postgres_url: str,
+) -> None:
+    run_migrations(unmigrated_postgres_url, revision="20260522_0062")
+    run_migrations(unmigrated_postgres_url)
+    engine = create_engine(unmigrated_postgres_url, future=True, pool_pre_ping=True)
+    try:
+        with engine.connect() as connection:
+            columns = {
+                str(row.column_name): bool(row.is_nullable == "YES")
+                for row in connection.execute(
+                    text(
+                        "SELECT column_name, is_nullable "
+                        "FROM information_schema.columns "
+                        "WHERE table_name = 'captures'"
+                    )
+                )
+            }
+            constraints = {
+                str(row.constraint_name)
+                for row in connection.execute(
+                    text(
+                        "SELECT constraint_name "
+                        "FROM information_schema.table_constraints "
+                        "WHERE table_name = 'captures' AND constraint_type = 'CHECK'"
+                    )
+                )
+                if not str(row.constraint_name).endswith("_not_null")
+            }
+
+        assert "original_payload" not in columns
+        assert "terminal_state" not in columns
+        assert "ingest_error_code" not in columns
+        assert "status_code" not in columns
+        assert "response_payload" not in columns
+        assert columns["normalized_turn_input"] is False
+        assert columns["effective_session_id"] is False
+        assert columns["turn_id"] is False
+        assert constraints == {"ck_capture_kind"}
+        assert schema_readiness_issues(engine) == []
     finally:
         engine.dispose()
 
@@ -256,7 +417,6 @@ def test_health_reads_subscriber_heartbeat_by_subscriber_name(
         "projects/my-project/subscriptions/ariel-gmail-watch-sub",
     )
     monkeypatch.setenv("ARIEL_GOOGLE_APPLICATION_CREDENTIALS_PATH", "/tmp/ariel-sa.json")
-    run_migrations(postgres_url)
     app = create_app(
         database_url=postgres_url,
         model_adapter=NoCallModelAdapter(),

@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from ariel.config import AppSettings
+from ariel.google_connector import GoogleProviderRequestFailure
 from ariel.persistence import (
     BackgroundTaskRecord,
     GoogleProviderObjectRecord,
@@ -170,8 +171,15 @@ class FakePagedGmailProvider:
             }
         raise AssertionError(f"unexpected page token: {page_token}")
 
-    def email_read(self, *, access_token: str, normalized_input: dict[str, Any]) -> dict[str, Any]:
+    def email_read(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+        provider_account_id: str,
+    ) -> dict[str, Any]:
         assert access_token == "access-token"
+        assert provider_account_id == "con_google"
         self.read_calls.append(normalized_input)
         message_id = normalized_input["message_id"]
         assert normalized_input in [
@@ -212,8 +220,15 @@ class FakeFullBodyGmailProvider:
             ],
         }
 
-    def email_read(self, *, access_token: str, normalized_input: dict[str, Any]) -> dict[str, Any]:
+    def email_read(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+        provider_account_id: str,
+    ) -> dict[str, Any]:
         assert access_token == "access-token"
+        assert provider_account_id == "con_google"
         self.read_calls.append(normalized_input)
         assert normalized_input == {
             "message_id": "msg-body",
@@ -276,8 +291,100 @@ class FakeFullBodyGmailProvider:
         }
 
 
+@dataclass
+class FakeUnreadableGmailProvider:
+    read_calls: list[dict[str, Any]] = field(default_factory=list)
+
+    def _request_json(self, **_: Any) -> dict[str, Any]:
+        raise AssertionError("existing Gmail cursor should use history pages")
+
+    def email_list_history(self, **_: Any) -> dict[str, Any]:
+        return {
+            "historyId": "hist-2",
+            "history": [
+                {
+                    "id": "history-unreadable",
+                    "messagesAdded": [
+                        {
+                            "message": {
+                                "id": "msg-invalid-date",
+                                "threadId": "thr-invalid-date",
+                                "labelIds": ["INBOX"],
+                                "internalDate": "not-a-millis",
+                            }
+                        },
+                        {
+                            "message": {
+                                "id": "msg-missing-date",
+                                "threadId": "thr-missing-date",
+                                "labelIds": ["INBOX"],
+                            }
+                        },
+                        {
+                            "message": {
+                                "id": "msg-blank-date",
+                                "threadId": "thr-blank-date",
+                                "labelIds": ["INBOX"],
+                                "internalDate": "",
+                            }
+                        },
+                        {
+                            "message": {
+                                "id": "msg-negative-date",
+                                "threadId": "thr-negative-date",
+                                "labelIds": ["INBOX"],
+                                "internalDate": "-1",
+                            }
+                        },
+                    ],
+                }
+            ],
+        }
+
+    def email_read(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+        provider_account_id: str,
+    ) -> dict[str, Any]:
+        assert access_token == "access-token"
+        assert provider_account_id == "con_google"
+        self.read_calls.append(normalized_input)
+        raise GoogleProviderRequestFailure("resource_not_found")
+
+
 def _settings() -> AppSettings:
     return cast(AppSettings, cast(Any, AppSettings)(_env_file=None))
+
+
+def _seed_sync_cursor(
+    session_factory: sessionmaker[Session],
+    new_id: IdFactory,
+    *,
+    resource_type: str,
+    resource_id: str,
+    cursor_value: str,
+    now: datetime,
+) -> None:
+    with session_factory() as db:
+        with db.begin():
+            db.add(
+                SyncCursorRecord(
+                    id=new_id("cur"),
+                    provider="google",
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    cursor_value=cursor_value,
+                    cursor_version=1,
+                    status="ready",
+                    last_successful_sync_at=None,
+                    last_error_code=None,
+                    last_error_at=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
 
 
 def test_gmail_sync_bootstraps_empty_cursor_from_profile(
@@ -474,6 +581,7 @@ def test_gmail_sync_hydrates_added_messages_into_body_evidence(
     assert provider_object is not None
     assert provider_object.external_id == "msg-body"
     assert provider_object.thread_external_id == "thr-body"
+    assert provider_object.source_timestamp == datetime(2026, 5, 7, 9, 0, tzinfo=UTC)
     assert provider_object.content_digest == "r" * 64
     assert provider_object.metadata_json == {
         "history_id": "history-body",
@@ -489,6 +597,7 @@ def test_gmail_sync_hydrates_added_messages_into_body_evidence(
     assert evidence.provider_object_id == provider_object.id
     assert evidence.external_id == "msg-body"
     assert evidence.thread_external_id == "thr-body"
+    assert evidence.source_timestamp == datetime(2026, 5, 7, 9, 0, tzinfo=UTC)
     assert evidence.content_digest == "b" * 64
     assert evidence.taint == "provider_untrusted"
     assert block is not None
@@ -499,6 +608,429 @@ def test_gmail_sync_hydrates_added_messages_into_body_evidence(
     assert block.digest == "d" * 64
     # The synced message wakes the agent through the shared push/poll sync path.
     assert [task.task_type for task in tasks] == ["agent_wake"]
+
+
+def test_gmail_sync_keeps_missing_or_invalid_internal_date_absent(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    providers: list[FakeUnreadableGmailProvider] = []
+
+    class FakeGoogleConnectorRuntime:
+        workspace_provider: FakeUnreadableGmailProvider
+
+        def __init__(self, **_: Any) -> None:
+            self.workspace_provider = FakeUnreadableGmailProvider()
+            providers.append(self.workspace_provider)
+
+        def access_token_for_background_sync(self, **_: Any) -> str:
+            return "access-token"
+
+    monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
+    now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
+    new_id = IdFactory()
+    with session_factory() as db:
+        with db.begin():
+            db.add(
+                SyncCursorRecord(
+                    id=new_id("cur"),
+                    provider="google",
+                    resource_type="gmail",
+                    resource_id="primary",
+                    cursor_value="hist-1",
+                    cursor_version=1,
+                    status="ready",
+                    last_successful_sync_at=None,
+                    last_error_code=None,
+                    last_error_at=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
+    process_provider_sync_due(
+        session_factory=session_factory,
+        task_payload={"provider": "google", "resource_type": "gmail", "resource_id": "primary"},
+        settings=_settings(),
+        now_fn=lambda: now,
+        new_id_fn=new_id,
+    )
+
+    with session_factory() as db:
+        with db.begin():
+            provider_objects = db.scalars(
+                select(GoogleProviderObjectRecord).order_by(
+                    GoogleProviderObjectRecord.external_id.asc()
+                )
+            ).all()
+            evidence_rows = db.scalars(
+                select(ProviderEvidenceRecord).order_by(ProviderEvidenceRecord.external_id.asc())
+            ).all()
+
+    assert len(providers) == 1
+    assert providers[0].read_calls == [
+        {"message_id": "msg-invalid-date", "thread_id": None, "mode": "message"},
+        {"message_id": "msg-missing-date", "thread_id": None, "mode": "message"},
+        {"message_id": "msg-blank-date", "thread_id": None, "mode": "message"},
+        {"message_id": "msg-negative-date", "thread_id": None, "mode": "message"},
+    ]
+    assert [row.external_id for row in provider_objects] == [
+        "msg-blank-date",
+        "msg-invalid-date",
+        "msg-missing-date",
+        "msg-negative-date",
+    ]
+    assert [row.source_timestamp for row in provider_objects] == [None, None, None, None]
+    assert [row.observed_at for row in provider_objects] == [now, now, now, now]
+    assert [row.external_id for row in evidence_rows] == [
+        "msg-blank-date",
+        "msg-invalid-date",
+        "msg-missing-date",
+        "msg-negative-date",
+    ]
+    assert [row.source_timestamp for row in evidence_rows] == [None, None, None, None]
+    assert [row.observed_at for row in evidence_rows] == [now, now, now, now]
+    assert [row.lifecycle_state for row in evidence_rows] == [
+        "unavailable",
+        "unavailable",
+        "unavailable",
+        "unavailable",
+    ]
+    assert [row.extraction_status for row in evidence_rows] == [
+        "failed",
+        "failed",
+        "failed",
+        "failed",
+    ]
+    assert [row.metadata_json["read_outcome"]["reason_code"] for row in evidence_rows] == [
+        "gmail_message_unavailable",
+        "gmail_message_unavailable",
+        "gmail_message_unavailable",
+        "gmail_message_unavailable",
+    ]
+
+
+def test_calendar_sync_keeps_missing_or_invalid_updated_timestamp_absent(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeCalendarProvider:
+        def calendar_list_event_deltas(self, **_: Any) -> dict[str, Any]:
+            return {
+                "nextSyncToken": "sync-token-2",
+                "items": [
+                    {
+                        "id": "evt-invalid-updated",
+                        "status": "confirmed",
+                        "summary": "Invalid updated",
+                        "updated": "not-a-timestamp",
+                        "start": {"dateTime": "2026-05-20T10:00:00Z"},
+                        "end": {"dateTime": "2026-05-20T11:00:00Z"},
+                    },
+                    {
+                        "id": "evt-missing-updated",
+                        "status": "confirmed",
+                        "summary": "Missing updated",
+                        "start": {"dateTime": "2026-05-21T10:00:00Z"},
+                        "end": {"dateTime": "2026-05-21T11:00:00Z"},
+                    },
+                ],
+            }
+
+    class FakeGoogleConnectorRuntime:
+        def __init__(self, **_: Any) -> None:
+            self.workspace_provider = FakeCalendarProvider()
+
+        def access_token_for_background_sync(self, **_: Any) -> str:
+            return "access-token"
+
+    monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
+    now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
+    new_id = IdFactory()
+    with session_factory() as db:
+        with db.begin():
+            db.add(
+                SyncCursorRecord(
+                    id=new_id("cur"),
+                    provider="google",
+                    resource_type="calendar",
+                    resource_id="primary",
+                    cursor_value="sync-token-1",
+                    cursor_version=1,
+                    status="ready",
+                    last_successful_sync_at=None,
+                    last_error_code=None,
+                    last_error_at=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
+    process_provider_sync_due(
+        session_factory=session_factory,
+        task_payload={"provider": "google", "resource_type": "calendar", "resource_id": "primary"},
+        settings=_settings(),
+        now_fn=lambda: now,
+        new_id_fn=new_id,
+    )
+
+    with session_factory() as db:
+        with db.begin():
+            provider_objects = db.scalars(
+                select(GoogleProviderObjectRecord).order_by(
+                    GoogleProviderObjectRecord.external_id.asc()
+                )
+            ).all()
+            evidence_rows = db.scalars(
+                select(ProviderEvidenceRecord).order_by(ProviderEvidenceRecord.external_id.asc())
+            ).all()
+
+    assert [row.external_id for row in provider_objects] == [
+        "evt-invalid-updated",
+        "evt-missing-updated",
+    ]
+    assert [row.source_timestamp for row in provider_objects] == [None, None]
+    assert [row.observed_at for row in provider_objects] == [now, now]
+    assert [row.external_id for row in evidence_rows] == [
+        "evt-invalid-updated",
+        "evt-missing-updated",
+    ]
+    assert [row.source_timestamp for row in evidence_rows] == [None, None]
+    assert [row.observed_at for row in evidence_rows] == [now, now]
+
+
+def test_calendar_provider_request_failure_marks_sync_failed(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingCalendarProvider:
+        def calendar_list_event_deltas(self, **_: Any) -> dict[str, Any]:
+            raise GoogleProviderRequestFailure("google_upstream_timeout")
+
+    class FakeGoogleConnectorRuntime:
+        def __init__(self, **_: Any) -> None:
+            self.workspace_provider = FailingCalendarProvider()
+
+        def access_token_for_background_sync(self, **_: Any) -> str:
+            return "access-token"
+
+    monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
+    now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
+    new_id = IdFactory()
+    _seed_sync_cursor(
+        session_factory,
+        new_id,
+        resource_type="calendar",
+        resource_id="primary",
+        cursor_value="sync-token-1",
+        now=now,
+    )
+
+    with pytest.raises(GoogleProviderRequestFailure, match="google_upstream_timeout"):
+        process_provider_sync_due(
+            session_factory=session_factory,
+            task_payload={
+                "provider": "google",
+                "resource_type": "calendar",
+                "resource_id": "primary",
+            },
+            settings=_settings(),
+            now_fn=lambda: now,
+            new_id_fn=new_id,
+        )
+
+    with session_factory() as db:
+        with db.begin():
+            cursor = db.scalar(select(SyncCursorRecord).limit(1))
+            run = db.scalar(select(SyncRunRecord).limit(1))
+            tasks = db.scalars(select(BackgroundTaskRecord)).all()
+
+    assert cursor is not None
+    assert cursor.status == "error"
+    assert cursor.last_error_code == "google_upstream_timeout"
+    assert run is not None
+    assert run.status == "failed"
+    assert run.error == "google_upstream_timeout"
+    assert tasks == []
+
+
+def test_unexpected_calendar_provider_defect_is_not_persisted_as_sync_failure(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BuggyCalendarProvider:
+        def calendar_list_event_deltas(self, **_: Any) -> dict[str, Any]:
+            raise RuntimeError("calendar bug")
+
+    class FakeGoogleConnectorRuntime:
+        def __init__(self, **_: Any) -> None:
+            self.workspace_provider = BuggyCalendarProvider()
+
+        def access_token_for_background_sync(self, **_: Any) -> str:
+            return "access-token"
+
+    monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
+    now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
+    new_id = IdFactory()
+    _seed_sync_cursor(
+        session_factory,
+        new_id,
+        resource_type="calendar",
+        resource_id="primary",
+        cursor_value="sync-token-1",
+        now=now,
+    )
+
+    with pytest.raises(RuntimeError, match="calendar bug"):
+        process_provider_sync_due(
+            session_factory=session_factory,
+            task_payload={
+                "provider": "google",
+                "resource_type": "calendar",
+                "resource_id": "primary",
+            },
+            settings=_settings(),
+            now_fn=lambda: now,
+            new_id_fn=new_id,
+        )
+
+    with session_factory() as db:
+        with db.begin():
+            cursor = db.scalar(select(SyncCursorRecord).limit(1))
+            run = db.scalar(select(SyncRunRecord).limit(1))
+
+    assert cursor is not None
+    assert cursor.status == "syncing"
+    assert cursor.last_error_code is None
+    assert run is not None
+    assert run.status == "running"
+    assert run.error is None
+
+
+def test_gmail_read_provider_request_failure_marks_sync_failed(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingReadGmailProvider:
+        def _request_json(self, **_: Any) -> dict[str, Any]:
+            raise AssertionError("existing Gmail cursor should use history pages")
+
+        def email_list_history(self, **_: Any) -> dict[str, Any]:
+            return {
+                "historyId": "hist-2",
+                "history": [
+                    {
+                        "id": "history-failing-read",
+                        "messagesAdded": [{"message": {"id": "msg-1", "threadId": "thr-1"}}],
+                    }
+                ],
+            }
+
+        def email_read(self, **_: Any) -> dict[str, Any]:
+            raise GoogleProviderRequestFailure("google_upstream_timeout")
+
+    class FakeGoogleConnectorRuntime:
+        def __init__(self, **_: Any) -> None:
+            self.workspace_provider = FailingReadGmailProvider()
+
+        def access_token_for_background_sync(self, **_: Any) -> str:
+            return "access-token"
+
+    monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
+    now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
+    new_id = IdFactory()
+    _seed_sync_cursor(
+        session_factory,
+        new_id,
+        resource_type="gmail",
+        resource_id="primary",
+        cursor_value="hist-1",
+        now=now,
+    )
+
+    with pytest.raises(GoogleProviderRequestFailure, match="google_upstream_timeout"):
+        process_provider_sync_due(
+            session_factory=session_factory,
+            task_payload={"provider": "google", "resource_type": "gmail", "resource_id": "primary"},
+            settings=_settings(),
+            now_fn=lambda: now,
+            new_id_fn=new_id,
+        )
+
+    with session_factory() as db:
+        with db.begin():
+            cursor = db.scalar(select(SyncCursorRecord).limit(1))
+            run = db.scalar(select(SyncRunRecord).limit(1))
+
+    assert cursor is not None
+    assert cursor.status == "error"
+    assert cursor.last_error_code == "google_upstream_timeout"
+    assert run is not None
+    assert run.status == "failed"
+    assert run.error == "google_upstream_timeout"
+
+
+def test_unexpected_gmail_read_defect_is_not_persisted_as_sync_failure(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BuggyReadGmailProvider:
+        def _request_json(self, **_: Any) -> dict[str, Any]:
+            raise AssertionError("existing Gmail cursor should use history pages")
+
+        def email_list_history(self, **_: Any) -> dict[str, Any]:
+            return {
+                "historyId": "hist-2",
+                "history": [
+                    {
+                        "id": "history-buggy-read",
+                        "messagesAdded": [{"message": {"id": "msg-1", "threadId": "thr-1"}}],
+                    }
+                ],
+            }
+
+        def email_read(self, **_: Any) -> dict[str, Any]:
+            raise RuntimeError("read bug")
+
+    class FakeGoogleConnectorRuntime:
+        def __init__(self, **_: Any) -> None:
+            self.workspace_provider = BuggyReadGmailProvider()
+
+        def access_token_for_background_sync(self, **_: Any) -> str:
+            return "access-token"
+
+    monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
+    now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
+    new_id = IdFactory()
+    _seed_sync_cursor(
+        session_factory,
+        new_id,
+        resource_type="gmail",
+        resource_id="primary",
+        cursor_value="hist-1",
+        now=now,
+    )
+
+    with pytest.raises(RuntimeError, match="read bug"):
+        process_provider_sync_due(
+            session_factory=session_factory,
+            task_payload={"provider": "google", "resource_type": "gmail", "resource_id": "primary"},
+            settings=_settings(),
+            now_fn=lambda: now,
+            new_id_fn=new_id,
+        )
+
+    with session_factory() as db:
+        with db.begin():
+            cursor = db.scalar(select(SyncCursorRecord).limit(1))
+            run = db.scalar(select(SyncRunRecord).limit(1))
+
+    assert cursor is not None
+    assert cursor.status == "syncing"
+    assert cursor.last_error_code is None
+    assert run is not None
+    assert run.status == "running"
+    assert run.error is None
 
 
 def test_gmail_sync_invalid_cursor_fails_closed_without_provider_call(

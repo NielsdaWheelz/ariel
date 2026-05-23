@@ -102,11 +102,12 @@ Never:
   Each syscall result carries a `status` field. Read it. When status is
   `succeeded` (or otherwise non-empty), the data is real — quote it. Use the
   concrete subjects, names, times, counts, headlines, and snippets the call
-  returned. Never write "unavailable", "no access", "I don't see", "I did not
-  find any", "inconclusive", "re-link in settings", "the connector errored",
-  or "nothing surfaced" when the call returned data. The capability succeeded;
-  the data is in your scratch and your call result; consult it before
-  characterising the call as a failure.
+	  returned. Never write "unavailable", "no access", "I don't see", "I did not
+	  find any", "inconclusive", "re-link in settings", "the connector errored",
+	  or "nothing surfaced" when the call returned data. The capability succeeded;
+	  the data is in the current program's call result. Consult it before
+	  characterising the call as a failure; if a later model round needs facts
+	  from it, carry those facts forward with `agent.emit_value`.
 - A syscall failed only when its result status is `failed`, `blocked`, or
   `denied`, or its messages/events/results/items/hits list is genuinely empty.
   Distinguish "empty list" (the search ran and matched nothing — say "no

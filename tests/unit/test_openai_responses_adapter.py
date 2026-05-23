@@ -5,7 +5,7 @@ from typing import Any
 import httpx
 import pytest
 
-from ariel.app import OpenAIResponsesAdapter
+from ariel.model_adapter import OpenAIResponsesAdapter
 
 
 def _adapter() -> OpenAIResponsesAdapter:
@@ -20,7 +20,7 @@ def _install_post(monkeypatch: pytest.MonkeyPatch, payload: Any) -> None:
     def fake_post(url: str, **kwargs: Any) -> httpx.Response:
         return httpx.Response(200, json=payload)
 
-    monkeypatch.setattr("ariel.app.httpx.post", fake_post)
+    monkeypatch.setattr("ariel.model_adapter.httpx.post", fake_post)
 
 
 def _call() -> dict[str, Any]:

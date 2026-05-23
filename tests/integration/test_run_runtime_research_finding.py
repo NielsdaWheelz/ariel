@@ -257,8 +257,7 @@ def test_emit_finding_rejected_in_main_agent_run(
             )
             assert not result.program_ok
             assert any(
-                "agent.emit_finding is not available in the main agent loop"
-                in error
+                "agent.emit_finding is not available in the main agent loop" in error
                 for error in result.callback_errors
             )
     sandbox.close()

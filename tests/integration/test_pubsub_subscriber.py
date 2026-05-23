@@ -9,8 +9,11 @@ the assertions.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any, cast
 
+import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.orm import Session, sessionmaker
 
 from ariel import pubsub_subscriber
@@ -28,11 +31,23 @@ from tests.fake_pubsub import FakePubSubMessage
 _NOW = datetime(2026, 5, 19, 12, 0, tzinfo=UTC)
 
 
+class _DbDiag:
+    def __init__(self, constraint_name: str | None = None) -> None:
+        self.constraint_name = constraint_name
+
+
+class _DbOrig(Exception):
+    def __init__(self, *, sqlstate: str, constraint_name: str | None = None) -> None:
+        super().__init__(sqlstate)
+        self.sqlstate = sqlstate
+        self.diag = _DbDiag(constraint_name)
+
+
 def _seed_connector(
     session_factory: sessionmaker[Session],
     *,
     account_email: str = "user@example.com",
-    account_subject: str = "sub_user",
+    account_subject: str | None = "sub_user",
 ) -> None:
     with session_factory() as db:
         with db.begin():
@@ -57,11 +72,26 @@ def _seed_connector(
             )
 
 
+def _events_and_tasks(
+    session_factory: sessionmaker[Session],
+) -> tuple[list[ProviderEventRecord], list[BackgroundTaskRecord]]:
+    with session_factory() as db:
+        events = list(db.scalars(select(ProviderEventRecord)).all())
+        tasks = list(
+            db.scalars(
+                select(BackgroundTaskRecord).where(
+                    BackgroundTaskRecord.task_type == "provider_event_received"
+                )
+            ).all()
+        )
+    return events, tasks
+
+
 def test_handle_message_happy_path(session_factory: sessionmaker[Session]) -> None:
     _seed_connector(session_factory)
     message = FakePubSubMessage(
         message_id="pubsub-msg-1",
-        data=b'{"emailAddress": "user@example.com", "historyId": 12345}',
+        data=b'{"emailAddress": "user@example.com", "historyId": "12345"}',
         publish_time=_NOW,
     )
 
@@ -99,7 +129,7 @@ def test_handle_message_happy_path(session_factory: sessionmaker[Session]) -> No
 
 def test_handle_message_duplicate_dedups(session_factory: sessionmaker[Session]) -> None:
     _seed_connector(session_factory)
-    payload = b'{"emailAddress": "user@example.com", "historyId": 12345}'
+    payload = b'{"emailAddress": "user@example.com", "historyId": "12345"}'
     first = FakePubSubMessage(message_id="pubsub-msg-dup", data=payload, publish_time=_NOW)
     second = FakePubSubMessage(message_id="pubsub-msg-dup", data=payload, publish_time=_NOW)
 
@@ -150,7 +180,7 @@ def test_handle_message_missing_email_field_nacks(session_factory: sessionmaker[
     _seed_connector(session_factory)
     message = FakePubSubMessage(
         message_id="pubsub-msg-no-email",
-        data=b'{"historyId": 42}',
+        data=b'{"historyId": "42"}',
         publish_time=_NOW,
     )
 
@@ -170,13 +200,44 @@ def test_handle_message_missing_email_field_nacks(session_factory: sessionmaker[
     assert len(message.nack_calls) == 1
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"[]",
+        b'{"emailAddress": "", "historyId": "1"}',
+        b'{"emailAddress": ["user@example.com"], "historyId": "1"}',
+        b'{"emailAddress": "user@example.com"}',
+        b'{"emailAddress": "user@example.com", "historyId": ""}',
+        b'{"emailAddress": "user@example.com", "historyId": 1}',
+    ],
+)
+def test_handle_message_invalid_payload_shape_nacks(
+    session_factory: sessionmaker[Session],
+    payload: bytes,
+) -> None:
+    _seed_connector(session_factory)
+    message = FakePubSubMessage(
+        message_id="pubsub-msg-invalid-shape",
+        data=payload,
+        publish_time=_NOW,
+    )
+
+    handle_message(session_factory, message)
+
+    events, tasks = _events_and_tasks(session_factory)
+    assert events == []
+    assert tasks == []
+    assert message.ack_calls == []
+    assert len(message.nack_calls) == 1
+
+
 def test_handle_message_unknown_account_acks_and_drops(
     session_factory: sessionmaker[Session],
 ) -> None:
     _seed_connector(session_factory, account_email="user@example.com")
     message = FakePubSubMessage(
         message_id="pubsub-msg-stranger",
-        data=b'{"emailAddress": "stranger@example.com", "historyId": 1}',
+        data=b'{"emailAddress": "stranger@example.com", "historyId": "1"}',
         publish_time=_NOW,
     )
 
@@ -194,6 +255,180 @@ def test_handle_message_unknown_account_acks_and_drops(
     assert tasks == []
     assert len(message.ack_calls) == 1
     assert message.nack_calls == []
+
+
+@pytest.mark.parametrize("account_subject", [None, "", " ", "unknown-subject"])
+def test_handle_message_invalid_connector_subject_acks_and_drops(
+    session_factory: sessionmaker[Session],
+    account_subject: str | None,
+) -> None:
+    _seed_connector(session_factory, account_subject=account_subject)
+    message = FakePubSubMessage(
+        message_id="pubsub-msg-invalid-subject",
+        data=b'{"emailAddress": "user@example.com", "historyId": "1"}',
+        publish_time=_NOW,
+    )
+
+    handle_message(session_factory, message)
+
+    events, tasks = _events_and_tasks(session_factory)
+    assert events == []
+    assert tasks == []
+    assert len(message.ack_calls) == 1
+    assert message.nack_calls == []
+
+
+def test_handle_message_ack_failure_raises_before_success_heartbeat(
+    session_factory: sessionmaker[Session],
+) -> None:
+    _seed_connector(session_factory)
+    message = FakePubSubMessage(
+        message_id="pubsub-msg-ack-fail",
+        data=b'{"emailAddress": "user@example.com", "historyId": "1"}',
+        publish_time=_NOW,
+        ack_succeeded=False,
+    )
+
+    with pytest.raises(pubsub_subscriber.PubSubAckFailure, match="ack_status_not_success"):
+        handle_message(session_factory, message)
+
+    with session_factory() as db:
+        heartbeat = db.scalar(
+            select(SubscriberHeartbeatRecord).where(
+                SubscriberHeartbeatRecord.subscriber_name == SUBSCRIBER_NAME
+            )
+        )
+
+    assert len(message.ack_calls) == 1
+    assert message.nack_calls == []
+    assert heartbeat is None
+
+
+def test_handle_message_wraps_retryable_db_failure(
+    session_factory: sessionmaker[Session],
+) -> None:
+    del session_factory
+
+    def fail_session_factory() -> None:
+        raise OperationalError("SELECT 1", {}, _DbOrig(sqlstate="40001"))
+
+    message = FakePubSubMessage(
+        message_id="pubsub-msg-retryable-db",
+        data=b'{"emailAddress": "user@example.com", "historyId": "1"}',
+        publish_time=_NOW,
+    )
+
+    with pytest.raises(pubsub_subscriber.PubSubProviderEventPersistenceFailure):
+        handle_message(cast(sessionmaker[Session], fail_session_factory), message)
+
+    assert message.ack_calls == []
+    assert message.nack_calls == []
+
+
+def test_handle_message_propagates_nonretryable_db_failure(
+    session_factory: sessionmaker[Session],
+) -> None:
+    del session_factory
+
+    def fail_session_factory() -> None:
+        raise ProgrammingError("SELECT 1", {}, _DbOrig(sqlstate="42P01"))
+
+    message = FakePubSubMessage(
+        message_id="pubsub-msg-schema-error",
+        data=b'{"emailAddress": "user@example.com", "historyId": "1"}',
+        publish_time=_NOW,
+    )
+
+    with pytest.raises(ProgrammingError):
+        handle_message(cast(sessionmaker[Session], fail_session_factory), message)
+
+    assert message.ack_calls == []
+    assert message.nack_calls == []
+
+
+def test_streaming_callback_logs_named_failure_and_leaves_message_unacked(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def fail_handler(_session_factory: sessionmaker[Session], _message: Any) -> None:
+        raise pubsub_subscriber.PubSubProviderEventPersistenceFailure()
+
+    monkeypatch.setattr(pubsub_subscriber, "handle_message", fail_handler)
+    message = FakePubSubMessage(
+        message_id="pubsub-msg-handler-fails",
+        data=b'{"emailAddress": "user@example.com", "historyId": "1"}',
+        publish_time=_NOW,
+    )
+
+    with caplog.at_level("ERROR", logger="ariel.pubsub_subscriber"):
+        pubsub_subscriber._handle_streaming_message(session_factory, message)
+
+    assert "Pub/Sub message handler failed; message will be redelivered" in caplog.text
+    assert caplog.records[-1].exc_info is not None
+    assert caplog.records[-1].exc_info[0] is (
+        pubsub_subscriber.PubSubProviderEventPersistenceFailure
+    )
+    assert message.ack_calls == []
+    assert message.nack_calls == []
+
+
+def test_streaming_callback_propagates_unexpected_handler_error(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def fail_handler(_session_factory: sessionmaker[Session], _message: Any) -> None:
+        raise RuntimeError("programmer bug")
+
+    monkeypatch.setattr(pubsub_subscriber, "handle_message", fail_handler)
+    message = FakePubSubMessage(
+        message_id="pubsub-msg-handler-bug",
+        data=b'{"emailAddress": "user@example.com", "historyId": "1"}',
+        publish_time=_NOW,
+    )
+
+    with (
+        caplog.at_level("ERROR", logger="ariel.pubsub_subscriber"),
+        pytest.raises(RuntimeError, match="programmer bug"),
+    ):
+        pubsub_subscriber._handle_streaming_message(session_factory, message)
+
+    assert "message will be redelivered" not in caplog.text
+    assert message.ack_calls == []
+    assert message.nack_calls == []
+
+
+def test_streaming_callback_logs_ack_failure_without_success_heartbeat(
+    session_factory: sessionmaker[Session],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _seed_connector(session_factory)
+    message = FakePubSubMessage(
+        message_id="pubsub-msg-streaming-ack-fail",
+        data=b'{"emailAddress": "user@example.com", "historyId": "1"}',
+        publish_time=_NOW,
+        ack_succeeded=False,
+    )
+
+    with caplog.at_level("ERROR", logger="ariel.pubsub_subscriber"):
+        pubsub_subscriber._handle_streaming_message(session_factory, message)
+
+    events, tasks = _events_and_tasks(session_factory)
+    with session_factory() as db:
+        heartbeat = db.scalar(
+            select(SubscriberHeartbeatRecord).where(
+                SubscriberHeartbeatRecord.subscriber_name == SUBSCRIBER_NAME
+            )
+        )
+
+    assert "Pub/Sub message handler failed; message will be redelivered" in caplog.text
+    assert "ack_status_not_success" in caplog.text
+    assert len(events) == 1
+    assert len(tasks) == 1
+    assert len(message.ack_calls) == 1
+    assert message.nack_calls == []
+    assert heartbeat is None
 
 
 def test_write_heartbeat_creates_then_updates(session_factory: sessionmaker[Session]) -> None:
@@ -220,3 +455,40 @@ def test_write_heartbeat_creates_then_updates(session_factory: sessionmaker[Sess
     assert second_row.id == first_row.id
     assert second_row.last_message_at is None
     assert second_row.last_seen_at >= first_seen_at
+
+
+def test_heartbeat_tick_logs_named_write_failure(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def fail_heartbeat(_session_factory: sessionmaker[Session]) -> None:
+        raise pubsub_subscriber.PubSubHeartbeatWriteFailure()
+
+    monkeypatch.setattr(pubsub_subscriber, "_write_heartbeat", fail_heartbeat)
+
+    with caplog.at_level("ERROR", logger="ariel.pubsub_subscriber"):
+        pubsub_subscriber._run_heartbeat_tick(session_factory)
+
+    assert "subscriber heartbeat write failed" in caplog.text
+    assert caplog.records[-1].exc_info is not None
+    assert caplog.records[-1].exc_info[0] is pubsub_subscriber.PubSubHeartbeatWriteFailure
+
+
+def test_heartbeat_tick_propagates_unexpected_write_error(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def fail_heartbeat(_session_factory: sessionmaker[Session]) -> None:
+        raise RuntimeError("programmer bug")
+
+    monkeypatch.setattr(pubsub_subscriber, "_write_heartbeat", fail_heartbeat)
+
+    with (
+        caplog.at_level("ERROR", logger="ariel.pubsub_subscriber"),
+        pytest.raises(RuntimeError, match="programmer bug"),
+    ):
+        pubsub_subscriber._run_heartbeat_tick(session_factory)
+
+    assert "subscriber heartbeat write failed" not in caplog.text

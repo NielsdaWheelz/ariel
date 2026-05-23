@@ -24,7 +24,6 @@ from ariel.google_connector import (
     GOOGLE_CONNECTOR_ID,
     GOOGLE_GMAIL_MODIFY_SCOPE,
     GoogleCapabilityExecutionResult,
-    _encrypt_secret,
 )
 from ariel.persistence import (
     ActionAttemptRecord,
@@ -37,6 +36,7 @@ from ariel.persistence import (
     TurnRecord,
     serialize_action_attempt,
 )
+from ariel.secret_cipher import encrypt_secret
 
 
 NOW = datetime(2026, 5, 8, 12, 0, tzinfo=UTC)
@@ -78,6 +78,8 @@ class FakeGoogleRuntime:
     execution_output: dict[str, Any] | None = None
     execution_status: Literal["succeeded", "failed"] = "succeeded"
     execution_error: str | None = None
+    execution_exception: Exception | None = None
+    refresh_failure: GoogleCapabilityExecutionResult | None = None
     executions: list[dict[str, Any]] = field(default_factory=list)
     encryption_secret: str = "test-secret"
     encryption_key_version: str = "v1"
@@ -90,8 +92,9 @@ class FakeGoogleRuntime:
         capability_id: str,
         now_fn: Any,
         new_id_fn: Any,
-    ) -> None:
+    ) -> GoogleCapabilityExecutionResult | None:
         del session_factory, capability_id, now_fn, new_id_fn
+        return self.refresh_failure
 
     def prepare_capability_access_without_refresh(
         self,
@@ -125,6 +128,8 @@ class FakeGoogleRuntime:
     ) -> GoogleCapabilityExecutionResult:
         del capability_id, access_token, granted_scopes, provider_account_id
         self.executions.append(normalized_input)
+        if self.execution_exception is not None:
+            raise self.execution_exception
         if self.execution_status == "succeeded":
             assert self.execution_output is not None
         return GoogleCapabilityExecutionResult(
@@ -249,7 +254,7 @@ def _seed_action_attempt(
                         payload_digest=hashlib.sha256(
                             private_payload_json.encode("utf-8")
                         ).hexdigest(),
-                        payload_enc=_encrypt_secret(
+                        payload_enc=encrypt_secret(
                             plaintext=private_payload_json,
                             secret="test-secret",
                             key_version="v1",
@@ -284,6 +289,65 @@ def _seed_google_connector(
                     encryption_key_version="v1",
                     last_error_code=None,
                     last_error_at=None,
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+
+
+def _seed_failed_email_write_receipt(
+    session_factory: sessionmaker[Session],
+    *,
+    receipt_id: str,
+    action_attempt_id: str,
+    capability_id: str,
+    client_key: str,
+    request_digest: str,
+    error: str,
+    before_messages: list[dict[str, Any]] | None = None,
+    after_messages: list[dict[str, Any]] | None = None,
+) -> None:
+    with session_factory() as db:
+        with db.begin():
+            action_attempt = db.get(ActionAttemptRecord, action_attempt_id)
+            assert action_attempt is not None
+            action_attempt.execution_output = {
+                "dispatch_state": "provider_call_started",
+                "provider_account_id": PROVIDER_ACCOUNT_ID,
+            }
+            db.add(
+                ProviderWriteReceiptRecord(
+                    id=receipt_id,
+                    provider="google",
+                    provider_account_id=PROVIDER_ACCOUNT_ID,
+                    action_attempt_id=action_attempt_id,
+                    capability_id=capability_id,
+                    idempotency_key=_provider_write_idempotency_key(
+                        capability_id=capability_id,
+                        provider_account_id=PROVIDER_ACCOUNT_ID,
+                        client_key=client_key,
+                    ),
+                    status="failed",
+                    provider_object_ids={"message_ids": ["msg_1"], "thread_ids": ["thr_1"]},
+                    request_digest=request_digest,
+                    response_payload={
+                        "status": "failed",
+                        "error": error,
+                        "provider_result": {"operation": "archive"},
+                    },
+                    ambiguity_reason=None,
+                    provider_timestamp=None,
+                    provider_etag=None,
+                    provider_history_id=None,
+                    response_digest="d" * 64,
+                    before_state={"messages": before_messages}
+                    if before_messages is not None
+                    else None,
+                    after_state={"messages": after_messages}
+                    if after_messages is not None
+                    else None,
+                    undo_token_hash=None,
+                    undo_expires_at=None,
                     created_at=NOW,
                     updated_at=NOW,
                 )
@@ -468,6 +532,139 @@ def test_email_action_provider_timeout_records_ambiguous_receipt_and_fails_close
         )
         assert reconcile_task is not None
         assert reconcile_task.provider_write_receipt_id == receipt.id
+
+
+def test_email_action_dispatch_defect_reconciles_provider_call_started(
+    session_factory: sessionmaker[Session],
+) -> None:
+    before_state = [{"message_id": "msg_1", "thread_id": "thr_1", "label_ids": ["INBOX"]}]
+    runtime = FakeGoogleRuntime(
+        workspace_provider=FakeWorkspaceProvider(before_state=before_state),
+        execution_exception=RuntimeError("dispatch defect"),
+    )
+    _seed_action_attempt(
+        session_factory,
+        action_attempt_id="act_dispatch_defect",
+        capability_id="cap.email.archive",
+        proposed_input={"message_ids": ["msg_1"], "idempotency_key": "archive-dispatch-defect"},
+        proposal_index=1,
+    )
+    new_id = _id_factory("dispatch_defect")
+
+    with pytest.raises(RuntimeError, match="dispatch defect"):
+        process_action_execution_task(
+            session_factory=session_factory,
+            action_attempt_id="act_dispatch_defect",
+            google_runtime=runtime,  # type: ignore[arg-type]
+            agency_runtime=None,
+            now_fn=lambda: NOW,
+            new_id_fn=new_id,
+        )
+
+    assert runtime.executions == [
+        {
+            "message_ids": ["msg_1"],
+            "idempotency_key": "archive-dispatch-defect",
+            "user_instruction_ref": "turn:turn_email",
+            "before_state": before_state,
+        }
+    ]
+    with session_factory() as db:
+        action_attempt = db.get(ActionAttemptRecord, "act_dispatch_defect")
+        assert action_attempt is not None
+        assert action_attempt.status == "executing"
+        assert action_attempt.execution_error is None
+        assert action_attempt.execution_output == {
+            "dispatch_state": "provider_call_started",
+            "provider_account_id": PROVIDER_ACCOUNT_ID,
+        }
+        receipt = db.scalar(select(ProviderWriteReceiptRecord).limit(1))
+        assert receipt is not None
+        assert receipt.status == "executing"
+        assert receipt.response_payload["dispatch_state"] == "provider_call_started"
+        assert receipt.response_payload["authority"]["user_instruction_ref"] == "turn:turn_email"
+        assert receipt.ambiguity_reason is None
+        assert (
+            db.scalar(
+                select(EventRecord).where(EventRecord.event_type == "evt.action.execution.failed")
+            )
+            is None
+        )
+
+    assert process_action_execution_task(
+        session_factory=session_factory,
+        action_attempt_id="act_dispatch_defect",
+        google_runtime=runtime,  # type: ignore[arg-type]
+        agency_runtime=None,
+        now_fn=lambda: NOW,
+        new_id_fn=new_id,
+    )
+
+    with session_factory() as db:
+        action_attempt = db.get(ActionAttemptRecord, "act_dispatch_defect")
+        assert action_attempt is not None
+        assert action_attempt.status == "failed"
+        assert action_attempt.execution_error == "provider_result_unknown"
+        receipt = db.scalar(select(ProviderWriteReceiptRecord).limit(1))
+        assert receipt is not None
+        assert receipt.status == "ambiguous"
+        assert receipt.ambiguity_reason == "provider_result_unknown"
+        event_types = [
+            row[0]
+            for row in db.execute(
+                select(EventRecord.event_type).order_by(EventRecord.sequence.asc())
+            ).all()
+        ]
+        assert event_types == [
+            "evt.provider_write.reconcile_unavailable",
+            "evt.action.execution.failed",
+        ]
+
+
+def test_email_action_refresh_timeout_fails_before_provider_mutation_without_receipt(
+    session_factory: sessionmaker[Session],
+) -> None:
+    runtime = FakeGoogleRuntime(
+        workspace_provider=FakeWorkspaceProvider(before_state=[]),
+        refresh_failure=GoogleCapabilityExecutionResult(
+            status="failed",
+            output=None,
+            auth_failure=None,
+            error="provider_timeout",
+        ),
+    )
+    _seed_action_attempt(
+        session_factory,
+        action_attempt_id="act_refresh_timeout",
+        capability_id="cap.email.archive",
+        proposed_input={"message_ids": ["msg_1"], "idempotency_key": "archive-refresh-timeout"},
+        proposal_index=1,
+    )
+
+    assert process_action_execution_task(
+        session_factory=session_factory,
+        action_attempt_id="act_refresh_timeout",
+        google_runtime=runtime,  # type: ignore[arg-type]
+        agency_runtime=None,
+        now_fn=lambda: NOW,
+        new_id_fn=_id_factory("refresh_timeout"),
+    )
+
+    assert runtime.workspace_provider.state_reads == 0
+    assert runtime.executions == []
+    with session_factory() as db:
+        action_attempt = db.get(ActionAttemptRecord, "act_refresh_timeout")
+        assert action_attempt is not None
+        assert action_attempt.status == "failed"
+        assert action_attempt.execution_error == "provider_timeout"
+        assert db.scalar(select(ProviderWriteReceiptRecord).limit(1)) is None
+        event_types = [
+            row[0]
+            for row in db.execute(
+                select(EventRecord.event_type).order_by(EventRecord.sequence.asc())
+            ).all()
+        ]
+        assert event_types == ["evt.action.execution.failed"]
 
 
 def test_email_action_success_redacts_undo_token_from_event_audit(
@@ -879,6 +1076,147 @@ def test_email_action_crash_recovery_reconciles_against_the_write_receipt(
         )
         assert reconcile_task is not None
         assert reconcile_task.provider_write_receipt_id == "pwr_crash"
+
+
+def test_email_action_crash_recovery_retries_failed_retryable_receipt(
+    session_factory: sessionmaker[Session],
+) -> None:
+    before_state = [{"message_id": "msg_1", "thread_id": "thr_1", "label_ids": ["INBOX"]}]
+    after_state = [{"message_id": "msg_1", "thread_id": "thr_1", "label_ids": []}]
+    original_hash = _seed_action_attempt(
+        session_factory,
+        action_attempt_id="act_crash_retryable",
+        capability_id="cap.email.archive",
+        proposed_input={
+            "message_ids": ["msg_1"],
+            "idempotency_key": "archive-crash-retryable",
+        },
+        proposal_index=1,
+    )
+    _seed_failed_email_write_receipt(
+        session_factory,
+        receipt_id="pwr_crash_retryable",
+        action_attempt_id="act_crash_retryable",
+        capability_id="cap.email.archive",
+        client_key="archive-crash-retryable",
+        request_digest=original_hash,
+        error="google_upstream_500",
+        before_messages=before_state,
+        after_messages=before_state,
+    )
+    runtime = FakeGoogleRuntime(
+        workspace_provider=FakeWorkspaceProvider(before_state=[]),
+        execution_output={
+            "status": "archived",
+            "operation": "archive",
+            "message_ids": ["msg_1"],
+            "before_state": before_state,
+            "after_state": after_state,
+            "provider_result": {
+                "operation": "archive",
+                "provider": "gmail",
+                "mutated_message_ids": ["msg_1"],
+                "attempted_message_ids": ["msg_1"],
+            },
+        },
+    )
+
+    assert process_action_execution_task(
+        session_factory=session_factory,
+        action_attempt_id="act_crash_retryable",
+        google_runtime=runtime,  # type: ignore[arg-type]
+        agency_runtime=None,
+        now_fn=lambda: NOW,
+        new_id_fn=_id_factory("crash_retryable"),
+    )
+
+    assert runtime.workspace_provider.state_reads == 0
+    assert runtime.executions[0]["before_state"] == before_state
+    with session_factory() as db:
+        action_attempt = db.get(ActionAttemptRecord, "act_crash_retryable")
+        assert action_attempt is not None
+        assert action_attempt.status == "succeeded"
+        assert action_attempt.execution_output is not None
+        assert action_attempt.execution_output["email_action_id"] == "pwr_crash_retryable"
+        receipt = db.get(ProviderWriteReceiptRecord, "pwr_crash_retryable")
+        assert receipt is not None
+        assert receipt.status == "succeeded"
+        assert receipt.ambiguity_reason is None
+        reconcile_event = db.scalar(
+            select(EventRecord)
+            .where(EventRecord.event_type == "evt.provider_write.reconcile_unavailable")
+            .limit(1)
+        )
+        assert reconcile_event is None
+        reconcile_task = db.scalar(
+            select(BackgroundTaskRecord)
+            .where(BackgroundTaskRecord.task_type == "provider_write_reconcile_due")
+            .limit(1)
+        )
+        assert reconcile_task is None
+
+
+def test_email_action_crash_recovery_replays_failed_nonretryable_receipt_without_reconcile(
+    session_factory: sessionmaker[Session],
+) -> None:
+    original_hash = _seed_action_attempt(
+        session_factory,
+        action_attempt_id="act_crash_nonretryable",
+        capability_id="cap.email.archive",
+        proposed_input={
+            "message_ids": ["msg_1"],
+            "idempotency_key": "archive-crash-nonretryable",
+        },
+        proposal_index=1,
+    )
+    _seed_failed_email_write_receipt(
+        session_factory,
+        receipt_id="pwr_crash_nonretryable",
+        action_attempt_id="act_crash_nonretryable",
+        capability_id="cap.email.archive",
+        client_key="archive-crash-nonretryable",
+        request_digest=original_hash,
+        error="provider_permission_denied",
+    )
+    runtime = FakeGoogleRuntime(
+        workspace_provider=FakeWorkspaceProvider(before_state=[]),
+        execution_output=None,
+    )
+
+    assert process_action_execution_task(
+        session_factory=session_factory,
+        action_attempt_id="act_crash_nonretryable",
+        google_runtime=runtime,  # type: ignore[arg-type]
+        agency_runtime=None,
+        now_fn=lambda: NOW,
+        new_id_fn=_id_factory("crash_nonretryable"),
+    )
+
+    assert runtime.workspace_provider.state_reads == 0
+    assert runtime.executions == []
+    with session_factory() as db:
+        action_attempt = db.get(ActionAttemptRecord, "act_crash_nonretryable")
+        assert action_attempt is not None
+        assert action_attempt.status == "failed"
+        assert action_attempt.execution_error == "provider_permission_denied"
+        receipt = db.get(ProviderWriteReceiptRecord, "pwr_crash_nonretryable")
+        assert receipt is not None
+        assert receipt.status == "failed"
+        assert receipt.ambiguity_reason is None
+        assert receipt.response_payload["error"] == "provider_permission_denied"
+        event_types = [
+            row[0]
+            for row in db.execute(
+                select(EventRecord.event_type).order_by(EventRecord.sequence.asc())
+            ).all()
+        ]
+        assert event_types == ["evt.action.execution.failed"]
+        reconcile_task = db.scalar(
+            select(BackgroundTaskRecord)
+            .where(BackgroundTaskRecord.task_type == "provider_write_reconcile_due")
+            .limit(1)
+        )
+        assert reconcile_task is None
 
 
 def test_email_undo_marks_prior_receipt_undone_on_the_single_ledger(

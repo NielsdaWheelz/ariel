@@ -12,8 +12,8 @@ from sqlalchemy import select
 
 import ariel.action_runtime as action_runtime_module
 import ariel.policy_engine as policy_engine_module
-from ariel.app import ModelAdapter
-from tests.integration.app_helpers import create_migrated_app
+from ariel.model_adapter import ModelAdapter
+from tests.integration.app_helpers import create_test_app
 from tests.integration.responses_helpers import (
     empty_recall_response,
     is_memory_subsystem_call,
@@ -23,6 +23,7 @@ from tests.integration.responses_helpers import (
 )
 from ariel.capability_registry import (
     CapabilityDefinition,
+    CapabilityExecutionError,
     get_capability as registry_get_capability,
 )
 from ariel.persistence import ArtifactRecord
@@ -101,7 +102,6 @@ class ActionRunAdapter:
         if not run_calls:
             run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
         return responses_with_run_calls(
-            assistant_text=assistant_text,
             calls=copy.deepcopy(run_calls),
             provider=self.provider,
             model=self.model,
@@ -118,7 +118,7 @@ def _provider_bindings(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
-    app = create_migrated_app(
+    app = create_test_app(
         database_url=postgres_url,
         model_adapter=adapter,
         sandbox=FakeSandboxRuntime(),
@@ -527,7 +527,7 @@ def test_weather_without_resolvable_location_asks_clarification_instead_of_guess
     def mutate(capability: CapabilityDefinition) -> CapabilityDefinition:
         def execute(input_payload: dict[str, Any]) -> dict[str, Any]:
             if input_payload.get("location") is None:
-                raise RuntimeError("weather_location_required")
+                raise CapabilityExecutionError("weather_location_required")
             return _weather_output(
                 input_payload,
                 forecast_time="2026-03-03T13:00:00Z",
@@ -574,7 +574,7 @@ def test_weather_upstream_failure_is_explicit_and_recoverable(
 ) -> None:
     def mutate(capability: CapabilityDefinition) -> CapabilityDefinition:
         def execute(_: dict[str, Any]) -> dict[str, Any]:
-            raise TimeoutError("weather provider timed out")
+            raise CapabilityExecutionError("weather provider timed out")
 
         return replace(capability, execute=execute)
 

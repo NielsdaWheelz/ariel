@@ -5,7 +5,7 @@ from typing import Any, cast
 
 import pytest
 
-from ariel.google_connector import GoogleConnectorRuntime
+from ariel.google_connector import GoogleConnectorRuntime, GoogleProviderRequestFailure
 
 
 @dataclass
@@ -17,8 +17,9 @@ class _FakeGoogleProvider:
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]:
-        del access_token, normalized_input
+        del access_token, normalized_input, provider_account_id
         return self.output
 
     def calendar_propose_slots(
@@ -26,9 +27,10 @@ class _FakeGoogleProvider:
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
         attendee_intersection_enabled: bool,
     ) -> dict[str, Any]:
-        del access_token, normalized_input, attendee_intersection_enabled
+        del access_token, normalized_input, provider_account_id, attendee_intersection_enabled
         return self.output
 
     def calendar_create_event(
@@ -63,8 +65,9 @@ class _FakeGoogleProvider:
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]:
-        del access_token, normalized_input
+        del access_token, normalized_input, provider_account_id
         return self.output
 
     def email_read(
@@ -72,8 +75,9 @@ class _FakeGoogleProvider:
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]:
-        del access_token, normalized_input
+        del access_token, normalized_input, provider_account_id
         return self.output
 
     def drive_search(
@@ -81,8 +85,9 @@ class _FakeGoogleProvider:
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]:
-        del access_token, normalized_input
+        del access_token, normalized_input, provider_account_id
         return self.output
 
     def drive_read(
@@ -90,20 +95,40 @@ class _FakeGoogleProvider:
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]:
-        del access_token, normalized_input
+        del access_token, normalized_input, provider_account_id
         return self.output
 
 
-def _runtime(output: dict[str, Any]) -> GoogleConnectorRuntime:
+@dataclass
+class _FailingEmailSearchProvider:
+    failure: Exception
+
+    def email_search(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+        provider_account_id: str,
+    ) -> dict[str, Any]:
+        del access_token, normalized_input, provider_account_id
+        raise self.failure
+
+
+def _runtime_for_provider(provider: object) -> GoogleConnectorRuntime:
     return GoogleConnectorRuntime(
         oauth_client=cast(Any, object()),
-        workspace_provider=cast(Any, _FakeGoogleProvider(output)),
+        workspace_provider=cast(Any, provider),
         redirect_uri="https://app.example.test/oauth/google/callback",
         oauth_state_ttl_seconds=300,
         encryption_secret="test-secret",
         encryption_key_version="v1",
     )
+
+
+def _runtime(output: dict[str, Any]) -> GoogleConnectorRuntime:
+    return _runtime_for_provider(_FakeGoogleProvider(output))
 
 
 def _execute(
@@ -123,8 +148,25 @@ def _execute(
         },
         access_token="tok_live",
         granted_scopes=set(),
+        provider_account_id="acct_google",
     )
     return result.status, result.output, result.error
+
+
+def _execute_with_provider(
+    provider: object,
+) -> tuple[str, dict[str, Any] | None, str | None, str | None]:
+    result = _runtime_for_provider(provider).execute_provider_capability(
+        capability_id="cap.email.search",
+        normalized_input={"query": "invoice"},
+        access_token="tok_live",
+        granted_scopes=set(),
+        provider_account_id="acct_google",
+    )
+    auth_failure_class = (
+        result.auth_failure.failure_class if result.auth_failure is not None else None
+    )
+    return result.status, result.output, result.error, auth_failure_class
 
 
 def _calendar_events_output(event: dict[str, Any]) -> dict[str, Any]:
@@ -218,6 +260,7 @@ def _calendar_event() -> dict[str, Any]:
             "cap.calendar.propose_slots",
             {
                 "schema_version": "google.calendar.slot_options.v1",
+                "provider_account_id": "acct_google",
                 "slots": [
                     {
                         "slot_id": "slot_1",
@@ -303,6 +346,7 @@ def _calendar_event() -> dict[str, Any]:
                 "status": "succeeded",
                 "messages": [
                     {
+                        "provider_account_id": "acct_google",
                         "message_id": "msg_1",
                         "thread_id": "thr_1",
                         "history_id": "hist_1",
@@ -326,7 +370,11 @@ def _calendar_event() -> dict[str, Any]:
             "cap.email.read",
             {
                 "schema_version": "google.gmail.message_evidence.v1",
-                "message": {"message_id": "msg_1", "thread_id": "thr_1"},
+                "message": {
+                    "provider_account_id": "acct_google",
+                    "message_id": "msg_1",
+                    "thread_id": "thr_1",
+                },
                 "evidence": {
                     "source_kind": "gmail_message",
                     "message_id": "msg_1",
@@ -359,6 +407,37 @@ def test_google_read_outputs_accept_typed_shapes(
     assert error is None
 
 
+def test_provider_dispatch_maps_typed_scope_failure() -> None:
+    status, output, error, auth_failure_class = _execute_with_provider(
+        _FailingEmailSearchProvider(GoogleProviderRequestFailure("insufficient_permissions"))
+    )
+
+    assert status == "failed"
+    assert output is None
+    assert error == "scope_missing"
+    assert auth_failure_class == "scope_missing"
+
+
+def test_provider_dispatch_maps_typed_provider_failure() -> None:
+    status, output, error, auth_failure_class = _execute_with_provider(
+        _FailingEmailSearchProvider(GoogleProviderRequestFailure("google_upstream_timeout"))
+    )
+
+    assert status == "failed"
+    assert output is None
+    assert error == "provider_timeout"
+    assert auth_failure_class is None
+
+
+@pytest.mark.parametrize(
+    "error_text",
+    ["insufficient_permissions", "google_upstream_timeout", "token_expired"],
+)
+def test_provider_dispatch_untyped_provider_string_defect_propagates(error_text: str) -> None:
+    with pytest.raises(RuntimeError, match=error_text):
+        _execute_with_provider(_FailingEmailSearchProvider(RuntimeError(error_text)))
+
+
 def test_gmail_search_accepts_message_refs_that_need_read() -> None:
     status, output, error = _execute(
         "cap.email.search",
@@ -367,6 +446,7 @@ def test_gmail_search_accepts_message_refs_that_need_read() -> None:
             "status": "succeeded",
             "messages": [
                 {
+                    "provider_account_id": "acct_google",
                     "message_id": "msg_1",
                     "thread_id": "thr_1",
                     "history_id": "hist_1",
@@ -412,6 +492,41 @@ def test_gmail_search_rejects_thin_message_refs() -> None:
     assert status == "failed"
     assert output is None
     assert error == "invalid_provider_output"
+
+
+def test_invalid_provider_output_does_not_write_raw_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    raw_marker = "RAW_PROVIDER_PAYLOAD_SHOULD_NOT_LEAK"
+
+    def fail_open(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("invalid provider output must not be written to disk")
+
+    monkeypatch.setattr("builtins.open", fail_open)
+    with caplog.at_level("WARNING", logger="ariel.google_connector"):
+        status, output, error = _execute(
+            "cap.email.search",
+            {
+                "schema_version": "google.gmail.message_refs.v1",
+                "messages": [
+                    {
+                        "message_id": "msg_1",
+                        "thread_id": "thr_1",
+                        "raw_body": raw_marker,
+                    }
+                ],
+                "retrieved_at": "2026-03-03T12:00:00Z",
+            },
+        )
+
+    assert status == "failed"
+    assert output is None
+    assert error == "invalid_provider_output"
+    assert "invalid_provider_output capability=cap.email.search" in caplog.text
+    assert "/tmp" not in caplog.text
+    assert "ariel-diag" not in caplog.text
+    assert raw_marker not in caplog.text
 
 
 def test_gmail_read_rejects_unbounded_message_body_fields() -> None:
@@ -551,13 +666,62 @@ def test_calendar_list_rejects_unbounded_description_blocks() -> None:
     assert error == "invalid_provider_output"
 
 
+@pytest.mark.parametrize("provider_account_id", [None, "", " "])
+def test_calendar_list_rejects_missing_event_provider_account_id(
+    provider_account_id: str | None,
+) -> None:
+    event = _calendar_event()
+    event["provider_account_id"] = provider_account_id
+
+    status, output, error = _execute("cap.calendar.list", _calendar_events_output(event))
+
+    assert status == "failed"
+    assert output is None
+    assert error == "invalid_provider_output"
+
+
+def test_gmail_search_rejects_missing_message_provider_account_id() -> None:
+    status, output, error = _execute(
+        "cap.email.search",
+        {
+            "schema_version": "google.gmail.message_refs.v1",
+            "status": "succeeded",
+            "messages": [
+                {
+                    "message_id": "msg_1",
+                    "thread_id": "thr_1",
+                    "history_id": "hist_1",
+                    "subject": "invoice",
+                    "subject_key": "invoice",
+                    "sender": None,
+                    "recipients": [],
+                    "label_ids": ["INBOX"],
+                    "direction": "received",
+                    "provider_url": "https://mail.google.com/mail/u/0/#all/msg_1",
+                    "evidence_status": "needs_read",
+                }
+            ],
+            "retrieved_at": "2026-03-03T12:00:00Z",
+            "total_estimate": 1,
+        },
+    )
+
+    assert status == "failed"
+    assert output is None
+    assert error == "invalid_provider_output"
+
+
 def test_gmail_read_accepts_typed_non_ok_body_read() -> None:
     status, output, error = _execute(
         "cap.email.read",
         {
             "schema_version": "google.gmail.message_evidence.v1",
             "mode": "message",
-            "message": {"message_id": "msg_1", "thread_id": "thr_1"},
+            "message": {
+                "provider_account_id": "acct_google",
+                "message_id": "msg_1",
+                "thread_id": "thr_1",
+            },
             "evidence": {
                 "source_kind": "gmail_message",
                 "message_id": "msg_1",
@@ -581,13 +745,53 @@ def test_gmail_read_accepts_typed_non_ok_body_read() -> None:
     assert error is None
 
 
+@pytest.mark.parametrize("provider_account_id", [None, "", " "])
+def test_gmail_read_rejects_missing_message_provider_account_id(
+    provider_account_id: str | None,
+) -> None:
+    message = {
+        "provider_account_id": provider_account_id,
+        "message_id": "msg_1",
+        "thread_id": "thr_1",
+    }
+    status, output, error = _execute(
+        "cap.email.read",
+        {
+            "schema_version": "google.gmail.message_evidence.v1",
+            "mode": "message",
+            "message": message,
+            "evidence": {
+                "source_kind": "gmail_message",
+                "message_id": "msg_1",
+                "thread_id": "thr_1",
+                "blocks": [],
+                "decode_notes": ["body too large"],
+            },
+            "read_outcome": {
+                "status": "body_too_large",
+                "reason_code": "gmail_body_too_large",
+                "recovery": "Use narrower context.",
+            },
+            "retrieved_at": "2026-03-03T12:00:00Z",
+            "status": "succeeded",
+        },
+    )
+
+    assert status == "failed"
+    assert output is None
+    assert error == "invalid_provider_output"
+
+
 @pytest.mark.parametrize(
     ("message", "evidence_thread_id"),
     [
-        ({"message_id": "msg_1"}, "thr_1"),
-        ({"message_id": "msg_1", "thread_id": ""}, ""),
-        ({"message_id": "msg_1", "thread_id": "thr_1"}, None),
-        ({"message_id": "msg_1", "thread_id": "thr_1"}, "other_thr"),
+        ({"provider_account_id": "acct_google", "message_id": "msg_1"}, "thr_1"),
+        ({"provider_account_id": "acct_google", "message_id": "msg_1", "thread_id": ""}, ""),
+        ({"provider_account_id": "acct_google", "message_id": "msg_1", "thread_id": "thr_1"}, None),
+        (
+            {"provider_account_id": "acct_google", "message_id": "msg_1", "thread_id": "thr_1"},
+            "other_thr",
+        ),
     ],
 )
 def test_gmail_read_requires_message_thread_id(
@@ -634,8 +838,18 @@ def test_gmail_read_accepts_thread_evidence_shape() -> None:
         {
             "schema_version": "google.gmail.message_evidence.v1",
             "mode": "thread",
-            "thread": {"thread_id": "thr_1", "message_count": 1},
-            "messages": [{"message_id": "msg_1", "thread_id": "thr_1"}],
+            "thread": {
+                "provider_account_id": "acct_google",
+                "thread_id": "thr_1",
+                "message_count": 1,
+            },
+            "messages": [
+                {
+                    "provider_account_id": "acct_google",
+                    "message_id": "msg_1",
+                    "thread_id": "thr_1",
+                }
+            ],
             "evidence": {
                 "source_kind": "gmail_thread",
                 "thread_id": "thr_1",
@@ -658,6 +872,42 @@ def test_gmail_read_accepts_thread_evidence_shape() -> None:
     assert status == "succeeded"
     assert output is not None
     assert error is None
+
+
+@pytest.mark.parametrize("provider_account_id", [None, "", " "])
+def test_gmail_read_rejects_missing_thread_provider_account_id(
+    provider_account_id: str | None,
+) -> None:
+    status, output, error = _execute(
+        "cap.email.read",
+        {
+            "schema_version": "google.gmail.message_evidence.v1",
+            "mode": "thread",
+            "thread": {
+                "provider_account_id": provider_account_id,
+                "thread_id": "thr_1",
+                "message_count": 0,
+            },
+            "messages": [],
+            "evidence": {
+                "source_kind": "gmail_thread",
+                "thread_id": "thr_1",
+                "blocks": [],
+                "decode_notes": ["body too large"],
+            },
+            "read_outcome": {
+                "status": "body_too_large",
+                "reason_code": "gmail_body_too_large",
+                "recovery": "Use narrower context.",
+            },
+            "retrieved_at": "2026-03-03T12:00:00Z",
+            "status": "succeeded",
+        },
+    )
+
+    assert status == "failed"
+    assert output is None
+    assert error == "invalid_provider_output"
 
 
 @pytest.mark.parametrize(

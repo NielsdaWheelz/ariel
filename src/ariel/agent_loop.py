@@ -34,7 +34,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Literal, assert_never
+from typing import TYPE_CHECKING, Any, Literal, assert_never
 
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy import func, select
@@ -46,6 +46,7 @@ from .ai_judgments import AIJudgmentFailure, record_ai_judgment
 from .attachment_content import AttachmentContentRuntime
 from .config import AppSettings
 from .google_connector import GoogleConnectorRuntime
+from .model_adapter import ModelAdapterError
 from .persistence import ActionAttemptRecord, TurnRecord
 from .run_runtime import (
     ScratchEntry,
@@ -53,6 +54,9 @@ from .run_runtime import (
     parse_run_function_call,
 )
 from .sandbox_runtime import RunSandbox
+
+if TYPE_CHECKING:
+    from .model_adapter import ModelAdapter
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +79,7 @@ class ResearchFinding:
       stuck-detection ended the run before a finding was emitted. The loop
       ran cleanly; it just did not converge. ``summary`` is a short honest
       non-convergence note; the three lists are empty.
-    - ``"failed"``: the model call raised an exception. ``summary`` is a
+    - ``"failed"``: the model call raised ``ModelAdapterError``. ``summary`` is a
       short honest failure note; the three lists are empty.
 
     The text fields are model-authored over untrusted content; the caller
@@ -191,7 +195,7 @@ class LoopResult:
     - ``"paused"`` — the program called ``agent.pause_until_input``.
     - ``"budget_exhausted"`` — the wall-clock budget, the model-call backstop,
       or stuck-detection ended the run without a terminal result.
-    - ``"model_failed"`` — a model call raised an unretryable exception (or
+    - ``"model_failed"`` — a model call raised unretryable ``ModelAdapterError`` (or
       ``retry_on_model_error`` is False).
     - ``"bounded_failure"`` — reserved for callers that enforce per-response
       token limits; not set by the loop itself.
@@ -231,7 +235,7 @@ def run_agent_loop(
     session_id: str,
     turn: TurnRecord,
     settings: AppSettings,
-    model_adapter: Any,  # structural: provider/model/create_response
+    model_adapter: ModelAdapter,
     responses_input_items: list[dict[str, Any]],
     tools: list[dict[str, Any]],
     user_message: str,
@@ -295,13 +299,6 @@ def run_agent_loop(
         elapsed_s = time.perf_counter() - loop_started_at
         if elapsed_s > cfg.budget_seconds or model_call_count > cfg.max_model_calls:
             return _budget_exhausted_result(
-                cfg=cfg,
-                model_adapter=model_adapter,
-                responses_input_items=responses_input_items,
-                user_message=user_message,
-                history=history,
-                context_bundle=context_bundle,
-                add_event=add_event,
                 model_call_count=model_call_count,
                 created_action_attempt_count=created_action_attempt_count,
                 final_runtime_provenance=final_runtime_provenance,
@@ -349,16 +346,16 @@ def run_agent_loop(
                     "model_call_count": model_call_count,
                 },
             )
-        except Exception as exc:
+        except ModelAdapterError as exc:
             duration_ms = int((time.perf_counter() - model_started_at) * 1000)
-            should_retry = cfg.retry_on_model_error and bool(getattr(exc, "retryable", False))
+            should_retry = cfg.retry_on_model_error and exc.retryable
             add_event(
                 "evt.model.failed",
                 {
                     "provider": model_adapter.provider,
                     "model": model_adapter.model,
                     "duration_ms": duration_ms,
-                    "failure_reason": getattr(exc, "safe_reason", str(exc)),
+                    "failure_reason": exc.safe_reason,
                     "model_call_count": model_call_count,
                 },
             )
@@ -447,13 +444,6 @@ def run_agent_loop(
         # Stuck-detection: identical source in consecutive rounds → budget_exhausted.
         if run_source == prev_run_source:
             return _budget_exhausted_result(
-                cfg=cfg,
-                model_adapter=model_adapter,
-                responses_input_items=responses_input_items,
-                user_message=user_message,
-                history=history,
-                context_bundle=context_bundle,
-                add_event=add_event,
                 model_call_count=model_call_count,
                 created_action_attempt_count=created_action_attempt_count,
                 final_runtime_provenance=final_runtime_provenance,
@@ -503,13 +493,6 @@ def run_agent_loop(
             # Stuck-detection: identical program_errors in consecutive rounds.
             if program_errors and program_errors == last_program_errors:
                 return _budget_exhausted_result(
-                    cfg=cfg,
-                    model_adapter=model_adapter,
-                    responses_input_items=responses_input_items,
-                    user_message=user_message,
-                    history=history,
-                    context_bundle=context_bundle,
-                    add_event=add_event,
                     model_call_count=model_call_count,
                     created_action_attempt_count=created_action_attempt_count,
                     final_runtime_provenance=final_runtime_provenance,
@@ -536,9 +519,9 @@ def run_agent_loop(
                 if isinstance(output_item, dict) and output_item.get("type") == "function_call":
                     responses_input_items.append(jsonable_encoder(output_item))
             # A failed program may still have succeeded syscalls before it
-            # raised — surface their bounded ``execution_output`` to the next
-            # round so recovery is grounded in what actually ran, not blind.
-            # Mirrors the clean-program and emit_value branches below.
+            # raised. Surface the attempt ledger, but not capability payloads:
+            # model-visible cross-round data must be carried deliberately with
+            # emit_value, not auto-echoed from the audit record.
             attempt_observations = _action_attempt_observations(run_program_result.action_attempts)
             if run_call_id:
                 responses_input_items.append(
@@ -687,9 +670,8 @@ def run_agent_loop(
         # message before seeing the fetched content. Writes and approval-gated
         # actions are exempt: the model has full knowledge of what it staged or
         # attempted, so an accompanying "drafted X for review" message is
-        # grounded. When the rail fires the message is dropped, the syscall
-        # trace is fed back, and the loop continues; the next round reasons over
-        # the observed results before answering.
+        # grounded. When the rail fires the message is dropped, the attempt
+        # ledger is fed back, and the loop continues.
         premature_synthesis = (
             cfg.output_mode == "message"
             and model_call_count == 1
@@ -828,11 +810,6 @@ def run_agent_loop(
             for output_item in output_items:
                 if isinstance(output_item, dict) and output_item.get("type") == "function_call":
                     responses_input_items.append(jsonable_encoder(output_item))
-            # When a round runs capability syscalls alongside emit_value, surface
-            # their execution_output (bounded) so the model sees the actual data
-            # its tools returned — not just what it deliberately emitted. Without
-            # this the model is blind to syscall results across rounds and
-            # fabricates absence ("no events found") despite real data.
             attempt_observations_value = _action_attempt_observations(
                 run_program_result.action_attempts
             )
@@ -866,11 +843,9 @@ def run_agent_loop(
 
         if run_program_result.action_attempts:
             # Syscall trace: feed back so the model can author the next program.
-            # Each succeeded attempt's bounded ``execution_output`` is included
-            # so the model sees the actual data its capabilities returned.
-            # Without ``execution_output`` the model is blind across rounds —
-            # it sees only "cap.X succeeded" with no payload and fabricates
-            # absence ("no events found") despite real data being available.
+            # Deliberately omit capability payloads. The program already saw each
+            # syscall result inline; data that should survive into a later model
+            # round must be carried through agent.emit_value.
             for output_item in output_items:
                 if isinstance(output_item, dict) and output_item.get("type") == "function_call":
                     responses_input_items.append(jsonable_encoder(output_item))
@@ -942,158 +917,27 @@ def run_agent_loop(
 # ---------------------------------------------------------------------------
 
 
-_BUDGET_EXHAUSTED_SUMMARY_INSTRUCTION = (
-    "Your time has run out. In one short paragraph of plain text, tell the "
-    "user what you actually accomplished and what remains. Do not call any "
-    "tools — return the text directly. Be honest about which side failed: "
-    "if your run program raised, hit a forbidden import, or otherwise did "
-    "not complete, name that as the cause; do not blame a connector or tool "
-    "that your program never successfully invoked."
-)
-
-
 _PREMATURE_SYNTHESIS_NUDGE = (
     "Your round-one program both called a read capability and emitted a "
     "user-visible message. That message was authored before you observed the "
     "capability's result, so it could not be grounded in fetched data; the "
-    "loop dropped it and the user did not see it. Take another round: read "
-    "the syscall trace above, reason over the concrete data your program "
-    "actually retrieved, then call exactly one run whose program ends with "
-    "agent.emit_message(text=...) carrying a grounded answer. If you need "
-    "more data, fetch it in this next round and emit the message in the "
-    "round after."
+    "loop dropped it and the user did not see it. Take another round: fetch "
+    "the data again and, if it needs model synthesis, carry the relevant facts "
+    "forward with agent.emit_value before answering in a later round."
 )
 
 
 def _budget_exhausted_result(
     *,
-    cfg: LoopConfig,
-    model_adapter: Any,
-    responses_input_items: list[dict[str, Any]],
-    user_message: str,
-    history: list[dict[str, Any]],
-    context_bundle: dict[str, Any],
-    add_event: Callable[[str, dict[str, Any]], None],
     model_call_count: int,
     created_action_attempt_count: int,
     final_runtime_provenance: RuntimeProvenance | None,
 ) -> LoopResult:
-    """Build the budget-exhausted result, attempting a one-shot summary call
-    on the main loop (``output_mode == "message"``).
-
-    On main-loop budget exhaustion, makes one constrained model call with
-    ``tools=[]`` and a tight system instruction asking the model to summarise
-    what it did and what remains. On usable text, returns an ``outcome="message"``
-    result so the caller's existing assistant-message path handles it. On any
-    failure, empty text, or non-message output mode, returns the unchanged
-    ``outcome="budget_exhausted"`` result.
-    """
-    if cfg.output_mode != "message":
-        return LoopResult(
-            outcome="budget_exhausted",
-            emitted_message=None,
-            emitted_finding=None,
-            emitted_operations=None,
-            model_call_count=model_call_count,
-            created_action_attempt_count=created_action_attempt_count,
-            awaiting_approval=None,
-            bounded_failure_details=None,
-            runtime_provenance=final_runtime_provenance,
-        )
-
-    summary_input_items = [
-        *responses_input_items,
-        {"role": "system", "content": _BUDGET_EXHAUSTED_SUMMARY_INSTRUCTION},
-    ]
-    model_call_count += 1
-    add_event(
-        "evt.model.started",
-        {
-            "provider": model_adapter.provider,
-            "model": model_adapter.model,
-            "model_call_count": model_call_count,
-        },
-    )
-    started_at = time.perf_counter()
-    try:
-        summary_response = model_adapter.create_response(
-            input_items=summary_input_items,
-            tools=[],
-            user_message=user_message,
-            history=history,
-            context_bundle=context_bundle,
-        )
-    except Exception as exc:
-        add_event(
-            "evt.model.failed",
-            {
-                "provider": model_adapter.provider,
-                "model": model_adapter.model,
-                "duration_ms": int((time.perf_counter() - started_at) * 1000),
-                "failure_reason": getattr(exc, "safe_reason", str(exc)),
-                "model_call_count": model_call_count,
-            },
-        )
-        return LoopResult(
-            outcome="budget_exhausted",
-            emitted_message=None,
-            emitted_finding=None,
-            emitted_operations=None,
-            model_call_count=model_call_count,
-            created_action_attempt_count=created_action_attempt_count,
-            awaiting_approval=None,
-            bounded_failure_details=None,
-            runtime_provenance=final_runtime_provenance,
-        )
-    add_event(
-        "evt.model.completed",
-        {
-            "provider": summary_response.get("provider"),
-            "model": summary_response.get("model"),
-            "duration_ms": int((time.perf_counter() - started_at) * 1000),
-            "usage": summary_response.get("usage"),
-            "provider_response_id": summary_response.get("provider_response_id"),
-            "model_call_count": model_call_count,
-        },
-    )
-
-    output_items = summary_response.get("output")
-    if not isinstance(output_items, list):
-        output_items = []
-    has_function_call = any(
-        isinstance(item, dict) and item.get("type") == "function_call" for item in output_items
-    )
-    text_parts: list[str] = []
-    for item in output_items:
-        if not isinstance(item, dict) or item.get("type") != "message":
-            continue
-        content = item.get("content")
-        if not isinstance(content, list):
-            continue
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            text = part.get("text")
-            if part.get("type") in {"output_text", "text"} and isinstance(text, str):
-                text_parts.append(text)
-    summary_text = "\n".join(text_parts).strip()
-
-    if has_function_call or not summary_text:
-        return LoopResult(
-            outcome="budget_exhausted",
-            emitted_message=None,
-            emitted_finding=None,
-            emitted_operations=None,
-            model_call_count=model_call_count,
-            created_action_attempt_count=created_action_attempt_count,
-            awaiting_approval=None,
-            bounded_failure_details=None,
-            runtime_provenance=final_runtime_provenance,
-        )
+    """Build the deterministic rail outcome for loop exhaustion."""
 
     return LoopResult(
-        outcome="message",
-        emitted_message=summary_text,
+        outcome="budget_exhausted",
+        emitted_message=None,
         emitted_finding=None,
         emitted_operations=None,
         model_call_count=model_call_count,
@@ -1122,94 +966,18 @@ def _merge_provenance(
     )
 
 
-# Per-attempt cap on the bytes of ``execution_output`` surfaced back to the
-# model in the syscall-trace / emit_value branches. Sized to fit a few rich
-# results (5 emails, 5 calendar events, 5 web hits) without overwhelming the
-# context window. Larger payloads are truncated and marked so the model knows
-# to ``scratch.get`` for the full value if it needs it.
-_MAX_ATTEMPT_OBSERVATION_OUTPUT_BYTES = 4096
-
-
-def _project_calendar_list_output(output: dict[str, Any]) -> dict[str, Any]:
-    """Project a ``cap.calendar.list`` output down to model-useful fields only.
-
-    A single ``cap.calendar.list`` event with ~30 attendees plus
-    ``description_blocks``, ``conference_data``, ``raw_payload_digest``, and
-    ``provider_evidence_refs`` balloons past 8KB and gets truncated mid-JSON
-    by ``_MAX_ATTEMPT_OBSERVATION_OUTPUT_BYTES``, leaving the model with no
-    usable substance. The full payload is preserved on the
-    ``ActionAttemptRecord`` for audit; this projection is only for the bytes
-    fed back into the model's context.
-
-    Kept fields per event: ``event_id``, ``calendar_id``, ``status``,
-    ``summary``, ``start``, ``end``, ``all_day``, ``location``,
-    ``organizer_email`` (extracted), ``attendee_count`` (count, not list),
-    ``html_link`` (from ``provider_url``). Dropped: ``attendees`` list,
-    ``description_blocks``, ``conference_data``, ``raw_payload_digest``,
-    ``provider_evidence_refs``, plus the various redacted/digest/etag fields
-    the model does not act on.
-    """
-    events_raw = output.get("events")
-    if not isinstance(events_raw, list):
-        return output
-    projected_events: list[dict[str, Any]] = []
-    for event in events_raw:
-        if not isinstance(event, dict):
-            continue
-        organizer_raw = event.get("organizer")
-        organizer = organizer_raw if isinstance(organizer_raw, dict) else None
-        attendees_raw = event.get("attendees")
-        attendees: list[Any] = attendees_raw if isinstance(attendees_raw, list) else []
-        projected_events.append(
-            {
-                "event_id": event.get("event_id"),
-                "calendar_id": event.get("calendar_id"),
-                "status": event.get("status"),
-                "summary": event.get("summary"),
-                "start": event.get("start"),
-                "end": event.get("end"),
-                "all_day": event.get("all_day"),
-                "location": event.get("location"),
-                "organizer_email": organizer.get("email") if organizer is not None else None,
-                "attendee_count": len(attendees),
-                "html_link": event.get("provider_url"),
-            }
-        )
-    return {
-        "schema_version": output.get("schema_version"),
-        "events": projected_events,
-        "retrieved_at": output.get("retrieved_at"),
-        "window_start": output.get("window_start"),
-        "window_end": output.get("window_end"),
-    }
-
-
 def _action_attempt_observations(
     action_attempts: list[ActionAttemptRecord],
 ) -> list[dict[str, Any]]:
     """Build the per-attempt observation list fed back to the model.
 
-    Each entry carries the attempt's identity, rail decision, status, AND the
-    bounded ``execution_output`` of a succeeded read. This closes the data-flow
-    loop: capability → program → model context. Without ``execution_output``
-    the model is blind to syscall results across rounds — it sees only
-    ``cap.X succeeded`` with no payload — and fabricates absence ("no events
-    found") despite real data sitting on the attempt record.
+    Each entry carries the attempt's identity, rail decision, and status. It
+    intentionally omits ``execution_output``. Capability results return inline
+    to the program that called them; the model must use ``agent.emit_value``
+    when it deliberately wants facts in a later model round.
 
     Failed/blocked/denied attempts carry the safe ``execution_error`` so the
     model can name the actual failure mode rather than guess at one.
-
-    Large outputs are truncated at ``_MAX_ATTEMPT_OBSERVATION_OUTPUT_BYTES``
-    and marked ``execution_output_truncated``; the full value is still on the
-    ``ActionAttemptRecord`` and was returned into the program at syscall time.
-
-    ``cap.calendar.list`` is projected down to model-useful fields by
-    ``_project_calendar_list_output`` BEFORE serialization: a single fat
-    event (~30+ attendees + description_blocks + raw_payload_digest +
-    conference_data + provider_evidence_refs) routinely overflows the 4KB
-    cap, leaving the model with a mid-JSON prefix and no grounding. Extend
-    by capability name when other capabilities exhibit the same symptom; do
-    NOT introduce a generic projection layer.
     """
 
     observations: list[dict[str, Any]] = []
@@ -1221,24 +989,7 @@ def _action_attempt_observations(
             "policy_decision": attempt.policy_decision,
             "approval_required": attempt.approval_required,
         }
-        if attempt.status == "succeeded" and attempt.execution_output is not None:
-            output_for_model = jsonable_encoder(attempt.execution_output)
-            if attempt.capability_id == "cap.calendar.list" and isinstance(output_for_model, dict):
-                output_for_model = _project_calendar_list_output(output_for_model)
-            encoded = json.dumps(
-                output_for_model,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            if len(encoded.encode("utf-8")) > _MAX_ATTEMPT_OBSERVATION_OUTPUT_BYTES:
-                entry["execution_output_truncated"] = True
-                entry["execution_output_bytes"] = len(encoded.encode("utf-8"))
-                # Still ship a prefix so the model has *something* to ground
-                # on, plus knows how much was elided.
-                entry["execution_output_prefix"] = encoded[:_MAX_ATTEMPT_OBSERVATION_OUTPUT_BYTES]
-            else:
-                entry["execution_output"] = output_for_model
-        elif attempt.execution_error is not None:
+        if attempt.execution_error is not None:
             entry["execution_error"] = attempt.execution_error
         observations.append(entry)
     return observations
@@ -1248,7 +999,7 @@ def _record_judgment(
     *,
     db: Session,
     cfg: LoopConfig,
-    model_adapter: Any,
+    model_adapter: ModelAdapter,
     candidate_response: dict[str, Any],
     session_id: str,
     turn: TurnRecord,

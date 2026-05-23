@@ -177,7 +177,7 @@ def test_search_news_uses_news_result_type_and_preserves_egress_preflight(
         ("cap.search.news", "news provider rate limited"),
     ],
 )
-def test_search_provider_errors_map_to_runtime_error_messages_by_capability(
+def test_search_provider_errors_map_to_execution_errors_by_capability(
     monkeypatch: pytest.MonkeyPatch,
     capability_id: str,
     expected_error: str,
@@ -190,7 +190,7 @@ def test_search_provider_errors_map_to_runtime_error_messages_by_capability(
         provider="test",
     )
 
-    with pytest.raises(RuntimeError, match=expected_error):
+    with pytest.raises(registry.CapabilityExecutionError, match=expected_error):
         capability = registry.get_capability(capability_id)
         assert capability is not None
         assert capability.execute is not None
@@ -227,6 +227,60 @@ def test_search_web_and_news_reject_non_query_or_malformed_inputs(
     payload: dict[str, Any],
 ) -> None:
     capability = registry.get_capability(capability_id)
+    assert capability is not None
+
+    normalized, error = capability.validate_input(payload)
+
+    assert normalized is None
+    assert error == "schema_invalid"
+
+
+def test_memory_search_validator_normalizes_boundary_filters() -> None:
+    capability = registry.get_capability("cap.memory.search")
+    assert capability is not None
+
+    normalized, error = capability.validate_input(
+        {
+            "query": "  offsite plan  ",
+            "limit": 12,
+            "since": "2026-05-20T10:15:00-07:00",
+            "kinds": ["user_message", "tool_observation"],
+        }
+    )
+
+    assert error is None
+    assert normalized == {
+        "query": "offsite plan",
+        "limit": 12,
+        "since": "2026-05-20T17:15:00Z",
+        "kinds": ["user_message", "tool_observation"],
+    }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"query": "offsite", "limit": 0},
+        {"query": "offsite", "limit": 101},
+        {"query": "offsite", "limit": True},
+        {"query": "offsite", "limit": None},
+        {"query": "offsite", "since": "not-a-date"},
+        {"query": "offsite", "since": ""},
+        {"query": "offsite", "since": 123},
+        {"query": "offsite", "kinds": []},
+        {"query": "offsite", "kinds": ["assistant_message", "unknown_kind"]},
+        {"query": "offsite", "kinds": ["user_message", 7]},
+        {"query": "offsite", "kinds": ["log"]},
+        {"query": "offsite", "kinds": ["note"]},
+        {"query": "offsite", "kinds": ["memory_notes"]},
+        {"query": "offsite", "kinds": "assistant_message"},
+        {"query": "offsite", "layer": "note"},
+    ],
+)
+def test_memory_search_validator_rejects_malformed_boundary_filters(
+    payload: dict[str, Any],
+) -> None:
+    capability = registry.get_capability("cap.memory.search")
     assert capability is not None
 
     normalized, error = capability.validate_input(payload)

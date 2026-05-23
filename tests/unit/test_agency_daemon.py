@@ -3,9 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from ariel.agency_daemon import (
     AGENCY_EGRESS_POLICY_VERSION,
     AGENCY_SANDBOX_POLICY_VERSION,
+    AgencyDaemonError,
     AgencyRuntime,
 )
 
@@ -60,6 +63,34 @@ class FakeAgencyClient:
             }
         )
         return {"pr_url": "https://github.test/acme/repo/pull/1", "request_id": "pr_req_123"}
+
+
+class DefectiveAgencyClient(FakeAgencyClient):
+    def worktree_pr_sync(
+        self,
+        *,
+        repo_id: str,
+        worktree_ref: str,
+        allow_dirty: bool,
+        force_with_lease: bool,
+        client_request_id: str,
+    ) -> dict[str, Any]:
+        del repo_id, worktree_ref, allow_dirty, force_with_lease, client_request_id
+        raise RuntimeError("agency client bug")
+
+
+class FailingAgencyClient(FakeAgencyClient):
+    def worktree_pr_sync(
+        self,
+        *,
+        repo_id: str,
+        worktree_ref: str,
+        allow_dirty: bool,
+        force_with_lease: bool,
+        client_request_id: str,
+    ) -> dict[str, Any]:
+        del repo_id, worktree_ref, allow_dirty, force_with_lease, client_request_id
+        raise AgencyDaemonError("agency daemon unavailable")
 
 
 def test_agency_run_sends_and_returns_policy_metadata(tmp_path: Path) -> None:
@@ -150,3 +181,43 @@ def test_agency_pr_request_uses_client_request_id(tmp_path: Path) -> None:
             "client_request_id": "pwr_123:pr-sync",
         }
     ]
+
+
+def test_agency_pr_request_preserves_daemon_failure(tmp_path: Path) -> None:
+    runtime = AgencyRuntime(
+        client=FailingAgencyClient(),  # type: ignore[arg-type]
+        allowed_repo_roots=(str(tmp_path),),
+        default_base_branch="main",
+        default_runner="codex",
+    )
+
+    with pytest.raises(AgencyDaemonError, match="agency daemon unavailable"):
+        runtime.request_pr(
+            prepared={
+                "job_id": "job_123",
+                "repo_id": "repo_123",
+                "invocation_id": "inv_123",
+                "worktree_id": "wt_123",
+                "client_request_id": "aat_pr_123",
+            }
+        )
+
+
+def test_agency_pr_request_propagates_unexpected_client_error(tmp_path: Path) -> None:
+    runtime = AgencyRuntime(
+        client=DefectiveAgencyClient(),  # type: ignore[arg-type]
+        allowed_repo_roots=(str(tmp_path),),
+        default_base_branch="main",
+        default_runner="codex",
+    )
+
+    with pytest.raises(RuntimeError, match="agency client bug"):
+        runtime.request_pr(
+            prepared={
+                "job_id": "job_123",
+                "repo_id": "repo_123",
+                "invocation_id": "inv_123",
+                "worktree_id": "wt_123",
+                "client_request_id": "aat_pr_123",
+            }
+        )

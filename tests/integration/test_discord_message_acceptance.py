@@ -9,8 +9,8 @@ from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import text
 
-from ariel.app import ModelAdapter
-from tests.integration.app_helpers import create_migrated_app
+from ariel.model_adapter import ModelAdapter
+from tests.integration.app_helpers import create_test_app
 from tests.integration.responses_helpers import (
     empty_recall_response,
     is_memory_subsystem_call,
@@ -29,7 +29,7 @@ def _timeline(client: TestClient, session_id: str) -> dict[str, Any]:
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
-    app = create_migrated_app(
+    app = create_test_app(
         database_url=postgres_url,
         model_adapter=adapter,
         sandbox=FakeSandboxRuntime(),
@@ -91,7 +91,6 @@ class NoVisibleResponseAdapter:
         self.context_bundles.append(context_bundle)
         calls = [{"name": "agent.pause_until_input", "input": {}}]
         return responses_with_run_calls(
-            assistant_text="",
             calls=calls,
             provider=self.provider,
             model=self.model,
@@ -202,7 +201,6 @@ class AttachmentReadAdapter:
             )
         self.input_items.append(input_items)
         return responses_with_run_calls(
-            assistant_text="",
             calls=[
                 {
                     "name": "attachment.read",

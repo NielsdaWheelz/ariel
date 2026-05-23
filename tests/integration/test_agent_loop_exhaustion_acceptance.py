@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session, sessionmaker
 
-from ariel.app import ModelAdapter, ModelAdapterError
+from ariel.agent_loop import LoopConfig, run_agent_loop
+from ariel.config import AppSettings
+from ariel.model_adapter import ModelAdapter, ModelAdapterError
+from ariel.persistence import SessionRecord, TurnRecord
 from tests.fake_sandbox import FakeSandboxRuntime
-from tests.integration.app_helpers import create_migrated_app
+from tests.integration.app_helpers import create_test_app
 from tests.integration.responses_helpers import (
     empty_recall_response,
     is_memory_subsystem_call,
@@ -83,6 +88,24 @@ class RetryableFailureAdapter:
         )
 
 
+@dataclass
+class DefectiveAdapter:
+    provider: str = "provider.defective"
+    model: str = "model.defective-v1"
+
+    def create_response(
+        self,
+        *,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
+        history: list[dict[str, Any]],
+        context_bundle: dict[str, Any],
+    ) -> dict[str, Any]:
+        del input_items, tools, user_message, history, context_bundle
+        raise RuntimeError("adapter bug")
+
+
 class RepeatingRunAdapter:
     provider: str = "provider.repeating-run"
     model: str = "model.repeating-run-v1"
@@ -102,7 +125,6 @@ class RepeatingRunAdapter:
             )
         del tools, user_message, history, context_bundle, input_items
         return responses_with_run_calls(
-            assistant_text="",
             calls=[{"name": "agent.emit_value", "input": {"value": {"x": 1}}}],
             provider=self.provider,
             model=self.model,
@@ -113,12 +135,96 @@ class RepeatingRunAdapter:
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
-    app = create_migrated_app(
+    app = create_test_app(
         database_url=postgres_url,
         model_adapter=adapter,
         sandbox=FakeSandboxRuntime(),
     )
     return TestClient(app)
+
+
+def test_unexpected_model_adapter_exception_propagates_as_defect(
+    session_factory: sessionmaker[Session],
+) -> None:
+    now = datetime(2026, 5, 23, 12, 0, tzinfo=UTC)
+    with session_factory() as db:
+        with db.begin():
+            session = SessionRecord(
+                id="ses_model_defect",
+                is_active=True,
+                lifecycle_state="active",
+                rotated_from_session_id=None,
+                rotation_reason=None,
+                created_at=now,
+                updated_at=now,
+            )
+            turn = TurnRecord(
+                id="trn_model_defect",
+                session_id=session.id,
+                user_message="trigger adapter defect",
+                assistant_message=None,
+                status="in_progress",
+                kind="agent_turn",
+                created_at=now,
+                updated_at=now,
+            )
+            db.add_all([session, turn])
+
+        events: list[dict[str, Any]] = []
+        sandbox = FakeSandboxRuntime()
+        sandbox.start()
+        try:
+            with pytest.raises(RuntimeError, match="adapter bug"):
+                run_agent_loop(
+                    LoopConfig(
+                        output_mode="message",
+                        finding_mode="",
+                        prompt_version="test",
+                        budget_seconds=60.0,
+                        max_model_calls=3,
+                        is_main_agent_loop=True,
+                        record_judgments=False,
+                        judgment_type=None,
+                        retry_on_model_error=True,
+                        void_failed_program_approvals=True,
+                        protocol_nudge="retry with a run call",
+                        program_failure_nudge="fix the program",
+                        action_trace_nudge="emit a terminal result",
+                        emit_value_nudge="emit a terminal result",
+                        no_terminal_output_nudge="emit a terminal result",
+                    ),
+                    sandbox=sandbox,
+                    db=db,
+                    session_factory=session_factory,
+                    session_id=session.id,
+                    turn=turn,
+                    settings=AppSettings(),
+                    model_adapter=DefectiveAdapter(),
+                    responses_input_items=[{"role": "system", "content": "test"}],
+                    tools=[],
+                    user_message=turn.user_message,
+                    history=[],
+                    context_bundle={},
+                    allowed_capability_ids=frozenset(),
+                    scratch={},
+                    proposal_index_start=0,
+                    approval_ttl_seconds=60,
+                    approval_actor_id="test",
+                    add_event=lambda event_type, payload: events.append(
+                        {"event_type": event_type, "payload": payload}
+                    ),
+                    now_fn=lambda: now,
+                    new_id_fn=lambda prefix: f"{prefix}_model_defect",
+                    runtime_provenance=None,
+                    google_runtime=None,
+                    execute_google_reads_outside_transaction=False,
+                    agency_runtime=None,
+                    attachment_runtime=None,
+                )
+        finally:
+            sandbox.close()
+
+    assert [event["event_type"] for event in events] == ["evt.model.started"]
 
 
 def test_model_call_backstop_exhaustion_ends_gracefully(

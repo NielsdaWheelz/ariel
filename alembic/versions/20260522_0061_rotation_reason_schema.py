@@ -30,23 +30,19 @@ _ROTATION_REASON_BEFORE = (
     "reason IN ('user_initiated', 'threshold_turn_count', "
     "'threshold_age', 'threshold_context_pressure')"
 )
-_ROTATION_REASON_AFTER = (
-    "reason IN ('user_initiated', 'threshold_turn_count', 'threshold_age')"
-)
+_ROTATION_REASON_AFTER = "reason IN ('user_initiated', 'threshold_turn_count', 'threshold_age')"
 
 
 def upgrade() -> None:
     bind = op.get_bind()
     session_count = bind.scalar(
         sa.text(
-            "SELECT count(*) FROM sessions "
-            "WHERE rotation_reason = 'threshold_context_pressure'"
+            "SELECT count(*) FROM sessions WHERE rotation_reason = 'threshold_context_pressure'"
         )
     )
     rotation_count = bind.scalar(
         sa.text(
-            "SELECT count(*) FROM session_rotations "
-            "WHERE reason = 'threshold_context_pressure'"
+            "SELECT count(*) FROM session_rotations WHERE reason = 'threshold_context_pressure'"
         )
     )
     if session_count or rotation_count:

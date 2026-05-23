@@ -8,7 +8,7 @@ and the normal-turn program-loop integration tests. They cover:
   ``ResearchFinding(status="complete", ...)``);
 - graceful non-convergence (stuck-detection and the model-call backstop end the
   run without a finding → ``ResearchFinding(status="partial", ...)``);
-- model-call failure (the adapter's ``create_response`` raises →
+- model-call failure (the adapter's ``create_response`` raises ``ModelAdapterError`` →
   ``ResearchFinding(status="failed", ...)``);
 - the per-run mode whitelist (a ``web`` run exposes only web read capabilities,
   a ``personal`` run only personal read capabilities — never both);
@@ -34,10 +34,11 @@ from ariel.google_connector import (
     GOOGLE_GMAIL_READ_SCOPE,
     GoogleConnectorRecord,
     GoogleWorkspaceProvider,
-    _encrypt_secret,
 )
-from ariel.persistence import SessionRecord, TurnRecord
+from ariel.model_adapter import ModelAdapterError
+from ariel.persistence import EventRecord, SessionRecord, TurnRecord
 from ariel.research_runtime import ResearchFinding, run_research
+from ariel.secret_cipher import encrypt_secret
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.responses_helpers import empty_recall_response, is_memory_subsystem_call
 
@@ -492,7 +493,13 @@ def test_run_research_model_call_failure_returns_failed_finding(
                 )
             del tools, user_message, history, context_bundle
             self.snapshots.append(list(input_items))
-            raise RuntimeError("model unavailable")
+            raise ModelAdapterError(
+                safe_reason="model unavailable",
+                status_code=502,
+                code="E_MODEL_FAILURE",
+                message="model provider request failed",
+                retryable=False,
+            )
 
     _seed_session(session_factory, "ses_research_fail")
     sandbox = FakeSandboxRuntime()
@@ -523,8 +530,16 @@ def test_run_research_model_call_failure_returns_failed_finding(
 
     with session_factory() as db:
         turn = db.scalar(select(TurnRecord).where(TurnRecord.session_id == "ses_research_fail"))
-    assert turn is not None
-    assert turn.status == "failed"
+        assert turn is not None
+        assert turn.status == "failed"
+        model_failed = db.scalar(
+            select(EventRecord).where(
+                EventRecord.turn_id == turn.id,
+                EventRecord.event_type == "evt.model.failed",
+            )
+        )
+        assert model_failed is not None
+        assert model_failed.payload["failure_reason"] == "model unavailable"
 
 
 @dataclass
@@ -538,8 +553,9 @@ class FakeCalendarProvider:
         *,
         access_token: str,
         normalized_input: dict[str, Any],
+        provider_account_id: str,
     ) -> dict[str, Any]:
-        del access_token
+        del access_token, provider_account_id
         self.calendar_list_calls.append(dict(normalized_input))
         return {
             "schema_version": "google.calendar.events.v1",
@@ -651,13 +667,13 @@ def _seed_connected_google_connector(
                     account_subject="sub_test",
                     account_email="test@example.com",
                     granted_scopes=[GOOGLE_CALENDAR_READ_SCOPE, GOOGLE_GMAIL_READ_SCOPE],
-                    access_token_enc=_encrypt_secret(
+                    access_token_enc=encrypt_secret(
                         plaintext="tok_access_test",
                         secret=settings.connector_encryption_secret,
                         key_version=settings.connector_encryption_key_version,
                         encryption_keys=settings.connector_encryption_keys,
                     ),
-                    refresh_token_enc=_encrypt_secret(
+                    refresh_token_enc=encrypt_secret(
                         plaintext="tok_refresh_test",
                         secret=settings.connector_encryption_secret,
                         key_version=settings.connector_encryption_key_version,

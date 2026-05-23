@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import os
 from typing import Any
 
 import httpx
@@ -9,8 +8,13 @@ import pytest
 
 from ariel.capability_registry import get_capability
 from ariel.google_connector import (
-    ConnectorTokenCipher,
+    DefaultGoogleOAuthClient,
     DefaultGoogleWorkspaceProvider,
+    GoogleOAuthExchangeFailure,
+    GoogleOAuthRefreshFailure,
+    GoogleOAuthRevokeFailure,
+    GoogleOAuthStartFailure,
+    GoogleProviderRequestFailure,
     is_typed_google_read_output,
 )
 
@@ -29,64 +33,292 @@ def _b64url(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
 
 
-def test_connector_token_cipher_round_trip_uses_aead_envelope_format() -> None:
-    cipher = ConnectorTokenCipher(
-        active_key_version="v2",
-        keys_by_version={
-            "v1": os.urandom(32),
-            "v2": os.urandom(32),
-        },
-    )
-    plaintext = "tok_live_secret"
-
-    encrypted = cipher.encrypt(plaintext)
-    assert encrypted.startswith("aeadv1:v2:")
-    assert plaintext not in encrypted
-    assert cipher.decrypt(encrypted) == plaintext
+def _oauth_token_response(*, payload: dict[str, Any] | list[Any]) -> httpx.Response:
+    request = httpx.Request("POST", "https://oauth.example.test/token")
+    return httpx.Response(status_code=200, json=payload, request=request)
 
 
-def test_connector_token_cipher_decrypts_tokens_from_previous_key_version() -> None:
-    key_v1 = os.urandom(32)
-    key_v2 = os.urandom(32)
-    previous_key_cipher = ConnectorTokenCipher(
-        active_key_version="v1",
-        keys_by_version={"v1": key_v1},
-    )
-    token = "tok_previous_key"
-    ciphertext = previous_key_cipher.encrypt(token)
+def test_oauth_start_requires_client_id() -> None:
+    client = DefaultGoogleOAuthClient(client_id=None, client_secret="secret")
 
-    rotated_cipher = ConnectorTokenCipher(
-        active_key_version="v2",
-        keys_by_version={"v1": key_v1, "v2": key_v2},
-    )
-    assert rotated_cipher.decrypt(ciphertext) == token
+    with pytest.raises(GoogleOAuthStartFailure) as raised:
+        client.build_authorization_url(
+            state="state",
+            code_challenge="challenge",
+            scopes=["openid"],
+            redirect_uri="https://example.test/callback",
+            prompt_consent=False,
+        )
+
+    assert raised.value.code == "oauth_client_not_configured"
 
 
-def test_connector_token_cipher_allows_single_secret_dev_key_version_relabel() -> None:
-    v1_cipher = ConnectorTokenCipher.from_config(
-        active_key_version="v1",
-        configured_keys=None,
-        single_secret="shared-dev-secret",
-    )
-    ciphertext = v1_cipher.encrypt("tok_single_secret")
+def test_oauth_exchange_uses_userinfo_subject_and_email(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def post(*_args: Any, **_kwargs: Any) -> httpx.Response:
+        return _oauth_token_response(
+            payload={
+                "access_token": " access-token ",
+                "refresh_token": " refresh-token ",
+                "scope": "https://www.googleapis.com/auth/gmail.readonly",
+                "expires_in": 1800,
+            }
+        )
 
-    v2_cipher = ConnectorTokenCipher.from_config(
-        active_key_version="v2",
-        configured_keys=None,
-        single_secret="shared-dev-secret",
-    )
-    assert v2_cipher.decrypt(ciphertext) == "tok_single_secret"
+    def get(*_args: Any, **_kwargs: Any) -> httpx.Response:
+        request = httpx.Request("GET", "https://oauth.example.test/userinfo")
+        return httpx.Response(
+            status_code=200,
+            json={"sub": " sub_123 ", "email": " owner@example.com "},
+            request=request,
+        )
 
+    monkeypatch.setattr(httpx, "post", post)
+    monkeypatch.setattr(httpx, "get", get)
+    client = DefaultGoogleOAuthClient(client_id="client", client_secret="secret")
 
-def test_connector_token_cipher_rejects_non_aead_ciphertext() -> None:
-    cipher = ConnectorTokenCipher.from_config(
-        active_key_version="v1",
-        configured_keys=None,
-        single_secret="shared-dev-secret",
+    token_payload = client.exchange_code_for_tokens(
+        code="code",
+        code_verifier="verifier",
+        redirect_uri="https://example.test/callback",
+        state="state",
     )
 
-    with pytest.raises(RuntimeError, match="encrypted value is malformed"):
-        cipher.decrypt("not-aead:v1")
+    assert token_payload["account_subject"] == "sub_123"
+    assert token_payload["account_email"] == "owner@example.com"
+    assert token_payload["access_token"] == "access-token"
+    assert token_payload["refresh_token"] == "refresh-token"
+    assert token_payload["expires_in_seconds"] == 1800
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected_code"),
+    [
+        (401, "provider_request_rejected"),
+        (429, "provider_rate_limited"),
+        (503, "provider_upstream_failure"),
+    ],
+)
+def test_oauth_exchange_fails_when_userinfo_http_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+    expected_code: str,
+) -> None:
+    def post(*_args: Any, **_kwargs: Any) -> httpx.Response:
+        return _oauth_token_response(payload={"access_token": "access-token"})
+
+    def get(*_args: Any, **_kwargs: Any) -> httpx.Response:
+        request = httpx.Request("GET", "https://oauth.example.test/userinfo")
+        return httpx.Response(status_code=status_code, json={}, request=request)
+
+    monkeypatch.setattr(httpx, "post", post)
+    monkeypatch.setattr(httpx, "get", get)
+    client = DefaultGoogleOAuthClient(client_id="client", client_secret="secret")
+
+    with pytest.raises(GoogleOAuthExchangeFailure) as raised:
+        client.exchange_code_for_tokens(
+            code="code",
+            code_verifier="verifier",
+            redirect_uri="https://example.test/callback",
+            state="state",
+        )
+
+    assert raised.value.code == expected_code
+
+
+def test_oauth_exchange_fails_when_userinfo_request_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def post(*_args: Any, **_kwargs: Any) -> httpx.Response:
+        return _oauth_token_response(payload={"access_token": "access-token"})
+
+    def get(*_args: Any, **_kwargs: Any) -> httpx.Response:
+        raise httpx.TimeoutException("timeout")
+
+    monkeypatch.setattr(httpx, "post", post)
+    monkeypatch.setattr(httpx, "get", get)
+    client = DefaultGoogleOAuthClient(client_id="client", client_secret="secret")
+
+    with pytest.raises(GoogleOAuthExchangeFailure) as raised:
+        client.exchange_code_for_tokens(
+            code="code",
+            code_verifier="verifier",
+            redirect_uri="https://example.test/callback",
+            state="state",
+        )
+
+    assert raised.value.code == "provider_timeout"
+
+
+@pytest.mark.parametrize(
+    "profile_payload",
+    [
+        {"email": "owner@example.com"},
+        {"sub": "sub_123"},
+        {"sub": " ", "email": "owner@example.com"},
+        {"sub": "sub_123", "email": " "},
+        [],
+    ],
+)
+def test_oauth_exchange_fails_when_userinfo_payload_lacks_subject_or_email(
+    monkeypatch: pytest.MonkeyPatch,
+    profile_payload: dict[str, Any] | list[Any],
+) -> None:
+    def post(*_args: Any, **_kwargs: Any) -> httpx.Response:
+        return _oauth_token_response(payload={"access_token": "access-token"})
+
+    def get(*_args: Any, **_kwargs: Any) -> httpx.Response:
+        request = httpx.Request("GET", "https://oauth.example.test/userinfo")
+        return httpx.Response(status_code=200, json=profile_payload, request=request)
+
+    monkeypatch.setattr(httpx, "post", post)
+    monkeypatch.setattr(httpx, "get", get)
+    client = DefaultGoogleOAuthClient(client_id="client", client_secret="secret")
+
+    with pytest.raises(GoogleOAuthExchangeFailure) as raised:
+        client.exchange_code_for_tokens(
+            code="code",
+            code_verifier="verifier",
+            redirect_uri="https://example.test/callback",
+            state="state",
+        )
+
+    assert raised.value.code == "provider_invalid_payload"
+
+
+@pytest.mark.parametrize(
+    ("status_code", "payload", "expected_code"),
+    [
+        (400, {"error": "invalid_grant"}, "access_revoked"),
+        (429, {"error": "rate_limit_exceeded"}, "provider_rate_limited"),
+        (503, {"error": "temporarily_unavailable"}, "provider_upstream_failure"),
+        (400, {"error": "invalid_request"}, "provider_request_rejected"),
+    ],
+)
+def test_oauth_refresh_http_failures_are_typed(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+    payload: dict[str, Any],
+    expected_code: str,
+) -> None:
+    def post(*_args: Any, **_kwargs: Any) -> httpx.Response:
+        request = httpx.Request("POST", "https://oauth.example.test/token")
+        return httpx.Response(status_code=status_code, json=payload, request=request)
+
+    monkeypatch.setattr(httpx, "post", post)
+    client = DefaultGoogleOAuthClient(client_id="client", client_secret="secret")
+
+    with pytest.raises(GoogleOAuthRefreshFailure) as raised:
+        client.refresh_access_token(refresh_token="refresh")
+
+    assert raised.value.code == expected_code
+
+
+def test_oauth_refresh_invalid_success_payload_is_typed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def post(*_args: Any, **_kwargs: Any) -> httpx.Response:
+        request = httpx.Request("POST", "https://oauth.example.test/token")
+        return httpx.Response(status_code=200, json={"expires_in": 3600}, request=request)
+
+    monkeypatch.setattr(httpx, "post", post)
+    client = DefaultGoogleOAuthClient(client_id="client", client_secret="secret")
+
+    with pytest.raises(GoogleOAuthRefreshFailure) as raised:
+        client.refresh_access_token(refresh_token="refresh")
+
+    assert raised.value.code == "provider_invalid_payload"
+
+
+def test_oauth_revoke_success_posts_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def post(*_args: Any, **kwargs: Any) -> httpx.Response:
+        calls.append(kwargs)
+        request = httpx.Request("POST", "https://oauth.example.test/revoke")
+        return httpx.Response(status_code=200, json={}, request=request)
+
+    monkeypatch.setattr(httpx, "post", post)
+    client = DefaultGoogleOAuthClient(
+        client_id="client",
+        client_secret="secret",
+        revoke_url="https://oauth.example.test/revoke",
+    )
+
+    client.revoke_token(token="revoke-token")
+
+    assert calls == [
+        {
+            "data": {"token": "revoke-token"},
+            "headers": {"content-type": "application/x-www-form-urlencoded"},
+            "timeout": client.timeout_seconds,
+        }
+    ]
+
+
+def test_oauth_revoke_blank_token_is_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def post(*_args: Any, **_kwargs: Any) -> httpx.Response:
+        raise AssertionError("blank token must not call revoke endpoint")
+
+    monkeypatch.setattr(httpx, "post", post)
+    client = DefaultGoogleOAuthClient(client_id="client", client_secret="secret")
+
+    client.revoke_token(token="   ")
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [
+        (httpx.TimeoutException("timeout"), "provider_timeout"),
+        (httpx.ConnectError("network"), "provider_network_failure"),
+    ],
+)
+def test_oauth_revoke_transport_failures_are_typed(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: httpx.HTTPError,
+    expected_code: str,
+) -> None:
+    def post(*_args: Any, **_kwargs: Any) -> httpx.Response:
+        raise failure
+
+    monkeypatch.setattr(httpx, "post", post)
+    client = DefaultGoogleOAuthClient(client_id="client", client_secret="secret")
+
+    with pytest.raises(GoogleOAuthRevokeFailure) as raised:
+        client.revoke_token(token="revoke-token")
+
+    assert raised.value.code == expected_code
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected_code"),
+    [
+        (400, "provider_request_rejected"),
+        (429, "provider_rate_limited"),
+        (503, "provider_upstream_failure"),
+    ],
+)
+def test_oauth_revoke_http_failures_are_typed(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+    expected_code: str,
+) -> None:
+    def post(*_args: Any, **_kwargs: Any) -> httpx.Response:
+        request = httpx.Request("POST", "https://oauth.example.test/revoke")
+        return httpx.Response(status_code=status_code, json={}, request=request)
+
+    monkeypatch.setattr(httpx, "post", post)
+    client = DefaultGoogleOAuthClient(client_id="client", client_secret="secret")
+
+    with pytest.raises(GoogleOAuthRevokeFailure) as raised:
+        client.revoke_token(token="revoke-token")
+
+    assert raised.value.code == expected_code
 
 
 def test_google_calendar_capability_validators_reject_inverted_windows() -> None:
@@ -266,6 +498,7 @@ def test_default_workspace_provider_calendar_list_calls_google_events_endpoint(
             "window_start": "2026-03-04T00:00:00Z",
             "window_end": "2026-03-05T00:00:00Z",
         },
+        provider_account_id="acct_google",
     )
 
     assert len(calls) == 1
@@ -335,6 +568,7 @@ def test_default_workspace_provider_calendar_slots_do_not_overstate_freebusy_err
             },
             "constraints": {"hard": [], "soft": [], "attendee_notes": []},
         },
+        provider_account_id="acct_google",
         attendee_intersection_enabled=True,
     )
 
@@ -454,6 +688,7 @@ def test_default_workspace_provider_retries_transient_errors_before_success(
     output = provider.email_read(
         access_token="tok_live",
         normalized_input={"message_id": "msg_1"},
+        provider_account_id="acct_google",
     )
 
     assert len(calls) == 2
@@ -505,6 +740,7 @@ def test_default_workspace_provider_email_search_fetches_to_cc_and_body_status(
     output = provider.email_search(
         access_token="tok_live",
         normalized_input={"query": "invoice"},
+        provider_account_id="acct_google",
     )
 
     assert calls[1]["params"]["metadataHeaders"] == ["Subject", "From", "To", "Cc", "Date"]
@@ -564,6 +800,7 @@ def test_default_workspace_provider_email_read_supports_thread_mode(
     output = provider.email_read(
         access_token="tok_live",
         normalized_input={"thread_id": "thr_1", "message_id": None, "mode": "thread"},
+        provider_account_id="acct_google",
     )
 
     assert calls[0]["url"].endswith("/gmail/v1/users/me/threads/thr_1")
@@ -579,6 +816,166 @@ def test_default_workspace_provider_email_read_supports_thread_mode(
         "msg_1",
         "msg_2",
     ]
+
+
+def test_default_workspace_provider_email_read_typed_too_large_returns_degraded_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_request(
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+        json: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        del method, headers, params, json, timeout
+        request = httpx.Request("GET", url)
+        return httpx.Response(status_code=200, text="x" * 262145, request=request)
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    provider = DefaultGoogleWorkspaceProvider(timeout_seconds=5.0, max_attempts=1)
+
+    output = provider.email_read(
+        access_token="tok_live",
+        normalized_input={"message_id": "msg_big", "mode": "message"},
+        provider_account_id="acct_google",
+    )
+
+    assert output["mode"] == "message"
+    assert output["message"]["message_id"] == "msg_big"
+    assert output["read_outcome"]["status"] == "body_too_large"
+    assert output["read_outcome"]["reason_code"] == "gmail_body_too_large"
+
+
+@pytest.mark.parametrize("too_large_at", ["thread", "message"])
+def test_default_workspace_provider_email_read_thread_typed_too_large_returns_degraded_thread(
+    monkeypatch: pytest.MonkeyPatch,
+    too_large_at: str,
+) -> None:
+    calls: list[str] = []
+
+    def fake_request(
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+        json: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        del method, headers, params, json, timeout
+        calls.append(url)
+        request = httpx.Request("GET", url)
+        if too_large_at == "thread" or url.endswith("/messages/msg_1"):
+            return httpx.Response(status_code=200, text="x" * 262145, request=request)
+        return httpx.Response(
+            status_code=200,
+            json={"id": "thr_big", "historyId": "88", "messages": [{"id": "msg_1"}]},
+            request=request,
+        )
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    provider = DefaultGoogleWorkspaceProvider(timeout_seconds=5.0, max_attempts=1)
+
+    output = provider.email_read(
+        access_token="tok_live",
+        normalized_input={"thread_id": "thr_big", "mode": "thread"},
+        provider_account_id="acct_google",
+    )
+
+    assert output["mode"] == "thread"
+    assert output["thread"]["thread_id"] == "thr_big"
+    assert output["read_outcome"]["status"] == "body_too_large"
+    assert output["read_outcome"]["reason_code"] == "gmail_body_too_large"
+    assert len(calls) == (1 if too_large_at == "thread" else 2)
+
+
+@pytest.mark.parametrize("failing_at", ["message", "thread", "thread_message"])
+def test_default_workspace_provider_email_read_untyped_too_large_defect_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+    failing_at: str,
+) -> None:
+    calls: list[str] = []
+
+    def fake_request(
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+        json: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        del method, headers, params, json, timeout
+        calls.append(url)
+        if failing_at in {"message", "thread"} or url.endswith("/messages/msg_1"):
+            raise RuntimeError("google_response_too_large")
+        request = httpx.Request("GET", url)
+        return httpx.Response(
+            status_code=200,
+            json={"id": "thr_bug", "historyId": "88", "messages": [{"id": "msg_1"}]},
+            request=request,
+        )
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    provider = DefaultGoogleWorkspaceProvider(timeout_seconds=5.0, max_attempts=1)
+    normalized_input = (
+        {"message_id": "msg_bug", "mode": "message"}
+        if failing_at == "message"
+        else {"thread_id": "thr_bug", "mode": "thread"}
+    )
+
+    with pytest.raises(RuntimeError, match="google_response_too_large"):
+        provider.email_read(
+            access_token="tok_live",
+            normalized_input=normalized_input,
+            provider_account_id="acct_google",
+        )
+    assert len(calls) == (2 if failing_at == "thread_message" else 1)
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected_code"),
+    [
+        (400, "google_request_failed:400"),
+        (404, "resource_not_found"),
+        (503, "google_upstream_503"),
+    ],
+)
+def test_default_workspace_provider_email_read_non_too_large_provider_failures_propagate(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+    expected_code: str,
+) -> None:
+    def fake_request(
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+        json: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        del method, headers, params, json, timeout
+        request = httpx.Request("GET", url)
+        return httpx.Response(
+            status_code=status_code,
+            json={"error": {"message": "provider failed"}},
+            request=request,
+        )
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    provider = DefaultGoogleWorkspaceProvider(timeout_seconds=5.0, max_attempts=1)
+
+    with pytest.raises(GoogleProviderRequestFailure) as raised:
+        provider.email_read(
+            access_token="tok_live",
+            normalized_input={"message_id": "msg_failed", "mode": "message"},
+            provider_account_id="acct_google",
+        )
+    assert raised.value.code == expected_code
 
 
 def test_default_workspace_provider_drive_search_builds_safe_query_and_shared_drive_params(
@@ -613,6 +1010,7 @@ def test_default_workspace_provider_drive_search_builds_safe_query_and_shared_dr
     output = provider.drive_search(
         access_token="tok_live",
         normalized_input={"query": raw_query},
+        provider_account_id="acct_google",
     )
 
     assert len(calls) == 1
@@ -681,6 +1079,7 @@ def test_default_workspace_provider_drive_read_enforces_size_boundary(
     output = provider.drive_read(
         access_token="tok_live",
         normalized_input={"file_id": "drv_boundary"},
+        provider_account_id="acct_google",
     )
 
     assert output["read_outcome"]["status"] == expected_status
@@ -698,6 +1097,174 @@ def test_default_workspace_provider_drive_read_enforces_size_boundary(
     else:
         assert output["read_outcome"]["reason_code"] == "drive_read_too_large"
         assert output["truncated"] is False
+
+
+@pytest.mark.parametrize("missing_at", ["metadata", "content"])
+def test_default_workspace_provider_drive_read_typed_not_found_returns_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    missing_at: str,
+) -> None:
+    calls: list[str] = []
+
+    def fake_request(
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+        json: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        del method, headers, params, json, timeout
+        calls.append(url)
+        request = httpx.Request("GET", url)
+        if missing_at == "metadata" or len(calls) == 2:
+            return httpx.Response(
+                status_code=404, json={"error": {"message": "gone"}}, request=request
+            )
+        return httpx.Response(
+            status_code=200,
+            json={
+                "id": "drv_missing",
+                "name": "Missing Doc",
+                "mimeType": "text/plain",
+                "modifiedTime": "2026-03-06T12:00:00Z",
+                "webViewLink": "https://drive.google.com/file/d/drv_missing/view",
+                "size": "12",
+                "owners": [],
+            },
+            request=request,
+        )
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    provider = DefaultGoogleWorkspaceProvider(timeout_seconds=5.0, max_attempts=1)
+
+    output = provider.drive_read(
+        access_token="tok_live",
+        normalized_input={"file_id": "drv_missing"},
+        provider_account_id="acct_google",
+    )
+
+    assert output["read_outcome"]["status"] == "unavailable"
+    assert output["read_outcome"]["reason_code"] == "drive_read_unavailable"
+    assert output["content_excerpt"] == ""
+    assert len(calls) == (1 if missing_at == "metadata" else 2)
+    if missing_at == "metadata":
+        assert output["title"] == "Drive file drv_missing"
+        assert output["source"] == "https://drive.google.com/file/d/drv_missing/view"
+        assert output["published_at"] is None
+    else:
+        assert output["title"] == "Missing Doc"
+        assert output["source"] == "https://drive.google.com/file/d/drv_missing/view"
+        assert output["published_at"] == "2026-03-06T12:00:00Z"
+
+
+@pytest.mark.parametrize("failing_at", ["metadata", "content"])
+def test_default_workspace_provider_drive_read_untyped_not_found_defect_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+    failing_at: str,
+) -> None:
+    calls: list[str] = []
+
+    def fake_request(
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+        json: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        del method, headers, params, json, timeout
+        calls.append(url)
+        if failing_at == "metadata" or len(calls) == 2:
+            raise RuntimeError("resource_not_found")
+        request = httpx.Request("GET", url)
+        return httpx.Response(
+            status_code=200,
+            json={
+                "id": "drv_bug",
+                "name": "Bug Doc",
+                "mimeType": "text/plain",
+                "modifiedTime": "2026-03-06T12:00:00Z",
+                "webViewLink": "https://drive.google.com/file/d/drv_bug/view",
+                "size": "12",
+                "owners": [],
+            },
+            request=request,
+        )
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    provider = DefaultGoogleWorkspaceProvider(timeout_seconds=5.0, max_attempts=1)
+
+    with pytest.raises(RuntimeError, match="resource_not_found"):
+        provider.drive_read(
+            access_token="tok_live",
+            normalized_input={"file_id": "drv_bug"},
+            provider_account_id="acct_google",
+        )
+    assert len(calls) == (1 if failing_at == "metadata" else 2)
+
+
+@pytest.mark.parametrize("failing_at", ["metadata", "content"])
+@pytest.mark.parametrize(
+    ("status_code", "expected_code"),
+    [
+        (400, "google_request_failed:400"),
+        (503, "google_upstream_503"),
+    ],
+)
+def test_default_workspace_provider_drive_read_non_not_found_provider_failures_propagate(
+    monkeypatch: pytest.MonkeyPatch,
+    failing_at: str,
+    status_code: int,
+    expected_code: str,
+) -> None:
+    calls: list[str] = []
+
+    def fake_request(
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+        json: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        del method, headers, params, json, timeout
+        calls.append(url)
+        request = httpx.Request("GET", url)
+        if failing_at == "metadata" or len(calls) == 2:
+            return httpx.Response(
+                status_code=status_code,
+                json={"error": {"message": "provider failed"}},
+                request=request,
+            )
+        return httpx.Response(
+            status_code=200,
+            json={
+                "id": "drv_failed",
+                "name": "Failed Doc",
+                "mimeType": "text/plain",
+                "modifiedTime": "2026-03-06T12:00:00Z",
+                "webViewLink": "https://drive.google.com/file/d/drv_failed/view",
+                "size": "12",
+                "owners": [],
+            },
+            request=request,
+        )
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    provider = DefaultGoogleWorkspaceProvider(timeout_seconds=5.0, max_attempts=1)
+
+    with pytest.raises(GoogleProviderRequestFailure) as raised:
+        provider.drive_read(
+            access_token="tok_live",
+            normalized_input={"file_id": "drv_failed"},
+            provider_account_id="acct_google",
+        )
+    assert raised.value.code == expected_code
+    assert len(calls) == (1 if failing_at == "metadata" else 2)
 
 
 @pytest.mark.parametrize(
@@ -744,11 +1311,13 @@ def test_default_workspace_provider_distinguishes_scope_vs_acl_forbidden(
     monkeypatch.setattr(httpx, "request", fake_request)
     provider = DefaultGoogleWorkspaceProvider(timeout_seconds=5.0, max_attempts=1)
 
-    with pytest.raises(RuntimeError, match=expected_error):
+    with pytest.raises(GoogleProviderRequestFailure) as raised:
         provider.drive_read(
             access_token="tok_live",
             normalized_input={"file_id": "drv_acl_scope"},
+            provider_account_id="acct_google",
         )
+    assert raised.value.code == expected_error
 
 
 class _FakeGmailMailbox:
@@ -960,8 +1529,100 @@ def test_default_workspace_provider_email_trash_partial_failure_keeps_audit_stat
     assert output["after_labels"]["msg_ok"] == ["TRASH"]
     assert output["after_labels"]["msg_fail"] == ["INBOX"]
     assert output["provider_result"]["mutated_message_ids"] == ["msg_ok"]
+    assert output["provider_result"]["failed_provider_call"]["api"] == "users.messages.trash"
     assert output["provider_result"]["failed_provider_call"]["message_id"] == "msg_fail"
+    assert output["provider_result"]["failed_provider_call"]["error"] == "google_upstream_500"
     assert output["provider_result"]["error"] == "google_upstream_500"
+
+
+def test_default_workspace_provider_email_trash_untyped_provider_failure_defect_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mailbox = _FakeGmailMailbox(labels_by_message_id={"msg_fail": ["INBOX"]})
+    monkeypatch.setattr(httpx, "request", mailbox.request)
+    provider = DefaultGoogleWorkspaceProvider(timeout_seconds=5.0, max_attempts=1)
+
+    def fail_trash_message(self: DefaultGoogleWorkspaceProvider, **_: Any) -> dict[str, Any]:
+        del self
+        raise RuntimeError("google_upstream_500")
+
+    monkeypatch.setattr(DefaultGoogleWorkspaceProvider, "_gmail_trash_message", fail_trash_message)
+
+    with pytest.raises(RuntimeError, match="google_upstream_500"):
+        provider.email_trash(
+            access_token="tok_live",
+            normalized_input={"message_ids": ["msg_fail"]},
+        )
+
+
+def test_default_workspace_provider_email_archive_typed_audit_failure_records_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mailbox = _FakeGmailMailbox(labels_by_message_id={"msg_1": ["INBOX"]})
+    monkeypatch.setattr(httpx, "request", mailbox.request)
+    provider = DefaultGoogleWorkspaceProvider(timeout_seconds=5.0, max_attempts=1)
+
+    def fail_read_message_state(self: DefaultGoogleWorkspaceProvider, **_: Any) -> dict[str, Any]:
+        del self
+        raise GoogleProviderRequestFailure("google_upstream_500")
+
+    monkeypatch.setattr(
+        DefaultGoogleWorkspaceProvider,
+        "_gmail_read_message_state",
+        fail_read_message_state,
+    )
+
+    output = provider.email_archive(
+        access_token="tok_live",
+        normalized_input={
+            "message_ids": ["msg_1"],
+            "before_state": [
+                {
+                    "message_id": "msg_1",
+                    "thread_id": "thr_msg_1",
+                    "label_ids": ["INBOX"],
+                }
+            ],
+        },
+    )
+
+    assert output["status"] == "partially_failed"
+    assert output["provider_result"]["mutated_message_ids"] == ["msg_1"]
+    assert output["provider_result"]["after_state_error"] == "google_upstream_500"
+    assert output["provider_result"]["error"] == "google_upstream_500"
+
+
+def test_default_workspace_provider_email_archive_untyped_audit_failure_defect_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mailbox = _FakeGmailMailbox(labels_by_message_id={"msg_1": ["INBOX"]})
+    monkeypatch.setattr(httpx, "request", mailbox.request)
+    provider = DefaultGoogleWorkspaceProvider(timeout_seconds=5.0, max_attempts=1)
+
+    def fail_read_message_state(self: DefaultGoogleWorkspaceProvider, **_: Any) -> dict[str, Any]:
+        del self
+        raise RuntimeError("google_upstream_500")
+
+    monkeypatch.setattr(
+        DefaultGoogleWorkspaceProvider,
+        "_gmail_read_message_state",
+        fail_read_message_state,
+    )
+
+    with pytest.raises(RuntimeError, match="google_upstream_500"):
+        provider.email_archive(
+            access_token="tok_live",
+            normalized_input={
+                "message_ids": ["msg_1"],
+                "before_state": [
+                    {
+                        "message_id": "msg_1",
+                        "thread_id": "thr_msg_1",
+                        "label_ids": ["INBOX"],
+                    }
+                ],
+            },
+        )
 
 
 def test_default_workspace_provider_email_labels_modify_reuses_provider_label_ids(
@@ -1296,6 +1957,7 @@ def test_calendar_write_validator_rejects_missing_event_id() -> None:
 def test_calendar_slot_options_validator_accepts_partial_and_full_availability() -> None:
     partial_payload: dict[str, Any] = {
         "schema_version": "google.calendar.slot_options.v1",
+        "provider_account_id": "acct_google",
         "slots": [
             {
                 "slot_id": "slot_1",
@@ -1325,6 +1987,7 @@ def test_calendar_slot_options_validator_accepts_partial_and_full_availability()
 
     full_payload: dict[str, Any] = {
         "schema_version": "google.calendar.slot_options.v1",
+        "provider_account_id": "acct_google",
         "slots": [],
         "retrieved_at": "2026-05-20T12:00:00Z",
         "window_start": "2026-05-20T15:00:00Z",
@@ -1350,6 +2013,7 @@ def test_calendar_slot_options_validator_rejects_confidence_leak() -> None:
     # boundary. Its presence here would mean a layer mismatch.
     poisoned: dict[str, Any] = {
         "schema_version": "google.calendar.slot_options.v1",
+        "provider_account_id": "acct_google",
         "slots": [],
         "retrieved_at": "2026-05-20T12:00:00Z",
         "window_start": "2026-05-20T15:00:00Z",
@@ -1382,6 +2046,7 @@ def test_gmail_message_refs_validator_accepts_minimal_real_search_payload() -> N
         "total_estimate": None,
         "messages": [
             {
+                "provider_account_id": "google",
                 "message_id": "msg_1",
                 "thread_id": "thr_1",
                 "provider_url": "https://mail.google.com/mail/u/0/#all/msg_1",
@@ -1397,7 +2062,6 @@ def test_gmail_message_refs_validator_accepts_minimal_real_search_payload() -> N
                 "direction": "received",
                 "preview": None,
                 "evidence_status": "needs_read",
-                "provider_account_id": "google",
             }
         ],
     }
@@ -1411,6 +2075,7 @@ def test_gmail_message_refs_validator_rejects_unknown_evidence_status() -> None:
         "total_estimate": 1,
         "messages": [
             {
+                "provider_account_id": "google",
                 "message_id": "msg_1",
                 "thread_id": "thr_1",
                 "provider_url": "https://mail.google.com/mail/u/0/#all/msg_1",
@@ -1440,6 +2105,7 @@ def _gmail_message_refs_payload_with_total_estimate(total_estimate: Any) -> dict
         "total_estimate": total_estimate,
         "messages": [
             {
+                "provider_account_id": "google",
                 "message_id": "msg_1",
                 "thread_id": "thr_1",
                 "provider_url": "https://mail.google.com/mail/u/0/#all/msg_1",
@@ -1604,6 +2270,7 @@ def test_gmail_message_evidence_validator_accepts_thread_mode_degraded_outcome()
         "schema_version": "google.gmail.message_evidence.v1",
         "mode": "thread",
         "thread": {
+            "provider_account_id": "google",
             "thread_id": "thr_big",
             "history_id": None,
             "message_count": 0,
@@ -1636,6 +2303,7 @@ def test_gmail_message_evidence_validator_accepts_thread_mode_payload() -> None:
         "schema_version": "google.gmail.message_evidence.v1",
         "mode": "thread",
         "thread": {
+            "provider_account_id": "google",
             "thread_id": "thr_x",
             "history_id": "100",
             "message_count": 2,
@@ -1888,25 +2556,41 @@ def test_drive_read_validator_accepts_ok_and_degraded_outcomes() -> None:
     }
     assert is_typed_google_read_output(capability_id="cap.drive.read", payload=ok_payload)
 
-    too_large_outcome = {
-        "status": "too_large",
-        "reason_code": "drive_read_too_large",
-        "recovery": "Open the file and request a smaller section, then retry.",
-    }
-    too_large: dict[str, Any] = {
-        "schema_version": "google.drive.read_result.v1",
-        "file_id": "drv_big",
-        "provider_account_id": "google",
-        "retrieved_at": "2026-05-20T12:00:00Z",
-        "title": "Big Doc",
-        "source": "https://drive.google.com/file/d/drv_big/view",
-        "published_at": None,
-        "content_excerpt": "",
-        "truncated": False,
-        "read_outcome": too_large_outcome,
-        "status": "succeeded",
-    }
-    assert is_typed_google_read_output(capability_id="cap.drive.read", payload=too_large)
+    for outcome_status, reason_code, recovery in [
+        (
+            "too_large",
+            "drive_read_too_large",
+            "Open the file and request a smaller section, then retry.",
+        ),
+        (
+            "unsupported",
+            "drive_read_unsupported",
+            "Export this file to Google Docs or plain text, then retry.",
+        ),
+        (
+            "unavailable",
+            "drive_read_unavailable",
+            "Verify file access and file ID, then retry.",
+        ),
+    ]:
+        degraded: dict[str, Any] = {
+            "schema_version": "google.drive.read_result.v1",
+            "file_id": f"drv_{outcome_status}",
+            "provider_account_id": "google",
+            "retrieved_at": "2026-05-20T12:00:00Z",
+            "title": "Degraded Doc",
+            "source": f"https://drive.google.com/file/d/drv_{outcome_status}/view",
+            "published_at": None,
+            "content_excerpt": "",
+            "truncated": False,
+            "read_outcome": {
+                "status": outcome_status,
+                "reason_code": reason_code,
+                "recovery": recovery,
+            },
+            "status": "succeeded",
+        }
+        assert is_typed_google_read_output(capability_id="cap.drive.read", payload=degraded)
 
 
 def test_drive_read_validator_rejects_unknown_read_outcome_status() -> None:

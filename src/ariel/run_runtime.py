@@ -4,7 +4,7 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -22,6 +22,9 @@ from .config import AppSettings
 from .google_connector import GoogleConnectorRuntime
 from .persistence import ActionAttemptRecord, TurnRecord
 from .sandbox_runtime import ProgramResult, RunSandbox
+
+if TYPE_CHECKING:
+    from .model_adapter import ModelAdapter
 
 _MAX_RUN_SOURCE_CHARS = 20000
 
@@ -250,7 +253,7 @@ def execute_run_program(
     allowed_capability_ids: set[str],
     settings: AppSettings | None,
     scratch: dict[str, ScratchEntry],
-    model_adapter: Any | None = None,
+    model_adapter: ModelAdapter | None = None,
     is_main_agent_loop: bool = True,
 ) -> RunProgramResult:
     """Run one model-authored Python ``run`` program inside the sandbox.

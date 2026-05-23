@@ -108,8 +108,8 @@ durable artifact:
 - **Calendar push** — Google POSTs to `/v1/providers/google/events` over the
   public Caddy-fronted HTTPS endpoint. The handler validates the
   `X-Goog-Channel-Token` against the per-channel `channel_token` stored on
-  `provider_watch_channels` (the global token gate fires first; a missing or
-  mismatched per-channel token returns 401). On accept, one
+  the active, unexpired `provider_watch_channels` row for the requested
+  resource and channel. A missing or mismatched per-channel token returns 401. On accept, one
   `ProviderEventRecord` row is inserted and one `provider_event_received`
   background task is enqueued.
 - **Gmail push** — Google publishes to a Cloud Pub/Sub topic; the
