@@ -36,6 +36,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from .clock import utcnow
 from .config import AppSettings
 from .ids import new_id
+from .google_connector import google_account_subject, google_connector_has_account_identity
 from .persistence import (
     GoogleConnectorRecord,
     ProviderEventRecord,
@@ -174,15 +175,9 @@ def _ack_message(message: Any) -> None:
 
 
 def _provider_account_subject(connector: GoogleConnectorRecord | None) -> str | None:
-    if connector is None:
+    if connector is None or not google_connector_has_account_identity(connector):
         return None
-    subject = connector.account_subject
-    if subject is None:
-        return None
-    normalized = subject.strip()
-    if not normalized or normalized == "unknown-subject":
-        return None
-    return normalized
+    return google_account_subject(connector.account_subject)
 
 
 def handle_message(

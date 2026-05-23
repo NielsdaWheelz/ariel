@@ -92,7 +92,7 @@ def google_account_subject(value: str | None) -> str | None:
     if value is None:
         return None
     normalized = value.strip()
-    if not normalized or normalized == "unknown-subject":
+    if not normalized or any(char.isspace() for char in normalized):
         return None
     return normalized
 
@@ -101,7 +101,13 @@ def google_account_email(value: str | None) -> str | None:
     if value is None:
         return None
     normalized = value.strip()
-    if not normalized or normalized == "unknown-email":
+    if (
+        not normalized
+        or any(char.isspace() for char in normalized)
+        or normalized.count("@") != 1
+        or normalized.startswith("@")
+        or normalized.endswith("@")
+    ):
         return None
     return normalized
 
@@ -5048,18 +5054,14 @@ class GoogleConnectorRuntime:
         expires_in_seconds = expires_in_raw if isinstance(expires_in_raw, int) else 3600
         if expires_in_seconds <= 0:
             expires_in_seconds = 0
-        account_subject = (
-            account_subject_raw.strip() if isinstance(account_subject_raw, str) else ""
+        account_subject = google_account_subject(
+            account_subject_raw if isinstance(account_subject_raw, str) else None
         )
-        account_email = account_email_raw.strip() if isinstance(account_email_raw, str) else ""
+        account_email = google_account_email(
+            account_email_raw if isinstance(account_email_raw, str) else None
+        )
         access_token = access_token_raw.strip() if isinstance(access_token_raw, str) else ""
-        if (
-            not account_subject
-            or account_subject == "unknown-subject"
-            or not account_email
-            or account_email == "unknown-email"
-            or not access_token
-        ):
+        if account_subject is None or account_email is None or not access_token:
             raise self._callback_invalid(
                 db=db,
                 connector=connector,

@@ -11,10 +11,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from ariel.action_runtime import (
-    _EmailAfterStateMissing,
-    process_action_execution_task,
-)
+from ariel.action_runtime import process_action_execution_task
 from ariel.capability_registry import (
     canonical_action_payload,
     capability_contract_hash,
@@ -22,7 +19,6 @@ from ariel.capability_registry import (
     payload_hash,
 )
 from ariel.google_connector import (
-    GOOGLE_CONNECTOR_ID,
     GOOGLE_GMAIL_MODIFY_SCOPE,
     GoogleCapabilityExecutionResult,
 )
@@ -31,7 +27,6 @@ from ariel.persistence import (
     ActionPrivatePayloadRecord,
     BackgroundTaskRecord,
     EventRecord,
-    GoogleConnectorRecord,
     ProviderWriteReceiptRecord,
     SessionRecord,
     TurnRecord,
@@ -266,34 +261,6 @@ def _seed_action_attempt(
                     )
                 )
     return action_hash
-
-
-def _seed_google_connector(
-    session_factory: sessionmaker[Session],
-    *,
-    account_subject: str = PROVIDER_ACCOUNT_ID,
-) -> None:
-    with session_factory() as db:
-        with db.begin():
-            db.merge(
-                GoogleConnectorRecord(
-                    id=GOOGLE_CONNECTOR_ID,
-                    provider="google",
-                    status="connected",
-                    account_subject=account_subject,
-                    account_email=f"{account_subject}@example.test",
-                    granted_scopes=[],
-                    access_token_enc=None,
-                    refresh_token_enc=None,
-                    access_token_expires_at=None,
-                    token_obtained_at=None,
-                    encryption_key_version="v1",
-                    last_error_code=None,
-                    last_error_at=None,
-                    created_at=NOW,
-                    updated_at=NOW,
-                )
-            )
 
 
 def _seed_failed_email_write_receipt(
@@ -552,7 +519,7 @@ def test_email_action_missing_provider_after_state_is_not_recovered(
         proposal_index=1,
     )
 
-    with pytest.raises(_EmailAfterStateMissing, match="email_after_state_missing"):
+    with pytest.raises(RuntimeError, match="email_after_state_missing"):
         process_action_execution_task(
             session_factory=session_factory,
             action_attempt_id="act_missing_provider_after",

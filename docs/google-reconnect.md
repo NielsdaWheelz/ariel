@@ -5,7 +5,7 @@ How to (re)connect Ariel's Google integration — including granting new scopes 
 ## When you need this
 
 - **First-time setup**: connect Google so Ariel can read your Mail/Calendar/Drive.
-- **Account email shows as `unknown-email`**: your connector predates the identity-scope addition. Reconnecting will request `openid + email + profile` and populate `account_email`; current connect/reconnect callbacks reject missing userinfo identity instead of creating this value.
+- **Account identity is missing or unusable**: reconnect to request `openid + email + profile` and populate `account_subject` plus `account_email`; current connect/reconnect callbacks require usable userinfo identity.
 - **Bot says "I can't send mail / create events / share files"**: the relevant write scope was never granted. Reconnect with a `capability_intent`.
 - **Google revoked the refresh token** (you removed access from [https://myaccount.google.com/permissions](https://myaccount.google.com/permissions), or it expired due to inactivity): reconnect to mint a fresh refresh token.
 
@@ -37,7 +37,7 @@ Each `start` / `reconnect` returns an `authorization_url`. You open that URL in 
 You are an existing user (`gmail.readonly + calendar.readonly` already granted). You want everything else (identity scopes + the common write capabilities). Run these one at a time. Each step opens one browser consent screen; you approve, Google redirects back, and the next step's request unions in more scopes (existing grants always carry forward).
 
 ```bash
-# Step 1: identity scopes (openid + email + profile) — fixes historical "unknown-email"
+# Step 1: identity scopes (openid + email + profile) - populates account identity
 curl -s "${auth[@]}" -X POST http://127.0.0.1:8000/v1/connectors/google/reconnect | jq -r '.oauth.authorization_url'
 # → open the URL in a browser, click Allow
 

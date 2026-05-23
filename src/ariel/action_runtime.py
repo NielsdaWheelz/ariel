@@ -51,6 +51,8 @@ from ariel.google_connector import (
     GOOGLE_WRITE_CAPABILITY_IDS,
     GoogleCapabilityExecutionResult,
     GoogleConnectorRuntime,
+    google_account_subject,
+    google_connector_has_account_identity,
 )
 from ariel.persistence import (
     ActionAttemptRecord,
@@ -366,10 +368,26 @@ def _current_google_provider_account_id(db: Session) -> str | None:
     )
     if connector is None or connector.status != "connected":
         return None
-    account_subject = connector.account_subject
-    if account_subject is None or not account_subject.strip():
+    provider_account_id = google_account_subject(connector.account_subject)
+    if provider_account_id is None or not google_connector_has_account_identity(connector):
         return None
-    return account_subject
+    return provider_account_id
+
+
+def _provider_write_account_id(
+    *,
+    db: Session,
+    provider: str,
+    provider_account_id: str | None,
+) -> str:
+    if isinstance(provider_account_id, str) and provider_account_id.strip():
+        return provider_account_id.strip()
+    if provider != "google":
+        return provider
+    current_provider_account_id = _current_google_provider_account_id(db)
+    if current_provider_account_id is None:
+        raise RuntimeError("google_account_identity_missing")
+    return current_provider_account_id
 
 
 def _email_advisory_lock_id(*parts: str) -> int:
@@ -2192,10 +2210,10 @@ def _record_provider_write_receipt(
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
 ) -> ProviderWriteReceiptRecord:
-    resolved_provider_account_id = (
-        provider_account_id
-        or (_current_google_provider_account_id(db) if provider == "google" else None)
-        or provider
+    resolved_provider_account_id = _provider_write_account_id(
+        db=db,
+        provider=provider,
+        provider_account_id=provider_account_id,
     )
     idempotency_key = _provider_write_idempotency_key(
         action_attempt=action_attempt,
@@ -2433,10 +2451,10 @@ def _provider_write_receipt_for_attempt(
     provider_account_id: str | None,
     normalized_input: dict[str, Any] | None,
 ) -> ProviderWriteReceiptRecord | None:
-    resolved_provider_account_id = (
-        provider_account_id
-        or (_current_google_provider_account_id(db) if provider == "google" else None)
-        or provider
+    resolved_provider_account_id = _provider_write_account_id(
+        db=db,
+        provider=provider,
+        provider_account_id=provider_account_id,
     )
     idempotency_key = _provider_write_idempotency_key(
         action_attempt=action_attempt,

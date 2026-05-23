@@ -356,6 +356,8 @@ def _seed_connected_connector(
     now: datetime,
     settings: AppSettings,
     granted_scopes: list[str],
+    account_subject: str | None = "sub_connected",
+    account_email: str | None = "connected@example.com",
 ) -> None:
     with session_factory() as db:
         with db.begin():
@@ -364,8 +366,8 @@ def _seed_connected_connector(
                     id=GOOGLE_CONNECTOR_ID,
                     provider="google",
                     status="connected",
-                    account_subject="sub_connected",
-                    account_email="connected@example.com",
+                    account_subject=account_subject,
+                    account_email=account_email,
                     granted_scopes=granted_scopes,
                     access_token_enc=encrypt_secret(
                         plaintext="tok_access_live",
@@ -450,6 +452,82 @@ def test_watch_renew_handler_rearms_near_expiry_channel(
             assert channel.status == "active"
             assert channel.cursor_seed == "hist-watch-1"
             assert channel.expires_at == datetime(2026, 6, 10, 12, 0, tzinfo=UTC)
+
+
+def test_watch_renew_handler_missing_identity_wakes_without_registering_fallback_watch(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 5, 18, 12, 0, tzinfo=UTC)
+    settings = _settings()
+    _seed_connected_connector(
+        session_factory,
+        now=now,
+        settings=settings,
+        granted_scopes=[GMAIL_READ_SCOPE],
+        account_subject=None,
+    )
+    with session_factory() as db:
+        with db.begin():
+            db.add(
+                ProviderWatchChannelRecord(
+                    id="wch_missing_identity",
+                    provider="google",
+                    resource_type="gmail",
+                    resource_id="sub_connected",
+                    channel_id=None,
+                    channel_token=None,
+                    provider_resource_id=None,
+                    cursor_seed="hist-old",
+                    status="active",
+                    expires_at=now + timedelta(hours=3),
+                    last_error_code=None,
+                    last_error_at=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
+    provider = WatchRecordingProvider()
+    runtime = GoogleConnectorRuntime(
+        oauth_client=ConnectOAuthClient(granted_scopes=[GMAIL_READ_SCOPE]),
+        workspace_provider=cast(Any, provider),
+        redirect_uri=settings.google_oauth_redirect_uri,
+        oauth_state_ttl_seconds=settings.google_oauth_state_ttl_seconds,
+        encryption_secret=settings.connector_encryption_secret,
+        encryption_key_version=settings.connector_encryption_key_version,
+        encryption_keys=settings.connector_encryption_keys,
+        pubsub_topic=PUBSUB_TOPIC,
+        public_webhook_base_url=None,
+    )
+    monkeypatch.setattr("ariel.worker.build_google_runtime", lambda _settings: runtime)
+
+    process_provider_watch_renew_due(
+        session_factory=session_factory,
+        settings=settings,
+        now_fn=lambda: now,
+        new_id_fn=IdFactory(),
+    )
+
+    assert provider.gmail_watch_calls == []
+    with session_factory() as db:
+        with db.begin():
+            connector = db.get(GoogleConnectorRecord, GOOGLE_CONNECTOR_ID)
+            tasks = db.scalars(
+                select(BackgroundTaskRecord).where(BackgroundTaskRecord.task_type == "agent_wake")
+            ).all()
+            channel = db.get(ProviderWatchChannelRecord, "wch_missing_identity")
+    assert connector is not None
+    assert connector.last_error_code == "account_identity_missing"
+    assert len(tasks) == 1
+    assert tasks[0].payload == {
+        "note": (
+            "The Google connector reported an error account_identity_missing; "
+            "the user may need to reconnect."
+        )
+    }
+    assert channel is not None
+    assert channel.cursor_seed == "hist-old"
 
 
 def test_watch_renew_handler_raises_after_recording_registration_failure(
@@ -744,7 +822,14 @@ def test_calendar_410_clears_cursor_and_reenqueues_full_sync(
 
     monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeRuntime)
     now = datetime(2026, 5, 18, 12, 0, tzinfo=UTC)
+    settings = _settings()
     new_id = IdFactory()
+    _seed_connected_connector(
+        session_factory,
+        now=now,
+        settings=settings,
+        granted_scopes=[GMAIL_READ_SCOPE, CALENDAR_READ_SCOPE],
+    )
     with session_factory() as db:
         with db.begin():
             db.add(
@@ -771,7 +856,7 @@ def test_calendar_410_clears_cursor_and_reenqueues_full_sync(
             "resource_type": "calendar",
             "resource_id": "primary",
         },
-        settings=_settings(),
+        settings=settings,
         now_fn=lambda: now,
         new_id_fn=new_id,
     )
@@ -820,7 +905,14 @@ def test_gmail_404_clears_cursor_and_reenqueues_full_sync(
 
     monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeRuntime)
     now = datetime(2026, 5, 18, 12, 0, tzinfo=UTC)
+    settings = _settings()
     new_id = IdFactory()
+    _seed_connected_connector(
+        session_factory,
+        now=now,
+        settings=settings,
+        granted_scopes=[GMAIL_READ_SCOPE, CALENDAR_READ_SCOPE],
+    )
     with session_factory() as db:
         with db.begin():
             db.add(
@@ -847,7 +939,7 @@ def test_gmail_404_clears_cursor_and_reenqueues_full_sync(
             "resource_type": "gmail",
             "resource_id": "primary",
         },
-        settings=_settings(),
+        settings=settings,
         now_fn=lambda: now,
         new_id_fn=new_id,
     )
@@ -902,7 +994,14 @@ def test_sync_with_new_items_enqueues_agent_wake(
 
     monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeRuntime)
     now = datetime(2026, 5, 18, 12, 0, tzinfo=UTC)
+    settings = _settings()
     new_id = IdFactory()
+    _seed_connected_connector(
+        session_factory,
+        now=now,
+        settings=settings,
+        granted_scopes=[GMAIL_READ_SCOPE, CALENDAR_READ_SCOPE],
+    )
     with session_factory() as db:
         with db.begin():
             db.add(
@@ -929,7 +1028,7 @@ def test_sync_with_new_items_enqueues_agent_wake(
             "resource_type": "calendar",
             "resource_id": "primary",
         },
-        settings=_settings(),
+        settings=settings,
         now_fn=lambda: now,
         new_id_fn=new_id,
     )
@@ -966,7 +1065,14 @@ def test_sync_with_no_new_items_does_not_enqueue_agent_wake(
 
     monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeRuntime)
     now = datetime(2026, 5, 18, 12, 0, tzinfo=UTC)
+    settings = _settings()
     new_id = IdFactory()
+    _seed_connected_connector(
+        session_factory,
+        now=now,
+        settings=settings,
+        granted_scopes=[GMAIL_READ_SCOPE, CALENDAR_READ_SCOPE],
+    )
     with session_factory() as db:
         with db.begin():
             db.add(
@@ -993,7 +1099,7 @@ def test_sync_with_no_new_items_does_not_enqueue_agent_wake(
             "resource_type": "calendar",
             "resource_id": "primary",
         },
-        settings=_settings(),
+        settings=settings,
         now_fn=lambda: now,
         new_id_fn=new_id,
     )

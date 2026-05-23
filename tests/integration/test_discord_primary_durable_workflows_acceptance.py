@@ -20,7 +20,12 @@ from tests.integration.responses_helpers import (
     responses_run_message,
 )
 from ariel.config import AppSettings
-from ariel.persistence import ProviderWatchChannelRecord, enqueue_background_task
+from ariel.google_connector import GOOGLE_CONNECTOR_ID
+from ariel.persistence import (
+    GoogleConnectorRecord,
+    ProviderWatchChannelRecord,
+    enqueue_background_task,
+)
 from ariel.worker import process_one_task
 from tests.fake_sandbox import FakeSandboxRuntime
 
@@ -418,8 +423,28 @@ def test_google_calendar_sync_persists_provider_evidence_without_ambient_case(
 
     monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
     with _build_client(postgres_url, DurableWorkflowAdapter()) as client:
+        now = datetime(2026, 4, 30, 12, 0, tzinfo=UTC)
         with _session_factory(client)() as db:
             with db.begin():
+                db.add(
+                    GoogleConnectorRecord(
+                        id=GOOGLE_CONNECTOR_ID,
+                        provider="google",
+                        status="connected",
+                        account_subject="sub_durable_sync",
+                        account_email="durable-sync@example.com",
+                        granted_scopes=["https://www.googleapis.com/auth/calendar.readonly"],
+                        access_token_enc=None,
+                        refresh_token_enc=None,
+                        access_token_expires_at=None,
+                        token_obtained_at=None,
+                        encryption_key_version="v1",
+                        last_error_code=None,
+                        last_error_at=None,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
                 enqueue_background_task(
                     db,
                     task_type="provider_sync_due",
@@ -428,7 +453,7 @@ def test_google_calendar_sync_persists_provider_evidence_without_ambient_case(
                         "resource_type": "calendar",
                         "resource_id": "primary",
                     },
-                    now=datetime(2026, 4, 30, 12, 0, tzinfo=UTC),
+                    now=now,
                 )
 
         settings = cast(Any, AppSettings)(_env_file=None)

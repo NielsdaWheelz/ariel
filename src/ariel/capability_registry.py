@@ -4081,8 +4081,8 @@ RUN_CALLABLE_SIGNATURES: dict[str, str] = {
     # email (read)
     # email.search: the only accepted key is ``query``. Returns
     # ``{messages: [{message_id, thread_id, subject, sender, ...}], ...}``;
-    # use ``message_id`` (NOT ``thread_id`` alone) to fetch the full body
-    # with ``email.read``. ``total_estimate`` is Gmail's ``resultSizeEstimate``
+    # pass ``message_id`` for one message or ``thread_id`` with thread mode for
+    # a thread read. ``total_estimate`` is Gmail's ``resultSizeEstimate``
     # — the server's best estimate of total matches for the query, useful for
     # "how many" questions (e.g. unread count) when the returned message list
     # is capped.

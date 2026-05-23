@@ -8,6 +8,7 @@ from typing import Any, cast
 from fastapi.testclient import TestClient
 import pytest
 
+from ariel.app import build_google_runtime
 from ariel.model_adapter import ModelAdapter
 from tests.integration.app_helpers import create_test_app
 from ariel.google_connector import (
@@ -175,6 +176,7 @@ class FakeGoogleOAuthClient:
 @dataclass
 class FakeGoogleWorkspaceProvider:
     fail_scope_missing_for: set[str] = field(default_factory=set)
+    read_provider_account_ids: list[str] = field(default_factory=list)
 
     def calendar_list(
         self,
@@ -184,6 +186,7 @@ class FakeGoogleWorkspaceProvider:
         provider_account_id: str,
     ) -> dict[str, Any]:
         del access_token
+        self.read_provider_account_ids.append(provider_account_id)
         return {
             "schema_version": "google.calendar.events.v1",
             "status": "succeeded",
@@ -307,7 +310,8 @@ class FakeGoogleWorkspaceProvider:
         normalized_input: dict[str, Any],
         provider_account_id: str,
     ) -> dict[str, Any]:
-        del access_token, normalized_input, provider_account_id
+        del access_token, normalized_input
+        self.read_provider_account_ids.append(provider_account_id)
         return {
             "schema_version": "google.gmail.message_refs.v1",
             "status": "succeeded",
@@ -323,7 +327,8 @@ class FakeGoogleWorkspaceProvider:
         normalized_input: dict[str, Any],
         provider_account_id: str,
     ) -> dict[str, Any]:
-        del access_token, normalized_input, provider_account_id
+        del access_token, normalized_input
+        self.read_provider_account_ids.append(provider_account_id)
         return {
             "schema_version": "google.gmail.message_evidence.v1",
             "message": {"message_id": "msg-1"},
@@ -640,6 +645,76 @@ def test_transient_auth_failures_do_not_remap_connected_readiness(
         assert connector_payload["status"] == "connected"
         assert connector_payload["readiness"] == "connected"
         assert connector_payload["last_error_code"] == "provider_timeout"
+
+
+def test_missing_account_identity_requires_reconnect_and_blocks_provider_calls(
+    postgres_url: str,
+) -> None:
+    adapter = ActionProposalAdapter(
+        run_calls_by_message={
+            "search inbox": [{"name": "email.search", "input": {"query": "from:manager"}}],
+        },
+    )
+    oauth_client = FakeGoogleOAuthClient(
+        tokens_by_code={
+            "connect-read": FakeTokenBundle(
+                account_subject="sub_identity",
+                account_email="identity@example.com",
+                granted_scopes=[GOOGLE_CALENDAR_READ_SCOPE, GOOGLE_GMAIL_READ_SCOPE],
+                access_token="tok_access_identity",
+                refresh_token="tok_refresh_identity",
+            )
+        },
+    )
+    workspace_provider = FakeGoogleWorkspaceProvider()
+    with _build_client(postgres_url, adapter) as client:
+        _bind_google_fakes(
+            client,
+            oauth_client=oauth_client,
+            workspace_provider=workspace_provider,
+        )
+        _connect_google(client, code="connect-read")
+        with cast(Any, client.app).state.session_factory() as db:
+            with db.begin():
+                connector = db.get(GoogleConnectorRecord, GOOGLE_CONNECTOR_ID)
+                assert connector is not None
+                connector.account_subject = None
+                connector.account_email = None
+
+        connector_response = client.get("/v1/connectors/google")
+        assert connector_response.status_code == 200
+        connector_payload = connector_response.json()["connector"]
+        assert connector_payload["status"] == "connected"
+        assert connector_payload["readiness"] == "reconnect_required"
+
+        app_state = cast(Any, client.app).state
+        runtime = build_google_runtime(
+            app_state.runtime.settings,
+            oauth_client=oauth_client,
+            workspace_provider=cast(GoogleWorkspaceProvider, workspace_provider),
+        )
+        with app_state.session_factory() as db:
+            with db.begin():
+                access_token, granted_scopes, provider_account_id, access_failure = (
+                    runtime.prepare_capability_access_without_refresh(
+                        db=db,
+                        capability_id="cap.email.search",
+                        now_fn=lambda: datetime.now(tz=UTC),
+                    )
+                )
+        assert access_token is None
+        assert granted_scopes == set()
+        assert provider_account_id is None
+        assert access_failure is not None
+        assert access_failure.auth_failure is not None
+        assert access_failure.auth_failure.failure_class == "account_identity_missing"
+        assert workspace_provider.read_provider_account_ids == []
+
+        connector_response = client.get("/v1/connectors/google")
+        assert connector_response.status_code == 200
+        connector_payload = connector_response.json()["connector"]
+        assert connector_payload["readiness"] == "reconnect_required"
+        assert connector_payload["last_error_code"] == "account_identity_missing"
 
 
 def test_reconnect_required_persists_until_successful_reconnect(

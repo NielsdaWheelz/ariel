@@ -9,16 +9,21 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from ariel.config import AppSettings
-from ariel.google_connector import GoogleProviderRequestFailure
+from ariel.google_connector import GOOGLE_CONNECTOR_ID, GoogleProviderRequestFailure
 from ariel.persistence import (
     BackgroundTaskRecord,
+    GoogleConnectorRecord,
     GoogleProviderObjectRecord,
     ProviderEvidenceBlockRecord,
     ProviderEvidenceRecord,
     SyncCursorRecord,
     SyncRunRecord,
 )
-from ariel.sync_runtime import process_provider_sync_due
+from ariel.sync_runtime import ProviderSyncFailure, process_provider_sync_due
+
+
+PROVIDER_ACCOUNT_ID = "sub_sync"
+PROVIDER_ACCOUNT_EMAIL = "sync@example.com"
 
 
 @dataclass
@@ -60,7 +65,7 @@ def gmail_message_read_output(
         "schema_version": "google.gmail.message_evidence.v1",
         "mode": "message",
         "message": {
-            "provider_account_id": "con_google",
+            "provider_account_id": PROVIDER_ACCOUNT_ID,
             "message_id": message_id,
             "thread_id": thread_id,
             "history_id": "hist-2",
@@ -179,7 +184,7 @@ class FakePagedGmailProvider:
         provider_account_id: str,
     ) -> dict[str, Any]:
         assert access_token == "access-token"
-        assert provider_account_id == "con_google"
+        assert provider_account_id == PROVIDER_ACCOUNT_ID
         self.read_calls.append(normalized_input)
         message_id = normalized_input["message_id"]
         assert normalized_input in [
@@ -228,7 +233,7 @@ class FakeFullBodyGmailProvider:
         provider_account_id: str,
     ) -> dict[str, Any]:
         assert access_token == "access-token"
-        assert provider_account_id == "con_google"
+        assert provider_account_id == PROVIDER_ACCOUNT_ID
         self.read_calls.append(normalized_input)
         assert normalized_input == {
             "message_id": "msg-body",
@@ -239,7 +244,7 @@ class FakeFullBodyGmailProvider:
             "schema_version": "google.gmail.message_evidence.v1",
             "mode": "message",
             "message": {
-                "provider_account_id": "con_google",
+                "provider_account_id": PROVIDER_ACCOUNT_ID,
                 "message_id": "msg-body",
                 "thread_id": "thr-body",
                 "history_id": "hist-2",
@@ -349,7 +354,7 @@ class FakeUnreadableGmailProvider:
         provider_account_id: str,
     ) -> dict[str, Any]:
         assert access_token == "access-token"
-        assert provider_account_id == "con_google"
+        assert provider_account_id == PROVIDER_ACCOUNT_ID
         self.read_calls.append(normalized_input)
         raise GoogleProviderRequestFailure("resource_not_found")
 
@@ -387,6 +392,107 @@ def _seed_sync_cursor(
             )
 
 
+def _seed_google_connector(
+    session_factory: sessionmaker[Session],
+    *,
+    now: datetime,
+    account_subject: str | None = PROVIDER_ACCOUNT_ID,
+    account_email: str | None = PROVIDER_ACCOUNT_EMAIL,
+) -> None:
+    with session_factory() as db:
+        with db.begin():
+            db.add(
+                GoogleConnectorRecord(
+                    id=GOOGLE_CONNECTOR_ID,
+                    provider="google",
+                    status="connected",
+                    account_subject=account_subject,
+                    account_email=account_email,
+                    granted_scopes=[
+                        "https://www.googleapis.com/auth/calendar.readonly",
+                        "https://www.googleapis.com/auth/gmail.readonly",
+                    ],
+                    access_token_enc=None,
+                    refresh_token_enc=None,
+                    access_token_expires_at=None,
+                    token_obtained_at=None,
+                    encryption_key_version="v1",
+                    last_error_code=None,
+                    last_error_at=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
+
+def test_gmail_sync_missing_account_identity_fails_before_provider_reads(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @dataclass
+    class NoCallGmailProvider:
+        history_calls: int = 0
+
+        def _request_json(self, **_: Any) -> dict[str, Any]:
+            raise AssertionError("missing identity should stop before Gmail profile access")
+
+        def email_list_history(self, **_: Any) -> dict[str, Any]:
+            self.history_calls += 1
+            raise AssertionError("missing identity should stop before Gmail history reads")
+
+    providers: list[NoCallGmailProvider] = []
+
+    class FakeGoogleConnectorRuntime:
+        workspace_provider: NoCallGmailProvider
+
+        def __init__(self, **_: Any) -> None:
+            self.workspace_provider = NoCallGmailProvider()
+            providers.append(self.workspace_provider)
+
+        def access_token_for_background_sync(self, **_: Any) -> str:
+            return "access-token"
+
+    monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
+    now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
+    new_id = IdFactory()
+    _seed_google_connector(session_factory, now=now, account_subject=None)
+    _seed_sync_cursor(
+        session_factory,
+        new_id,
+        resource_type="gmail",
+        resource_id="primary",
+        cursor_value="hist-1",
+        now=now,
+    )
+
+    with pytest.raises(ProviderSyncFailure, match="account_identity_missing"):
+        process_provider_sync_due(
+            session_factory=session_factory,
+            task_payload={"provider": "google", "resource_type": "gmail", "resource_id": "primary"},
+            settings=_settings(),
+            now_fn=lambda: now,
+            new_id_fn=new_id,
+        )
+
+    with session_factory() as db:
+        with db.begin():
+            cursor = db.scalar(select(SyncCursorRecord).limit(1))
+            run = db.scalar(select(SyncRunRecord).limit(1))
+            provider_objects = db.scalars(select(GoogleProviderObjectRecord)).all()
+            evidence_rows = db.scalars(select(ProviderEvidenceRecord)).all()
+
+    assert len(providers) == 1
+    assert providers[0].history_calls == 0
+    assert cursor is not None
+    assert cursor.status == "error"
+    assert cursor.last_error_code == "account_identity_missing"
+    assert run is not None
+    assert run.status == "failed"
+    assert run.error == "account_identity_missing"
+    assert provider_objects == []
+    assert evidence_rows == []
+
+
 def test_gmail_sync_bootstraps_empty_cursor_from_profile(
     session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
@@ -406,6 +512,7 @@ def test_gmail_sync_bootstraps_empty_cursor_from_profile(
     monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
     now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
     new_id = IdFactory()
+    _seed_google_connector(session_factory, now=now)
 
     process_provider_sync_due(
         session_factory=session_factory,
@@ -453,6 +560,7 @@ def test_gmail_sync_follows_history_pages_and_dedupes_replayed_events(
     monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
     now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
     new_id = IdFactory()
+    _seed_google_connector(session_factory, now=now)
     with session_factory() as db:
         with db.begin():
             db.add(
@@ -534,6 +642,7 @@ def test_gmail_sync_hydrates_added_messages_into_body_evidence(
     monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
     now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
     new_id = IdFactory()
+    _seed_google_connector(session_factory, now=now)
     with session_factory() as db:
         with db.begin():
             db.add(
@@ -579,6 +688,7 @@ def test_gmail_sync_hydrates_added_messages_into_body_evidence(
     assert run.status == "succeeded"
     assert run.item_count == 1
     assert provider_object is not None
+    assert provider_object.provider_account_id == PROVIDER_ACCOUNT_ID
     assert provider_object.external_id == "msg-body"
     assert provider_object.thread_external_id == "thr-body"
     assert provider_object.source_timestamp == datetime(2026, 5, 7, 9, 0, tzinfo=UTC)
@@ -595,6 +705,7 @@ def test_gmail_sync_hydrates_added_messages_into_body_evidence(
     }
     assert evidence is not None
     assert evidence.provider_object_id == provider_object.id
+    assert evidence.provider_account_id == PROVIDER_ACCOUNT_ID
     assert evidence.external_id == "msg-body"
     assert evidence.thread_external_id == "thr-body"
     assert evidence.source_timestamp == datetime(2026, 5, 7, 9, 0, tzinfo=UTC)
@@ -629,6 +740,7 @@ def test_gmail_sync_keeps_missing_or_invalid_internal_date_absent(
     monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
     now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
     new_id = IdFactory()
+    _seed_google_connector(session_factory, now=now)
     with session_factory() as db:
         with db.begin():
             db.add(
@@ -682,6 +794,7 @@ def test_gmail_sync_keeps_missing_or_invalid_internal_date_absent(
     ]
     assert [row.source_timestamp for row in provider_objects] == [None, None, None, None]
     assert [row.observed_at for row in provider_objects] == [now, now, now, now]
+    assert [row.provider_account_id for row in provider_objects] == [PROVIDER_ACCOUNT_ID] * 4
     assert [row.external_id for row in evidence_rows] == [
         "msg-blank-date",
         "msg-invalid-date",
@@ -690,6 +803,7 @@ def test_gmail_sync_keeps_missing_or_invalid_internal_date_absent(
     ]
     assert [row.source_timestamp for row in evidence_rows] == [None, None, None, None]
     assert [row.observed_at for row in evidence_rows] == [now, now, now, now]
+    assert [row.provider_account_id for row in evidence_rows] == [PROVIDER_ACCOUNT_ID] * 4
     assert [row.lifecycle_state for row in evidence_rows] == [
         "unavailable",
         "unavailable",
@@ -747,6 +861,7 @@ def test_calendar_sync_keeps_missing_or_invalid_updated_timestamp_absent(
     monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
     now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
     new_id = IdFactory()
+    _seed_google_connector(session_factory, now=now)
     with session_factory() as db:
         with db.begin():
             db.add(
@@ -791,12 +906,14 @@ def test_calendar_sync_keeps_missing_or_invalid_updated_timestamp_absent(
     ]
     assert [row.source_timestamp for row in provider_objects] == [None, None]
     assert [row.observed_at for row in provider_objects] == [now, now]
+    assert [row.provider_account_id for row in provider_objects] == [PROVIDER_ACCOUNT_ID] * 2
     assert [row.external_id for row in evidence_rows] == [
         "evt-invalid-updated",
         "evt-missing-updated",
     ]
     assert [row.source_timestamp for row in evidence_rows] == [None, None]
     assert [row.observed_at for row in evidence_rows] == [now, now]
+    assert [row.provider_account_id for row in evidence_rows] == [PROVIDER_ACCOUNT_ID] * 2
 
 
 def test_calendar_provider_request_failure_marks_sync_failed(
@@ -817,6 +934,7 @@ def test_calendar_provider_request_failure_marks_sync_failed(
     monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
     now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
     new_id = IdFactory()
+    _seed_google_connector(session_factory, now=now)
     _seed_sync_cursor(
         session_factory,
         new_id,
@@ -872,6 +990,7 @@ def test_unexpected_calendar_provider_defect_is_not_persisted_as_sync_failure(
     monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
     now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
     new_id = IdFactory()
+    _seed_google_connector(session_factory, now=now)
     _seed_sync_cursor(
         session_factory,
         new_id,
@@ -939,6 +1058,7 @@ def test_gmail_read_provider_request_failure_marks_sync_failed(
     monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
     now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
     new_id = IdFactory()
+    _seed_google_connector(session_factory, now=now)
     _seed_sync_cursor(
         session_factory,
         new_id,
@@ -1002,6 +1122,7 @@ def test_unexpected_gmail_read_defect_is_not_persisted_as_sync_failure(
     monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
     now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
     new_id = IdFactory()
+    _seed_google_connector(session_factory, now=now)
     _seed_sync_cursor(
         session_factory,
         new_id,

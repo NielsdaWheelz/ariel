@@ -54,6 +54,8 @@ from ariel.google_connector import (
     GoogleConnectorRuntime,
     GoogleOAuthClient,
     GoogleWorkspaceProvider,
+    google_account_subject,
+    google_connector_has_account_identity,
 )
 from ariel.memory import (
     MemoryRecallError,
@@ -917,9 +919,9 @@ def _tool_surface_facts(
         else []
     )
     provider_account_id = (
-        connector.account_subject.strip()
-        if connector is not None and isinstance(connector.account_subject, str)
-        else ""
+        google_account_subject(connector.account_subject)
+        if connector is not None and google_connector_has_account_identity(connector)
+        else None
     )
     discord_context = context_bundle.get("discord_context")
     attachment_count = (
@@ -940,8 +942,8 @@ def _tool_surface_facts(
         "google": {
             "connected": connector is not None
             and connector.status == "connected"
-            and bool(provider_account_id),
-            "provider_account_id": provider_account_id or None,
+            and provider_account_id is not None,
+            "provider_account_id": provider_account_id,
             "granted_scopes": sorted(set(granted_scopes)),
         },
         "discord": {

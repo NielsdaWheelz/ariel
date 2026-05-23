@@ -28,7 +28,12 @@ from .app import (
 from .capability_registry import REMEMBERER_CAPABILITY_IDS, capability_action_label
 from .clock import utcnow
 from .config import AppSettings
-from .google_connector import GOOGLE_CONNECTOR_ID, GoogleWatchRegistrationFailure
+from .google_connector import (
+    GOOGLE_CONNECTOR_ID,
+    GoogleWatchRegistrationFailure,
+    google_account_subject,
+    google_connector_has_account_identity,
+)
 from .ids import new_id
 from .persistence import (
     AgencyEventRecord,
@@ -314,12 +319,26 @@ def process_provider_watch_renew_due(
                     now=now,
                 )
                 return
+            account_subject = google_account_subject(connector.account_subject)
+            if account_subject is None or not google_connector_has_account_identity(connector):
+                enqueue_background_task(
+                    db,
+                    task_type="agent_wake",
+                    payload={
+                        "note": (
+                            "The Google connector reported an error account_identity_missing; "
+                            "the user may need to reconnect."
+                        )
+                    },
+                    now=now,
+                )
+                return
             try:
                 runtime.register_provider_watches(
                     db=db,
                     access_token=access_token,
                     granted_scopes=list(connector.granted_scopes),
-                    account_subject=connector.account_subject or connector.id,
+                    account_subject=account_subject,
                     now_fn=now_fn,
                     new_id_fn=new_id_fn,
                 )

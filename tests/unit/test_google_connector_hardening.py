@@ -1730,8 +1730,8 @@ def test_default_workspace_provider_email_undo_skips_immutable_system_labels(
 # ---------------------------------------------------------------------------
 # Typed-output validator audits
 #
-# Each ``cap.*`` validator is exercised with a realistic provider payload so a
-# defect that rejects what Google actually sends shows up as a test failure,
+# Each ``cap.*`` validator is exercised with a realistic typed provider output
+# so a defect that rejects Ariel's normalized shape shows up as a test failure,
 # not as ``invalid_provider_output`` in production. Each test also asserts one
 # explicit rejection case so the validator still refuses malformed shapes.
 # ---------------------------------------------------------------------------

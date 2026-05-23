@@ -17,6 +17,8 @@ from ariel.google_connector import (
     GOOGLE_CONNECTOR_ID,
     GoogleConnectorRuntime,
     GoogleProviderRequestFailure,
+    google_account_subject,
+    google_connector_has_account_identity,
     is_typed_google_read_output,
 )
 from ariel.google_workspace_normalization import normalize_calendar_event
@@ -76,14 +78,15 @@ def _release_provider_sync_lock(lock_db: Session | None, lock_id: int | None) ->
 
 
 def _provider_account_id_for_sync(db: Session) -> str:
-    account_subject = db.scalar(
-        select(GoogleConnectorRecord.account_subject)
-        .where(GoogleConnectorRecord.id == GOOGLE_CONNECTOR_ID)
-        .limit(1)
-    )
-    if isinstance(account_subject, str) and account_subject.strip():
-        return account_subject.strip()
-    return GOOGLE_CONNECTOR_ID
+    connector = db.get(GoogleConnectorRecord, GOOGLE_CONNECTOR_ID)
+    if connector is None or connector.status == "not_connected":
+        raise ProviderSyncFailure("not_connected")
+    if connector.status == "revoked":
+        raise ProviderSyncFailure("access_revoked")
+    provider_account_id = google_account_subject(connector.account_subject)
+    if provider_account_id is None or not google_connector_has_account_identity(connector):
+        raise ProviderSyncFailure("account_identity_missing")
+    return provider_account_id
 
 
 def process_provider_event_received(
@@ -277,7 +280,7 @@ def process_provider_sync_due(
         )
 
         outputs: list[dict[str, Any]] = []
-        sync_provider_account_id = GOOGLE_CONNECTOR_ID
+        sync_provider_account_id: str | None = None
         try:
             sync_capability_id = {
                 "calendar": "cap.calendar.list",
@@ -546,6 +549,8 @@ def process_provider_sync_due(
                 item_count = 0
                 observation_count = 0
                 cursor_after = cursor_before
+                if sync_provider_account_id is None:
+                    raise RuntimeError("sync provider account identity missing")
                 provider_account_id = sync_provider_account_id
                 if resource_type == "calendar":
                     for output in outputs:

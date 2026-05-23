@@ -46,7 +46,7 @@ class _DbOrig(Exception):
 def _seed_connector(
     session_factory: sessionmaker[Session],
     *,
-    account_email: str = "user@example.com",
+    account_email: str | None = "user@example.com",
     account_subject: str | None = "sub_user",
 ) -> None:
     with session_factory() as db:
@@ -257,15 +257,32 @@ def test_handle_message_unknown_account_acks_and_drops(
     assert message.nack_calls == []
 
 
-@pytest.mark.parametrize("account_subject", [None, "", " ", "unknown-subject"])
-def test_handle_message_invalid_connector_subject_acks_and_drops(
+@pytest.mark.parametrize(
+    ("account_subject", "account_email", "notification_email"),
+    [
+        (None, "user@example.com", "user@example.com"),
+        ("", "user@example.com", "user@example.com"),
+        (" ", "user@example.com", "user@example.com"),
+        ("sub_user", None, "user@example.com"),
+        ("sub_user", "", "user@example.com"),
+        ("sub_user", " ", "user@example.com"),
+        ("sub_user", "not-an-email", "not-an-email"),
+    ],
+)
+def test_handle_message_invalid_connector_identity_acks_and_drops(
     session_factory: sessionmaker[Session],
     account_subject: str | None,
+    account_email: str | None,
+    notification_email: str,
 ) -> None:
-    _seed_connector(session_factory, account_subject=account_subject)
+    _seed_connector(
+        session_factory,
+        account_subject=account_subject,
+        account_email=account_email,
+    )
     message = FakePubSubMessage(
         message_id="pubsub-msg-invalid-subject",
-        data=b'{"emailAddress": "user@example.com", "historyId": "1"}',
+        data=f'{{"emailAddress": "{notification_email}", "historyId": "1"}}'.encode(),
         publish_time=_NOW,
     )
 

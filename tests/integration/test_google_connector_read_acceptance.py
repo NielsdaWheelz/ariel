@@ -954,8 +954,8 @@ def test_google_connector_callback_rejects_oauth_payload_without_account_identit
     oauth_client = FakeGoogleOAuthClient(
         tokens_by_code={
             "connect-code": FakeTokenBundle(
-                account_subject="unknown-subject",
-                account_email="unknown-email",
+                account_subject=" ",
+                account_email=" ",
                 granted_scopes=[GOOGLE_CALENDAR_READ_SCOPE, GOOGLE_GMAIL_READ_SCOPE],
                 access_token="tok_access_plain_connect",
                 refresh_token="tok_refresh_plain_connect",

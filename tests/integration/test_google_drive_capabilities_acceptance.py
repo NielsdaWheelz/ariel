@@ -807,9 +807,7 @@ def test_drive_reconnect_intent_is_capability_scoped_and_least_privilege(
         assert GOOGLE_GMAIL_COMPOSE_SCOPE not in share_scopes
         assert GOOGLE_CALENDAR_WRITE_SCOPE not in share_scopes
 
-        # Reconnect must always union in the current default scope set so that
-        # identity scopes added to the default (openid/email/profile) reach
-        # users who first connected before those scopes existed.
+        # Reconnect always unions in the current default identity and read scope set.
         for scopes in (search_scopes, read_scopes, share_scopes):
             assert GOOGLE_OPENID_SCOPE in scopes
             assert GOOGLE_USERINFO_EMAIL_SCOPE in scopes

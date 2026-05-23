@@ -478,7 +478,7 @@ Owns Google API calls and typed provider outputs:
 
 - no DB access
 - no lifecycle logic
-- no old `results` shapes
+- no untyped provider result envelopes
 - no unknown Google capability output accepted as valid
 - all reads and writes return strict typed outputs or typed failures
 - all external calls bounded by timeout, page size, and byte size

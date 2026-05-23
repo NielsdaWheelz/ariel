@@ -18,6 +18,9 @@ from ariel.persistence import (
 from tests.fake_sandbox import FakeSandboxRuntime
 
 
+PROVIDER_ACCOUNT_ID = "sub_email_api"
+
+
 class NoopModelAdapter:
     provider = "provider.test"
     model = "model.test"
@@ -113,7 +116,7 @@ def test_email_state_inspection_endpoints_return_serialized_records(
                 ProviderWriteReceiptRecord(
                     id="ema_api",
                     provider="google",
-                    provider_account_id="con_google",
+                    provider_account_id=PROVIDER_ACCOUNT_ID,
                     action_attempt_id="aat_email_api",
                     capability_id="cap.email.archive",
                     idempotency_key="provider-write:archive:idem_1",
@@ -137,7 +140,7 @@ def test_email_state_inspection_endpoints_return_serialized_records(
 
     action_list = client.get(
         "/v1/email/actions",
-        params={"provider_account_id": "con_google", "status": "succeeded"},
+        params={"provider_account_id": PROVIDER_ACCOUNT_ID, "status": "succeeded"},
     )
     assert action_list.status_code == 200
     action_payload = action_list.json()
@@ -147,7 +150,7 @@ def test_email_state_inspection_endpoints_return_serialized_records(
 
     action_detail = client.get(
         "/v1/email/actions/ema_api",
-        params={"provider_account_id": "con_google"},
+        params={"provider_account_id": PROVIDER_ACCOUNT_ID},
     )
     assert action_detail.status_code == 200
     assert action_detail.json()["email_action"]["provider_message_ids"] == ["msg_1"]
@@ -160,7 +163,7 @@ def test_email_state_inspection_endpoints_return_serialized_records(
 
     missing_action = client.get(
         "/v1/email/actions/ema_missing",
-        params={"provider_account_id": "con_google"},
+        params={"provider_account_id": PROVIDER_ACCOUNT_ID},
     )
     assert missing_action.status_code == 404
     assert missing_action.json()["error"]["code"] == "E_EMAIL_ACTION_NOT_FOUND"
