@@ -396,8 +396,11 @@ def _seed_google_connector(
     session_factory: sessionmaker[Session],
     *,
     now: datetime,
+    status: str = "connected",
     account_subject: str | None = PROVIDER_ACCOUNT_ID,
     account_email: str | None = PROVIDER_ACCOUNT_EMAIL,
+    last_error_code: str | None = None,
+    last_error_at: datetime | None = None,
 ) -> None:
     with session_factory() as db:
         with db.begin():
@@ -405,7 +408,7 @@ def _seed_google_connector(
                 GoogleConnectorRecord(
                     id=GOOGLE_CONNECTOR_ID,
                     provider="google",
-                    status="connected",
+                    status=status,
                     account_subject=account_subject,
                     account_email=account_email,
                     granted_scopes=[
@@ -417,15 +420,15 @@ def _seed_google_connector(
                     access_token_expires_at=None,
                     token_obtained_at=None,
                     encryption_key_version="v1",
-                    last_error_code=None,
-                    last_error_at=None,
+                    last_error_code=last_error_code,
+                    last_error_at=last_error_at,
                     created_at=now,
                     updated_at=now,
                 )
             )
 
 
-def test_gmail_sync_missing_account_identity_fails_before_provider_reads(
+def test_gmail_sync_error_connector_fails_before_provider_reads(
     session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -434,11 +437,11 @@ def test_gmail_sync_missing_account_identity_fails_before_provider_reads(
         history_calls: int = 0
 
         def _request_json(self, **_: Any) -> dict[str, Any]:
-            raise AssertionError("missing identity should stop before Gmail profile access")
+            raise AssertionError("connector error should stop before Gmail profile access")
 
         def email_list_history(self, **_: Any) -> dict[str, Any]:
             self.history_calls += 1
-            raise AssertionError("missing identity should stop before Gmail history reads")
+            raise AssertionError("connector error should stop before Gmail history reads")
 
     providers: list[NoCallGmailProvider] = []
 
@@ -455,7 +458,13 @@ def test_gmail_sync_missing_account_identity_fails_before_provider_reads(
     monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
     now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
     new_id = IdFactory()
-    _seed_google_connector(session_factory, now=now, account_subject=None)
+    _seed_google_connector(
+        session_factory,
+        now=now,
+        status="error",
+        last_error_code="account_identity_missing",
+        last_error_at=now,
+    )
     _seed_sync_cursor(
         session_factory,
         new_id,

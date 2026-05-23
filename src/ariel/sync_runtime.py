@@ -17,8 +17,7 @@ from ariel.google_connector import (
     GOOGLE_CONNECTOR_ID,
     GoogleConnectorRuntime,
     GoogleProviderRequestFailure,
-    google_account_subject,
-    google_connector_has_account_identity,
+    google_connected_account_subject,
     is_typed_google_read_output,
 )
 from ariel.google_workspace_normalization import normalize_calendar_event
@@ -83,10 +82,14 @@ def _provider_account_id_for_sync(db: Session) -> str:
         raise ProviderSyncFailure("not_connected")
     if connector.status == "revoked":
         raise ProviderSyncFailure("access_revoked")
-    provider_account_id = google_account_subject(connector.account_subject)
-    if provider_account_id is None or not google_connector_has_account_identity(connector):
-        raise ProviderSyncFailure("account_identity_missing")
-    return provider_account_id
+    if connector.status != "connected":
+        error_code = (
+            "account_identity_missing"
+            if connector.last_error_code == "account_identity_missing"
+            else "not_connected"
+        )
+        raise ProviderSyncFailure(error_code)
+    return google_connected_account_subject(connector)
 
 
 def process_provider_event_received(

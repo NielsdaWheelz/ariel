@@ -214,6 +214,26 @@ class FakeGoogleOAuthClient:
 class FakeGoogleWorkspaceProvider:
     fail_scope_missing_for: set[str] = field(default_factory=set)
     fail_token_expired_for: set[str] = field(default_factory=set)
+    gmail_stop_calls: list[str] = field(default_factory=list)
+    calendar_stop_calls: list[dict[str, str]] = field(default_factory=list)
+
+    def gmail_stop_watch(self, *, access_token: str) -> None:
+        self.gmail_stop_calls.append(access_token)
+
+    def calendar_stop_watch(
+        self,
+        *,
+        access_token: str,
+        channel_id: str,
+        provider_resource_id: str,
+    ) -> None:
+        self.calendar_stop_calls.append(
+            {
+                "access_token": access_token,
+                "channel_id": channel_id,
+                "provider_resource_id": provider_resource_id,
+            }
+        )
 
     def calendar_list(
         self,
@@ -554,6 +574,43 @@ def _connect_google(client: TestClient, *, code: str) -> dict[str, Any]:
     return callback.json()
 
 
+def _seed_active_provider_watches(client: TestClient) -> None:
+    with cast(Any, client.app).state.session_factory() as db:
+        with db.begin():
+            db.execute(
+                text(
+                    "INSERT INTO provider_watch_channels "
+                    "(id, provider, resource_type, resource_id, channel_id, channel_token, "
+                    "provider_resource_id, cursor_seed, status, expires_at, created_at, updated_at) "
+                    "VALUES "
+                    "('wch_disconnect_gmail', 'google', 'gmail', 'sub_connect', NULL, NULL, "
+                    "NULL, 'hist-1', 'active', now() + interval '7 days', now(), now()), "
+                    "('wch_disconnect_calendar', 'google', 'calendar', 'primary', "
+                    "'channel-disconnect', 'calendar-token', 'res-disconnect', NULL, "
+                    "'active', now() + interval '7 days', now(), now())"
+                )
+            )
+
+
+def _provider_watch_rows(client: TestClient) -> list[dict[str, Any]]:
+    with cast(Any, client.app).state.session_factory() as db:
+        return [
+            dict(row)
+            for row in db.execute(
+                text(
+                    "SELECT resource_type, status, channel_token, cursor_seed, last_error_code "
+                    "FROM provider_watch_channels ORDER BY resource_type ASC"
+                )
+            )
+            .mappings()
+            .all()
+        ]
+
+
+def _assert_provider_watches_removed(client: TestClient) -> None:
+    assert _provider_watch_rows(client) == []
+
+
 def test_google_connector_start_reports_typed_oauth_misconfiguration(
     postgres_url: str,
 ) -> None:
@@ -645,11 +702,12 @@ def test_google_connector_lifecycle_endpoints_are_complete_secure_and_auditable(
             ),
         }
     )
+    workspace_provider = FakeGoogleWorkspaceProvider()
     with _build_client(postgres_url, adapter) as client:
         _bind_google_fakes(
             client,
             oauth_client=oauth_client,
-            workspace_provider=FakeGoogleWorkspaceProvider(),
+            workspace_provider=workspace_provider,
         )
 
         initial_status = client.get("/v1/connectors/google")
@@ -733,12 +791,15 @@ def test_google_connector_lifecycle_endpoints_are_complete_secure_and_auditable(
         assert "tok_refresh_plain_connect" not in events.text
         assert "tok_access_plain_reconnect" not in events.text
         assert "tok_refresh_plain_reconnect" not in events.text
+        _seed_active_provider_watches(client)
 
         disconnected = client.delete("/v1/connectors/google")
         assert disconnected.status_code == 200
         disconnected_connector = disconnected.json()["connector"]
         assert disconnected_connector["readiness"] == "not_connected"
         assert disconnected_connector["status"] in {"revoked", "not_connected"}
+        assert disconnected_connector["account_subject"] is None
+        assert disconnected_connector["account_email"] is None
 
         events_after_disconnect = client.get("/v1/connectors/google/events")
         events_after_disconnect_payload = events_after_disconnect.json()["events"]
@@ -759,14 +820,28 @@ def test_google_connector_lifecycle_endpoints_are_complete_secure_and_auditable(
             {"slot": "refresh_token", "status": "succeeded", "stage": "revoke"},
             {"slot": "access_token", "status": "succeeded", "stage": "revoke"},
         ]
+        assert disconnected_event["payload"]["watch_stop_results"] == [
+            {"resource_type": "calendar", "resource_id": "primary", "status": "succeeded"},
+            {"resource_type": "gmail", "resource_id": "sub_connect", "status": "succeeded"},
+        ]
+        assert workspace_provider.calendar_stop_calls == [
+            {
+                "access_token": "tok_access_plain_reconnect",
+                "channel_id": "channel-disconnect",
+                "provider_resource_id": "res-disconnect",
+            }
+        ]
+        assert workspace_provider.gmail_stop_calls == ["tok_access_plain_reconnect"]
         assert "revoked_remote" not in disconnected_event["payload"]
         assert "tok_access_plain_reconnect" not in events_after_disconnect.text
         assert "tok_refresh_plain_reconnect" not in events_after_disconnect.text
         with cast(Any, client.app).state.session_factory() as db:
-            tokens = (
+            connector = (
                 db.execute(
                     text(
-                        "SELECT access_token_enc, refresh_token_enc FROM google_connectors "
+                        "SELECT access_token_enc, refresh_token_enc, "
+                        "account_subject, account_email "
+                        "FROM google_connectors "
                         "WHERE id = :connector_id"
                     ),
                     {"connector_id": GOOGLE_CONNECTOR_ID},
@@ -774,8 +849,24 @@ def test_google_connector_lifecycle_endpoints_are_complete_secure_and_auditable(
                 .mappings()
                 .one()
             )
-        assert tokens["access_token_enc"] is None
-        assert tokens["refresh_token_enc"] is None
+        assert connector["access_token_enc"] is None
+        assert connector["refresh_token_enc"] is None
+        assert connector["account_subject"] is None
+        assert connector["account_email"] is None
+        _assert_provider_watches_removed(client)
+
+        stale_provider_event = client.post(
+            "/v1/providers/google/events?resource_type=calendar&resource_id=primary",
+            headers={
+                "X-Goog-Channel-Token": "calendar-token",
+                "X-Goog-Channel-ID": "channel-disconnect",
+                "X-Goog-Message-Number": "1",
+                "X-Goog-Resource-State": "exists",
+            },
+            json={},
+        )
+        assert stale_provider_event.status_code == 401
+        assert stale_provider_event.json()["error"]["code"] == "E_PROVIDER_EVENT_CHANNEL_INVALID"
 
 
 def test_google_disconnect_records_revoke_failure_without_leaking_token_material(
@@ -802,6 +893,7 @@ def test_google_disconnect_records_revoke_failure_without_leaking_token_material
             workspace_provider=FakeGoogleWorkspaceProvider(),
         )
         _connect_google(client, code="connect-code")
+        _seed_active_provider_watches(client)
 
         disconnected = client.delete("/v1/connectors/google")
 
@@ -822,6 +914,10 @@ def test_google_disconnect_records_revoke_failure_without_leaking_token_material
             },
             {"slot": "access_token", "status": "succeeded", "stage": "revoke"},
         ]
+        assert disconnected_event["payload"]["watch_stop_results"] == [
+            {"resource_type": "calendar", "resource_id": "primary", "status": "succeeded"},
+            {"resource_type": "gmail", "resource_id": "sub_connect", "status": "succeeded"},
+        ]
         assert "tok_refresh_plain_connect" not in events.text
         assert "tok_access_plain_connect" not in events.text
         with cast(Any, client.app).state.session_factory() as db:
@@ -838,6 +934,7 @@ def test_google_disconnect_records_revoke_failure_without_leaking_token_material
             )
         assert tokens["access_token_enc"] is None
         assert tokens["refresh_token_enc"] is None
+        _assert_provider_watches_removed(client)
 
 
 def test_google_disconnect_records_decrypt_failure_without_leaking_token_material(
@@ -861,6 +958,7 @@ def test_google_disconnect_records_decrypt_failure_without_leaking_token_materia
             workspace_provider=FakeGoogleWorkspaceProvider(),
         )
         _connect_google(client, code="connect-code")
+        _seed_active_provider_watches(client)
         with cast(Any, client.app).state.session_factory() as db:
             with db.begin():
                 db.execute(
@@ -893,6 +991,10 @@ def test_google_disconnect_records_decrypt_failure_without_leaking_token_materia
             },
             {"slot": "access_token", "status": "succeeded", "stage": "revoke"},
         ]
+        assert disconnected_event["payload"]["watch_stop_results"] == [
+            {"resource_type": "calendar", "resource_id": "primary", "status": "succeeded"},
+            {"resource_type": "gmail", "resource_id": "sub_connect", "status": "succeeded"},
+        ]
         assert "tok_access_plain_connect" not in events.text
         assert "tok_refresh_plain_connect" not in events.text
         with cast(Any, client.app).state.session_factory() as db:
@@ -909,6 +1011,7 @@ def test_google_disconnect_records_decrypt_failure_without_leaking_token_materia
             )
         assert tokens["access_token_enc"] is None
         assert tokens["refresh_token_enc"] is None
+        _assert_provider_watches_removed(client)
 
 
 def test_google_disconnect_unexpected_revoke_exception_propagates(

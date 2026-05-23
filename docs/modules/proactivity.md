@@ -98,7 +98,8 @@ The agent never writes the queue directly; it only calls the syscall.
 
 ## Provider ingestion
 
-A `provider_watch_channels` table records push-channel identity and expiry.
+A `provider_watch_channels` table records push-channel identity, expiry, and
+local revocation state.
 When a Google connector connects, Ariel registers a Gmail `users.watch` (Cloud
 Pub/Sub) channel and a Calendar `events.watch` channel.
 
@@ -109,20 +110,23 @@ durable artifact:
   public Caddy-fronted HTTPS endpoint. The handler validates the
   `X-Goog-Channel-Token` against the per-channel `channel_token` stored on
   the active, unexpired `provider_watch_channels` row for the requested
-  resource and channel. A missing or mismatched per-channel token returns 401. On accept, one
-  `ProviderEventRecord` row is inserted and one `provider_event_received`
-  background task is enqueued.
+  resource and channel. Disconnect deletes these rows, so stale channel
+  callbacks fail before enqueue. A missing or mismatched per-channel token
+  returns 401. On accept, one `ProviderEventRecord` row is inserted and one
+  `provider_event_received` background task is enqueued.
 - **Gmail push** — Google publishes to a Cloud Pub/Sub topic; the
   `ariel-pubsub` sidecar systemd unit consumes the matching subscription via
   StreamingPull with exactly-once delivery and a dead-letter topic. On each
   delivery it inserts the same `ProviderEventRecord` row and enqueues the same
   `provider_event_received` task — and only then acks the Pub/Sub message.
-  Malformed payloads nack; unknown accounts ack and drop. The sidecar writes
-  a `subscriber_heartbeat` row that `/v1/health` reports.
+  Malformed payloads nack; unknown or inactive connector accounts ack and
+  drop. The sidecar writes a `subscriber_heartbeat` row that `/v1/health`
+  reports.
 
 The worker performs two recurring maintenance tasks from connector state:
 
-- `provider_watch_renew_due` re-arms each `watch` before it expires. The
+- `provider_watch_renew_due` re-arms active watches for a connected connector
+  before they expire. The
   6-hour sweep + 6-day lead time renews any watch with less than 6 days
   remaining, matching Google's recommended daily Gmail cadence under the
   7-day cap.

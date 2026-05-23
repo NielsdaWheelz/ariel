@@ -46,6 +46,7 @@ class _DbOrig(Exception):
 def _seed_connector(
     session_factory: sessionmaker[Session],
     *,
+    status: str = "connected",
     account_email: str | None = "user@example.com",
     account_subject: str | None = "sub_user",
 ) -> None:
@@ -55,7 +56,7 @@ def _seed_connector(
                 GoogleConnectorRecord(
                     id=GOOGLE_CONNECTOR_ID,
                     provider="google",
-                    status="connected",
+                    status=status,
                     account_subject=account_subject,
                     account_email=account_email,
                     granted_scopes=["https://www.googleapis.com/auth/gmail.readonly"],
@@ -257,32 +258,18 @@ def test_handle_message_unknown_account_acks_and_drops(
     assert message.nack_calls == []
 
 
-@pytest.mark.parametrize(
-    ("account_subject", "account_email", "notification_email"),
-    [
-        (None, "user@example.com", "user@example.com"),
-        ("", "user@example.com", "user@example.com"),
-        (" ", "user@example.com", "user@example.com"),
-        ("sub_user", None, "user@example.com"),
-        ("sub_user", "", "user@example.com"),
-        ("sub_user", " ", "user@example.com"),
-        ("sub_user", "not-an-email", "not-an-email"),
-    ],
-)
-def test_handle_message_invalid_connector_identity_acks_and_drops(
+def test_handle_message_inactive_connector_acks_and_drops(
     session_factory: sessionmaker[Session],
-    account_subject: str | None,
-    account_email: str | None,
-    notification_email: str,
 ) -> None:
     _seed_connector(
         session_factory,
-        account_subject=account_subject,
-        account_email=account_email,
+        status="error",
+        account_subject="sub_user",
+        account_email="user@example.com",
     )
     message = FakePubSubMessage(
-        message_id="pubsub-msg-invalid-subject",
-        data=f'{{"emailAddress": "{notification_email}", "historyId": "1"}}'.encode(),
+        message_id="pubsub-msg-inactive-connector",
+        data=b'{"emailAddress": "user@example.com", "historyId": "1"}',
         publish_time=_NOW,
     )
 

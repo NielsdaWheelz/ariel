@@ -23,9 +23,11 @@ from ariel.persistence import (
     BackgroundTaskRecord,
     GoogleConnectorRecord,
     GoogleConnectorEventRecord,
+    ProviderEventRecord,
     ProviderWatchChannelRecord,
     SyncCursorRecord,
     SyncRunRecord,
+    enqueue_background_task,
 )
 from ariel.secret_cipher import encrypt_secret
 from ariel.sync_runtime import process_provider_sync_due
@@ -67,6 +69,8 @@ def _settings() -> AppSettings:
 class WatchRecordingProvider:
     gmail_watch_calls: list[dict[str, Any]] = field(default_factory=list)
     calendar_watch_calls: list[dict[str, Any]] = field(default_factory=list)
+    gmail_stop_calls: list[str] = field(default_factory=list)
+    calendar_stop_calls: list[dict[str, str]] = field(default_factory=list)
     gmail_expiration: datetime = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
     calendar_expiration: datetime = datetime(2030, 1, 1, 12, 0, tzinfo=UTC)
 
@@ -103,6 +107,24 @@ class WatchRecordingProvider:
             }
         )
         return {"resourceId": "res-watch-1", "expiration": self.calendar_expiration}
+
+    def gmail_stop_watch(self, *, access_token: str) -> None:
+        self.gmail_stop_calls.append(access_token)
+
+    def calendar_stop_watch(
+        self,
+        *,
+        access_token: str,
+        channel_id: str,
+        provider_resource_id: str,
+    ) -> None:
+        self.calendar_stop_calls.append(
+            {
+                "access_token": access_token,
+                "channel_id": channel_id,
+                "provider_resource_id": provider_resource_id,
+            }
+        )
 
 
 @dataclass
@@ -244,6 +266,145 @@ def test_connect_registers_watches_and_calendar_push_accepts_persisted_token(
         assert provider_event.json()["duplicate"] is False
 
 
+def test_disconnect_clears_google_provider_ingestion_state(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARIEL_GOOGLE_PUBSUB_TOPIC", PUBSUB_TOPIC)
+    monkeypatch.setenv("ARIEL_PUBLIC_WEBHOOK_BASE_URL", PUBLIC_WEBHOOK_BASE_URL)
+    provider = WatchRecordingProvider()
+    oauth_client = ConnectOAuthClient(granted_scopes=[GMAIL_READ_SCOPE, CALENDAR_READ_SCOPE])
+    app = create_test_app(
+        database_url=postgres_url,
+        model_adapter=cast(ModelAdapter, _NoCallAdapter()),
+        sandbox=FakeSandboxRuntime(),
+    )
+    with TestClient(app) as client:
+        app_state = cast(Any, client.app).state
+        app_state.google_oauth_client = oauth_client
+        app_state.google_workspace_provider = provider
+
+        started = client.post("/v1/connectors/google/start")
+        state = started.json()["oauth"]["state"]
+        callback = client.get(
+            "/v1/connectors/google/callback",
+            params={"state": state, "code": "connect-watch"},
+        )
+        assert callback.status_code == 200
+
+        with app_state.session_factory() as db:
+            calendar_channel = db.scalar(
+                select(ProviderWatchChannelRecord).where(
+                    ProviderWatchChannelRecord.resource_type == "calendar"
+                )
+            )
+            assert calendar_channel is not None
+            calendar_channel_id = calendar_channel.channel_id
+            calendar_channel_token = calendar_channel.channel_token
+            assert calendar_channel_id is not None
+            assert calendar_channel_token is not None
+
+        provider_event = client.post(
+            "/v1/providers/google/events?resource_type=calendar&resource_id=primary",
+            headers={
+                "X-Goog-Channel-ID": calendar_channel_id,
+                "X-Goog-Channel-Token": calendar_channel_token,
+                "X-Goog-Message-Number": "1",
+                "X-Goog-Resource-ID": "res-watch-1",
+                "X-Goog-Resource-State": "exists",
+            },
+            json={},
+        )
+        assert provider_event.status_code == 202
+
+        now = datetime(2026, 5, 18, 12, 0, tzinfo=UTC)
+        with app_state.session_factory() as db:
+            with db.begin():
+                db.add(
+                    SyncCursorRecord(
+                        id="cur_disconnect",
+                        provider="google",
+                        resource_type="calendar",
+                        resource_id="primary",
+                        cursor_value="sync-token",
+                        cursor_version=1,
+                        status="ready",
+                        last_successful_sync_at=now,
+                        last_error_code=None,
+                        last_error_at=None,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                enqueue_background_task(
+                    db,
+                    task_type="provider_sync_due",
+                    payload={
+                        "provider": "google",
+                        "resource_type": "calendar",
+                        "resource_id": "primary",
+                    },
+                    now=now,
+                )
+
+        disconnected = client.delete("/v1/connectors/google")
+        assert disconnected.status_code == 200
+
+        stale_event = client.post(
+            "/v1/providers/google/events?resource_type=calendar&resource_id=primary",
+            headers={
+                "X-Goog-Channel-ID": calendar_channel_id,
+                "X-Goog-Channel-Token": calendar_channel_token,
+                "X-Goog-Message-Number": "2",
+                "X-Goog-Resource-ID": "res-watch-1",
+                "X-Goog-Resource-State": "exists",
+            },
+            json={},
+        )
+        assert stale_event.status_code == 401
+
+        with app_state.session_factory() as db:
+            channels = db.scalars(select(ProviderWatchChannelRecord)).all()
+            cursors = db.scalars(select(SyncCursorRecord)).all()
+            events = db.scalars(select(ProviderEventRecord)).all()
+            one_shot_provider_tasks = db.scalars(
+                select(BackgroundTaskRecord).where(
+                    BackgroundTaskRecord.task_type.in_(
+                        ("provider_event_received", "provider_sync_due")
+                    ),
+                    BackgroundTaskRecord.recurrence_seconds.is_(None),
+                )
+            ).all()
+            disconnected_event = db.scalar(
+                select(GoogleConnectorEventRecord)
+                .where(GoogleConnectorEventRecord.event_type == "evt.connector.google.disconnected")
+                .order_by(GoogleConnectorEventRecord.created_at.desc())
+                .limit(1)
+            )
+
+        assert channels == []
+        assert cursors == []
+        assert [(event.status, event.error) for event in events] == [
+            ("failed", "google_connector_disconnected")
+        ]
+        assert one_shot_provider_tasks == []
+        assert provider.calendar_stop_calls == [
+            {
+                "access_token": "tok_access_watch",
+                "channel_id": calendar_channel_id,
+                "provider_resource_id": "res-watch-1",
+            }
+        ]
+        assert provider.gmail_stop_calls == ["tok_access_watch"]
+        assert disconnected_event is not None
+        assert disconnected_event.payload["cleanup_counts"] == {
+            "sync_cursors_deleted": 1,
+            "provider_events_failed": 1,
+            "background_tasks_deleted": 2,
+            "provider_watch_channels": 2,
+        }
+
+
 def test_connect_watch_registration_failure_fails_callback(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -356,8 +517,11 @@ def _seed_connected_connector(
     now: datetime,
     settings: AppSettings,
     granted_scopes: list[str],
+    status: str = "connected",
     account_subject: str | None = "sub_connected",
     account_email: str | None = "connected@example.com",
+    last_error_code: str | None = None,
+    last_error_at: datetime | None = None,
 ) -> None:
     with session_factory() as db:
         with db.begin():
@@ -365,7 +529,7 @@ def _seed_connected_connector(
                 GoogleConnectorRecord(
                     id=GOOGLE_CONNECTOR_ID,
                     provider="google",
-                    status="connected",
+                    status=status,
                     account_subject=account_subject,
                     account_email=account_email,
                     granted_scopes=granted_scopes,
@@ -384,8 +548,8 @@ def _seed_connected_connector(
                     access_token_expires_at=now + timedelta(hours=1),
                     token_obtained_at=now,
                     encryption_key_version=settings.connector_encryption_key_version,
-                    last_error_code=None,
-                    last_error_at=None,
+                    last_error_code=last_error_code,
+                    last_error_at=last_error_at,
                     created_at=now,
                     updated_at=now,
                 )
@@ -454,7 +618,7 @@ def test_watch_renew_handler_rearms_near_expiry_channel(
             assert channel.expires_at == datetime(2026, 6, 10, 12, 0, tzinfo=UTC)
 
 
-def test_watch_renew_handler_missing_identity_wakes_without_registering_fallback_watch(
+def test_watch_renew_handler_error_connector_does_not_register_watch(
     session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -465,13 +629,15 @@ def test_watch_renew_handler_missing_identity_wakes_without_registering_fallback
         now=now,
         settings=settings,
         granted_scopes=[GMAIL_READ_SCOPE],
-        account_subject=None,
+        status="error",
+        last_error_code="account_identity_missing",
+        last_error_at=now,
     )
     with session_factory() as db:
         with db.begin():
             db.add(
                 ProviderWatchChannelRecord(
-                    id="wch_missing_identity",
+                    id="wch_error_connector",
                     provider="google",
                     resource_type="gmail",
                     resource_id="sub_connected",
@@ -516,16 +682,11 @@ def test_watch_renew_handler_missing_identity_wakes_without_registering_fallback
             tasks = db.scalars(
                 select(BackgroundTaskRecord).where(BackgroundTaskRecord.task_type == "agent_wake")
             ).all()
-            channel = db.get(ProviderWatchChannelRecord, "wch_missing_identity")
+            channel = db.get(ProviderWatchChannelRecord, "wch_error_connector")
     assert connector is not None
+    assert connector.status == "error"
     assert connector.last_error_code == "account_identity_missing"
-    assert len(tasks) == 1
-    assert tasks[0].payload == {
-        "note": (
-            "The Google connector reported an error account_identity_missing; "
-            "the user may need to reconnect."
-        )
-    }
+    assert tasks == []
     assert channel is not None
     assert channel.cursor_seed == "hist-old"
 

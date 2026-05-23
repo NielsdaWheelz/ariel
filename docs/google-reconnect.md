@@ -5,7 +5,7 @@ How to (re)connect Ariel's Google integration — including granting new scopes 
 ## When you need this
 
 - **First-time setup**: connect Google so Ariel can read your Mail/Calendar/Drive.
-- **Account identity is missing or unusable**: reconnect to request `openid + email + profile` and populate `account_subject` plus `account_email`; current connect/reconnect callbacks require usable userinfo identity.
+- **Account identity is missing or unusable**: reconnect to request `openid + email + profile` and populate `account_subject` plus `account_email`; current connect/reconnect callbacks and the connected-row schema require usable userinfo identity.
 - **Bot says "I can't send mail / create events / share files"**: the relevant write scope was never granted. Reconnect with a `capability_intent`.
 - **Google revoked the refresh token** (you removed access from [https://myaccount.google.com/permissions](https://myaccount.google.com/permissions), or it expired due to inactivity): reconnect to mint a fresh refresh token.
 
@@ -118,4 +118,4 @@ curl -s "${auth[@]}" -X DELETE http://127.0.0.1:8000/v1/connectors/google | jq
 curl -s "${auth[@]}" -X POST   http://127.0.0.1:8000/v1/connectors/google/start | jq -r '.oauth.authorization_url'
 ```
 
-`DELETE` revokes the local refresh token and marks the connector disconnected; `start` mints a fresh OAuth flow asking for the current default scope set.
+`DELETE` revokes the local refresh token, stops active watch channels, clears local account identity, and marks the connector disconnected; `start` mints a fresh OAuth flow asking for the current default scope set.

@@ -51,8 +51,7 @@ from ariel.google_connector import (
     GOOGLE_WRITE_CAPABILITY_IDS,
     GoogleCapabilityExecutionResult,
     GoogleConnectorRuntime,
-    google_account_subject,
-    google_connector_has_account_identity,
+    google_connected_account_subject,
 )
 from ariel.persistence import (
     ActionAttemptRecord,
@@ -368,10 +367,7 @@ def _current_google_provider_account_id(db: Session) -> str | None:
     )
     if connector is None or connector.status != "connected":
         return None
-    provider_account_id = google_account_subject(connector.account_subject)
-    if provider_account_id is None or not google_connector_has_account_identity(connector):
-        return None
-    return provider_account_id
+    return google_connected_account_subject(connector)
 
 
 def _provider_write_account_id(

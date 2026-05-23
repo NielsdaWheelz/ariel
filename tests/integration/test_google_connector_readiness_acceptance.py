@@ -647,7 +647,7 @@ def test_transient_auth_failures_do_not_remap_connected_readiness(
         assert connector_payload["last_error_code"] == "provider_timeout"
 
 
-def test_missing_account_identity_requires_reconnect_and_blocks_provider_calls(
+def test_error_connector_requires_reconnect_and_blocks_provider_calls(
     postgres_url: str,
 ) -> None:
     adapter = ActionProposalAdapter(
@@ -678,13 +678,14 @@ def test_missing_account_identity_requires_reconnect_and_blocks_provider_calls(
             with db.begin():
                 connector = db.get(GoogleConnectorRecord, GOOGLE_CONNECTOR_ID)
                 assert connector is not None
-                connector.account_subject = None
-                connector.account_email = None
+                connector.status = "error"
+                connector.last_error_code = "account_identity_missing"
+                connector.last_error_at = datetime.now(tz=UTC)
 
         connector_response = client.get("/v1/connectors/google")
         assert connector_response.status_code == 200
         connector_payload = connector_response.json()["connector"]
-        assert connector_payload["status"] == "connected"
+        assert connector_payload["status"] == "error"
         assert connector_payload["readiness"] == "reconnect_required"
 
         app_state = cast(Any, client.app).state

@@ -18,10 +18,13 @@ from sqlalchemy.orm import Session, sessionmaker
 from ariel.clock import utcnow
 from ariel.secret_cipher import SecretDecryptionFailure, decrypt_secret, encrypt_secret
 from ariel.persistence import (
+    BackgroundTaskRecord,
     GoogleConnectorEventRecord,
     GoogleConnectorRecord,
     GoogleOAuthStateRecord,
+    ProviderEventRecord,
     ProviderWatchChannelRecord,
+    SyncCursorRecord,
     to_rfc3339,
 )
 from ariel.google_workspace_normalization import (
@@ -112,11 +115,13 @@ def google_account_email(value: str | None) -> str | None:
     return normalized
 
 
-def google_connector_has_account_identity(connector: GoogleConnectorRecord) -> bool:
-    return (
-        google_account_subject(connector.account_subject) is not None
-        and google_account_email(connector.account_email) is not None
-    )
+def google_connected_account_subject(connector: GoogleConnectorRecord) -> str:
+    if connector.status != "connected":
+        raise RuntimeError("google_connector_not_connected")
+    account_subject = google_account_subject(connector.account_subject)
+    if account_subject is None or google_account_email(connector.account_email) is None:
+        raise RuntimeError("google_connected_account_identity_invalid")
+    return account_subject
 
 
 GOOGLE_CAPABILITY_IDS = frozenset(GOOGLE_CAPABILITY_SCOPES.keys())
@@ -4540,6 +4545,22 @@ def _is_blocking_readiness_failure(error_code: str | None) -> bool:
     return _readiness_failure_kind(error_code) == "blocking"
 
 
+def _connector_unavailable_failure_class(
+    connector: GoogleConnectorRecord,
+) -> TypedAuthFailureClass:
+    if connector.last_error_code == "account_identity_missing":
+        return "account_identity_missing"
+    if connector.last_error_code == "consent_required":
+        return "consent_required"
+    if connector.last_error_code == "scope_missing":
+        return "scope_missing"
+    if connector.last_error_code == "token_expired":
+        return "token_expired"
+    if connector.last_error_code == "access_revoked":
+        return "access_revoked"
+    return "not_connected"
+
+
 def _set_connector_error(
     *,
     connector: GoogleConnectorRecord,
@@ -4582,8 +4603,6 @@ def _readiness(connector: GoogleConnectorRecord | None) -> str:
     if connector.status == "not_connected":
         return "not_connected"
     if connector.status != "connected":
-        return "reconnect_required"
-    if not google_connector_has_account_identity(connector):
         return "reconnect_required"
     if _is_blocking_readiness_failure(connector.last_error_code):
         return "reconnect_required"
@@ -5185,6 +5204,26 @@ class GoogleConnectorRuntime:
         new_id_fn: Callable[[str], str],
     ) -> dict[str, Any]:
         connector = self._ensure_connector(db=db, now_fn=now_fn)
+        now = now_fn()
+        access_token: str | None = None
+        access_token_error: str | None = None
+        if connector.access_token_enc is not None:
+            try:
+                access_token = decrypt_secret(
+                    ciphertext=connector.access_token_enc,
+                    secret=self.encryption_secret,
+                    expected_key_version=connector.encryption_key_version,
+                    encryption_keys=self.encryption_keys,
+                )
+            except SecretDecryptionFailure as exc:
+                access_token_error = exc.code
+        watch_stop_results = self._stop_provider_watches(
+            db=db,
+            access_token=access_token,
+            access_token_error=access_token_error,
+        )
+        cleanup_counts = self._clear_disconnected_provider_state(db=db)
+        cleanup_counts["provider_watch_channels"] = len(watch_stop_results)
         token_revoke_results: list[dict[str, str]] = []
         token_slots = (
             ("refresh_token", connector.refresh_token_enc),
@@ -5231,6 +5270,8 @@ class GoogleConnectorRuntime:
             )
 
         connector.status = "not_connected"
+        connector.account_subject = None
+        connector.account_email = None
         connector.granted_scopes = []
         connector.access_token_enc = None
         connector.refresh_token_enc = None
@@ -5238,7 +5279,7 @@ class GoogleConnectorRuntime:
         connector.token_obtained_at = None
         connector.last_error_code = None
         connector.last_error_at = None
-        connector.updated_at = now_fn()
+        connector.updated_at = now
 
         _append_connector_event(
             db=db,
@@ -5247,11 +5288,134 @@ class GoogleConnectorRuntime:
             payload_data={
                 **_connector_event_payload(connector, scopes=[]),
                 "token_revoke_results": token_revoke_results,
+                "watch_stop_results": watch_stop_results,
+                "cleanup_counts": cleanup_counts,
             },
-            now_fn=now_fn,
+            now_fn=lambda: now,
             new_id_fn=new_id_fn,
         )
         return _connector_payload(connector)
+
+    def _clear_disconnected_provider_state(
+        self,
+        *,
+        db: Session,
+    ) -> dict[str, int]:
+        google_events = db.scalars(
+            select(ProviderEventRecord)
+            .where(ProviderEventRecord.provider == GOOGLE_PROVIDER)
+            .with_for_update()
+            .order_by(ProviderEventRecord.id.asc())
+        ).all()
+        provider_event_ids = {event.id for event in google_events}
+        accepted_events = [event for event in google_events if event.status == "accepted"]
+        for event in accepted_events:
+            event.status = "failed"
+            event.error = "google_connector_disconnected"
+
+        sync_cursors = db.scalars(
+            select(SyncCursorRecord)
+            .where(SyncCursorRecord.provider == GOOGLE_PROVIDER)
+            .with_for_update()
+            .order_by(SyncCursorRecord.id.asc())
+        ).all()
+        for cursor in sync_cursors:
+            db.delete(cursor)
+
+        deleted_task_count = 0
+        tasks = db.scalars(
+            select(BackgroundTaskRecord)
+            .where(
+                BackgroundTaskRecord.recurrence_seconds.is_(None),
+                BackgroundTaskRecord.task_type.in_(
+                    ("provider_event_received", "provider_sync_due")
+                ),
+            )
+            .with_for_update()
+            .order_by(BackgroundTaskRecord.id.asc())
+        ).all()
+        for task in tasks:
+            payload = task.payload if isinstance(task.payload, dict) else {}
+            delete_task = (
+                task.task_type == "provider_event_received"
+                and payload.get("provider_event_id") in provider_event_ids
+            ) or (task.task_type == "provider_sync_due" and payload.get("provider") == "google")
+            if delete_task:
+                db.delete(task)
+                deleted_task_count += 1
+
+        return {
+            "sync_cursors_deleted": len(sync_cursors),
+            "provider_events_failed": len(accepted_events),
+            "background_tasks_deleted": deleted_task_count,
+        }
+
+    def _stop_provider_watches(
+        self,
+        *,
+        db: Session,
+        access_token: str | None,
+        access_token_error: str | None,
+    ) -> list[dict[str, str]]:
+        channels = db.scalars(
+            select(ProviderWatchChannelRecord)
+            .where(ProviderWatchChannelRecord.provider == GOOGLE_PROVIDER)
+            .with_for_update()
+            .order_by(
+                ProviderWatchChannelRecord.resource_type.asc(),
+                ProviderWatchChannelRecord.resource_id.asc(),
+            )
+        ).all()
+        results: list[dict[str, str]] = []
+        gmail_stopped = False
+        for channel in channels:
+            reason: str | None = None
+            if channel.status != "active":
+                result_status = "removed"
+            elif access_token is None:
+                reason = access_token_error or "access_token_missing"
+                result_status = "failed"
+            elif channel.resource_type == "gmail":
+                if not gmail_stopped:
+                    try:
+                        self.workspace_provider.gmail_stop_watch(access_token=access_token)
+                    except GoogleProviderRequestFailure as exc:
+                        reason = exc.code
+                        result_status = "failed"
+                    else:
+                        gmail_stopped = True
+                        result_status = "succeeded"
+                else:
+                    result_status = "succeeded"
+            elif channel.resource_type == "calendar":
+                if channel.channel_id is None or channel.provider_resource_id is None:
+                    reason = "watch_identity_missing"
+                    result_status = "failed"
+                else:
+                    try:
+                        self.workspace_provider.calendar_stop_watch(
+                            access_token=access_token,
+                            channel_id=channel.channel_id,
+                            provider_resource_id=channel.provider_resource_id,
+                        )
+                    except GoogleProviderRequestFailure as exc:
+                        reason = exc.code
+                        result_status = "failed"
+                    else:
+                        result_status = "succeeded"
+            else:
+                raise RuntimeError(f"unknown_provider_watch_resource_type:{channel.resource_type}")
+
+            result = {
+                "resource_type": channel.resource_type,
+                "resource_id": channel.resource_id,
+                "status": result_status,
+            }
+            if reason is not None:
+                result["reason"] = reason
+            results.append(result)
+            db.delete(channel)
+        return results
 
     def register_provider_watches(
         self,
@@ -5860,15 +6024,15 @@ class GoogleConnectorRuntime:
             return None, set(), None, self._typed_failure(failure_class="not_connected")
         if connector.status == "revoked":
             return None, set(), None, self._typed_failure(failure_class="access_revoked")
-        provider_account_id = google_account_subject(connector.account_subject)
-        if provider_account_id is None or google_account_email(connector.account_email) is None:
-            _set_connector_error(
-                connector=connector,
-                error_code="account_identity_missing",
-                now_fn=now_fn,
-                preserve_existing_blocking=True,
+        if connector.status != "connected":
+            failure_class = _connector_unavailable_failure_class(connector)
+            return (
+                None,
+                set(),
+                None,
+                self._typed_failure(failure_class=failure_class),
             )
-            return None, set(), None, self._typed_failure(failure_class="account_identity_missing")
+        provider_account_id = google_connected_account_subject(connector)
         granted_scopes = set(_normalize_scope_list(connector.granted_scopes))
         if not required_scopes.issubset(granted_scopes):
             _set_connector_error(
@@ -5946,15 +6110,15 @@ class GoogleConnectorRuntime:
             return None, set(), None, self._typed_failure(failure_class="not_connected")
         if connector.status == "revoked":
             return None, set(), None, self._typed_failure(failure_class="access_revoked")
-        provider_account_id = google_account_subject(connector.account_subject)
-        if provider_account_id is None or google_account_email(connector.account_email) is None:
-            _set_connector_error(
-                connector=connector,
-                error_code="account_identity_missing",
-                now_fn=now_fn,
-                preserve_existing_blocking=True,
+        if connector.status != "connected":
+            failure_class = _connector_unavailable_failure_class(connector)
+            return (
+                None,
+                set(),
+                None,
+                self._typed_failure(failure_class=failure_class),
             )
-            return None, set(), None, self._typed_failure(failure_class="account_identity_missing")
+        provider_account_id = google_connected_account_subject(connector)
         granted_scopes = set(_normalize_scope_list(connector.granted_scopes))
         if not required_scopes.issubset(granted_scopes):
             _set_connector_error(
@@ -6197,14 +6361,9 @@ class GoogleConnectorRuntime:
             raise GoogleProviderRequestFailure("not_connected")
         if connector.status == "revoked":
             raise GoogleProviderRequestFailure("access_revoked")
-        if not google_connector_has_account_identity(connector):
-            _set_connector_error(
-                connector=connector,
-                error_code="account_identity_missing",
-                now_fn=now_fn,
-                preserve_existing_blocking=True,
-            )
-            raise GoogleProviderRequestFailure("account_identity_missing")
+        if connector.status != "connected":
+            failure_class = _connector_unavailable_failure_class(connector)
+            raise GoogleProviderRequestFailure(failure_class)
         access_token, refresh_failure = self._refresh_access_token_if_needed(
             db=db,
             connector=connector,
@@ -6228,14 +6387,9 @@ class GoogleConnectorRuntime:
             raise GoogleProviderRequestFailure("not_connected")
         if connector.status == "revoked":
             raise GoogleProviderRequestFailure("access_revoked")
-        if not google_connector_has_account_identity(connector):
-            _set_connector_error(
-                connector=connector,
-                error_code="account_identity_missing",
-                now_fn=now_fn,
-                preserve_existing_blocking=True,
-            )
-            raise GoogleProviderRequestFailure("account_identity_missing")
+        if connector.status != "connected":
+            failure_class = _connector_unavailable_failure_class(connector)
+            raise GoogleProviderRequestFailure(failure_class)
         if connector.access_token_enc is None:
             _set_connector_error(
                 connector=connector,

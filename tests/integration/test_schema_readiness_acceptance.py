@@ -7,6 +7,8 @@ from typing import Any
 from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Connection
+from sqlalchemy.exc import IntegrityError
 
 from ariel.app import create_app
 from ariel.db import SchemaReadinessProbe, run_migrations, schema_readiness_issues
@@ -21,6 +23,36 @@ class NoCallModelAdapter:
 
     def create_response(self, **_: Any) -> dict[str, Any]:
         raise AssertionError("schema readiness tests must not call the model adapter")
+
+
+def _integrity_constraint_name(exc: IntegrityError) -> str:
+    diag = getattr(exc.orig, "diag", None)
+    return str(getattr(diag, "constraint_name", ""))
+
+
+def _insert_google_connector(
+    connection: Connection,
+    *,
+    connector_id: str,
+    status: str,
+    account_subject: str | None,
+    account_email: str | None,
+) -> None:
+    connection.execute(
+        text(
+            "INSERT INTO google_connectors "
+            "(id, provider, status, account_subject, account_email, granted_scopes, "
+            "encryption_key_version, created_at, updated_at) "
+            "VALUES (:connector_id, 'google', :status, :account_subject, :account_email, "
+            "'[]'::jsonb, 'v1', now(), now())"
+        ),
+        {
+            "connector_id": connector_id,
+            "status": status,
+            "account_subject": account_subject,
+            "account_email": account_email,
+        },
+    )
 
 
 def test_schema_not_ready_returns_503_until_migrated(unmigrated_postgres_url: str) -> None:
@@ -237,6 +269,152 @@ def test_schema_readiness_reports_changed_check_constraint_column(postgres_url: 
         engine.dispose()
 
 
+def test_schema_readiness_reports_google_connector_identity_constraint_drift(
+    postgres_url: str,
+) -> None:
+    engine = create_engine(postgres_url, future=True, pool_pre_ping=True)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "ALTER TABLE google_connectors "
+                    "DROP CONSTRAINT ck_google_connector_connected_account_email"
+                )
+            )
+            connection.execute(
+                text(
+                    "ALTER TABLE google_connectors "
+                    "ADD CONSTRAINT ck_google_connector_connected_account_email "
+                    "CHECK (status <> 'connected' OR account_subject IS NOT NULL)"
+                )
+            )
+
+        assert (
+            "missing_constraint_fragment:"
+            "google_connectors.ck_google_connector_connected_account_email"
+            in schema_readiness_issues(engine)
+        )
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("connector_id", "account_subject", "account_email", "constraint_name"),
+    [
+        (
+            "con_no_subject",
+            None,
+            "owner@example.com",
+            "ck_google_connector_connected_account_subject",
+        ),
+        (
+            "con_blank_subject",
+            "",
+            "owner@example.com",
+            "ck_google_connector_connected_account_subject",
+        ),
+        (
+            "con_space_subject",
+            "sub owner",
+            "owner@example.com",
+            "ck_google_connector_connected_account_subject",
+        ),
+        ("con_no_email", "sub_owner", None, "ck_google_connector_connected_account_email"),
+        ("con_blank_email", "sub_owner", "", "ck_google_connector_connected_account_email"),
+        (
+            "con_space_email",
+            "sub_owner",
+            "owner @example.com",
+            "ck_google_connector_connected_account_email",
+        ),
+        (
+            "con_bad_email",
+            "sub_owner",
+            "owner.example.com",
+            "ck_google_connector_connected_account_email",
+        ),
+    ],
+)
+def test_google_connector_connected_identity_is_check_constrained(
+    postgres_url: str,
+    connector_id: str,
+    account_subject: str | None,
+    account_email: str | None,
+    constraint_name: str,
+) -> None:
+    engine = create_engine(postgres_url, future=True, pool_pre_ping=True)
+    try:
+        with pytest.raises(IntegrityError) as exc_info:
+            with engine.begin() as connection:
+                _insert_google_connector(
+                    connection,
+                    connector_id=connector_id,
+                    status="connected",
+                    account_subject=account_subject,
+                    account_email=account_email,
+                )
+
+        assert _integrity_constraint_name(exc_info.value) == constraint_name
+
+        with engine.begin() as connection:
+            _insert_google_connector(
+                connection,
+                connector_id=f"{connector_id}_off",
+                status="not_connected",
+                account_subject=None,
+                account_email=None,
+            )
+            _insert_google_connector(
+                connection,
+                connector_id=f"{connector_id}_on",
+                status="connected",
+                account_subject="sub_owner",
+                account_email="owner@example.com",
+            )
+    finally:
+        engine.dispose()
+
+
+def test_google_connector_connected_identity_migration_reclassifies_invalid_rows(
+    unmigrated_postgres_url: str,
+) -> None:
+    run_migrations(unmigrated_postgres_url, revision="20260522_0063")
+    engine = create_engine(unmigrated_postgres_url, future=True, pool_pre_ping=True)
+    try:
+        with engine.begin() as connection:
+            _insert_google_connector(
+                connection,
+                connector_id="con_google",
+                status="connected",
+                account_subject=None,
+                account_email=" ",
+            )
+
+        run_migrations(unmigrated_postgres_url)
+
+        with engine.connect() as connection:
+            connector = (
+                connection.execute(
+                    text(
+                        "SELECT status, account_subject, account_email, last_error_code, "
+                        "last_error_at "
+                        "FROM google_connectors WHERE id = 'con_google'"
+                    )
+                )
+                .mappings()
+                .one()
+            )
+
+        assert connector["status"] == "error"
+        assert connector["account_subject"] is None
+        assert connector["account_email"] is None
+        assert connector["last_error_code"] == "account_identity_missing"
+        assert connector["last_error_at"] is not None
+        assert schema_readiness_issues(engine) == []
+    finally:
+        engine.dispose()
+
+
 def test_subscriber_heartbeat_identity_migration_backfills_existing_rows(
     unmigrated_postgres_url: str,
 ) -> None:
@@ -277,7 +455,7 @@ def test_schema_readiness_reports_context_pressure_rotation_reason(
     engine = create_engine(unmigrated_postgres_url, future=True, pool_pre_ping=True)
     try:
         schema_issues = schema_readiness_issues(engine)
-        assert "missing_alembic_head:20260522_0063" in schema_issues
+        assert "missing_alembic_head:20260523_0064" in schema_issues
         assert "forbidden_constraint_fragment:sessions.ck_session_rotation_reason" in schema_issues
         assert (
             "forbidden_constraint_fragment:"
@@ -324,7 +502,7 @@ def test_schema_readiness_reports_stale_capture_ingress_schema(
     engine = create_engine(unmigrated_postgres_url, future=True, pool_pre_ping=True)
     try:
         schema_issues = schema_readiness_issues(engine)
-        assert "missing_alembic_head:20260522_0063" in schema_issues
+        assert "missing_alembic_head:20260523_0064" in schema_issues
         assert "unexpected_column:captures.original_payload" in schema_issues
         assert "unexpected_column:captures.terminal_state" in schema_issues
         assert "unexpected_constraint:captures.ck_capture_terminal_state" in schema_issues

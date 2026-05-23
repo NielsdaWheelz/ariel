@@ -36,7 +36,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from .clock import utcnow
 from .config import AppSettings
 from .ids import new_id
-from .google_connector import google_account_subject, google_connector_has_account_identity
+from .google_connector import google_connected_account_subject
 from .persistence import (
     GoogleConnectorRecord,
     ProviderEventRecord,
@@ -175,9 +175,9 @@ def _ack_message(message: Any) -> None:
 
 
 def _provider_account_subject(connector: GoogleConnectorRecord | None) -> str | None:
-    if connector is None or not google_connector_has_account_identity(connector):
+    if connector is None or connector.status != "connected":
         return None
-    return google_account_subject(connector.account_subject)
+    return google_connected_account_subject(connector)
 
 
 def handle_message(
@@ -187,8 +187,9 @@ def handle_message(
     """Process one Pub/Sub message: decode, dedup, insert, enqueue, ack.
 
     Malformed payload → nack (Pub/Sub redelivers up to ``max_delivery_attempts``,
-    then dead-letters). Unknown account → ack (drop). Duplicate messageId → ack.
-    DB serialization failure → no ack; Pub/Sub redelivers; dedup catches.
+    then dead-letters). Unknown or inactive account → ack (drop). Duplicate
+    messageId → ack. DB serialization failure → no ack; Pub/Sub redelivers;
+    dedup catches.
     """
     try:
         notification = _parse_message_payload(message)
@@ -226,7 +227,8 @@ def _persist_provider_event(
                 provider_account_subject = _provider_account_subject(connector)
                 if provider_account_subject is None:
                     _log.info(
-                        "Pub/Sub message for unknown account %s (message_id=%s); acking",
+                        "Pub/Sub message for unknown or inactive account %s "
+                        "(message_id=%s); acking",
                         notification.email_address,
                         notification.message_id,
                     )

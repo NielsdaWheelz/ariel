@@ -909,6 +909,25 @@ class GoogleConnectorRecord(Base):
             "status IN ('not_connected', 'connected', 'error', 'revoked')",
             name="ck_google_connector_status",
         ),
+        CheckConstraint(
+            "status <> 'connected' OR ("
+            "account_subject IS NOT NULL "
+            "AND btrim(account_subject) <> '' "
+            "AND account_subject !~ '[[:space:]]'"
+            ")",
+            name="ck_google_connector_connected_account_subject",
+        ),
+        CheckConstraint(
+            "status <> 'connected' OR ("
+            "account_email IS NOT NULL "
+            "AND btrim(account_email) <> '' "
+            "AND account_email !~ '[[:space:]]' "
+            "AND length(account_email) - length(replace(account_email, '@', '')) = 1 "
+            "AND position('@' in account_email) > 1 "
+            "AND position('@' in account_email) < length(account_email)"
+            ")",
+            name="ck_google_connector_connected_account_email",
+        ),
     )
 
 
