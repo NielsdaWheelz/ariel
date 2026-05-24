@@ -162,6 +162,23 @@ class RuntimeProvenance:
     status: Literal["clean", "tainted"]
     evidence: tuple[dict[str, Any], ...] = ()
 
+    def merge(self, other: RuntimeProvenance | None) -> RuntimeProvenance:
+        if other is None:
+            return self
+        status: Literal["clean", "tainted"] = (
+            "tainted" if self.status == "tainted" or other.status == "tainted" else "clean"
+        )
+        return RuntimeProvenance(status=status, evidence=(*self.evidence, *other.evidence))
+
+    @staticmethod
+    def merge_optional(
+        baseline: RuntimeProvenance | None,
+        ingress: RuntimeProvenance | None,
+    ) -> RuntimeProvenance | None:
+        if baseline is None:
+            return ingress
+        return baseline.merge(ingress)
+
 
 @dataclass(frozen=True, slots=True)
 class GroundedSourceCandidate:

@@ -21,11 +21,11 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from pydantic_ai.messages import ModelRequest, SystemPromptPart, ToolReturnPart
+from pydantic_ai.messages import ModelMessage, ModelRequest, SystemPromptPart, ToolReturnPart
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from ariel.model_adapter import ModelCall, ModelMessage, ModelResponse
+from ariel.model_adapter import ModelCall, ModelResponse
 from ariel.persistence import MemoryLogRecord
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.app_helpers import create_test_app

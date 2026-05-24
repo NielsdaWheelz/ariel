@@ -6,12 +6,14 @@ from typing import Any
 from fastapi.encoders import jsonable_encoder
 from fastapi.testclient import TestClient
 import pytest
+from pydantic_ai.messages import ModelMessage
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 import ariel.run_runtime as run_runtime_module
 from ariel.action_runtime import RuntimeProvenance
-from ariel.model_adapter import ModelAdapter, ModelCall, ModelMessage, ModelResponse, ModelTier
+from ariel.model_adapter import ModelAdapter, ModelCall, ModelResponse
+from ariel.model_tiers import ModelTier
 from ariel.persistence import (
     ActionAttemptRecord,
     AIJudgmentRecord,

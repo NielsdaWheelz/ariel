@@ -699,7 +699,7 @@ def run_retriever(
             return {"summary": "", "items": [], "status": "partial"}
         case "model_failed":
             raise MemoryRecallError("memory_recall_model_failed")
-        case "message" | "approval" | "paused" | "operations" | "bounded_failure":
+        case "message" | "approval" | "paused" | "operations":
             msg = f"unexpected memory recall loop outcome: {loop_result.outcome}"
             raise AssertionError(msg)
 

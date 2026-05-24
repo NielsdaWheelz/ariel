@@ -17,7 +17,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
-from pydantic_ai.messages import ModelRequest, SystemPromptPart, UserPromptPart
+from pydantic_ai.messages import ModelMessage, ModelRequest, SystemPromptPart, UserPromptPart
 from sqlalchemy import (
     Engine,
     and_,
@@ -63,7 +63,8 @@ from ariel.memory import (
     run_retriever,
 )
 from ariel.ids import new_id
-from ariel.model_adapter import ModelAdapter, ModelMessage, ModelTier
+from ariel.model_adapter import ModelAdapter
+from ariel.model_tiers import ModelTier
 from ariel.persistence import (
     ActionAttemptRecord,
     ApprovalRequestRecord,
@@ -915,20 +916,6 @@ def _runtime_provenance_for_turn(
     return RuntimeProvenance(status=status, evidence=tuple(evidence))
 
 
-def _merge_runtime_provenance(
-    *,
-    baseline: RuntimeProvenance,
-    ingress: RuntimeProvenance | None,
-) -> RuntimeProvenance:
-    if ingress is None:
-        return baseline
-    merged_status: Literal["clean", "tainted"] = (
-        "tainted" if baseline.status == "tainted" or ingress.status == "tainted" else "clean"
-    )
-    merged_evidence = tuple([*baseline.evidence, *ingress.evidence])
-    return RuntimeProvenance(status=merged_status, evidence=merged_evidence)
-
-
 def _turn_retrieval_sources(*, db: Session, turn_id: str) -> list[dict[str, Any]]:
     """Citations for the turn's surfaced response.
 
@@ -1105,10 +1092,7 @@ def _wake(
         db=db,
         prior_turns=prior_turns,
     )
-    runtime_provenance = _merge_runtime_provenance(
-        baseline=runtime_provenance,
-        ingress=ingress_runtime_provenance,
-    )
+    runtime_provenance = runtime_provenance.merge(ingress_runtime_provenance)
     now = utcnow()
     turn = TurnRecord(
         id=new_id("trn"),
@@ -1330,10 +1314,7 @@ def _wake(
         attachment_runtime=runtime.attachment_runtime,
     )
     # Thread taint back and collect retrieval sources for the response.
-    runtime_provenance = _merge_runtime_provenance(
-        baseline=runtime_provenance,
-        ingress=loop_result.runtime_provenance,
-    )
+    runtime_provenance = runtime_provenance.merge(loop_result.runtime_provenance)
     assistant_sources = _turn_retrieval_sources(db=db, turn_id=turn.id)
 
     # Map loop outcome to the post-loop variables.
@@ -1365,10 +1346,7 @@ def _wake(
                 "assistant_text": "",
                 "assistant_silent": True,
             }
-        case "budget_exhausted" | "bounded_failure" | "finding" | "operations":
-            # "bounded_failure" is reserved on the loop but never produced; the
-            # cross-mode outcomes "finding"/"operations" are not valid for
-            # output_mode="message". All three degrade to the exhausted message.
+        case "budget_exhausted" | "finding" | "operations":
             assistant_response = exhausted_response
         case "model_failed":
             model_failure = ApiError(

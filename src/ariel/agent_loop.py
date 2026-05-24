@@ -211,8 +211,6 @@ class LoopResult:
       or stuck-detection ended the run without a terminal result.
     - ``"model_failed"`` — a model call raised an unretryable exception (or
       ``retry_on_model_error`` is False).
-    - ``"bounded_failure"`` — reserved for callers that enforce per-response
-      token limits; not set by the loop itself.
     """
 
     outcome: Literal[
@@ -223,7 +221,6 @@ class LoopResult:
         "paused",
         "budget_exhausted",
         "model_failed",
-        "bounded_failure",
     ]
     emitted_message: str | None
     emitted_finding: ResearchFinding | None
@@ -231,7 +228,6 @@ class LoopResult:
     model_call_count: int
     created_action_attempt_count: int
     awaiting_approval: ActionAttemptRecord | None
-    bounded_failure_details: dict[str, Any] | None
     runtime_provenance: RuntimeProvenance | None
 
 
@@ -400,7 +396,6 @@ def run_agent_loop(
                 model_call_count=model_call_count,
                 created_action_attempt_count=created_action_attempt_count,
                 awaiting_approval=None,
-                bounded_failure_details=None,
                 runtime_provenance=final_runtime_provenance,
             )
 
@@ -498,11 +493,10 @@ def run_agent_loop(
         )
         created_action_attempt_count += len(run_program_result.action_attempts)
         # Thread taint across programs in the same turn.
-        if run_program_result.runtime_provenance is not None:
-            final_runtime_provenance = _merge_provenance(
-                baseline=final_runtime_provenance,
-                ingress=run_program_result.runtime_provenance,
-            )
+        final_runtime_provenance = RuntimeProvenance.merge_optional(
+            final_runtime_provenance,
+            run_program_result.runtime_provenance,
+        )
 
         if not run_program_result.program_ok:
             # Program failure.
@@ -731,7 +725,6 @@ def run_agent_loop(
                         model_call_count=model_call_count,
                         created_action_attempt_count=created_action_attempt_count,
                         awaiting_approval=None,
-                        bounded_failure_details=None,
                         runtime_provenance=final_runtime_provenance,
                     )
             case "operations":
@@ -744,7 +737,6 @@ def run_agent_loop(
                         model_call_count=model_call_count,
                         created_action_attempt_count=created_action_attempt_count,
                         awaiting_approval=None,
-                        bounded_failure_details=None,
                         runtime_provenance=final_runtime_provenance,
                     )
             case "message":
@@ -757,7 +749,6 @@ def run_agent_loop(
                         model_call_count=model_call_count,
                         created_action_attempt_count=created_action_attempt_count,
                         awaiting_approval=None,
-                        bounded_failure_details=None,
                         runtime_provenance=final_runtime_provenance,
                     )
 
@@ -778,7 +769,6 @@ def run_agent_loop(
                         model_call_count=model_call_count,
                         created_action_attempt_count=created_action_attempt_count,
                         awaiting_approval=awaiting,
-                        bounded_failure_details=None,
                         runtime_provenance=final_runtime_provenance,
                     )
 
@@ -791,7 +781,6 @@ def run_agent_loop(
                         model_call_count=model_call_count,
                         created_action_attempt_count=created_action_attempt_count,
                         awaiting_approval=None,
-                        bounded_failure_details=None,
                         runtime_provenance=final_runtime_provenance,
                     )
             case _:
@@ -986,26 +975,7 @@ def _budget_exhausted_result(
         model_call_count=model_call_count,
         created_action_attempt_count=created_action_attempt_count,
         awaiting_approval=None,
-        bounded_failure_details=None,
         runtime_provenance=final_runtime_provenance,
-    )
-
-
-def _merge_provenance(
-    *,
-    baseline: RuntimeProvenance | None,
-    ingress: RuntimeProvenance | None,
-) -> RuntimeProvenance | None:
-    if baseline is None:
-        return ingress
-    if ingress is None:
-        return baseline
-    merged_status: Literal["clean", "tainted"] = (
-        "tainted" if baseline.status == "tainted" or ingress.status == "tainted" else "clean"
-    )
-    return RuntimeProvenance(
-        status=merged_status,
-        evidence=tuple([*baseline.evidence, *ingress.evidence]),
     )
 
 

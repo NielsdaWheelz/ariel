@@ -7,10 +7,10 @@ from typing import Any, cast
 from fastapi.testclient import TestClient
 from fastapi.encoders import jsonable_encoder
 import pytest
-from pydantic_ai.messages import ModelRequest, SystemPromptPart
+from pydantic_ai.messages import ModelMessage, ModelRequest, SystemPromptPart
 from sqlalchemy import text
 
-from ariel.model_adapter import ModelAdapter, ModelCall, ModelMessage, ModelResponse
+from ariel.model_adapter import ModelAdapter, ModelCall, ModelResponse
 from tests.integration.app_helpers import create_test_app
 from tests.integration.responses_helpers import (
     FakeModelAdapter,

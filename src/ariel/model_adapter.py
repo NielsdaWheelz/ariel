@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from pydantic_ai.embeddings.base import EmbeddingModel
 from pydantic_ai.embeddings.openai import OpenAIEmbeddingModel
 from pydantic_ai.messages import (
-    ModelMessage as ModelMessage,
+    ModelMessage,
     ModelResponse as _PydAIModelResponse,
     TextPart,
     ThinkingPart,
@@ -26,7 +26,7 @@ from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import ToolDefinition
 
 from .config import AppSettings
-from .model_tiers import ModelTier as ModelTier, TierBinding, resolve_tier
+from .model_tiers import ModelTier, TierBinding, resolve_tier
 from .response_contracts import ResponseContractViolation
 
 
@@ -183,13 +183,6 @@ class ModelAdapter:
         emitted *before* the response is in hand (e.g. ``evt.model.started``).
         """
         return self._tiers[tier]
-
-    # Test-injection seam: substitute a substrate model under unit test.
-    def _override_model(self, tier: ModelTier, model: Model) -> None:
-        self._models[tier] = model
-
-    def _override_embedder(self, embedder: EmbeddingModel) -> None:
-        self._embedder = embedder
 
     def _get_model(self, tier: ModelTier) -> Model:
         model = self._models.get(tier)

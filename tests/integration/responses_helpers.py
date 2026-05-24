@@ -5,7 +5,13 @@ from datetime import datetime
 from typing import Any, cast
 
 from fastapi.testclient import TestClient
-from pydantic_ai.messages import ModelRequest, SystemPromptPart, ToolReturnPart, UserPromptPart
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    SystemPromptPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -21,13 +27,11 @@ from ariel.ids import new_id
 from ariel.model_adapter import (
     ModelAdapter,
     ModelCall,
-    ModelMessage,
     ModelResponse,
-    ModelTier,
     ToolCall,
     TokenUsage,
 )
-from ariel.model_tiers import TierBinding
+from ariel.model_tiers import ModelTier, TierBinding
 from ariel.persistence import MEMORY_EMBEDDING_DIMENSIONS, BackgroundTaskRecord, TurnRecord
 from ariel.worker import process_one_task
 

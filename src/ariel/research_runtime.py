@@ -356,7 +356,7 @@ def run_research(
             turn.assistant_message = finding.summary
             turn.status = "completed"
             add_event("evt.research.partial", {"mode": mode})
-        case "message" | "approval" | "paused" | "operations" | "bounded_failure":
+        case "message" | "approval" | "paused" | "operations":
             msg = f"unexpected research loop outcome: {loop_result.outcome}"
             raise AssertionError(msg)
 
