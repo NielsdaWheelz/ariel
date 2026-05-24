@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from collections.abc import Callable
@@ -43,6 +44,7 @@ from .persistence import (
     ProviderWatchChannelRecord,
     SessionRecord,
     SyncCursorRecord,
+    TurnIdempotencyRecord,
     enqueue_background_task,
     get_or_create_active_session,
 )
@@ -60,14 +62,14 @@ from .sync_runtime import (
 _log = logging.getLogger(__name__)
 
 
-class UnsupportedTaskType(RuntimeError):
-    pass
-
-
 # A failing task retries up to this many times. A recurring task that exhausts
 # its retries is re-armed to its next occurrence rather than dropped; a one-shot
 # is deleted.
 MAX_TASK_ATTEMPTS = 5
+
+
+def _discord_delivery_nonce(*, turn_id: str, channel_id: int | str) -> str:
+    return hashlib.sha256(f"turn:{turn_id}:discord:{channel_id}".encode()).hexdigest()[:24]
 
 
 def _deliver_to_discord(
@@ -159,6 +161,8 @@ def _deliver_to_discord(
         content = content[:1888].rstrip() + "\n[truncated]"
 
     body: dict[str, Any] = {"content": content}
+    body["nonce"] = _discord_delivery_nonce(turn_id=outcome.turn_id, channel_id=target_channel_id)
+    body["enforce_nonce"] = True
     if reply_to_message_id is not None:
         body["message_reference"] = {
             "message_id": str(reply_to_message_id),
@@ -205,6 +209,25 @@ def _deliver_to_discord(
         return
 
 
+def _record_user_message_idempotency_outcome(
+    *,
+    db: Session,
+    task_id: str,
+    outcome: TurnExecutionOutcome,
+) -> None:
+    record = db.scalar(
+        select(TurnIdempotencyRecord)
+        .where(TurnIdempotencyRecord.background_task_id == task_id)
+        .limit(1)
+    )
+    if record is None:
+        return
+    record.turn_id = outcome.turn_id
+    record.status_code = outcome.status_code
+    record.response_payload = outcome.response_payload
+    record.updated_at = utcnow()
+
+
 def select_next_task(db: Session, *, now: datetime) -> BackgroundTaskRecord | None:
     # The single-threaded worker takes the earliest due row. There is no claim
     # protocol: "a row exists and is due" is the only pending state.
@@ -221,6 +244,7 @@ def select_next_task(db: Session, *, now: datetime) -> BackgroundTaskRecord | No
 
 
 _PROVIDER_WATCH_RENEW_INTERVAL_SECONDS = 6 * 3600
+_APPROVAL_EXPIRY_INTERVAL_SECONDS = 60
 
 
 def seed_provider_maintenance_tasks(
@@ -252,6 +276,28 @@ def seed_provider_maintenance_tasks(
             now=now,
             recurrence_seconds=recurrence_seconds,
         )
+
+
+def seed_approval_expiry_task(
+    db: Session,
+    *,
+    now: datetime,
+) -> None:
+    existing_id = db.scalar(
+        select(BackgroundTaskRecord.id)
+        .where(BackgroundTaskRecord.task_type == "expire_approvals")
+        .with_for_update(skip_locked=True)
+        .limit(1)
+    )
+    if existing_id is not None:
+        return
+    enqueue_background_task(
+        db,
+        task_type="expire_approvals",
+        payload={"origin": "worker_approval_expiry"},
+        now=now,
+        recurrence_seconds=_APPROVAL_EXPIRY_INTERVAL_SECONDS,
+    )
 
 
 # Gmail's watch expires after 7 days; Google recommends daily renewal. With
@@ -393,6 +439,7 @@ def process_one_task(
             now = utcnow()
             enqueue_due_memory_dream(db, settings=resolved_settings, now=now)
             seed_provider_maintenance_tasks(db, settings=resolved_settings, now=now)
+            seed_approval_expiry_task(db, now=now)
 
     with session_factory() as db:
         with db.begin():
@@ -446,6 +493,7 @@ def process_one_task(
                         db=db,
                         request_session_id=request_session_id,
                         wake_context=wake_context,
+                        source_background_task_id=task_id,
                         google_runtime=build_google_runtime(runtime.settings),
                     )
                     db.commit()
@@ -453,7 +501,7 @@ def process_one_task(
             case "research_run":
                 if runtime is None:
                     raise RuntimeError("research_run task requires a configured runtime")
-                _process_research_run(runtime=runtime, task_payload=task_payload)
+                _process_research_run(runtime=runtime, task_id=task_id, task_payload=task_payload)
             case "user_message":
                 if runtime is None:
                     raise RuntimeError("user_message task requires a configured runtime")
@@ -480,7 +528,13 @@ def process_one_task(
                             else None,
                             ingress_provenance=None,
                         ),
+                        source_background_task_id=task_id,
                         google_runtime=build_google_runtime(runtime.settings),
+                    )
+                    _record_user_message_idempotency_outcome(
+                        db=db,
+                        task_id=task_id,
+                        outcome=outcome,
                     )
                     db.commit()
                 _deliver_to_discord(
@@ -489,8 +543,6 @@ def process_one_task(
                     discord_context=discord_context_for_wake,
                 )
             case "execute_action_attempt":
-                if runtime is None:
-                    raise RuntimeError("execute_action_attempt task requires a configured runtime")
                 action_attempt_id = _payload_text(task_payload, "action_attempt_id")
                 if action_attempt_id is None:
                     raise RuntimeError("execute_action_attempt task missing action_attempt_id")
@@ -502,7 +554,6 @@ def process_one_task(
                     now_fn=utcnow,
                     new_id_fn=new_id,
                     settings=resolved_settings,
-                    model_adapter=runtime.model_adapter,
                 )
             case "provider_write_reconcile_due":
                 shape_error = _payload_text(task_payload, "shape_error")
@@ -538,49 +589,47 @@ def process_one_task(
                 if not note:
                     raise RuntimeError("memory_encode task missing note")
                 session_id = _payload_text(task_payload, "session_id")
-                with runtime.session_factory() as db:
-                    run_rememberer(
-                        trigger="encode",
-                        sandbox=_require_sandbox(runtime),
-                        db=db,
-                        session_factory=runtime.session_factory,
-                        session_id=session_id,
-                        settings=runtime.settings,
-                        model_adapter=runtime.model_adapter,
-                        google_runtime=build_google_runtime(runtime.settings),
-                        agency_runtime=None,
-                        attachment_runtime=None,
-                        note=note,
-                        allowed_capability_ids=REMEMBERER_CAPABILITY_IDS,
-                        approval_ttl_seconds=int(runtime.settings.approval_ttl_seconds),
-                        approval_actor_id=str(runtime.settings.approval_actor_id),
-                        add_event=lambda *_args, **_kwargs: None,
-                        now_fn=utcnow,
-                        new_id_fn=new_id,
-                    )
+                run_rememberer(
+                    trigger="encode",
+                    sandbox=_require_sandbox(runtime),
+                    session_factory=runtime.session_factory,
+                    session_id=session_id,
+                    settings=runtime.settings,
+                    model_adapter=runtime.model_adapter,
+                    google_runtime=build_google_runtime(runtime.settings),
+                    agency_runtime=None,
+                    attachment_runtime=None,
+                    note=note,
+                    allowed_capability_ids=REMEMBERER_CAPABILITY_IDS,
+                    approval_ttl_seconds=int(runtime.settings.approval_ttl_seconds),
+                    approval_actor_id=str(runtime.settings.approval_actor_id),
+                    add_event=lambda *_args, **_kwargs: None,
+                    now_fn=utcnow,
+                    new_id_fn=new_id,
+                    source_background_task_id=task_id,
+                )
             case "memory_dream":
                 if runtime is None:
                     raise RuntimeError("memory_dream task requires a configured runtime")
-                with runtime.session_factory() as db:
-                    run_rememberer(
-                        trigger="dream",
-                        sandbox=_require_sandbox(runtime),
-                        db=db,
-                        session_factory=runtime.session_factory,
-                        session_id=None,
-                        settings=runtime.settings,
-                        model_adapter=runtime.model_adapter,
-                        google_runtime=build_google_runtime(runtime.settings),
-                        agency_runtime=None,
-                        attachment_runtime=None,
-                        note=None,
-                        allowed_capability_ids=REMEMBERER_CAPABILITY_IDS,
-                        approval_ttl_seconds=int(runtime.settings.approval_ttl_seconds),
-                        approval_actor_id=str(runtime.settings.approval_actor_id),
-                        add_event=lambda *_args, **_kwargs: None,
-                        now_fn=utcnow,
-                        new_id_fn=new_id,
-                    )
+                run_rememberer(
+                    trigger="dream",
+                    sandbox=_require_sandbox(runtime),
+                    session_factory=runtime.session_factory,
+                    session_id=None,
+                    settings=runtime.settings,
+                    model_adapter=runtime.model_adapter,
+                    google_runtime=build_google_runtime(runtime.settings),
+                    agency_runtime=None,
+                    attachment_runtime=None,
+                    note=None,
+                    allowed_capability_ids=REMEMBERER_CAPABILITY_IDS,
+                    approval_ttl_seconds=int(runtime.settings.approval_ttl_seconds),
+                    approval_actor_id=str(runtime.settings.approval_actor_id),
+                    add_event=lambda *_args, **_kwargs: None,
+                    now_fn=utcnow,
+                    new_id_fn=new_id,
+                    source_background_task_id=task_id,
+                )
             case "provider_watch_renew_due":
                 process_provider_watch_renew_due(
                     session_factory=session_factory,
@@ -595,18 +644,12 @@ def process_one_task(
                     new_id_fn=new_id,
                 )
             case _:
-                raise UnsupportedTaskType(f"unsupported task type: {task_type}")
-    except UnsupportedTaskType as exc:
-        _log.error("worker rejected task %s: %s", task_id, exc)
-        _mark_task_failed(session_factory=session_factory, task_id=task_id)
-        return True
+                raise RuntimeError(f"background task type is not dispatched: {task_type}")
     except Exception:
-        # The worker is the boundary for arbitrary task-type dispatch: each arm
-        # has its own failure modes (model errors, sandbox crashes, DB
-        # conflicts) and a single task must never down the worker. The catch
-        # must therefore log the full traceback — silent swallow makes
-        # production failures undiagnosable, which is exactly the regression
-        # this comment guards against.
+        # The worker is the task-dispatch boundary: each arm has its own
+        # failure modes, and one failed row must never down the worker. The
+        # catch must log the full traceback; silent swallow makes production
+        # failures undiagnosable.
         _log.exception(
             "worker task %s (%s) failed; marking attempt as failed",
             task_id,
@@ -770,7 +813,12 @@ def _agent_wake_context(task_payload: dict[str, Any]) -> tuple[str | None, WakeC
     )
 
 
-def _process_research_run(*, runtime: Runtime, task_payload: dict[str, Any]) -> None:
+def _process_research_run(
+    *,
+    runtime: Runtime,
+    task_id: str,
+    task_payload: dict[str, Any],
+) -> None:
     """Run one ``research_run`` task: drive ``run_research`` in the worker, then
     enqueue a completion ``agent_wake`` carrying the finding back to the session
     that dispatched the run.
@@ -804,6 +852,7 @@ def _process_research_run(*, runtime: Runtime, task_payload: dict[str, Any]) -> 
             question=question,
             mode=mode,
             now_fn=utcnow,
+            source_background_task_id=task_id,
         )
 
     with runtime.session_factory() as db:
@@ -824,6 +873,7 @@ def _process_research_run(*, runtime: Runtime, task_payload: dict[str, Any]) -> 
                     "session_id": session_id,
                 },
                 now=utcnow(),
+                idempotency_key=f"research_completion:{task_id}",
             )
 
 

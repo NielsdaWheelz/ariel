@@ -56,8 +56,8 @@ ok "Caddyfile validated"
 info "Bootstrapping /var/log/caddy"
 id -u caddy >/dev/null 2>&1 || { fail "caddy user missing (apt install failed?)"; exit 1; }
 getent group caddy >/dev/null 2>&1 || { fail "caddy group missing (apt install failed?)"; exit 1; }
-install -d -o caddy -g caddy -m 0755 /var/log/caddy
-ok "/var/log/caddy ready (caddy:caddy 0755)"
+install -d -o caddy -g caddy -m 0750 /var/log/caddy
+ok "/var/log/caddy ready (caddy:caddy 0750)"
 CADDY_LOG_FILES=(
   /var/log/caddy/ariel-webhook.log
 )

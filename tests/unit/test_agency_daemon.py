@@ -6,8 +6,10 @@ from typing import Any
 import pytest
 
 from ariel.agency_daemon import (
+    AGENCY_DAEMON_API_VERSION,
     AGENCY_EGRESS_POLICY_VERSION,
     AGENCY_SANDBOX_POLICY_VERSION,
+    AgencyDaemonClient,
     AgencyDaemonError,
     AgencyRuntime,
 )
@@ -49,16 +51,12 @@ class FakeAgencyClient:
         *,
         repo_id: str,
         worktree_ref: str,
-        allow_dirty: bool,
-        force_with_lease: bool,
         client_request_id: str,
     ) -> dict[str, Any]:
         self.pr_sync_calls.append(
             {
                 "repo_id": repo_id,
                 "worktree_ref": worktree_ref,
-                "allow_dirty": allow_dirty,
-                "force_with_lease": force_with_lease,
                 "client_request_id": client_request_id,
             }
         )
@@ -71,11 +69,9 @@ class DefectiveAgencyClient(FakeAgencyClient):
         *,
         repo_id: str,
         worktree_ref: str,
-        allow_dirty: bool,
-        force_with_lease: bool,
         client_request_id: str,
     ) -> dict[str, Any]:
-        del repo_id, worktree_ref, allow_dirty, force_with_lease, client_request_id
+        del repo_id, worktree_ref, client_request_id
         raise RuntimeError("agency client bug")
 
 
@@ -85,12 +81,55 @@ class FailingAgencyClient(FakeAgencyClient):
         *,
         repo_id: str,
         worktree_ref: str,
-        allow_dirty: bool,
-        force_with_lease: bool,
         client_request_id: str,
     ) -> dict[str, Any]:
-        del repo_id, worktree_ref, allow_dirty, force_with_lease, client_request_id
+        del repo_id, worktree_ref, client_request_id
         raise AgencyDaemonError("agency daemon unavailable")
+
+
+def test_agency_daemon_client_health_accepts_current_api_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_request(
+        self: AgencyDaemonClient,
+        method: str,
+        path: str,
+        **_: Any,
+    ) -> dict[str, Any]:
+        del self
+        assert method == "GET"
+        assert path == "/health"
+        return {"ok": True, "api_version": AGENCY_DAEMON_API_VERSION}
+
+    monkeypatch.setattr(AgencyDaemonClient, "_request", fake_request)
+    client = AgencyDaemonClient(socket_path="/tmp/agency.sock", timeout_seconds=1.0)
+
+    assert client.health() == {"ok": True, "api_version": AGENCY_DAEMON_API_VERSION}
+
+
+def test_agency_daemon_client_health_reports_api_version_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_request(
+        self: AgencyDaemonClient,
+        method: str,
+        path: str,
+        **_: Any,
+    ) -> dict[str, Any]:
+        del self, method, path
+        return {"ok": True, "api_version": AGENCY_DAEMON_API_VERSION + 1}
+
+    monkeypatch.setattr(AgencyDaemonClient, "_request", fake_request)
+    client = AgencyDaemonClient(socket_path="/tmp/agency.sock", timeout_seconds=1.0)
+
+    with pytest.raises(
+        AgencyDaemonError,
+        match=(
+            "agency daemon API version mismatch: "
+            f"daemon={AGENCY_DAEMON_API_VERSION + 1}, client={AGENCY_DAEMON_API_VERSION}"
+        ),
+    ):
+        client.health()
 
 
 def test_agency_run_sends_and_returns_policy_metadata(tmp_path: Path) -> None:
@@ -110,7 +149,7 @@ def test_agency_run_sends_and_returns_policy_metadata(tmp_path: Path) -> None:
             "base_branch": None,
             "runner": None,
             "runner_args": [],
-            "env": {"SECRET": "redacted"},
+            "env": [{"name": "SECRET", "value": "redacted"}],
             "no_include_untracked": True,
         },
         action_attempt_id="aat_123",
@@ -156,8 +195,6 @@ def test_agency_pr_request_uses_client_request_id(tmp_path: Path) -> None:
             "repo_id": "repo_123",
             "invocation_id": "inv_123",
             "worktree_id": "wt_123",
-            "allow_dirty": False,
-            "force_with_lease": True,
             "client_request_id": "aat_pr_123",
             "land_client_request_id": "pwr_123:land",
             "pr_sync_client_request_id": "pwr_123:pr-sync",
@@ -176,8 +213,6 @@ def test_agency_pr_request_uses_client_request_id(tmp_path: Path) -> None:
         {
             "repo_id": "repo_123",
             "worktree_ref": "wt_123",
-            "allow_dirty": False,
-            "force_with_lease": True,
             "client_request_id": "pwr_123:pr-sync",
         }
     ]

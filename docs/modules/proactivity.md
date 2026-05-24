@@ -119,9 +119,9 @@ durable artifact:
   StreamingPull with exactly-once delivery and a dead-letter topic. On each
   delivery it inserts the same `ProviderEventRecord` row and enqueues the same
   `provider_event_received` task — and only then acks the Pub/Sub message.
-  Malformed payloads nack; unknown or inactive connector accounts ack and
-  drop. The sidecar writes a `subscriber_heartbeat` row that `/v1/health`
-  reports.
+  Malformed payloads, unknown accounts, and inactive connector accounts ack and
+  drop because redelivery cannot repair immutable provider data. The sidecar
+  writes a `subscriber_heartbeat` row that `/v1/health` reports.
 
 The worker performs two recurring maintenance tasks from connector state:
 
@@ -171,6 +171,9 @@ denies; it cannot act irreversibly on its own.
   no table of its own beyond `provider_watch_channels`.
 - The worker takes the earliest due row and deletes it on success. There is no
   claim protocol, heartbeat, dead-letter state, or reaper.
+- Wake tasks that have already committed a source turn are replayed through
+  `turns.source_background_task_id`; a retry does not call the model a second
+  time for the same task row.
 - The agent's scheduling surface is `proactive.schedule`; it writes scheduled
   `agent_wake` rows through the capability runtime. System-owned wake writers
   are provider syncs that find new data, Google connector-error handling,

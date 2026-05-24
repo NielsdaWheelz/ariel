@@ -4883,7 +4883,16 @@ class GoogleConnectorRuntime:
             },
         }
 
-    def _callback_invalid(
+    def _callback_invalid_error(self, *, reason: str) -> GoogleConnectorError:
+        return GoogleConnectorError(
+            status_code=400,
+            code="E_CONNECTOR_CALLBACK_INVALID",
+            message="google connector callback was rejected",
+            details={"reason": reason},
+            retryable=False,
+        )
+
+    def _append_callback_failed_event(
         self,
         *,
         db: Session,
@@ -4892,13 +4901,7 @@ class GoogleConnectorRuntime:
         reason: str,
         now_fn: Callable[[], datetime],
         new_id_fn: Callable[[str], str],
-    ) -> GoogleConnectorError:
-        _set_connector_error(
-            connector=connector,
-            error_code=reason,
-            now_fn=now_fn,
-            preserve_existing_blocking=True,
-        )
+    ) -> None:
         failed_event_type = (
             "evt.connector.google.reconnect.failed"
             if flow == "reconnect"
@@ -4918,13 +4921,52 @@ class GoogleConnectorRuntime:
             now_fn=now_fn,
             new_id_fn=new_id_fn,
         )
-        return GoogleConnectorError(
-            status_code=400,
-            code="E_CONNECTOR_CALLBACK_INVALID",
-            message="google connector callback was rejected",
-            details={"reason": reason},
-            retryable=False,
+
+    def _callback_invalid_recorded(
+        self,
+        *,
+        db: Session,
+        connector: GoogleConnectorRecord,
+        flow: str,
+        reason: str,
+        now_fn: Callable[[], datetime],
+        new_id_fn: Callable[[str], str],
+    ) -> GoogleConnectorError:
+        _set_connector_error(
+            connector=connector,
+            error_code=reason,
+            now_fn=now_fn,
+            preserve_existing_blocking=True,
         )
+        self._append_callback_failed_event(
+            db=db,
+            connector=connector,
+            flow=flow,
+            reason=reason,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        return self._callback_invalid_error(reason=reason)
+
+    def _callback_invalid_event_only(
+        self,
+        *,
+        db: Session,
+        connector: GoogleConnectorRecord,
+        flow: str,
+        reason: str,
+        now_fn: Callable[[], datetime],
+        new_id_fn: Callable[[str], str],
+    ) -> GoogleConnectorError:
+        self._append_callback_failed_event(
+            db=db,
+            connector=connector,
+            flow=flow,
+            reason=reason,
+            now_fn=now_fn,
+            new_id_fn=new_id_fn,
+        )
+        return self._callback_invalid_error(reason=reason)
 
     def complete_oauth_callback(
         self,
@@ -4938,7 +4980,7 @@ class GoogleConnectorRuntime:
     ) -> dict[str, Any]:
         connector = self._ensure_connector(db=db, now_fn=now_fn)
         if state is None or not state.strip():
-            raise self._callback_invalid(
+            raise self._callback_invalid_event_only(
                 db=db,
                 connector=connector,
                 flow="connect",
@@ -4955,7 +4997,7 @@ class GoogleConnectorRuntime:
         )
         flow = state_record.flow if state_record is not None else "connect"
         if state_record is None:
-            raise self._callback_invalid(
+            raise self._callback_invalid_event_only(
                 db=db,
                 connector=connector,
                 flow=flow,
@@ -4965,7 +5007,16 @@ class GoogleConnectorRuntime:
             )
 
         if state_record.consumed_at is not None:
-            raise self._callback_invalid(
+            if connector.status == "connected":
+                raise self._callback_invalid_event_only(
+                    db=db,
+                    connector=connector,
+                    flow=flow,
+                    reason="state_replayed",
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
+            raise self._callback_invalid_recorded(
                 db=db,
                 connector=connector,
                 flow=flow,
@@ -4975,7 +5026,7 @@ class GoogleConnectorRuntime:
             )
         now = now_fn()
         if state_record.expires_at < now:
-            raise self._callback_invalid(
+            raise self._callback_invalid_recorded(
                 db=db,
                 connector=connector,
                 flow=flow,
@@ -4984,7 +5035,7 @@ class GoogleConnectorRuntime:
                 new_id_fn=new_id_fn,
             )
         if error is not None and error.strip():
-            raise self._callback_invalid(
+            raise self._callback_invalid_recorded(
                 db=db,
                 connector=connector,
                 flow=flow,
@@ -4993,7 +5044,7 @@ class GoogleConnectorRuntime:
                 new_id_fn=new_id_fn,
             )
         if code is None or not code.strip():
-            raise self._callback_invalid(
+            raise self._callback_invalid_recorded(
                 db=db,
                 connector=connector,
                 flow=flow,
@@ -5012,7 +5063,7 @@ class GoogleConnectorRuntime:
                 encryption_keys=self.encryption_keys,
             )
         except SecretDecryptionFailure as exc:
-            raise self._callback_invalid(
+            raise self._callback_invalid_recorded(
                 db=db,
                 connector=connector,
                 flow=flow,
@@ -5081,7 +5132,7 @@ class GoogleConnectorRuntime:
         )
         access_token = access_token_raw.strip() if isinstance(access_token_raw, str) else ""
         if account_subject is None or account_email is None or not access_token:
-            raise self._callback_invalid(
+            raise self._callback_invalid_recorded(
                 db=db,
                 connector=connector,
                 flow=flow,
@@ -5102,7 +5153,7 @@ class GoogleConnectorRuntime:
                 encryption_keys=self.encryption_keys,
             )
         if refresh_token is None:
-            raise self._callback_invalid(
+            raise self._callback_invalid_recorded(
                 db=db,
                 connector=connector,
                 flow=flow,

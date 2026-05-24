@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 import json
-from typing import Any
+from typing import Any, cast
 
 from fastapi.encoders import jsonable_encoder
 from fastapi.testclient import TestClient
@@ -17,6 +18,8 @@ from ariel.persistence import (
     ActionAttemptRecord,
     AIJudgmentRecord,
     BackgroundTaskRecord,
+    MemoryLogRecord,
+    MemoryNoteRecord,
     TurnRecord,
 )
 from ariel.policy_engine import evaluate_proposal
@@ -765,6 +768,115 @@ def test_memory_remember_enqueues_background_task(
     task = tasks[0]
     assert task.payload["note"] == "the user prefers tea"
     assert task.payload["session_id"] == session_id
+
+
+def test_memory_note_create_read_delete_syscalls_execute_inline(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A main-agent run can create, inspect, and delete a controlled memory note.
+
+    This is the app/worker smoke path for the direct memory note syscalls:
+    the program observes each real syscall result, the note is gone at the end,
+    and the append-only memory log records the reversible note mutations.
+    """
+    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr("ariel.memory.embed_text", lambda _text, *, adapter, settings: None)
+
+    log_id = "mev_memory_read_log_fixture"
+    program = (
+        "created = memory.note.create(content='manual smoke controlled memory note')\n"
+        "read_created = memory.read(id=created['id'])\n"
+        "edited = memory.note.edit(id=created['id'], content='manual smoke edited memory note')\n"
+        "read_edited = memory.read(id=created['id'])\n"
+        f"read_log = memory.read(id={log_id!r})\n"
+        "deleted = memory.note.delete(id=created['id'])\n"
+        "read_deleted = memory.read(id=created['id'])\n"
+        "assert read_created['status'] == 'found', read_created\n"
+        "assert read_created['layer'] == 'note', read_created\n"
+        "assert edited['status'] == 'edited', edited\n"
+        "assert read_edited['content'] == 'manual smoke edited memory note', read_edited\n"
+        "assert read_log['status'] == 'found', read_log\n"
+        "assert read_log['layer'] == 'log', read_log\n"
+        "assert deleted['status'] == 'deleted', deleted\n"
+        "assert read_deleted['status'] == 'not_found', read_deleted\n"
+        "agent.emit_value(value={'note_cycle': 'ok'})\n"
+    )
+    adapter = CapturingRunAdapter(
+        responses=[
+            _program_response(
+                source=program,
+                provider="provider.program-loop",
+                model="model.program-loop-v1",
+                provider_response_id="resp_memory_note_cycle",
+            ),
+            _program_response(
+                source="agent.emit_message(text='note-cycle:ok')\n",
+                provider="provider.program-loop",
+                model="model.program-loop-v1",
+                provider_response_id="resp_memory_note_cycle_done",
+            ),
+        ]
+    )
+    with _build_client(postgres_url, adapter) as client:
+        with cast(Any, client.app).state.runtime.session_factory() as db:
+            with db.begin():
+                db.add(
+                    MemoryLogRecord(
+                        id=log_id,
+                        created_at=datetime(2026, 5, 24, 12, 0, tzinfo=UTC),
+                        kind="tool_observation",
+                        content="manual smoke controlled memory log row",
+                        embedding=None,
+                        session_id=None,
+                        turn_id=None,
+                        taint="clean",
+                        source_ref="manual-smoke",
+                    )
+                )
+        session_id = _session_id(client)
+        turn = post_message_and_drain(client, session_id, message="cycle a memory note")
+
+    assert turn.assistant_message == "note-cycle:ok"
+
+    engine = create_engine(postgres_url, future=True)
+    session_factory = sessionmaker(bind=engine, future=True, expire_on_commit=False)
+    try:
+        with session_factory() as db:
+            db_turn = db.scalar(select(TurnRecord).where(TurnRecord.session_id == session_id))
+            assert db_turn is not None
+            attempts = db.scalars(
+                select(ActionAttemptRecord)
+                .where(ActionAttemptRecord.turn_id == db_turn.id)
+                .order_by(ActionAttemptRecord.proposal_index.asc())
+            ).all()
+            note_attempt = next(
+                attempt for attempt in attempts if attempt.capability_id == "cap.memory.note.create"
+            )
+            assert note_attempt.execution_output is not None
+            note_id = note_attempt.execution_output["id"]
+            assert isinstance(note_id, str)
+            stored_note = db.get(MemoryNoteRecord, note_id)
+            log_rows = db.scalars(
+                select(MemoryLogRecord)
+                .where(MemoryLogRecord.source_ref == note_id)
+                .order_by(MemoryLogRecord.kind.asc())
+            ).all()
+    finally:
+        engine.dispose()
+
+    assert [attempt.capability_id for attempt in attempts] == [
+        "cap.memory.note.create",
+        "cap.memory.read",
+        "cap.memory.note.edit",
+        "cap.memory.read",
+        "cap.memory.read",
+        "cap.memory.note.delete",
+        "cap.memory.read",
+    ]
+    assert all(attempt.status == "succeeded" for attempt in attempts)
+    assert stored_note is None
+    assert {row.kind for row in log_rows} == {"note_create", "note_delete", "note_edit"}
 
 
 def test_two_programs_with_capability_syscalls_get_distinct_proposal_index(

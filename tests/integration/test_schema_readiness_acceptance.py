@@ -455,7 +455,7 @@ def test_schema_readiness_reports_context_pressure_rotation_reason(
     engine = create_engine(unmigrated_postgres_url, future=True, pool_pre_ping=True)
     try:
         schema_issues = schema_readiness_issues(engine)
-        assert "missing_alembic_head:20260523_0064" in schema_issues
+        assert "missing_alembic_head:20260524_0068" in schema_issues
         assert "forbidden_constraint_fragment:sessions.ck_session_rotation_reason" in schema_issues
         assert (
             "forbidden_constraint_fragment:"
@@ -502,7 +502,7 @@ def test_schema_readiness_reports_stale_capture_ingress_schema(
     engine = create_engine(unmigrated_postgres_url, future=True, pool_pre_ping=True)
     try:
         schema_issues = schema_readiness_issues(engine)
-        assert "missing_alembic_head:20260523_0064" in schema_issues
+        assert "missing_alembic_head:20260524_0068" in schema_issues
         assert "unexpected_column:captures.original_payload" in schema_issues
         assert "unexpected_column:captures.terminal_state" in schema_issues
         assert "unexpected_constraint:captures.ck_capture_terminal_state" in schema_issues
@@ -586,10 +586,91 @@ def test_capture_schema_migration_removes_raw_payload_and_dead_state(
         engine.dispose()
 
 
+def test_schema_readiness_reports_undispatched_background_task_types(
+    unmigrated_postgres_url: str,
+) -> None:
+    run_migrations(unmigrated_postgres_url, revision="20260523_0064")
+    engine = create_engine(unmigrated_postgres_url, future=True, pool_pre_ping=True)
+    try:
+        schema_issues = schema_readiness_issues(engine)
+        assert "missing_alembic_head:20260524_0068" in schema_issues
+        assert (
+            "forbidden_constraint_fragment:background_tasks.ck_background_task_type"
+            in schema_issues
+        )
+    finally:
+        engine.dispose()
+
+
+def test_schema_readiness_reports_missing_turn_idempotency_owner_constraint(
+    unmigrated_postgres_url: str,
+) -> None:
+    run_migrations(unmigrated_postgres_url, revision="20260524_0067")
+    engine = create_engine(unmigrated_postgres_url, future=True, pool_pre_ping=True)
+    try:
+        schema_issues = schema_readiness_issues(engine)
+        assert "missing_constraint:turn_idempotency_keys.ck_turn_idempotency_has_owner" in (
+            schema_issues
+        )
+    finally:
+        engine.dispose()
+
+
+def test_background_task_schema_migration_rejects_undispatched_task_rows(
+    unmigrated_postgres_url: str,
+) -> None:
+    run_migrations(unmigrated_postgres_url, revision="20260523_0064")
+    engine = create_engine(unmigrated_postgres_url, future=True, pool_pre_ping=True)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO background_tasks "
+                    "(id, task_type, payload, attempts, run_after, created_at, updated_at) "
+                    "VALUES ('tsk_dead_google_object', 'google_object_hydration_due', "
+                    "'{}'::jsonb, 0, now(), now(), now())"
+                )
+            )
+
+        with pytest.raises(RuntimeError, match="undispatched background task rows"):
+            run_migrations(unmigrated_postgres_url)
+    finally:
+        engine.dispose()
+
+
+def test_background_task_schema_migration_removes_undispatched_task_types(
+    unmigrated_postgres_url: str,
+) -> None:
+    run_migrations(unmigrated_postgres_url, revision="20260523_0064")
+    run_migrations(unmigrated_postgres_url)
+    engine = create_engine(unmigrated_postgres_url, future=True, pool_pre_ping=True)
+    try:
+        with pytest.raises(IntegrityError) as exc_info:
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "INSERT INTO background_tasks "
+                        "(id, task_type, payload, attempts, run_after, created_at, updated_at) "
+                        "VALUES ('tsk_dead_provider_evidence', "
+                        "'provider_evidence_extraction_due', "
+                        "'{}'::jsonb, 0, now(), now(), now())"
+                    )
+                )
+
+        assert _integrity_constraint_name(exc_info.value) == "ck_background_task_type"
+        assert schema_readiness_issues(engine) == []
+    finally:
+        engine.dispose()
+
+
 def test_health_reads_subscriber_heartbeat_by_subscriber_name(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv(
+        "ARIEL_GOOGLE_PUBSUB_TOPIC",
+        "projects/my-project/topics/ariel-gmail-watch",
+    )
     monkeypatch.setenv(
         "ARIEL_GOOGLE_PUBSUB_SUBSCRIPTION",
         "projects/my-project/subscriptions/ariel-gmail-watch-sub",

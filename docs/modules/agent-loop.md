@@ -139,11 +139,19 @@ and the program's emitted outputs — message, values, finding/done, pause — a
 scrubbed from `RunProgramResult`. The model is fed the program error and
 authors the next program.
 
-A turn is not journaled and not replayed. If the worker crashes mid-turn the
-`background_tasks` row was not deleted and is retried as a fresh wake; the model
-re-evaluates from current committed state. Committed programs' effects stand;
-write capabilities carry capability-layer idempotency keys, so a re-run cannot
-double-send. This is the documented single-user tradeoff.
+A turn is not program-journaled. If the worker crashes after committing any turn
+state but before deleting the `background_tasks` row, the retried task looks up
+`turns.source_background_task_id`. A completed or failed source turn is reused;
+an interrupted `in_progress` source turn is marked failed and the model is not
+called again. Committed programs' effects stand; write capabilities still carry
+capability-layer idempotency keys, but crash replay does not intentionally run a
+second model turn.
+
+Direct HTTP user-message ingress also has request idempotency above the queue:
+`turn_idempotency_keys` stores the pending `202` response by `Idempotency-Key`
+and is updated with the completed turn response after the worker commits. A
+retry after the transient queue row is gone replays that durable response instead
+of creating a second `user_message` task.
 
 ## The scratch store
 
@@ -261,8 +269,10 @@ unapproved action.
   returns `202`; it never runs a turn. There is no per-turn session advisory
   lock.
 - A turn commits per `run` program. There is no turn-spanning transaction and
-  no program journaling or replay. A failed program's syscall-trace audit
-  commits; its staged approvals are voided and its emitted outputs scrubbed.
+  no program journaling. Task replay is keyed by `source_background_task_id`; it
+  reuses or fails the source turn rather than running the model again. A failed
+  program's syscall-trace audit commits; its staged approvals are voided and its
+  emitted outputs scrubbed.
 - The loop is bounded by a wall-clock budget the model can see, a model-call
   backstop, and host-side stuck-detection; budget or backstop exhaustion ends
   the loop gracefully.

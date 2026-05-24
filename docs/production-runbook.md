@@ -37,8 +37,9 @@ Use a dedicated Linux user:
 - User: `ariel`
 - App root: `/opt/ariel`
 - Agency root: `/opt/agency`
+- Agency state root: `/var/lib/agency`
 - Env file: `/etc/ariel/ariel.env`
-- Agency socket: `/run/agency/agency-daemon.sock`
+- Agency socket: `/var/lib/agency/agencyd.sock`
 - Ariel API bind: `127.0.0.1:8000`
 - Postgres database: `ariel`
 
@@ -60,6 +61,9 @@ apt-get install -y caddy git postgresql postgresql-contrib
 5. Install `uv` for the `ariel` user.
 6. Install Agency using its production installation path.
 7. Clone Ariel into `/opt/ariel` and Agency into `/opt/agency`.
+8. Install the Agency binary at `/opt/agency/bin/agency`, owned by `root`
+   and executable by the `ariel` service user. The checked-in
+   `deploy/systemd/agency-daemon.service` runs this binary directly.
 
 ## Sandbox Runtime
 
@@ -165,14 +169,18 @@ message-specific Discord target is unavailable.
 Required Agency settings:
 
 ```sh
-ARIEL_AGENCY_SOCKET_PATH=/run/agency/agency-daemon.sock
+ARIEL_AGENCY_SOCKET_PATH=/var/lib/agency/agencyd.sock
 ARIEL_AGENCY_ALLOWED_REPO_ROOTS=/opt/ariel,/opt/agency
 ARIEL_AGENCY_DEFAULT_BASE_BRANCH=main
 ARIEL_AGENCY_DEFAULT_RUNNER=codex
 ARIEL_AGENCY_TIMEOUT_SECONDS=30.0
-ARIEL_AGENCY_EVENT_SECRET=<shared-event-secret>
 ARIEL_AGENCY_EVENT_MAX_SKEW_SECONDS=300
 ```
+
+Set `ARIEL_AGENCY_EVENT_SECRET=<shared-event-secret>` only when signed
+`POST /v1/agency/events` webhook ingress is enabled. When unset, the Agency
+daemon socket capabilities still run, but the public Agency event route returns
+`E_AGENCY_EVENTS_DISABLED`.
 
 Required worker settings:
 
@@ -184,28 +192,34 @@ ARIEL_PROVIDER_RECONCILE_SYNC_INTERVAL_SECONDS=3600
 Required Google Workspace push settings when Gmail/Calendar push is enabled:
 
 ```sh
+ARIEL_GOOGLE_OAUTH_CLIENT_ID=<google-oauth-client-id>
+ARIEL_GOOGLE_OAUTH_CLIENT_SECRET=<google-oauth-client-secret>
+ARIEL_GOOGLE_OAUTH_REDIRECT_URI=https://<your-fqdn>/v1/connectors/google/callback
+ARIEL_GOOGLE_OAUTH_STATE_TTL_SECONDS=600
+ARIEL_GOOGLE_OAUTH_TIMEOUT_SECONDS=10
 ARIEL_PUBLIC_WEBHOOK_BASE_URL=https://<your-fqdn>
 ARIEL_GOOGLE_PUBSUB_TOPIC=projects/<gcp-project>/topics/ariel-gmail-watch
 ARIEL_GOOGLE_PUBSUB_SUBSCRIPTION=projects/<gcp-project>/subscriptions/ariel-gmail-watch-sub
 ARIEL_GOOGLE_APPLICATION_CREDENTIALS_PATH=/etc/ariel/secrets/gcp-pubsub-sa.json
 ```
 
-`ARIEL_PUBLIC_WEBHOOK_BASE_URL` is required in production; the Calendar
-`events.watch` `address` and the Google OAuth redirect URI are derived from
-it. Calendar push callbacks are authenticated by the per-watch
+`ARIEL_PUBLIC_WEBHOOK_BASE_URL` is required in production; Calendar
+`events.watch` addresses are derived from it. The OAuth redirect URI is
+configured explicitly by `ARIEL_GOOGLE_OAUTH_REDIRECT_URI` and must match the
+Google OAuth client. Calendar push callbacks are authenticated by the per-watch
 `X-Goog-Channel-Token` values stored with active watch-channel records.
-`ARIEL_GOOGLE_PUBSUB_SUBSCRIPTION` and
-`ARIEL_GOOGLE_APPLICATION_CREDENTIALS_PATH` must be set together: both for
-Gmail push on, neither for off.
+`ARIEL_GOOGLE_PUBSUB_TOPIC`, `ARIEL_GOOGLE_PUBSUB_SUBSCRIPTION`, and
+`ARIEL_GOOGLE_APPLICATION_CREDENTIALS_PATH` must be set together: all three for
+Gmail push on, none for off.
 
 The single-threaded `ariel-worker` service drains the one `background_tasks`
-queue: scheduled agent wakes, provider push and poll ingestion, the memory
-rememberer and sweep, durable action execution, approval expiry, and Agency
-event ingestion. There is no separate scheduler process. The worker takes the
+queue: scheduled agent wakes, provider push and poll ingestion, `memory_encode`,
+`memory_dream`, durable action execution, approval expiry, and Agency event
+ingestion. There is no separate scheduler process. The worker takes the
 earliest due row, dispatches by `task_type`, and on success deletes the row or
 re-arms it when it recurs; a failed task backs off within its `attempts` budget
 (cap 5). There is no claim protocol, heartbeat, dead-letter state, or stale-task
-reaper — a row existing and due is the only pending state.
+reaper; a row existing and due is the only pending state.
 
 Proactivity is not a separate engine. A provider push, a poll result that finds
 new data, a due scheduled task, and a Google connector error each enqueue an
@@ -219,14 +233,13 @@ Set provider keys only for enabled capabilities:
 
 ```sh
 ARIEL_SEARCH_WEB_API_KEY=<brave-api-key>
-ARIEL_SEARCH_NEWS_API_KEY=<optional-news-api-key>
-ARIEL_WEB_EXTRACT_API_KEY=<optional-extract-api-key>
 ARIEL_MAPS_API_KEY=<google-maps-platform-api-key>
 ARIEL_WEATHER_PROVIDER_MODE=production
 ARIEL_WEATHER_PRODUCTION_API_KEY=<weather-api-key>
 ```
 
-Do not set `ARIEL_MODEL_PROVIDER` or `ARIEL_MODEL_API_BASE_URL`.
+The model runtime is OpenAI Responses only. Keep model settings to the current
+`ARIEL_OPENAI_*` and `ARIEL_MODEL_*` fields in `src/ariel/config.py`.
 
 Restrict `ARIEL_MAPS_API_KEY` in the Google Cloud console to the Routes API, Places API
 (New), and Geocoding API, and to this deployment's egress IP address. An unrestricted Maps
@@ -300,7 +313,9 @@ a Gmail `users.watch` (publishes to the Pub/Sub topic) and a Calendar
 
 ```sh
 curl -I https://<your-fqdn>/                                # 404
-curl -I https://<your-fqdn>/v1/providers/google/events      # 405 (POST-only)
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  -X POST 'https://<your-fqdn>/v1/providers/google/events?resource_type=calendar&resource_id=primary'
+# 422 without Google watch headers; provider auth is enforced by the route
 curl http://127.0.0.1:8000/v1/health                        # subscribers.gmail_pubsub present
 ```
 
@@ -317,16 +332,25 @@ Configure Cloud Monitoring alerts on the subscription:
 - Any non-zero count of messages on the `ariel-gmail-watch-dlq` topic
 
 A stuck message on the DLQ topic is investigated by pulling from
-`ariel-gmail-watch-dlq-sub`.
+`ariel-gmail-watch-dlq-sub`. The DLQ is for Pub/Sub delivery exhaustion on
+retryable subscriber failures. Malformed payloads, unknown accounts, and inactive
+connector accounts are immutable provider data; the subscriber logs and
+ack/drops them so they do not churn through retries.
 
 ## Services
 
-Run four systemd services:
+Run five systemd services:
 
 - `agency-daemon.service`
 - `ariel-api.service`
 - `ariel-worker.service`
+- `ariel-pubsub.service`
 - `ariel-discord.service`
+
+The checked-in `agency-daemon.service` starts
+`/opt/agency/bin/agency daemon start --foreground`, sets
+`AGENCY_DATA_DIR=/var/lib/agency`, and keeps Agency state under
+`/var/lib/agency`.
 
 All Ariel services use:
 
@@ -335,6 +359,9 @@ All Ariel services use:
 - `EnvironmentFile=/etc/ariel/ariel.env`
 - `Restart=always`
 - `RestartSec=5`
+- `NoNewPrivileges=true`
+- `ProtectSystem=full`
+- no Linux capabilities
 
 `ariel-api` hosts the in-process `run` sandbox, so its unit must reach `runsc`
 on `PATH`. Installing `runsc` to `/usr/local/bin` satisfies this; otherwise add
@@ -345,15 +372,22 @@ Service ordering:
 - `ariel-api` starts after Postgres.
 - `agency-daemon` starts before Agency-backed Ariel work is accepted.
 - `ariel-worker` starts after `ariel-api` and Postgres.
+- `ariel-pubsub` starts after `ariel-api` and Postgres.
 - `ariel-discord` starts after `ariel-api`.
 
 Start or restart with:
 
 ```sh
 systemctl daemon-reload
-systemctl enable --now agency-daemon ariel-api ariel-worker ariel-discord
-systemctl restart ariel-api ariel-worker ariel-discord
+systemctl enable --now agency-daemon ariel-api ariel-worker ariel-pubsub ariel-discord
+systemctl restart ariel-api ariel-worker ariel-pubsub ariel-discord
+make production-posture
 ```
+
+`make production-posture` checks systemd state, Ariel unit hardening, the Agency
+daemon/socket, and loopback health without loading the Ariel env file. Add
+`--check-db-schema` to `scripts/verify_production_posture.py` only when a direct
+database readiness check is needed.
 
 ## Caddy And TLS
 
@@ -386,7 +420,12 @@ make verify
 6. Confirm health checks.
 7. Send one ambient owner DM smoke message and one ambient owner home-guild smoke
    message.
-8. Start one approval-required `agency.run` smoke task in an allowed repo.
+8. Start one approval-required `agency.run` smoke task in an allowed repo with
+   `no_include_untracked=true`, an explicit runner, and a prompt that can touch
+   only a disposable smoke branch or smoke-only file. Verify the resulting job
+   with `agency.status` and `agency.artifacts`. Run `agency.request_pr` only
+   when the operator has approved the external-send side effect, then close the
+   smoke PR unmerged and delete the smoke branch.
 
 ## Health Checks
 
@@ -394,11 +433,17 @@ Inspect provider ingestion and the durable timeline through the typed API:
 
 ```sh
 export ARIEL_LOCAL_AUTH_TOKEN=<local-api-token>
-curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" http://127.0.0.1:8000/v1/connectors/google
-curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" http://127.0.0.1:8000/v1/connectors/google/sync-cursors
-curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" http://127.0.0.1:8000/v1/provider-events
-curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" http://127.0.0.1:8000/v1/sync-runs
-curl -s -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" http://127.0.0.1:8000/v1/discord-messages
+auth=( -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" )
+curl -fsS "${auth[@]}" http://127.0.0.1:8000/v1/connectors/google \
+  | jq '{ok, status:.connector.status, readiness:.connector.readiness, account_identity_present:(.connector.account_email != null), last_error_code:.connector.last_error_code}'
+curl -fsS "${auth[@]}" http://127.0.0.1:8000/v1/connectors/google/sync-cursors \
+  | jq '{ok, count:(.cursors|length), cursors:[.cursors[] | {resource_type, resource_id, status, has_cursor:(.cursor_value != null), last_error_code}]}'
+curl -fsS "${auth[@]}" 'http://127.0.0.1:8000/v1/provider-events?limit=5' \
+  | jq '{ok, count:(.events|length)}'
+curl -fsS "${auth[@]}" 'http://127.0.0.1:8000/v1/sync-runs?limit=5' \
+  | jq '{ok, count:(.sync_runs|length)}'
+curl -fsS "${auth[@]}" 'http://127.0.0.1:8000/v1/discord-messages?limit=5' \
+  | jq '{ok, count:(.discord_messages|length), ids:[.discord_messages[].id]}'
 ```
 
 A proactive wake leaves no proactive-specific record: it is a session turn like

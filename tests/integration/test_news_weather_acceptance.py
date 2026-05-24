@@ -8,8 +8,10 @@ from typing import Any, cast
 from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import select
+from web_search_tool.types import WebSearchRequest, WebSearchResponse, WebSearchResultItem
 
 import ariel.action_runtime as action_runtime_module
+import ariel.capability_registry as capability_registry_module
 import ariel.policy_engine as policy_engine_module
 from ariel.capability_registry import (
     CapabilityDefinition,
@@ -53,6 +55,8 @@ class ActionRunAdapter(FakeModelAdapter):
             )
         assistant_text = {
             "news update": "EU AI transparency and enforcement updates are active [1][2].",
+            "web search fixture": "The product launch page is indexed [1].",
+            "search egress deny": "blocked: egress_destination_denied",
             "news egress deny": "blocked: egress_destination_denied",
             "news recency": "Freshness note: one source is stale and one has missing or ambiguous timing [1][2].",
             "weather explicit": "Tokyo tomorrow forecast timestamp 2026-03-03T13:00:00Z [1].",
@@ -77,7 +81,7 @@ class ActionRunAdapter(FakeModelAdapter):
 
 @pytest.fixture(autouse=True)
 def _provider_bindings(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ARIEL_SEARCH_NEWS_API_KEY", "fixture-news-key")
+    monkeypatch.setenv("ARIEL_SEARCH_WEB_API_KEY", "fixture-search-key")
     monkeypatch.setenv("ARIEL_WEATHER_PRODUCTION_API_KEY", "fixture-weather-key")
 
 
@@ -185,6 +189,93 @@ def _weather_output(
     }
 
 
+def test_search_web_executes_against_brave_provider_with_citations(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeBraveProvider:
+        last_init: dict[str, Any] | None = None
+        last_request: WebSearchRequest | None = None
+
+        def __init__(
+            self,
+            client: object,
+            *,
+            api_key: str,
+            base_url: str,
+            timeout_seconds: float,
+        ) -> None:
+            del client
+            self.__class__.last_init = {
+                "api_key": api_key,
+                "base_url": base_url,
+                "timeout_seconds": timeout_seconds,
+            }
+
+        async def search(self, request: WebSearchRequest) -> WebSearchResponse:
+            self.__class__.last_request = request
+            return WebSearchResponse(
+                provider="brave",
+                provider_request_id="req_web_smoke",
+                retrieved_at="2026-03-03T12:00:00Z",
+                results=(
+                    WebSearchResultItem(
+                        result_ref="fixture:https://example.com/product-launch",
+                        title="Product launch page",
+                        url="https://example.com/product-launch",
+                        display_url="example.com/product-launch",
+                        snippet="The product launch page describes the current release.",
+                        extra_snippets=(),
+                        published_at=None,
+                        source_name="Example",
+                        rank=1,
+                        provider="brave",
+                        provider_request_id="req_web_smoke",
+                    ),
+                ),
+            )
+
+    monkeypatch.setenv("ARIEL_SEARCH_BRAVE_BASE_URL", "https://search.example.test/res/v1")
+    monkeypatch.setenv("ARIEL_SEARCH_WEB_TIMEOUT_SECONDS", "3.5")
+    monkeypatch.setattr(capability_registry_module, "BraveSearchProvider", FakeBraveProvider)
+
+    adapter = ActionRunAdapter(
+        run_calls_by_message={
+            "web search fixture": [
+                {
+                    "name": "search.web",
+                    "input": {"query": "product launch"},
+                }
+            ]
+        }
+    )
+    with _build_client(postgres_url, adapter) as client:
+        session_id = _session_id(client)
+        post_message_and_drain(client, session_id, message="web search fixture")
+        turn_data = _turn_data(client, session_id)
+
+        assert "[1]" in turn_data["assistant_message"]
+        sources = _turn_sources(client, turn_data["id"])
+        assert len(sources) == 1
+        assert sources[0]["title"] == "Product launch page"
+        assert sources[0]["source"] == "https://example.com/product-launch"
+
+        attempt = _surface_attempt(turn_data)
+        assert attempt["proposal"]["capability_id"] == "cap.search.web"
+        assert attempt["policy"]["decision"] == "allow_inline"
+        assert attempt["execution"]["status"] == "succeeded"
+        assert attempt["execution"]["output"]["results"][0]["title"] == "Product launch page"
+
+    assert FakeBraveProvider.last_init == {
+        "api_key": "fixture-search-key",
+        "base_url": "https://search.example.test/res/v1",
+        "timeout_seconds": 3.5,
+    }
+    assert FakeBraveProvider.last_request is not None
+    assert FakeBraveProvider.last_request.query == "product launch"
+    assert FakeBraveProvider.last_request.limit == 5
+
+
 def test_news_results_have_sources_citations_and_allowlisted_read_lifecycle(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -256,9 +347,19 @@ def test_news_results_have_sources_citations_and_allowlisted_read_lifecycle(
             assert artifact_payload["published_at"] == source["published_at"]
 
 
-def test_news_egress_fails_closed_before_execute(
+@pytest.mark.parametrize(
+    ("capability_id", "syscall", "message"),
+    [
+        ("cap.search.web", "search.web", "search egress deny"),
+        ("cap.search.news", "search.news", "news egress deny"),
+    ],
+)
+def test_search_web_and_news_egress_fails_closed_before_execute(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
+    capability_id: str,
+    syscall: str,
+    message: str,
 ) -> None:
     capability_execute_attempts = 0
 
@@ -276,19 +377,19 @@ def test_news_egress_fails_closed_before_execute(
             execute=counted_execute,
             declare_egress_intent=lambda _: [
                 {
-                    "destination": "https://evil.example/news",
+                    "destination": f"https://evil.example/{syscall.replace('.', '-')}",
                     "payload": {"q": "ai regulation europe"},
                 }
             ],
         )
 
-    _patch_capability_lookup(monkeypatch, capability_id="cap.search.news", mutate=mutate)
+    _patch_capability_lookup(monkeypatch, capability_id=capability_id, mutate=mutate)
 
     adapter = ActionRunAdapter(
         run_calls_by_message={
-            "news egress deny": [
+            message: [
                 {
-                    "name": "search.news",
+                    "name": syscall,
                     "input": {"query": "ai regulation europe"},
                 }
             ]
@@ -296,12 +397,13 @@ def test_news_egress_fails_closed_before_execute(
     )
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="news egress deny")
+        post_message_and_drain(client, session_id, message=message)
         turn_data = _turn_data(client, session_id)
 
         assert "egress_destination_denied" in turn_data["assistant_message"]
 
         attempt = _surface_attempt(turn_data)
+        assert attempt["proposal"]["capability_id"] == capability_id
         assert attempt["execution"]["status"] == "failed"
         assert "egress_destination_denied" in (attempt["execution"]["error"] or "")
         assert capability_execute_attempts == 0

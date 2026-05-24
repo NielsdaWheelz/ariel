@@ -96,7 +96,6 @@ def test_model_call_backstop_exhaustion_ends_gracefully(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("ARIEL_MAX_CONTEXT_TOKENS", "20000")
     monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "20000")
     monkeypatch.setenv("ARIEL_AGENT_LOOP_MAX_MODEL_CALLS", "1")
     monkeypatch.setenv("ARIEL_MAIN_TURN_BUDGET_SECONDS", "300.0")
@@ -121,7 +120,6 @@ def test_turn_budget_exhaustion_ends_gracefully(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("ARIEL_MAX_CONTEXT_TOKENS", "20000")
     monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "20000")
     monkeypatch.setenv("ARIEL_MAIN_TURN_BUDGET_SECONDS", "0.001")
     monkeypatch.setenv("ARIEL_AGENT_LOOP_MAX_MODEL_CALLS", "100")
@@ -154,7 +152,6 @@ def test_stuck_detection_ends_turn_gracefully(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("ARIEL_MAX_CONTEXT_TOKENS", "20000")
     monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "20000")
     monkeypatch.setenv("ARIEL_MAIN_TURN_BUDGET_SECONDS", "300.0")
     monkeypatch.setenv("ARIEL_AGENT_LOOP_MAX_MODEL_CALLS", "100")

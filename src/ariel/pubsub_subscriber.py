@@ -29,6 +29,7 @@ from google.cloud import pubsub_v1  # type: ignore[import-untyped]
 from google.cloud.pubsub_v1.subscriber.exceptions import (  # type: ignore[import-untyped]
     AcknowledgeError,
 )
+from google.oauth2 import service_account  # type: ignore[import-untyped]
 from sqlalchemy import create_engine, select
 from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
 from sqlalchemy.orm import Session, sessionmaker
@@ -186,17 +187,17 @@ def handle_message(
 ) -> None:
     """Process one Pub/Sub message: decode, dedup, insert, enqueue, ack.
 
-    Malformed payload → nack (Pub/Sub redelivers up to ``max_delivery_attempts``,
-    then dead-letters). Unknown or inactive account → ack (drop). Duplicate
-    messageId → ack. DB serialization failure → no ack; Pub/Sub redelivers;
-    dedup catches.
+    Malformed payload → ack/drop because the Pub/Sub data is immutable and a
+    redelivery cannot repair it. Unknown or inactive account → ack/drop.
+    Duplicate messageId → ack. DB serialization failure → no ack; Pub/Sub
+    redelivers; dedup catches.
     """
     try:
         notification = _parse_message_payload(message)
     except MalformedPubSubPayload as exc:
         message_id = getattr(message, "message_id", "<unknown>")
         _log.warning("malformed Pub/Sub payload (message_id=%s): %s", message_id, exc)
-        message.nack()
+        _ack_message(message)
         return
 
     dedup_input = f"google:gmail:{notification.email_address}:pubsub:{notification.message_id}"
@@ -382,7 +383,7 @@ def main() -> None:
     sa_stat = os.stat(sa_path)
     if (sa_stat.st_mode & 0o077) != 0:
         raise RuntimeError(f"{sa_path} must be chmod 600 (group/other bits must be 0)")
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = sa_path
+    credentials = service_account.Credentials.from_service_account_file(sa_path)
 
     engine = create_engine(
         settings.database_url,
@@ -392,7 +393,7 @@ def main() -> None:
     )
     session_factory = sessionmaker(bind=engine, future=True, expire_on_commit=False)
 
-    subscriber = pubsub_v1.SubscriberClient()
+    subscriber = pubsub_v1.SubscriberClient(credentials=credentials)
     subscription_path = settings.google_pubsub_subscription
     # Fail loudly if the subscription or our SA's binding is missing.
     subscriber.get_subscription(subscription=subscription_path)

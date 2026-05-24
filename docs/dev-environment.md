@@ -101,6 +101,9 @@ Two options:
   ID, and user ID into `.env.dev`. The prod and dev bots then sit on
   different Discord identities and do not collide.
 
+The Discord application/client ID is only for constructing the provider invite
+URL in the Discord developer portal. Ariel does not read it as an env var.
+
 ## Alembic against dev
 
 `make dev-upgrade` is equivalent to:

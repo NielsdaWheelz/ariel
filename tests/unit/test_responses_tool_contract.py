@@ -138,6 +138,17 @@ def test_run_callable_aliases_are_unique_and_deliberate() -> None:
     assert capability_id_for_run_callable("memory.forget_all") is None
 
 
+def test_every_run_callable_alias_has_model_facing_signature() -> None:
+    missing: list[tuple[str, str]] = []
+    for capability_id in internal_callable_capability_ids():
+        alias = run_callable_name_for_capability_id(capability_id)
+        assert alias is not None, capability_id
+        if not RUN_CALLABLE_SIGNATURES.get(alias, "").strip():
+            missing.append((alias, capability_id))
+
+    assert missing == []
+
+
 def test_run_callable_signatures_match_validators_for_common_capabilities() -> None:
     """Each high-traffic capability's signature string must list every key its
     input validator accepts, by exact name. The model sees this signature both
@@ -182,6 +193,98 @@ def test_run_callable_signatures_match_validators_for_common_capabilities() -> N
             },
         ),
         (
+            "calendar.list_calendars",
+            "cap.calendar.list_calendars",
+            set(),
+            {},
+        ),
+        (
+            "calendar.propose_slots",
+            "cap.calendar.propose_slots",
+            {
+                "window_start",
+                "window_end",
+                "duration_minutes",
+                "attendees",
+                "timezone",
+                "source_evidence_ids",
+                "quoted_content_caveat",
+                "participants",
+                "proposed_windows",
+                "timezone_evidence",
+                "constraints",
+            },
+            {
+                "window_start": "2026-05-20T00:00:00Z",
+                "window_end": "2026-05-21T00:00:00Z",
+                "duration_minutes": 30,
+                "attendees": ["niels@example.com"],
+                "timezone": "UTC",
+                "source_evidence_ids": [],
+                "quoted_content_caveat": False,
+                "participants": ["Niels"],
+                "proposed_windows": [],
+                "timezone_evidence": {
+                    "source": None,
+                    "rationale": None,
+                    "confidence": None,
+                },
+                "constraints": {
+                    "hard": [],
+                    "soft": [],
+                    "attendee_notes": [],
+                },
+            },
+        ),
+        (
+            "calendar.create_event",
+            "cap.calendar.create_event",
+            {
+                "title",
+                "start_time",
+                "end_time",
+                "idempotency_key",
+                "user_instruction_ref",
+            },
+            {
+                "title": "Manual smoke hold",
+                "start_time": "2026-05-20T09:00:00Z",
+                "end_time": "2026-05-20T09:30:00Z",
+                "attendees": [],
+                "idempotency_key": "smoke-cal-create",
+                "user_instruction_ref": "turn:test",
+            },
+        ),
+        (
+            "calendar.update_event",
+            "cap.calendar.update_event",
+            {"event_id", "title", "idempotency_key", "user_instruction_ref"},
+            {
+                "event_id": "evt_123",
+                "title": "Manual smoke hold, updated",
+                "idempotency_key": "smoke-cal-update",
+                "user_instruction_ref": "turn:test",
+            },
+        ),
+        (
+            "calendar.respond_to_event",
+            "cap.calendar.respond_to_event",
+            {
+                "event_id",
+                "attendee_email",
+                "response_status",
+                "idempotency_key",
+                "user_instruction_ref",
+            },
+            {
+                "event_id": "evt_123",
+                "attendee_email": "niels@example.com",
+                "response_status": "tentative",
+                "idempotency_key": "smoke-cal-respond",
+                "user_instruction_ref": "turn:test",
+            },
+        ),
+        (
             "email.search",
             "cap.email.search",
             {"query"},
@@ -204,6 +307,96 @@ def test_run_callable_signatures_match_validators_for_common_capabilities() -> N
             "cap.drive.read",
             {"file_id"},
             {"file_id": "1AbCdEf"},
+        ),
+        (
+            "drive.share",
+            "cap.drive.share",
+            {
+                "file_id",
+                "grantee_email",
+                "role",
+                "idempotency_key",
+                "user_instruction_ref",
+            },
+            {
+                "file_id": "1AbCdEf",
+                "grantee_email": "niels@example.com",
+                "role": "reader",
+                "idempotency_key": "smoke-drive-share",
+                "user_instruction_ref": "turn:test",
+            },
+        ),
+        (
+            "email.draft",
+            "cap.email.draft",
+            {"to", "subject", "body", "idempotency_key", "user_instruction_ref"},
+            {
+                "to": ["niels@example.com"],
+                "subject": "Manual smoke draft",
+                "body": "Draft body",
+                "idempotency_key": "smoke-email-draft",
+                "user_instruction_ref": "turn:test",
+            },
+        ),
+        (
+            "email.send",
+            "cap.email.send",
+            {"to", "subject", "body", "idempotency_key", "user_instruction_ref"},
+            {
+                "to": ["niels@example.com"],
+                "subject": "Manual smoke send",
+                "body": "Send body",
+                "idempotency_key": "smoke-email-send",
+                "user_instruction_ref": "turn:test",
+            },
+        ),
+        (
+            "email.archive",
+            "cap.email.archive",
+            {"message_ids", "idempotency_key", "user_instruction_ref"},
+            {
+                "message_ids": ["msg_123"],
+                "idempotency_key": "smoke-email-archive",
+                "user_instruction_ref": "turn:test",
+            },
+        ),
+        (
+            "email.trash",
+            "cap.email.trash",
+            {"message_ids", "idempotency_key", "user_instruction_ref"},
+            {
+                "message_ids": ["msg_123"],
+                "idempotency_key": "smoke-email-trash",
+                "user_instruction_ref": "turn:test",
+            },
+        ),
+        (
+            "email.labels.modify",
+            "cap.email.labels.modify",
+            {
+                "message_ids",
+                "add_labels",
+                "remove_labels",
+                "idempotency_key",
+                "user_instruction_ref",
+            },
+            {
+                "message_ids": ["msg_123"],
+                "add_labels": ["ManualSmoke"],
+                "remove_labels": [],
+                "idempotency_key": "smoke-email-labels",
+                "user_instruction_ref": "turn:test",
+            },
+        ),
+        (
+            "email.undo",
+            "cap.email.undo",
+            {"undo_token", "idempotency_key", "user_instruction_ref"},
+            {
+                "undo_token": "undo_123",
+                "idempotency_key": "smoke-email-undo",
+                "user_instruction_ref": "turn:test",
+            },
         ),
         (
             "maps.search_places",
@@ -242,6 +435,12 @@ def test_run_callable_signatures_match_validators_for_common_capabilities() -> N
             {"when": "2026-05-21T09:00:00Z", "note": "remind about offsite"},
         ),
         (
+            "memory.recall",
+            "cap.memory.recall",
+            {"query"},
+            {"query": "project phoenix"},
+        ),
+        (
             "memory.remember",
             "cap.memory.remember",
             {"note"},
@@ -259,10 +458,82 @@ def test_run_callable_signatures_match_validators_for_common_capabilities() -> N
             },
         ),
         (
+            "memory.read",
+            "cap.memory.read",
+            {"id"},
+            {"id": "mem_123"},
+        ),
+        (
+            "memory.note.create",
+            "cap.memory.note.create",
+            {"content"},
+            {"content": "new note"},
+        ),
+        (
+            "memory.note.edit",
+            "cap.memory.note.edit",
+            {"id", "content"},
+            {"id": "note_123", "content": "updated note"},
+        ),
+        (
+            "memory.note.delete",
+            "cap.memory.note.delete",
+            {"id"},
+            {"id": "note_123"},
+        ),
+        (
             "research.investigate",
             "cap.research.investigate",
             {"question", "mode"},
             {"question": "What is the state of fusion in 2026?", "mode": "web"},
+        ),
+        (
+            "agency.run",
+            "cap.agency.run",
+            {
+                "repo_root",
+                "name",
+                "prompt",
+                "base_branch",
+                "runner",
+                "runner_args",
+                "env",
+                "no_include_untracked",
+            },
+            {
+                "repo_root": "/home/niels/src/personal/ariel",
+                "name": "Manual smoke survey",
+                "prompt": "Inspect only.",
+                "base_branch": "main",
+                "runner": "codex",
+                "runner_args": [],
+                "env": [],
+                "no_include_untracked": True,
+            },
+        ),
+        (
+            "agency.status",
+            "cap.agency.status",
+            {"job_id", "repo_id", "task_id"},
+            {"job_id": "job_123"},
+        ),
+        (
+            "agency.artifacts",
+            "cap.agency.artifacts",
+            {"job_id", "repo_id", "task_id"},
+            {"job_id": "job_123"},
+        ),
+        (
+            "agency.request_pr",
+            "cap.agency.request_pr",
+            {
+                "job_id",
+                "repo_id",
+                "task_id",
+                "invocation_id",
+                "worktree_id",
+            },
+            {"job_id": "job_123"},
         ),
     ]
 
@@ -297,6 +568,39 @@ def test_memory_search_validator_defaults_match_signature() -> None:
         "since": None,
         "kinds": None,
     }
+
+
+def test_agency_run_validator_accepts_its_normalized_payload_for_approval_replay() -> None:
+    capability = get_capability("cap.agency.run")
+    assert capability is not None
+
+    normalized, error = capability.validate_input(
+        {
+            "repo_root": "/home/niels/src/personal/ariel",
+            "name": "Replayable Agency run",
+            "prompt": "Inspect only.",
+            "base_branch": " main ",
+            "runner": " codex ",
+            "runner_args": [" --sandbox=workspace-write "],
+            "env": [{"name": " SMOKE_FLAG ", "value": " enabled "}],
+            "no_include_untracked": True,
+        }
+    )
+    assert error is None
+    assert normalized is not None
+
+    replayed, replay_error = capability.validate_input(normalized)
+
+    assert replay_error is None
+    assert replayed == normalized
+    assert capability.validate_input(
+        {
+            "repo_root": "/home/niels/src/personal/ariel",
+            "name": "Replayable Agency run",
+            "prompt": "Inspect only.",
+            "env": {"SMOKE_FLAG": "enabled"},
+        }
+    ) == (None, "schema_invalid")
 
 
 def test_run_callable_signatures_warn_about_email_read_invented_nulls() -> None:
@@ -347,6 +651,33 @@ def test_memory_remember_signature_names_runtime_output_shape() -> None:
     assert "task_id" not in signature
 
 
+def test_memory_and_scheduler_signatures_name_runtime_outputs() -> None:
+    assert "'status': 'recalled'" in RUN_CALLABLE_SIGNATURES["memory.recall"]
+    assert "recall" in RUN_CALLABLE_SIGNATURES["memory.recall"]
+
+    memory_read_signature = RUN_CALLABLE_SIGNATURES["memory.read"]
+    for field_name in {
+        "'status'",
+        "'found'",
+        "'not_found'",
+        "session_id",
+        "turn_id",
+        "taint",
+    }:
+        assert field_name in memory_read_signature
+
+    assert "'created'" in RUN_CALLABLE_SIGNATURES["memory.note.create"]
+    assert "'edited'" in RUN_CALLABLE_SIGNATURES["memory.note.edit"]
+    assert "'deleted'" in RUN_CALLABLE_SIGNATURES["memory.note.delete"]
+    assert "run_after" in RUN_CALLABLE_SIGNATURES["proactive.schedule"]
+
+
+def test_sandbox_level_syscall_signatures_match_runtime_callbacks() -> None:
+    assert RUN_CALLABLE_SIGNATURES["agent.emit_done"] == "(summary: str = '') -> None"
+    assert RUN_CALLABLE_SIGNATURES["scratch.set"] == "(key: str, value: JSONValue) -> None"
+    assert RUN_CALLABLE_SIGNATURES["scratch.get"] == "(key: str) -> JSONValue"
+
+
 def test_drive_contract_metadata_uses_google_drive_schema_family() -> None:
     drive_search = get_capability("cap.drive.search")
     drive_read = get_capability("cap.drive.read")
@@ -374,11 +705,9 @@ def test_drive_read_signature_is_read_native_not_search_style() -> None:
 
 
 def test_agency_capabilities_become_eligible_when_runtime_is_bound() -> None:
-    """The agency.* family is gated by ``runtime_bindings.agency`` (set true when
-    both ``ARIEL_AGENCY_ALLOWED_REPO_ROOTS`` is non-empty and the daemon socket
-    file exists; see app._tool_surface_facts and the inline predicate at the
-    turn-context build site). When the binding flips on, all four agency caps
-    become eligible. When off, none are."""
+    """The agency.* family is gated by ``runtime_bindings.agency`` after the app
+    has proven configured repo roots plus a reachable daemon. When the binding
+    flips on, all four agency caps become eligible. When off, none are."""
 
     on = set(
         eligible_internal_callable_capability_ids(
@@ -404,6 +733,23 @@ def test_agency_capabilities_become_eligible_when_runtime_is_bound() -> None:
         )
     )
     assert not any(cap_id.startswith("cap.agency.") for cap_id in off)
+
+
+def test_agency_request_pr_does_not_expose_operator_override_knobs() -> None:
+    signature = RUN_CALLABLE_SIGNATURES["agency.request_pr"]
+    assert "allow_dirty" not in signature
+    assert "force_with_lease" not in signature
+
+    capability = get_capability("cap.agency.request_pr")
+    assert capability is not None
+    assert capability.validate_input({"job_id": "job_123", "allow_dirty": True}) == (
+        None,
+        "schema_invalid",
+    )
+    assert capability.validate_input({"job_id": "job_123", "force_with_lease": True}) == (
+        None,
+        "schema_invalid",
+    )
 
 
 def test_google_capabilities_require_connection_and_granted_scopes() -> None:

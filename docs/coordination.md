@@ -126,6 +126,10 @@ document records only the coordination contract.
   set) is re-armed in place to `now + recurrence_seconds` with `attempts` reset.
 - **Failure**: the row is left in place with `attempts` incremented and
   `run_after` pushed out for backoff.
+- **Turn replay**: a task that creates a turn writes its task id into
+  `turns.source_background_task_id`. If the worker crashes after committing
+  turn state but before deleting the task, replay reuses or fails that source
+  turn instead of running the model a second time.
 
 ```python
 task = db.scalar(
@@ -142,7 +146,12 @@ task = db.scalar(
 
 There is no `status` column, no claim, no `dead_letter` state, and no row
 lifecycle beyond "exists" and "deleted". A row is deleted only on success, so a
-crash mid-task leaves the row to be retried on the next pass.
+crash mid-task leaves the row to be retried on the next pass. Task arms that
+commit durable work before deletion own replay identity at their domain layer;
+for turns that identity is `turns.source_background_task_id`. Direct
+user-message HTTP ingress adds `turn_idempotency_keys` above the queue so
+`Idempotency-Key` retries replay the stored pending or completed response even
+after the one-shot queue row has been deleted.
 
 ### Retry
 

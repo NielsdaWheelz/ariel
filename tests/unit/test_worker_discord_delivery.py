@@ -9,7 +9,7 @@ import pytest
 
 from ariel.app import TurnExecutionOutcome
 from ariel.config import AppSettings
-from ariel.worker import _deliver_to_discord
+from ariel.worker import _deliver_to_discord, _discord_delivery_nonce
 
 
 def _settings(**overrides: Any) -> AppSettings:
@@ -102,7 +102,11 @@ def test_deliver_to_discord_posts_on_happy_path(monkeypatch: pytest.MonkeyPatch)
     post = posts[0]
     assert post["url"] == "https://discord.com/api/v10/channels/123456789/messages"
     assert post["headers"] == {"Authorization": "Bot test-bot-token"}
-    assert post["json"] == {"content": "Hello from Ariel"}
+    assert post["json"] == {
+        "content": "Hello from Ariel",
+        "nonce": _discord_delivery_nonce(turn_id="trn_test", channel_id=123456789),
+        "enforce_nonce": True,
+    }
     assert post["timeout"] == settings.discord_notification_timeout_seconds
     responses[0].raise_for_status.assert_called_once_with()
 
@@ -276,6 +280,11 @@ def test_deliver_to_discord_no_approvals_posts_no_components(
     assert len(posted_bodies) == 1
     assert "components" not in posted_bodies[0]
     assert posted_bodies[0]["content"] == "Hello from Ariel"
+    assert posted_bodies[0]["nonce"] == _discord_delivery_nonce(
+        turn_id="trn_test",
+        channel_id=123456789,
+    )
+    assert posted_bodies[0]["enforce_nonce"] is True
 
 
 def test_deliver_to_discord_pending_approval_adds_approval_line_and_buttons(

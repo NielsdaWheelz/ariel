@@ -153,7 +153,9 @@ def test_handle_message_duplicate_dedups(session_factory: sessionmaker[Session])
     assert second.nack_calls == []
 
 
-def test_handle_message_malformed_payload_nacks(session_factory: sessionmaker[Session]) -> None:
+def test_handle_message_malformed_payload_acks_and_drops(
+    session_factory: sessionmaker[Session],
+) -> None:
     _seed_connector(session_factory)
     message = FakePubSubMessage(
         message_id="pubsub-msg-bad",
@@ -173,11 +175,13 @@ def test_handle_message_malformed_payload_nacks(session_factory: sessionmaker[Se
 
     assert events == []
     assert tasks == []
-    assert message.ack_calls == []
-    assert len(message.nack_calls) == 1
+    assert len(message.ack_calls) == 1
+    assert message.nack_calls == []
 
 
-def test_handle_message_missing_email_field_nacks(session_factory: sessionmaker[Session]) -> None:
+def test_handle_message_missing_email_field_acks_and_drops(
+    session_factory: sessionmaker[Session],
+) -> None:
     _seed_connector(session_factory)
     message = FakePubSubMessage(
         message_id="pubsub-msg-no-email",
@@ -197,8 +201,8 @@ def test_handle_message_missing_email_field_nacks(session_factory: sessionmaker[
 
     assert events == []
     assert tasks == []
-    assert message.ack_calls == []
-    assert len(message.nack_calls) == 1
+    assert len(message.ack_calls) == 1
+    assert message.nack_calls == []
 
 
 @pytest.mark.parametrize(
@@ -212,7 +216,7 @@ def test_handle_message_missing_email_field_nacks(session_factory: sessionmaker[
         b'{"emailAddress": "user@example.com", "historyId": 1}',
     ],
 )
-def test_handle_message_invalid_payload_shape_nacks(
+def test_handle_message_invalid_payload_shape_acks_and_drops(
     session_factory: sessionmaker[Session],
     payload: bytes,
 ) -> None:
@@ -228,8 +232,8 @@ def test_handle_message_invalid_payload_shape_nacks(
     events, tasks = _events_and_tasks(session_factory)
     assert events == []
     assert tasks == []
-    assert message.ack_calls == []
-    assert len(message.nack_calls) == 1
+    assert len(message.ack_calls) == 1
+    assert message.nack_calls == []
 
 
 def test_handle_message_unknown_account_acks_and_drops(

@@ -925,6 +925,64 @@ def test_calendar_sync_keeps_missing_or_invalid_updated_timestamp_absent(
     assert [row.provider_account_id for row in evidence_rows] == [PROVIDER_ACCOUNT_ID] * 2
 
 
+def test_calendar_sync_uses_bounded_delta_pages(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @dataclass
+    class BoundedCalendarProvider:
+        calls: list[dict[str, Any]] = field(default_factory=list)
+
+        def calendar_list_event_deltas(self, **kwargs: Any) -> dict[str, Any]:
+            self.calls.append(kwargs)
+            assert kwargs["max_results"] == 10
+            if kwargs["page_token"] is None:
+                return {"nextPageToken": "page-2", "items": []}
+            return {"nextSyncToken": "sync-token-2", "items": []}
+
+    providers: list[BoundedCalendarProvider] = []
+
+    class FakeGoogleConnectorRuntime:
+        workspace_provider: BoundedCalendarProvider
+
+        def __init__(self, **_: Any) -> None:
+            self.workspace_provider = BoundedCalendarProvider()
+            providers.append(self.workspace_provider)
+
+        def access_token_for_background_sync(self, **_: Any) -> str:
+            return "access-token"
+
+    monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
+    now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
+    new_id = IdFactory()
+    _seed_google_connector(session_factory, now=now)
+
+    process_provider_sync_due(
+        session_factory=session_factory,
+        task_payload={"provider": "google", "resource_type": "calendar", "resource_id": "primary"},
+        settings=_settings(),
+        now_fn=lambda: now,
+        new_id_fn=new_id,
+    )
+
+    assert len(providers) == 1
+    assert len(providers[0].calls) == 2
+    assert providers[0].calls[0]["page_token"] is None
+    assert providers[0].calls[0]["time_min"] is not None
+    assert providers[0].calls[1]["page_token"] == "page-2"
+
+    with session_factory() as db:
+        with db.begin():
+            cursor = db.scalar(select(SyncCursorRecord).limit(1))
+            run = db.scalar(select(SyncRunRecord).limit(1))
+
+    assert cursor is not None
+    assert cursor.cursor_value == "sync-token-2"
+    assert cursor.status == "ready"
+    assert run is not None
+    assert run.status == "succeeded"
+
+
 def test_calendar_provider_request_failure_marks_sync_failed(
     session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,

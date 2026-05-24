@@ -37,10 +37,14 @@ from ariel.model_adapter import ModelAdapter, ModelCall, ModelResponse
 from ariel.persistence import (
     ActionAttemptRecord,
     BackgroundTaskRecord,
+    EventRecord,
     MemoryLogRecord,
     MemoryNoteRecord,
     SessionRecord,
+    SYSTEM_SESSION_ID,
     TurnRecord,
+    enqueue_background_task,
+    ensure_system_session,
 )
 from ariel.worker import process_one_task
 from tests.fake_sandbox import FakeSandboxRuntime
@@ -48,6 +52,7 @@ from tests.integration.app_helpers import create_test_app
 from tests.integration.responses_helpers import (
     FakeModelAdapter,
     drain_task,
+    last_user_message,
     post_message_and_drain,
     run_response,
 )
@@ -188,6 +193,32 @@ class _TwoPhaseAdapter(FakeModelAdapter):
         return _run_response(source, idx=self.call_count)
 
 
+class _MemoryRecallSyscallAdapter(FakeModelAdapter):
+    """Pre-turn retriever, main-agent recall syscall, then syscall retriever."""
+
+    provider = "provider.test"
+    model = "model.test"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.call_count: int = 0
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        del request
+        self.call_count += 1
+        if self.call_count == 2:
+            source = (
+                "result = memory.recall(query='incident recovery')\n"
+                "assert result['status'] == 'recalled', result\n"
+                "agent.emit_value(value={'recall': 'ok'})\n"
+            )
+        elif self.call_count == 4:
+            source = "agent.emit_message(text='recall syscall ok')\n"
+        else:
+            source = _RETRIEVER_PROGRAM
+        return _run_response(source, idx=self.call_count)
+
+
 class _FailingRetrieverAdapter(FakeModelAdapter):
     """Retriever emits the same source twice → stuck-detection ends it with no finding.
 
@@ -252,6 +283,29 @@ class _RememberAdapter(FakeModelAdapter):
         del request
         self.call_count += 1
         if self.call_count % 2 == 1:
+            source = _RETRIEVER_PROGRAM
+        else:
+            source = f"memory.remember(note={self.note_text!r})\n{_EMIT_MSG}"
+        return _run_response(source, idx=self.call_count)
+
+
+class _RememberThenEncodeAdapter(FakeModelAdapter):
+    """Main turn enqueues a remember request; rememberer completes the encode task."""
+
+    provider = "provider.test"
+    model = "model.test"
+    note_text = "user prefers dark mode"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.call_count: int = 0
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        self.call_count += 1
+        user_message = last_user_message(request.messages)
+        if user_message != "remember this":
+            source = "agent.emit_done(summary='remembered preference')\n"
+        elif self.call_count % 2 == 1:
             source = _RETRIEVER_PROGRAM
         else:
             source = f"memory.remember(note={self.note_text!r})\n{_EMIT_MSG}"
@@ -387,6 +441,29 @@ def test_retriever_fires_preturn_and_injects_recall_context(
     assert "memory recall:" in rendered
 
 
+def test_memory_recall_syscall_runs_retriever_inline(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _MemoryRecallSyscallAdapter()
+    with TestClient(_app(postgres_url, adapter, monkeypatch)) as client:
+        sid = _session_id(client)
+        turn = post_message_and_drain(client, sid, message="recall via syscall")
+        timeline = client.get(f"/v1/sessions/{sid}/events").json()
+
+    assert turn.assistant_message == "recall syscall ok"
+    assert adapter.call_count == 4
+    attempts = [
+        attempt
+        for saved_turn in timeline["turns"]
+        for attempt in saved_turn["surface_action_lifecycle"]
+        if attempt["proposal"]["capability_id"] == "cap.memory.recall"
+    ]
+    assert len(attempts) == 1
+    assert attempts[0]["execution"]["status"] == "succeeded"
+    assert attempts[0]["execution"]["output"]["status"] == "recalled"
+
+
 # ===========================================================================
 # 5. Recall failure is non-fatal
 # ===========================================================================
@@ -452,6 +529,43 @@ def test_memory_remember_enqueues_memory_encode_task(
 
     assert len(tasks) == 1, f"expected 1 memory_encode task, got {len(tasks)}"
     assert tasks[0].payload.get("note") == adapter.note_text
+
+
+def test_memory_remember_enqueues_and_worker_records_encode_turn(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _RememberThenEncodeAdapter()
+    with TestClient(_app(postgres_url, adapter, monkeypatch)) as client:
+        sid = _session_id(client)
+        sf = _sf(client)
+        post_message_and_drain(client, sid, message="remember this")
+        runtime = cast(Any, client.app).state.runtime
+
+        with sf() as db:
+            task = db.scalar(
+                select(BackgroundTaskRecord).where(
+                    BackgroundTaskRecord.task_type == "memory_encode"
+                )
+            )
+            assert task is not None
+            task_id = task.id
+
+        for _ in range(5):
+            assert process_one_task(session_factory=sf, settings=runtime.settings, runtime=runtime)
+            with sf() as db:
+                if db.get(BackgroundTaskRecord, task_id) is None:
+                    break
+
+        with sf() as db:
+            assert db.get(BackgroundTaskRecord, task_id) is None
+            encode_turn = db.scalar(
+                select(TurnRecord).where(TurnRecord.source_background_task_id == task_id)
+            )
+
+        assert encode_turn is not None
+        assert encode_turn.kind == "memory_encode"
+        assert encode_turn.status == "completed"
 
 
 def test_approved_memory_note_missing_fails_with_typed_memory_error(
@@ -612,6 +726,119 @@ def test_worker_accepts_memory_encode_and_memory_dream(
             assert turns[0].status == "completed"
 
 
+def test_worker_memory_task_replay_reuses_completed_turn_without_model_call(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed rememberer source turn makes task replay a no-op, not a
+    second rememberer model run."""
+
+    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, adapter, settings: None)
+    adapter = _DreamCompleteAdapter()
+    app = create_test_app(
+        database_url=postgres_url,
+        model_adapter=adapter,
+        sandbox=FakeSandboxRuntime(),
+    )
+    with TestClient(app) as client:
+        runtime = cast(Any, client.app).state.runtime
+        sf = runtime.session_factory
+        with sf() as db:
+            with db.begin():
+                ensure_system_session(db, now=NOW)
+                task = enqueue_background_task(
+                    db,
+                    task_type="memory_dream",
+                    payload={},
+                    now=NOW,
+                )
+                task_id = task.id
+                db.add(
+                    TurnRecord(
+                        id="trn_memory_replay_done",
+                        session_id=SYSTEM_SESSION_ID,
+                        user_message='{"note": null, "prompt_version": "memory-rememberer-dream-v3", "trigger": "dream"}',
+                        assistant_message=None,
+                        status="completed",
+                        kind="memory_dream",
+                        source_background_task_id=task_id,
+                        created_at=NOW,
+                        updated_at=NOW,
+                    )
+                )
+
+        assert process_one_task(session_factory=sf, settings=runtime.settings, runtime=runtime)
+
+        assert adapter.call_count == 0
+        with sf() as db:
+            assert db.get(BackgroundTaskRecord, task_id) is None
+            turns = db.scalars(
+                select(TurnRecord).where(TurnRecord.source_background_task_id == task_id)
+            ).all()
+            assert len(turns) == 1
+
+
+def test_worker_memory_task_replay_fails_interrupted_turn_without_model_call(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An interrupted rememberer source turn is failed on replay instead of
+    running the rememberer again."""
+
+    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, adapter, settings: None)
+    adapter = _DreamCompleteAdapter()
+    app = create_test_app(
+        database_url=postgres_url,
+        model_adapter=adapter,
+        sandbox=FakeSandboxRuntime(),
+    )
+    with TestClient(app) as client:
+        runtime = cast(Any, client.app).state.runtime
+        sf = runtime.session_factory
+        with sf() as db:
+            with db.begin():
+                ensure_system_session(db, now=NOW)
+                task = enqueue_background_task(
+                    db,
+                    task_type="memory_dream",
+                    payload={},
+                    now=NOW,
+                )
+                task_id = task.id
+                db.add(
+                    TurnRecord(
+                        id="trn_memory_replay_interrupted",
+                        session_id=SYSTEM_SESSION_ID,
+                        user_message='{"note": null, "prompt_version": "memory-rememberer-dream-v3", "trigger": "dream"}',
+                        assistant_message=None,
+                        status="in_progress",
+                        kind="memory_dream",
+                        source_background_task_id=task_id,
+                        created_at=NOW,
+                        updated_at=NOW,
+                    )
+                )
+
+        assert process_one_task(session_factory=sf, settings=runtime.settings, runtime=runtime)
+
+        assert adapter.call_count == 0
+        with sf() as db:
+            assert db.get(BackgroundTaskRecord, task_id) is None
+            turn = db.get(TurnRecord, "trn_memory_replay_interrupted")
+            assert turn is not None
+            assert turn.status == "failed"
+            failure = db.scalar(
+                select(EventRecord).where(
+                    EventRecord.turn_id == turn.id,
+                    EventRecord.event_type == "evt.turn.failed",
+                )
+            )
+            assert failure is not None
+            assert failure.payload["error_code"] == "E_BACKGROUND_TURN_INTERRUPTED"
+
+
 def test_background_tasks_rejects_unknown_task_type(
     session_factory: sessionmaker[Session],
 ) -> None:
@@ -728,6 +955,42 @@ def test_notes_are_editable_and_deletable(
             db.execute(text("DELETE FROM memory_notes WHERE id=:id"), {"id": note_id})
     with session_factory() as db:
         assert db.get(MemoryNoteRecord, note_id) is None
+
+
+def test_memory_notes_route_lists_operator_visible_notes(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 5, 22, 12, 0, tzinfo=UTC)
+    with TestClient(_app(postgres_url, _TwoPhaseAdapter(), monkeypatch)) as client:
+        with cast(Any, client.app).state.session_factory() as db:
+            with db.begin():
+                db.add(
+                    MemoryNoteRecord(
+                        id="mno_route_visible",
+                        content="Remember the incident checklist.",
+                        embedding=None,
+                        taint="clean",
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+
+        response = client.get("/v1/memory/notes?limit=5")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": True,
+        "notes": [
+            {
+                "id": "mno_route_visible",
+                "content": "Remember the incident checklist.",
+                "created_at": "2026-05-22T12:00:00Z",
+                "updated_at": "2026-05-22T12:00:00Z",
+                "taint": "clean",
+            }
+        ],
+    }
 
 
 # ===========================================================================
@@ -853,26 +1116,24 @@ def test_run_rememberer_dream_succeeds_with_no_user_session(
                 db.scalar(select(SessionRecord).where(SessionRecord.is_active.is_(True))) is None
             ), "fresh DB must have no active user session"
 
-        with session_factory() as db:
-            run_rememberer(
-                trigger="dream",
-                sandbox=sandbox,
-                db=db,
-                session_factory=session_factory,
-                session_id=None,
-                settings=settings,
-                model_adapter=_DreamCompleteAdapter(),
-                google_runtime=None,
-                agency_runtime=None,
-                attachment_runtime=None,
-                note=None,
-                allowed_capability_ids=REMEMBERER_CAPABILITY_IDS,
-                approval_ttl_seconds=int(settings.approval_ttl_seconds),
-                approval_actor_id=str(settings.approval_actor_id),
-                add_event=lambda *_args, **_kwargs: None,
-                now_fn=lambda: datetime.now(tz=UTC),
-                new_id_fn=_new_id,
-            )
+        run_rememberer(
+            trigger="dream",
+            sandbox=sandbox,
+            session_factory=session_factory,
+            session_id=None,
+            settings=settings,
+            model_adapter=_DreamCompleteAdapter(),
+            google_runtime=None,
+            agency_runtime=None,
+            attachment_runtime=None,
+            note=None,
+            allowed_capability_ids=REMEMBERER_CAPABILITY_IDS,
+            approval_ttl_seconds=int(settings.approval_ttl_seconds),
+            approval_actor_id=str(settings.approval_actor_id),
+            add_event=lambda *_args, **_kwargs: None,
+            now_fn=lambda: datetime.now(tz=UTC),
+            new_id_fn=_new_id,
+        )
 
         with session_factory() as db:
             dream_turns = db.scalars(
@@ -913,26 +1174,24 @@ def test_run_rememberer_dream_self_heals_if_system_session_missing(
                 )
             assert db.get(SessionRecord, SYSTEM_SESSION_ID) is None
 
-        with session_factory() as db:
-            run_rememberer(
-                trigger="dream",
-                sandbox=sandbox,
-                db=db,
-                session_factory=session_factory,
-                session_id=None,
-                settings=settings,
-                model_adapter=_DreamCompleteAdapter(),
-                google_runtime=None,
-                agency_runtime=None,
-                attachment_runtime=None,
-                note=None,
-                allowed_capability_ids=REMEMBERER_CAPABILITY_IDS,
-                approval_ttl_seconds=int(settings.approval_ttl_seconds),
-                approval_actor_id=str(settings.approval_actor_id),
-                add_event=lambda *_args, **_kwargs: None,
-                now_fn=lambda: datetime.now(tz=UTC),
-                new_id_fn=_new_id,
-            )
+        run_rememberer(
+            trigger="dream",
+            sandbox=sandbox,
+            session_factory=session_factory,
+            session_id=None,
+            settings=settings,
+            model_adapter=_DreamCompleteAdapter(),
+            google_runtime=None,
+            agency_runtime=None,
+            attachment_runtime=None,
+            note=None,
+            allowed_capability_ids=REMEMBERER_CAPABILITY_IDS,
+            approval_ttl_seconds=int(settings.approval_ttl_seconds),
+            approval_actor_id=str(settings.approval_actor_id),
+            add_event=lambda *_args, **_kwargs: None,
+            now_fn=lambda: datetime.now(tz=UTC),
+            new_id_fn=_new_id,
+        )
 
         with session_factory() as db:
             assert db.get(SessionRecord, SYSTEM_SESSION_ID) is not None, (

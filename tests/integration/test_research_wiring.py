@@ -35,6 +35,7 @@ from tests.integration.app_helpers import create_test_app
 from ariel.persistence import (
     ActionAttemptRecord,
     BackgroundTaskRecord,
+    EventRecord,
     MemoryLogRecord,
     SessionRecord,
     TurnRecord,
@@ -412,6 +413,301 @@ def test_worker_research_run_arm_runs_research_and_enqueues_completion_wake(
                     "retrieved_at": "2026-06-01T12:00:00Z",
                 }
             ]
+
+
+def test_worker_research_run_replay_uses_completed_research_turn_without_model_call(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If a crash leaves a completed research turn and the original task row,
+    replay must enqueue the completion wake without rerunning research."""
+
+    _stub_memory_retriever(monkeypatch)
+    monkeypatch.setattr("ariel.worker.utcnow", lambda: NOW)
+    adapter = _ResearchRunAdapter()
+    app = create_test_app(
+        database_url=postgres_url,
+        model_adapter=adapter,
+        sandbox=FakeSandboxRuntime(),
+    )
+    with TestClient(app) as client:
+        runtime = client.app.state.runtime  # type: ignore[attr-defined]
+        session_factory = runtime.session_factory
+        session_response = client.get("/v1/sessions/active")
+        assert session_response.status_code == 200
+        session_id = session_response.json()["session"]["id"]
+
+        with session_factory() as db:
+            with db.begin():
+                task = enqueue_background_task(
+                    db,
+                    task_type="research_run",
+                    payload={
+                        "question": "What is the capital of France?",
+                        "mode": "web",
+                        "session_id": session_id,
+                    },
+                    now=NOW - timedelta(minutes=5),
+                    run_after=NOW - timedelta(minutes=1),
+                )
+                task_id = task.id
+                db.add(
+                    TurnRecord(
+                        id="trn_research_replay_done",
+                        session_id=session_id,
+                        user_message="What is the capital of France?",
+                        assistant_message="France is in Europe.",
+                        status="completed",
+                        kind="research",
+                        source_background_task_id=task_id,
+                        created_at=NOW,
+                        updated_at=NOW,
+                    )
+                )
+                db.add(
+                    EventRecord(
+                        id="evn_research_replay_finding",
+                        session_id=session_id,
+                        turn_id="trn_research_replay_done",
+                        sequence=1,
+                        event_type="evt.research.finding_emitted",
+                        payload={
+                            "mode": "web",
+                            "finding": {
+                                "question": "What is the capital of France?",
+                                "mode": "web",
+                                "status": "complete",
+                                "summary": "France is in Europe.",
+                                "claims": [
+                                    {
+                                        "statement": "Paris is the capital",
+                                        "sources": ["https://example.test"],
+                                        "confidence": "high",
+                                    }
+                                ],
+                                "gaps": ["Population unknown."],
+                                "sources": [
+                                    {
+                                        "title": "Example",
+                                        "reference": "https://example.test",
+                                        "retrieved_at": "2026-06-01T12:00:00Z",
+                                    }
+                                ],
+                            },
+                        },
+                        created_at=NOW,
+                    )
+                )
+                db.add(
+                    EventRecord(
+                        id="evn_research_replay_completed",
+                        session_id=session_id,
+                        turn_id="trn_research_replay_done",
+                        sequence=2,
+                        event_type="evt.turn.completed",
+                        payload={},
+                        created_at=NOW,
+                    )
+                )
+
+        assert process_one_task(
+            session_factory=session_factory,
+            settings=runtime.settings,
+            runtime=runtime,
+        )
+
+        assert adapter.snapshots == []
+        with session_factory() as db:
+            assert db.get(BackgroundTaskRecord, task_id) is None
+            wake_tasks = db.scalars(
+                select(BackgroundTaskRecord).where(BackgroundTaskRecord.task_type == "agent_wake")
+            ).all()
+            assert len(wake_tasks) == 1
+            finding = wake_tasks[0].payload["research_finding"]
+            assert finding["status"] == "complete"
+            assert finding["claims"][0]["statement"] == "Paris is the capital"
+
+
+def test_worker_research_run_replay_fails_interrupted_turn_without_model_call(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A source research turn left in progress is failed on replay instead of
+    rerunning the model and duplicating already committed program effects."""
+
+    _stub_memory_retriever(monkeypatch)
+    monkeypatch.setattr("ariel.worker.utcnow", lambda: NOW)
+    adapter = _ResearchRunAdapter()
+    app = create_test_app(
+        database_url=postgres_url,
+        model_adapter=adapter,
+        sandbox=FakeSandboxRuntime(),
+    )
+    with TestClient(app) as client:
+        runtime = client.app.state.runtime  # type: ignore[attr-defined]
+        session_factory = runtime.session_factory
+        session_response = client.get("/v1/sessions/active")
+        assert session_response.status_code == 200
+        session_id = session_response.json()["session"]["id"]
+
+        with session_factory() as db:
+            with db.begin():
+                task = enqueue_background_task(
+                    db,
+                    task_type="research_run",
+                    payload={
+                        "question": "What is the capital of France?",
+                        "mode": "web",
+                        "session_id": session_id,
+                    },
+                    now=NOW - timedelta(minutes=5),
+                    run_after=NOW - timedelta(minutes=1),
+                )
+                task_id = task.id
+                db.add(
+                    TurnRecord(
+                        id="trn_research_replay_interrupted",
+                        session_id=session_id,
+                        user_message="What is the capital of France?",
+                        assistant_message=None,
+                        status="in_progress",
+                        kind="research",
+                        source_background_task_id=task_id,
+                        created_at=NOW,
+                        updated_at=NOW,
+                    )
+                )
+                db.add(
+                    EventRecord(
+                        id="evn_research_replay_started",
+                        session_id=session_id,
+                        turn_id="trn_research_replay_interrupted",
+                        sequence=1,
+                        event_type="evt.research.started",
+                        payload={
+                            "research_question": "What is the capital of France?",
+                            "research_mode": "web",
+                        },
+                        created_at=NOW,
+                    )
+                )
+
+        assert process_one_task(
+            session_factory=session_factory,
+            settings=runtime.settings,
+            runtime=runtime,
+        )
+
+        assert adapter.snapshots == []
+        with session_factory() as db:
+            assert db.get(BackgroundTaskRecord, task_id) is None
+            turn = db.get(TurnRecord, "trn_research_replay_interrupted")
+            assert turn is not None
+            assert turn.status == "failed"
+            wake_task = db.scalar(
+                select(BackgroundTaskRecord).where(BackgroundTaskRecord.task_type == "agent_wake")
+            )
+            assert wake_task is not None
+            finding = wake_task.payload["research_finding"]
+            assert finding["status"] == "failed"
+            assert (
+                finding["summary"] == "The research run was interrupted before producing a finding."
+            )
+            assert finding["claims"] == []
+            assert finding["gaps"] == []
+            assert finding["sources"] == []
+            event_types = [
+                row.event_type
+                for row in db.scalars(
+                    select(EventRecord)
+                    .where(EventRecord.turn_id == "trn_research_replay_interrupted")
+                    .order_by(EventRecord.sequence.asc())
+                ).all()
+            ]
+            assert "evt.turn.failed" in event_types
+            assert "evt.turn.completed" not in event_types
+
+
+def test_worker_research_run_replay_rejects_corrupt_terminal_finding(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A terminal research turn without a valid finding is persisted corruption,
+    not a partial answer to synthesize during replay."""
+
+    _stub_memory_retriever(monkeypatch)
+    monkeypatch.setattr("ariel.worker.utcnow", lambda: NOW)
+    adapter = _ResearchRunAdapter()
+    app = create_test_app(
+        database_url=postgres_url,
+        model_adapter=adapter,
+        sandbox=FakeSandboxRuntime(),
+    )
+    with TestClient(app) as client:
+        runtime = client.app.state.runtime  # type: ignore[attr-defined]
+        session_factory = runtime.session_factory
+        session_response = client.get("/v1/sessions/active")
+        assert session_response.status_code == 200
+        session_id = session_response.json()["session"]["id"]
+
+        with session_factory() as db:
+            with db.begin():
+                task = enqueue_background_task(
+                    db,
+                    task_type="research_run",
+                    payload={
+                        "question": "What is the capital of France?",
+                        "mode": "web",
+                        "session_id": session_id,
+                    },
+                    now=NOW - timedelta(minutes=5),
+                    run_after=NOW - timedelta(minutes=1),
+                )
+                task_id = task.id
+                db.add(
+                    TurnRecord(
+                        id="trn_research_replay_corrupt",
+                        session_id=session_id,
+                        user_message="What is the capital of France?",
+                        assistant_message="France is in Europe.",
+                        status="completed",
+                        kind="research",
+                        source_background_task_id=task_id,
+                        created_at=NOW,
+                        updated_at=NOW,
+                    )
+                )
+                db.add(
+                    EventRecord(
+                        id="evn_research_replay_corrupt",
+                        session_id=session_id,
+                        turn_id="trn_research_replay_corrupt",
+                        sequence=1,
+                        event_type="evt.research.finding_emitted",
+                        payload={"mode": "web", "finding": {"status": "complete"}},
+                        created_at=NOW,
+                    )
+                )
+
+        assert process_one_task(
+            session_factory=session_factory,
+            settings=runtime.settings,
+            runtime=runtime,
+        )
+
+        assert adapter.snapshots == []
+        with session_factory() as db:
+            task = db.get(BackgroundTaskRecord, task_id)
+            assert task is not None
+            assert task.attempts == 1
+            assert (
+                db.scalars(
+                    select(BackgroundTaskRecord).where(
+                        BackgroundTaskRecord.task_type == "agent_wake"
+                    )
+                ).all()
+                == []
+            )
 
 
 def test_worker_research_run_arm_rejects_a_bad_payload(

@@ -271,6 +271,32 @@ class FakeGoogleWorkspaceProvider:
             "window_end": normalized_input["window_end"],
         }
 
+    def calendar_list_calendars(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+        provider_account_id: str,
+    ) -> dict[str, Any]:
+        del access_token, normalized_input
+        if "cap.calendar.list_calendars" in self.fail_scope_missing_for:
+            raise GoogleProviderRequestFailure("insufficient_permissions")
+        return {
+            "schema_version": "google.calendar.calendar_list.v1",
+            "status": "succeeded",
+            "calendars": [
+                {
+                    "provider_account_id": provider_account_id,
+                    "calendar_id": "primary",
+                    "summary": "Primary calendar",
+                    "primary": True,
+                    "access_role": "owner",
+                    "time_zone": "UTC",
+                }
+            ],
+            "retrieved_at": "2026-03-03T12:00:00Z",
+        }
+
     def calendar_propose_slots(
         self,
         *,
@@ -438,6 +464,97 @@ class FakeGoogleWorkspaceProvider:
         del access_token
         if "cap.email.read" in self.fail_scope_missing_for:
             raise GoogleProviderRequestFailure("insufficient_permissions")
+        mode = normalized_input.get("mode", "message")
+        if mode == "thread":
+            thread_id = normalized_input["thread_id"]
+            return {
+                "schema_version": "google.gmail.message_evidence.v1",
+                "mode": "thread",
+                "thread": {
+                    "provider_account_id": provider_account_id,
+                    "thread_id": thread_id,
+                    "history_id": "hist-thread",
+                    "message_count": 2,
+                    "anchor_message_id": None,
+                },
+                "messages": [
+                    {
+                        "provider_account_id": provider_account_id,
+                        "message_id": "msg-thread-1",
+                        "thread_id": thread_id,
+                        "history_id": "hist-thread",
+                        "subject": "email thread",
+                        "subject_key": "email thread",
+                        "sender": {
+                            "raw": "Acme Billing <billing@acme.test>",
+                            "name": "Acme Billing",
+                            "email": "billing@acme.test",
+                        },
+                        "recipients": [],
+                        "direction": "received",
+                        "labels": ["INBOX"],
+                        "attachments": [],
+                        "provider_url": "https://mail.google.com/mail/u/0/#all/msg-thread-1",
+                        "raw_payload_digest": "1" * 64,
+                    },
+                    {
+                        "provider_account_id": provider_account_id,
+                        "message_id": "msg-thread-2",
+                        "thread_id": thread_id,
+                        "history_id": "hist-thread",
+                        "subject": "email thread reply",
+                        "subject_key": "email thread reply",
+                        "sender": {
+                            "raw": "User <user@example.com>",
+                            "name": "User",
+                            "email": "user@example.com",
+                        },
+                        "recipients": [],
+                        "direction": "sent",
+                        "labels": ["SENT"],
+                        "attachments": [],
+                        "provider_url": "https://mail.google.com/mail/u/0/#all/msg-thread-2",
+                        "raw_payload_digest": "2" * 64,
+                    },
+                ],
+                "published_at": "2026-03-02T09:00:00Z",
+                "evidence": {
+                    "source_kind": "gmail_thread",
+                    "thread_id": thread_id,
+                    "anchor_message_id": None,
+                    "body_digest": "b" * 64,
+                    "blocks": [
+                        {
+                            "block_id": f"gmail:{thread_id}:msg-thread-1:body:0",
+                            "kind": "body",
+                            "text": "body preview: first thread message",
+                            "digest": "c" * 64,
+                            "truncated": False,
+                            "source_mime_type": "text/plain",
+                            "charset": "utf-8",
+                            "source_message_id": "msg-thread-1",
+                            "source_thread_id": thread_id,
+                        },
+                        {
+                            "block_id": f"gmail:{thread_id}:msg-thread-2:body:0",
+                            "kind": "body",
+                            "text": "body preview: second thread message",
+                            "digest": "d" * 64,
+                            "truncated": False,
+                            "source_mime_type": "text/plain",
+                            "charset": "utf-8",
+                            "source_message_id": "msg-thread-2",
+                            "source_thread_id": thread_id,
+                        },
+                    ],
+                    "truncated": False,
+                    "decode_notes": [],
+                },
+                "read_outcome": {"status": "ok", "reason_code": None, "recovery": None},
+                "retrieved_at": "2026-03-03T12:00:00Z",
+                "status": "succeeded",
+            }
+
         message_id = normalized_input["message_id"]
         return {
             "schema_version": "google.gmail.message_evidence.v1",
@@ -835,6 +952,58 @@ def test_google_connector_lifecycle_endpoints_are_complete_secure_and_auditable(
         )
         assert stale_provider_event.status_code == 401
         assert stale_provider_event.json()["error"]["code"] == "E_PROVIDER_EVENT_CHANNEL_INVALID"
+
+
+def test_google_connector_callback_unknown_state_does_not_dirty_connected_connector(
+    postgres_url: str,
+) -> None:
+    oauth_client = FakeGoogleOAuthClient(
+        tokens_by_code={
+            "connect-code": FakeTokenBundle(
+                account_subject="sub_connect",
+                account_email="owner@example.com",
+                granted_scopes=[GOOGLE_CALENDAR_READ_SCOPE, GOOGLE_GMAIL_READ_SCOPE],
+                access_token="tok_access_plain_connect",
+                refresh_token="tok_refresh_plain_connect",
+            )
+        }
+    )
+    with _build_client(postgres_url, ActionProposalAdapter()) as client:
+        _bind_google_fakes(
+            client,
+            oauth_client=oauth_client,
+            workspace_provider=FakeGoogleWorkspaceProvider(),
+        )
+
+        _connect_google(client, code="connect-code")
+        invalid_callback = client.get(
+            "/v1/connectors/google/callback",
+            params={"state": "st_invalid", "code": "connect-code"},
+        )
+
+        assert invalid_callback.status_code == 400
+        error = invalid_callback.json()["error"]
+        assert error["code"] == "E_CONNECTOR_CALLBACK_INVALID"
+        assert error["details"]["reason"] == "invalid_state"
+
+        status = client.get("/v1/connectors/google")
+        assert status.status_code == 200
+        connector = status.json()["connector"]
+        assert connector["status"] == "connected"
+        assert connector["readiness"] == "connected"
+        assert connector["last_error_code"] is None
+
+        events = client.get("/v1/connectors/google/events")
+        assert events.status_code == 200
+        connector_events = events.json()["events"]
+        event_types = [event["event_type"] for event in connector_events]
+        assert "evt.connector.google.connect.failed" in event_types
+        failed_events = [
+            event
+            for event in connector_events
+            if event["event_type"] == "evt.connector.google.connect.failed"
+        ]
+        assert failed_events[-1]["payload"]["failure_reason"] == "invalid_state"
 
 
 def test_google_disconnect_records_revoke_failure_without_leaking_token_material(
@@ -1459,6 +1628,7 @@ def test_calendar_and_email_read_caps_execute_allowlisted_without_approval(
                     },
                 }
             ],
+            "list calendars": [{"name": "calendar.list_calendars", "input": {}}],
             "propose slots": [
                 {
                     "name": "calendar.propose_slots",
@@ -1514,7 +1684,13 @@ def test_calendar_and_email_read_caps_execute_allowlisted_without_approval(
         _connect_google(client, code="connect-read-scopes")
 
         session_id = _session_id(client)
-        for message in ("show schedule", "propose slots", "search inbox", "open inbox item"):
+        for message in (
+            "show schedule",
+            "list calendars",
+            "propose slots",
+            "search inbox",
+            "open inbox item",
+        ):
             post_message_and_drain(client, session_id, message=message)
             turn_data = _turn_data(client, session_id)
 
@@ -1529,6 +1705,11 @@ def test_calendar_and_email_read_caps_execute_allowlisted_without_approval(
             if message == "show schedule":
                 assert {event["provider_account_id"] for event in output["events"]} == {"sub_reads"}
                 assert "schedule" in rendered_message
+            if message == "list calendars":
+                assert {item["provider_account_id"] for item in output["calendars"]} == {
+                    "sub_reads"
+                }
+                assert "calendar" in rendered_message
             if message == "propose slots":
                 assert output["provider_account_id"] == "sub_reads"
                 assert "availability" in rendered_message
@@ -1613,6 +1794,147 @@ def test_attendee_slots_are_limited_scope_and_recoverable_without_freebusy_scope
         attempt = _surface_attempt(turn_data)
         assert attempt["policy"]["decision"] == "allow_inline"
         assert attempt["execution"]["status"] == "succeeded"
+
+
+def test_calendar_propose_slots_uses_freebusy_scope_for_all_attendees(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = ActionProposalAdapter(
+        run_calls_by_message={
+            "plan with attendee calendars": [
+                {
+                    "name": "calendar.propose_slots",
+                    "input": {
+                        "window_start": "2026-03-04T00:00:00Z",
+                        "window_end": "2026-03-05T00:00:00Z",
+                        "duration_minutes": 30,
+                        "attendees": ["a@example.com", "b@example.com"],
+                        "timezone": "UTC",
+                        "source_evidence_ids": [],
+                        "quoted_content_caveat": False,
+                        "participants": ["a@example.com", "b@example.com"],
+                        "proposed_windows": [],
+                        "timezone_evidence": {
+                            "source": None,
+                            "rationale": None,
+                            "confidence": None,
+                        },
+                        "constraints": {"hard": [], "soft": [], "attendee_notes": []},
+                    },
+                }
+            ]
+        },
+        assistant_text_by_message={
+            "plan with attendee calendars": "availability includes all attendees."
+        },
+    )
+    oauth_client = FakeGoogleOAuthClient(
+        tokens_by_code={
+            "connect-freebusy": FakeTokenBundle(
+                account_subject="sub_freebusy",
+                account_email="freebusy@example.com",
+                granted_scopes=[
+                    GOOGLE_CALENDAR_READ_SCOPE,
+                    GOOGLE_CALENDAR_FREEBUSY_SCOPE,
+                    GOOGLE_GMAIL_READ_SCOPE,
+                ],
+                access_token="tok_access_freebusy",
+                refresh_token="tok_refresh_freebusy",
+            )
+        }
+    )
+    workspace_provider = FakeGoogleWorkspaceProvider()
+    monkeypatch.setattr(
+        "ariel.worker.build_google_runtime",
+        lambda settings: build_google_runtime(
+            settings,
+            oauth_client=oauth_client,
+            workspace_provider=cast(GoogleWorkspaceProvider, workspace_provider),
+        ),
+    )
+    with _build_client(postgres_url, adapter) as client:
+        _bind_google_fakes(
+            client,
+            oauth_client=oauth_client,
+            workspace_provider=workspace_provider,
+        )
+        _connect_google(client, code="connect-freebusy")
+
+        session_id = _session_id(client)
+        post_message_and_drain(client, session_id, message="plan with attendee calendars")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
+        output = attempt["execution"]["output"]
+
+        assert attempt["policy"]["decision"] == "allow_inline"
+        assert attempt["approval"]["status"] == "not_requested"
+        assert attempt["execution"]["status"] == "succeeded"
+        assert output["provider_account_id"] == "sub_freebusy"
+        assert output["attendees_considered"] == ["a@example.com", "b@example.com"]
+        assert output["availability_scope"] == "all_attendees"
+        assert output["partial"] is False
+        assert output["freebusy_diagnostics"] == []
+
+
+def test_email_read_thread_mode_executes_allowlisted_without_approval(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = ActionProposalAdapter(
+        run_calls_by_message={
+            "open inbox thread": [
+                {"name": "email.read", "input": {"thread_id": "thr-1", "mode": "thread"}}
+            ]
+        },
+        assistant_text_by_message={"open inbox thread": "email thread is ready."},
+    )
+    oauth_client = FakeGoogleOAuthClient(
+        tokens_by_code={
+            "connect-thread-read": FakeTokenBundle(
+                account_subject="sub_thread_read",
+                account_email="thread@example.com",
+                granted_scopes=[GOOGLE_CALENDAR_READ_SCOPE, GOOGLE_GMAIL_READ_SCOPE],
+                access_token="tok_access_thread",
+                refresh_token="tok_refresh_thread",
+            )
+        }
+    )
+    workspace_provider = FakeGoogleWorkspaceProvider()
+    monkeypatch.setattr(
+        "ariel.worker.build_google_runtime",
+        lambda settings: build_google_runtime(
+            settings,
+            oauth_client=oauth_client,
+            workspace_provider=cast(GoogleWorkspaceProvider, workspace_provider),
+        ),
+    )
+    with _build_client(postgres_url, adapter) as client:
+        _bind_google_fakes(
+            client,
+            oauth_client=oauth_client,
+            workspace_provider=workspace_provider,
+        )
+        _connect_google(client, code="connect-thread-read")
+
+        session_id = _session_id(client)
+        post_message_and_drain(client, session_id, message="open inbox thread")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
+        output = attempt["execution"]["output"]
+
+        assert attempt["policy"]["decision"] == "allow_inline"
+        assert attempt["approval"]["status"] == "not_requested"
+        assert attempt["execution"]["status"] == "succeeded"
+        assert output["mode"] == "thread"
+        assert output["thread"]["provider_account_id"] == "sub_thread_read"
+        assert output["thread"]["thread_id"] == "thr-1"
+        assert [message["message_id"] for message in output["messages"]] == [
+            "msg-thread-1",
+            "msg-thread-2",
+        ]
+        assert output["evidence"]["source_kind"] == "gmail_thread"
+        assert "first thread message" not in turn_data["assistant_message"]
 
 
 @pytest.mark.parametrize(

@@ -165,8 +165,9 @@ class SandboxRuntime:
     """Owns one persistent gVisor sandbox and runs programs as fresh processes.
 
     ``start()`` once at service start, ``run_program()`` per program, ``close()``
-    at shutdown. Not safe for concurrent ``run_program()`` calls — the design is
-    single-user and runs one program at a time.
+    at shutdown. Calls from different threads are serialized. Same-thread nested
+    calls are allowed so a syscall can run a bounded subagent program while the
+    outer guest is paused waiting for the syscall result.
     """
 
     container_id: str = "ariel-run-sandbox"
@@ -174,7 +175,7 @@ class SandboxRuntime:
     wall_clock_seconds: float = SANDBOX_WALL_CLOCK_SECONDS
     _bundle_dir: Path | None = field(default=None, init=False)
     _started: bool = field(default=False, init=False)
-    _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
+    _lock: Any = field(default_factory=threading.RLock, init=False)
 
     def _base_command(self, *args: str) -> list[str]:
         # Rootless runsc requires an explicit network mode; "none" is also the
@@ -396,8 +397,19 @@ def _drive_program(
         timed_out.set()
         process.kill()
 
-    watchdog = threading.Timer(wall_clock_seconds, _watchdog)
-    watchdog.daemon = True
+    watchdog: threading.Timer | None = None
+
+    def _start_watchdog() -> None:
+        nonlocal watchdog
+        watchdog = threading.Timer(wall_clock_seconds, _watchdog)
+        watchdog.daemon = True
+        watchdog.start()
+
+    def _cancel_watchdog() -> None:
+        nonlocal watchdog
+        if watchdog is not None:
+            watchdog.cancel()
+            watchdog = None
 
     def _send_host_message(message: dict[str, Any]) -> None:
         encoded = _encode_host_message(message)
@@ -437,8 +449,13 @@ def _drive_program(
             if message["type"] == "syscall":
                 syscall_count += 1
                 syscall = _Syscall(name=message["name"], input=message["input"])
+                # The guest is blocked waiting for this reply; host callbacks
+                # own their own provider/runtime timeouts, so the sandbox's
+                # guest wall-clock watchdog should not charge callback time.
+                _cancel_watchdog()
                 result = _invoke_syscall_callback(syscall, syscall_callback)
                 _send_host_message(result)
+                _start_watchdog()
                 continue
             outcome.update(
                 ok=bool(message["ok"]),
@@ -448,7 +465,7 @@ def _drive_program(
             return
 
     conversation_error: list[str] = []
-    watchdog.start()
+    _start_watchdog()
     try:
         _conversation()
     except SandboxRuntimeError as exc:
@@ -459,7 +476,7 @@ def _drive_program(
         _kill_and_wait(process)
         raise
     finally:
-        watchdog.cancel()
+        _cancel_watchdog()
 
     if timed_out.is_set():
         process.wait()

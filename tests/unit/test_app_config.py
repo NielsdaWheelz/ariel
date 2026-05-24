@@ -10,6 +10,8 @@ from typing import Any, cast
 import pytest
 from pydantic import ValidationError
 
+from ariel import app as app_module
+from ariel.agency_daemon import AgencyDaemonError
 from ariel.app import create_app
 from ariel.config import AppSettings
 from ariel.persistence import MEMORY_EMBEDDING_DIMENSIONS
@@ -20,6 +22,45 @@ CONNECTOR_KEYRING = '{"v1":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}'
 
 def _app_settings_without_env_files() -> AppSettings:
     return cast(Any, AppSettings)(_env_file=None)
+
+
+def test_agency_runtime_binding_requires_reachable_daemon(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    socket_path = tmp_path / "agency.sock"
+    socket_path_text = str(socket_path)
+    settings = cast(Any, AppSettings)(
+        _env_file=None,
+        agency_allowed_repo_roots=str(tmp_path),
+        agency_socket_path=str(socket_path),
+        agency_timeout_seconds=30.0,
+    )
+
+    assert app_module._agency_runtime_is_bound(settings) is False
+
+    socket_path.touch()
+
+    class ReachableAgencyDaemonClient:
+        def __init__(self, *, socket_path: str, timeout_seconds: float) -> None:
+            assert socket_path == socket_path_text
+            assert timeout_seconds == 1.0
+
+        def health(self) -> dict[str, object]:
+            return {"ok": True, "api_version": 3}
+
+    monkeypatch.setattr(app_module, "AgencyDaemonClient", ReachableAgencyDaemonClient)
+    assert app_module._agency_runtime_is_bound(settings) is True
+
+    class UnreachableAgencyDaemonClient:
+        def __init__(self, *, socket_path: str, timeout_seconds: float) -> None:
+            del socket_path, timeout_seconds
+
+        def health(self) -> dict[str, object]:
+            raise AgencyDaemonError("agency daemon unavailable")
+
+    monkeypatch.setattr(app_module, "AgencyDaemonClient", UnreachableAgencyDaemonClient)
+    assert app_module._agency_runtime_is_bound(settings) is False
 
 
 @pytest.mark.uses_real_env_files
@@ -308,11 +349,9 @@ def test_provider_runtime_settings_default_to_production_values() -> None:
     assert settings.search_web_timeout_seconds == 8.0
     assert settings.search_web_api_key is None
     assert settings.search_news_timeout_seconds == 8.0
-    assert settings.search_news_api_key is None
     assert settings.web_extract_provider_endpoint is None
     assert settings.web_extract_timeout_seconds == 10.0
     assert settings.web_extract_max_retries == 2
-    assert settings.web_extract_api_key is None
     assert settings.maps_api_key is None
     assert settings.maps_timeout_seconds == 8.0
     assert settings.weather_provider_mode == "production"
@@ -329,11 +368,9 @@ def test_provider_runtime_settings_load_from_env(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("ARIEL_SEARCH_WEB_TIMEOUT_SECONDS", "3.5")
     monkeypatch.setenv("ARIEL_SEARCH_WEB_API_KEY", "search-key")
     monkeypatch.setenv("ARIEL_SEARCH_NEWS_TIMEOUT_SECONDS", "4.5")
-    monkeypatch.setenv("ARIEL_SEARCH_NEWS_API_KEY", "news-key")
     monkeypatch.setenv("ARIEL_WEB_EXTRACT_PROVIDER_ENDPOINT", "https://extract.example.test")
     monkeypatch.setenv("ARIEL_WEB_EXTRACT_TIMEOUT_SECONDS", "5.5")
     monkeypatch.setenv("ARIEL_WEB_EXTRACT_MAX_RETRIES", "4")
-    monkeypatch.setenv("ARIEL_WEB_EXTRACT_API_KEY", "extract-key")
     monkeypatch.setenv("ARIEL_MAPS_API_KEY", "maps-key")
     monkeypatch.setenv("ARIEL_MAPS_TIMEOUT_SECONDS", "6.5")
     monkeypatch.setenv("ARIEL_WEATHER_PROVIDER_MODE", "dev")
@@ -350,11 +387,9 @@ def test_provider_runtime_settings_load_from_env(monkeypatch: pytest.MonkeyPatch
     assert settings.search_web_timeout_seconds == 3.5
     assert settings.search_web_api_key == "search-key"
     assert settings.search_news_timeout_seconds == 4.5
-    assert settings.search_news_api_key == "news-key"
     assert settings.web_extract_provider_endpoint == "https://extract.example.test"
     assert settings.web_extract_timeout_seconds == 5.5
     assert settings.web_extract_max_retries == 4
-    assert settings.web_extract_api_key == "extract-key"
     assert settings.maps_api_key == "maps-key"
     assert settings.maps_timeout_seconds == 6.5
     assert settings.weather_provider_mode == "dev"
@@ -502,6 +537,7 @@ def test_production_requires_public_webhook_base_url(monkeypatch: pytest.MonkeyP
 def test_google_pubsub_subscription_rejects_non_resource_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("ARIEL_GOOGLE_PUBSUB_TOPIC", "projects/my-project/topics/topic")
     monkeypatch.setenv("ARIEL_GOOGLE_PUBSUB_SUBSCRIPTION", "not-a-resource-path")
     monkeypatch.setenv("ARIEL_GOOGLE_APPLICATION_CREDENTIALS_PATH", "/etc/sa.json")
 
@@ -509,9 +545,24 @@ def test_google_pubsub_subscription_rejects_non_resource_path(
         _app_settings_without_env_files()
 
 
+def test_google_pubsub_topic_rejects_non_resource_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARIEL_GOOGLE_PUBSUB_TOPIC", "not-a-resource-path")
+    monkeypatch.setenv(
+        "ARIEL_GOOGLE_PUBSUB_SUBSCRIPTION",
+        "projects/my-project/subscriptions/ariel-gmail-watch-sub",
+    )
+    monkeypatch.setenv("ARIEL_GOOGLE_APPLICATION_CREDENTIALS_PATH", "/etc/sa.json")
+
+    with pytest.raises(ValidationError, match="google_pubsub_topic"):
+        _app_settings_without_env_files()
+
+
 def test_google_application_credentials_path_must_be_absolute(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("ARIEL_GOOGLE_PUBSUB_TOPIC", "projects/my-project/topics/topic")
     monkeypatch.setenv(
         "ARIEL_GOOGLE_PUBSUB_SUBSCRIPTION",
         "projects/my-project/subscriptions/ariel-gmail-watch-sub",
@@ -523,17 +574,21 @@ def test_google_application_credentials_path_must_be_absolute(
 
 
 @pytest.mark.parametrize(
-    "subscription, credentials_path",
+    "topic, subscription, credentials_path",
     [
-        ("projects/my-project/subscriptions/ariel-gmail-watch-sub", None),
-        (None, "/etc/sa.json"),
+        ("projects/my-project/topics/topic", "projects/my-project/subscriptions/sub", None),
+        ("projects/my-project/topics/topic", None, "/etc/sa.json"),
+        (None, "projects/my-project/subscriptions/sub", "/etc/sa.json"),
     ],
 )
-def test_pubsub_subscription_and_credentials_must_be_set_together(
+def test_pubsub_settings_must_be_set_together(
     monkeypatch: pytest.MonkeyPatch,
+    topic: str | None,
     subscription: str | None,
     credentials_path: str | None,
 ) -> None:
+    if topic is not None:
+        monkeypatch.setenv("ARIEL_GOOGLE_PUBSUB_TOPIC", topic)
     if subscription is not None:
         monkeypatch.setenv("ARIEL_GOOGLE_PUBSUB_SUBSCRIPTION", subscription)
     if credentials_path is not None:
@@ -543,9 +598,10 @@ def test_pubsub_subscription_and_credentials_must_be_set_together(
         _app_settings_without_env_files()
 
 
-def test_pubsub_subscription_and_credentials_set_together_validate(
+def test_pubsub_settings_set_together_validate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("ARIEL_GOOGLE_PUBSUB_TOPIC", "projects/my-project/topics/topic")
     monkeypatch.setenv(
         "ARIEL_GOOGLE_PUBSUB_SUBSCRIPTION",
         "projects/my-project/subscriptions/ariel-gmail-watch-sub",
@@ -554,10 +610,54 @@ def test_pubsub_subscription_and_credentials_set_together_validate(
 
     settings = _app_settings_without_env_files()
 
+    assert settings.google_pubsub_topic == "projects/my-project/topics/topic"
     assert settings.google_pubsub_subscription == (
         "projects/my-project/subscriptions/ariel-gmail-watch-sub"
     )
     assert settings.google_application_credentials_path == "/etc/sa.json"
+
+
+def test_production_requires_google_redirect_to_match_public_webhook_base(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARIEL_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("ARIEL_LOCAL_AUTH_REQUIRED", "true")
+    monkeypatch.setenv("ARIEL_LOCAL_AUTH_TOKEN", STRONG_LOCAL_AUTH_TOKEN)
+    monkeypatch.setenv("ARIEL_CONNECTOR_ENCRYPTION_SECRET", "prod-not-default")
+    monkeypatch.setenv("ARIEL_CONNECTOR_ENCRYPTION_KEYS", CONNECTOR_KEYRING)
+    monkeypatch.setenv("ARIEL_PUBLIC_WEBHOOK_BASE_URL", "https://ariel.example.com")
+    monkeypatch.setenv("ARIEL_GOOGLE_OAUTH_REDIRECT_URI", "https://other.example.com/callback")
+    monkeypatch.setenv("ARIEL_AGENCY_SOCKET_PATH", "/tmp/agencyd.sock")
+    monkeypatch.setenv("ARIEL_AGENCY_ALLOWED_REPO_ROOTS", "/opt/ariel,/opt/agency")
+
+    with pytest.raises(ValidationError, match="google_oauth_redirect_uri must equal"):
+        _app_settings_without_env_files()
+
+
+def test_production_requires_absolute_agency_socket_and_roots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARIEL_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("ARIEL_LOCAL_AUTH_REQUIRED", "true")
+    monkeypatch.setenv("ARIEL_LOCAL_AUTH_TOKEN", STRONG_LOCAL_AUTH_TOKEN)
+    monkeypatch.setenv("ARIEL_CONNECTOR_ENCRYPTION_SECRET", "prod-not-default")
+    monkeypatch.setenv("ARIEL_CONNECTOR_ENCRYPTION_KEYS", CONNECTOR_KEYRING)
+    monkeypatch.setenv("ARIEL_PUBLIC_WEBHOOK_BASE_URL", "https://ariel.example.com")
+    monkeypatch.setenv(
+        "ARIEL_GOOGLE_OAUTH_REDIRECT_URI",
+        "https://ariel.example.com/v1/connectors/google/callback",
+    )
+    monkeypatch.setenv("ARIEL_AGENCY_SOCKET_PATH", "relative.sock")
+    monkeypatch.setenv("ARIEL_AGENCY_ALLOWED_REPO_ROOTS", "/opt/ariel,/opt/agency")
+
+    with pytest.raises(ValidationError, match="agency_socket_path"):
+        _app_settings_without_env_files()
+
+    monkeypatch.setenv("ARIEL_AGENCY_SOCKET_PATH", "/tmp/agencyd.sock")
+    monkeypatch.setenv("ARIEL_AGENCY_ALLOWED_REPO_ROOTS", "relative")
+
+    with pytest.raises(ValidationError, match="agency_allowed_repo_roots"):
+        _app_settings_without_env_files()
 
 
 @pytest.mark.parametrize(

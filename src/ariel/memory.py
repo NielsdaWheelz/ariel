@@ -38,6 +38,7 @@ from .ids import new_id
 from .model_adapter import ModelAdapter, ModelMessage
 from .persistence import (
     BackgroundTaskRecord,
+    EventRecord,
     MemoryLogRecord,
     MemoryNoteRecord,
     TurnRecord,
@@ -709,11 +710,54 @@ def run_retriever(
 # ---------------------------------------------------------------------------
 
 
+def _next_memory_turn_event_sequence(*, db: Session, turn_id: str) -> int:
+    return (
+        int(
+            db.scalar(
+                select(func.coalesce(func.max(EventRecord.sequence), 0)).where(
+                    EventRecord.turn_id == turn_id
+                )
+            )
+            or 0
+        )
+        + 1
+    )
+
+
+def _complete_existing_rememberer_turn(
+    *,
+    db: Session,
+    turn: TurnRecord,
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> None:
+    if turn.status in {"completed", "failed"}:
+        return
+    if turn.status != "in_progress":
+        raise RuntimeError("rememberer source turn status invalid")
+    failure_reason = "background task replay found an interrupted in-progress rememberer turn"
+    turn.status = "failed"
+    turn.updated_at = now_fn()
+    db.add(
+        EventRecord(
+            id=new_id_fn("evn"),
+            session_id=turn.session_id,
+            turn_id=turn.id,
+            sequence=_next_memory_turn_event_sequence(db=db, turn_id=turn.id),
+            event_type="evt.turn.failed",
+            payload={
+                "failure_reason": failure_reason,
+                "error_code": "E_BACKGROUND_TURN_INTERRUPTED",
+            },
+            created_at=now_fn(),
+        )
+    )
+
+
 def run_rememberer(
     *,
     trigger: Literal["encode", "dream"],
     sandbox: RunSandbox,
-    db: Session,
     session_factory: sessionmaker[Session],
     session_id: str | None,
     settings: AppSettings,
@@ -728,6 +772,7 @@ def run_rememberer(
     add_event: Callable[[str, dict[str, Any]], None],
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
+    source_background_task_id: str | None = None,
 ) -> None:
     """Run the rememberer (encode or dream) as a background task.
 
@@ -770,6 +815,20 @@ def run_rememberer(
 
     with session_factory() as task_db:
         with task_db.begin():
+            if source_background_task_id is not None:
+                existing_turn = task_db.scalar(
+                    select(TurnRecord)
+                    .where(TurnRecord.source_background_task_id == source_background_task_id)
+                    .limit(1)
+                )
+                if existing_turn is not None:
+                    _complete_existing_rememberer_turn(
+                        db=task_db,
+                        turn=existing_turn,
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
+                    return
             turn = TurnRecord(
                 id=new_id_fn("trn"),
                 session_id=effective_session_id,
@@ -777,6 +836,7 @@ def run_rememberer(
                 assistant_message=None,
                 status="in_progress",
                 kind=judgment_type,
+                source_background_task_id=source_background_task_id,
                 created_at=now,
                 updated_at=now,
             )

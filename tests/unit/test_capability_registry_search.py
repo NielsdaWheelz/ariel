@@ -68,6 +68,15 @@ def _result(
     )
 
 
+class _WeatherResponse:
+    def __init__(self, *, status_code: int, payload: dict[str, Any]) -> None:
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self) -> dict[str, Any]:
+        return self._payload
+
+
 def test_search_web_maps_provider_results_to_search_results_v1(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -233,6 +242,201 @@ def test_search_web_and_news_reject_non_query_or_malformed_inputs(
 
     assert normalized is None
     assert error == "schema_invalid"
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "should_send_key"),
+    [
+        ("", True),
+        ("https://extract.example.test/v1/extract", False),
+    ],
+)
+def test_web_extract_sends_brave_key_only_to_brave_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    endpoint: str,
+    should_send_key: bool,
+) -> None:
+    class _Response:
+        status_code = 200
+
+        def json(self) -> dict[str, Any]:
+            return {
+                "document": {
+                    "url": "https://example.com/article",
+                    "title": "Example",
+                    "content": "Extracted article body.",
+                }
+            }
+
+    seen_headers: dict[str, str] = {}
+
+    def fake_post(*args: Any, **kwargs: Any) -> _Response:
+        del args
+        seen_headers.update(kwargs["headers"])
+        return _Response()
+
+    monkeypatch.setenv("ARIEL_SEARCH_WEB_API_KEY", "shared-brave-key")
+    monkeypatch.setenv("ARIEL_WEB_EXTRACT_PROVIDER_ENDPOINT", endpoint)
+    monkeypatch.setattr(registry.httpx, "post", fake_post)
+
+    capability = registry.get_capability("cap.web.extract")
+    assert capability is not None
+    assert capability.execute is not None
+    output = capability.execute({"url": "https://example.com/article"})
+
+    assert output["status"] == "succeeded"
+    assert ("x-subscription-token" in seen_headers) is should_send_key
+
+
+def test_weather_dev_adapter_parses_wttr_payload_without_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, Any] = {}
+
+    def fake_get(url: str, **kwargs: Any) -> _WeatherResponse:
+        seen["url"] = url
+        seen["kwargs"] = kwargs
+        return _WeatherResponse(
+            status_code=200,
+            payload={
+                "current_condition": [
+                    {
+                        "weatherDesc": [{"value": "Light rain"}],
+                        "temp_C": "14",
+                    }
+                ],
+                "weather": [{"date": "2026-05-24"}],
+            },
+        )
+
+    monkeypatch.setenv("ARIEL_WEATHER_PROVIDER_MODE", "dev")
+    monkeypatch.setenv("ARIEL_WEATHER_DEV_ENDPOINT", "https://wttr.example.test")
+    monkeypatch.setenv("ARIEL_WEATHER_DEV_TIMEOUT_SECONDS", "4.5")
+    monkeypatch.delenv("ARIEL_WEATHER_PRODUCTION_API_KEY", raising=False)
+    monkeypatch.setattr(registry.httpx, "get", fake_get)
+
+    capability = registry.get_capability("cap.weather.forecast")
+    assert capability is not None
+    assert capability.execute is not None
+    output = capability.execute({"location": "Portland, OR", "timeframe": "today"})
+
+    assert seen == {
+        "url": "https://wttr.example.test/Portland%2C%20OR",
+        "kwargs": {"params": {"format": "j1"}, "timeout": 4.5},
+    }
+    assert output["location"] == "Portland, OR"
+    assert output["timeframe"] == "today"
+    assert output["forecast"] == {
+        "summary": "Light rain, 14C",
+        "source": "https://wttr.example.test",
+        "timestamp": "2026-05-24T00:00:00Z",
+    }
+    assert output["status"] == "succeeded"
+
+
+def test_weather_production_adapter_parses_tomorrow_io_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, Any] = {}
+
+    def fake_get(url: str, **kwargs: Any) -> _WeatherResponse:
+        seen["url"] = url
+        seen["kwargs"] = kwargs
+        return _WeatherResponse(
+            status_code=200,
+            payload={
+                "timelines": {
+                    "daily": [
+                        {
+                            "time": "2026-05-24T00:00:00Z",
+                            "values": {
+                                "temperatureMin": 9,
+                                "temperatureMax": 15,
+                                "weatherCode": 1000,
+                            },
+                        },
+                        {
+                            "time": "2026-05-25T00:00:00Z",
+                            "values": {
+                                "temperatureMin": 11,
+                                "temperatureMax": 17,
+                                "weatherCode": 1001,
+                                "windSpeed": 4,
+                            },
+                        },
+                    ]
+                }
+            },
+        )
+
+    monkeypatch.setenv("ARIEL_WEATHER_PROVIDER_MODE", "production")
+    monkeypatch.setenv(
+        "ARIEL_WEATHER_PRODUCTION_ENDPOINT",
+        "https://weather.example.test/v4/weather/forecast",
+    )
+    monkeypatch.setenv("ARIEL_WEATHER_PRODUCTION_API_KEY", "weather-key")
+    monkeypatch.setenv("ARIEL_WEATHER_PRODUCTION_TIMEOUT_SECONDS", "6.5")
+    monkeypatch.setattr(registry.httpx, "get", fake_get)
+
+    capability = registry.get_capability("cap.weather.forecast")
+    assert capability is not None
+    assert capability.execute is not None
+    output = capability.execute({"location": "Tokyo, JP", "timeframe": "tomorrow"})
+
+    assert seen == {
+        "url": "https://weather.example.test/v4/weather/forecast",
+        "kwargs": {
+            "params": {
+                "location": "Tokyo JP",
+                "timesteps": "1d",
+                "apikey": "weather-key",
+            },
+            "timeout": 6.5,
+        },
+    }
+    assert output["location"] == "Tokyo, JP"
+    assert output["timeframe"] == "tomorrow"
+    assert output["forecast"] == {
+        "summary": "temperature 11.0-17.0C, code 1001, wind 4.0 m/s",
+        "source": "https://weather.example.test/v4/weather/forecast",
+        "timestamp": "2026-05-25T00:00:00Z",
+    }
+    assert output["status"] == "succeeded"
+
+
+def test_weather_production_adapter_preserves_lat_lon_location_param(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_params: dict[str, Any] = {}
+
+    def fake_get(url: str, **kwargs: Any) -> _WeatherResponse:
+        del url
+        seen_params.update(kwargs["params"])
+        return _WeatherResponse(
+            status_code=200,
+            payload={
+                "timelines": {
+                    "daily": [
+                        {
+                            "time": "2026-05-24T00:00:00Z",
+                            "values": {"temperatureMin": 9, "temperatureMax": 15},
+                        }
+                    ]
+                }
+            },
+        )
+
+    monkeypatch.setenv("ARIEL_WEATHER_PROVIDER_MODE", "production")
+    monkeypatch.setenv("ARIEL_WEATHER_PRODUCTION_API_KEY", "weather-key")
+    monkeypatch.setattr(registry.httpx, "get", fake_get)
+
+    capability = registry.get_capability("cap.weather.forecast")
+    assert capability is not None
+    assert capability.execute is not None
+    output = capability.execute({"location": "47.6062,-122.3321", "timeframe": "today"})
+
+    assert seen_params["location"] == "47.6062,-122.3321"
+    assert output["status"] == "succeeded"
 
 
 def test_memory_search_validator_normalizes_boundary_filters() -> None:

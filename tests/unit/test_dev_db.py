@@ -7,6 +7,8 @@ import pytest
 from ariel.dev_db import (
     load_local_env,
     parse_dotenv_file,
+    redact_command_for_display,
+    redact_database_url,
     resolve_local_postgres_runtime,
 )
 
@@ -110,3 +112,22 @@ def test_resolve_local_postgres_runtime_rejects_non_loopback_host() -> None:
         resolve_local_postgres_runtime(
             {"ARIEL_DATABASE_URL": "postgresql+psycopg://user:pass@db.internal:5432/ariel"}
         )
+
+
+def test_redact_database_url_hides_password() -> None:
+    assert (
+        redact_database_url("postgresql+psycopg://myuser:mypass@localhost:5544/mydb")
+        == "postgresql+psycopg://myuser:***@localhost:5544/mydb"
+    )
+
+
+def test_redact_database_url_leaves_passwordless_url_alone() -> None:
+    assert redact_database_url("postgresql+psycopg://localhost/ariel") == (
+        "postgresql+psycopg://localhost/ariel"
+    )
+
+
+def test_redact_command_for_display_hides_postgres_password() -> None:
+    assert redact_command_for_display(
+        ["docker", "run", "-e", "POSTGRES_PASSWORD=secret-value", "postgres:17"]
+    ) == ["docker", "run", "-e", "POSTGRES_PASSWORD=***", "postgres:17"]

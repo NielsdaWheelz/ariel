@@ -33,6 +33,8 @@ from ariel.persistence import (
     to_rfc3339,
 )
 
+_CALENDAR_SYNC_PAGE_SIZE = 10
+
 
 def _provider_sync_lock_id(*parts: str) -> int:
     digest = hashlib.sha256("\x1f".join(parts).encode("utf-8")).digest()
@@ -323,6 +325,7 @@ def process_provider_sync_due(
                         sync_token=cursor_before,
                         time_min=None if cursor_before else to_rfc3339(now - timedelta(days=30)),
                         page_token=page_token,
+                        max_results=_CALENDAR_SYNC_PAGE_SIZE,
                     )
                     outputs.append(output)
                     page_token = _payload_text(output, "nextPageToken")

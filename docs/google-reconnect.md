@@ -41,7 +41,7 @@ You are an existing user (`gmail.readonly + calendar.readonly` already granted).
 curl -s "${auth[@]}" -X POST http://127.0.0.1:8000/v1/connectors/google/reconnect | jq -r '.oauth.authorization_url'
 # → open the URL in a browser, click Allow
 
-# Step 2: Gmail send (compose + send are bundled in cap.email.send via its scope)
+# Step 2: Gmail send
 curl -s "${auth[@]}" -X POST 'http://127.0.0.1:8000/v1/connectors/google/reconnect?capability_intent=cap.email.send' | jq -r '.oauth.authorization_url'
 # → open the URL, Allow
 
@@ -52,6 +52,7 @@ curl -s "${auth[@]}" -X POST 'http://127.0.0.1:8000/v1/connectors/google/reconne
 # Optional — only add if you actually want them, each is one extra prompt:
 curl -s "${auth[@]}" -X POST 'http://127.0.0.1:8000/v1/connectors/google/reconnect?capability_intent=cap.email.archive' | jq -r '.oauth.authorization_url'  # archive / trash / labels
 curl -s "${auth[@]}" -X POST 'http://127.0.0.1:8000/v1/connectors/google/reconnect?capability_intent=cap.email.draft'   | jq -r '.oauth.authorization_url'  # drafts
+curl -s "${auth[@]}" -X POST 'http://127.0.0.1:8000/v1/connectors/google/reconnect?capability_intent=cap.drive.search'  | jq -r '.oauth.authorization_url'  # Drive metadata search
 curl -s "${auth[@]}" -X POST 'http://127.0.0.1:8000/v1/connectors/google/reconnect?capability_intent=cap.drive.share'   | jq -r '.oauth.authorization_url'  # Drive share
 curl -s "${auth[@]}" -X POST 'http://127.0.0.1:8000/v1/connectors/google/reconnect?capability_intent=cap.drive.read'    | jq -r '.oauth.authorization_url'  # Drive read content
 ```
@@ -86,6 +87,8 @@ What each `capability_intent` adds beyond what you already have:
 | `cap.drive.share` | `drive` |
 
 Reconnect always unions the requested set with what you have. Granted scopes never get removed by reconnect — only by `DELETE /v1/connectors/google`.
+Gmail send and draft are separate grants: `cap.email.send` adds `gmail.send`,
+while `cap.email.draft` adds `gmail.compose`.
 
 ## Google Cloud Console — do you need to touch it?
 
