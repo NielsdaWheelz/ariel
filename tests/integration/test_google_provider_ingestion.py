@@ -9,9 +9,13 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from ariel.model_adapter import ModelAdapter
+from ariel.model_adapter import ModelAdapter, ModelCall, ModelResponse
 from tests.integration.app_helpers import create_test_app
-from tests.integration.responses_helpers import empty_recall_response, is_memory_subsystem_call
+from tests.integration.responses_helpers import (
+    FakeModelAdapter,
+    empty_recall_response,
+    is_memory_subsystem_call,
+)
 from ariel.config import AppSettings
 from ariel.google_connector import (
     GOOGLE_CONNECTOR_ID,
@@ -181,20 +185,14 @@ class ConnectOAuthClient:
         del token
 
 
-@dataclass
-class _NoCallAdapter:
-    provider: str = "provider.test"
-    model: str = "model.test"
+class _NoCallAdapter(FakeModelAdapter):
+    provider = "provider.test"
+    model = "model.test"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        **_: Any,
-    ) -> dict[str, Any]:
-        if is_memory_subsystem_call(input_items):
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_memory_subsystem_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
         raise AssertionError("model should not be called in this test")
 

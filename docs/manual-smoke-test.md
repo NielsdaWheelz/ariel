@@ -58,11 +58,16 @@ systemd units run from `/home/niels/src/personal/ariel` and load the default
 
 | Env var | Secret | Owner | Smoke evidence |
 | --- | --- | --- | --- |
-| `ARIEL_OPENAI_API_KEY` | yes | Responses API and embeddings | One low-risk agent turn completes; memory embedding call succeeds when exercised. |
+| `ARIEL_OPENAI_API_KEY` | yes | OpenAI provider | One low-risk agent turn against an OpenAI ref completes; embedding call succeeds when exercised. |
+| `ARIEL_OPENAI_BASE_URL` | no | OpenAI provider | Override is honored when set; default OpenAI base URL is used when unset. |
+| `ARIEL_ANTHROPIC_API_KEY` | yes | Anthropic provider | Required when any ref in `src/ariel/models.py` uses `provider="anthropic"`. |
+| `ARIEL_GOOGLE_API_KEY` | yes | Google provider | Required when any ref in `src/ariel/models.py` uses `provider="google"`. |
+| `ARIEL_OPENROUTER_API_KEY` | yes | OpenRouter provider | Required when any ref in `src/ariel/models.py` uses `provider="openrouter"`. |
+| `ARIEL_CLOUDFLARE_API_TOKEN` | yes | Cloudflare Workers AI provider | Required when any ref in `src/ariel/models.py` uses `provider="cloudflare"`. |
+| `ARIEL_CLOUDFLARE_ACCOUNT_ID` | no | Cloudflare Workers AI provider | Account id encoded into the Workers AI base URL; required when using the Cloudflare provider. |
 | `ARIEL_MODEL_NAME` | no | Main model | Health/config redacted dump shows intended model. |
 | `ARIEL_MODEL_TIMEOUT_SECONDS` | no | Model adapter | Short failure tests remain bounded; normal smoke turn completes. |
 | `ARIEL_MODEL_REASONING_EFFORT` | no | Model adapter | Validated as `minimal`, `low`, `medium`, or `high`. |
-| `ARIEL_MODEL_VERBOSITY` | no | Model adapter | Validated as `low`, `medium`, or `high`. |
 | `ARIEL_MAX_RESPONSE_TOKENS` | no | Agent loop | Overlong output is rejected with bounded failure. |
 | `ARIEL_MAIN_TURN_BUDGET_SECONDS` | no | Agent loop | Budget exhaustion test completes gracefully. |
 | `ARIEL_RESEARCH_RUN_BUDGET_SECONDS` | no | Research runtime | Research run timeout test or bounded manual research check. |
@@ -77,9 +82,7 @@ systemd units run from `/home/niels/src/personal/ariel` and load the default
 
 | Env var | Secret | Owner | Smoke evidence |
 | --- | --- | --- | --- |
-| `ARIEL_MEMORY_EMBEDDING_PROVIDER` | no | Memory | Validated nonblank; current production value is `openai`. |
-| `ARIEL_MEMORY_EMBEDDING_MODEL` | no | Memory | Validated nonblank. |
-| `ARIEL_MEMORY_EMBEDDING_DIMENSIONS` | no | Memory schema | Must match the schema dimension constant. |
+| `ARIEL_MEMORY_EMBEDDING_DIMENSIONS` | no | Memory schema | Must match the dimension of the `EMBEDDING` ref in `src/ariel/models.py`. |
 | `ARIEL_MEMORY_RECALL_BUDGET_SECONDS` | no | Memory retriever | Memory recall syscall returns or fails within budget. |
 | `ARIEL_MEMORY_ENCODE_BUDGET_SECONDS` | no | Memory rememberer | `memory.remember` enqueues and worker drains `memory_encode`. |
 | `ARIEL_MEMORY_DREAM_BUDGET_SECONDS` | no | Memory dream | Recurring memory dream task runs within budget. |
@@ -162,9 +165,7 @@ runtime env files.
 | `ARIEL_ATTACHMENT_FETCH_TIMEOUT_SECONDS` | no | Attachment fetch | Fetch timeout path is bounded. |
 | `ARIEL_ATTACHMENT_HANDLE_TTL_SECONDS` | no | Attachment refs | Expired handle is rejected. |
 | `ARIEL_ATTACHMENT_SCANNER_MODE` | no | Attachment extraction | `fail_closed` blocks newly fetched extraction until scanner support exists. |
-| `ARIEL_ATTACHMENT_OPENAI_MODEL` | no | Attachment extraction | Text/image extraction uses intended model when enabled. |
 | `ARIEL_ATTACHMENT_OPENAI_AUDIO_MODEL` | no | Audio extraction | Audio extraction uses intended model when enabled. |
-| `ARIEL_ATTACHMENT_OPENAI_TIMEOUT_SECONDS` | no | Attachment extraction | Extraction timeout path is bounded. |
 | `ARIEL_WORKER_POLL_SECONDS` | no | Worker loop | Worker idles and drains due rows at this cadence. |
 
 ### Local DB Helper Only

@@ -28,15 +28,23 @@ without creating a cycle.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Literal, assert_never
+from typing import Any, Literal, assert_never
 
 from fastapi.encoders import jsonable_encoder
+from pydantic_ai.messages import (
+    ModelRequest,
+    ModelResponse as PydAIModelResponse,
+    SystemPromptPart,
+    ToolCallPart,
+    ToolReturnPart,
+)
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -46,7 +54,16 @@ from .ai_judgments import AIJudgmentFailure, record_ai_judgment
 from .attachment_content import AttachmentContentRuntime
 from .config import AppSettings
 from .google_connector import GoogleConnectorRuntime
-from .model_adapter import ModelAdapterError
+from .model_adapter import (
+    ModelAdapter,
+    ModelCall,
+    ModelMessage,
+    ModelResponse,
+    ReasoningConfig,
+    ToolCall,
+    ToolSpec,
+)
+from .models import MAIN
 from .persistence import ActionAttemptRecord, TurnRecord
 from .run_runtime import (
     ScratchEntry,
@@ -54,9 +71,6 @@ from .run_runtime import (
     parse_run_function_call,
 )
 from .sandbox_runtime import RunSandbox
-
-if TYPE_CHECKING:
-    from .model_adapter import ModelAdapter
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +93,7 @@ class ResearchFinding:
       stuck-detection ended the run before a finding was emitted. The loop
       ran cleanly; it just did not converge. ``summary`` is a short honest
       non-convergence note; the three lists are empty.
-    - ``"failed"``: the model call raised ``ModelAdapterError``. ``summary`` is a
+    - ``"failed"``: the model call raised an exception. ``summary`` is a
       short honest failure note; the three lists are empty.
 
     The text fields are model-authored over untrusted content; the caller
@@ -138,7 +152,7 @@ class LoopConfig:
         The ``ai_judgments.judgment_type`` to use when ``record_judgments`` is
         True.  Must be ``None`` when ``record_judgments`` is False.
     retry_on_model_error:
-        True for ``_wake`` (retries ``ModelAdapterError(retryable=True)``),
+        True for ``_wake`` (retries exceptions carrying ``retryable=True``),
         False for ``run_research`` (exits on any model call failure).
     protocol_nudge:
         The system-message text appended on a ``run``-protocol failure.
@@ -195,10 +209,8 @@ class LoopResult:
     - ``"paused"`` — the program called ``agent.pause_until_input``.
     - ``"budget_exhausted"`` — the wall-clock budget, the model-call backstop,
       or stuck-detection ended the run without a terminal result.
-    - ``"model_failed"`` — a model call raised unretryable ``ModelAdapterError`` (or
+    - ``"model_failed"`` — a model call raised an unretryable exception (or
       ``retry_on_model_error`` is False).
-    - ``"bounded_failure"`` — reserved for callers that enforce per-response
-      token limits; not set by the loop itself.
     """
 
     outcome: Literal[
@@ -209,7 +221,6 @@ class LoopResult:
         "paused",
         "budget_exhausted",
         "model_failed",
-        "bounded_failure",
     ]
     emitted_message: str | None
     emitted_finding: ResearchFinding | None
@@ -217,7 +228,6 @@ class LoopResult:
     model_call_count: int
     created_action_attempt_count: int
     awaiting_approval: ActionAttemptRecord | None
-    bounded_failure_details: dict[str, Any] | None
     runtime_provenance: RuntimeProvenance | None
 
 
@@ -236,11 +246,8 @@ def run_agent_loop(
     turn: TurnRecord,
     settings: AppSettings,
     model_adapter: ModelAdapter,
-    responses_input_items: list[dict[str, Any]],
-    tools: list[dict[str, Any]],
-    user_message: str,
-    history: list[dict[str, Any]],
-    context_bundle: dict[str, Any],
+    messages: list[ModelMessage],
+    tools: list[ToolSpec],
     allowed_capability_ids: frozenset[str],
     scratch: dict[str, ScratchEntry],
     proposal_index_start: int,
@@ -258,23 +265,30 @@ def run_agent_loop(
     """Drive the shared agent loop and return a typed result.
 
     The loop runs until one of the terminal outcomes occurs.  The caller is
-    responsible for all pre-loop and post-loop work: building
-    ``responses_input_items``, the ``turn`` record, ``scratch``, and mapping
-    the returned ``LoopResult`` to a domain-level outcome.
+    responsible for all pre-loop and post-loop work: building the initial
+    ``messages`` list (system + user), the ``turn`` record, ``scratch``, and
+    mapping the returned ``LoopResult`` to a domain-level outcome.
+
+    ``messages`` is the caller-owned conversation history as pydantic-ai
+    ``ModelMessage``\\ s; the loop appends one ``ModelResponse`` (the model's
+    reply) and one ``ModelRequest`` (tool returns + any system nudge) per
+    round. The model adapter (``ModelAdapter.call``) is async; we bridge with
+    ``asyncio.run`` at the call sites because the rest of the agent path —
+    DB session, FastAPI handlers, worker — is sync.
     """
 
     loop_started_at = time.perf_counter()
     budget_item_index: int | None = None
 
-    # The stable prefix length — items present before the loop started
+    # The stable prefix length — messages present before the loop started
     # (system prompts, user message, etc.).  Round eviction never touches these.
-    stable_prefix_len = len(responses_input_items)
+    stable_prefix_len = len(messages)
 
-    # Tracks (start_index, end_index) of each round's appended items so the
+    # Tracks (start_index, end_index) of each round's appended messages so the
     # oldest round can be evicted when the live window overflows.
     round_spans: list[tuple[int, int]] = []
 
-    # Tail index of the items appended by the most recent emit_value round.
+    # Tail index of the messages appended by the most recent emit_value round.
     # ``None`` before the first emit_value round.
     last_emit_value_tail: int | None = None
 
@@ -304,58 +318,70 @@ def run_agent_loop(
                 final_runtime_provenance=final_runtime_provenance,
             )
 
-        # Remaining-budget signal: replace the previous round's item in-place.
+        # Remaining-budget signal: replace the previous round's message in-place.
         remaining_s = max(0.0, cfg.budget_seconds - elapsed_s)
-        budget_line: dict[str, Any] = {
-            "role": "system",
-            "content": f"remaining budget: {remaining_s:.0f}s",
-        }
+        budget_line = _system_message(f"remaining budget: {remaining_s:.0f}s")
         if budget_item_index is None:
-            responses_input_items.append(budget_line)
-            budget_item_index = len(responses_input_items) - 1
+            messages.append(budget_line)
+            budget_item_index = len(messages) - 1
         else:
-            responses_input_items[budget_item_index] = budget_line
+            messages[budget_item_index] = budget_line
 
         model_call_count += 1
         add_event(
             "evt.model.started",
             {
-                "provider": model_adapter.provider,
-                "model": model_adapter.model,
+                "provider": MAIN.provider,
+                "model": MAIN.model,
                 "model_call_count": model_call_count,
             },
         )
         model_started_at = time.perf_counter()
         try:
-            candidate_response = model_adapter.create_response(
-                input_items=responses_input_items,
-                tools=tools,
-                user_message=user_message,
-                history=history,
-                context_bundle=context_bundle,
+            # asyncio.run is fine to call twice per loop invocation: each call
+            # spins up a fresh event loop, runs to completion, and tears down.
+            # The surrounding code (FastAPI handlers, worker, DB session) is
+            # sync; bridging here is the smallest change.
+            candidate_response = asyncio.run(
+                model_adapter.call(
+                    ModelCall(
+                        model=MAIN,
+                        messages=messages,
+                        tools=tools,
+                        tool_choice="auto",
+                        reasoning=ReasoningConfig(effort=settings.model_reasoning_effort),
+                        max_output_tokens=settings.max_response_tokens,
+                    )
+                )
             )
-            duration_ms = int((time.perf_counter() - model_started_at) * 1000)
+            usage = candidate_response.usage
             add_event(
                 "evt.model.completed",
                 {
-                    "provider": candidate_response.get("provider"),
-                    "model": candidate_response.get("model"),
-                    "duration_ms": duration_ms,
-                    "usage": candidate_response.get("usage"),
-                    "provider_response_id": candidate_response.get("provider_response_id"),
+                    "provider": candidate_response.provider,
+                    "model": candidate_response.model,
+                    "duration_ms": candidate_response.duration_ms,
+                    "usage": {
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                        "total_tokens": usage.input_tokens + usage.output_tokens,
+                        "reasoning_tokens": usage.reasoning_tokens,
+                        "cached_tokens": usage.cached_tokens,
+                    },
+                    "provider_response_id": candidate_response.provider_response_id,
                     "model_call_count": model_call_count,
                 },
             )
-        except ModelAdapterError as exc:
+        except Exception as exc:
             duration_ms = int((time.perf_counter() - model_started_at) * 1000)
-            should_retry = cfg.retry_on_model_error and exc.retryable
+            should_retry = cfg.retry_on_model_error and bool(getattr(exc, "retryable", False))
             add_event(
                 "evt.model.failed",
                 {
-                    "provider": model_adapter.provider,
-                    "model": model_adapter.model,
+                    "provider": MAIN.provider,
+                    "model": MAIN.model,
                     "duration_ms": duration_ms,
-                    "failure_reason": exc.safe_reason,
+                    "failure_reason": getattr(exc, "safe_reason", str(exc)),
                     "model_call_count": model_call_count,
                 },
             )
@@ -369,19 +395,11 @@ def run_agent_loop(
                 model_call_count=model_call_count,
                 created_action_attempt_count=created_action_attempt_count,
                 awaiting_approval=None,
-                bounded_failure_details=None,
                 runtime_provenance=final_runtime_provenance,
             )
 
-        output_items = candidate_response.get("output")
-        if not isinstance(output_items, list):
-            output_items = []
-        function_calls = [
-            item
-            for item in output_items
-            if isinstance(item, dict) and item.get("type") == "function_call"
-        ]
-        run_source, run_protocol_error = parse_run_function_call(function_calls)
+        tool_calls = candidate_response.tool_calls
+        run_source, run_protocol_error = parse_run_function_call(tool_calls)
 
         if run_protocol_error is not None or run_source is None:
             # Protocol failure: the model did not emit a valid run call.
@@ -389,50 +407,46 @@ def run_agent_loop(
                 _record_judgment(
                     db=db,
                     cfg=cfg,
-                    model_adapter=model_adapter,
-                    candidate_response=candidate_response,
+                    response=candidate_response,
                     session_id=session_id,
                     turn=turn,
                     model_call_count=model_call_count,
                     now_fn=now_fn,
                     new_id_fn=new_id_fn,
                     input_summary="run protocol validation for model response",
-                    input_refs={"response_output": output_items},
+                    input_refs={
+                        "tool_calls": [
+                            {"name": t.name, "arguments": t.arguments} for t in tool_calls
+                        ],
+                    },
                     output={},
                     failure_reason=run_protocol_error or "model failed the run tool protocol",
                 )
-            round_start = len(responses_input_items)
-            for output_item in output_items:
-                if isinstance(output_item, dict) and output_item.get("type") == "function_call":
-                    responses_input_items.append(jsonable_encoder(output_item))
-            for function_call in function_calls:
-                call_id = function_call.get("call_id")
-                if not isinstance(call_id, str) or not call_id:
-                    continue
-                responses_input_items.append(
-                    {
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": json.dumps(
-                            {
-                                "status": "failed",
-                                "error": run_protocol_error or "model failed the run tool protocol",
-                            },
-                            sort_keys=True,
-                        ),
-                    }
+            round_start = len(messages)
+            failure_payload = json.dumps(
+                {
+                    "status": "failed",
+                    "error": run_protocol_error or "model failed the run tool protocol",
+                },
+                sort_keys=True,
+            )
+            messages.append(_assistant_tool_call_message(tool_calls))
+            messages.append(
+                _tool_returns_with_nudge(
+                    returns=[(t.call_id, failure_payload) for t in tool_calls if t.call_id],
+                    nudge=cfg.protocol_nudge,
                 )
-            responses_input_items.append({"role": "system", "content": cfg.protocol_nudge})
+            )
             add_event(
                 "evt.model.protocol_failed",
                 {
                     "reason": run_protocol_error,
                     "model_call_count": model_call_count,
-                    "provider_response_id": candidate_response.get("provider_response_id"),
+                    "provider_response_id": candidate_response.provider_response_id,
                 },
             )
             _evict_oldest_round(
-                responses_input_items,
+                messages,
                 round_spans,
                 round_start,
                 stable_prefix_len,
@@ -450,8 +464,7 @@ def run_agent_loop(
             )
         prev_run_source = run_source
 
-        run_call_id = function_calls[0].get("call_id")
-        run_call_id = run_call_id if isinstance(run_call_id, str) else ""
+        run_call_id = tool_calls[0].call_id
 
         run_program_result = execute_run_program(
             sandbox=sandbox,
@@ -479,11 +492,10 @@ def run_agent_loop(
         )
         created_action_attempt_count += len(run_program_result.action_attempts)
         # Thread taint across programs in the same turn.
-        if run_program_result.runtime_provenance is not None:
-            final_runtime_provenance = _merge_provenance(
-                baseline=final_runtime_provenance,
-                ingress=run_program_result.runtime_provenance,
-            )
+        final_runtime_provenance = RuntimeProvenance.merge_optional(
+            final_runtime_provenance,
+            run_program_result.runtime_provenance,
+        )
 
         if not run_program_result.program_ok:
             # Program failure.
@@ -502,8 +514,7 @@ def run_agent_loop(
                 _record_judgment(
                     db=db,
                     cfg=cfg,
-                    model_adapter=model_adapter,
-                    candidate_response=candidate_response,
+                    response=candidate_response,
                     session_id=session_id,
                     turn=turn,
                     model_call_count=model_call_count,
@@ -514,30 +525,7 @@ def run_agent_loop(
                     output={},
                     failure_reason=json.dumps(program_errors, sort_keys=True),
                 )
-            round_start = len(responses_input_items)
-            for output_item in output_items:
-                if isinstance(output_item, dict) and output_item.get("type") == "function_call":
-                    responses_input_items.append(jsonable_encoder(output_item))
-            # A failed program may still have succeeded syscalls before it
-            # raised. Surface the attempt ledger, but not capability payloads:
-            # model-visible cross-round data must be carried deliberately with
-            # emit_value, not auto-echoed from the audit record.
-            attempt_observations = _action_attempt_observations(run_program_result.action_attempts)
-            if run_call_id:
-                responses_input_items.append(
-                    {
-                        "type": "function_call_output",
-                        "call_id": run_call_id,
-                        "output": json.dumps(
-                            {
-                                "status": "failed",
-                                "errors": program_errors,
-                                "action_attempts": attempt_observations,
-                            },
-                            sort_keys=True,
-                        ),
-                    }
-                )
+            round_start = len(messages)
             nudge = cfg.program_failure_nudge
             for err in program_errors:
                 if "agent.emit_finding is not available in the main agent loop" in err:
@@ -554,23 +542,38 @@ def run_agent_loop(
                         "agent.emit_message(text=...) to reply to the user."
                     )
                     break
-            responses_input_items.append(
+            # A failed program may still have succeeded syscalls before it
+            # raised. Surface the attempt ledger, but not capability payloads:
+            # model-visible cross-round data must be carried deliberately with
+            # emit_value, not auto-echoed from the audit record.
+            attempt_observations = _action_attempt_observations(run_program_result.action_attempts)
+            failure_output = json.dumps(
                 {
-                    "role": "system",
-                    "content": (
-                        "run program did not complete: "
-                        + json.dumps(program_errors, sort_keys=True)
-                        + ". "
-                        + nudge
-                    ),
-                }
+                    "status": "failed",
+                    "errors": program_errors,
+                    "action_attempts": attempt_observations,
+                },
+                sort_keys=True,
+            )
+            nudge_text = (
+                "run program did not complete: "
+                + json.dumps(program_errors, sort_keys=True)
+                + ". "
+                + nudge
+            )
+            messages.append(_assistant_tool_call_message(tool_calls))
+            messages.append(
+                _tool_returns_with_nudge(
+                    returns=[(run_call_id, failure_output)] if run_call_id else [],
+                    nudge=nudge_text,
+                )
             )
             add_event(
                 "evt.run.validation_failed",
                 {
                     "errors": program_errors,
                     "model_call_count": model_call_count,
-                    "provider_response_id": candidate_response.get("provider_response_id"),
+                    "provider_response_id": candidate_response.provider_response_id,
                 },
             )
             if cfg.void_failed_program_approvals:
@@ -582,7 +585,7 @@ def run_agent_loop(
                 )
             db.commit()
             _evict_oldest_round(
-                responses_input_items,
+                messages,
                 round_spans,
                 round_start,
                 stable_prefix_len,
@@ -597,15 +600,17 @@ def run_agent_loop(
             _record_judgment(
                 db=db,
                 cfg=cfg,
-                model_adapter=model_adapter,
-                candidate_response=candidate_response,
+                response=candidate_response,
                 session_id=session_id,
                 turn=turn,
                 model_call_count=model_call_count,
                 now_fn=now_fn,
                 new_id_fn=new_id_fn,
                 input_summary="executed run program for model response",
-                input_refs={"source": run_source, "response_output": output_items},
+                input_refs={
+                    "source": run_source,
+                    "tool_calls": [{"name": t.name, "arguments": t.arguments} for t in tool_calls],
+                },
                 output={
                     "emitted_message": bool(run_program_result.emitted_message),
                     "paused": run_program_result.paused,
@@ -655,6 +660,7 @@ def run_agent_loop(
                 turn_id=turn.id,
                 taint=taint,
                 source_ref=turn.id,
+                adapter=model_adapter,
                 settings=settings,
                 now=now_fn(),
                 new_id_fn=new_id_fn,
@@ -683,7 +689,7 @@ def run_agent_loop(
                 "evt.agent.premature_synthesis_rejected",
                 {
                     "model_call_count": model_call_count,
-                    "provider_response_id": candidate_response.get("provider_response_id"),
+                    "provider_response_id": candidate_response.provider_response_id,
                     "rejected_message_chars": len(run_program_result.emitted_message),
                     "read_capability_ids": [
                         a.capability_id
@@ -703,7 +709,10 @@ def run_agent_loop(
                         outcome="finding",
                         emitted_message=None,
                         emitted_finding=ResearchFinding(
-                            question=user_message,
+                            # ``question`` is the caller's: it knows the
+                            # question it dispatched. The loop carries the
+                            # model-authored body only.
+                            question="",
                             mode=cfg.finding_mode,
                             status="complete",
                             summary=str(raw["summary"]),
@@ -715,7 +724,6 @@ def run_agent_loop(
                         model_call_count=model_call_count,
                         created_action_attempt_count=created_action_attempt_count,
                         awaiting_approval=None,
-                        bounded_failure_details=None,
                         runtime_provenance=final_runtime_provenance,
                     )
             case "operations":
@@ -728,7 +736,6 @@ def run_agent_loop(
                         model_call_count=model_call_count,
                         created_action_attempt_count=created_action_attempt_count,
                         awaiting_approval=None,
-                        bounded_failure_details=None,
                         runtime_provenance=final_runtime_provenance,
                     )
             case "message":
@@ -741,7 +748,6 @@ def run_agent_loop(
                         model_call_count=model_call_count,
                         created_action_attempt_count=created_action_attempt_count,
                         awaiting_approval=None,
-                        bounded_failure_details=None,
                         runtime_provenance=final_runtime_provenance,
                     )
 
@@ -762,7 +768,6 @@ def run_agent_loop(
                         model_call_count=model_call_count,
                         created_action_attempt_count=created_action_attempt_count,
                         awaiting_approval=awaiting,
-                        bounded_failure_details=None,
                         runtime_provenance=final_runtime_provenance,
                     )
 
@@ -775,7 +780,6 @@ def run_agent_loop(
                         model_call_count=model_call_count,
                         created_action_attempt_count=created_action_attempt_count,
                         awaiting_approval=None,
-                        bounded_failure_details=None,
                         runtime_provenance=final_runtime_provenance,
                     )
             case _:
@@ -783,7 +787,7 @@ def run_agent_loop(
 
         # --- Non-terminal branches (continue the loop) ---
 
-        round_start = len(responses_input_items)
+        round_start = len(messages)
 
         if run_program_result.emitted_values:
             # Surface one evt.agent.value_emitted event per value (digest only,
@@ -797,42 +801,35 @@ def run_agent_loop(
                         "value_digest": hashlib.sha256(encoded).hexdigest(),
                         "value_bytes": len(encoded),
                         "model_call_count": model_call_count,
-                        "provider_response_id": candidate_response.get("provider_response_id"),
+                        "provider_response_id": candidate_response.provider_response_id,
                     },
                 )
-            # Emit_value round: evict the previous emit_value round's items so
-            # only the most recent round's values are in context.
+            # Emit_value round: evict the previous emit_value round's messages
+            # so only the most recent round's values are in context.
             if last_emit_value_tail is not None:
-                del responses_input_items[last_emit_value_tail:]
-                round_start = len(responses_input_items)
+                del messages[last_emit_value_tail:]
+                round_start = len(messages)
                 round_spans = [(s, e) for s, e in round_spans if e <= last_emit_value_tail]
             last_emit_value_tail = round_start
-            for output_item in output_items:
-                if isinstance(output_item, dict) and output_item.get("type") == "function_call":
-                    responses_input_items.append(jsonable_encoder(output_item))
-            attempt_observations_value = _action_attempt_observations(
-                run_program_result.action_attempts
+            emitted_values_output = json.dumps(
+                {
+                    "status": "completed",
+                    "emitted_values": jsonable_encoder(run_program_result.emitted_values),
+                    "action_attempts": _action_attempt_observations(
+                        run_program_result.action_attempts
+                    ),
+                },
+                sort_keys=True,
             )
-            if run_call_id:
-                responses_input_items.append(
-                    {
-                        "type": "function_call_output",
-                        "call_id": run_call_id,
-                        "output": json.dumps(
-                            {
-                                "status": "completed",
-                                "emitted_values": jsonable_encoder(
-                                    run_program_result.emitted_values
-                                ),
-                                "action_attempts": attempt_observations_value,
-                            },
-                            sort_keys=True,
-                        ),
-                    }
+            messages.append(_assistant_tool_call_message(tool_calls))
+            messages.append(
+                _tool_returns_with_nudge(
+                    returns=[(run_call_id, emitted_values_output)] if run_call_id else [],
+                    nudge=cfg.emit_value_nudge,
                 )
-            responses_input_items.append({"role": "system", "content": cfg.emit_value_nudge})
+            )
             _evict_oldest_round(
-                responses_input_items,
+                messages,
                 round_spans,
                 round_start,
                 stable_prefix_len,
@@ -846,43 +843,37 @@ def run_agent_loop(
             # Deliberately omit capability payloads. The program already saw each
             # syscall result inline; data that should survive into a later model
             # round must be carried through agent.emit_value.
-            for output_item in output_items:
-                if isinstance(output_item, dict) and output_item.get("type") == "function_call":
-                    responses_input_items.append(jsonable_encoder(output_item))
             attempt_observations = _action_attempt_observations(run_program_result.action_attempts)
-            if run_call_id:
-                responses_input_items.append(
-                    {
-                        "type": "function_call_output",
-                        "call_id": run_call_id,
-                        "output": json.dumps(
-                            {
-                                "status": "completed",
-                                "message_emitted": False,
-                                "action_attempts": attempt_observations,
-                            },
-                            sort_keys=True,
-                        ),
-                    }
-                )
+            trace_output = json.dumps(
+                {
+                    "status": "completed",
+                    "message_emitted": False,
+                    "action_attempts": attempt_observations,
+                },
+                sort_keys=True,
+            )
             # When the premature-synthesis rail dropped the round's
             # emit_message, the model needs a different nudge than the
             # generic "user saw no output": it must know its message was
             # rejected as ungrounded and what to do on the next round.
-            nudge = _PREMATURE_SYNTHESIS_NUDGE if premature_synthesis else cfg.action_trace_nudge
-            responses_input_items.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "run program syscall trace:\n"
-                        + json.dumps(attempt_observations, sort_keys=True)
-                        + "\n"
-                        + nudge
-                    ),
-                }
+            trace_nudge_body = (
+                _PREMATURE_SYNTHESIS_NUDGE if premature_synthesis else cfg.action_trace_nudge
+            )
+            trace_nudge = (
+                "run program syscall trace:\n"
+                + json.dumps(attempt_observations, sort_keys=True)
+                + "\n"
+                + trace_nudge_body
+            )
+            messages.append(_assistant_tool_call_message(tool_calls))
+            messages.append(
+                _tool_returns_with_nudge(
+                    returns=[(run_call_id, trace_output)] if run_call_id else [],
+                    nudge=trace_nudge,
+                )
             )
             _evict_oldest_round(
-                responses_input_items,
+                messages,
                 round_spans,
                 round_start,
                 stable_prefix_len,
@@ -892,17 +883,17 @@ def run_agent_loop(
             continue
 
         # The program ran but produced no terminal output.
-        responses_input_items.append({"role": "system", "content": cfg.no_terminal_output_nudge})
+        messages.append(_system_message(cfg.no_terminal_output_nudge))
         add_event(
             "evt.model.protocol_failed",
             {
                 "reason": "run_completed_without_visible_output",
                 "model_call_count": model_call_count,
-                "provider_response_id": candidate_response.get("provider_response_id"),
+                "provider_response_id": candidate_response.provider_response_id,
             },
         )
         _evict_oldest_round(
-            responses_input_items,
+            messages,
             round_spans,
             round_start,
             stable_prefix_len,
@@ -927,6 +918,46 @@ _PREMATURE_SYNTHESIS_NUDGE = (
 )
 
 
+def _system_message(content: str) -> ModelMessage:
+    """A ``ModelRequest`` carrying one system instruction part."""
+    return ModelRequest(parts=[SystemPromptPart(content=content)])
+
+
+def _assistant_tool_call_message(tool_calls: list[ToolCall]) -> ModelMessage:
+    """The assistant turn's ``ModelResponse`` for a set of tool calls.
+
+    Pydantic AI's request/response graph expects an assistant ``ModelResponse``
+    holding the model's ``ToolCallPart``\\ s before the next ``ModelRequest``
+    can carry their ``ToolReturnPart``\\ s; we synthesise that response from
+    the typed ``ToolCall`` list our adapter returned.
+    """
+    return PydAIModelResponse(
+        parts=[
+            ToolCallPart(tool_name=tc.name, args=tc.arguments, tool_call_id=tc.call_id)
+            for tc in tool_calls
+        ]
+    )
+
+
+def _tool_returns_with_nudge(
+    *,
+    returns: list[tuple[str, str]],
+    nudge: str | None,
+) -> ModelMessage:
+    """Build the next-round ``ModelRequest`` carrying tool returns and a nudge.
+
+    ``returns`` is a list of ``(tool_call_id, json_output_string)`` pairs;
+    ``nudge`` is an optional system instruction appended after the returns.
+    """
+    parts: list[Any] = [
+        ToolReturnPart(tool_name="run", content=output, tool_call_id=call_id)
+        for call_id, output in returns
+    ]
+    if nudge is not None:
+        parts.append(SystemPromptPart(content=nudge))
+    return ModelRequest(parts=parts)
+
+
 def _budget_exhausted_result(
     *,
     model_call_count: int,
@@ -943,26 +974,7 @@ def _budget_exhausted_result(
         model_call_count=model_call_count,
         created_action_attempt_count=created_action_attempt_count,
         awaiting_approval=None,
-        bounded_failure_details=None,
         runtime_provenance=final_runtime_provenance,
-    )
-
-
-def _merge_provenance(
-    *,
-    baseline: RuntimeProvenance | None,
-    ingress: RuntimeProvenance | None,
-) -> RuntimeProvenance | None:
-    if baseline is None:
-        return ingress
-    if ingress is None:
-        return baseline
-    merged_status: Literal["clean", "tainted"] = (
-        "tainted" if baseline.status == "tainted" or ingress.status == "tainted" else "clean"
-    )
-    return RuntimeProvenance(
-        status=merged_status,
-        evidence=tuple([*baseline.evidence, *ingress.evidence]),
     )
 
 
@@ -999,8 +1011,7 @@ def _record_judgment(
     *,
     db: Session,
     cfg: LoopConfig,
-    model_adapter: ModelAdapter,
-    candidate_response: dict[str, Any],
+    response: ModelResponse,
     session_id: str,
     turn: TurnRecord,
     model_call_count: int,
@@ -1011,19 +1022,14 @@ def _record_judgment(
     output: dict[str, Any],
     failure_reason: str | None,
 ) -> None:
-    provider_response_id = candidate_response.get("provider_response_id")
     record_ai_judgment(
         db,
         judgment_type=cfg.judgment_type or "model_output",
         source_type="turn",
         source_id=turn.id,
-        model=candidate_response.get("model")
-        if isinstance(candidate_response.get("model"), str)
-        else model_adapter.model,
+        model=response.model,
         prompt_version=cfg.prompt_version,
-        provider_response_id=provider_response_id
-        if isinstance(provider_response_id, str)
-        else None,
+        provider_response_id=response.provider_response_id,
         input_summary=input_summary,
         input_refs={
             "session_id": session_id,
@@ -1047,7 +1053,7 @@ def _record_judgment(
 
 
 def _evict_oldest_round(
-    responses_input_items: list[dict[str, Any]],
+    messages: list[ModelMessage],
     round_spans: list[tuple[int, int]],
     round_start: int,
     stable_prefix_len: int,
@@ -1057,12 +1063,11 @@ def _evict_oldest_round(
     """Record the current round's span and evict the oldest if the window overflows.
 
     The stable prefix (system prompts, user message) and the budget-signal
-    slot are never evicted.  Each round's items are tracked as a ``(start,
-    end)`` slice of ``responses_input_items``.  When tracked rounds exceed
-    ``live_rounds``, the oldest is spliced out and all subsequent spans are
-    adjusted.
+    slot are never evicted.  Each round's messages are tracked as a ``(start,
+    end)`` slice of ``messages``.  When tracked rounds exceed ``live_rounds``,
+    the oldest is spliced out and all subsequent spans are adjusted.
     """
-    round_end = len(responses_input_items)
+    round_end = len(messages)
     if round_start >= round_end:
         return
     round_spans.append((round_start, round_end))
@@ -1070,14 +1075,14 @@ def _evict_oldest_round(
         return
 
     old_start, old_end = round_spans.pop(0)
-    # Safety: never evict items from the stable prefix or the budget slot.
+    # Safety: never evict messages from the stable prefix or the budget slot.
     if old_start < stable_prefix_len:
         return
     if budget_item_index is not None and old_start <= budget_item_index < old_end:
         return
 
     evict_count = old_end - old_start
-    del responses_input_items[old_start:old_end]
+    del messages[old_start:old_end]
     for i, (s, e) in enumerate(round_spans):
         round_spans[i] = (s - evict_count, e - evict_count)
 

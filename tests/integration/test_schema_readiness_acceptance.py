@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
 
 from fastapi.testclient import TestClient
 import pytest
@@ -12,16 +10,18 @@ from sqlalchemy.exc import IntegrityError
 
 from ariel.app import create_app
 from ariel.db import SchemaReadinessProbe, run_migrations, schema_readiness_issues
+from ariel.model_adapter import ModelCall, ModelResponse
 from ariel.persistence import SubscriberHeartbeatRecord
 from tests.fake_sandbox import FakeSandboxRuntime
+from tests.integration.responses_helpers import FakeModelAdapter
 
 
-@dataclass
-class NoCallModelAdapter:
-    provider: str = "provider.schema-readiness"
-    model: str = "model.schema-readiness-v1"
+class NoCallModelAdapter(FakeModelAdapter):
+    provider = "provider.schema-readiness"
+    model = "model.schema-readiness-v1"
 
-    def create_response(self, **_: Any) -> dict[str, Any]:
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        del request
         raise AssertionError("schema readiness tests must not call the model adapter")
 
 

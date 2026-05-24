@@ -16,63 +16,61 @@ from __future__ import annotations
 
 import copy
 import threading
-from dataclasses import dataclass, field
 from typing import Any, cast
 
 from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import select
 
-from ariel.model_adapter import ModelAdapter
 from ariel.persistence import SessionRecord
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.app_helpers import create_test_app
 from tests.integration.responses_helpers import (
+    FakeModelAdapter,
     drain_task,
     empty_recall_response,
     is_memory_subsystem_call,
+    last_user_message,
     post_message_and_drain,
     responses_run_message,
     responses_with_run_calls,
 )
+from ariel.model_adapter import ModelAdapter, ModelCall, ModelResponse
 
 
-@dataclass
-class SessionManagementProbeAdapter:
-    provider: str = "provider.session-management"
-    model: str = "model.session-management-v1"
-    context_bundles: list[dict[str, Any]] = field(default_factory=list)
-    history_lengths_by_message: dict[str, int] = field(default_factory=dict)
-    message_delays_seconds: dict[str, float] = field(default_factory=dict)
-    run_calls_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
-    _lock: threading.Lock = field(default_factory=threading.Lock)
+class SessionManagementProbeAdapter(FakeModelAdapter):
+    provider = "provider.session-management"
+    model = "model.session-management-v1"
 
-    def create_response(
+    def __init__(
         self,
         *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_memory_subsystem_call(input_items):
+        run_calls_by_message: dict[str, list[dict[str, Any]]] | None = None,
+        message_delays_seconds: dict[str, float] | None = None,
+    ) -> None:
+        super().__init__()
+        self.input_items: list[Any] = []
+        self.history_lengths_by_message: dict[str, int] = {}
+        self.message_delays_seconds: dict[str, float] = (
+            message_delays_seconds if message_delays_seconds is not None else {}
+        )
+        self.run_calls_by_message: dict[str, list[dict[str, Any]]] = (
+            run_calls_by_message if run_calls_by_message is not None else {}
+        )
+        self._lock = threading.Lock()
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        user_message = last_user_message(request.messages)
+        if is_memory_subsystem_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        assert [tool.get("name") for tool in tools] == ["run"]
+        assert [tool.name for tool in request.tools] == ["run"]
         with self._lock:
-            self.context_bundles.append(copy.deepcopy(context_bundle))
-            self.history_lengths_by_message[user_message] = len(history)
+            self.input_items.append(copy.deepcopy(list(request.messages)))
+            self.history_lengths_by_message[user_message] = len(request.messages)
         run_calls = self.run_calls_by_message.get(user_message)
         if isinstance(run_calls, list):
-            if any(
-                isinstance(item, dict) and item.get("type") == "function_call_output"
-                for item in input_items
-            ):
-                run_calls = [
-                    {"name": "agent.emit_message", "input": {"text": f"assistant::{user_message}"}}
-                ]
             if not run_calls:
                 run_calls = [
                     {"name": "agent.emit_message", "input": {"text": f"assistant::{user_message}"}}
@@ -163,7 +161,7 @@ def test_message_idempotency_key_replays_same_task_id(
         timeline = _timeline(client, session_id)
         assert len(timeline["turns"]) == 1
         turn_id = timeline["turns"][0]["id"]
-        assert len(adapter.context_bundles) == 1
+        assert len(adapter.input_items) == 1
 
         completed_replay = client.post(
             f"/v1/sessions/{session_id}/message",
@@ -174,7 +172,7 @@ def test_message_idempotency_key_replays_same_task_id(
         completed_body = completed_replay.json()
         assert completed_body["turn"]["id"] == turn_id
         assert completed_body["assistant"]["message"] == f"assistant::{message}"
-        assert len(adapter.context_bundles) == 1
+        assert len(adapter.input_items) == 1
 
 
 def test_idempotency_replay_survives_auto_rotation_when_retrying_new_session_id(

@@ -8,7 +8,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from tests.integration.app_helpers import create_test_app
-from tests.integration.responses_helpers import empty_recall_response, is_memory_subsystem_call
+from tests.integration.responses_helpers import (
+    FakeModelAdapter,
+    empty_recall_response,
+    is_memory_subsystem_call,
+)
+from ariel.model_adapter import ModelCall, ModelResponse
 from ariel.persistence import (
     ActionAttemptRecord,
     ProviderWriteReceiptRecord,
@@ -21,31 +26,19 @@ from tests.fake_sandbox import FakeSandboxRuntime
 PROVIDER_ACCOUNT_ID = "sub_email_api"
 
 
-class NoopModelAdapter:
+class NoopModelAdapter(FakeModelAdapter):
     provider = "provider.test"
     model = "model.test"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_memory_subsystem_call(input_items):
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        # Email-decluttering API tests poke the HTTP surface; the model is
+        # only ever invoked by the pre-turn retriever, which exits immediately
+        # via the empty-recall canned response.
+        if is_memory_subsystem_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del input_items, tools, user_message, history, context_bundle
-        return {
-            "assistant_message": "unused",
-            "provider": self.provider,
-            "model": self.model,
-            "provider_response_id": "resp_unused",
-            "usage": {"input_tokens": 0, "output_tokens": 0},
-        }
+        raise AssertionError("email-decluttering API tests must not call the main model")
 
 
 @pytest.fixture

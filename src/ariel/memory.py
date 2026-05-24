@@ -21,19 +21,21 @@ background-task enqueueing.  It makes no relevance, importance, ranking, or
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal
 
-import httpx
+from pydantic_ai.messages import ModelRequest, SystemPromptPart, UserPromptPart
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from .capability_registry import run_callable_signature
 from .config import AppSettings
 from .ids import new_id
+from .model_adapter import ModelAdapter, ModelMessage
 from .persistence import (
     BackgroundTaskRecord,
     EventRecord,
@@ -48,7 +50,6 @@ from .run_runtime import run_tool_definitions
 
 if TYPE_CHECKING:
     from .agency_daemon import AgencyRuntime
-    from .model_adapter import ModelAdapter
     from .attachment_content import AttachmentContentRuntime
     from .google_connector import GoogleConnectorRuntime
     from .sandbox_runtime import RunSandbox
@@ -76,19 +77,7 @@ class MemoryRecallError(MemoryExecutionError):
     """Expected memory recall failure that should not fail the user turn."""
 
 
-class MemoryEmbeddingError(Exception):
-    pass
-
-
-class MemoryEmbeddingConfigurationError(MemoryEmbeddingError):
-    pass
-
-
-class MemoryEmbeddingResponseError(MemoryEmbeddingError):
-    pass
-
-
-class MemoryEmbeddingUnavailable(MemoryEmbeddingError):
+class MemoryEmbeddingResponseError(Exception):
     pass
 
 
@@ -213,65 +202,33 @@ Exactly one keyword argument — `summary`. Do NOT use `message=`, `result=`, \
 # ---------------------------------------------------------------------------
 
 
-def embed_text(text: str, *, settings: AppSettings) -> list[float]:
-    """Embed ``text`` with the configured OpenAI embedding model."""
-    if settings.memory_embedding_provider != "openai":
-        raise MemoryEmbeddingConfigurationError(
-            f"unsupported memory embedding provider: {settings.memory_embedding_provider}"
-        )
-    if settings.openai_api_key is None:
-        raise MemoryEmbeddingUnavailable("ARIEL_OPENAI_API_KEY is required for memory embeddings")
+def embed_text(text: str, *, adapter: ModelAdapter, settings: AppSettings) -> list[float]:
+    """Embed ``text`` via the shared ``ModelAdapter``'s EMBEDDING tier.
 
-    try:
-        response = httpx.post(
-            "https://api.openai.com/v1/embeddings",
-            headers={
-                "Authorization": f"Bearer {settings.openai_api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": settings.memory_embedding_model,
-                "input": " ".join(text.split()),
-                "dimensions": settings.memory_embedding_dimensions,
-                "encoding_format": "float",
-            },
-            timeout=settings.model_timeout_seconds,
-        )
-        response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        status_code = exc.response.status_code
-        raise MemoryEmbeddingUnavailable(
-            f"memory embedding request failed: HTTP {status_code}"
-        ) from exc
-    except httpx.RequestError as exc:
-        raise MemoryEmbeddingUnavailable("memory embedding request failed") from exc
+    The adapter is async; we bridge with ``asyncio.run`` because the rest of
+    the memory path is sync — same pattern as ``agent_loop.py``. Any
+    provider-side failure (missing credentials, network, malformed response)
+    is wrapped in ``RuntimeError`` so the fail-soft contract holds regardless
+    of which substrate the EMBEDDING tier resolves to; callers
+    (``append_log_event`` / ``create_note`` / ``edit_note`` / ``search_memory``)
+    catch ``RuntimeError`` to fall back to a null vector.
 
+    The DB column is fixed-width so a dimension mismatch in the adapter's
+    response is a configuration defect (wrong embedding model bound to the
+    EMBEDDING tier) and raises ``MemoryEmbeddingResponseError``, which
+    propagates past the fail-soft callers.
+    """
     try:
-        payload = response.json()
-    except ValueError as exc:
-        raise MemoryEmbeddingResponseError("memory embedding response must be JSON") from exc
-    data = payload.get("data") if isinstance(payload, dict) else None
-    first = data[0] if isinstance(data, list) and data else None
-    vector = first.get("embedding") if isinstance(first, dict) else None
-    if not isinstance(vector, list):
-        raise MemoryEmbeddingResponseError("memory embedding response missing vector")
+        vectors = asyncio.run(adapter.embed([" ".join(text.split())]))
+    except Exception as exc:  # noqa: BLE001 — justify-embedding-fail-soft
+        raise RuntimeError(f"memory embedding failed: {exc}") from exc
+    vector = vectors[0]
     if len(vector) != settings.memory_embedding_dimensions:
         raise MemoryEmbeddingResponseError(
             "memory embedding response dimension mismatch: "
             f"expected {settings.memory_embedding_dimensions}, got {len(vector)}"
         )
-    if not all(isinstance(item, int | float) for item in vector):
-        raise MemoryEmbeddingResponseError("memory embedding response vector must be numeric")
-    return [float(item) for item in vector]
-
-
-def _embedding_or_none(text: str, *, settings: AppSettings) -> list[float] | None:
-    try:
-        return embed_text(text, settings=settings)
-    except MemoryEmbeddingUnavailable:
-        # justify-ignore-error: nullable embeddings are the documented pending state
-        # for transient embedding provider outages.
-        return None
+    return vector
 
 
 # ---------------------------------------------------------------------------
@@ -319,15 +276,16 @@ def append_log_event(
     turn_id: str | None,
     taint: Literal["clean", "tainted"],
     source_ref: str | None,
+    adapter: ModelAdapter,
     settings: AppSettings,
     now: datetime,
     new_id_fn: Callable[[str], str],
 ) -> MemoryLogRecord | None:
     """Append one event to the raw log inside the caller's transaction.
 
-    Computes the embedding via ``embed_text``; when the embedding provider is
-    unavailable, inserts with ``embedding=None`` (null = pending, to be
-    backfilled).
+    Computes the embedding via ``embed_text``; when the EMBEDDING tier fails
+    (missing credentials, network, malformed response), inserts with
+    ``embedding=None`` (null = pending, to be backfilled).
 
     Returns ``None`` when the row is skipped by an inbound filter — currently
     only ``assistant_message`` rows whose content matches the assistant-failure
@@ -336,7 +294,10 @@ def append_log_event(
     if kind == "assistant_message" and _is_assistant_failure_message(content):
         return None
 
-    embedding = _embedding_or_none(content, settings=settings)
+    try:
+        embedding: list[float] | None = embed_text(content, adapter=adapter, settings=settings)
+    except RuntimeError:
+        embedding = None
 
     record = MemoryLogRecord(
         id=new_id_fn("mev"),
@@ -374,12 +335,16 @@ def create_note(
     *,
     content: str,
     taint: Literal["clean", "tainted"],
+    adapter: ModelAdapter,
     settings: AppSettings,
     now: datetime,
     new_id_fn: Callable[[str], str],
 ) -> MemoryNoteRecord:
     """Insert a new curated note and append a ``note_create`` log event."""
-    embedding = _embedding_or_none(content, settings=settings)
+    try:
+        embedding: list[float] | None = embed_text(content, adapter=adapter, settings=settings)
+    except RuntimeError:
+        embedding = None
 
     note = MemoryNoteRecord(
         id=new_id_fn("mno"),
@@ -400,6 +365,7 @@ def create_note(
         turn_id=None,
         taint=taint,
         source_ref=note.id,
+        adapter=adapter,
         settings=settings,
         now=now,
         new_id_fn=new_id_fn,
@@ -412,6 +378,7 @@ def edit_note(
     *,
     note_id: str,
     content: str,
+    adapter: ModelAdapter,
     settings: AppSettings,
     now: datetime,
     new_id_fn: Callable[[str], str],
@@ -421,7 +388,10 @@ def edit_note(
     if note is None:
         raise MemoryExecutionError("memory_note_not_found")
 
-    embedding = _embedding_or_none(content, settings=settings)
+    try:
+        embedding: list[float] | None = embed_text(content, adapter=adapter, settings=settings)
+    except RuntimeError:
+        embedding = None
 
     note.content = content
     note.embedding = embedding
@@ -437,6 +407,7 @@ def edit_note(
         turn_id=None,
         taint=note_taint,
         source_ref=note.id,
+        adapter=adapter,
         settings=settings,
         now=now,
         new_id_fn=new_id_fn,
@@ -448,6 +419,7 @@ def delete_note(
     db: Session,
     *,
     note_id: str,
+    adapter: ModelAdapter,
     settings: AppSettings,
     now: datetime,
     new_id_fn: Callable[[str], str],
@@ -469,6 +441,7 @@ def delete_note(
         turn_id=None,
         taint=note_taint,
         source_ref=note_id,
+        adapter=adapter,
         settings=settings,
         now=now,
         new_id_fn=new_id_fn,
@@ -484,19 +457,19 @@ def search_memory(
     db: Session,
     *,
     query: str,
+    adapter: ModelAdapter,
     settings: AppSettings,
     limit: int = 24,
     since: datetime | None = None,
     kinds: tuple[str, ...] | None = None,
-    layers: tuple[Literal["log", "note"], ...] = ("log", "note"),
 ) -> list[dict[str, Any]]:
     """Hybrid search across ``memory_log`` and ``memory_notes``.
 
-    Computes the query embedding once; for each requested layer runs a keyword
-    tsquery match against ``search_vector`` and a vector cosine-distance match
-    against ``embedding`` (skipped when no rows have embeddings yet). Unions
-    the results, deduplicates by id, applies ``since``/``kinds`` filters on the
-    log layer, and returns up to ``limit`` hits ordered by ``created_at DESC``
+    Computes the query embedding once; for each layer runs a keyword tsquery
+    match against ``search_vector`` and a vector cosine-distance match against
+    ``embedding`` (skipped when no rows have embeddings yet). Unions the
+    results, deduplicates by id, applies ``since``/``kinds`` filters on the log
+    layer, and returns up to ``limit`` hits ordered by ``created_at DESC``
     (transport order — the model ranks, code does not).
 
     Skips ``assistant_message`` log rows whose content matches the
@@ -509,87 +482,87 @@ def search_memory(
     Returns ``[{"id", "layer", "kind", "created_at", "snippet", "taint"}, ...]``.
     ``"kind"`` is ``None`` for note-layer hits.
     """
-    query_embedding = _embedding_or_none(query, settings=settings)
+    try:
+        query_embedding: list[float] | None = embed_text(query, adapter=adapter, settings=settings)
+    except RuntimeError:
+        query_embedding = None
 
     hits: dict[str, dict[str, Any]] = {}
 
-    if "log" in layers:
-        tsquery = func.websearch_to_tsquery("english", query)
-        stmt = select(MemoryLogRecord).where(MemoryLogRecord.search_vector.op("@@")(tsquery))
+    tsquery = func.websearch_to_tsquery("english", query)
+    stmt = select(MemoryLogRecord).where(MemoryLogRecord.search_vector.op("@@")(tsquery))
+    if since is not None:
+        stmt = stmt.where(MemoryLogRecord.created_at >= since)
+    if kinds is not None:
+        stmt = stmt.where(MemoryLogRecord.kind.in_(kinds))
+    for row in db.scalars(stmt.order_by(MemoryLogRecord.created_at.desc()).limit(limit)).all():
+        if row.kind == "assistant_message" and _is_assistant_failure_message(row.content):
+            continue
+        hits[row.id] = {
+            "id": row.id,
+            "layer": "log",
+            "kind": row.kind,
+            "created_at": to_rfc3339(row.created_at),
+            "snippet": row.content[:200],
+            "taint": row.taint,
+        }
+
+    has_log_embeddings = db.scalar(
+        select(MemoryLogRecord.id).where(MemoryLogRecord.embedding.is_not(None)).limit(1)
+    )
+    if query_embedding is not None and has_log_embeddings is not None:
+        vec_stmt = select(MemoryLogRecord).where(MemoryLogRecord.embedding.is_not(None))
         if since is not None:
-            stmt = stmt.where(MemoryLogRecord.created_at >= since)
+            vec_stmt = vec_stmt.where(MemoryLogRecord.created_at >= since)
         if kinds is not None:
-            stmt = stmt.where(MemoryLogRecord.kind.in_(kinds))
-        for row in db.scalars(stmt.order_by(MemoryLogRecord.created_at.desc()).limit(limit)).all():
+            vec_stmt = vec_stmt.where(MemoryLogRecord.kind.in_(kinds))
+        distance = MemoryLogRecord.embedding.cosine_distance(query_embedding)
+        for row in db.scalars(vec_stmt.order_by(distance.asc()).limit(limit)).all():
             if row.kind == "assistant_message" and _is_assistant_failure_message(row.content):
                 continue
-            hits[row.id] = {
-                "id": row.id,
-                "layer": "log",
-                "kind": row.kind,
-                "created_at": to_rfc3339(row.created_at),
-                "snippet": row.content[:200],
-                "taint": row.taint,
-            }
+            if row.id not in hits:
+                hits[row.id] = {
+                    "id": row.id,
+                    "layer": "log",
+                    "kind": row.kind,
+                    "created_at": to_rfc3339(row.created_at),
+                    "snippet": row.content[:200],
+                    "taint": row.taint,
+                }
 
-        has_log_embeddings = db.scalar(
-            select(MemoryLogRecord.id).where(MemoryLogRecord.embedding.is_not(None)).limit(1)
-        )
-        if query_embedding is not None and has_log_embeddings is not None:
-            vec_stmt = select(MemoryLogRecord).where(MemoryLogRecord.embedding.is_not(None))
-            if since is not None:
-                vec_stmt = vec_stmt.where(MemoryLogRecord.created_at >= since)
-            if kinds is not None:
-                vec_stmt = vec_stmt.where(MemoryLogRecord.kind.in_(kinds))
-            distance = MemoryLogRecord.embedding.cosine_distance(query_embedding)
-            for row in db.scalars(vec_stmt.order_by(distance.asc()).limit(limit)).all():
-                if row.kind == "assistant_message" and _is_assistant_failure_message(row.content):
-                    continue
-                if row.id not in hits:
-                    hits[row.id] = {
-                        "id": row.id,
-                        "layer": "log",
-                        "kind": row.kind,
-                        "created_at": to_rfc3339(row.created_at),
-                        "snippet": row.content[:200],
-                        "taint": row.taint,
-                    }
+    note_stmt = select(MemoryNoteRecord).where(MemoryNoteRecord.search_vector.op("@@")(tsquery))
+    for note_row in db.scalars(
+        note_stmt.order_by(MemoryNoteRecord.created_at.desc()).limit(limit)
+    ).all():
+        hits[note_row.id] = {
+            "id": note_row.id,
+            "layer": "note",
+            "kind": None,
+            "created_at": to_rfc3339(note_row.created_at),
+            "snippet": note_row.content[:200],
+            "taint": note_row.taint,
+        }
 
-    if "note" in layers:
-        tsquery = func.websearch_to_tsquery("english", query)
-        note_stmt = select(MemoryNoteRecord).where(MemoryNoteRecord.search_vector.op("@@")(tsquery))
+    has_note_embeddings = db.scalar(
+        select(MemoryNoteRecord.id).where(MemoryNoteRecord.embedding.is_not(None)).limit(1)
+    )
+    if query_embedding is not None and has_note_embeddings is not None:
+        distance = MemoryNoteRecord.embedding.cosine_distance(query_embedding)
         for note_row in db.scalars(
-            note_stmt.order_by(MemoryNoteRecord.created_at.desc()).limit(limit)
+            select(MemoryNoteRecord)
+            .where(MemoryNoteRecord.embedding.is_not(None))
+            .order_by(distance.asc())
+            .limit(limit)
         ).all():
-            hits[note_row.id] = {
-                "id": note_row.id,
-                "layer": "note",
-                "kind": None,
-                "created_at": to_rfc3339(note_row.created_at),
-                "snippet": note_row.content[:200],
-                "taint": note_row.taint,
-            }
-
-        has_note_embeddings = db.scalar(
-            select(MemoryNoteRecord.id).where(MemoryNoteRecord.embedding.is_not(None)).limit(1)
-        )
-        if query_embedding is not None and has_note_embeddings is not None:
-            distance = MemoryNoteRecord.embedding.cosine_distance(query_embedding)
-            for note_row in db.scalars(
-                select(MemoryNoteRecord)
-                .where(MemoryNoteRecord.embedding.is_not(None))
-                .order_by(distance.asc())
-                .limit(limit)
-            ).all():
-                if note_row.id not in hits:
-                    hits[note_row.id] = {
-                        "id": note_row.id,
-                        "layer": "note",
-                        "kind": None,
-                        "created_at": to_rfc3339(note_row.created_at),
-                        "snippet": note_row.content[:200],
-                        "taint": note_row.taint,
-                    }
+            if note_row.id not in hits:
+                hits[note_row.id] = {
+                    "id": note_row.id,
+                    "layer": "note",
+                    "kind": None,
+                    "created_at": to_rfc3339(note_row.created_at),
+                    "snippet": note_row.content[:200],
+                    "taint": note_row.taint,
+                }
 
     return sorted(hits.values(), key=lambda h: h["created_at"], reverse=True)[:limit]
 
@@ -632,28 +605,27 @@ def run_retriever(
         f"- {name}{run_callable_signature(name)}" for name in eligible_callables
     )
 
-    responses_input_items: list[dict[str, Any]] = [
-        {"role": "system", "content": _RETRIEVER_PROMPT},
-        {
-            "role": "system",
-            "content": json.dumps(
+    retriever_parts: list[Any] = [
+        SystemPromptPart(content=_RETRIEVER_PROMPT),
+        SystemPromptPart(
+            content=json.dumps(
                 {"prompt_version": RETRIEVER_PROMPT_VERSION, "wake_context": query},
                 sort_keys=True,
-            ),
-        },
-        {
-            "role": "system",
-            "content": (
+            )
+        ),
+        SystemPromptPart(
+            content=(
                 "syscall callables available this run. Their namespaces "
                 "(agent, memory) are pre-injected globals — do NOT import "
                 "them; `import ariel` fails. All arguments are keyword "
                 "arguments — the signature shown is the contract. Results "
                 "are returned inline:\n"
             )
-            + callable_lines,
-        },
-        {"role": "user", "content": query},
+            + callable_lines
+        ),
+        UserPromptPart(content=query),
     ]
+    retriever_messages: list[ModelMessage] = [ModelRequest(parts=retriever_parts)]
 
     cfg = LoopConfig(
         output_mode="finding",
@@ -694,11 +666,8 @@ def run_retriever(
         turn=turn,
         settings=settings,
         model_adapter=model_adapter,
-        responses_input_items=responses_input_items,
+        messages=retriever_messages,
         tools=run_tool_definitions(),
-        user_message=query,
-        history=[],
-        context_bundle={},
         allowed_capability_ids=allowed_capability_ids,
         scratch={},
         proposal_index_start=0,
@@ -731,7 +700,7 @@ def run_retriever(
             return {"summary": "", "items": [], "status": "partial"}
         case "model_failed":
             raise MemoryRecallError("memory_recall_model_failed")
-        case "message" | "approval" | "paused" | "operations" | "bounded_failure":
+        case "message" | "approval" | "paused" | "operations":
             msg = f"unexpected memory recall loop outcome: {loop_result.outcome}"
             raise AssertionError(msg)
 
@@ -887,21 +856,21 @@ def run_rememberer(
         f"- {name}{run_callable_signature(name)}" for name in eligible_callables
     )
 
-    responses_input_items: list[dict[str, Any]] = [
-        {"role": "system", "content": system_prompt},
-        {
-            "role": "system",
-            "content": (
+    rememberer_parts: list[Any] = [
+        SystemPromptPart(content=system_prompt),
+        SystemPromptPart(
+            content=(
                 "syscall callables available this run. Their namespaces "
                 "(agent, memory) are pre-injected globals — do NOT import "
                 "them; `import ariel` fails. All arguments are keyword "
                 "arguments — the signature shown is the contract. Results "
                 "are returned inline:\n"
             )
-            + callable_lines,
-        },
-        {"role": "user", "content": json.dumps(user_payload, sort_keys=True)},
+            + callable_lines
+        ),
+        UserPromptPart(content=json.dumps(user_payload, sort_keys=True)),
     ]
+    rememberer_messages: list[ModelMessage] = [ModelRequest(parts=rememberer_parts)]
 
     cfg = LoopConfig(
         output_mode="operations",
@@ -951,11 +920,8 @@ def run_rememberer(
             turn=loop_turn,
             settings=settings,
             model_adapter=model_adapter,
-            responses_input_items=responses_input_items,
+            messages=rememberer_messages,
             tools=run_tool_definitions(),
-            user_message=json.dumps(user_payload, sort_keys=True),
-            history=[],
-            context_bundle={},
             allowed_capability_ids=allowed_capability_ids,
             scratch={},
             proposal_index_start=0,

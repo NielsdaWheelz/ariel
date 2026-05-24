@@ -13,21 +13,18 @@ No test asserts that the model "chose correctly."
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from itertools import count
 from typing import Any, cast
 
 import pytest
+from fastapi.encoders import jsonable_encoder
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 from sqlalchemy.orm import Session, sessionmaker
 
 from ariel.action_runtime import process_action_execution_task
-from ariel.config import AppSettings
-from ariel.model_adapter import ModelAdapter
-from tests.integration.app_helpers import create_test_app
 from ariel.capability_registry import (
     canonical_action_payload,
     capability_contract_hash,
@@ -35,6 +32,8 @@ from ariel.capability_registry import (
     get_capability,
     payload_hash,
 )
+from ariel.config import AppSettings
+from ariel.model_adapter import ModelAdapter, ModelCall, ModelResponse
 from ariel.persistence import (
     ActionAttemptRecord,
     BackgroundTaskRecord,
@@ -49,7 +48,18 @@ from ariel.persistence import (
 )
 from ariel.worker import process_one_task
 from tests.fake_sandbox import FakeSandboxRuntime
-from tests.integration.responses_helpers import drain_task, post_message_and_drain
+from tests.integration.app_helpers import create_test_app
+from tests.integration.responses_helpers import (
+    FakeModelAdapter,
+    drain_task,
+    last_user_message,
+    post_message_and_drain,
+    run_response,
+)
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
 
 _id_counter = count(1)
 
@@ -68,7 +78,7 @@ _EMIT_MSG = "agent.emit_message(text='hello')\n"
 def _app(postgres_url: str, adapter: ModelAdapter, monkeypatch: pytest.MonkeyPatch) -> Any:
     """Build a migrated app with embed_text stubbed out."""
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
-    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
+    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, adapter, settings: None)
     return create_test_app(
         database_url=postgres_url,
         model_adapter=adapter,
@@ -153,56 +163,48 @@ def _sf(client: TestClient) -> sessionmaker[Session]:
 # ---------------------------------------------------------------------------
 
 
-def _run_response(source: str, *, idx: int, provider: str = "provider.test") -> dict[str, Any]:
-    return {
-        "provider": provider,
-        "model": "model.test",
-        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-        "provider_response_id": f"resp_{idx}",
-        "output": [
-            {
-                "type": "function_call",
-                "id": f"fc_{idx}",
-                "call_id": f"call_{idx}",
-                "name": "run",
-                "arguments": json.dumps({"source": source}, sort_keys=True),
-                "status": "completed",
-            }
-        ],
-    }
+def _run_response(source: str, *, idx: int) -> ModelResponse:
+    """Build a one-tool-call ``ModelResponse`` carrying the run program ``source``."""
+    return run_response(
+        source=source,
+        provider="provider.test",
+        model="model.test",
+        provider_response_id=f"resp_{idx}",
+        input_tokens=1,
+        output_tokens=1,
+    )
 
 
-@dataclass
-class _TwoPhaseAdapter:
+class _TwoPhaseAdapter(FakeModelAdapter):
     """Odd calls → retriever (emit_finding); even calls → main agent (emit_message)."""
 
-    provider: str = "provider.test"
-    model: str = "model.test"
-    call_count: int = 0
-    snapshots: list[list[dict[str, Any]]] = field(default_factory=list)
+    provider = "provider.test"
+    model = "model.test"
 
-    def create_response(
-        self, *, input_items: Any, tools: Any, user_message: Any, history: Any, context_bundle: Any
-    ) -> dict[str, Any]:
-        del tools, user_message, history, context_bundle
+    def __init__(self) -> None:
+        super().__init__()
+        self.call_count: int = 0
+        self.snapshots: list[list[Any]] = []
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
         self.call_count += 1
-        self.snapshots.append(list(input_items))
+        self.snapshots.append(list(request.messages))
         source = _RETRIEVER_PROGRAM if self.call_count % 2 == 1 else _EMIT_MSG
         return _run_response(source, idx=self.call_count)
 
 
-@dataclass
-class _MemoryRecallSyscallAdapter:
+class _MemoryRecallSyscallAdapter(FakeModelAdapter):
     """Pre-turn retriever, main-agent recall syscall, then syscall retriever."""
 
-    provider: str = "provider.test"
-    model: str = "model.test"
-    call_count: int = 0
+    provider = "provider.test"
+    model = "model.test"
 
-    def create_response(
-        self, *, input_items: Any, tools: Any, user_message: Any, history: Any, context_bundle: Any
-    ) -> dict[str, Any]:
-        del input_items, tools, user_message, history, context_bundle
+    def __init__(self) -> None:
+        super().__init__()
+        self.call_count: int = 0
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        del request
         self.call_count += 1
         if self.call_count == 2:
             source = (
@@ -217,8 +219,7 @@ class _MemoryRecallSyscallAdapter:
         return _run_response(source, idx=self.call_count)
 
 
-@dataclass
-class _FailingRetrieverAdapter:
+class _FailingRetrieverAdapter(FakeModelAdapter):
     """Retriever emits the same source twice → stuck-detection ends it with no finding.
 
     On calls 1 and 2 (both retriever rounds) the same emit_value source is
@@ -227,32 +228,33 @@ class _FailingRetrieverAdapter:
     agent, which emits a message.
     """
 
-    provider: str = "provider.test"
-    model: str = "model.test"
-    call_count: int = 0
-    _stuck_source: str = "agent.emit_value(value={'stuck':1})\n"
+    provider = "provider.test"
+    model = "model.test"
+    _stuck_source = "agent.emit_value(value={'stuck':1})\n"
 
-    def create_response(
-        self, *, input_items: Any, tools: Any, user_message: Any, history: Any, context_bundle: Any
-    ) -> dict[str, Any]:
-        del tools, user_message, history, context_bundle, input_items
+    def __init__(self) -> None:
+        super().__init__()
+        self.call_count: int = 0
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        del request
         self.call_count += 1
         source = self._stuck_source if self.call_count <= 2 else _EMIT_MSG
         return _run_response(source, idx=self.call_count)
 
 
-@dataclass
-class _InvalidRecallAdapter:
+class _InvalidRecallAdapter(FakeModelAdapter):
     """Retriever emits a malformed recall_v1 finding; main agent still answers."""
 
-    provider: str = "provider.test"
-    model: str = "model.test"
-    call_count: int = 0
+    provider = "provider.test"
+    model = "model.test"
 
-    def create_response(
-        self, *, input_items: Any, tools: Any, user_message: Any, history: Any, context_bundle: Any
-    ) -> dict[str, Any]:
-        del tools, user_message, history, context_bundle, input_items
+    def __init__(self) -> None:
+        super().__init__()
+        self.call_count: int = 0
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        del request
         self.call_count += 1
         if self.call_count == 1:
             source = (
@@ -266,19 +268,19 @@ class _InvalidRecallAdapter:
         return _run_response(source, idx=self.call_count)
 
 
-@dataclass
-class _RememberAdapter:
+class _RememberAdapter(FakeModelAdapter):
     """Retriever on odd calls; main agent calls memory.remember then emits on even."""
 
-    provider: str = "provider.test"
-    model: str = "model.test"
-    call_count: int = 0
-    note_text: str = "user prefers dark mode"
+    provider = "provider.test"
+    model = "model.test"
+    note_text = "user prefers dark mode"
 
-    def create_response(
-        self, *, input_items: Any, tools: Any, user_message: Any, history: Any, context_bundle: Any
-    ) -> dict[str, Any]:
-        del tools, user_message, history, context_bundle, input_items
+    def __init__(self) -> None:
+        super().__init__()
+        self.call_count: int = 0
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        del request
         self.call_count += 1
         if self.call_count % 2 == 1:
             source = _RETRIEVER_PROGRAM
@@ -287,22 +289,21 @@ class _RememberAdapter:
         return _run_response(source, idx=self.call_count)
 
 
-@dataclass
-class _RememberThenEncodeAdapter:
+class _RememberThenEncodeAdapter(FakeModelAdapter):
     """Main turn enqueues a remember request; rememberer completes the encode task."""
 
-    provider: str = "provider.test"
-    model: str = "model.test"
-    call_count: int = 0
-    note_text: str = "user prefers dark mode"
+    provider = "provider.test"
+    model = "model.test"
+    note_text = "user prefers dark mode"
 
-    def create_response(
-        self, *, input_items: Any, tools: Any, user_message: Any, history: Any, context_bundle: Any
-    ) -> dict[str, Any]:
-        del tools, history, context_bundle
+    def __init__(self) -> None:
+        super().__init__()
+        self.call_count: int = 0
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
         self.call_count += 1
+        user_message = last_user_message(request.messages)
         if user_message != "remember this":
-            del input_items
             source = "agent.emit_done(summary='remembered preference')\n"
         elif self.call_count % 2 == 1:
             source = _RETRIEVER_PROGRAM
@@ -322,7 +323,7 @@ def test_schema_memory_tables_are_only_log_and_notes(
 ) -> None:
     """``memory_log`` and ``memory_notes`` are the only ``memory_*`` tables."""
     engine = create_engine(postgres_url, future=True)
-    with TestClient(_app(postgres_url, cast(ModelAdapter, _TwoPhaseAdapter()), monkeypatch)):
+    with TestClient(_app(postgres_url, _TwoPhaseAdapter(), monkeypatch)):
         table_names = set(inspect(engine).get_table_names())
     memory_tables = {t for t in table_names if t.startswith("memory_")}
     assert memory_tables == {"memory_log", "memory_notes"}, (
@@ -431,12 +432,12 @@ def test_retriever_fires_preturn_and_injects_recall_context(
 ) -> None:
     """The main agent's context includes the ``recall_v1`` reconstruction."""
     adapter = _TwoPhaseAdapter()
-    with TestClient(_app(postgres_url, cast(ModelAdapter, adapter), monkeypatch)) as client:
+    with TestClient(_app(postgres_url, adapter, monkeypatch)) as client:
         sid = _session_id(client)
         post_message_and_drain(client, sid, message="hello")
 
     assert adapter.call_count >= 2, "expected retriever + main agent calls"
-    rendered = json.dumps(adapter.snapshots[1])  # main-agent snapshot
+    rendered = json.dumps(jsonable_encoder(adapter.snapshots[1]))  # main-agent snapshot
     assert "memory recall:" in rendered
 
 
@@ -445,7 +446,7 @@ def test_memory_recall_syscall_runs_retriever_inline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     adapter = _MemoryRecallSyscallAdapter()
-    with TestClient(_app(postgres_url, cast(ModelAdapter, adapter), monkeypatch)) as client:
+    with TestClient(_app(postgres_url, adapter, monkeypatch)) as client:
         sid = _session_id(client)
         turn = post_message_and_drain(client, sid, message="recall via syscall")
         timeline = client.get(f"/v1/sessions/{sid}/events").json()
@@ -475,7 +476,7 @@ def test_recall_failure_is_nonfatal(
     """When the retriever emits the same source twice (stuck-detection fires, no
     finding emitted), the main-agent turn still completes with the assistant message."""
     adapter = _FailingRetrieverAdapter()
-    with TestClient(_app(postgres_url, cast(ModelAdapter, adapter), monkeypatch)) as client:
+    with TestClient(_app(postgres_url, adapter, monkeypatch)) as client:
         sid = _session_id(client)
         turn = post_message_and_drain(client, sid, message="ping")
     assert turn.status == "completed"
@@ -489,7 +490,7 @@ def test_recall_contract_violation_is_typed_nonfatal(
     """Malformed recall findings are classified, not silently converted inside
     the retriever."""
     adapter = _InvalidRecallAdapter()
-    with TestClient(_app(postgres_url, cast(ModelAdapter, adapter), monkeypatch)) as client:
+    with TestClient(_app(postgres_url, adapter, monkeypatch)) as client:
         sid = _session_id(client)
         turn = post_message_and_drain(client, sid, message="ping")
         timeline = client.get(f"/v1/sessions/{sid}/events").json()
@@ -515,7 +516,7 @@ def test_memory_remember_enqueues_memory_encode_task(
     """A ``memory.remember(note='...')`` syscall enqueues exactly one
     ``memory_encode`` background task whose payload carries the note."""
     adapter = _RememberAdapter()
-    with TestClient(_app(postgres_url, cast(ModelAdapter, adapter), monkeypatch)) as client:
+    with TestClient(_app(postgres_url, adapter, monkeypatch)) as client:
         sid = _session_id(client)
         sf = _sf(client)
         post_message_and_drain(client, sid, message="remember this")
@@ -535,7 +536,7 @@ def test_memory_remember_enqueues_and_worker_records_encode_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     adapter = _RememberThenEncodeAdapter()
-    with TestClient(_app(postgres_url, cast(ModelAdapter, adapter), monkeypatch)) as client:
+    with TestClient(_app(postgres_url, adapter, monkeypatch)) as client:
         sid = _session_id(client)
         sf = _sf(client)
         post_message_and_drain(client, sid, message="remember this")
@@ -585,6 +586,7 @@ def test_approved_memory_note_missing_fails_with_typed_memory_error(
         action_attempt_id="act_memory_missing_note",
         google_runtime=None,
         agency_runtime=None,
+        model_adapter=FakeModelAdapter(),
         settings=settings,
         now_fn=lambda: NOW,
         new_id_fn=lambda prefix: f"{prefix}_memory_missing_note",
@@ -638,22 +640,22 @@ def test_approved_memory_action_unexpected_defect_propagates(
 # ===========================================================================
 
 
-@dataclass
-class _RetrieverSearchesThenMainSearchesAdapter:
-    """Retriever and main-agent calls share one parent-turn proposal index space.
+class _RetrieverSearchesThenMainSearchesAdapter(FakeModelAdapter):
+    """Retriever calls ``memory.search``; main agent then calls ``memory.search``.
 
     The main-agent search and message are split across two rounds because
     ``run_agent_loop`` rejects messages authored before read observations.
     """
 
-    provider: str = "provider.test"
-    model: str = "model.test"
-    call_count: int = 0
+    provider = "provider.test"
+    model = "model.test"
 
-    def create_response(
-        self, *, input_items: Any, tools: Any, user_message: Any, history: Any, context_bundle: Any
-    ) -> dict[str, Any]:
-        del input_items, tools, user_message, history, context_bundle
+    def __init__(self) -> None:
+        super().__init__()
+        self.call_count: int = 0
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        del request
         self.call_count += 1
         if self.call_count == 1:
             source = (
@@ -675,7 +677,7 @@ def test_retriever_and_main_loop_action_attempts_do_not_collide(
     main loop's first capability call must not violate ``(turn_id,
     proposal_index)`` uniqueness."""
     adapter = _RetrieverSearchesThenMainSearchesAdapter()
-    with TestClient(_app(postgres_url, cast(ModelAdapter, adapter), monkeypatch)) as client:
+    with TestClient(_app(postgres_url, adapter, monkeypatch)) as client:
         sid = _session_id(client)
         turn = post_message_and_drain(client, sid, message="ping")
     assert turn.status == "completed", f"turn status={turn.status!r}"
@@ -695,10 +697,10 @@ def test_worker_accepts_memory_encode_and_memory_dream(
     from ariel.persistence import TurnRecord, enqueue_background_task
 
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
-    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
+    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, adapter, settings: None)
     app = create_test_app(
         database_url=postgres_url,
-        model_adapter=cast(ModelAdapter, _DreamCompleteAdapter()),
+        model_adapter=_DreamCompleteAdapter(),
         sandbox=FakeSandboxRuntime(),
     )
     with TestClient(app) as client:
@@ -732,11 +734,11 @@ def test_worker_memory_task_replay_reuses_completed_turn_without_model_call(
     second rememberer model run."""
 
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
-    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
+    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, adapter, settings: None)
     adapter = _DreamCompleteAdapter()
     app = create_test_app(
         database_url=postgres_url,
-        model_adapter=cast(ModelAdapter, adapter),
+        model_adapter=adapter,
         sandbox=FakeSandboxRuntime(),
     )
     with TestClient(app) as client:
@@ -785,11 +787,11 @@ def test_worker_memory_task_replay_fails_interrupted_turn_without_model_call(
     running the rememberer again."""
 
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
-    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
+    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, adapter, settings: None)
     adapter = _DreamCompleteAdapter()
     app = create_test_app(
         database_url=postgres_url,
-        model_adapter=cast(ModelAdapter, adapter),
+        model_adapter=adapter,
         sandbox=FakeSandboxRuntime(),
     )
     with TestClient(app) as client:
@@ -894,7 +896,7 @@ def test_memory_log_accumulates_events_after_turn(
     ``user_message``, ``agent_round``, and ``assistant_message`` events, all
     sharing the same ``session_id`` and ``turn_id``."""
     adapter = _TwoPhaseAdapter()
-    with TestClient(_app(postgres_url, cast(ModelAdapter, adapter), monkeypatch)) as client:
+    with TestClient(_app(postgres_url, adapter, monkeypatch)) as client:
         sid = _session_id(client)
         sf = _sf(client)
         turn = post_message_and_drain(client, sid, message="what day is it")
@@ -960,9 +962,7 @@ def test_memory_notes_route_lists_operator_visible_notes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     now = datetime(2026, 5, 22, 12, 0, tzinfo=UTC)
-    with TestClient(
-        _app(postgres_url, cast(ModelAdapter, _TwoPhaseAdapter()), monkeypatch)
-    ) as client:
+    with TestClient(_app(postgres_url, _TwoPhaseAdapter(), monkeypatch)) as client:
         with cast(Any, client.app).state.session_factory() as db:
             with db.begin():
                 db.add(
@@ -1077,18 +1077,18 @@ def test_ensure_system_session_is_idempotent(
 # ===========================================================================
 
 
-@dataclass
-class _DreamCompleteAdapter:
+class _DreamCompleteAdapter(FakeModelAdapter):
     """One call → the rememberer emits ``agent.emit_done(...)`` and the loop ends."""
 
-    provider: str = "provider.test"
-    model: str = "model.test"
-    call_count: int = 0
+    provider = "provider.test"
+    model = "model.test"
 
-    def create_response(
-        self, *, input_items: Any, tools: Any, user_message: Any, history: Any, context_bundle: Any
-    ) -> dict[str, Any]:
-        del tools, user_message, history, context_bundle, input_items
+    def __init__(self) -> None:
+        super().__init__()
+        self.call_count: int = 0
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        del request
         self.call_count += 1
         return _run_response("agent.emit_done(summary='dreamt')\n", idx=self.call_count)
 
@@ -1104,7 +1104,7 @@ def test_run_rememberer_dream_succeeds_with_no_user_session(
     from ariel.persistence import SYSTEM_SESSION_ID, SessionRecord, TurnRecord
 
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
-    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
+    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, adapter, settings: None)
     settings = AppSettings()
 
     sandbox = FakeSandboxRuntime()
@@ -1122,7 +1122,7 @@ def test_run_rememberer_dream_succeeds_with_no_user_session(
             session_factory=session_factory,
             session_id=None,
             settings=settings,
-            model_adapter=cast(Any, _DreamCompleteAdapter()),
+            model_adapter=_DreamCompleteAdapter(),
             google_runtime=None,
             agency_runtime=None,
             attachment_runtime=None,
@@ -1159,7 +1159,7 @@ def test_run_rememberer_dream_self_heals_if_system_session_missing(
     from ariel.persistence import SYSTEM_SESSION_ID, SessionRecord, TurnRecord
 
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
-    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
+    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, adapter, settings: None)
     settings = AppSettings()
 
     sandbox = FakeSandboxRuntime()
@@ -1180,7 +1180,7 @@ def test_run_rememberer_dream_self_heals_if_system_session_missing(
             session_factory=session_factory,
             session_id=None,
             settings=settings,
-            model_adapter=cast(Any, _DreamCompleteAdapter()),
+            model_adapter=_DreamCompleteAdapter(),
             google_runtime=None,
             agency_runtime=None,
             attachment_runtime=None,
@@ -1216,10 +1216,10 @@ def test_worker_memory_dream_task_inserts_turn_against_system_session(
     from ariel.persistence import SYSTEM_SESSION_ID, TurnRecord, enqueue_background_task
 
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
-    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
+    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, adapter, settings: None)
     app = create_test_app(
         database_url=postgres_url,
-        model_adapter=cast(ModelAdapter, _DreamCompleteAdapter()),
+        model_adapter=_DreamCompleteAdapter(),
         sandbox=FakeSandboxRuntime(),
     )
     with TestClient(app) as client:
@@ -1283,9 +1283,10 @@ def test_append_log_event_skips_assistant_failure_messages(
     from ariel.persistence import MemoryLogRecord
 
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
-    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
+    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, adapter, settings: None)
     settings = AppSettings()
     now = datetime.now(tz=UTC)
+    adapter = FakeModelAdapter()
 
     with session_factory() as db:
         with db.begin():
@@ -1297,6 +1298,7 @@ def test_append_log_event_skips_assistant_failure_messages(
                 turn_id=None,
                 taint="clean",
                 source_ref=None,
+                adapter=adapter,
                 settings=settings,
                 now=now,
                 new_id_fn=_new_id,
@@ -1337,9 +1339,10 @@ def test_append_log_event_preserves_legitimate_assistant_messages(
     from ariel.persistence import MemoryLogRecord
 
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
-    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
+    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, adapter, settings: None)
     settings = AppSettings()
     now = datetime.now(tz=UTC)
+    adapter = FakeModelAdapter()
 
     with session_factory() as db:
         with db.begin():
@@ -1351,6 +1354,7 @@ def test_append_log_event_preserves_legitimate_assistant_messages(
                 turn_id=None,
                 taint="clean",
                 source_ref=None,
+                adapter=adapter,
                 settings=settings,
                 now=now,
                 new_id_fn=_new_id,
@@ -1380,9 +1384,10 @@ def test_append_log_event_filter_applies_only_to_assistant_messages(
     from ariel.persistence import MemoryLogRecord
 
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
-    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
+    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, adapter, settings: None)
     settings = AppSettings()
     now = datetime.now(tz=UTC)
+    adapter = FakeModelAdapter()
     failure_text = "Calendar fetch failed"
 
     with session_factory() as db:
@@ -1401,6 +1406,7 @@ def test_append_log_event_filter_applies_only_to_assistant_messages(
                     turn_id=None,
                     taint="clean",
                     source_ref=None,
+                    adapter=adapter,
                     settings=settings,
                     now=now,
                     new_id_fn=_new_id,
@@ -1415,92 +1421,22 @@ def test_append_log_event_filter_applies_only_to_assistant_messages(
     assert kinds == {"user_message", "agent_round", "tool_observation", "proactive_trigger"}
 
 
-def test_embed_text_maps_network_failure_to_unavailable(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import httpx
-
-    from ariel.config import AppSettings
-    from ariel.memory import MemoryEmbeddingUnavailable, embed_text
-
-    def fail_post(*_: Any, **__: Any) -> httpx.Response:
-        request = httpx.Request("POST", "https://api.openai.com/v1/embeddings")
-        raise httpx.ConnectError("network down", request=request)
-
-    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
-    monkeypatch.setattr("ariel.memory.httpx.post", fail_post)
-
-    with pytest.raises(MemoryEmbeddingUnavailable):
-        embed_text("remember this", settings=AppSettings())
-
-
-def test_embed_text_maps_http_status_failure_to_unavailable(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import httpx
-
-    from ariel.config import AppSettings
-    from ariel.memory import MemoryEmbeddingUnavailable, embed_text
-
-    def reject_post(*_: Any, **__: Any) -> httpx.Response:
-        request = httpx.Request("POST", "https://api.openai.com/v1/embeddings")
-        return httpx.Response(401, request=request, json={"error": "unauthorized"})
-
-    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
-    monkeypatch.setattr("ariel.memory.httpx.post", reject_post)
-
-    with pytest.raises(MemoryEmbeddingUnavailable):
-        embed_text("remember this", settings=AppSettings())
-
-
-def test_append_log_event_records_pending_embedding_when_embedding_unavailable(
+def test_append_log_event_records_pending_embedding_when_embedding_fails(
     session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from ariel.config import AppSettings
-    from ariel.memory import MemoryEmbeddingUnavailable, append_log_event
-
-    def unavailable(*_: Any, **__: Any) -> list[float]:
-        raise MemoryEmbeddingUnavailable("memory embedding request failed")
-
-    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
-    monkeypatch.setattr("ariel.memory.embed_text", unavailable)
-    settings = AppSettings()
-    now = datetime.now(tz=UTC)
-
-    with session_factory() as db:
-        with db.begin():
-            result = append_log_event(
-                db,
-                kind="user_message",
-                content="project phoenix update",
-                session_id=None,
-                turn_id=None,
-                taint="clean",
-                source_ref=None,
-                settings=settings,
-                now=now,
-                new_id_fn=_new_id,
-            )
-        assert result is not None
-        written_id = result.id
-
-    with session_factory() as db:
-        row = db.get(MemoryLogRecord, written_id)
-    assert row is not None
-    assert row.embedding is None
-
-
-def test_append_log_event_records_pending_embedding_without_api_key(
-    session_factory: sessionmaker[Session],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+    """When the embedding provider raises, the row is written with ``embedding=None``."""
     from ariel.config import AppSettings
     from ariel.memory import append_log_event
 
-    monkeypatch.delenv("ARIEL_OPENAI_API_KEY", raising=False)
+    def failing(*_: Any, **__: Any) -> list[float]:
+        raise RuntimeError("memory embedding failed: provider down")
+
+    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr("ariel.memory.embed_text", failing)
     settings = AppSettings()
     now = datetime.now(tz=UTC)
+    adapter = FakeModelAdapter()
 
     with session_factory() as db:
         with db.begin():
@@ -1512,6 +1448,7 @@ def test_append_log_event_records_pending_embedding_without_api_key(
                 turn_id=None,
                 taint="clean",
                 source_ref=None,
+                adapter=adapter,
                 settings=settings,
                 now=now,
                 new_id_fn=_new_id,
@@ -1525,20 +1462,21 @@ def test_append_log_event_records_pending_embedding_without_api_key(
     assert row.embedding is None
 
 
-def test_note_mutations_record_pending_embeddings_when_embedding_unavailable(
+def test_note_mutations_record_pending_embeddings_when_embedding_fails(
     session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from ariel.config import AppSettings
-    from ariel.memory import MemoryEmbeddingUnavailable, create_note, edit_note
+    from ariel.memory import create_note, edit_note
 
-    def unavailable(*_: Any, **__: Any) -> list[float]:
-        raise MemoryEmbeddingUnavailable("memory embedding request failed")
+    def failing(*_: Any, **__: Any) -> list[float]:
+        raise RuntimeError("memory embedding failed: provider down")
 
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
-    monkeypatch.setattr("ariel.memory.embed_text", unavailable)
+    monkeypatch.setattr("ariel.memory.embed_text", failing)
     settings = AppSettings()
     now = datetime.now(tz=UTC)
+    adapter = FakeModelAdapter()
 
     with session_factory() as db:
         with db.begin():
@@ -1546,6 +1484,7 @@ def test_note_mutations_record_pending_embeddings_when_embedding_unavailable(
                 db,
                 content="initial note",
                 taint="clean",
+                adapter=adapter,
                 settings=settings,
                 now=now,
                 new_id_fn=_new_id,
@@ -1556,6 +1495,7 @@ def test_note_mutations_record_pending_embeddings_when_embedding_unavailable(
                 db,
                 note_id=note_id,
                 content="updated note",
+                adapter=adapter,
                 settings=settings,
                 now=now,
                 new_id_fn=_new_id,
@@ -1576,20 +1516,21 @@ def test_note_mutations_record_pending_embeddings_when_embedding_unavailable(
     assert all(row.embedding is None for row in log_rows)
 
 
-def test_search_memory_uses_keyword_hits_when_embedding_unavailable(
+def test_search_memory_uses_keyword_hits_when_embedding_fails(
     session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from ariel.config import AppSettings
-    from ariel.memory import MemoryEmbeddingUnavailable, search_memory
+    from ariel.memory import search_memory
 
-    def unavailable(*_: Any, **__: Any) -> list[float]:
-        raise MemoryEmbeddingUnavailable("memory embedding request failed")
+    def failing(*_: Any, **__: Any) -> list[float]:
+        raise RuntimeError("memory embedding failed: provider down")
 
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
-    monkeypatch.setattr("ariel.memory.embed_text", unavailable)
+    monkeypatch.setattr("ariel.memory.embed_text", failing)
     settings = AppSettings()
     now = datetime.now(tz=UTC)
+    adapter = FakeModelAdapter()
     log_id = _insert_log_row_directly(
         session_factory,
         kind="user_message",
@@ -1599,7 +1540,9 @@ def test_search_memory_uses_keyword_hits_when_embedding_unavailable(
 
     with session_factory() as db:
         with db.begin():
-            hits = search_memory(db, query="project phoenix", settings=settings, limit=24)
+            hits = search_memory(
+                db, query="project phoenix", adapter=adapter, settings=settings, limit=24
+            )
 
     assert log_id in {hit["id"] for hit in hits}
 
@@ -1608,6 +1551,8 @@ def test_append_log_event_propagates_embedding_response_defect(
     session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A dimension-mismatch defect from the embedding provider propagates as
+    ``MemoryEmbeddingResponseError`` (configuration bug, not fail-soft)."""
     from ariel.config import AppSettings
     from ariel.memory import MemoryEmbeddingResponseError, append_log_event
 
@@ -1617,6 +1562,7 @@ def test_append_log_event_propagates_embedding_response_defect(
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
     monkeypatch.setattr("ariel.memory.embed_text", malformed)
     settings = AppSettings()
+    adapter = FakeModelAdapter()
 
     with pytest.raises(MemoryEmbeddingResponseError):
         with session_factory() as db:
@@ -1629,6 +1575,7 @@ def test_append_log_event_propagates_embedding_response_defect(
                     turn_id=None,
                     taint="clean",
                     source_ref=None,
+                    adapter=adapter,
                     settings=settings,
                     now=datetime.now(tz=UTC),
                     new_id_fn=_new_id,
@@ -1686,9 +1633,10 @@ def test_search_memory_skips_directly_inserted_error_assistant_messages(
     from ariel.memory import search_memory
 
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
-    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
+    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, adapter, settings: None)
     settings = AppSettings()
     now = datetime.now(tz=UTC)
+    adapter = FakeModelAdapter()
 
     polluting_id = _insert_log_row_directly(
         session_factory,
@@ -1705,9 +1653,13 @@ def test_search_memory_skips_directly_inserted_error_assistant_messages(
 
     with session_factory() as db:
         with db.begin():
-            calendar_hits = search_memory(db, query="calendar", settings=settings, limit=24)
+            calendar_hits = search_memory(
+                db, query="calendar", adapter=adapter, settings=settings, limit=24
+            )
         with db.begin():
-            email_hits = search_memory(db, query="emails today", settings=settings, limit=24)
+            email_hits = search_memory(
+                db, query="emails today", adapter=adapter, settings=settings, limit=24
+            )
 
     calendar_ids = {h["id"] for h in calendar_hits}
     email_ids = {h["id"] for h in email_hits}
@@ -1734,9 +1686,10 @@ def test_search_memory_does_not_filter_non_assistant_kinds(
     from ariel.memory import search_memory
 
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
-    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, settings: None)
+    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, adapter, settings: None)
     settings = AppSettings()
     now = datetime.now(tz=UTC)
+    adapter = FakeModelAdapter()
 
     user_id = _insert_log_row_directly(
         session_factory,
@@ -1747,7 +1700,7 @@ def test_search_memory_does_not_filter_non_assistant_kinds(
 
     with session_factory() as db:
         with db.begin():
-            hits = search_memory(db, query="calendar", settings=settings, limit=24)
+            hits = search_memory(db, query="calendar", adapter=adapter, settings=settings, limit=24)
 
     assert user_id in {h["id"] for h in hits}, (
         f"user_message with matching text must surface; got hits={hits!r}"

@@ -1,11 +1,17 @@
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 from datetime import datetime
 from typing import Any, cast
 
 from fastapi.testclient import TestClient
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    SystemPromptPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -18,7 +24,14 @@ from ariel.action_runtime import (
 from ariel.clock import utcnow
 from ariel.google_connector import GoogleConnectorRuntime
 from ariel.ids import new_id
-from ariel.persistence import BackgroundTaskRecord, TurnRecord
+from ariel.model_adapter import (
+    ModelAdapter,
+    ModelCall,
+    ModelResponse,
+    ToolCall,
+    TokenUsage,
+)
+from ariel.persistence import MEMORY_EMBEDDING_DIMENSIONS, BackgroundTaskRecord, TurnRecord
 from ariel.worker import process_one_task
 
 
@@ -152,6 +165,29 @@ def run_function_calls(
     return ctx
 
 
+def _build_response(
+    *,
+    text: str | None,
+    tool_calls: list[ToolCall],
+    provider: str,
+    model: str,
+    provider_response_id: str,
+    input_tokens: int = 1,
+    output_tokens: int = 1,
+) -> ModelResponse:
+    return ModelResponse(
+        text=text,
+        tool_calls=tool_calls,
+        structured_output=None,
+        reasoning_summary=None,
+        usage=TokenUsage(input_tokens=input_tokens, output_tokens=output_tokens),
+        provider=provider,
+        model=model,
+        duration_ms=1,
+        provider_response_id=provider_response_id,
+    )
+
+
 def responses_message(
     *,
     assistant_text: str,
@@ -160,24 +196,22 @@ def responses_message(
     provider_response_id: str,
     input_tokens: int = 1,
     output_tokens: int = 1,
-) -> dict[str, Any]:
-    return {
-        "provider": provider,
-        "model": model,
-        "usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens,
-        },
-        "provider_response_id": provider_response_id,
-        "output": [
-            {
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": assistant_text}],
-            }
-        ],
-    }
+) -> ModelResponse:
+    """A canned ``ModelResponse`` carrying assistant text (no tool calls).
+
+    The agent loop ignores plain text in the main path — only the
+    budget-exhausted summary call returns this shape — but tests use it to
+    drive specific assistant-text scenarios.
+    """
+    return _build_response(
+        text=assistant_text,
+        tool_calls=[],
+        provider=provider,
+        model=model,
+        provider_response_id=provider_response_id,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
 
 
 def responses_run_message(
@@ -188,7 +222,7 @@ def responses_run_message(
     provider_response_id: str,
     input_tokens: int = 1,
     output_tokens: int = 1,
-) -> dict[str, Any]:
+) -> ModelResponse:
     return responses_with_run_calls(
         calls=[{"name": "agent.emit_message", "input": {"text": assistant_text}}],
         provider=provider,
@@ -227,51 +261,105 @@ def responses_with_run_calls(
     provider_response_id: str,
     input_tokens: int = 1,
     output_tokens: int = 1,
-) -> dict[str, Any]:
+) -> ModelResponse:
     if not calls:
         raise AssertionError("responses_with_run_calls requires at least one run call")
-    return {
-        "provider": provider,
-        "model": model,
-        "usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens,
-        },
-        "provider_response_id": provider_response_id,
-        "output": [
-            {
-                "type": "function_call",
-                "id": "fc_run_test",
-                "call_id": "call_run_test",
-                "name": "run",
-                "arguments": json.dumps(
-                    {"source": run_program_source_from_calls(calls)},
-                    sort_keys=True,
-                ),
-                "status": "completed",
-            }
+    return _build_response(
+        text=None,
+        tool_calls=[
+            ToolCall(
+                call_id="call_run_test",
+                name="run",
+                arguments={"source": run_program_source_from_calls(calls)},
+            )
         ],
-    }
+        provider=provider,
+        model=model,
+        provider_response_id=provider_response_id,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
 
 
-def _detect_memory_subsystem(input_items: list[dict[str, Any]]) -> str | None:
-    """Inspect input_items for a memory-subsystem system prompt; return the
-    prompt kind (``retriever`` | ``encoder`` | ``dreamer``) or ``None``."""
-    for item in input_items:
-        if item.get("role") != "system":
+def run_response(
+    *,
+    source: str,
+    provider: str,
+    model: str,
+    provider_response_id: str,
+    input_tokens: int = 1,
+    output_tokens: int = 1,
+) -> ModelResponse:
+    """A canned ``ModelResponse`` carrying one ``run(source=...)`` tool call."""
+    return _build_response(
+        text=None,
+        tool_calls=[
+            ToolCall(
+                call_id=f"call_{provider_response_id}",
+                name="run",
+                arguments={"source": source},
+            )
+        ],
+        provider=provider,
+        model=model,
+        provider_response_id=provider_response_id,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
+
+
+def last_user_message(messages: list[ModelMessage]) -> str:
+    """Return the most recent user-prompt text from ``messages``.
+
+    Test fakes use this to recover the user message string the agent loop
+    derived from the initial ``ModelRequest`` so they can echo or branch on
+    it without unpacking the message graph by hand.
+    """
+    for message in reversed(messages):
+        if not isinstance(message, ModelRequest):
             continue
-        content = str(item.get("content", ""))
-        if "Ariel's memory retriever" in content:
-            return "retriever"
-        if "Ariel's memory encoder" in content:
-            return "encoder"
-        if "Ariel's memory dreamer" in content:
-            return "dreamer"
+        for part in reversed(message.parts):
+            if isinstance(part, UserPromptPart) and isinstance(part.content, str):
+                return part.content
+    return ""
+
+
+def has_tool_returns(messages: list[ModelMessage]) -> bool:
+    """True iff ``messages`` carries any ``ToolReturnPart`` (a prior round's
+    tool returns).
+
+    Test fakes that respond with a syscall on round 1 use this to detect the
+    next round and switch to an ``agent.emit_message`` finalisation.
+    """
+    for message in messages:
+        if not isinstance(message, ModelRequest):
+            continue
+        if any(isinstance(part, ToolReturnPart) for part in message.parts):
+            return True
+    return False
+
+
+def _detect_memory_subsystem(messages: list[ModelMessage]) -> str | None:
+    """Inspect the stable-prefix system prompts of ``messages`` and return the
+    memory-subsystem configuration (``retriever`` | ``encoder`` | ``dreamer``)
+    or ``None`` when none is detected."""
+    for message in messages:
+        if not isinstance(message, ModelRequest):
+            continue
+        for part in message.parts:
+            if not isinstance(part, SystemPromptPart):
+                continue
+            content = part.content
+            if "Ariel's memory retriever" in content:
+                return "retriever"
+            if "Ariel's memory encoder" in content:
+                return "encoder"
+            if "Ariel's memory dreamer" in content:
+                return "dreamer"
     return None
 
 
-def is_memory_subsystem_call(input_items: list[dict[str, Any]]) -> bool:
+def is_memory_subsystem_call(messages: list[ModelMessage]) -> bool:
     """Detects a memory subsystem model call by its system prompt.
 
     Catches the three memory model-call prompts used by the two memory drivers:
@@ -279,47 +367,68 @@ def is_memory_subsystem_call(input_items: list[dict[str, Any]]) -> bool:
     rememberer encode prompt (``Ariel's memory encoder``), and the scheduled
     rememberer dream prompt (``Ariel's memory dreamer``).
     """
-    return _detect_memory_subsystem(input_items) is not None
+    return _detect_memory_subsystem(messages) is not None
 
 
 def empty_recall_response(
     *,
     provider: str,
     model: str,
-    input_items: list[dict[str, Any]],
+    messages: list[ModelMessage],
     provider_response_id: str | None = None,
-) -> dict[str, Any]:
+) -> ModelResponse:
     """A canned response that exits a memory-subsystem loop immediately.
 
     For the retriever (``output_mode='finding'``) the program emits an empty
     ``recall_v1`` finding; for the encoder / dreamer (``output_mode='operations'``)
     it calls ``agent.emit_done``. The memory prompt kind is sniffed from
-    ``input_items``.
+    ``messages``; the retriever finding is the safe default when no memory
+    subsystem prompt is present.
 
     Lets tests' canned-response queues stay focused on the main agent.
     """
     rid = provider_response_id or "resp_retriever_empty"
-    config = _detect_memory_subsystem(input_items)
+    config = _detect_memory_subsystem(messages)
     if config in ("encoder", "dreamer"):
         program = "agent.emit_done(summary='')"
     else:
         program = 'agent.emit_finding(summary="", claims=[], gaps=[], sources=[])'
-    return {
-        "provider": provider,
-        "model": model,
-        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
-        "provider_response_id": rid,
-        "output": [
-            {
-                "type": "function_call",
-                "id": f"fc_{rid}",
-                "call_id": f"call_{rid}",
-                "name": "run",
-                "arguments": __import__("json").dumps({"source": program}, sort_keys=True),
-                "status": "completed",
-            }
-        ],
-    }
+    return run_response(
+        source=program,
+        provider=provider,
+        model=model,
+        provider_response_id=rid,
+        input_tokens=0,
+        output_tokens=0,
+    )
+
+
+class FakeModelAdapter(ModelAdapter):
+    """Base ``ModelAdapter`` subclass for tests.
+
+    Bypasses ``ModelAdapter.__init__`` (which would require API keys);
+    subclasses override ``_respond`` to return a typed ``ModelResponse``
+    from the call's ``messages``/``tools`` inputs.
+    """
+
+    def __init__(self) -> None:
+        # Deliberately skip ``ModelAdapter.__init__``. ``call`` and ``embed``
+        # are the only surfaces tests touch; both are overridden here.
+        pass
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        raise NotImplementedError("FakeModelAdapter subclasses must override _respond")
+
+    async def call(self, request: ModelCall) -> ModelResponse:
+        return self._respond(request)
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        # Stub: zero vectors of the configured DB-column width. Tests that
+        # exercise memory writes/searches go through ``embed_text``; the
+        # production adapter would hit OpenAIEmbeddingModel which the fake
+        # never instantiated (``__init__`` is bypassed). Override on the
+        # subclass if a test cares about vector content / ranking.
+        return [[0.0] * MEMORY_EMBEDDING_DIMENSIONS for _ in texts]
 
 
 def process_queued_action_execution(client: TestClient, approval_payload: dict[str, Any]) -> bool:

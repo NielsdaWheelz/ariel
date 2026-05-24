@@ -61,32 +61,6 @@ SurfaceEventType = Literal[
 ]
 
 
-class SurfaceTurnLimitDetailContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    budget: str
-    unit: str
-    limit: int
-    measured: int
-
-
-class SurfaceAppliedTurnLimitsContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    max_recent_turns: int
-    max_context_tokens: int
-    max_response_tokens: int
-    main_turn_budget_seconds: float
-    agent_loop_max_model_calls: int
-
-
-class SurfaceBoundedFailureContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    code: str
-    limit: SurfaceTurnLimitDetailContract
-
-
 class SurfaceContextRecentWindowContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -207,15 +181,12 @@ class SurfaceEventAssistantEmittedPayloadContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     message: str
-    bounded_failure: SurfaceBoundedFailureContract | None = None
 
 
 class SurfaceEventTurnFailedPayloadContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     failure_reason: str
-    error_code: str | None = None
-    limit: SurfaceTurnLimitDetailContract | None = None
 
 
 class SurfaceEventTurnCompletedPayloadContract(BaseModel):

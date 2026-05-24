@@ -23,7 +23,7 @@ BROAD_GMAIL_SCOPE = "https://mail.google.com/"
 
 
 def test_email_registry_contains_current_family_but_model_gets_only_run() -> None:
-    assert [tool["name"] for tool in run_tool_definitions()] == ["run"]
+    assert [tool.name for tool in run_tool_definitions()] == ["run"]
     for capability_id in EMAIL_CAPABILITY_IDS:
         assert get_capability(capability_id) is not None
 

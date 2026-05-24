@@ -17,6 +17,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic_ai.messages import ModelMessage, ModelRequest, SystemPromptPart, UserPromptPart
 from sqlalchemy import (
     Engine,
     and_,
@@ -63,7 +64,8 @@ from ariel.memory import (
     run_retriever,
 )
 from ariel.ids import new_id
-from ariel.model_adapter import ModelAdapter, OpenAIResponsesAdapter
+from ariel.model_adapter import ModelAdapter
+from ariel.models import MAIN
 from ariel.persistence import (
     ActionAttemptRecord,
     ApprovalRequestRecord,
@@ -387,24 +389,33 @@ def _render_recall_v1(recall: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _build_responses_input_items(
+def _build_initial_messages(
     *,
     context_bundle: dict[str, Any],
     user_message: str,
-) -> list[dict[str, Any]]:
-    input_items: list[dict[str, Any]] = []
+) -> list[ModelMessage]:
+    """Render the pre-loop conversation as a list of pydantic-ai messages.
+
+    One ``ModelRequest`` carries the full system-prompt context (each system
+    block as its own ``SystemPromptPart``) followed by the user turn as a
+    ``UserPromptPart``. This is the stable prefix the agent loop never evicts.
+    """
+    system_parts: list[SystemPromptPart] = []
+
+    def push_system(content: str) -> None:
+        system_parts.append(SystemPromptPart(content=content))
 
     # 1. Policy system instructions
     policy_system_instructions = context_bundle.get("policy_system_instructions")
     if isinstance(policy_system_instructions, list):
         for instruction in policy_system_instructions:
             if isinstance(instruction, str) and instruction:
-                input_items.append({"role": "system", "content": instruction})
+                push_system(instruction)
 
     # 2. Discord context (when present)
     discord_context_text = _discord_context_text(context_bundle.get("discord_context"))
     if discord_context_text is not None:
-        input_items.append({"role": "system", "content": discord_context_text})
+        push_system(discord_context_text)
 
     # 3. Eligible callables list (with signatures so the model does not guess args)
     eligible_callables = context_bundle.get("eligible_internal_callables")
@@ -415,38 +426,29 @@ def _build_responses_input_items(
             if isinstance(callable_name, str) and callable_name
         ]
         if callable_lines:
-            input_items.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "syscall callables your run program may call this turn. "
-                        "Their namespaces (agent, memory, email, calendar, etc.) "
-                        "are pre-injected globals — do NOT import them; "
-                        "`import ariel` fails. All arguments are keyword "
-                        "arguments (the signature shown is the contract; "
-                        "calls that pass extra or wrong-named keys return "
-                        "blocked/schema_invalid). The agent.* terminals "
-                        "(agent.emit_message(text: str), "
-                        "agent.emit_value(value: Any), "
-                        "agent.pause_until_input()) are always available.\n"
-                    )
-                    + "\n".join(callable_lines),
-                }
+            push_system(
+                "syscall callables your run program may call this turn. "
+                "Their namespaces (agent, memory, email, calendar, etc.) "
+                "are pre-injected globals — do NOT import them; "
+                "`import ariel` fails. All arguments are keyword "
+                "arguments (the signature shown is the contract; "
+                "calls that pass extra or wrong-named keys return "
+                "blocked/schema_invalid). The agent.* terminals "
+                "(agent.emit_message(text: str), "
+                "agent.emit_value(value: Any), "
+                "agent.pause_until_input()) are always available.\n" + "\n".join(callable_lines)
             )
 
     # 4. Tool surface facts
     tool_surface_facts = context_bundle.get("tool_surface_facts")
     if isinstance(tool_surface_facts, dict):
-        input_items.append(
-            {
-                "role": "system",
-                "content": "runtime facts:\n"
-                + json.dumps(
-                    jsonable_encoder(tool_surface_facts),
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-            }
+        push_system(
+            "runtime facts:\n"
+            + json.dumps(
+                jsonable_encoder(tool_surface_facts),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
         )
 
     # 6. Turn-id reference block for write authority
@@ -457,19 +459,14 @@ def _build_responses_input_items(
         if isinstance(current_turn_id, str) and current_turn_id:
             turn_ref_lines.append(f"- current user instruction: turn:{current_turn_id}")
     if turn_ref_lines:
-        input_items.append(
-            {
-                "role": "system",
-                "content": "turn-id context for write authority:\n" + "\n".join(turn_ref_lines),
-            }
-        )
+        push_system("turn-id context for write authority:\n" + "\n".join(turn_ref_lines))
 
     # recall_v1 reconstruction — the retriever's working-context reconstruction
     recall_v1 = context_bundle.get("recall_v1")
     if isinstance(recall_v1, dict):
         rendered = _render_recall_v1(recall_v1)
         if rendered:
-            input_items.append({"role": "system", "content": rendered})
+            push_system(rendered)
 
     # 10. Open jobs
     open_commitments_and_jobs = context_bundle.get("open_commitments_and_jobs")
@@ -486,12 +483,7 @@ def _build_responses_input_items(
                 if isinstance(job_id, str) and isinstance(status, str) and isinstance(title, str):
                     job_lines.append(f"- {job_id}: {status}: {title}")
             if job_lines:
-                input_items.append(
-                    {
-                        "role": "system",
-                        "content": "open jobs:\n" + "\n".join(job_lines),
-                    }
-                )
+                push_system("open jobs:\n" + "\n".join(job_lines))
 
     # 11. Recent artifacts
     relevant_artifacts_and_observations = context_bundle.get("relevant_artifacts_and_observations")
@@ -507,16 +499,10 @@ def _build_responses_input_items(
                 if isinstance(title, str) and isinstance(source, str):
                     artifact_lines.append(f"- {title} ({source})")
             if artifact_lines:
-                input_items.append(
-                    {
-                        "role": "system",
-                        "content": "recent artifacts:\n" + "\n".join(artifact_lines),
-                    }
-                )
+                push_system("recent artifacts:\n" + "\n".join(artifact_lines))
 
-    # 13. Current user message
-    input_items.append({"role": "user", "content": user_message})
-    return input_items
+    parts: list[Any] = [*system_parts, UserPromptPart(content=user_message)]
+    return [ModelRequest(parts=parts)]
 
 
 def _discord_context_text(raw_context: Any) -> str | None:
@@ -564,82 +550,6 @@ def _discord_context_text(raw_context: Any) -> str | None:
             if attachment_parts:
                 lines.append("  - " + " ".join(attachment_parts))
     return "\n".join(lines)
-
-
-@dataclass(slots=True, frozen=True)
-class TurnLimitViolation:
-    budget: str
-    unit: str
-    measured: int
-    limit: int
-
-
-def _response_tokens_from_model_payload(
-    assistant_response: dict[str, Any],
-    *,
-    assistant_text: str,
-) -> int:
-    del assistant_text
-    usage_payload = assistant_response.get("usage")
-    if isinstance(usage_payload, dict):
-        output_tokens = usage_payload.get("output_tokens")
-        if isinstance(output_tokens, int) and output_tokens >= 0:
-            return output_tokens
-    return 0
-
-
-def _turn_limit_message(violation: TurnLimitViolation) -> str:
-    if violation.budget == "response_tokens":
-        return (
-            "this turn stopped because the response budget was exhausted. "
-            "please narrow the request so i can answer within the response budget."
-        )
-    return "this turn stopped because a configured turn budget was exhausted."
-
-
-def _applied_turn_limits(settings: AppSettings) -> dict[str, Any]:
-    return {
-        "max_response_tokens": int(settings.max_response_tokens),
-        "main_turn_budget_seconds": float(settings.main_turn_budget_seconds),
-        "agent_loop_max_model_calls": int(settings.agent_loop_max_model_calls),
-    }
-
-
-def _build_turn_limit_error(
-    *,
-    session_id: str,
-    turn_id: str,
-    violation: TurnLimitViolation,
-    applied_limits: dict[str, Any],
-) -> ApiError:
-    return ApiError(
-        status_code=429,
-        code="E_TURN_LIMIT_REACHED",
-        message=_turn_limit_message(violation),
-        details={
-            "session_id": session_id,
-            "turn_id": turn_id,
-            "limit": {
-                "budget": violation.budget,
-                "unit": violation.unit,
-                "limit": violation.limit,
-                "measured": violation.measured,
-            },
-            "applied_limits": applied_limits,
-        },
-        retryable=False,
-    )
-
-
-def _build_default_model_adapter(settings: AppSettings) -> ModelAdapter:
-    return OpenAIResponsesAdapter(
-        provider="provider.openai.responses",
-        model=settings.model_name,
-        api_key=settings.openai_api_key,
-        timeout_seconds=settings.model_timeout_seconds,
-        reasoning_effort=settings.model_reasoning_effort,
-        verbosity=settings.model_verbosity,
-    )
 
 
 @dataclass(slots=True)
@@ -1071,20 +981,6 @@ def _runtime_provenance_for_turn(
     return RuntimeProvenance(status=status, evidence=tuple(evidence))
 
 
-def _merge_runtime_provenance(
-    *,
-    baseline: RuntimeProvenance,
-    ingress: RuntimeProvenance | None,
-) -> RuntimeProvenance:
-    if ingress is None:
-        return baseline
-    merged_status: Literal["clean", "tainted"] = (
-        "tainted" if baseline.status == "tainted" or ingress.status == "tainted" else "clean"
-    )
-    merged_evidence = tuple([*baseline.evidence, *ingress.evidence])
-    return RuntimeProvenance(status=merged_status, evidence=merged_evidence)
-
-
 def _turn_retrieval_sources(*, db: Session, turn_id: str) -> list[dict[str, Any]]:
     """Citations for the turn's surfaced response.
 
@@ -1123,7 +1019,7 @@ def build_runtime(
 ) -> tuple[Runtime, Engine]:
     settings = AppSettings()
     db_url = database_url or settings.database_url
-    adapter = model_adapter or _build_default_model_adapter(settings)
+    adapter = model_adapter or ModelAdapter(settings)
 
     engine = create_engine(
         db_url,
@@ -1138,10 +1034,10 @@ def build_runtime(
         fetch_timeout_seconds=settings.attachment_fetch_timeout_seconds,
         handle_ttl_seconds=settings.attachment_handle_ttl_seconds,
         scanner_mode=settings.attachment_scanner_mode,
+        adapter=adapter,
         openai_api_key=settings.openai_api_key,
-        openai_model=settings.attachment_openai_model,
         openai_audio_model=settings.attachment_openai_audio_model,
-        openai_timeout_seconds=settings.attachment_openai_timeout_seconds,
+        openai_audio_timeout_seconds=settings.model_timeout_seconds,
         encryption_secret=settings.connector_encryption_secret,
         encryption_key_version=settings.connector_encryption_key_version,
         encryption_keys=settings.connector_encryption_keys,
@@ -1442,10 +1338,7 @@ def _wake(
         db=db,
         prior_turns=prior_turns,
     )
-    runtime_provenance = _merge_runtime_provenance(
-        baseline=runtime_provenance,
-        ingress=ingress_runtime_provenance,
-    )
+    runtime_provenance = runtime_provenance.merge(ingress_runtime_provenance)
     now = utcnow()
     turn = TurnRecord(
         id=new_id("trn"),
@@ -1515,6 +1408,7 @@ def _wake(
         turn_id=turn.id,
         taint=runtime_provenance.status,
         source_ref=turn.id,
+        adapter=runtime.model_adapter,
         settings=runtime.settings,
         now=utcnow(),
         new_id_fn=new_id,
@@ -1577,53 +1471,6 @@ def _wake(
         agency_configured=_agency_runtime_is_bound(runtime.settings),
         settings=runtime.settings,
     )
-    applied_limits = _applied_turn_limits(runtime.settings)
-
-    def build_turn_limit_failure(
-        *,
-        budget: str,
-        unit: str,
-        measured: int,
-        limit: int,
-    ) -> ApiError:
-        return _build_turn_limit_error(
-            session_id=effective_session_id,
-            turn_id=turn.id,
-            violation=TurnLimitViolation(
-                budget=budget,
-                unit=unit,
-                measured=measured,
-                limit=limit,
-            ),
-            applied_limits=applied_limits,
-        )
-
-    def emit_turn_limit_failure(failure: ApiError) -> None:
-        raw_limit = failure.details.get("limit")
-        limit_details = raw_limit if isinstance(raw_limit, dict) else {}
-        add_event(
-            "evt.assistant.emitted",
-            {
-                "message": failure.message,
-                "bounded_failure": {
-                    "code": failure.code,
-                    "limit": limit_details,
-                },
-            },
-        )
-        turn.assistant_message = failure.message
-        turn.status = "failed"
-        turn.updated_at = utcnow()
-        add_event(
-            "evt.turn.failed",
-            {
-                "failure_reason": failure.message,
-                "error_code": failure.code,
-                "limit": limit_details,
-            },
-        )
-
-    bounded_failure: ApiError | None = None
     model_failure: ApiError | None = None
     model_failure_reason: str | None = None
     assistant_response: dict[str, Any] | None = None
@@ -1638,8 +1485,8 @@ def _wake(
         if callable_name is not None:
             eligible_internal_callables.append(callable_name)
     context_bundle["eligible_internal_callables"] = sorted(eligible_internal_callables)
-    responses_tools = run_tool_definitions()
-    responses_input_items = _build_responses_input_items(
+    main_loop_tools = run_tool_definitions()
+    initial_messages = _build_initial_messages(
         context_bundle=context_bundle,
         user_message=user_message,
     )
@@ -1693,11 +1540,8 @@ def _wake(
         turn=turn,
         settings=runtime.settings,
         model_adapter=runtime.model_adapter,
-        responses_input_items=responses_input_items,
-        tools=responses_tools,
-        user_message=user_message,
-        history=[],
-        context_bundle=context_bundle,
+        messages=initial_messages,
+        tools=main_loop_tools,
         allowed_capability_ids=frozenset(allowed_capability_ids),
         scratch=scratch,
         proposal_index_start=0,
@@ -1713,16 +1557,13 @@ def _wake(
         attachment_runtime=runtime.attachment_runtime,
     )
     # Thread taint back and collect retrieval sources for the response.
-    runtime_provenance = _merge_runtime_provenance(
-        baseline=runtime_provenance,
-        ingress=loop_result.runtime_provenance,
-    )
+    runtime_provenance = runtime_provenance.merge(loop_result.runtime_provenance)
     assistant_sources = _turn_retrieval_sources(db=db, turn_id=turn.id)
 
     # Map loop outcome to the post-loop variables.
     exhausted_response: dict[str, Any] = {
-        "provider": runtime.model_adapter.provider,
-        "model": runtime.model_adapter.model,
+        "provider": MAIN.provider,
+        "model": MAIN.model,
         "assistant_text": "I wasn't able to finish that within the time available.",
         "assistant_silent": False,
     }
@@ -1730,23 +1571,11 @@ def _wake(
     match loop_result.outcome:
         case "message":
             assert loop_result.emitted_message is not None
-            response_tokens = _response_tokens_from_model_payload(
-                exhausted_response,
-                assistant_text=loop_result.emitted_message,
-            )
-            if response_tokens > runtime.settings.max_response_tokens:
-                bounded_failure = build_turn_limit_failure(
-                    budget="response_tokens",
-                    unit="tokens",
-                    measured=response_tokens,
-                    limit=runtime.settings.max_response_tokens,
-                )
-            else:
-                assistant_response = {
-                    **exhausted_response,
-                    "assistant_text": loop_result.emitted_message,
-                    "assistant_silent": False,
-                }
+            assistant_response = {
+                **exhausted_response,
+                "assistant_text": loop_result.emitted_message,
+                "assistant_silent": False,
+            }
         case "approval":
             assistant_response = {
                 **exhausted_response,
@@ -1759,7 +1588,7 @@ def _wake(
                 "assistant_text": "",
                 "assistant_silent": True,
             }
-        case "budget_exhausted":
+        case "budget_exhausted" | "finding" | "operations":
             assistant_response = exhausted_response
         case "model_failed":
             model_failure = ApiError(
@@ -1774,15 +1603,8 @@ def _wake(
                 retryable=True,
             )
             model_failure_reason = "model provider request failed"
-        case "bounded_failure":
-            pass  # bounded_failure set inside the message branch above
-        case "finding" | "operations":
-            # Not a valid outcome for output_mode="message" — treat as exhausted.
-            assistant_response = exhausted_response
 
-    if bounded_failure is not None:
-        emit_turn_limit_failure(bounded_failure)
-    elif model_failure is not None:
+    if model_failure is not None:
         turn.status = "failed"
         turn.updated_at = utcnow()
         add_event(
@@ -1820,6 +1642,7 @@ def _wake(
             turn_id=turn.id,
             taint=runtime_provenance.status,
             source_ref=turn.id,
+            adapter=runtime.model_adapter,
             settings=runtime.settings,
             now=utcnow(),
             new_id_fn=new_id,
@@ -1833,13 +1656,6 @@ def _wake(
     active_session.updated_at = utcnow()
     db.commit()
 
-    if bounded_failure is not None:
-        return TurnExecutionOutcome(
-            turn_id=turn.id,
-            effective_session_id=effective_session_id,
-            status_code=bounded_failure.status_code,
-            response_payload=_error_payload(bounded_failure),
-        )
     if model_failure is not None:
         return TurnExecutionOutcome(
             turn_id=turn.id,

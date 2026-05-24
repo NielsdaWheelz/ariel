@@ -245,16 +245,14 @@ def test_turn_budget_env_overrides_are_loaded(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_memory_runtime_settings_load_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ARIEL_MEMORY_EMBEDDING_PROVIDER", "local")
-    monkeypatch.setenv("ARIEL_MEMORY_EMBEDDING_MODEL", "fixture-embedding")
+    monkeypatch.setenv("ARIEL_MEMORY_EMBEDDING_DIMENSIONS", str(MEMORY_EMBEDDING_DIMENSIONS))
     monkeypatch.setenv("ARIEL_MEMORY_RECALL_BUDGET_SECONDS", "30.0")
     monkeypatch.setenv("ARIEL_MEMORY_ENCODE_BUDGET_SECONDS", "45.0")
     monkeypatch.setenv("ARIEL_MEMORY_DREAM_BUDGET_SECONDS", "1200.0")
     monkeypatch.setenv("ARIEL_MEMORY_DREAM_INTERVAL_SECONDS", "3600.0")
 
     settings = AppSettings()
-    assert settings.memory_embedding_provider == "local"
-    assert settings.memory_embedding_model == "fixture-embedding"
+    assert settings.memory_embedding_dimensions == MEMORY_EMBEDDING_DIMENSIONS
     assert settings.memory_recall_budget_seconds == 30.0
     assert settings.memory_encode_budget_seconds == 45.0
     assert settings.memory_dream_budget_seconds == 1200.0
@@ -265,20 +263,6 @@ def test_memory_embedding_dimensions_must_match_schema(monkeypatch: pytest.Monke
     monkeypatch.setenv("ARIEL_MEMORY_EMBEDDING_DIMENSIONS", str(MEMORY_EMBEDDING_DIMENSIONS + 1))
 
     with pytest.raises(ValidationError):
-        AppSettings()
-
-
-@pytest.mark.parametrize(
-    "env_name",
-    ["ARIEL_MEMORY_EMBEDDING_PROVIDER", "ARIEL_MEMORY_EMBEDDING_MODEL"],
-)
-def test_memory_embedding_text_settings_reject_blank_values(
-    monkeypatch: pytest.MonkeyPatch,
-    env_name: str,
-) -> None:
-    monkeypatch.setenv(env_name, "   ")
-
-    with pytest.raises(ValidationError, match="memory embedding settings must not be blank"):
         AppSettings()
 
 

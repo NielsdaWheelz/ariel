@@ -16,43 +16,57 @@ These exercise three new behaviours layered on top of ``run_agent_loop``:
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic_ai.messages import ModelMessage, ModelRequest, SystemPromptPart, ToolReturnPart
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from tests.integration.app_helpers import create_test_app
+from ariel.model_adapter import ModelCall, ModelResponse
 from ariel.persistence import MemoryLogRecord
 from tests.fake_sandbox import FakeSandboxRuntime
+from tests.integration.app_helpers import create_test_app
 from tests.integration.responses_helpers import (
+    FakeModelAdapter,
     empty_recall_response,
     is_memory_subsystem_call,
     post_message_and_drain,
 )
 
 
-def _run_response(source: str, *, provider: str, model: str, rid: str) -> dict[str, Any]:
-    """Wrap a raw run-program source as a Responses-API function_call payload."""
-    return {
-        "provider": provider,
-        "model": model,
-        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-        "provider_response_id": rid,
-        "output": [
-            {
-                "type": "function_call",
-                "id": f"fc_{rid}",
-                "call_id": f"call_{rid}",
-                "name": "run",
-                "arguments": json.dumps({"source": source}, sort_keys=True),
-                "status": "completed",
-            }
-        ],
-    }
+def _run_response(source: str, *, provider: str, model: str, rid: str) -> ModelResponse:
+    """Wrap a raw run-program source as a ``run`` tool-call ``ModelResponse``."""
+    from tests.integration.responses_helpers import run_response  # noqa: PLC0415
+
+    return run_response(source=source, provider=provider, model=model, provider_response_id=rid)
+
+
+def _tool_returns(messages: list[ModelMessage]) -> list[dict[str, Any]]:
+    """Extract the JSON-decoded ``ToolReturnPart.content`` payloads from
+    ``messages``.
+
+    The agent loop appends one ``ModelRequest`` per round whose ``parts``
+    include a ``ToolReturnPart`` per syscall return; the ``content`` is a
+    JSON document carrying ``status``, ``emitted_values``, ``action_attempts``,
+    etc. This helper returns the parsed bodies in message order so tests can
+    assert on the cross-round payload contract.
+    """
+    bodies: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, ModelRequest):
+            continue
+        for part in message.parts:
+            if isinstance(part, ToolReturnPart) and isinstance(part.content, str):
+                try:
+                    body = json.loads(part.content)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(body, dict):
+                    bodies.append(body)
+    return bodies
 
 
 _EMIT_FINDING_MAIN_ERROR = (
@@ -84,31 +98,24 @@ def _build_client(postgres_url: str, adapter: Any) -> TestClient:
 # ===========================================================================
 
 
-@dataclass
-class _FindingThenMessageAdapter:
+class _FindingThenMessageAdapter(FakeModelAdapter):
     """Round 1: invalid emit_finding (main-loop). Round 2: valid emit_message."""
 
-    provider: str = "provider.recovery"
-    model: str = "model.recovery-v1"
-    main_call_count: int = 0
-    last_input_items: list[list[dict[str, Any]]] = field(default_factory=list)
+    provider = "provider.recovery"
+    model = "model.recovery-v1"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_memory_subsystem_call(input_items):
+    def __init__(self) -> None:
+        super().__init__()
+        self.main_call_count: int = 0
+        self.last_messages: list[list[ModelMessage]] = []
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_memory_subsystem_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del tools, user_message, history, context_bundle
         self.main_call_count += 1
-        self.last_input_items.append(list(input_items))
+        self.last_messages.append(list(request.messages))
         if self.main_call_count == 1:
             return _run_response(
                 _INVALID_FINDING_SOURCE,
@@ -152,40 +159,36 @@ def test_main_loop_emit_finding_misuse_recovers_with_typed_nudge(
 
         # The second model call sees the specialised typed nudge, not the
         # generic program-failure nudge.
-        recovery_items = adapter.last_input_items[1]
-        nudge_seen = any(
-            isinstance(item.get("content"), str)
-            and "is not available in this loop" in item["content"]
-            for item in recovery_items
-        )
+        recovery_messages = adapter.last_messages[1]
+        system_contents = [
+            part.content
+            for message in recovery_messages
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+            if isinstance(part, SystemPromptPart)
+        ]
+        nudge_seen = any("is not available in this loop" in content for content in system_contents)
         assert nudge_seen
 
 
-@dataclass
-class _DoneThenMessageAdapter:
+class _DoneThenMessageAdapter(FakeModelAdapter):
     """Round 1: invalid emit_done (main-loop). Round 2: valid emit_message."""
 
-    provider: str = "provider.recovery"
-    model: str = "model.recovery-v1"
-    main_call_count: int = 0
-    last_input_items: list[list[dict[str, Any]]] = field(default_factory=list)
+    provider = "provider.recovery"
+    model = "model.recovery-v1"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_memory_subsystem_call(input_items):
+    def __init__(self) -> None:
+        super().__init__()
+        self.main_call_count: int = 0
+        self.last_messages: list[list[ModelMessage]] = []
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_memory_subsystem_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del tools, user_message, history, context_bundle
         self.main_call_count += 1
-        self.last_input_items.append(list(input_items))
+        self.last_messages.append(list(request.messages))
         if self.main_call_count == 1:
             return _run_response(
                 _INVALID_DONE_SOURCE,
@@ -225,12 +228,15 @@ def test_main_loop_emit_done_misuse_recovers_with_typed_nudge(
         )
         assert any(_EMIT_DONE_MAIN_ERROR in err for err in validation_failed["payload"]["errors"])
 
-        recovery_items = adapter.last_input_items[1]
-        assert any(
-            isinstance(item.get("content"), str)
-            and "is not available in this loop" in item["content"]
-            for item in recovery_items
-        )
+        recovery_messages = adapter.last_messages[1]
+        system_contents = [
+            part.content
+            for message in recovery_messages
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+            if isinstance(part, SystemPromptPart)
+        ]
+        assert any("is not available in this loop" in content for content in system_contents)
 
 
 # ===========================================================================
@@ -246,28 +252,21 @@ _WHITESPACE_VARIANTS = (
 )
 
 
-@dataclass
-class _WhitespaceVariantFindingAdapter:
+class _WhitespaceVariantFindingAdapter(FakeModelAdapter):
     """Returns whitespace-different but semantically identical emit_finding calls."""
 
-    provider: str = "provider.stuck-semantic"
-    model: str = "model.stuck-semantic-v1"
-    main_call_count: int = 0
+    provider = "provider.stuck-semantic"
+    model = "model.stuck-semantic-v1"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_memory_subsystem_call(input_items):
+    def __init__(self) -> None:
+        super().__init__()
+        self.main_call_count = 0
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_memory_subsystem_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del tools, user_message, history, context_bundle, input_items
         index = self.main_call_count
         self.main_call_count += 1
         # Beyond the prepared variants, keep returning the last one so the
@@ -325,31 +324,25 @@ def test_main_loop_semantic_stuck_rail_halts_on_repeated_program_errors(
 # ===========================================================================
 
 
-@dataclass
-class _BudgetExhaustedAdapter:
-    """Round 1: invalid emit_finding. A later tools=[] call is a defect."""
+class _BudgetExhaustedAdapter(FakeModelAdapter):
+    """Round 1+: invalid emit_finding. A later tools=[] call is a defect — the
+    canned-line emission path runs without a constrained model call."""
 
-    provider: str = "provider.summary"
-    model: str = "model.summary-v1"
-    main_call_count: int = 0
-    constrained_calls: int = 0
+    provider = "provider.summary"
+    model = "model.summary-v1"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_memory_subsystem_call(input_items):
+    def __init__(self) -> None:
+        super().__init__()
+        self.main_call_count: int = 0
+        self.constrained_calls: int = 0
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_memory_subsystem_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del user_message, history, context_bundle, input_items
         self.main_call_count += 1
-        if tools == []:
+        if request.tools == []:
             self.constrained_calls += 1
             raise AssertionError("budget exhaustion must not call the model with tools=[]")
         return _run_response(
@@ -400,32 +393,25 @@ def test_main_loop_budget_exhaustion_uses_canned_line_without_summary_call(
 _DISTINCTIVE_SNIPPET = "Weekly Career Meeting at Fractal Tech"
 
 
-@dataclass
-class _SyscallThenMessageAdapter:
+class _SyscallThenMessageAdapter(FakeModelAdapter):
     """Round 1: program runs a read cap and deliberately emits the facts it
     wants in the next round. Round 2: program emits a grounded message."""
 
-    provider: str = "provider.exec-output"
-    model: str = "model.exec-output-v1"
-    main_call_count: int = 0
-    last_input_items: list[list[dict[str, Any]]] = field(default_factory=list)
+    provider = "provider.exec-output"
+    model = "model.exec-output-v1"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_memory_subsystem_call(input_items):
+    def __init__(self) -> None:
+        super().__init__()
+        self.main_call_count: int = 0
+        self.last_messages: list[list[ModelMessage]] = []
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_memory_subsystem_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del tools, user_message, history, context_bundle
         self.main_call_count += 1
-        self.last_input_items.append(list(input_items))
+        self.last_messages.append(list(request.messages))
         if self.main_call_count == 1:
             source = (
                 "result = memory.search(query='career meeting')\n"
@@ -483,14 +469,10 @@ def test_emit_value_carries_read_facts_to_next_round_context(
     assert turn.status == "completed"
     assert adapter.main_call_count == 2
 
-    round2_items = adapter.last_input_items[1]
-
-    function_call_outputs = [
-        item for item in round2_items if item.get("type") == "function_call_output"
-    ]
+    round2_messages = adapter.last_messages[1]
+    tool_returns = _tool_returns(round2_messages)
     found_emit_value = False
-    for fc_out in function_call_outputs:
-        body = json.loads(fc_out["output"])
+    for body in tool_returns:
         emitted_values = body.get("emitted_values")
         if isinstance(emitted_values, list) and any(
             _DISTINCTIVE_SNIPPET in json.dumps(value) for value in emitted_values
@@ -518,8 +500,7 @@ def test_emit_value_carries_read_facts_to_next_round_context(
 # ===========================================================================
 
 
-@dataclass
-class _PrematureSynthesisAdapter:
+class _PrematureSynthesisAdapter(FakeModelAdapter):
     """Round 1: memory.search + agent.emit_message (the synthesis-question
     bug shape). Round 2: fetch again and emit the facts for the next round.
     Round 3: answer from the emitted facts.
@@ -530,32 +511,26 @@ class _PrematureSynthesisAdapter:
     delivered as the assistant message.
     """
 
-    provider: str = "provider.synthesis"
-    model: str = "model.synthesis-v1"
-    main_call_count: int = 0
-    last_input_items: list[list[dict[str, Any]]] = field(default_factory=list)
-    round_one_message: str = "The most important thing today is the career meeting at Fractal Tech."
-    round_two_message: str = (
+    provider = "provider.synthesis"
+    model = "model.synthesis-v1"
+    round_one_message = "The most important thing today is the career meeting at Fractal Tech."
+    round_two_message = (
         "After looking at the search results, the most important thing today is "
         "the career meeting at Fractal Tech."
     )
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_memory_subsystem_call(input_items):
+    def __init__(self) -> None:
+        super().__init__()
+        self.main_call_count: int = 0
+        self.last_messages: list[list[ModelMessage]] = []
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_memory_subsystem_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del tools, user_message, history, context_bundle
         self.main_call_count += 1
-        self.last_input_items.append(list(input_items))
+        self.last_messages.append(list(request.messages))
         if self.main_call_count == 1:
             # The bug shape: a read capability + an emit_message in the same
             # program.  The message text was authored before the search ran.
@@ -633,33 +608,26 @@ def test_main_loop_premature_synthesis_rail_drops_round_one_message_and_forces_a
     assert payload["read_capability_ids"] == ["cap.memory.search"]
 
 
-@dataclass
-class _GreetingOnlyAdapter:
+class _GreetingOnlyAdapter(FakeModelAdapter):
     """Round 1: only ``agent.emit_message`` with no capability call.
 
     A pure-greeting round must not be dropped — the rail's domain is
     ``read capability + emit_message``, not every round-one emit.
     """
 
-    provider: str = "provider.greeting"
-    model: str = "model.greeting-v1"
-    main_call_count: int = 0
-    greeting_text: str = "Hello."
+    provider = "provider.greeting"
+    model = "model.greeting-v1"
+    greeting_text = "Hello."
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_memory_subsystem_call(input_items):
+    def __init__(self) -> None:
+        super().__init__()
+        self.main_call_count: int = 0
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_memory_subsystem_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del tools, user_message, history, context_bundle, input_items
         self.main_call_count += 1
         return _run_response(
             f"agent.emit_message(text={self.greeting_text!r})\n",
@@ -704,32 +672,25 @@ def test_main_loop_pure_emit_message_round_one_is_not_dropped(
 _FAILED_PROGRAM_DISTINCTIVE_SNIPPET = "Acme term sheet revision from counsel"
 
 
-@dataclass
-class _SearchThenRaiseAdapter:
+class _SearchThenRaiseAdapter(FakeModelAdapter):
     """Round 1: program runs memory.search (succeeds) then raises NameError
     on the next line. Round 2: program emits a recovery message."""
 
-    provider: str = "provider.failed-with-syscalls"
-    model: str = "model.failed-with-syscalls-v1"
-    main_call_count: int = 0
-    last_input_items: list[list[dict[str, Any]]] = field(default_factory=list)
+    provider = "provider.failed-with-syscalls"
+    model = "model.failed-with-syscalls-v1"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_memory_subsystem_call(input_items):
+    def __init__(self) -> None:
+        super().__init__()
+        self.main_call_count: int = 0
+        self.last_messages: list[list[ModelMessage]] = []
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_memory_subsystem_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del tools, user_message, history, context_bundle
         self.main_call_count += 1
-        self.last_input_items.append(list(input_items))
+        self.last_messages.append(list(request.messages))
         if self.main_call_count == 1:
             source = "result = memory.search(query='term sheet')\nraise NameError('e')\n"
             return _run_response(
@@ -767,13 +728,10 @@ def test_failed_program_preserves_action_attempt_status_without_output_echo(
     assert turn.status == "completed"
     assert adapter.main_call_count == 2
 
-    round2_items = adapter.last_input_items[1]
-    function_call_outputs = [
-        item for item in round2_items if item.get("type") == "function_call_output"
-    ]
+    round2_messages = adapter.last_messages[1]
+    tool_returns = _tool_returns(round2_messages)
     found_succeeded_attempt = False
-    for fc_out in function_call_outputs:
-        body = json.loads(fc_out["output"])
+    for body in tool_returns:
         if body.get("status") != "failed":
             continue
         attempts = body.get("action_attempts")

@@ -62,11 +62,16 @@ class AppSettings(BaseSettings):
     schema_readiness_ttl_seconds: float = 10.0
     model_name: str = "gpt-5.5"
     openai_api_key: str | None = None
+    anthropic_api_key: str | None = None
+    google_api_key: str | None = None
+    openrouter_api_key: str | None = None
+    openai_base_url: str | None = None
+    cloudflare_api_token: str | None = None
+    cloudflare_account_id: str | None = None
     model_timeout_seconds: float = 30.0
-    model_reasoning_effort: str = "medium"
-    model_verbosity: str = "low"
-    memory_embedding_provider: str = "openai"
-    memory_embedding_model: str = "text-embedding-3-small"
+    model_reasoning_effort: Literal["minimal", "low", "medium", "high"] = "medium"
+    # ``memory_embedding_dimensions`` is the DB column width invariant; the
+    # actual provider/model are resolved by the EMBEDDING tier in the adapter.
     memory_embedding_dimensions: int = MEMORY_EMBEDDING_DIMENSIONS
     auto_rotate_max_turns: int = 120
     auto_rotate_max_age_seconds: int = 172800
@@ -107,9 +112,11 @@ class AppSettings(BaseSettings):
     attachment_fetch_timeout_seconds: float = 10.0
     attachment_handle_ttl_seconds: int = 3600
     attachment_scanner_mode: Literal["disabled", "fail_closed"] = "fail_closed"
-    attachment_openai_model: str = "gpt-5.5"
+    # Image/PDF extraction routes through the VISION tier on the shared
+    # ``ModelAdapter``. Audio transcription still calls OpenAI directly (no
+    # audio Model in pydantic-ai 1.99), and uses this audio-model name plus
+    # ``model_timeout_seconds`` for the timeout.
     attachment_openai_audio_model: str = "gpt-4o-transcribe"
-    attachment_openai_timeout_seconds: float = 30.0
     agency_socket_path: str = "/tmp/agency-daemon.sock"
     agency_allowed_repo_roots: str = ""
     agency_default_base_branch: str = "main"
@@ -159,6 +166,21 @@ class AppSettings(BaseSettings):
     @field_validator("openai_api_key", mode="before")
     @classmethod
     def _blank_openai_api_key_is_unset(cls, value: Any) -> Any:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator(
+        "anthropic_api_key",
+        "google_api_key",
+        "openrouter_api_key",
+        "openai_base_url",
+        "cloudflare_api_token",
+        "cloudflare_account_id",
+        mode="before",
+    )
+    @classmethod
+    def _blank_model_settings_are_unset(cls, value: Any) -> Any:
         if isinstance(value, str) and not value.strip():
             return None
         return value
@@ -314,32 +336,19 @@ class AppSettings(BaseSettings):
             )
         return self
 
-    @field_validator("model_reasoning_effort")
+    @field_validator("model_reasoning_effort", mode="before")
     @classmethod
-    def _model_reasoning_effort_must_be_supported(cls, value: str) -> str:
+    def _model_reasoning_effort_normalized(
+        cls, value: Any
+    ) -> Literal["minimal", "low", "medium", "high"]:
+        # Pydantic validates the Literal after this hook returns; we just
+        # normalize whitespace + case so common env-var typos still resolve.
+        if not isinstance(value, str):
+            raise ValueError("model_reasoning_effort must be a string")
         normalized = value.strip().lower()
         if normalized not in {"minimal", "low", "medium", "high"}:
             raise ValueError("model_reasoning_effort must be one of: minimal, low, medium, high")
-        return normalized
-
-    @field_validator("model_verbosity")
-    @classmethod
-    def _model_verbosity_must_be_supported(cls, value: str) -> str:
-        normalized = value.strip().lower()
-        if normalized not in {"low", "medium", "high"}:
-            raise ValueError("model_verbosity must be one of: low, medium, high")
-        return normalized
-
-    @field_validator(
-        "memory_embedding_provider",
-        "memory_embedding_model",
-    )
-    @classmethod
-    def _memory_embedding_text_settings_must_not_be_blank(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("memory embedding settings must not be blank")
-        return normalized
+        return normalized  # type: ignore[return-value]  # justify-narrowed-by-set-check
 
     @field_validator("memory_embedding_dimensions")
     @classmethod
@@ -545,7 +554,6 @@ class AppSettings(BaseSettings):
     @field_validator(
         "discord_notification_timeout_seconds",
         "attachment_fetch_timeout_seconds",
-        "attachment_openai_timeout_seconds",
         "agency_timeout_seconds",
         "search_web_timeout_seconds",
         "search_news_timeout_seconds",
@@ -585,7 +593,6 @@ class AppSettings(BaseSettings):
 
     @field_validator(
         "attachment_blob_store_path",
-        "attachment_openai_model",
         "attachment_openai_audio_model",
     )
     @classmethod

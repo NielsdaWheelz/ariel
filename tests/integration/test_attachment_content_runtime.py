@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from ariel.attachment_content import AttachmentContentRuntime, AttachmentScannerMode
 from ariel.ids import new_id
 from ariel.persistence import SessionRecord, TurnRecord
+from tests.integration.responses_helpers import FakeModelAdapter
 
 
 NOW = datetime(2026, 5, 23, 12, 0, tzinfo=UTC)
@@ -29,10 +30,10 @@ def _runtime(tmp_path: Path, *, scanner_mode: AttachmentScannerMode) -> Attachme
         fetch_timeout_seconds=10.0,
         handle_ttl_seconds=86_400,
         scanner_mode=scanner_mode,
+        adapter=FakeModelAdapter(),
         openai_api_key=None,
-        openai_model="gpt-5.5",
         openai_audio_model="gpt-4o-transcribe",
-        openai_timeout_seconds=30.0,
+        openai_audio_timeout_seconds=30.0,
         encryption_secret="test-attachment-secret",
         encryption_key_version="v1",
         encryption_keys=None,
@@ -47,10 +48,10 @@ def test_attachment_runtime_rejects_unknown_scanner_mode(tmp_path: Path) -> None
             fetch_timeout_seconds=10.0,
             handle_ttl_seconds=86_400,
             scanner_mode=cast(Any, "permissive"),
+            adapter=FakeModelAdapter(),
             openai_api_key=None,
-            openai_model="gpt-5.5",
             openai_audio_model="gpt-4o-transcribe",
-            openai_timeout_seconds=30.0,
+            openai_audio_timeout_seconds=30.0,
             encryption_secret="test-attachment-secret",
             encryption_key_version="v1",
             encryption_keys=None,

@@ -8,7 +8,7 @@ and the normal-turn program-loop integration tests. They cover:
   ``ResearchFinding(status="complete", ...)``);
 - graceful non-convergence (stuck-detection and the model-call backstop end the
   run without a finding → ``ResearchFinding(status="partial", ...)``);
-- model-call failure (the adapter's ``create_response`` raises ``ModelAdapterError`` →
+- model-call failure (the adapter's ``_respond`` raises →
   ``ResearchFinding(status="failed", ...)``);
 - the per-run mode whitelist (a ``web`` run exposes only web read capabilities,
   a ``personal`` run only personal read capabilities — never both);
@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy import select
 
 from ariel.app import build_google_runtime
@@ -35,12 +36,16 @@ from ariel.google_connector import (
     GoogleConnectorRecord,
     GoogleWorkspaceProvider,
 )
-from ariel.model_adapter import ModelAdapterError
 from ariel.persistence import EventRecord, SessionRecord, TurnRecord
 from ariel.research_runtime import ResearchFinding, run_research
 from ariel.secret_cipher import encrypt_secret
 from tests.fake_sandbox import FakeSandboxRuntime
-from tests.integration.responses_helpers import empty_recall_response, is_memory_subsystem_call
+from tests.integration.responses_helpers import (
+    FakeModelAdapter,
+    empty_recall_response,
+    is_memory_subsystem_call,
+)
+from ariel.model_adapter import ModelCall, ModelResponse
 
 NOW = datetime(2026, 5, 20, 10, 0, tzinfo=UTC)
 
@@ -63,51 +68,38 @@ def _settings(**overrides: Any) -> AppSettings:
     return cast(AppSettings, cast(Any, AppSettings)(_env_file=None, **overrides))
 
 
-def _program_response(*, source: str, provider_response_id: str) -> dict[str, Any]:
+def _program_response(*, source: str, provider_response_id: str) -> ModelResponse:
     """A model response whose single ``run`` call carries a Python program."""
 
-    return {
-        "provider": "provider.research",
-        "model": "model.research-v1",
-        "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
-        "provider_response_id": provider_response_id,
-        "output": [
-            {
-                "type": "function_call",
-                "id": f"fc_{provider_response_id}",
-                "call_id": f"call_{provider_response_id}",
-                "name": "run",
-                "arguments": json.dumps({"source": source}, sort_keys=True),
-                "status": "completed",
-            }
-        ],
-    }
+    from tests.integration.responses_helpers import run_response  # noqa: PLC0415
+
+    return run_response(
+        source=source,
+        provider="provider.research",
+        model="model.research-v1",
+        provider_response_id=provider_response_id,
+        input_tokens=3,
+        output_tokens=2,
+    )
 
 
-@dataclass
-class SnapshotAdapter:
+class SnapshotAdapter(FakeModelAdapter):
     """Fake adapter: returns queued responses and snapshots each call's input."""
 
-    provider: str = "provider.research"
-    model: str = "model.research-v1"
-    responses: list[dict[str, Any]] = field(default_factory=list)
-    snapshots: list[list[dict[str, Any]]] = field(default_factory=list)
+    provider = "provider.research"
+    model = "model.research-v1"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_memory_subsystem_call(input_items):
+    def __init__(self, *, responses: list[ModelResponse] | None = None) -> None:
+        super().__init__()
+        self.responses: list[ModelResponse] = responses if responses is not None else []
+        self.snapshots: list[list[Any]] = []
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_memory_subsystem_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del tools, user_message, history, context_bundle
-        self.snapshots.append(list(input_items))
+        self.snapshots.append(list(request.messages))
         return self.responses.pop(0)
 
 
@@ -335,7 +327,7 @@ def test_run_research_web_mode_exposes_only_web_capabilities(session_factory: An
         )
     sandbox.close()
 
-    rendered = json.dumps(adapter.snapshots[0])
+    rendered = json.dumps(jsonable_encoder(adapter.snapshots[0]))
     # The web whitelist's run callables are advertised to the model.
     assert "- search.web(query: str)" in rendered
     assert "- search.news(query: str)" in rendered
@@ -374,7 +366,7 @@ def test_run_research_personal_mode_exposes_only_personal_capabilities(
         )
     sandbox.close()
 
-    rendered = json.dumps(adapter.snapshots[0])
+    rendered = json.dumps(jsonable_encoder(adapter.snapshots[0]))
     # The personal whitelist's run callables are advertised to the model.
     assert "email.search" in rendered
     assert "email.read" in rendered
@@ -413,7 +405,7 @@ def test_run_research_memories_mode_exposes_only_memory_capabilities(
         )
     sandbox.close()
 
-    rendered = json.dumps(adapter.snapshots[0])
+    rendered = json.dumps(jsonable_encoder(adapter.snapshots[0]))
     assert "- memory.search(query: str" in rendered
     assert "- memory.read(id: str)" in rendered
     assert "search.web" not in rendered
@@ -463,7 +455,7 @@ def test_run_research_web_mode_program_cannot_call_personal_capability(
     assert finding.claims == []
     # The personal capability was unreachable: the program did not complete and
     # that failure — not a private-data read — was fed back to the model.
-    feedback = json.dumps(adapter.snapshots[-1])
+    feedback = json.dumps(jsonable_encoder(adapter.snapshots[-1]))
     assert "did not complete" in feedback
 
 
@@ -472,34 +464,21 @@ def test_run_research_model_call_failure_returns_failed_finding(
 ) -> None:
     """A model call that raises yields ResearchFinding(status='failed') and a failed TurnRecord."""
 
-    @dataclass
-    class RaisingAdapter:
-        provider: str = "provider.research"
-        model: str = "model.research-v1"
-        snapshots: list[list[dict[str, Any]]] = field(default_factory=list)
+    class RaisingAdapter(FakeModelAdapter):
+        provider = "provider.research"
+        model = "model.research-v1"
 
-        def create_response(
-            self,
-            *,
-            input_items: list[dict[str, Any]],
-            tools: list[dict[str, Any]],
-            user_message: str,
-            history: list[dict[str, Any]],
-            context_bundle: dict[str, Any],
-        ) -> dict[str, Any]:
-            if is_memory_subsystem_call(input_items):
+        def __init__(self) -> None:
+            super().__init__()
+            self.snapshots: list[list[Any]] = []
+
+        def _respond(self, request: ModelCall) -> ModelResponse:
+            if is_memory_subsystem_call(request.messages):
                 return empty_recall_response(
-                    provider=self.provider, model=self.model, input_items=input_items
+                    provider=self.provider, model=self.model, messages=request.messages
                 )
-            del tools, user_message, history, context_bundle
-            self.snapshots.append(list(input_items))
-            raise ModelAdapterError(
-                safe_reason="model unavailable",
-                status_code=502,
-                code="E_MODEL_FAILURE",
-                message="model provider request failed",
-                retryable=False,
-            )
+            self.snapshots.append(list(request.messages))
+            raise RuntimeError("model unavailable")
 
     _seed_session(session_factory, "ses_research_fail")
     sandbox = FakeSandboxRuntime()

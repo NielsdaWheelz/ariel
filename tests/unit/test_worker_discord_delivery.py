@@ -312,7 +312,9 @@ def test_deliver_to_discord_pending_approval_adds_approval_line_and_buttons(
     assert len(posted_bodies) == 1
     body = posted_bodies[0]
 
-    # Approval line appended after a blank line.
+    # Approval line appended after a blank line. The format uses the
+    # capability action label rather than "Approval pending"; the ref id is
+    # carried by the buttons rather than printed in the content.
     content = body["content"]
     assert "Shall I proceed?" in content
     assert "⏳ Send email — needs approval" in content
@@ -363,6 +365,10 @@ def test_deliver_to_discord_multiple_pending_approvals_produces_one_row_each(
     body = posted_bodies[0]
 
     content = body["content"]
+    # Refs live on the buttons; the content shows one approval line per pending
+    # entry, each with the ⏳ marker and the per-capability action label
+    # (``cap.calendar.event_create`` is not a known id and falls back to the
+    # ``Calendar action`` namespace label).
     assert "⏳ Send email — needs approval" in content
     assert "⏳ Calendar action — needs approval" in content
 
@@ -404,6 +410,8 @@ def test_deliver_to_discord_approval_with_expires_at_includes_suffix(
 
     assert len(posted_bodies) == 1
     content = posted_bodies[0]["content"]
+    # The new format renders ``expires_at`` as a Discord relative-time marker
+    # ``<t:EPOCH:R>`` rather than the raw ISO string.
     expected_epoch = int(datetime(2026, 6, 1, 13, 0, 0, tzinfo=timezone.utc).timestamp())
     assert f"⏳ Send email — needs approval (expires <t:{expected_epoch}:R>)" in content
 

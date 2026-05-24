@@ -30,17 +30,20 @@ loop ends in one of three ways:
 This module does not import from ``app.py`` (the worker imports both, so an
 ``app.py`` import would close a layering cycle).  ``ResearchFinding`` lives in
 ``agent_loop.py`` so both this module and ``app.py`` can reference it without
-a cycle.  Model calls use the shared ``ModelAdapter`` protocol.
+a cycle.  The model adapter is the shared ``ModelAdapter`` from
+``src/ariel/model_adapter.py`` — no research-specific protocol.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, assert_never
 
 from fastapi.encoders import jsonable_encoder
+from pydantic_ai.messages import ModelRequest, SystemPromptPart, UserPromptPart
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -62,7 +65,7 @@ from .run_runtime import ScratchEntry, run_tool_definitions
 from .sandbox_runtime import RunSandbox
 
 if TYPE_CHECKING:
-    from .model_adapter import ModelAdapter
+    from .model_adapter import ModelAdapter, ModelMessage
 
 
 RESEARCH_PROMPT_VERSION = "research-v3"
@@ -98,12 +101,12 @@ def render_finding(finding: ResearchFinding) -> str:
     )
 
 
-def _build_research_input_items(
+def _build_research_messages(
     *,
     question: str,
     mode: ResearchMode,
     eligible_callables: list[str],
-) -> list[dict[str, Any]]:
+) -> list[ModelMessage]:
     """The research prompt: the run-program syscall framing plus research framing.
 
     The model authors ``run`` programs against the mode's read capabilities, the
@@ -113,30 +116,27 @@ def _build_research_input_items(
     """
 
     callable_lines = [f"- {name}{run_callable_signature(name)}" for name in eligible_callables]
-    return [
-        {
-            "role": "system",
-            "content": (
+    parts: list[Any] = [
+        SystemPromptPart(
+            content=(
                 "You are Ariel's research subagent. You investigate one bounded "
                 "question read-only and report a structured finding. You author "
                 "Ariel run programs: each is a Python program run in a sandbox "
                 "whose effects are namespaced syscalls. Call exactly one run tool "
                 "per round with the program as its source."
-            ),
-        },
-        {
-            "role": "system",
-            "content": (
+            )
+        ),
+        SystemPromptPart(
+            content=(
                 f"research mode: {mode}. This run is read-only and limited to "
                 f"{mode} sources; it has no other reach. Hold raw evidence "
                 "(search results, fetched pages, extracts) in the scratch store "
                 "with scratch.set / scratch.get so it stays out of your context; "
                 "carry only what you need to reason over with agent.emit_value."
-            ),
-        },
-        {
-            "role": "system",
-            "content": (
+            )
+        ),
+        SystemPromptPart(
+            content=(
                 "syscall callables your run program may call this run "
                 "(each is namespace.member(...) and returns its result; "
                 "scratch.set, scratch.get, agent.emit_value, and "
@@ -151,11 +151,10 @@ def _build_research_input_items(
                 "shown after each callable is the contract: calls that pass "
                 "extra or wrong-named keys return schema_invalid.\n"
             )
-            + "\n".join(callable_lines),
-        },
-        {
-            "role": "system",
-            "content": (
+            + "\n".join(callable_lines)
+        ),
+        SystemPromptPart(
+            content=(
                 "Begin by writing your sub-questions, then investigate them with "
                 "the read capabilities above. When you have investigated enough, "
                 "call agent.emit_finding(summary=, claims=, gaps=, sources=) "
@@ -164,10 +163,11 @@ def _build_research_input_items(
                 "list of what you could not determine; sources is a list of "
                 "{title, reference, retrieved_at}. The run ends when you call "
                 "agent.emit_finding; nothing you emit is shown to a user directly."
-            ),
-        },
-        {"role": "user", "content": question},
+            )
+        ),
+        UserPromptPart(content=question),
     ]
+    return [ModelRequest(parts=parts)]
 
 
 def _research_finding_payload(finding: ResearchFinding) -> dict[str, Any]:
@@ -426,7 +426,7 @@ def run_research(
         {"research_question": question, "research_mode": mode},
     )
 
-    responses_input_items = _build_research_input_items(
+    initial_messages = _build_research_messages(
         question=question,
         mode=mode,
         eligible_callables=eligible_callables,
@@ -476,11 +476,8 @@ def run_research(
         turn=turn,
         settings=settings,
         model_adapter=model_adapter,
-        responses_input_items=responses_input_items,
+        messages=initial_messages,
         tools=run_tool_definitions(),
-        user_message=question,
-        history=[],
-        context_bundle={},
         allowed_capability_ids=allowed_capability_ids,
         scratch=scratch,
         proposal_index_start=0,
@@ -497,10 +494,12 @@ def run_research(
     )
 
     # Map loop outcome to a ResearchFinding and update the turn record.
+    # The loop emits ``question=""`` on the finding — only the caller knows
+    # the question it dispatched; we splice it back in here.
     match loop_result.outcome:
         case "finding":
             assert loop_result.emitted_finding is not None
-            finding = loop_result.emitted_finding
+            finding = dataclasses.replace(loop_result.emitted_finding, question=question)
             turn.assistant_message = finding.summary
             turn.status = "completed"
             add_event(
@@ -539,7 +538,7 @@ def run_research(
                 "evt.research.partial",
                 {"mode": mode, "finding": _research_finding_payload(finding)},
             )
-        case "message" | "approval" | "paused" | "operations" | "bounded_failure":
+        case "message" | "approval" | "paused" | "operations":
             msg = f"unexpected research loop outcome: {loop_result.outcome}"
             raise AssertionError(msg)
 

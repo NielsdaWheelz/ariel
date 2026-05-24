@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import copy
-import json
 from collections.abc import Callable
-from dataclasses import dataclass, field, replace
+from dataclasses import replace
 from typing import Any, cast
 
 from fastapi.testclient import TestClient
@@ -14,77 +13,45 @@ from web_search_tool.types import WebSearchRequest, WebSearchResponse, WebSearch
 import ariel.action_runtime as action_runtime_module
 import ariel.capability_registry as capability_registry_module
 import ariel.policy_engine as policy_engine_module
-from ariel.model_adapter import ModelAdapter
-from tests.integration.app_helpers import create_test_app
-from tests.integration.responses_helpers import (
-    empty_recall_response,
-    is_memory_subsystem_call,
-    post_message_and_drain,
-    responses_message,
-    responses_with_run_calls,
-)
 from ariel.capability_registry import (
     CapabilityDefinition,
     CapabilityExecutionError,
     get_capability as registry_get_capability,
 )
-from ariel.persistence import ArtifactRecord
-from ariel.persistence import to_rfc3339
+from ariel.model_adapter import ModelAdapter, ModelCall, ModelResponse
+from ariel.persistence import ArtifactRecord, to_rfc3339
 from tests.fake_sandbox import FakeSandboxRuntime
+from tests.integration.app_helpers import create_test_app
+from tests.integration.responses_helpers import (
+    FakeModelAdapter,
+    empty_recall_response,
+    has_tool_returns,
+    is_memory_subsystem_call,
+    last_user_message,
+    post_message_and_drain,
+    responses_with_run_calls,
+)
 
 
-@dataclass
-class ActionRunAdapter:
-    provider: str = "provider.news-weather"
-    model: str = "model.news-weather-v1"
-    run_calls_by_message: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+class ActionRunAdapter(FakeModelAdapter):
+    provider = "provider.news-weather"
+    model = "model.news-weather-v1"
 
-    def create_response(
+    def __init__(
         self,
         *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_memory_subsystem_call(input_items):
+        run_calls_by_message: dict[str, list[dict[str, Any]]] | None = None,
+    ) -> None:
+        super().__init__()
+        self.run_calls_by_message: dict[str, list[dict[str, Any]]] = (
+            run_calls_by_message if run_calls_by_message is not None else {}
+        )
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        user_message = last_user_message(request.messages)
+        if is_memory_subsystem_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
-            )
-        del tools, history
-        if context_bundle.get("origin") == "tool_result_interpretation":
-            interpreter_input = context_bundle.get("tool_result_interpreter_input")
-            if not isinstance(interpreter_input, dict):
-                interpreter_input = {}
-            audited_outputs = interpreter_input.get("audited_tool_outputs")
-            selected_output_refs = []
-            if isinstance(audited_outputs, list):
-                selected_output_refs = [
-                    output["output_ref"]
-                    for output in audited_outputs
-                    if isinstance(output, dict) and isinstance(output.get("output_ref"), str)
-                ]
-            return responses_message(
-                assistant_text=json.dumps(
-                    {
-                        "findings": ["tool evidence inspected"],
-                        "contradictions": [],
-                        "uncertainty": [],
-                        "selected_output_refs": selected_output_refs,
-                        "omitted_output_refs": [],
-                        "citation_refs": interpreter_input.get("citation_refs", []),
-                        "artifact_refs": interpreter_input.get("artifact_refs", []),
-                        "recommended_next_evidence": [],
-                        "confidence": 0.9,
-                    },
-                    sort_keys=True,
-                ),
-                provider=self.provider,
-                model=self.model,
-                provider_response_id="resp_news_weather_interpreter",
-                input_tokens=34,
-                output_tokens=19,
+                provider=self.provider, model=self.model, messages=request.messages
             )
         assistant_text = {
             "news update": "EU AI transparency and enforcement updates are active [1][2].",
@@ -98,10 +65,7 @@ class ActionRunAdapter:
             "weather egress deny": "blocked: egress_destination_denied",
         }.get(user_message, f"assistant::{user_message}")
         run_calls = self.run_calls_by_message.get(user_message, [])
-        if any(
-            isinstance(item, dict) and item.get("type") == "function_call_output"
-            for item in input_items
-        ):
+        if has_tool_returns(request.messages):
             run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
         if not run_calls:
             run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
