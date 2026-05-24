@@ -19,6 +19,10 @@ _LOCAL_AUTH_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,}$")
 _PUBSUB_SUBSCRIPTION_PATTERN = re.compile(
     r"^projects/[a-z][a-z0-9-]{4,28}[a-z0-9]/subscriptions/[A-Za-z][A-Za-z0-9_.~+%-]{2,254}$"
 )
+_PUBSUB_TOPIC_PATTERN = re.compile(
+    r"^projects/[a-z][a-z0-9-]{4,28}[a-z0-9]/topics/[A-Za-z][A-Za-z0-9_.~+%-]{2,254}$"
+)
+ENV_FILE_SELECTOR_ENV_VAR = "ARIEL_ENV_FILE"
 # Default env-file stack: `.env` for shared local defaults, `.env.local` for
 # local secrets and overrides. Dev workflows set `ARIEL_ENV_FILE` (e.g., to
 # `.env.dev`) to swap in an isolated env file without touching local defaults.
@@ -26,7 +30,7 @@ _DEFAULT_ENV_FILES = (_PROJECT_ROOT / ".env", _PROJECT_ROOT / ".env.local")
 
 
 def _resolve_env_files() -> tuple[Path, ...]:
-    override = os.environ.get("ARIEL_ENV_FILE", "").strip()
+    override = os.environ.get(ENV_FILE_SELECTOR_ENV_VAR, "").strip()
     if not override:
         return _DEFAULT_ENV_FILES
     path = Path(override)
@@ -117,11 +121,9 @@ class AppSettings(BaseSettings):
     search_web_timeout_seconds: float = 8.0
     search_web_api_key: str | None = None
     search_news_timeout_seconds: float = 8.0
-    search_news_api_key: str | None = None
     web_extract_provider_endpoint: str | None = None
     web_extract_timeout_seconds: float = 10.0
     web_extract_max_retries: int = 2
-    web_extract_api_key: str | None = None
     maps_api_key: str | None = None
     maps_timeout_seconds: float = 8.0
     weather_provider_mode: str = "production"
@@ -163,9 +165,7 @@ class AppSettings(BaseSettings):
 
     @field_validator(
         "search_web_api_key",
-        "search_news_api_key",
         "web_extract_provider_endpoint",
-        "web_extract_api_key",
         "maps_api_key",
         "weather_production_api_key",
         "weather_default_location",
@@ -204,6 +204,16 @@ class AppSettings(BaseSettings):
             raise ValueError(
                 "google_pubsub_subscription must match projects/<project>/subscriptions/<name>"
             )
+        return normalized
+
+    @field_validator("google_pubsub_topic")
+    @classmethod
+    def _google_pubsub_topic_must_be_resource_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not _PUBSUB_TOPIC_PATTERN.fullmatch(normalized):
+            raise ValueError("google_pubsub_topic must match projects/<project>/topics/<name>")
         return normalized
 
     @field_validator("google_application_credentials_path")
@@ -276,12 +286,31 @@ class AppSettings(BaseSettings):
                 raise ValueError(str(exc)) from exc
             if self.public_webhook_base_url is None:
                 raise ValueError("public_webhook_base_url is required in production")
-        if (self.google_pubsub_subscription is None) != (
-            self.google_application_credentials_path is None
+            expected_redirect_uri = f"{self.public_webhook_base_url}/v1/connectors/google/callback"
+            if self.google_oauth_redirect_uri != expected_redirect_uri:
+                raise ValueError(
+                    f"google_oauth_redirect_uri must equal {expected_redirect_uri!r} in production"
+                )
+            repo_roots = [
+                root.strip() for root in self.agency_allowed_repo_roots.split(",") if root.strip()
+            ]
+            if not repo_roots:
+                raise ValueError("agency_allowed_repo_roots is required in production")
+            for repo_root in repo_roots:
+                if not Path(repo_root).is_absolute():
+                    raise ValueError("agency_allowed_repo_roots must be absolute paths")
+        pubsub_values = (
+            self.google_pubsub_topic,
+            self.google_pubsub_subscription,
+            self.google_application_credentials_path,
+        )
+        if any(value is not None for value in pubsub_values) and not all(
+            value is not None for value in pubsub_values
         ):
             raise ValueError(
-                "google_pubsub_subscription and google_application_credentials_path "
-                "must be set together (both for Gmail push on, neither for off)"
+                "google_pubsub_topic, google_pubsub_subscription, and "
+                "google_application_credentials_path must be set together "
+                "(all for Gmail push on, none for off)"
             )
         return self
 
@@ -463,7 +492,17 @@ class AppSettings(BaseSettings):
             return None
         return value
 
-    @field_validator("agency_socket_path", "agency_default_base_branch", "agency_default_runner")
+    @field_validator("agency_socket_path")
+    @classmethod
+    def _agency_socket_path_must_be_absolute(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("agency_socket_path must not be blank")
+        if not Path(normalized).is_absolute():
+            raise ValueError("agency_socket_path must be an absolute path")
+        return normalized
+
+    @field_validator("agency_default_base_branch", "agency_default_runner")
     @classmethod
     def _agency_text_settings_must_not_be_blank(cls, value: str) -> str:
         normalized = value.strip()

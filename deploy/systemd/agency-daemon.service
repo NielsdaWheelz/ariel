@@ -1,19 +1,21 @@
 [Unit]
-Description=Ariel Discord surface bot
-After=network-online.target ariel-api.service
-Wants=network-online.target ariel-api.service
+Description=Agency daemon for Ariel
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=ariel
 Group=ariel
-WorkingDirectory=/opt/ariel
-Environment=PYTHONUNBUFFERED=1
-EnvironmentFile=/etc/ariel/ariel.env
-ExecStart=/opt/ariel/.venv/bin/python -m ariel.discord_bot
+WorkingDirectory=/opt/agency
+StateDirectory=agency
+Environment=AGENCY_DATA_DIR=/var/lib/agency
+Environment=HOME=/var/lib/agency
+Environment=CODEX_HOME=/var/lib/agency/.codex
+ExecStart=/opt/agency/bin/agency daemon start --foreground
 Restart=always
 RestartSec=5
-SyslogIdentifier=ariel-discord
+SyslogIdentifier=agency-daemon
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
@@ -26,6 +28,7 @@ RestrictSUIDSGID=true
 LockPersonality=true
 CapabilityBoundingSet=
 SystemCallArchitectures=native
+ReadWritePaths=/var/lib/agency
 
 [Install]
 WantedBy=multi-user.target

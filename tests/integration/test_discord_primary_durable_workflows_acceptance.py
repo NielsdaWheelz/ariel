@@ -240,7 +240,8 @@ def test_google_provider_event_ingress_is_token_bound_deduped_and_conflict_safe(
                     text(
                         "SELECT task_type FROM background_tasks "
                         "WHERE task_type NOT IN ('memory_dream', "
-                        "'provider_watch_renew_due', 'provider_reconcile_sync_due') "
+                        "'provider_watch_renew_due', 'provider_reconcile_sync_due', "
+                        "'expire_approvals') "
                         "ORDER BY created_at DESC LIMIT 1"
                     )
                 ).scalar_one()

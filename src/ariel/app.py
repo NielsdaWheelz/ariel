@@ -24,6 +24,7 @@ from sqlalchemy import (
     func,
     or_,
     select,
+    text,
 )
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -33,7 +34,7 @@ from ariel.action_runtime import (
     reconcile_expired_approvals_for_session,
     resolve_approval_decision,
 )
-from ariel.agency_daemon import AgencyDaemonClient, AgencyRuntime
+from ariel.agency_daemon import AgencyDaemonClient, AgencyDaemonError, AgencyRuntime
 from ariel.attachment_content import AttachmentContentRuntime
 from ariel.capability_registry import (
     EMAIL_MUTATION_CAPABILITY_IDS,
@@ -85,6 +86,7 @@ from ariel.persistence import (
     SyncCursorRecord,
     SyncRunRecord,
     TurnRecord,
+    TurnIdempotencyRecord,
     enqueue_background_task,
     get_or_create_active_session,
     lock_active_session,
@@ -133,6 +135,15 @@ from ariel.run_runtime import (
 from ariel.sandbox_runtime import RunSandbox
 from ariel.weather_state import get_weather_default_location_state, set_weather_default_location
 
+
+PUBLIC_LOCAL_AUTH_BYPASS_ROUTES: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("GET", "/v1/health"),
+        ("GET", "/v1/connectors/google/callback"),
+        ("POST", "/v1/providers/google/events"),
+        ("POST", "/v1/agency/events"),
+    }
+)
 
 RotationReason = Literal["user_initiated", "threshold_turn_count", "threshold_age"]
 AutoRotationReason = Literal["threshold_turn_count", "threshold_age"]
@@ -706,6 +717,64 @@ def _normalize_idempotency_key(raw_key: str | None) -> str | None:
     return normalized
 
 
+def _message_idempotency_lock_id(*, session_id: str, idempotency_key: str) -> int:
+    digest = hashlib.sha256(
+        f"message-idempotency:{session_id}:{idempotency_key}".encode("utf-8")
+    ).digest()
+    lock_value = int.from_bytes(digest[:8], byteorder="big", signed=False)
+    if lock_value >= 2**63:
+        lock_value -= 2**64
+    return lock_value
+
+
+def _acquire_message_idempotency_lock(
+    db: Session, *, session_id: str, idempotency_key: str
+) -> None:
+    bind = db.get_bind()
+    # justify-service-invariant-check: Ariel persistence is PostgreSQL, and
+    # message idempotency requires transaction-scoped advisory locks.
+    if bind is None:
+        raise RuntimeError("message idempotency lock requires a database bind")
+    if bind.dialect.name != "postgresql":
+        raise RuntimeError("message idempotency lock requires PostgreSQL")
+    db.execute(
+        text("SELECT pg_advisory_xact_lock(:lock_id)"),
+        {
+            "lock_id": _message_idempotency_lock_id(
+                session_id=session_id,
+                idempotency_key=idempotency_key,
+            )
+        },
+    )
+
+
+def _message_request_hash(
+    *,
+    session_id: str,
+    message: str,
+    discord_context: dict[str, Any] | None,
+    attachment_sources: list[dict[str, Any]],
+) -> str:
+    encoded = json.dumps(
+        {
+            "mode": "message",
+            "session_id": session_id,
+            "message": message,
+            "discord_context": discord_context,
+            "attachment_sources": attachment_sources,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _message_task_idempotency_key(*, session_id: str, idempotency_key: str) -> str:
+    digest = hashlib.sha256(f"{session_id}:{idempotency_key}".encode("utf-8")).hexdigest()
+    return f"user_message:{digest}"
+
+
 @dataclass(slots=True, frozen=True)
 class TurnExecutionOutcome:
     turn_id: str
@@ -932,11 +1001,7 @@ def _tool_surface_facts(
         else 0
     )
     search_web_bound = settings.search_web_api_key is not None
-    web_extract_bound = (
-        settings.web_extract_provider_endpoint is not None
-        or settings.web_extract_api_key is not None
-        or search_web_bound
-    )
+    web_extract_bound = settings.web_extract_provider_endpoint is not None or search_web_bound
     return {
         "google": {
             "connected": connector is not None
@@ -953,7 +1018,7 @@ def _tool_surface_facts(
             "agency": agency_configured,
             "web_extract": web_extract_bound,
             "search_web": search_web_bound,
-            "search_news": settings.search_news_api_key is not None or search_web_bound,
+            "search_news": search_web_bound,
             "maps": settings.maps_api_key is not None,
             "weather": settings.weather_provider_mode == "dev"
             or settings.weather_production_api_key is not None,
@@ -1129,6 +1194,177 @@ def build_agency_runtime(settings: AppSettings) -> AgencyRuntime:
     )
 
 
+def _agency_runtime_is_bound(settings: AppSettings) -> bool:
+    if not str(settings.agency_allowed_repo_roots).strip():
+        return False
+    if not Path(settings.agency_socket_path).exists():
+        return False
+    try:
+        AgencyDaemonClient(
+            socket_path=settings.agency_socket_path,
+            timeout_seconds=min(settings.agency_timeout_seconds, 1.0),
+        ).health()
+    except AgencyDaemonError:
+        return False
+    return True
+
+
+def _turn_events(*, db: Session, turn_id: str) -> list[EventRecord]:
+    return list(
+        db.scalars(
+            select(EventRecord)
+            .where(EventRecord.turn_id == turn_id)
+            .order_by(EventRecord.sequence.asc())
+        ).all()
+    )
+
+
+def _append_turn_event(
+    *,
+    db: Session,
+    turn: TurnRecord,
+    event_type: str,
+    payload: dict[str, Any],
+) -> None:
+    next_sequence = (
+        int(
+            db.scalar(
+                select(func.coalesce(func.max(EventRecord.sequence), 0)).where(
+                    EventRecord.turn_id == turn.id
+                )
+            )
+            or 0
+        )
+        + 1
+    )
+    db.add(
+        EventRecord(
+            id=new_id("evn"),
+            session_id=turn.session_id,
+            turn_id=turn.id,
+            sequence=next_sequence,
+            event_type=event_type,
+            payload=jsonable_encoder(payload),
+            created_at=utcnow(),
+        )
+    )
+
+
+def _serialize_action_attempts_for_turn(
+    *,
+    db: Session,
+    turn_id: str,
+) -> list[dict[str, Any]]:
+    turn_action_attempts = db.scalars(
+        select(ActionAttemptRecord)
+        .where(ActionAttemptRecord.turn_id == turn_id)
+        .order_by(ActionAttemptRecord.proposal_index.asc())
+    ).all()
+    approvals_by_attempt_id = (
+        {
+            approval.action_attempt_id: approval
+            for approval in db.scalars(
+                select(ApprovalRequestRecord).where(
+                    ApprovalRequestRecord.action_attempt_id.in_(
+                        [attempt.id for attempt in turn_action_attempts]
+                    )
+                )
+            ).all()
+        }
+        if turn_action_attempts
+        else {}
+    )
+    return [
+        serialize_action_attempt(
+            action_attempt,
+            approval=approvals_by_attempt_id.get(action_attempt.id),
+        )
+        for action_attempt in turn_action_attempts
+    ]
+
+
+def _background_turn_failed_outcome(
+    *,
+    turn: TurnRecord,
+    failure_reason: str,
+) -> TurnExecutionOutcome:
+    error = ApiError(
+        status_code=500,
+        code="E_BACKGROUND_TURN_FAILED",
+        message="background turn failed before producing a deliverable response",
+        details={"turn_id": turn.id, "failure_reason": failure_reason},
+        retryable=False,
+    )
+    return TurnExecutionOutcome(
+        turn_id=turn.id,
+        effective_session_id=turn.session_id,
+        status_code=error.status_code,
+        response_payload=_error_payload(error),
+    )
+
+
+def _existing_background_turn_outcome(
+    *,
+    db: Session,
+    turn: TurnRecord,
+) -> TurnExecutionOutcome:
+    if turn.status == "in_progress":
+        failure_reason = "background task replay found an interrupted in-progress turn"
+        turn.status = "failed"
+        turn.updated_at = utcnow()
+        _append_turn_event(
+            db=db,
+            turn=turn,
+            event_type="evt.turn.failed",
+            payload={
+                "failure_reason": failure_reason,
+                "error_code": "E_BACKGROUND_TURN_INTERRUPTED",
+            },
+        )
+        db.commit()
+        return _background_turn_failed_outcome(turn=turn, failure_reason=failure_reason)
+
+    if turn.status == "failed":
+        failure_event = db.scalar(
+            select(EventRecord)
+            .where(
+                EventRecord.turn_id == turn.id,
+                EventRecord.event_type == "evt.turn.failed",
+            )
+            .order_by(EventRecord.sequence.desc())
+            .limit(1)
+        )
+        failure_payload = failure_event.payload if failure_event is not None else {}
+        raw_reason = (
+            failure_payload.get("failure_reason") if isinstance(failure_payload, dict) else None
+        )
+        failure_reason = raw_reason if isinstance(raw_reason, str) else "turn failed"
+        return _background_turn_failed_outcome(turn=turn, failure_reason=failure_reason)
+
+    session_record = db.get(SessionRecord, turn.session_id)
+    if session_record is None:
+        raise RuntimeError("background turn session is missing")
+    events = _turn_events(db=db, turn_id=turn.id)
+    action_attempts = _serialize_action_attempts_for_turn(db=db, turn_id=turn.id)
+    assistant_sources = _turn_retrieval_sources(db=db, turn_id=turn.id)
+    try:
+        response_payload = build_surface_message_response(
+            session=serialize_session(session_record),
+            turn=serialize_turn(turn, events=events, action_attempts=action_attempts),
+            assistant_message=turn.assistant_message,
+            assistant_sources=assistant_sources,
+            assistant_silent=not bool(turn.assistant_message),
+        )
+    except ResponseContractViolation as exc:
+        raise _response_contract_error(exc) from exc
+    return TurnExecutionOutcome(
+        turn_id=turn.id,
+        effective_session_id=turn.session_id,
+        status_code=200,
+        response_payload=response_payload,
+    )
+
+
 def _wake(
     *,
     runtime: Runtime,
@@ -1136,6 +1372,7 @@ def _wake(
     db: Session,
     request_session_id: str,
     wake_context: WakeContext,
+    source_background_task_id: str | None = None,
     execute_google_reads_outside_transaction: bool = False,
 ) -> TurnExecutionOutcome:
     # _wake invokes the agent loop, which always needs a sandbox; only the
@@ -1148,6 +1385,15 @@ def _wake(
     discord_context = wake_context.discord_context
     discord_attachment_sources = wake_context.attachment_sources
     ingress_runtime_provenance = wake_context.ingress_provenance
+    if source_background_task_id is not None:
+        existing_turn = db.scalar(
+            select(TurnRecord)
+            .where(TurnRecord.source_background_task_id == source_background_task_id)
+            .limit(1)
+        )
+        if existing_turn is not None:
+            return _existing_background_turn_outcome(db=db, turn=existing_turn)
+
     active_session = db.scalar(
         select(SessionRecord)
         .where(
@@ -1207,6 +1453,7 @@ def _wake(
         user_message=user_message,
         assistant_message=None,
         status="in_progress",
+        source_background_task_id=source_background_task_id,
         created_at=now,
         updated_at=now,
     )
@@ -1324,14 +1571,10 @@ def _wake(
         "user_instruction_ref": f"turn:{turn.id}",
     }
     _context_meta[0] = _context_bundle_audit_metadata(context_bundle)
-    agency_configured = (
-        bool(str(runtime.settings.agency_allowed_repo_roots).strip())
-        and Path(runtime.settings.agency_socket_path).exists()
-    )
     tool_surface_facts = _tool_surface_facts(
         db=db,
         context_bundle=context_bundle,
-        agency_configured=agency_configured,
+        agency_configured=_agency_runtime_is_bound(runtime.settings),
         settings=runtime.settings,
     )
     applied_limits = _applied_turn_limits(runtime.settings)
@@ -1608,32 +1851,7 @@ def _wake(
     assert assistant_response is not None
     # Re-query action attempts from the DB: the loop tracks them internally and
     # commits after each program, so they are durable by this point.
-    turn_action_attempts = db.scalars(
-        select(ActionAttemptRecord)
-        .where(ActionAttemptRecord.turn_id == turn.id)
-        .order_by(ActionAttemptRecord.proposal_index.asc())
-    ).all()
-    approvals_by_attempt_id = (
-        {
-            approval.action_attempt_id: approval
-            for approval in db.scalars(
-                select(ApprovalRequestRecord).where(
-                    ApprovalRequestRecord.action_attempt_id.in_(
-                        [attempt.id for attempt in turn_action_attempts]
-                    )
-                )
-            ).all()
-        }
-        if turn_action_attempts
-        else {}
-    )
-    serialized_action_attempts = [
-        serialize_action_attempt(
-            action_attempt,
-            approval=approvals_by_attempt_id.get(action_attempt.id),
-        )
-        for action_attempt in turn_action_attempts
-    ]
+    serialized_action_attempts = _serialize_action_attempts_for_turn(db=db, turn_id=turn.id)
     raw_session = serialize_session(active_session)
     raw_turn = serialize_turn(
         turn,
@@ -1765,12 +1983,7 @@ def create_app(
     async def _local_auth_middleware(request: Request, call_next: Any) -> Any:
         if not app.state.local_auth_required:
             return await call_next(request)
-        if (request.method, request.url.path) in {
-            ("GET", "/v1/health"),
-            ("GET", "/v1/connectors/google/callback"),
-            ("POST", "/v1/providers/google/events"),
-            ("POST", "/v1/agency/events"),
-        }:
+        if (request.method, request.url.path) in PUBLIC_LOCAL_AUTH_BYPASS_ROUTES:
             return await call_next(request)
         expected_token = app.state.local_auth_token
         authorization = request.headers.get("authorization")
@@ -2348,9 +2561,50 @@ def create_app(
         normalized_idempotency_key = _normalize_idempotency_key(
             request.headers.get("Idempotency-Key")
         )
+        request_hash = (
+            _message_request_hash(
+                session_id=request_session_id,
+                message=payload.message,
+                discord_context=discord_context,
+                attachment_sources=discord_attachment_sources,
+            )
+            if normalized_idempotency_key is not None
+            else None
+        )
 
         with session_factory() as db:
             with db.begin():
+                if normalized_idempotency_key is not None:
+                    assert request_hash is not None
+                    _acquire_message_idempotency_lock(
+                        db,
+                        session_id=request_session_id,
+                        idempotency_key=normalized_idempotency_key,
+                    )
+                    existing_idempotency = db.scalar(
+                        select(TurnIdempotencyRecord)
+                        .where(
+                            TurnIdempotencyRecord.session_id == request_session_id,
+                            TurnIdempotencyRecord.idempotency_key == normalized_idempotency_key,
+                        )
+                        .limit(1)
+                    )
+                    if existing_idempotency is not None:
+                        if existing_idempotency.request_hash != request_hash:
+                            raise ApiError(
+                                status_code=409,
+                                code="E_IDEMPOTENCY_KEY_REUSED",
+                                message=("idempotency key reused with different request payload"),
+                                details={
+                                    "idempotency_record_id": existing_idempotency.id,
+                                },
+                                retryable=False,
+                            )
+                        return JSONResponse(
+                            status_code=existing_idempotency.status_code,
+                            content=existing_idempotency.response_payload,
+                        )
+
                 # Validate that the target session exists before enqueuing.
                 active_session_check = db.scalar(
                     select(SessionRecord)
@@ -2470,11 +2724,35 @@ def create_app(
                         else None,
                     },
                     now=now,
-                    idempotency_key=normalized_idempotency_key,
+                    idempotency_key=(
+                        _message_task_idempotency_key(
+                            session_id=request_session_id,
+                            idempotency_key=normalized_idempotency_key,
+                        )
+                        if normalized_idempotency_key is not None
+                        else None
+                    ),
                 )
+                response_payload = {"status": "accepted", "task_id": task.id}
+                if normalized_idempotency_key is not None:
+                    assert request_hash is not None
+                    db.add(
+                        TurnIdempotencyRecord(
+                            id=new_id("idem"),
+                            session_id=request_session_id,
+                            idempotency_key=normalized_idempotency_key,
+                            request_hash=request_hash,
+                            turn_id=None,
+                            background_task_id=task.id,
+                            status_code=202,
+                            response_payload=response_payload,
+                            created_at=now,
+                            updated_at=now,
+                        )
+                    )
                 return JSONResponse(
                     status_code=202,
-                    content={"status": "accepted", "task_id": task.id},
+                    content=response_payload,
                 )
 
     @app.post("/v1/captures/record", response_model=None)

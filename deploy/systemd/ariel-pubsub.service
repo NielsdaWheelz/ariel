@@ -1,7 +1,7 @@
 [Unit]
 Description=Ariel Gmail Pub/Sub subscriber sidecar
-After=network-online.target docker.service ariel-api.service
-Wants=network-online.target docker.service ariel-api.service
+After=network-online.target postgresql.service ariel-api.service
+Wants=network-online.target postgresql.service ariel-api.service
 
 [Service]
 Type=simple
@@ -14,6 +14,18 @@ ExecStart=/opt/ariel/.venv/bin/python -m ariel.pubsub_subscriber
 Restart=always
 RestartSec=5
 SyslogIdentifier=ariel-pubsub
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

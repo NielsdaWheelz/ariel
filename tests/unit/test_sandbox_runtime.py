@@ -9,13 +9,16 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from typing import Any
 
 import pytest
 
+import ariel.sandbox_runtime as sandbox_runtime_module
 from ariel.sandbox_runtime import (
     SANDBOX_MAX_MESSAGE_BYTES,
     ProgramResult,
+    SandboxRuntime,
     SandboxRuntimeError,
     _build_oci_config,
     _drive_program,
@@ -194,6 +197,99 @@ def test_multiple_syscalls_are_dispatched_in_order() -> None:
     result = _drive(process, syscall_names=("stub.one", "stub.two"), syscall_callback=callback)
     assert result.syscall_count == 2
     assert order == ["stub.one", "stub.two"]
+
+
+def test_run_program_allows_same_thread_nested_run_program(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host callback may run a bounded subagent program while the outer guest
+    waits for that syscall result. ``memory.recall`` uses this shape in
+    production: outer main-agent program -> syscall callback -> retriever
+    run-program.
+    """
+
+    outer = _FakeGuestProcess(
+        [
+            {"type": "syscall", "name": "memory.recall", "input": {"query": "incident"}},
+            {"type": "program-result", "ok": True, "error": None},
+        ]
+    )
+    inner = _FakeGuestProcess([{"type": "program-result", "ok": True, "error": None}])
+    processes = [outer, inner]
+
+    def popen(*_args: Any, **_kwargs: Any) -> _FakeGuestProcess:
+        return processes.pop(0)
+
+    monkeypatch.setattr(sandbox_runtime_module.subprocess, "Popen", popen)
+
+    runtime = SandboxRuntime(container_id="sandbox-nested-test", runsc_path="/bin/true")
+    runtime._started = True
+    nested_results: list[ProgramResult] = []
+
+    def callback(name: str, payload: dict[str, Any]) -> tuple[bool, Any]:
+        assert name == "memory.recall"
+        assert payload == {"query": "incident"}
+        nested_results.append(
+            runtime.run_program(
+                source="agent.emit_finding(summary='ok', claims=[], gaps=[], sources=[])\n",
+                syscall_names=("agent.emit_finding",),
+                syscall_callback=lambda _name, _payload: (False, "unexpected"),
+            )
+        )
+        return True, {"nested_ok": nested_results[-1].ok}
+
+    outcome: dict[str, Any] = {}
+
+    def run_outer() -> None:
+        try:
+            outcome["result"] = runtime.run_program(
+                source="memory.recall(query='incident')\n",
+                syscall_names=("memory.recall",),
+                syscall_callback=callback,
+            )
+        except BaseException as exc:  # pragma: no cover - re-raised by assertion below
+            outcome["exception"] = exc
+
+    thread = threading.Thread(target=run_outer, daemon=True)
+    thread.start()
+    thread.join(timeout=2.0)
+
+    assert thread.is_alive() is False
+    assert "exception" not in outcome
+    assert outcome["result"] == ProgramResult(ok=True, error=None, syscall_count=1)
+    assert nested_results == [ProgramResult(ok=True, error=None, syscall_count=0)]
+    assert processes == []
+    assert outer.received_syscall_results == [
+        {"type": "syscall-result", "ok": True, "value": {"nested_ok": True}}
+    ]
+
+
+def test_wall_clock_limit_does_not_charge_host_callback_time() -> None:
+    process = _FakeGuestProcess(
+        [
+            {"type": "syscall", "name": "slow.host", "input": {}},
+            {"type": "program-result", "ok": True, "error": None},
+        ]
+    )
+
+    def callback(name: str, payload: dict[str, Any]) -> tuple[bool, Any]:
+        assert name == "slow.host"
+        assert payload == {}
+        time.sleep(0.2)
+        return True, "ok"
+
+    result = _drive(
+        process,
+        syscall_names=("slow.host",),
+        syscall_callback=callback,
+        wall_clock_seconds=0.05,
+    )
+
+    assert result == ProgramResult(ok=True, error=None, syscall_count=1)
+    assert process.received_syscall_results == [
+        {"type": "syscall-result", "ok": True, "value": "ok"}
+    ]
+    assert process.killed is False
 
 
 def test_callback_failure_is_marshalled_back_as_a_typed_error() -> None:

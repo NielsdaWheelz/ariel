@@ -22,12 +22,13 @@ from tests.integration.app_helpers import create_test_app
 from ariel.persistence import (
     ActionAttemptRecord,
     BackgroundTaskRecord,
+    EventRecord,
     MemoryLogRecord,
     SessionRecord,
     TurnRecord,
     enqueue_background_task,
 )
-from ariel.worker import process_one_task
+from ariel.worker import _deliver_to_discord, _discord_delivery_nonce, process_one_task
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.responses_helpers import (
     empty_recall_response,
@@ -552,3 +553,200 @@ def test_worker_user_message_arm_invokes_wake_for_target_session(
             )
             assert turn is not None
             assert turn.status == "completed"
+
+
+def test_worker_user_message_replay_reuses_committed_turn_without_model_call(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the worker crashes after committing a user-message turn but before
+    deleting the task row, replay must not run the model again."""
+
+    _stub_memory_retriever(monkeypatch)
+    now = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr("ariel.worker.utcnow", lambda: now)
+    monkeypatch.setenv("ARIEL_DISCORD_BOT_TOKEN", "test-bot-token")
+    monkeypatch.setenv("ARIEL_DISCORD_CHANNEL_ID", "987654321")
+    discord_posts: list[dict[str, Any]] = []
+
+    class _DiscordResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+    def fake_discord_post(
+        url: str, *, headers: dict[str, str], json: dict[str, Any], timeout: float
+    ) -> _DiscordResponse:
+        discord_posts.append(
+            {
+                "url": url,
+                "headers": headers,
+                "json": dict(json),
+                "timeout": timeout,
+            }
+        )
+        return _DiscordResponse()
+
+    monkeypatch.setattr("ariel.worker.httpx.post", fake_discord_post)
+    adapter = _WakeAdapter()
+    app = create_test_app(
+        database_url=postgres_url,
+        model_adapter=adapter,
+        sandbox=FakeSandboxRuntime(),
+    )
+    with TestClient(app) as client:
+        runtime = client.app.state.runtime  # type: ignore[attr-defined]
+        session_factory = runtime.session_factory
+        session_response = client.get("/v1/sessions/active")
+        assert session_response.status_code == 200
+        session_id = session_response.json()["session"]["id"]
+
+        with session_factory() as db:
+            with db.begin():
+                task = enqueue_background_task(
+                    db,
+                    task_type="user_message",
+                    payload={
+                        "session_id": session_id,
+                        "message": "recover this turn exactly once",
+                        "discord_context": None,
+                        "attachment_sources": None,
+                    },
+                    now=now - timedelta(minutes=5),
+                    run_after=now - timedelta(minutes=1),
+                )
+                task_id = task.id
+
+        def crash_after_discord_send(**kwargs: Any) -> None:
+            _deliver_to_discord(**kwargs)
+            raise RuntimeError("simulated crash after committed turn")
+
+        monkeypatch.setattr("ariel.worker._deliver_to_discord", crash_after_discord_send)
+        assert process_one_task(
+            session_factory=session_factory,
+            settings=runtime.settings,
+            runtime=runtime,
+        )
+        assert adapter.user_messages_seen == ["recover this turn exactly once"]
+        assert len(discord_posts) == 1
+
+        with session_factory() as db:
+            with db.begin():
+                task = db.get(BackgroundTaskRecord, task_id)
+                assert task is not None
+                assert task.attempts == 1
+                task.run_after = now - timedelta(seconds=1)
+                committed_turn = db.scalar(
+                    select(TurnRecord).where(TurnRecord.source_background_task_id == task_id)
+                )
+                assert committed_turn is not None
+                assert committed_turn.status == "completed"
+
+        monkeypatch.setattr("ariel.worker._deliver_to_discord", _deliver_to_discord)
+        assert process_one_task(
+            session_factory=session_factory,
+            settings=runtime.settings,
+            runtime=runtime,
+        )
+
+        assert adapter.user_messages_seen == ["recover this turn exactly once"]
+        assert len(discord_posts) == 2
+        assert discord_posts[0]["url"] == discord_posts[1]["url"]
+        assert discord_posts[0]["json"] == discord_posts[1]["json"]
+        assert discord_posts[0]["json"]["nonce"] == _discord_delivery_nonce(
+            turn_id=committed_turn.id,
+            channel_id=987654321,
+        )
+        assert discord_posts[0]["json"]["enforce_nonce"] is True
+        with session_factory() as db:
+            with db.begin():
+                assert db.get(BackgroundTaskRecord, task_id) is None
+                turns = db.scalars(
+                    select(TurnRecord).where(
+                        TurnRecord.user_message == "recover this turn exactly once"
+                    )
+                ).all()
+                assert len(turns) == 1
+
+
+def test_worker_user_message_replay_fails_interrupted_turn_without_model_call(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An in-progress source turn means the earlier process crashed mid-turn.
+    Recovery fails that turn and consumes the task instead of replaying model work."""
+
+    _stub_memory_retriever(monkeypatch)
+    now = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr("ariel.worker.utcnow", lambda: now)
+    adapter = _WakeAdapter()
+    app = create_test_app(
+        database_url=postgres_url,
+        model_adapter=adapter,
+        sandbox=FakeSandboxRuntime(),
+    )
+    with TestClient(app) as client:
+        runtime = client.app.state.runtime  # type: ignore[attr-defined]
+        session_factory = runtime.session_factory
+        session_response = client.get("/v1/sessions/active")
+        assert session_response.status_code == 200
+        session_id = session_response.json()["session"]["id"]
+
+        with session_factory() as db:
+            with db.begin():
+                task = enqueue_background_task(
+                    db,
+                    task_type="user_message",
+                    payload={
+                        "session_id": session_id,
+                        "message": "do not replay this interrupted turn",
+                        "discord_context": None,
+                        "attachment_sources": None,
+                    },
+                    now=now - timedelta(minutes=5),
+                    run_after=now - timedelta(minutes=1),
+                )
+                task_id = task.id
+                turn = TurnRecord(
+                    id="trn_interrupted_replay",
+                    session_id=session_id,
+                    user_message="do not replay this interrupted turn",
+                    assistant_message=None,
+                    status="in_progress",
+                    source_background_task_id=task_id,
+                    created_at=now,
+                    updated_at=now,
+                )
+                db.add(turn)
+                db.add(
+                    EventRecord(
+                        id="evn_interrupted_started",
+                        session_id=session_id,
+                        turn_id=turn.id,
+                        sequence=1,
+                        event_type="evt.turn.started",
+                        payload={"message": turn.user_message, "discord": None},
+                        created_at=now,
+                    )
+                )
+
+        assert process_one_task(
+            session_factory=session_factory,
+            settings=runtime.settings,
+            runtime=runtime,
+        )
+
+        assert adapter.user_messages_seen == []
+        with session_factory() as db:
+            with db.begin():
+                assert db.get(BackgroundTaskRecord, task_id) is None
+                turn = db.get(TurnRecord, "trn_interrupted_replay")
+                assert turn is not None
+                assert turn.status == "failed"
+                failure = db.scalar(
+                    select(EventRecord).where(
+                        EventRecord.turn_id == turn.id,
+                        EventRecord.event_type == "evt.turn.failed",
+                    )
+                )
+                assert failure is not None
+                assert failure.payload["error_code"] == "E_BACKGROUND_TURN_INTERRUPTED"

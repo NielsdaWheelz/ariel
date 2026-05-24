@@ -32,7 +32,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from ariel import run_runtime
 from ariel.action_runtime import RuntimeProvenance
 from ariel.config import AppSettings
-from ariel.persistence import SessionRecord, TurnRecord
+from ariel.persistence import MemoryLogRecord, SessionRecord, TurnRecord
 from ariel.run_runtime import execute_run_program
 from ariel.sandbox_runtime import SandboxRuntime
 
@@ -152,20 +152,38 @@ def test_program_reads_a_capability_then_composes_an_emit_message(
     with session_factory() as db:
         with db.begin():
             turn = _seed_turn(db, session_id="ses_read", turn_id="turn_read")
-            # The program searches memory, branches on the real result, and emits
-            # a mechanical confirmation derived from it. The store may have some
-            # wake-log entries; the structural assertion is what matters.
-            source = (
-                "result = memory.search(query='project status')\n"
-                "assert result['status'] == 'succeeded', result\n"
-                "count = len(result['hits'])\n"
-                "agent.emit_message(text='Found ' + str(count) + ' results.')\n"
+            db.add(
+                MemoryLogRecord(
+                    id="mem_project_status",
+                    kind="user_message",
+                    content="project status is green for the seeded smoke row",
+                    embedding=None,
+                    session_id=turn.session_id,
+                    turn_id=turn.id,
+                    taint="clean",
+                    source_ref=None,
+                    created_at=NOW,
+                )
             )
+
+    # The program searches memory, branches on a seeded result, and emits a
+    # mechanical confirmation derived from it.
+    source = (
+        "result = memory.search(query='project status')\n"
+        "assert result['status'] == 'succeeded', result\n"
+        "ids = [hit['id'] for hit in result['hits']]\n"
+        "assert 'mem_project_status' in ids, result\n"
+        "agent.emit_message(text='Found seeded memory.')\n"
+    )
+    with session_factory() as db:
+        with db.begin():
+            loaded_turn = db.get(TurnRecord, "turn_read")
+            assert loaded_turn is not None
             result = _execute(
                 sandbox=sandbox,
                 db=db,
                 session_factory=session_factory,
-                turn=turn,
+                turn=loaded_turn,
                 source=source,
                 allowed_capability_ids={"cap.memory.search"},
                 events=events,
@@ -176,7 +194,7 @@ def test_program_reads_a_capability_then_composes_an_emit_message(
 
     assert result.program_ok is True, result.program_error
     assert result.callback_errors == []
-    assert result.emitted_message.startswith("Found ")
+    assert result.emitted_message == "Found seeded memory."
     assert result.emitted_values == []
     assert result.paused is False
     assert len(result.action_attempts) == 1

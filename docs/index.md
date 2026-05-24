@@ -29,10 +29,13 @@ This directory is the canonical home for repository documentation.
 - [generated-text.md](generated-text.md): escaping and quoting at generated-text boundaries
 - [jarvis-system-prompt.md](jarvis-system-prompt.md): Jarvis-style assistant
   prompt, persona, tool policy, proactivity policy, and eval checklist
+- [typing.md](typing.md): typing discipline, boundary narrowing, and avoiding
+  type erasure
 
 ### Code style
 
 - [ai-first.md](ai-first.md): AI owns judgment, deterministic code owns rails
+- [ai-first-sota-gaps.md](ai-first-sota-gaps.md): AI-first gaps and audit notes
 - [personal-agent-sota-roadmap.md](personal-agent-sota-roadmap.md):
   OpenClaw-class parity, Claw-variant lessons, and personal-agent SOTA roadmap
 - [north-star-cutover.md](north-star-cutover.md): single-`run`,
@@ -52,6 +55,8 @@ This directory is the canonical home for repository documentation.
 - [production-runbook.md](production-runbook.md): production deployment, operations,
   ambient Discord chat, deterministic slash operations, health checks, recovery,
   and acceptance criteria
+- [manual-smoke-test.md](manual-smoke-test.md): source-derived env var, user
+  action, agent capability, background job, and smoke-test checklist
 - [dev-environment.md](dev-environment.md): isolated local dev stack — `.env.dev`,
   parallel postgres on `:5435`, dev API on `:8001`, coexistence with the prod
   systemd services

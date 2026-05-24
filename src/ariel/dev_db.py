@@ -9,10 +9,17 @@ import socket
 import subprocess
 import time
 from typing import Mapping
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 
 _DEFAULT_DATABASE_URL = "postgresql+psycopg://localhost/ariel"
+DEV_DB_ENV_VARS = frozenset(
+    {
+        "ARIEL_DB_CONTAINER_NAME",
+        "ARIEL_DB_DOCKER_IMAGE",
+        "ARIEL_DB_VOLUME_NAME",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -26,6 +33,35 @@ class LocalPostgresRuntime:
     container_name: str
     image: str
     volume_name: str
+
+
+def redact_database_url(database_url: str) -> str:
+    parsed = urlsplit(database_url)
+    if parsed.password is None:
+        return database_url
+
+    username = parsed.username or ""
+    hostname = parsed.hostname or ""
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    netloc = f"{username}:***@{hostname}"
+    if port is not None:
+        netloc = f"{netloc}:{port}"
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+
+def redact_command_for_display(cmd: list[str]) -> list[str]:
+    redacted: list[str] = []
+    for arg in cmd:
+        if arg.startswith("POSTGRES_PASSWORD="):
+            redacted.append("POSTGRES_PASSWORD=***")
+        else:
+            redacted.append(arg)
+    return redacted
 
 
 def parse_dotenv_file(path: Path) -> dict[str, str]:
@@ -322,7 +358,7 @@ def cmd_destroy(runtime: LocalPostgresRuntime) -> int:
 
 
 def cmd_status(runtime: LocalPostgresRuntime) -> int:
-    print(f"database_url={runtime.database_url}")
+    print(f"database_url={redact_database_url(runtime.database_url)}")
     print(f"container_name={runtime.container_name}")
     print(f"image={runtime.image}")
     print(f"volume={runtime.volume_name}")
@@ -350,7 +386,7 @@ def cmd_logs(runtime: LocalPostgresRuntime, *, follow: bool) -> int:
 
 
 def cmd_print_config(runtime: LocalPostgresRuntime) -> int:
-    print(f"database_url={runtime.database_url}")
+    print(f"database_url={redact_database_url(runtime.database_url)}")
     print(f"db_user={runtime.user}")
     print(f"db_name={runtime.database}")
     print(f"db_host={runtime.host}")
@@ -402,7 +438,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_print_config(runtime)
         return 2
     except subprocess.CalledProcessError as exc:
-        print(f"command failed: {' '.join(exc.cmd)}")
+        cmd = [str(arg) for arg in exc.cmd]
+        print(f"command failed: {' '.join(redact_command_for_display(cmd))}")
         return exc.returncode
     except RuntimeError as exc:
         print(f"error: {exc}")

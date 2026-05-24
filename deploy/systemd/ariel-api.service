@@ -1,7 +1,7 @@
 [Unit]
 Description=Ariel API (FastAPI, loopback 127.0.0.1:8000)
-After=network-online.target docker.service
-Wants=network-online.target docker.service
+After=network-online.target postgresql.service
+Wants=network-online.target postgresql.service
 
 [Service]
 Type=simple
@@ -10,10 +10,22 @@ Group=ariel
 WorkingDirectory=/opt/ariel
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/etc/ariel/ariel.env
-ExecStart=/opt/ariel/.venv/bin/uvicorn ariel.app:create_app --factory --host 127.0.0.1 --port 8000
+ExecStart=/bin/sh -c 'exec /opt/ariel/.venv/bin/uvicorn ariel.app:create_app --factory --host "$${ARIEL_BIND_HOST}" --port "$${ARIEL_BIND_PORT}"'
 Restart=always
 RestartSec=5
 SyslogIdentifier=ariel-api
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

@@ -15,6 +15,7 @@ from ariel.persistence import ActionAttemptRecord, JobEventRecord, JobRecord
 
 AGENCY_SANDBOX_POLICY_VERSION = "agency-sandbox-v1"
 AGENCY_EGRESS_POLICY_VERSION = "agency-egress-v1"
+AGENCY_DAEMON_API_VERSION = 3
 
 
 class AgencyDaemonError(Exception):
@@ -28,8 +29,14 @@ class AgencyDaemonClient:
 
     def health(self) -> dict[str, Any]:
         payload = self._request("GET", "/health")
-        if payload.get("ok") is not True or payload.get("api_version") != 2:
+        if payload.get("ok") is not True:
             raise AgencyDaemonError("agency daemon health check failed")
+        api_version = payload.get("api_version")
+        if api_version != AGENCY_DAEMON_API_VERSION:
+            raise AgencyDaemonError(
+                "agency daemon API version mismatch: "
+                f"daemon={api_version}, client={AGENCY_DAEMON_API_VERSION}"
+            )
         return payload
 
     def task_start(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -81,8 +88,6 @@ class AgencyDaemonClient:
         *,
         repo_id: str,
         worktree_ref: str,
-        allow_dirty: bool,
-        force_with_lease: bool,
         client_request_id: str,
     ) -> dict[str, Any]:
         return self._action(
@@ -90,8 +95,6 @@ class AgencyDaemonClient:
             f"/worktrees/{worktree_ref}/pr/sync",
             params={"repo_id": repo_id},
             json_payload={
-                "allow_dirty": allow_dirty,
-                "force_with_lease": force_with_lease,
                 "client_request_id": client_request_id,
             },
         )
@@ -222,7 +225,16 @@ class AgencyRuntime:
         repo_root = self._allowed_repo_root(input_payload["repo_root"])
         base_branch = input_payload.get("base_branch") or self.default_base_branch
         runner_args = input_payload.get("runner_args", [])
-        env = input_payload.get("env", {})
+        env_items = input_payload.get("env", [])
+        if not isinstance(env_items, list):
+            raise AgencyDaemonError("agency run env shape invalid")
+        env: dict[str, str] = {}
+        for item in env_items:
+            if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+                raise AgencyDaemonError("agency run env shape invalid")
+            if not isinstance(item.get("value"), str):
+                raise AgencyDaemonError("agency run env shape invalid")
+            env[item["name"]] = item["value"]
         sandbox_policy = {
             "version": AGENCY_SANDBOX_POLICY_VERSION,
             "repo_root": repo_root,
@@ -415,8 +427,6 @@ class AgencyRuntime:
             "repo_id": repo_id,
             "invocation_id": invocation_id,
             "worktree_id": worktree_id,
-            "allow_dirty": bool(input_payload.get("allow_dirty")),
-            "force_with_lease": bool(input_payload.get("force_with_lease")),
             "client_request_id": action_attempt_id,
         }
 
@@ -448,8 +458,6 @@ class AgencyRuntime:
         pr_response = self.client.worktree_pr_sync(
             repo_id=repo_id,
             worktree_ref=worktree_id,
-            allow_dirty=bool(prepared.get("allow_dirty")),
-            force_with_lease=bool(prepared.get("force_with_lease")),
             client_request_id=pr_sync_client_request_id,
         )
         if not (

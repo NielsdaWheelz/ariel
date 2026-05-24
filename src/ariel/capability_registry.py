@@ -1287,12 +1287,12 @@ def _normalize_optional_string_list(
     return items
 
 
-def _normalize_optional_env(value: Any) -> dict[str, str] | None:
+def _normalize_optional_env(value: Any) -> list[dict[str, str]] | None:
     if value is None:
-        return {}
+        return []
     if not isinstance(value, list) or len(value) > 20:
         return None
-    env: dict[str, str] = {}
+    env: list[dict[str, str]] = []
     for item in value:
         if not isinstance(item, dict) or set(item.keys()) != {"name", "value"}:
             return None
@@ -1300,7 +1300,7 @@ def _normalize_optional_env(value: Any) -> dict[str, str] | None:
         env_value = _normalize_optional_text(item.get("value"), max_length=2000)
         if key is None or env_value is None:
             return None
-        env[key] = env_value
+        env.append({"name": key, "value": env_value})
     return env
 
 
@@ -1375,8 +1375,6 @@ def _validate_agency_request_pr_input(
             "task_id",
             "invocation_id",
             "worktree_id",
-            "allow_dirty",
-            "force_with_lease",
         }
     ):
         return None, "schema_invalid"
@@ -1391,20 +1389,10 @@ def _validate_agency_request_pr_input(
         return None, "schema_invalid"
     invocation_id = _normalize_optional_text(raw_input.get("invocation_id"), max_length=128)
     worktree_id = _normalize_optional_text(raw_input.get("worktree_id"), max_length=128)
-    allow_dirty_raw = raw_input.get("allow_dirty")
-    force_with_lease_raw = raw_input.get("force_with_lease")
-    if allow_dirty_raw is not None and not isinstance(allow_dirty_raw, bool):
-        return None, "schema_invalid"
-    if force_with_lease_raw is not None and not isinstance(force_with_lease_raw, bool):
-        return None, "schema_invalid"
     return {
         **lookup,
         "invocation_id": invocation_id,
         "worktree_id": worktree_id,
-        "allow_dirty": bool(allow_dirty_raw) if allow_dirty_raw is not None else False,
-        "force_with_lease": bool(force_with_lease_raw)
-        if force_with_lease_raw is not None
-        else False,
     }, None
 
 
@@ -1528,11 +1516,8 @@ def _search_timeout_seconds(result_type: WebSearchResultType) -> float:
     return settings.search_web_timeout_seconds
 
 
-def _search_api_key(result_type: WebSearchResultType) -> str | None:
-    settings = AppSettings()
-    if result_type == WebSearchResultType.NEWS:
-        return settings.search_news_api_key or settings.search_web_api_key
-    return settings.search_web_api_key
+def _brave_api_key() -> str | None:
+    return AppSettings().search_web_api_key
 
 
 def _search_error_prefix(result_type: WebSearchResultType) -> str:
@@ -1544,7 +1529,7 @@ def _execute_search(
     *,
     result_type: WebSearchResultType,
 ) -> dict[str, Any]:
-    api_key = _search_api_key(result_type)
+    api_key = _brave_api_key()
     error_prefix = _search_error_prefix(result_type)
     if api_key is None:
         if result_type == WebSearchResultType.NEWS:
@@ -1631,20 +1616,27 @@ _WEB_EXTRACT_MAX_BLOCK_CHARS = 1200
 _WEB_EXTRACT_MAX_TOTAL_CHARS = 4000
 
 
+_BRAVE_WEB_EXTRACT_ENDPOINT = "https://api.search.brave.com/res/v1/web/extract"
+_BRAVE_WEB_EXTRACT_HOST = "api.search.brave.com"
+
+
 def _web_extract_provider_endpoint() -> str:
-    default_endpoint = "https://api.search.brave.com/res/v1/web/extract"
     configured_endpoint = AppSettings().web_extract_provider_endpoint
     if configured_endpoint is None:
-        return default_endpoint
+        return _BRAVE_WEB_EXTRACT_ENDPOINT
     normalized = configured_endpoint.strip()
     if not normalized:
-        return default_endpoint
+        return _BRAVE_WEB_EXTRACT_ENDPOINT
     parsed = urlparse(normalized)
     if parsed.scheme:
         return normalized
     if "://" in normalized:
-        return default_endpoint
+        return _BRAVE_WEB_EXTRACT_ENDPOINT
     return f"https://{normalized.lstrip('/')}"
+
+
+def _web_extract_uses_brave_auth(endpoint: str) -> bool:
+    return _endpoint_host(endpoint) == _BRAVE_WEB_EXTRACT_HOST
 
 
 def _web_extract_timeout_seconds() -> float:
@@ -1653,11 +1645,6 @@ def _web_extract_timeout_seconds() -> float:
 
 def _web_extract_max_retries() -> int:
     return AppSettings().web_extract_max_retries
-
-
-def _web_extract_api_key() -> str | None:
-    settings = AppSettings()
-    return settings.web_extract_api_key or settings.search_web_api_key
 
 
 def _is_unsafe_web_extract_host(host: str) -> bool:
@@ -1868,8 +1855,8 @@ def _execute_web_extract(input_payload: dict[str, Any]) -> dict[str, Any]:
         "accept": "application/json",
         "content-type": "application/json",
     }
-    api_key = _web_extract_api_key()
-    if api_key is not None:
+    api_key = _brave_api_key()
+    if api_key is not None and _web_extract_uses_brave_auth(endpoint):
         headers["x-subscription-token"] = api_key
 
     response: Any = None
@@ -2915,6 +2902,19 @@ def _weather_timesteps_for_timeframe(timeframe: str) -> str:
     return "1h"
 
 
+def _tomorrow_io_location_param(location: str) -> str:
+    parts = [part.strip() for part in location.split(",")]
+    if len(parts) == 2:
+        try:
+            lat = float(parts[0])
+            lon = float(parts[1])
+        except ValueError:
+            return " ".join(part for part in parts if part)
+        if -90 <= lat <= 90 and -180 <= lon <= 180:
+            return f"{parts[0]},{parts[1]}"
+    return location
+
+
 def _build_weather_output(
     *,
     source: str,
@@ -2970,7 +2970,7 @@ class _TomorrowIoWeatherAdapter:
             response = httpx.get(
                 self.endpoint,
                 params={
-                    "location": location,
+                    "location": _tomorrow_io_location_param(location),
                     "timesteps": _weather_timesteps_for_timeframe(timeframe),
                     "apikey": self.api_key,
                 },
@@ -4043,20 +4043,22 @@ RUN_CALLABLE_SIGNATURES: dict[str, str] = {
     "agent.emit_message": "(text: str)",
     "agent.emit_value": "(value: Any)",
     "agent.emit_finding": "(summary: str, claims: list, gaps: list, sources: list)",
-    "agent.emit_done": "(summary: str)",
+    "agent.emit_done": "(summary: str = '') -> None",
     "agent.pause_until_input": "()",
+    "scratch.set": "(key: str, value: JSONValue) -> None",
+    "scratch.get": "(key: str) -> JSONValue",
     # memory.*
     # memory.search: both layers (memory_log + memory_notes) are always
     # searched together — there is no layer-selector arg. ``kinds`` filters the
     # log layer to specific event types only; pass it only with values from the
     # enum below. ``since`` is RFC3339 (e.g. ``"2026-05-20T12:00:00Z"``).
     "memory.search": "(query: str, limit: int = 24, since: str | None = None, kinds: list[Literal['user_message','agent_round','assistant_message','tool_observation','proactive_trigger','note_create','note_edit','note_delete','recall','research_finding']] | None = None) -> {'hits': list[{'id', 'layer', 'kind', 'created_at', 'snippet', 'taint'}], 'status': 'succeeded'}",
-    "memory.read": "(id: str) -> {'id', 'layer', 'kind', 'created_at', 'content', 'taint'}",
-    "memory.recall": "(query: str) -> {'summary', 'items': list, 'status'}",
+    "memory.read": "(id: str) -> {'status': Literal['found', 'not_found'], 'id': str, 'layer': Literal['log', 'note'], 'kind': str | None, 'created_at': str, 'content': dict | str, 'taint': dict, 'session_id': str | None, 'turn_id': str | None}",
+    "memory.recall": "(query: str) -> {'status': 'recalled', 'recall': dict}",
     "memory.remember": "(note: str) -> {'status': 'queued', 'encode_id': str}",
-    "memory.note.create": "(content: str) -> {'id', 'status'}",
-    "memory.note.edit": "(id: str, content: str) -> {'id', 'status'}",
-    "memory.note.delete": "(id: str) -> {'id', 'status'}",
+    "memory.note.create": "(content: str) -> {'status': 'created', 'id': str}",
+    "memory.note.edit": "(id: str, content: str) -> {'status': 'edited', 'id': str}",
+    "memory.note.delete": "(id: str) -> {'status': 'deleted', 'id': str}",
     # search / web
     # search.web: the only accepted key is ``query``. Other names (``q``,
     # ``topn``, ``count``, ``limit``) are rejected as schema_invalid.
@@ -4065,6 +4067,14 @@ RUN_CALLABLE_SIGNATURES: dict[str, str] = {
     "web.extract": "(url: str) -> {'url': str, 'status': 'succeeded', 'extract_outcome': {'status': Literal['ok', 'partial'], 'reason_code': str | None, 'recovery': str | None}, 'document': {'title': str, 'canonical_source': str, 'resolved_url': str, 'retrieved_at': str, 'published_at': str | None, 'language': str | None, 'content_chars': int, 'content_blocks': list[{'index': int, 'text': str}]}, 'provider': {'endpoint': str, 'attempt_count': int}}",
     # research
     "research.investigate": "(question: str, mode: Literal['web', 'personal', 'memories']) -> {'status': 'queued', 'research_id': str}",
+    # agency
+    "agency.run": "(repo_root: str, name: str, prompt: str, base_branch: str | None = None, runner: str | None = None, runner_args: list[str] = [], env: list[{'name': str, 'value': str}] = [], no_include_untracked: bool = False) -> {'job_id': str, 'agency': dict}",
+    # agency.status / agency.artifacts: pass either ``job_id`` or both
+    # ``repo_id`` and ``task_id``. ``repo_id``/``task_id`` are Agency daemon
+    # ids, not local database ids.
+    "agency.status": "(job_id: str | None = None, repo_id: str | None = None, task_id: str | None = None) -> {'job_id': str | None, 'task': dict, 'invocation': dict | None, 'check': dict | None}",
+    "agency.artifacts": "(job_id: str | None = None, repo_id: str | None = None, task_id: str | None = None) -> {'job_id': str | None, 'diff': dict, 'timeline': dict}",
+    "agency.request_pr": "(job_id: str | None = None, repo_id: str | None = None, task_id: str | None = None, invocation_id: str | None = None, worktree_id: str | None = None) -> {'job_id': str, 'land': dict | None, 'pr': dict}",
     # calendar (read)
     # calendar.list: REQUIRED keys ``window_start`` and ``window_end``, both
     # RFC3339 strings (e.g. ``"2026-05-20T12:00:00Z"``). Other names
@@ -4078,6 +4088,16 @@ RUN_CALLABLE_SIGNATURES: dict[str, str] = {
     # access to — primary, secondary, and subscribed — so the model can pass a
     # specific ``calendar_id`` to ``calendar.list``.
     "calendar.list_calendars": "() -> {'schema_version': 'google.calendar.calendar_list.v1', 'calendars': list[{'calendar_id': str, 'summary': str | None, 'primary': bool, 'access_role': str, 'time_zone': str | None, 'provider_account_id': str}], 'retrieved_at': str, 'status': 'succeeded'}",
+    # calendar.propose_slots: all keys are required. The model must carry
+    # evidence context explicitly; ``source_evidence_ids`` may be empty, but
+    # ``quoted_content_caveat`` and the nested evidence/constraint objects must
+    # be present.
+    "calendar.propose_slots": "(window_start: str, window_end: str, duration_minutes: int, attendees: list[str], timezone: str, source_evidence_ids: list[str], quoted_content_caveat: bool, participants: list[str], proposed_windows: list[{'start': str, 'end': str}], timezone_evidence: {'source': str | None, 'rationale': str | None, 'confidence': float | None}, constraints: {'hard': list[str], 'soft': list[str], 'attendee_notes': list[str]}) -> {'schema_version': 'google.calendar.slot_options.v1', 'slots': list, 'availability_scope': Literal['all_attendees', 'primary_calendar_only'], 'partial': bool, 'source_evidence_refs': list, 'constraints_used': dict}",
+    # calendar writes require ``idempotency_key`` and exactly one authority
+    # field: ``source_evidence_id`` or ``user_instruction_ref``.
+    "calendar.create_event": "(title: str, start_time: str, end_time: str, idempotency_key: str, source_evidence_id: str | None = None, user_instruction_ref: str | None = None, calendar_id: str | None = None, description: str | None = None, location: str | None = None, attendees: list[str] = []) -> {'schema_version': 'google.calendar.create_result.v1', 'status': 'created', 'event_id': str, 'calendar_id': str, 'provider_event_ref': str, 'executed_at': str}",
+    "calendar.update_event": "(event_id: str, idempotency_key: str, source_evidence_id: str | None = None, user_instruction_ref: str | None = None, calendar_id: str | None = None, title: str | None = None, start_time: str | None = None, end_time: str | None = None, description: str | None = None, location: str | None = None, attendees: list[str] | None = None) -> {'schema_version': 'google.calendar.update_result.v1', 'status': 'updated', 'event_id': str, 'calendar_id': str, 'provider_event_ref': str, 'executed_at': str}",
+    "calendar.respond_to_event": "(event_id: str, attendee_email: str, response_status: Literal['accepted', 'declined', 'tentative', 'needsAction'], idempotency_key: str, source_evidence_id: str | None = None, user_instruction_ref: str | None = None, calendar_id: str | None = None) -> {'schema_version': 'google.calendar.response_result.v1', 'status': 'responded', 'event_id': str, 'calendar_id': str, 'response_status': str, 'provider_event_ref': str, 'executed_at': str}",
     # email (read)
     # email.search: the only accepted key is ``query``. Returns
     # ``{messages: [{message_id, thread_id, subject, sender, ...}], ...}``;
@@ -4095,6 +4115,17 @@ RUN_CALLABLE_SIGNATURES: dict[str, str] = {
     # drive (read)
     "drive.search": "(query: str) -> {'schema_version': 'google.drive.search_results.v1', 'query': str, 'provider_account_id': str, 'results': list[{'title', 'source', 'snippet', 'published_at'}], 'retrieved_at': str, 'status': 'succeeded'}",
     "drive.read": "(file_id: str) -> {'schema_version': 'google.drive.read_result.v1', 'file_id': str, 'provider_account_id': str, 'title': str, 'source': str, 'published_at': str | None, 'content_excerpt': str, 'truncated': bool, 'read_outcome': {'status': Literal['ok', 'unsupported', 'too_large', 'unavailable'], 'reason_code': str | None, 'recovery': str | None}, 'retrieved_at': str, 'status': 'succeeded'}",
+    # drive.share requires ``idempotency_key`` and exactly one authority field:
+    # ``source_evidence_id`` or ``user_instruction_ref``.
+    "drive.share": "(file_id: str, grantee_email: str, idempotency_key: str, source_evidence_id: str | None = None, user_instruction_ref: str | None = None, role: Literal['reader', 'commenter', 'writer'] = 'reader') -> {'status': 'shared', 'file_id': str, 'grantee_email': str, 'role': str, 'permission_id': str}",
+    # email writes require ``idempotency_key`` and exactly one authority field:
+    # ``source_evidence_id`` or ``user_instruction_ref``.
+    "email.draft": "(to: list[str], subject: str, body: str, idempotency_key: str, source_evidence_id: str | None = None, user_instruction_ref: str | None = None, cc: list[str] = [], bcc: list[str] = []) -> {'status': 'drafted_not_sent', 'delivery_state': 'draft_only', 'sent': False, 'draft': dict, 'provider_draft_ref': str}",
+    "email.send": "(to: list[str], subject: str, body: str, idempotency_key: str, source_evidence_id: str | None = None, user_instruction_ref: str | None = None, cc: list[str] = [], bcc: list[str] = []) -> {'status': 'sent', 'message_id': str, 'provider_message_ref': str, 'to': list[str], 'subject': str}",
+    "email.archive": "(message_ids: list[str], idempotency_key: str, source_evidence_id: str | None = None, user_instruction_ref: str | None = None) -> {'status': Literal['archived', 'failed', 'partially_failed'], 'operation': 'archive', 'message_ids': list[str], 'undo_supported': True, 'executed_at': str}",
+    "email.trash": "(message_ids: list[str], idempotency_key: str, source_evidence_id: str | None = None, user_instruction_ref: str | None = None) -> {'status': Literal['trashed', 'failed', 'partially_failed'], 'operation': 'trash', 'message_ids': list[str], 'undo_supported': True, 'executed_at': str}",
+    "email.labels.modify": "(message_ids: list[str], add_labels: list[str], remove_labels: list[str], idempotency_key: str, source_evidence_id: str | None = None, user_instruction_ref: str | None = None) -> {'status': Literal['labels_modified', 'failed', 'partially_failed'], 'operation': 'labels.modify', 'message_ids': list[str], 'provider_label_ids': dict, 'undo_supported': True, 'executed_at': str}",
+    "email.undo": "(undo_token: str, idempotency_key: str, source_evidence_id: str | None = None, user_instruction_ref: str | None = None) -> {'status': Literal['undone', 'failed', 'partially_failed'], 'operation': 'undo', 'message_ids': list[str], 'restored_state': list, 'executed_at': str}",
     # maps
     # maps.search_places: ``query`` is required. ``radius_meters`` is in
     # [100, 50000] (default 2000). No other arg names are accepted.
@@ -4107,7 +4138,7 @@ RUN_CALLABLE_SIGNATURES: dict[str, str] = {
     # ``"today"``). ``location`` is an optional plain-language place string.
     "weather.forecast": "(location: str | None = None, timeframe: Literal['now', 'today', 'tomorrow', 'next_24h'] = 'today') -> {'location', 'timeframe', 'forecast': dict, 'retrieved_at': str, 'status': 'succeeded'}",
     # proactive
-    "proactive.schedule": "(when: str, note: str) -> {'status': 'scheduled', 'task_id': str}",
+    "proactive.schedule": "(when: str, note: str) -> {'status': 'scheduled', 'task_id': str, 'run_after': str}",
     # attachment
     # attachment.read: ``intent`` must be one of the five below.
     "attachment.read": "(attachment_ref: str, intent: Literal['summarize', 'ocr', 'transcribe', 'extract_text', 'answer']) -> {'attachment_ref', 'filename', 'blocks': list, 'status': 'succeeded'}",

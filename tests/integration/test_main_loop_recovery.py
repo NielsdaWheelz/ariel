@@ -59,8 +59,13 @@ _EMIT_FINDING_MAIN_ERROR = (
     "agent.emit_finding is not available in the main agent loop; "
     "finish the main loop with agent.emit_message"
 )
+_EMIT_DONE_MAIN_ERROR = (
+    "agent.emit_done is not available in the main agent loop; "
+    "finish the main loop with agent.emit_message"
+)
 
 _INVALID_FINDING_SOURCE = "agent.emit_finding(summary='x', claims=[], gaps=[], sources=[])\n"
+_INVALID_DONE_SOURCE = "agent.emit_done(summary='x')\n"
 
 _VALID_MESSAGE_SOURCE = "agent.emit_message(text='Hello, here is the answer.')\n"
 
@@ -156,6 +161,78 @@ def test_main_loop_emit_finding_misuse_recovers_with_typed_nudge(
         assert nudge_seen
 
 
+@dataclass
+class _DoneThenMessageAdapter:
+    """Round 1: invalid emit_done (main-loop). Round 2: valid emit_message."""
+
+    provider: str = "provider.recovery"
+    model: str = "model.recovery-v1"
+    main_call_count: int = 0
+    last_input_items: list[list[dict[str, Any]]] = field(default_factory=list)
+
+    def create_response(
+        self,
+        *,
+        input_items: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        user_message: str,
+        history: list[dict[str, Any]],
+        context_bundle: dict[str, Any],
+    ) -> dict[str, Any]:
+        if is_memory_subsystem_call(input_items):
+            return empty_recall_response(
+                provider=self.provider, model=self.model, input_items=input_items
+            )
+        del tools, user_message, history, context_bundle
+        self.main_call_count += 1
+        self.last_input_items.append(list(input_items))
+        if self.main_call_count == 1:
+            return _run_response(
+                _INVALID_DONE_SOURCE,
+                provider=self.provider,
+                model=self.model,
+                rid="resp_done_misuse",
+            )
+        return _run_response(
+            _VALID_MESSAGE_SOURCE,
+            provider=self.provider,
+            model=self.model,
+            rid="resp_done_recovered_msg",
+        )
+
+
+def test_main_loop_emit_done_misuse_recovers_with_typed_nudge(
+    postgres_url: str,
+) -> None:
+    adapter = _DoneThenMessageAdapter()
+    with _build_client(postgres_url, adapter) as client:
+        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
+        turn = post_message_and_drain(client, session_id, message="answer this")
+
+        assert turn.status == "completed"
+        assert turn.assistant_message == "Hello, here is the answer."
+        assert adapter.main_call_count == 2
+
+        timeline = client.get(f"/v1/sessions/{session_id}/events").json()
+        events = timeline["turns"][0]["events"]
+        event_types = [event["event_type"] for event in events]
+        assert "evt.run.validation_failed" in event_types
+        assert "evt.turn.completed" in event_types
+        assert "evt.turn.failed" not in event_types
+
+        validation_failed = next(
+            event for event in events if event["event_type"] == "evt.run.validation_failed"
+        )
+        assert any(_EMIT_DONE_MAIN_ERROR in err for err in validation_failed["payload"]["errors"])
+
+        recovery_items = adapter.last_input_items[1]
+        assert any(
+            isinstance(item.get("content"), str)
+            and "is not available in this loop" in item["content"]
+            for item in recovery_items
+        )
+
+
 # ===========================================================================
 # Test 2 — semantic stuck rail halts on repeated program_errors across
 # whitespace-different sources.
@@ -211,7 +288,6 @@ def test_main_loop_semantic_stuck_rail_halts_on_repeated_program_errors(
 ) -> None:
     # Generous budget and backstop so wall-clock / call-count rails do not
     # fire — the semantic stuck rail must be the one that halts the loop.
-    monkeypatch.setenv("ARIEL_MAX_CONTEXT_TOKENS", "20000")
     monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "20000")
     monkeypatch.setenv("ARIEL_MAIN_TURN_BUDGET_SECONDS", "300.0")
     monkeypatch.setenv("ARIEL_AGENT_LOOP_MAX_MODEL_CALLS", "100")
@@ -288,7 +364,6 @@ def test_main_loop_budget_exhaustion_uses_canned_line_without_summary_call(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("ARIEL_MAX_CONTEXT_TOKENS", "20000")
     monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "20000")
     # Tiny budget — wall-clock rail trips quickly. The fake perf_counter
     # advances 0.1s per call so the budget check fires on the next round.
@@ -395,7 +470,6 @@ def test_emit_value_carries_read_facts_to_next_round_context(
 ) -> None:
     """A round must use ``agent.emit_value`` to carry read facts forward."""
 
-    monkeypatch.setenv("ARIEL_MAX_CONTEXT_TOKENS", "20000")
     monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "20000")
     monkeypatch.setenv("ARIEL_MAIN_TURN_BUDGET_SECONDS", "300.0")
     monkeypatch.setenv("ARIEL_AGENT_LOOP_MAX_MODEL_CALLS", "100")
@@ -524,7 +598,6 @@ def test_main_loop_premature_synthesis_rail_drops_round_one_message_and_forces_a
     before observing the search result would be delivered to the user.
     """
 
-    monkeypatch.setenv("ARIEL_MAX_CONTEXT_TOKENS", "20000")
     monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "20000")
     monkeypatch.setenv("ARIEL_MAIN_TURN_BUDGET_SECONDS", "300.0")
     monkeypatch.setenv("ARIEL_AGENT_LOOP_MAX_MODEL_CALLS", "100")
@@ -603,7 +676,6 @@ def test_main_loop_pure_emit_message_round_one_is_not_dropped(
     """A round-one program that emits a message with no capability call is
     delivered as-is; the rail only fires on ``read capability + emit_message``."""
 
-    monkeypatch.setenv("ARIEL_MAX_CONTEXT_TOKENS", "20000")
     monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "20000")
 
     adapter = _GreetingOnlyAdapter()
@@ -680,7 +752,6 @@ def test_failed_program_preserves_action_attempt_status_without_output_echo(
 ) -> None:
     """Failed-program recovery sees attempt status, not read payloads."""
 
-    monkeypatch.setenv("ARIEL_MAX_CONTEXT_TOKENS", "20000")
     monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "20000")
     monkeypatch.setenv("ARIEL_MAIN_TURN_BUDGET_SECONDS", "300.0")
     monkeypatch.setenv("ARIEL_AGENT_LOOP_MAX_MODEL_CALLS", "100")

@@ -263,6 +263,146 @@ def _seed_action_attempt(
     return action_hash
 
 
+@pytest.mark.parametrize(
+    ("capability_id", "proposed_input", "execution_output", "expected_provider_input"),
+    [
+        (
+            "cap.calendar.update_event",
+            {
+                "event_id": "evt_update",
+                "calendar_id": "primary",
+                "title": "Updated risk review",
+                "description": "Private event notes.",
+                "idempotency_key": "calendar-update-smoke",
+                "user_instruction_ref": "turn:turn_email",
+            },
+            {
+                "schema_version": "google.calendar.update_result.v1",
+                "status": "updated",
+                "event_id": "evt_update",
+                "calendar_id": "primary",
+                "provider_event_ref": "https://calendar.google.com/event?eid=evt_update",
+                "etag": '"etag_update"',
+                "updated": "2026-05-08T12:00:01Z",
+                "ical_uid": "evt_update@google.com",
+                "provider_status": "confirmed",
+                "executed_at": "2026-05-08T12:00:01Z",
+            },
+            {
+                "event_id": "evt_update",
+                "calendar_id": "primary",
+                "title": "Updated risk review",
+                "description": "Private event notes.",
+                "idempotency_key": "calendar-update-smoke",
+                "user_instruction_ref": "turn:turn_email",
+            },
+        ),
+        (
+            "cap.calendar.respond_to_event",
+            {
+                "event_id": "evt_rsvp",
+                "calendar_id": "primary",
+                "attendee_email": "NIELS@EXAMPLE.COM",
+                "response_status": "accepted",
+                "idempotency_key": "calendar-rsvp-smoke",
+                "user_instruction_ref": "turn:turn_email",
+            },
+            {
+                "schema_version": "google.calendar.response_result.v1",
+                "status": "responded",
+                "event_id": "evt_rsvp",
+                "calendar_id": "primary",
+                "response_status": "accepted",
+                "provider_event_ref": "https://calendar.google.com/event?eid=evt_rsvp",
+                "etag": '"etag_rsvp"',
+                "updated": "2026-05-08T12:00:02Z",
+                "ical_uid": "evt_rsvp@google.com",
+                "provider_status": "confirmed",
+                "executed_at": "2026-05-08T12:00:02Z",
+            },
+            {
+                "event_id": "evt_rsvp",
+                "calendar_id": "primary",
+                "attendee_email": "niels@example.com",
+                "response_status": "accepted",
+                "idempotency_key": "calendar-rsvp-smoke",
+                "user_instruction_ref": "turn:turn_email",
+            },
+        ),
+    ],
+)
+def test_calendar_write_actions_record_receipts_and_authority(
+    session_factory: sessionmaker[Session],
+    capability_id: str,
+    proposed_input: dict[str, Any],
+    execution_output: dict[str, Any],
+    expected_provider_input: dict[str, Any],
+) -> None:
+    runtime = FakeGoogleRuntime(
+        workspace_provider=FakeWorkspaceProvider(before_state=[]),
+        execution_output=execution_output,
+    )
+    _seed_action_attempt(
+        session_factory,
+        action_attempt_id="act_calendar_write",
+        capability_id=capability_id,
+        proposed_input=proposed_input,
+        proposal_index=1,
+    )
+
+    assert process_action_execution_task(
+        session_factory=session_factory,
+        action_attempt_id="act_calendar_write",
+        google_runtime=runtime,  # type: ignore[arg-type]
+        agency_runtime=None,
+        now_fn=lambda: NOW,
+        new_id_fn=_id_factory("calendar_write"),
+    )
+
+    assert runtime.executions == [expected_provider_input]
+    with session_factory() as db:
+        action_attempt = db.get(ActionAttemptRecord, "act_calendar_write")
+        receipt = db.scalar(select(ProviderWriteReceiptRecord).limit(1))
+        event = db.scalar(
+            select(EventRecord)
+            .where(EventRecord.event_type == "evt.action.execution.succeeded")
+            .limit(1)
+        )
+
+    assert action_attempt is not None
+    assert action_attempt.status == "succeeded"
+    assert action_attempt.execution_error is None
+    assert action_attempt.execution_output == execution_output
+    if capability_id == "cap.calendar.update_event":
+        assert action_attempt.proposed_input["description"]["private_payload"] is True
+        assert "Private event notes." not in json.dumps(
+            action_attempt.proposed_input,
+            sort_keys=True,
+        )
+    assert receipt is not None
+    assert receipt.status == "succeeded"
+    assert receipt.provider_account_id == PROVIDER_ACCOUNT_ID
+    assert receipt.action_attempt_id == "act_calendar_write"
+    assert receipt.capability_id == capability_id
+    assert receipt.request_digest == action_attempt.payload_hash
+    assert receipt.provider_object_ids["event_id"] == execution_output["event_id"]
+    assert receipt.provider_object_ids["calendar_id"] == execution_output["calendar_id"]
+    assert receipt.provider_object_ids["user_instruction_ref"] == "turn:turn_email"
+    assert receipt.provider_timestamp == datetime.fromisoformat(
+        execution_output["updated"].replace("Z", "+00:00")
+    )
+    assert receipt.provider_etag == execution_output["etag"]
+    assert receipt.response_payload["authority"] == {
+        "source_type": "user_instruction_ref",
+        "user_instruction_ref": "turn:turn_email",
+        "turn_id": "turn_email",
+        "action_turn_id": "turn_email",
+        "session_id": "ses_email",
+    }
+    assert event is not None
+    assert event.payload["output"] == execution_output
+
+
 def _seed_failed_email_write_receipt(
     session_factory: sessionmaker[Session],
     *,
@@ -812,6 +952,118 @@ def test_email_action_success_redacts_undo_token_from_event_audit(
         assert receipt.after_state["messages"][0]["label_ids"] == []
         assert isinstance(receipt.response_digest, str)
         assert len(receipt.response_digest) == 64
+
+
+@pytest.mark.parametrize(
+    ("capability_id", "proposed_input", "execution_output", "expected_after_labels"),
+    [
+        (
+            "cap.email.trash",
+            {"message_ids": ["msg_1"], "idempotency_key": "trash-success"},
+            {
+                "status": "trashed",
+                "operation": "trash",
+                "message_ids": ["msg_1"],
+                "before_state": [
+                    {"message_id": "msg_1", "thread_id": "thr_1", "label_ids": ["INBOX"]}
+                ],
+                "after_state": [
+                    {"message_id": "msg_1", "thread_id": "thr_1", "label_ids": ["TRASH"]}
+                ],
+                "provider_result": {
+                    "operation": "trash",
+                    "provider": "gmail",
+                    "mutated_message_ids": ["msg_1"],
+                    "attempted_message_ids": ["msg_1"],
+                },
+            },
+            ["TRASH"],
+        ),
+        (
+            "cap.email.labels.modify",
+            {
+                "message_ids": ["msg_1"],
+                "add_labels": ["Client"],
+                "remove_labels": ["Old"],
+                "idempotency_key": "labels-modify-success",
+            },
+            {
+                "status": "labels_modified",
+                "operation": "labels.modify",
+                "message_ids": ["msg_1"],
+                "before_state": [
+                    {
+                        "message_id": "msg_1",
+                        "thread_id": "thr_1",
+                        "label_ids": ["INBOX", "Label_Old"],
+                    }
+                ],
+                "after_state": [
+                    {
+                        "message_id": "msg_1",
+                        "thread_id": "thr_1",
+                        "label_ids": ["INBOX", "Label_Client"],
+                    }
+                ],
+                "provider_result": {
+                    "operation": "labels.modify",
+                    "provider": "gmail",
+                    "mutated_message_ids": ["msg_1"],
+                    "attempted_message_ids": ["msg_1"],
+                    "provider_label_ids": {"add": ["Label_Client"], "remove": ["Label_Old"]},
+                },
+            },
+            ["INBOX", "Label_Client"],
+        ),
+    ],
+)
+def test_email_mutation_success_records_receipts_and_undo_token(
+    session_factory: sessionmaker[Session],
+    capability_id: str,
+    proposed_input: dict[str, Any],
+    execution_output: dict[str, Any],
+    expected_after_labels: list[str],
+) -> None:
+    before_state = execution_output["before_state"]
+    runtime = FakeGoogleRuntime(
+        workspace_provider=FakeWorkspaceProvider(before_state=before_state),
+        execution_output=execution_output,
+    )
+    _seed_action_attempt(
+        session_factory,
+        action_attempt_id="act_email_mutation_success",
+        capability_id=capability_id,
+        proposed_input=proposed_input,
+        proposal_index=1,
+    )
+
+    assert process_action_execution_task(
+        session_factory=session_factory,
+        action_attempt_id="act_email_mutation_success",
+        google_runtime=runtime,  # type: ignore[arg-type]
+        agency_runtime=None,
+        now_fn=lambda: NOW,
+        new_id_fn=lambda prefix: f"{prefix}_email_mutation_success",
+    )
+
+    with session_factory() as db:
+        action_attempt = db.get(ActionAttemptRecord, "act_email_mutation_success")
+        receipt = db.scalar(select(ProviderWriteReceiptRecord).limit(1))
+
+    assert action_attempt is not None
+    assert action_attempt.status == "succeeded"
+    assert receipt is not None
+    assert receipt.status == "succeeded"
+    assert receipt.capability_id == capability_id
+    assert receipt.provider_object_ids["message_ids"] == ["msg_1"]
+    assert receipt.before_state is not None
+    assert receipt.before_state["messages"][0]["message_id"] == "msg_1"
+    assert receipt.after_state is not None
+    assert receipt.after_state["messages"][0]["label_ids"] == expected_after_labels
+    assert action_attempt.execution_output is not None
+    assert isinstance(action_attempt.execution_output["undo_token"], str)
+    assert action_attempt.execution_output["undo_token"]
+    assert receipt.undo_token_hash is not None
 
 
 def test_email_draft_write_receipt_redacts_body_and_records_authority(

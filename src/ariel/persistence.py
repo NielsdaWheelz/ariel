@@ -229,6 +229,7 @@ class TurnRecord(Base):
     assistant_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     kind: Mapped[str] = mapped_column(String(32), nullable=False, server_default="agent_turn")
+    source_background_task_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )
@@ -247,6 +248,12 @@ class TurnRecord(Base):
             "kind IN ('agent_turn', 'research', 'memory_encode', 'memory_dream')",
             name="ck_turn_kind",
         ),
+        Index(
+            "ix_turns_source_background_task_unique",
+            "source_background_task_id",
+            unique=True,
+            postgresql_where=(source_background_task_id.is_not(None)),
+        ),
     )
 
 
@@ -262,12 +269,13 @@ class TurnIdempotencyRecord(Base):
     )
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    turn_id: Mapped[str] = mapped_column(
+    turn_id: Mapped[str | None] = mapped_column(
         String(32),
         ForeignKey("turns.id", ondelete="RESTRICT"),
-        nullable=False,
+        nullable=True,
         index=True,
     )
+    background_task_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     status_code: Mapped[int] = mapped_column(Integer, nullable=False)
     response_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(
@@ -278,11 +286,21 @@ class TurnIdempotencyRecord(Base):
     )
 
     __table_args__ = (
+        CheckConstraint(
+            "turn_id IS NOT NULL OR background_task_id IS NOT NULL",
+            name="ck_turn_idempotency_has_owner",
+        ),
         Index(
             "ix_turn_idempotency_session_key_unique",
             "session_id",
             "idempotency_key",
             unique=True,
+        ),
+        Index(
+            "ix_turn_idempotency_background_task_unique",
+            "background_task_id",
+            unique=True,
+            postgresql_where=(background_task_id.is_not(None)),
         ),
     )
 
@@ -1508,8 +1526,8 @@ class BackgroundTaskRecord(Base):
             (
                 "task_type IN ('agency_event_received', 'expire_approvals', "
                 "'provider_event_received', 'provider_sync_due', 'memory_encode', "
-                "'memory_dream', 'execute_action_attempt', 'google_object_hydration_due', "
-                "'provider_evidence_extraction_due', 'provider_write_reconcile_due', "
+                "'memory_dream', 'execute_action_attempt', "
+                "'provider_write_reconcile_due', "
                 "'agent_wake', 'provider_watch_renew_due', 'provider_reconcile_sync_due', "
                 "'user_message', 'research_run')"
             ),

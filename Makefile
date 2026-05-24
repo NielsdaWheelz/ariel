@@ -17,7 +17,7 @@ DEV_ENV_FILE := .env.dev
 DEV_ENV := ARIEL_ENV_FILE=$(DEV_ENV_FILE)
 DEV_UVICORN_CMD := .venv/bin/uvicorn ariel.app:create_app --factory --host 127.0.0.1 --port 8001
 
-.PHONY: help bootstrap setup env-init check-venv check-uv db-up db-stop db-down db-destroy db-status db-logs db-config db-upgrade tailscale-serve run run-worker run-discord dev lint format-check typecheck test verify e2e dev-init dev-up dev-stop dev-down dev-destroy dev-status dev-logs dev-config dev-upgrade dev-api dev-worker dev-discord dev-shell
+.PHONY: help bootstrap setup env-init check-venv check-uv db-up db-stop db-down db-destroy db-status db-logs db-config db-upgrade tailscale-serve run run-worker run-discord dev lint format-check typecheck test verify e2e production-posture dev-init dev-up dev-stop dev-down dev-destroy dev-status dev-logs dev-config dev-upgrade dev-api dev-worker dev-discord dev-shell
 
 bootstrap:
 	bash scripts/bootstrap.sh
@@ -60,7 +60,8 @@ help:
 	  "dev-shell    - open a subshell with ARIEL_ENV_FILE=.env.dev exported" \
 	  "" \
 	  "verify       - lint + format check + typecheck + tests" \
-	  "e2e          - high-signal end-to-end smoke tests"
+	  "e2e          - high-signal end-to-end smoke tests" \
+	  "production-posture - verify live systemd/agency/health posture"
 
 env-init:
 	@if [ ! -f ".env.local" ]; then \
@@ -163,6 +164,9 @@ verify: lint format-check typecheck test
 
 e2e: check-venv
 	.venv/bin/python -m pytest tests/integration/test_prompt_context_acceptance.py -k "test_turn_context_section_order_and_audit_metadata or test_context_audit_is_stable_even_if_adapter_mutates_context_bundle"
+
+production-posture: check-venv
+	.venv/bin/python scripts/verify_production_posture.py
 
 # ── Isolated dev env (ARIEL_ENV_FILE=.env.dev) ─────────────────────────
 # These targets never read .env.local; they operate against a parallel

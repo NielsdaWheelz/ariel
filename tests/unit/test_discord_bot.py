@@ -11,7 +11,6 @@ from ariel.config import AppSettings
 from ariel.discord_bot import (
     ArielDiscordBot,
     ArielDiscordError,
-    ArielActionView,
     decide_approval,
     DiscordBotConfigError,
     configured_discord_bot,
@@ -20,7 +19,6 @@ from ariel.discord_bot import (
     get_status,
     list_jobs,
     record_capture,
-    refresh_job,
     submit_discord_turn,
     _is_ariel_custom_id,
 )
@@ -501,56 +499,6 @@ def test_decide_approval_posts_discord_decision(
     ]
 
 
-def test_refresh_job_fetches_job_and_events(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_clients: list[FakeHttpClient] = []
-
-    def fake_client(*, timeout: float) -> FakeHttpClient:
-        assert timeout == 60.0
-        client = FakeHttpClient(
-            responses=[
-                httpx.Response(
-                    200,
-                    json={
-                        "ok": True,
-                        "job": {
-                            "id": "job_123",
-                            "status": "completed",
-                            "title": "Draft release notes",
-                            "summary": "done",
-                        },
-                    },
-                ),
-                httpx.Response(
-                    200,
-                    json={
-                        "ok": True,
-                        "job_id": "job_123",
-                        "events": [
-                            {
-                                "event_type": "completed",
-                                "created_at": "2026-04-27T12:00:00Z",
-                            }
-                        ],
-                    },
-                ),
-            ]
-        )
-        fake_clients.append(client)
-        return client
-
-    monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
-
-    message = refresh_job(ariel_base_url="http://127.0.0.1:8000", job_id="job_123")
-
-    assert "Job job_123: completed" in message
-    assert "Draft release notes" in message
-    assert "- completed at 2026-04-27T12:00:00Z" in message
-    assert fake_clients[0].calls[:2] == [
-        {"method": "GET", "url": "http://127.0.0.1:8000/v1/jobs/job_123"},
-        {"method": "GET", "url": "http://127.0.0.1:8000/v1/jobs/job_123/events"},
-    ]
-
-
 def test_status_command_fetches_only_deterministic_ops_endpoints(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -705,6 +653,73 @@ def test_slash_status_rejects_wrong_user() -> None:
     assert "limited to the configured Discord user" in interaction.response.messages[0]["content"]
 
 
+def test_slash_status_rejects_wrong_guild(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_get_status(**_: object) -> str:
+        raise AssertionError("wrong-guild status command must not call Ariel API")
+
+    monkeypatch.setattr("ariel.discord_bot.get_status", fail_get_status)
+    bot = _bot()
+    interaction = FakeInteraction(guild_id=99)
+
+    asyncio.run(bot._slash_status(cast(discord.Interaction, interaction)))
+
+    assert interaction.response.messages[0]["ephemeral"] is True
+    assert "limited to the configured Discord user" in interaction.response.messages[0]["content"]
+
+
+def test_slash_jobs_sends_ephemeral_deterministic_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_list_jobs(
+        *,
+        ariel_base_url: str,
+        ariel_auth_token: str | None = None,
+    ) -> str:
+        assert ariel_base_url == "http://127.0.0.1:8000"
+        assert ariel_auth_token is None
+        return "Recent jobs:\n- job_123: running: Draft release notes"
+
+    monkeypatch.setattr("ariel.discord_bot.list_jobs", fake_list_jobs)
+    bot = _bot()
+    interaction = FakeInteraction()
+
+    asyncio.run(bot._slash_jobs(cast(discord.Interaction, interaction)))
+
+    assert interaction.response.deferrals == [{"thinking": True, "ephemeral": True}]
+    assert interaction.followup.messages[0]["content"] == (
+        "Recent jobs:\n- job_123: running: Draft release notes"
+    )
+    assert interaction.followup.messages[0]["ephemeral"] is True
+
+
+def test_slash_jobs_rejects_wrong_user(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_list_jobs(**_: object) -> str:
+        raise AssertionError("wrong-user jobs command must not call Ariel API")
+
+    monkeypatch.setattr("ariel.discord_bot.list_jobs", fail_list_jobs)
+    bot = _bot()
+    interaction = FakeInteraction(user_id=44)
+
+    asyncio.run(bot._slash_jobs(cast(discord.Interaction, interaction)))
+
+    assert interaction.response.messages[0]["ephemeral"] is True
+    assert "limited to the configured Discord user" in interaction.response.messages[0]["content"]
+
+
+def test_slash_jobs_rejects_wrong_guild(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_list_jobs(**_: object) -> str:
+        raise AssertionError("wrong-guild jobs command must not call Ariel API")
+
+    monkeypatch.setattr("ariel.discord_bot.list_jobs", fail_list_jobs)
+    bot = _bot()
+    interaction = FakeInteraction(guild_id=99)
+
+    asyncio.run(bot._slash_jobs(cast(discord.Interaction, interaction)))
+
+    assert interaction.response.messages[0]["ephemeral"] is True
+    assert "limited to the configured Discord user" in interaction.response.messages[0]["content"]
+
+
 def test_slash_capture_sends_ephemeral_deterministic_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -746,28 +761,36 @@ def test_slash_capture_sends_ephemeral_deterministic_response(
     assert interaction.followup.messages[0]["ephemeral"] is True
 
 
-def test_action_view_uses_custom_id_for_job_refresh() -> None:
-    view = ArielActionView(
-        ariel_base_url="http://127.0.0.1:8000",
-        job_id="job_123",
-        allowed_user_id=3,
-    )
+def test_slash_capture_rejects_wrong_user(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_record_capture(**_: object) -> str:
+        raise AssertionError("wrong-user capture command must not call Ariel API")
 
-    custom_ids = [cast(Any, item).custom_id for item in view.children]
-    assert custom_ids == [
-        "ariel:job:refresh:job_123",
-    ]
+    monkeypatch.setattr("ariel.discord_bot.record_capture", fail_record_capture)
+    bot = _bot()
+    interaction = FakeInteraction(user_id=44)
+
+    asyncio.run(bot._slash_capture(cast(discord.Interaction, interaction), "save this"))
+
+    assert interaction.response.messages[0]["ephemeral"] is True
+    assert "limited to the configured Discord user" in interaction.response.messages[0]["content"]
 
 
-@pytest.mark.parametrize(
-    "custom_id",
-    [
-        "ariel:approval:approve:apr_123",
-        "ariel:job:refresh:job_123",
-    ],
-)
-def test_is_ariel_custom_id_recognizes_supported_action_prefixes(custom_id: str) -> None:
-    assert _is_ariel_custom_id(custom_id) is True
+def test_slash_capture_rejects_wrong_guild(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_record_capture(**_: object) -> str:
+        raise AssertionError("wrong-guild capture command must not call Ariel API")
+
+    monkeypatch.setattr("ariel.discord_bot.record_capture", fail_record_capture)
+    bot = _bot()
+    interaction = FakeInteraction(guild_id=99)
+
+    asyncio.run(bot._slash_capture(cast(discord.Interaction, interaction), "save this"))
+
+    assert interaction.response.messages[0]["ephemeral"] is True
+    assert "limited to the configured Discord user" in interaction.response.messages[0]["content"]
+
+
+def test_is_ariel_custom_id_recognizes_supported_action_prefix() -> None:
+    assert _is_ariel_custom_id("ariel:approval:approve:apr_123") is True
 
 
 def test_is_ariel_custom_id_rejects_unknown_action() -> None:
@@ -815,11 +838,89 @@ def test_on_interaction_handles_approval_custom_id(monkeypatch: pytest.MonkeyPat
     assert interaction.response.edits[0]["view"] is None
 
 
+def test_on_interaction_handles_approval_deny_custom_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_decide_approval(
+        *,
+        ariel_base_url: str,
+        ariel_auth_token: str | None = None,
+        approval_ref: str,
+        decision: str,
+        reason: str | None = None,
+    ) -> str:
+        calls.append(
+            {
+                "ariel_base_url": ariel_base_url,
+                "ariel_auth_token": ariel_auth_token,
+                "approval_ref": approval_ref,
+                "decision": decision,
+                "reason": reason,
+            }
+        )
+        return "Approval denied: apr_123"
+
+    monkeypatch.setattr("ariel.discord_bot.decide_approval", fake_decide_approval)
+    bot = _bot()
+    interaction = FakeInteraction(custom_id="ariel:approval:deny:apr_123", channel_id=88)
+
+    _send_interaction(bot, interaction)
+
+    assert calls == [
+        {
+            "ariel_base_url": "http://127.0.0.1:8000",
+            "ariel_auth_token": None,
+            "approval_ref": "apr_123",
+            "decision": "deny",
+            "reason": None,
+        }
+    ]
+    assert interaction.response.edits[0]["content"] == "Approval denied: apr_123"
+    assert interaction.response.edits[0]["view"] is None
+
+
+def test_on_interaction_duplicate_approval_click_surfaces_api_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_decide_approval(**_: object) -> str:
+        raise ArielDiscordError("approval is not pending")
+
+    monkeypatch.setattr("ariel.discord_bot.decide_approval", fake_decide_approval)
+    bot = _bot()
+    interaction = FakeInteraction(custom_id="ariel:approval:deny:apr_123", channel_id=88)
+
+    _send_interaction(bot, interaction)
+
+    assert interaction.response.edits[0]["content"] == (
+        "Ariel request failed: approval is not pending"
+    )
+    assert interaction.response.edits[0]["view"] is None
+
+
 def test_on_interaction_rejects_wrong_user() -> None:
     bot = _bot()
     interaction = FakeInteraction(
-        custom_id="ariel:job:refresh:job_123",
+        custom_id="ariel:approval:approve:apr_123",
         user_id=44,
+    )
+
+    _send_interaction(bot, interaction)
+
+    assert interaction.response.messages[0]["ephemeral"] is True
+    assert "limited to the configured Discord user" in interaction.response.messages[0]["content"]
+
+
+def test_on_interaction_rejects_wrong_guild(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_decide_approval(**_: object) -> str:
+        raise AssertionError("wrong-guild approval click must not call Ariel API")
+
+    monkeypatch.setattr("ariel.discord_bot.decide_approval", fail_decide_approval)
+    bot = _bot()
+    interaction = FakeInteraction(
+        custom_id="ariel:approval:approve:apr_123",
+        guild_id=99,
     )
 
     _send_interaction(bot, interaction)
@@ -1100,6 +1201,24 @@ def test_on_message_ignores_other_server_unmentioned_message(
     message = FakeDiscordMessage(
         content="ambient chatter",
         guild=FakeGuild(guild_id=99),
+        channel=FakeChannel(channel_id=88),
+    )
+
+    _send_message(bot, message)
+
+    assert calls == []
+    assert message.replies == []
+
+
+def test_on_message_ignores_non_owner_home_guild_ambient_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _stub_discord_turn(monkeypatch)
+    bot = _bot()
+    message = FakeDiscordMessage(
+        content="ambient from someone else",
+        author=FakeUser(user_id=44),
+        guild=FakeGuild(guild_id=1),
         channel=FakeChannel(channel_id=88),
     )
 

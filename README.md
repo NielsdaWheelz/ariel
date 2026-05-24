@@ -265,7 +265,8 @@ Canonical durable memory, explicit rotation, threshold rotation, and hardened se
 
 - message idempotency:
   - `POST /v1/sessions/{session_id}/message` accepts optional `Idempotency-Key`.
-  - same key + same payload replays the prior turn result.
+  - same key + same payload replays the stored response: `202` with the same task while pending,
+    and the completed turn response after the worker commits it.
   - same key + different payload returns `409` with `E_IDEMPOTENCY_KEY_REUSED`.
 - rotation surfaces:
   - `POST /v1/sessions/rotate`
@@ -391,15 +392,15 @@ Quick capture records bounded text, url, and shared-content payloads via
   - optional `note`
   - optional `source` object (`app`, `title`, `url`)
 - client does not provide a session id; ariel resolves effective active session server-side and
-  runs the same turn/orchestration/action lifecycle used by chat turns.
+  records a completed capture turn without invoking the model.
 - responses are strict surfaced contracts:
-  - success: `{ok, capture, session, turn, assistant}`
-  - failure: `{ok, capture, error}`
+  - success: `{ok, capture}`
+  - failure: `{ok, error}`
 - idempotency is request-scoped and optional via `Idempotency-Key`:
-  - same key + same payload replays prior capture/turn outcome
+  - same key + same payload replays the prior capture response
   - same key + different payload returns `409 E_IDEMPOTENCY_KEY_REUSED`
-- capture ingress failures are durable and typed (`E_CAPTURE_*`) and are explicitly separated from
-  in-turn failures (`capture.terminal_state="turn_created"` with typed `error`).
+- capture ingress failures are typed (`E_CAPTURE_*`); capture does not enqueue
+  agent work.
 
 local runtime auth config:
 
@@ -447,10 +448,9 @@ search capability runtime config:
 Search execution delegates to `web-search-tool`'s Brave provider. Ariel still owns capability
 policy, egress preflight, and the `search_results_v1` output mapping.
 
-- `ARIEL_SEARCH_WEB_API_KEY` (required for live web retrieval backend)
+- `ARIEL_SEARCH_WEB_API_KEY` (required for live Brave-backed web/news search; also authenticates the default Brave web extract endpoint)
 - `ARIEL_SEARCH_BRAVE_BASE_URL` (optional provider base URL; defaults to Brave Search API base)
 - `ARIEL_SEARCH_WEB_TIMEOUT_SECONDS` (optional provider timeout; defaults to `8.0`)
-- `ARIEL_SEARCH_NEWS_API_KEY` (optional; falls back to `ARIEL_SEARCH_WEB_API_KEY`)
 - `ARIEL_SEARCH_NEWS_TIMEOUT_SECONDS` (optional provider timeout; defaults to `8.0`)
 
 weather capability runtime config:
@@ -477,7 +477,6 @@ web extract capability runtime config:
 - `ARIEL_WEB_EXTRACT_PROVIDER_ENDPOINT` (optional; defaults to Brave extract endpoint)
 - `ARIEL_WEB_EXTRACT_TIMEOUT_SECONDS` (optional; defaults to `10.0`)
 - `ARIEL_WEB_EXTRACT_MAX_RETRIES` (optional; defaults to `2`, max `5`)
-- `ARIEL_WEB_EXTRACT_API_KEY` (optional; falls back to `ARIEL_SEARCH_WEB_API_KEY`)
 
 weather default location APIs:
 
@@ -543,7 +542,7 @@ make env-init
 # edit .env.local with real values for your machine
 ```
 
-inspect resolved local-db runtime config (derived from `ARIEL_DATABASE_URL`):
+inspect resolved local-db runtime config with the password redacted:
 
 ```bash
 make db-config
@@ -582,7 +581,7 @@ make run-discord
 
 run the durable worker in another shell to drain `background_tasks` — user
 message turns, scheduled agent wakes, research runs, provider ingestion, the
-memory rememberer, and Agency events:
+memory encode/dream tasks, and Agency events:
 
 ```bash
 make run-worker
@@ -608,14 +607,13 @@ explicit shell env vars still override `.env.local` when set.
 
 turn and session settings are runtime-configurable:
 
-- `ARIEL_MAX_RECENT_TURNS` (default `12`) bounds how many prior turns are included in the deterministic turn context bundle.
-- `ARIEL_MAX_CONTEXT_TOKENS` (default `6000`) bounds estimated prompt/context tokens for a turn.
 - `ARIEL_AUTO_ROTATE_MAX_TURNS` (default `120`) rotates on turn boundary when prior turn count meets/exceeds threshold.
 - `ARIEL_AUTO_ROTATE_MAX_AGE_SECONDS` (default `172800`) rotates on turn boundary when session age meets/exceeds threshold.
 - `ARIEL_MAX_RESPONSE_TOKENS` (default `700`) bounds assistant completion tokens per turn.
 - `ARIEL_MAIN_TURN_BUDGET_SECONDS` — wall-clock budget for a main-agent turn; the model is told its remaining budget each round.
 - `ARIEL_RESEARCH_RUN_BUDGET_SECONDS` — wall-clock budget for a research subagent run.
 - `ARIEL_AGENT_LOOP_MAX_MODEL_CALLS` — paranoid backstop on model calls per loop; not the primary control.
+- `ARIEL_AGENT_LOOP_LIVE_ROUNDS` (default `8`) bounds how many verbatim live rounds are kept in model context.
 - `ARIEL_APPROVAL_TTL_SECONDS` (default `900`) sets approval expiry window for approval-gated actions.
 - `ARIEL_APPROVAL_ACTOR_ID` (default `user.local`) sets the expected actor for approval-bound actions.
 

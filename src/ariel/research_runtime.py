@@ -41,6 +41,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, assert_never
 
 from fastapi.encoders import jsonable_encoder
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from .agent_loop import LoopConfig, ResearchFinding, run_agent_loop
@@ -169,6 +170,162 @@ def _build_research_input_items(
     ]
 
 
+def _research_finding_payload(finding: ResearchFinding) -> dict[str, Any]:
+    return {
+        "question": finding.question,
+        "mode": finding.mode,
+        "status": finding.status,
+        "summary": finding.summary,
+        "claims": finding.claims,
+        "gaps": finding.gaps,
+        "sources": finding.sources,
+    }
+
+
+def _parse_research_finding_payload(raw: object) -> ResearchFinding | None:
+    if not isinstance(raw, dict):
+        return None
+    question = raw.get("question")
+    mode = raw.get("mode")
+    status = raw.get("status")
+    summary = raw.get("summary")
+    claims = raw.get("claims")
+    gaps = raw.get("gaps")
+    sources = raw.get("sources")
+    if (
+        not isinstance(question, str)
+        or not isinstance(mode, str)
+        or not isinstance(status, str)
+        or not isinstance(summary, str)
+        or not isinstance(claims, list)
+        or not isinstance(gaps, list)
+        or not isinstance(sources, list)
+    ):
+        return None
+    return ResearchFinding(
+        question=question,
+        mode=mode,
+        status=status,
+        summary=summary,
+        claims=claims,
+        gaps=gaps,
+        sources=sources,
+    )
+
+
+def _next_turn_event_sequence(*, db: Session, turn_id: str) -> int:
+    return (
+        int(
+            db.scalar(
+                select(func.coalesce(func.max(EventRecord.sequence), 0)).where(
+                    EventRecord.turn_id == turn_id
+                )
+            )
+            or 0
+        )
+        + 1
+    )
+
+
+def _add_existing_research_event(
+    *,
+    db: Session,
+    turn: TurnRecord,
+    event_type: str,
+    payload: dict[str, Any],
+    clock: Callable[[], datetime],
+) -> None:
+    db.add(
+        EventRecord(
+            id=new_id("evn"),
+            session_id=turn.session_id,
+            turn_id=turn.id,
+            sequence=_next_turn_event_sequence(db=db, turn_id=turn.id),
+            event_type=event_type,
+            payload=jsonable_encoder(payload),
+            created_at=clock(),
+        )
+    )
+
+
+def _research_finding_from_existing_turn(
+    *,
+    db: Session,
+    turn: TurnRecord,
+    question: str,
+    mode: ResearchMode,
+    clock: Callable[[], datetime],
+) -> ResearchFinding:
+    if turn.status == "in_progress":
+        finding = ResearchFinding(
+            question=question,
+            mode=mode,
+            status="failed",
+            summary="The research run was interrupted before producing a finding.",
+            claims=[],
+            gaps=[],
+            sources=[],
+        )
+        turn.assistant_message = finding.summary
+        turn.status = "failed"
+        turn.updated_at = clock()
+        _add_existing_research_event(
+            db=db,
+            turn=turn,
+            event_type="evt.research.failed",
+            payload={
+                "mode": mode,
+                "finding": _research_finding_payload(finding),
+                "failure_reason": "background task replay found an interrupted in-progress turn",
+            },
+            clock=clock,
+        )
+        _add_existing_research_event(
+            db=db,
+            turn=turn,
+            event_type="evt.turn.failed",
+            payload={
+                "failure_reason": "background task replay found an interrupted in-progress turn",
+                "error_code": "E_BACKGROUND_TURN_INTERRUPTED",
+            },
+            clock=clock,
+        )
+        db.commit()
+        return finding
+
+    terminal_event = db.scalar(
+        select(EventRecord)
+        .where(
+            EventRecord.turn_id == turn.id,
+            EventRecord.event_type.in_(
+                (
+                    "evt.research.finding_emitted",
+                    "evt.research.partial",
+                    "evt.research.failed",
+                )
+            ),
+        )
+        .order_by(EventRecord.sequence.desc())
+        .limit(1)
+    )
+    if terminal_event is None:
+        # justify-defect: replaying a terminal research turn without its typed
+        # terminal event would lose the only durable finding contract.
+        raise RuntimeError("research replay terminal event missing")
+    terminal_payload = terminal_event.payload if terminal_event is not None else {}
+    parsed_finding = (
+        _parse_research_finding_payload(terminal_payload.get("finding"))
+        if isinstance(terminal_payload, dict)
+        else None
+    )
+    if parsed_finding is not None:
+        return parsed_finding
+
+    # justify-defect: terminal research events must carry the typed finding
+    # payload emitted by the research loop; synthesizing one hides corruption.
+    raise RuntimeError("research replay terminal finding invalid")
+
+
 def run_research(
     *,
     sandbox: RunSandbox,
@@ -181,6 +338,7 @@ def run_research(
     question: str,
     mode: ResearchMode,
     now_fn: Callable[[], datetime] | None = None,
+    source_background_task_id: str | None = None,
 ) -> ResearchFinding:
     """Drive the read-only research loop and return a typed finding.
 
@@ -208,6 +366,20 @@ def run_research(
             assert_never(mode)
 
     clock = now_fn or utcnow
+    if source_background_task_id is not None:
+        existing_turn = db.scalar(
+            select(TurnRecord)
+            .where(TurnRecord.source_background_task_id == source_background_task_id)
+            .limit(1)
+        )
+        if existing_turn is not None:
+            return _research_finding_from_existing_turn(
+                db=db,
+                turn=existing_turn,
+                question=question,
+                mode=mode,
+                clock=clock,
+            )
 
     now = clock()
     turn = TurnRecord(
@@ -217,6 +389,7 @@ def run_research(
         assistant_message=None,
         status="in_progress",
         kind="research",
+        source_background_task_id=source_background_task_id,
         created_at=now,
         updated_at=now,
     )
@@ -330,7 +503,10 @@ def run_research(
             finding = loop_result.emitted_finding
             turn.assistant_message = finding.summary
             turn.status = "completed"
-            add_event("evt.research.finding_emitted", {"mode": mode})
+            add_event(
+                "evt.research.finding_emitted",
+                {"mode": mode, "finding": _research_finding_payload(finding)},
+            )
         case "model_failed":
             finding = ResearchFinding(
                 question=question,
@@ -343,7 +519,10 @@ def run_research(
             )
             turn.assistant_message = finding.summary
             turn.status = "failed"
-            add_event("evt.research.failed", {"mode": mode})
+            add_event(
+                "evt.research.failed",
+                {"mode": mode, "finding": _research_finding_payload(finding)},
+            )
         case "budget_exhausted":
             finding = ResearchFinding(
                 question=question,
@@ -356,7 +535,10 @@ def run_research(
             )
             turn.assistant_message = finding.summary
             turn.status = "completed"
-            add_event("evt.research.partial", {"mode": mode})
+            add_event(
+                "evt.research.partial",
+                {"mode": mode, "finding": _research_finding_payload(finding)},
+            )
         case "message" | "approval" | "paused" | "operations" | "bounded_failure":
             msg = f"unexpected research loop outcome: {loop_result.outcome}"
             raise AssertionError(msg)

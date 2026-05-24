@@ -34,6 +34,7 @@ from ariel.sync_runtime import process_provider_sync_due
 from ariel.worker import (
     process_provider_reconcile_sync_due,
     process_provider_watch_renew_due,
+    seed_approval_expiry_task,
     seed_provider_maintenance_tasks,
 )
 from tests.fake_sandbox import FakeSandboxRuntime
@@ -41,7 +42,9 @@ from tests.fake_sandbox import FakeSandboxRuntime
 
 GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 CALENDAR_READ_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
-PUBSUB_TOPIC = "projects/ariel/topics/gmail-watch"
+PUBSUB_TOPIC = "projects/ariel-test/topics/gmail-watch"
+PUBSUB_SUBSCRIPTION = "projects/ariel-test/subscriptions/gmail-watch-sub"
+PUBSUB_CREDENTIALS_PATH = "/tmp/ariel-test-gcp-sa.json"
 PUBLIC_WEBHOOK_BASE_URL = "https://ariel.example"
 EXPECTED_CALENDAR_WATCH_ADDRESS = f"{PUBLIC_WEBHOOK_BASE_URL}/v1/providers/google/events?resource_type=calendar&resource_id=primary"
 
@@ -58,6 +61,12 @@ class IdFactory:
 
 def _settings() -> AppSettings:
     return cast(AppSettings, cast(Any, AppSettings)(_env_file=None))
+
+
+def _enable_pubsub_push_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARIEL_GOOGLE_PUBSUB_TOPIC", PUBSUB_TOPIC)
+    monkeypatch.setenv("ARIEL_GOOGLE_PUBSUB_SUBSCRIPTION", PUBSUB_SUBSCRIPTION)
+    monkeypatch.setenv("ARIEL_GOOGLE_APPLICATION_CREDENTIALS_PATH", PUBSUB_CREDENTIALS_PATH)
 
 
 # --------------------------------------------------------------------------
@@ -194,7 +203,7 @@ def test_connect_registers_watches_and_calendar_push_accepts_persisted_token(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("ARIEL_GOOGLE_PUBSUB_TOPIC", PUBSUB_TOPIC)
+    _enable_pubsub_push_env(monkeypatch)
     monkeypatch.setenv("ARIEL_PUBLIC_WEBHOOK_BASE_URL", PUBLIC_WEBHOOK_BASE_URL)
     provider = WatchRecordingProvider()
     oauth_client = ConnectOAuthClient(granted_scopes=[GMAIL_READ_SCOPE, CALENDAR_READ_SCOPE])
@@ -270,7 +279,7 @@ def test_disconnect_clears_google_provider_ingestion_state(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("ARIEL_GOOGLE_PUBSUB_TOPIC", PUBSUB_TOPIC)
+    _enable_pubsub_push_env(monkeypatch)
     monkeypatch.setenv("ARIEL_PUBLIC_WEBHOOK_BASE_URL", PUBLIC_WEBHOOK_BASE_URL)
     provider = WatchRecordingProvider()
     oauth_client = ConnectOAuthClient(granted_scopes=[GMAIL_READ_SCOPE, CALENDAR_READ_SCOPE])
@@ -409,7 +418,7 @@ def test_connect_watch_registration_failure_fails_callback(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("ARIEL_GOOGLE_PUBSUB_TOPIC", PUBSUB_TOPIC)
+    _enable_pubsub_push_env(monkeypatch)
 
     @dataclass
     class FailingWatchProvider:
@@ -461,7 +470,7 @@ def test_connect_watch_registration_defect_propagates_without_connector_error(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("ARIEL_GOOGLE_PUBSUB_TOPIC", PUBSUB_TOPIC)
+    _enable_pubsub_push_env(monkeypatch)
 
     @dataclass
     class DefectiveWatchProvider:
@@ -959,6 +968,82 @@ def test_seed_provider_maintenance_tasks_creates_recurring_rows_once(
         by_type["provider_reconcile_sync_due"].recurrence_seconds
         == settings.provider_reconcile_sync_interval_seconds
     )
+
+
+def test_seed_approval_expiry_task_creates_recurring_row_once(
+    session_factory: sessionmaker[Session],
+) -> None:
+    now = datetime(2026, 5, 18, 12, 0, tzinfo=UTC)
+    with session_factory() as db:
+        with db.begin():
+            seed_approval_expiry_task(db, now=now)
+    # A second pass must not create duplicates.
+    with session_factory() as db:
+        with db.begin():
+            seed_approval_expiry_task(db, now=now)
+
+    with session_factory() as db:
+        tasks = db.scalars(
+            select(BackgroundTaskRecord).where(BackgroundTaskRecord.task_type == "expire_approvals")
+        ).all()
+
+    assert len(tasks) == 1
+    assert tasks[0].payload == {"origin": "worker_approval_expiry"}
+    assert tasks[0].recurrence_seconds == 60
+
+
+def test_connector_sync_cursor_routes_list_cursors_and_enqueue_forced_sync(
+    postgres_url: str,
+) -> None:
+    app = create_test_app(
+        database_url=postgres_url,
+        model_adapter=cast(ModelAdapter, _NoCallAdapter()),
+        sandbox=FakeSandboxRuntime(),
+    )
+    now = datetime(2026, 5, 22, 12, 0, tzinfo=UTC)
+
+    with TestClient(app) as client:
+        app_state = cast(Any, client.app).state
+        with app_state.session_factory() as db:
+            with db.begin():
+                db.add(
+                    SyncCursorRecord(
+                        id="cur_route_calendar",
+                        provider="google",
+                        resource_type="calendar",
+                        resource_id="primary",
+                        cursor_value="sync-token-route",
+                        cursor_version=3,
+                        status="ready",
+                        last_successful_sync_at=now,
+                        last_error_code=None,
+                        last_error_at=None,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+
+        listed = client.get("/v1/connectors/google/sync-cursors?resource_type=calendar")
+        assert listed.status_code == 200
+        cursor_payload = listed.json()["cursors"]
+        assert [cursor["id"] for cursor in cursor_payload] == ["cur_route_calendar"]
+        assert cursor_payload[0]["cursor_value"] == "sync-token-route"
+
+        forced = client.post(
+            "/v1/connectors/google/sync?resource_type=calendar&resource_id=primary"
+        )
+        assert forced.status_code == 200
+        task_id = forced.json()["task_id"]
+
+        with app_state.session_factory() as db:
+            task = db.get(BackgroundTaskRecord, task_id)
+            assert task is not None
+            assert task.task_type == "provider_sync_due"
+            assert task.payload == {
+                "provider": "google",
+                "resource_type": "calendar",
+                "resource_id": "primary",
+            }
 
 
 # --------------------------------------------------------------------------

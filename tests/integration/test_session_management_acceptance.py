@@ -7,9 +7,9 @@ event-timeline cursor, the turn lock, and the context-bundle constitution.
 returns ``202 {"status": "accepted", "task_id": ...}``. Tests drain the
 enqueued task via ``post_message_and_drain`` or ``drain_task`` before asserting
 outcomes. Idempotency lives in
-``enqueue_background_task``'s key dedup: a duplicate key returns the existing
-task (same ``task_id``), regardless of payload, while the task is still
-pending; there is no 409 conflict.
+``turn_idempotency_keys`` stores pending async responses and completed turn
+responses durably: a duplicate key with the same payload replays the stored
+response, while a duplicate key with a different payload returns a 409 conflict.
 """
 
 from __future__ import annotations
@@ -125,19 +125,16 @@ def _timeline(client: TestClient, session_id: str, *, after: str | None = None) 
 def test_message_idempotency_key_replays_same_task_id(
     postgres_url: str,
 ) -> None:
-    """A duplicate Idempotency-Key with the same payload returns 202 with the
-    same task_id while the task is still pending. A duplicate key with a
-    different payload also returns 202 with the same task_id — enqueue deduplicates
-    by key regardless of payload. After the task is drained (deleted), only one turn
-    is recorded."""
+    """Message idempotency survives both pending and completed queue states."""
     adapter = SessionManagementProbeAdapter()
     with _build_client(postgres_url, adapter) as client:
         session_id = _session_id(client)
+        message = "remember project phoenix = planning kickoff on monday"
 
         first = client.post(
             f"/v1/sessions/{session_id}/message",
             headers={"Idempotency-Key": "msg-idem-001"},
-            json={"message": "remember project phoenix = planning kickoff on monday"},
+            json={"message": message},
         )
         assert first.status_code == 202
         first_task_id = first.json()["task_id"]
@@ -146,25 +143,38 @@ def test_message_idempotency_key_replays_same_task_id(
         replay = client.post(
             f"/v1/sessions/{session_id}/message",
             headers={"Idempotency-Key": "msg-idem-001"},
-            json={"message": "remember project phoenix = planning kickoff on monday"},
+            json={"message": message},
         )
         assert replay.status_code == 202
         assert replay.json()["task_id"] == first_task_id
 
-        # Different payload, same key — still deduplicates to the same task.
+        # Different payload, same key — reject instead of silently dropping input.
         conflict = client.post(
             f"/v1/sessions/{session_id}/message",
             headers={"Idempotency-Key": "msg-idem-001"},
             json={"message": "remember project phoenix = kickoff on tuesday instead"},
         )
-        assert conflict.status_code == 202
-        assert conflict.json()["task_id"] == first_task_id
+        assert conflict.status_code == 409
+        assert conflict.json()["error"]["code"] == "E_IDEMPOTENCY_KEY_REUSED"
 
         # Drain the original task so the turn is committed.
         drain_task(client, first_task_id)
 
         timeline = _timeline(client, session_id)
         assert len(timeline["turns"]) == 1
+        turn_id = timeline["turns"][0]["id"]
+        assert len(adapter.context_bundles) == 1
+
+        completed_replay = client.post(
+            f"/v1/sessions/{session_id}/message",
+            headers={"Idempotency-Key": "msg-idem-001"},
+            json={"message": message},
+        )
+        assert completed_replay.status_code == 200
+        completed_body = completed_replay.json()
+        assert completed_body["turn"]["id"] == turn_id
+        assert completed_body["assistant"]["message"] == f"assistant::{message}"
+        assert len(adapter.context_bundles) == 1
 
 
 def test_idempotency_replay_survives_auto_rotation_when_retrying_new_session_id(
@@ -205,6 +215,20 @@ def test_idempotency_replay_survives_auto_rotation_when_retrying_new_session_id(
 
         timeline_rotated = _timeline(client, rotated_session_id)
         assert len(timeline_rotated["turns"]) == 1
+        rotated_turn_id = timeline_rotated["turns"][0]["id"]
+
+        # The original path session is now closed, but idempotent replay still
+        # returns the completed response instead of enqueuing a duplicate turn.
+        replay_after_drain = client.post(
+            f"/v1/sessions/{initial_session_id}/message",
+            headers={"Idempotency-Key": "msg-idem-rotate-001"},
+            json={"message": "second turn triggers threshold rotation"},
+        )
+        assert replay_after_drain.status_code == 200
+        replay_body = replay_after_drain.json()
+        assert replay_body["turn"]["id"] == rotated_turn_id
+        assert replay_body["turn"]["session_id"] == rotated_session_id
+        assert len(_timeline(client, rotated_session_id)["turns"]) == 1
 
 
 def test_rotate_rejects_overlong_idempotency_key_with_typed_validation_error(
@@ -219,6 +243,51 @@ def test_rotate_rejects_overlong_idempotency_key_with_typed_validation_error(
         assert payload["message"] == "idempotency key is invalid"
         assert payload["retryable"] is False
         assert payload["details"]["max_length"] == 128
+
+
+def test_manual_rotation_endpoint_creates_new_active_session_and_is_idempotent(
+    postgres_url: str,
+) -> None:
+    adapter = SessionManagementProbeAdapter()
+    with _build_client(postgres_url, adapter) as client:
+        initial_session_id = _session_id(client)
+
+        first = client.post(
+            "/v1/sessions/rotate",
+            headers={"Idempotency-Key": "rotate-manual-001"},
+        )
+        assert first.status_code == 200
+        first_body = first.json()
+        rotated_session_id = first_body["session"]["id"]
+        rotation_id = first_body["rotation"]["rotation_id"]
+        assert first_body["ok"] is True
+        assert rotated_session_id != initial_session_id
+        assert first_body["rotation"] == {
+            "rotation_id": rotation_id,
+            "reason": "user_initiated",
+            "rotated_from_session_id": initial_session_id,
+            "idempotency_key": "rotate-manual-001",
+            "idempotent_replay": False,
+        }
+
+        active = client.get("/v1/sessions/active")
+        assert active.status_code == 200
+        assert active.json()["session"]["id"] == rotated_session_id
+
+        replay = client.post(
+            "/v1/sessions/rotate",
+            headers={"Idempotency-Key": "rotate-manual-001"},
+        )
+        assert replay.status_code == 200
+        replay_body = replay.json()
+        assert replay_body["session"]["id"] == rotated_session_id
+        assert replay_body["rotation"] == {
+            "rotation_id": rotation_id,
+            "reason": "user_initiated",
+            "rotated_from_session_id": initial_session_id,
+            "idempotency_key": "rotate-manual-001",
+            "idempotent_replay": True,
+        }
 
 
 def test_rotation_follows_turn_count_threshold_with_typed_reason(

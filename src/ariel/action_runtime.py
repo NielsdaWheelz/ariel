@@ -983,7 +983,8 @@ _TYPED_PROVIDER_RECOVERY: dict[str, str] = {
     "provider_rate_limited": "Google rate limited this request. Wait briefly, then retry.",
     "provider_upstream_failure": "Google is degraded right now. Retry shortly.",
     "provider_permission_denied": (
-        "Google denied provider-level access. Verify file permissions and retry."
+        "Provider denied access. Verify scopes, API key restrictions, or file permissions "
+        "and retry."
     ),
     "provider_request_rejected": "Google rejected this request. Verify inputs and retry.",
     "resource_unavailable": "The file is unavailable. Verify file ID and access, then retry.",
@@ -2619,8 +2620,6 @@ def process_provider_write_reconcile_due(
                         "repo_id": repo_id,
                         "invocation_id": invocation_id,
                         "worktree_id": worktree_id,
-                        "allow_dirty": bool(proposed_input.get("allow_dirty")),
-                        "force_with_lease": bool(proposed_input.get("force_with_lease")),
                         "client_request_id": client_request_id,
                         "land_client_request_id": (
                             text_value("land_client_request_id") or f"{client_request_id}:land"

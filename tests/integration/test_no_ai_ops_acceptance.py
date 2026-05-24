@@ -72,6 +72,15 @@ def _capture_count(client: TestClient) -> int:
             return int(result["count"])
 
 
+def _background_task_count(client: TestClient) -> int:
+    with _session_factory(client)() as db:
+        with db.begin():
+            result = (
+                db.execute(text("SELECT COUNT(*) AS count FROM background_tasks")).mappings().one()
+            )
+            return int(result["count"])
+
+
 def _capture_columns(client: TestClient) -> set[str]:
     with _session_factory(client)() as db:
         with db.begin():
@@ -208,6 +217,7 @@ def test_capture_record_creates_durable_capture_without_model(postgres_url: str)
             "evt.turn.started",
             "evt.turn.completed",
         ]
+        assert _background_task_count(client) == 0
 
         replay = client.post(
             "/v1/captures/record",
@@ -222,6 +232,7 @@ def test_capture_record_creates_durable_capture_without_model(postgres_url: str)
         assert replay.status_code == 200
         assert replay.json()["capture"]["id"] == capture["id"]
         assert _turn_count(client) == 1
+        assert _background_task_count(client) == 0
         assert adapter.calls == 0
 
 

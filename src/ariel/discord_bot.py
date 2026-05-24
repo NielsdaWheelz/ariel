@@ -23,7 +23,6 @@ class ArielDiscordError(Exception):
 
 
 _APPROVAL_CUSTOM_ID_PREFIX = "ariel:approval:"
-_JOB_REFRESH_CUSTOM_ID_PREFIX = "ariel:job:refresh:"
 
 
 def format_discord_message(message: str) -> str:
@@ -189,32 +188,6 @@ def decide_approval(
         if response.status_code >= 400 or response_payload.get("ok") is not True:
             raise ArielDiscordError(_safe_ariel_error_message(response_payload))
         return _format_approval_response_for_discord(response_payload)
-
-
-def refresh_job(
-    *,
-    ariel_base_url: str,
-    ariel_auth_token: str | None = None,
-    job_id: str,
-) -> str:
-    with httpx.Client(timeout=60.0) as client:
-        job_response = client.get(
-            f"{ariel_base_url}/v1/jobs/{job_id}",
-            headers=_auth_headers(ariel_auth_token),
-        )
-        job_payload = _json_response_payload(job_response)
-        if job_response.status_code >= 400 or job_payload.get("ok") is not True:
-            raise ArielDiscordError(_safe_ariel_error_message(job_payload))
-
-        events_response = client.get(
-            f"{ariel_base_url}/v1/jobs/{job_id}/events",
-            headers=_auth_headers(ariel_auth_token),
-        )
-        events_payload = _json_response_payload(events_response)
-        if events_response.status_code >= 400 or events_payload.get("ok") is not True:
-            raise ArielDiscordError(_safe_ariel_error_message(events_payload))
-
-    return _format_job_response_for_discord(job_payload, events_payload)
 
 
 class ArielDiscordBot(commands.Bot):
@@ -453,17 +426,6 @@ class ArielDiscordBot(commands.Bot):
                     decision=decision,
                 )
                 return
-        elif custom_id.startswith(_JOB_REFRESH_CUSTOM_ID_PREFIX):
-            job_id = custom_id.removeprefix(_JOB_REFRESH_CUSTOM_ID_PREFIX)
-            if job_id:
-                await _edit_with_job_refresh(
-                    interaction=interaction,
-                    ariel_base_url=self.ariel_base_url,
-                    ariel_auth_token=self.ariel_auth_token,
-                    job_id=job_id,
-                    allowed_user_id=self.ariel_user_id,
-                )
-                return
         await interaction.response.send_message(
             "Ariel action failed: invalid Discord action id.",
             ephemeral=True,
@@ -552,40 +514,6 @@ def _format_approval_response_for_discord(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _format_job_response_for_discord(
-    job_payload: dict[str, Any],
-    events_payload: dict[str, Any],
-) -> str:
-    job = job_payload.get("job")
-    if not isinstance(job, dict):
-        raise ArielDiscordError("Ariel returned an invalid job response.")
-
-    job_id = job.get("id")
-    status = job.get("status")
-    title = job.get("title") or job.get("external_job_id")
-    if not all(isinstance(value, str) and value for value in (job_id, status, title)):
-        raise ArielDiscordError("Ariel returned an invalid job response.")
-
-    lines = [f"Job {job_id}: {status}", str(title)]
-    summary = job.get("summary")
-    if isinstance(summary, str) and summary.strip():
-        lines.append(summary.strip())
-
-    events = events_payload.get("events")
-    if isinstance(events, list) and events:
-        lines.append("")
-        lines.append("Recent events:")
-        for event in events[-5:]:
-            if not isinstance(event, dict):
-                continue
-            event_type = event.get("event_type")
-            created_at = event.get("created_at")
-            if isinstance(event_type, str):
-                timestamp = f" at {created_at}" if isinstance(created_at, str) else ""
-                lines.append(f"- {event_type}{timestamp}")
-    return "\n".join(lines)
-
-
 def _format_status_for_discord(
     *,
     session: dict[str, Any],
@@ -630,21 +558,8 @@ def _format_jobs_for_discord(jobs: list[Any]) -> str:
     return "\n".join(lines)
 
 
-def _approval_custom_id(decision: str, approval_ref: str) -> str:
-    return f"{_APPROVAL_CUSTOM_ID_PREFIX}{decision}:{approval_ref}"
-
-
-def _job_refresh_custom_id(job_id: str) -> str:
-    return f"{_JOB_REFRESH_CUSTOM_ID_PREFIX}{job_id}"
-
-
 def _is_ariel_custom_id(custom_id: str) -> bool:
-    return custom_id.startswith(
-        (
-            _APPROVAL_CUSTOM_ID_PREFIX,
-            _JOB_REFRESH_CUSTOM_ID_PREFIX,
-        )
-    )
+    return custom_id.startswith(_APPROVAL_CUSTOM_ID_PREFIX)
 
 
 def _discord_context_for_message(
@@ -740,72 +655,6 @@ async def _edit_with_approval_decision(
         view=None,
         allowed_mentions=discord.AllowedMentions.none(),
     )
-
-
-async def _edit_with_job_refresh(
-    *,
-    interaction: discord.Interaction,
-    ariel_base_url: str,
-    ariel_auth_token: str | None,
-    job_id: str,
-    allowed_user_id: int | None,
-) -> None:
-    try:
-        content = await asyncio.to_thread(
-            refresh_job,
-            ariel_base_url=ariel_base_url,
-            ariel_auth_token=ariel_auth_token,
-            job_id=job_id,
-        )
-    except ArielDiscordError as exc:
-        content = f"Ariel request failed: {exc}"
-    except httpx.HTTPError:
-        content = "Ariel request failed: could not reach the local Ariel API."
-    await interaction.response.edit_message(
-        content=format_discord_message(content),
-        view=ArielActionView(
-            ariel_base_url=ariel_base_url,
-            job_id=job_id,
-            allowed_user_id=allowed_user_id,
-        ),
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
-
-
-class ArielActionView(discord.ui.View):
-    def __init__(
-        self,
-        *,
-        ariel_base_url: str,
-        approval_refs: list[str] | None = None,
-        job_id: str | None = None,
-        allowed_user_id: int | None = None,
-    ) -> None:
-        super().__init__(timeout=None)
-        self.ariel_base_url = ariel_base_url
-        self.allowed_user_id = allowed_user_id
-        for approval_ref in approval_refs or []:
-            approve_button: discord.ui.Button[ArielActionView] = discord.ui.Button(
-                label="Approve",
-                style=discord.ButtonStyle.success,
-                custom_id=_approval_custom_id("approve", approval_ref),
-            )
-            self.add_item(approve_button)
-
-            deny_button: discord.ui.Button[ArielActionView] = discord.ui.Button(
-                label="Deny",
-                style=discord.ButtonStyle.danger,
-                custom_id=_approval_custom_id("deny", approval_ref),
-            )
-            self.add_item(deny_button)
-
-        if job_id is not None:
-            refresh_button: discord.ui.Button[ArielActionView] = discord.ui.Button(
-                label="Refresh job",
-                style=discord.ButtonStyle.secondary,
-                custom_id=_job_refresh_custom_id(job_id),
-            )
-            self.add_item(refresh_button)
 
 
 def main() -> None:
