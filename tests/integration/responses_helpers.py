@@ -31,7 +31,6 @@ from ariel.model_adapter import (
     ToolCall,
     TokenUsage,
 )
-from ariel.model_tiers import ModelTier, TierBinding
 from ariel.persistence import MEMORY_EMBEDDING_DIMENSIONS, BackgroundTaskRecord, TurnRecord
 from ariel.worker import process_one_task
 
@@ -184,7 +183,6 @@ def _build_response(
         usage=TokenUsage(input_tokens=input_tokens, output_tokens=output_tokens),
         provider=provider,
         model=model,
-        tier=ModelTier.MAIN,
         duration_ms=1,
         provider_response_id=provider_response_id,
     )
@@ -408,44 +406,23 @@ def empty_recall_response(
 class FakeModelAdapter(ModelAdapter):
     """Base ``ModelAdapter`` subclass for tests.
 
-    Bypasses ``ModelAdapter.__init__`` (which resolves real tiers and would
-    require API keys); subclasses override ``_respond`` to return a typed
-    ``ModelResponse`` from the call's ``messages``/``tools`` inputs.
-
-    Subclasses customise ``provider`` / ``model`` for the ``tier_binding``
-    surface the loop reads for its ``evt.model.started`` event.
+    Bypasses ``ModelAdapter.__init__`` (which would require API keys);
+    subclasses override ``_respond`` to return a typed ``ModelResponse``
+    from the call's ``messages``/``tools`` inputs.
     """
 
-    provider: str = "provider.fake"
-    model: str = "model.fake"
-
     def __init__(self) -> None:
-        # Deliberately skip ``ModelAdapter.__init__`` — no settings, no tier
-        # resolution. ``call`` and ``tier_binding`` are the only surfaces the
-        # loop touches; both are overridden here.
+        # Deliberately skip ``ModelAdapter.__init__``. ``call`` and ``embed``
+        # are the only surfaces tests touch; both are overridden here.
         pass
-
-    def tier_binding(self, tier: ModelTier) -> TierBinding:
-        del tier
-        return TierBinding(
-            provider=self.provider,
-            model=self.model,
-            max_context_tokens=200_000,
-            supports_tools=True,
-            supports_structured_output=True,
-            supports_vision=False,
-        )
 
     def _respond(self, request: ModelCall) -> ModelResponse:
         raise NotImplementedError("FakeModelAdapter subclasses must override _respond")
 
-    async def call(self, request: ModelCall) -> ModelResponse:  # type: ignore[override]  # justify-test-fake
+    async def call(self, request: ModelCall) -> ModelResponse:
         return self._respond(request)
 
-    async def embed(  # type: ignore[override]  # justify-test-fake
-        self, texts: list[str], tier: ModelTier = ModelTier.EMBEDDING
-    ) -> list[list[float]]:
-        del tier
+    async def embed(self, texts: list[str]) -> list[list[float]]:
         # Stub: zero vectors of the configured DB-column width. Tests that
         # exercise memory writes/searches go through ``embed_text``; the
         # production adapter would hit OpenAIEmbeddingModel which the fake

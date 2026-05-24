@@ -64,7 +64,7 @@ from ariel.memory import (
 )
 from ariel.ids import new_id
 from ariel.model_adapter import ModelAdapter
-from ariel.model_tiers import ModelTier
+from ariel.models import MAIN
 from ariel.persistence import (
     ActionAttemptRecord,
     ApprovalRequestRecord,
@@ -1318,10 +1318,9 @@ def _wake(
     assistant_sources = _turn_retrieval_sources(db=db, turn_id=turn.id)
 
     # Map loop outcome to the post-loop variables.
-    main_binding = runtime.model_adapter.tier_binding(ModelTier.MAIN)
     exhausted_response: dict[str, Any] = {
-        "provider": main_binding.provider,
-        "model": main_binding.model,
+        "provider": MAIN.provider,
+        "model": MAIN.model,
         "assistant_text": "I wasn't able to finish that within the time available.",
         "assistant_silent": False,
     }

@@ -64,12 +64,6 @@ class AppSettings(BaseSettings):
     openai_base_url: str | None = None
     cloudflare_api_token: str | None = None
     cloudflare_account_id: str | None = None
-    model_tier_main: str | None = None
-    model_tier_bulk: str | None = None
-    model_tier_structured: str | None = None
-    model_tier_coding: str | None = None
-    model_tier_vision: str | None = None
-    model_tier_embedding: str | None = None
     model_timeout_seconds: float = 30.0
     model_reasoning_effort: Literal["minimal", "low", "medium", "high"] = "medium"
     # ``memory_embedding_dimensions`` is the DB column width invariant; the
@@ -181,12 +175,6 @@ class AppSettings(BaseSettings):
         "openai_base_url",
         "cloudflare_api_token",
         "cloudflare_account_id",
-        "model_tier_main",
-        "model_tier_bulk",
-        "model_tier_structured",
-        "model_tier_coding",
-        "model_tier_vision",
-        "model_tier_embedding",
         mode="before",
     )
     @classmethod

@@ -13,7 +13,6 @@ from sqlalchemy.orm import sessionmaker
 import ariel.run_runtime as run_runtime_module
 from ariel.action_runtime import RuntimeProvenance
 from ariel.model_adapter import ModelAdapter, ModelCall, ModelResponse
-from ariel.model_tiers import ModelTier
 from ariel.persistence import (
     ActionAttemptRecord,
     AIJudgmentRecord,
@@ -109,7 +108,6 @@ def _direct_function_response(
         usage=TokenUsage(input_tokens=3, output_tokens=2),
         provider=provider,
         model=model,
-        tier=ModelTier.MAIN,
         duration_ms=1,
         provider_response_id=provider_response_id,
     )

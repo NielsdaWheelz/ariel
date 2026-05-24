@@ -5,6 +5,7 @@ import json
 
 import pytest
 from pydantic import BaseModel, ValidationError
+from pydantic_ai.embeddings.base import EmbeddingModel
 from pydantic_ai.embeddings.test import TestEmbeddingModel
 from pydantic_ai.messages import (
     ModelMessage,
@@ -15,7 +16,6 @@ from pydantic_ai.messages import (
     ToolCallPart,
     UserPromptPart,
 )
-from pydantic_ai.embeddings.base import EmbeddingModel
 from pydantic_ai.models import Model
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
@@ -23,7 +23,7 @@ from pydantic_ai.usage import RequestUsage
 
 from ariel.config import AppSettings
 from ariel.model_adapter import ModelAdapter, ModelCall, ToolSpec
-from ariel.model_tiers import DEFAULT_TIERS, ModelTier, TierBinding
+from ariel.models import MAIN, ModelRef
 from ariel.response_contracts import ResponseContractViolation
 
 
@@ -60,35 +60,29 @@ class _ProbeAdapter(ModelAdapter):
         self._probe_substrate = substrate
         self._probe_embedder = embedder
 
-    def _build_model(self, binding: TierBinding) -> Model:
+    def _build_model(self, ref: ModelRef) -> Model:
         if self._probe_substrate is not None:
             return self._probe_substrate
-        return super()._build_model(binding)
+        return super()._build_model(ref)
 
-    def _build_embedder(self, binding: TierBinding) -> EmbeddingModel:
+    def _build_embedder(self, ref: ModelRef) -> EmbeddingModel:
         if self._probe_embedder is not None:
             return self._probe_embedder
-        return super()._build_embedder(binding)
+        return super()._build_embedder(ref)
 
 
 def _adapter_with(substrate: Model) -> ModelAdapter:
     return _ProbeAdapter(substrate=substrate)
 
 
-@pytest.mark.parametrize(
-    "tier",
-    [ModelTier.MAIN, ModelTier.BULK, ModelTier.STRUCTURED, ModelTier.CODING, ModelTier.VISION],
-)
-def test_call_dispatches_each_tier_to_its_binding(tier: ModelTier) -> None:
-    adapter = _adapter_with(TestModel(custom_output_text=f"hello-{tier}"))
+def test_call_routes_to_ref() -> None:
+    adapter = _adapter_with(TestModel(custom_output_text="hello"))
 
-    response = asyncio.run(adapter.call(ModelCall(tier=tier, messages=_msgs())))
+    response = asyncio.run(adapter.call(ModelCall(model=MAIN, messages=_msgs())))
 
-    binding = DEFAULT_TIERS[tier]
-    assert response.text == f"hello-{tier}"
-    assert response.provider == binding.provider
-    assert response.model == binding.model
-    assert response.tier == tier
+    assert response.text == "hello"
+    assert response.provider == MAIN.provider
+    assert response.model == MAIN.model
     assert response.tool_calls == []
     assert response.structured_output is None
     assert response.usage.input_tokens > 0
@@ -102,9 +96,7 @@ def test_call_extracts_tool_calls() -> None:
 
     adapter = _adapter_with(FunctionModel(fn))
     tools = [ToolSpec(name="lookup", description="d", parameters={"type": "object"})]
-    response = asyncio.run(
-        adapter.call(ModelCall(tier=ModelTier.MAIN, messages=_msgs(), tools=tools))
-    )
+    response = asyncio.run(adapter.call(ModelCall(model=MAIN, messages=_msgs(), tools=tools)))
 
     assert response.text is None
     assert len(response.tool_calls) == 1
@@ -120,7 +112,7 @@ def test_call_parses_string_tool_call_arguments() -> None:
         )
 
     adapter = _adapter_with(FunctionModel(fn))
-    response = asyncio.run(adapter.call(ModelCall(tier=ModelTier.MAIN, messages=_msgs())))
+    response = asyncio.run(adapter.call(ModelCall(model=MAIN, messages=_msgs())))
 
     assert response.tool_calls[0].arguments == {"q": "x"}
 
@@ -133,7 +125,7 @@ def test_call_raises_contract_violation_on_malformed_tool_args() -> None:
 
     adapter = _adapter_with(FunctionModel(fn))
     with pytest.raises(ResponseContractViolation):
-        asyncio.run(adapter.call(ModelCall(tier=ModelTier.MAIN, messages=_msgs())))
+        asyncio.run(adapter.call(ModelCall(model=MAIN, messages=_msgs())))
 
 
 def test_call_validates_structured_output() -> None:
@@ -144,7 +136,7 @@ def test_call_validates_structured_output() -> None:
 
     adapter = _adapter_with(FunctionModel(fn))
     response = asyncio.run(
-        adapter.call(ModelCall(tier=ModelTier.STRUCTURED, messages=_msgs(), response_format=_Out))
+        adapter.call(ModelCall(model=MAIN, messages=_msgs(), response_format=_Out))
     )
 
     assert isinstance(response.structured_output, _Out)
@@ -158,11 +150,7 @@ def test_call_raises_contract_violation_on_structured_output_mismatch() -> None:
 
     adapter = _adapter_with(FunctionModel(fn))
     with pytest.raises(ResponseContractViolation) as info:
-        asyncio.run(
-            adapter.call(
-                ModelCall(tier=ModelTier.STRUCTURED, messages=_msgs(), response_format=_Out)
-            )
-        )
+        asyncio.run(adapter.call(ModelCall(model=MAIN, messages=_msgs(), response_format=_Out)))
 
     assert info.value.contract == "_Out"
 
@@ -174,7 +162,7 @@ def test_call_captures_thinking_parts_as_reasoning_summary() -> None:
         )
 
     adapter = _adapter_with(FunctionModel(fn))
-    response = asyncio.run(adapter.call(ModelCall(tier=ModelTier.MAIN, messages=_msgs())))
+    response = asyncio.run(adapter.call(ModelCall(model=MAIN, messages=_msgs())))
 
     assert response.text == "answer"
     assert response.reasoning_summary == "reasoning"
@@ -194,19 +182,13 @@ def test_call_lifts_provider_response_id_and_usage_details() -> None:
         )
 
     adapter = _adapter_with(FunctionModel(fn))
-    response = asyncio.run(adapter.call(ModelCall(tier=ModelTier.MAIN, messages=_msgs())))
+    response = asyncio.run(adapter.call(ModelCall(model=MAIN, messages=_msgs())))
 
     assert response.provider_response_id == "resp_abc"
     assert response.usage.input_tokens == 12
     assert response.usage.output_tokens == 3
     assert response.usage.cached_tokens == 4
     assert response.usage.reasoning_tokens == 7
-
-
-def test_call_rejects_embedding_tier() -> None:
-    adapter = ModelAdapter(_settings())
-    with pytest.raises(ValueError, match="EMBEDDING"):
-        asyncio.run(adapter.call(ModelCall(tier=ModelTier.EMBEDDING, messages=_msgs())))
 
 
 def test_embed_returns_vector_per_input() -> None:
@@ -218,22 +200,21 @@ def test_embed_returns_vector_per_input() -> None:
     assert all(len(v) == 4 for v in vectors)
 
 
-def test_embed_rejects_non_embedding_tier() -> None:
-    adapter = ModelAdapter(_settings())
-    with pytest.raises(ValueError, match="EMBEDDING"):
-        asyncio.run(adapter.embed(["x"], tier=ModelTier.MAIN))
-
-
 def test_model_call_is_frozen() -> None:
-    call = ModelCall(tier=ModelTier.MAIN, messages=_msgs())
+    call = ModelCall(model=MAIN, messages=_msgs())
     with pytest.raises(ValidationError):
-        call.tier = ModelTier.BULK  # type: ignore[misc]  # justify-test-invariant
+        call.model = ModelRef(provider="openai", model="gpt-5")  # type: ignore[misc]  # justify-test-invariant
 
 
 def test_model_call_rejects_unknown_fields() -> None:
     with pytest.raises(ValidationError):
         ModelCall(
-            tier=ModelTier.MAIN,  # type: ignore[call-arg]  # justify-test-invariant
+            model=MAIN,
             messages=_msgs(),
-            unknown="x",
+            unknown="x",  # type: ignore[call-arg]  # justify-test-invariant
         )
+
+
+def test_model_ref_rejects_unsupported_provider() -> None:
+    with pytest.raises(ValidationError):
+        ModelRef(provider="bogus-provider", model="x")  # type: ignore[arg-type]  # justify-test-invariant

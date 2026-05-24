@@ -26,7 +26,7 @@ from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import ToolDefinition
 
 from .config import AppSettings
-from .model_tiers import ModelTier, TierBinding, resolve_tier
+from .models import EMBEDDING, ModelRef
 from .response_contracts import ResponseContractViolation
 
 
@@ -65,7 +65,7 @@ class ToolCall(BaseModel):
 class ModelCall(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
 
-    tier: ModelTier
+    model: ModelRef
     messages: list[ModelMessage]
     tools: list[ToolSpec] = []
     tool_choice: Literal["auto", "required", "none"] = "auto"
@@ -85,68 +85,49 @@ class ModelResponse(BaseModel):
     usage: TokenUsage
     provider: str
     model: str
-    tier: ModelTier
     duration_ms: int
     provider_response_id: str | None
 
 
 class ModelAdapter:
-    """Thin tier-routed adapter over Pydantic AI per-provider Models.
+    """Thin provider-routed adapter over Pydantic AI per-provider Models.
 
-    Construction resolves every tier to a single concrete substrate Model and
-    caches it. ``call`` translates an ``ModelCall`` into a pydantic-ai
-    ``Model.request``; ``embed`` dispatches to the EMBEDDING tier's
-    ``EmbeddingModel``. Callers wrap calls in their own ``evt.model.*``
-    telemetry — the adapter is pure (input → output or raised exception).
+    ``call`` translates a ``ModelCall`` into a pydantic-ai ``Model.request``;
+    ``embed`` dispatches to the ``EMBEDDING`` constant's ``EmbeddingModel``.
+    Substrate clients are built lazily and cached by ``ModelRef`` — building
+    a provider eagerly validates credentials, which would block startup when
+    (say) ``ANTHROPIC_API_KEY`` is unset even though the caller only ever
+    invokes OpenAI. Callers wrap calls in their own ``evt.model.*`` telemetry
+    — the adapter is pure (input → output or raised exception).
     """
 
     def __init__(self, settings: AppSettings) -> None:
         self._settings = settings
-        self._tiers: dict[ModelTier, TierBinding] = {
-            tier: resolve_tier(tier, self._tier_override(settings, tier)) for tier in ModelTier
-        }
-        # Lazy: building a Pydantic AI provider eagerly validates creds, which
-        # would block startup when (say) ANTHROPIC_API_KEY is unset even though
-        # the user only ever calls BULK/STRUCTURED tiers. Defer to first use.
-        self._models: dict[ModelTier, Model] = {}
+        self._models: dict[ModelRef, Model] = {}
         self._embedder: EmbeddingModel | None = None
 
-    @staticmethod
-    def _tier_override(settings: AppSettings, tier: ModelTier) -> str | None:
-        # Each tier maps 1:1 to a config field; missing creds are validated at
-        # the per-call boundary (the provider client raises if asked to dispatch
-        # without an API key).
-        return {
-            ModelTier.MAIN: settings.model_tier_main,
-            ModelTier.BULK: settings.model_tier_bulk,
-            ModelTier.STRUCTURED: settings.model_tier_structured,
-            ModelTier.CODING: settings.model_tier_coding,
-            ModelTier.VISION: settings.model_tier_vision,
-            ModelTier.EMBEDDING: settings.model_tier_embedding,
-        }[tier]
-
-    def _build_model(self, binding: TierBinding) -> Model:
+    def _build_model(self, ref: ModelRef) -> Model:
         s = self._settings
-        if binding.provider == "openai":
+        if ref.provider == "openai":
             return OpenAIResponsesModel(
-                binding.model,
+                ref.model,
                 provider=OpenAIProvider(api_key=s.openai_api_key, base_url=s.openai_base_url),
             )
-        if binding.provider == "openrouter":
+        if ref.provider == "openrouter":
             return OpenAIResponsesModel(
-                binding.model,
+                ref.model,
                 provider=OpenAIProvider(
                     api_key=s.openrouter_api_key,
                     base_url=s.openai_base_url or "https://openrouter.ai/api/v1",
                 ),
             )
-        if binding.provider == "anthropic":
+        if ref.provider == "anthropic":
             return AnthropicModel(
-                binding.model, provider=AnthropicProvider(api_key=s.anthropic_api_key)
+                ref.model, provider=AnthropicProvider(api_key=s.anthropic_api_key)
             )
-        if binding.provider == "google":
-            return GoogleModel(binding.model, provider=GoogleProvider(api_key=s.google_api_key))
-        if binding.provider == "cloudflare":
+        if ref.provider == "google":
+            return GoogleModel(ref.model, provider=GoogleProvider(api_key=s.google_api_key))
+        if ref.provider == "cloudflare":
             # Workers AI exposes only chat-completions + embeddings; the Responses
             # API is OpenAI-only. Account id lives in the URL path; auth is a
             # bearer token.
@@ -154,53 +135,43 @@ class ModelAdapter:
                 f"https://api.cloudflare.com/client/v4/accounts/{s.cloudflare_account_id}/ai/v1"
             )
             return OpenAIChatModel(
-                binding.model,
+                ref.model,
                 provider=OpenAIProvider(api_key=s.cloudflare_api_token, base_url=base_url),
             )
-        raise ValueError(f"unsupported provider {binding.provider!r} for tier model")
+        raise ValueError(f"unsupported provider {ref.provider!r}")
 
-    def _build_embedder(self, binding: TierBinding) -> EmbeddingModel:
+    def _build_embedder(self, ref: ModelRef) -> EmbeddingModel:
         s = self._settings
-        if binding.provider == "openai":
+        if ref.provider == "openai":
             return OpenAIEmbeddingModel(
-                binding.model,
+                ref.model,
                 provider=OpenAIProvider(api_key=s.openai_api_key, base_url=s.openai_base_url),
             )
-        if binding.provider == "cloudflare":
+        if ref.provider == "cloudflare":
             base_url = (
                 f"https://api.cloudflare.com/client/v4/accounts/{s.cloudflare_account_id}/ai/v1"
             )
             return OpenAIEmbeddingModel(
-                binding.model,
+                ref.model,
                 provider=OpenAIProvider(api_key=s.cloudflare_api_token, base_url=base_url),
             )
-        raise ValueError(f"EMBEDDING tier provider {binding.provider!r} not yet supported")
+        raise ValueError(f"embedding provider {ref.provider!r} not yet supported")
 
-    def tier_binding(self, tier: ModelTier) -> TierBinding:
-        """Return the resolved ``TierBinding`` for ``tier``.
-
-        Callers use this to source ``provider``/``model`` for telemetry events
-        emitted *before* the response is in hand (e.g. ``evt.model.started``).
-        """
-        return self._tiers[tier]
-
-    def _get_model(self, tier: ModelTier) -> Model:
-        model = self._models.get(tier)
+    def _get_model(self, ref: ModelRef) -> Model:
+        model = self._models.get(ref)
         if model is None:
-            model = self._build_model(self._tiers[tier])
-            self._models[tier] = model
+            model = self._build_model(ref)
+            self._models[ref] = model
         return model
 
     def _get_embedder(self) -> EmbeddingModel:
         if self._embedder is None:
-            self._embedder = self._build_embedder(self._tiers[ModelTier.EMBEDDING])
+            self._embedder = self._build_embedder(EMBEDDING)
         return self._embedder
 
     async def call(self, request: ModelCall) -> ModelResponse:
-        if request.tier is ModelTier.EMBEDDING:
-            raise ValueError("EMBEDDING tier is dispatched via .embed(), not .call()")
-        binding = self._tiers[request.tier]
-        model = self._get_model(request.tier)
+        ref = request.model
+        model = self._get_model(ref)
 
         function_tools = [
             ToolDefinition(
@@ -235,7 +206,6 @@ class ModelAdapter:
         return self._build_response(
             raw=raw,
             request=request,
-            binding=binding,
             duration_ms=duration_ms,
         )
 
@@ -244,7 +214,6 @@ class ModelAdapter:
         *,
         raw: _PydAIModelResponse,
         request: ModelCall,
-        binding: TierBinding,
         duration_ms: int,
     ) -> ModelResponse:
         text_parts: list[str] = []
@@ -300,17 +269,12 @@ class ModelAdapter:
                 reasoning_tokens=usage.details.get("reasoning_tokens", 0),
                 cached_tokens=usage.cache_read_tokens,
             ),
-            provider=binding.provider,
-            model=binding.model,
-            tier=request.tier,
+            provider=request.model.provider,
+            model=request.model.model,
             duration_ms=duration_ms,
             provider_response_id=raw.provider_response_id,
         )
 
-    async def embed(
-        self, texts: list[str], tier: ModelTier = ModelTier.EMBEDDING
-    ) -> list[list[float]]:
-        if tier is not ModelTier.EMBEDDING:
-            raise ValueError(f"embed() requires EMBEDDING tier (got {tier!r})")
+    async def embed(self, texts: list[str]) -> list[list[float]]:
         result = await self._get_embedder().embed(texts, input_type="document")
         return [list(vec) for vec in result.embeddings]

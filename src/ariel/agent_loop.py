@@ -59,11 +59,11 @@ from .model_adapter import (
     ModelCall,
     ModelMessage,
     ModelResponse,
-    ModelTier,
     ReasoningConfig,
     ToolCall,
     ToolSpec,
 )
+from .models import MAIN
 from .persistence import ActionAttemptRecord, TurnRecord
 from .run_runtime import (
     ScratchEntry,
@@ -327,13 +327,12 @@ def run_agent_loop(
         else:
             messages[budget_item_index] = budget_line
 
-        binding = model_adapter.tier_binding(ModelTier.MAIN)
         model_call_count += 1
         add_event(
             "evt.model.started",
             {
-                "provider": binding.provider,
-                "model": binding.model,
+                "provider": MAIN.provider,
+                "model": MAIN.model,
                 "model_call_count": model_call_count,
             },
         )
@@ -346,7 +345,7 @@ def run_agent_loop(
             candidate_response = asyncio.run(
                 model_adapter.call(
                     ModelCall(
-                        tier=ModelTier.MAIN,
+                        model=MAIN,
                         messages=messages,
                         tools=tools,
                         tool_choice="auto",
@@ -379,8 +378,8 @@ def run_agent_loop(
             add_event(
                 "evt.model.failed",
                 {
-                    "provider": binding.provider,
-                    "model": binding.model,
+                    "provider": MAIN.provider,
+                    "model": MAIN.model,
                     "duration_ms": duration_ms,
                     "failure_reason": getattr(exc, "safe_reason", str(exc)),
                     "model_call_count": model_call_count,
