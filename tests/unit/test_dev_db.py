@@ -47,6 +47,45 @@ def test_load_local_env_prefers_env_file_then_os_env(tmp_path: Path) -> None:
     assert merged["ARIEL_MODEL_NAME"] == "echo-v2"
 
 
+def test_load_local_env_honors_ariel_env_file_override(tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text("ARIEL_DATABASE_URL=prod-url\n")
+    (tmp_path / ".env.local").write_text("ARIEL_DATABASE_URL=prod-url\n")
+    (tmp_path / ".env.dev").write_text("ARIEL_DATABASE_URL=dev-url\n")
+
+    merged = load_local_env(
+        tmp_path,
+        environ={"ARIEL_ENV_FILE": ".env.dev"},
+    )
+
+    assert merged["ARIEL_DATABASE_URL"] == "dev-url"
+    assert merged["ARIEL_ENV_FILE"] == ".env.dev"
+
+
+def test_load_local_env_ariel_env_file_override_accepts_absolute_path(tmp_path: Path) -> None:
+    env_file = tmp_path / "custom.env"
+    env_file.write_text("ARIEL_DATABASE_URL=custom-url\n")
+    # .env.local should be bypassed.
+    (tmp_path / ".env.local").write_text("ARIEL_DATABASE_URL=prod-url\n")
+
+    merged = load_local_env(
+        tmp_path,
+        environ={"ARIEL_ENV_FILE": str(env_file)},
+    )
+
+    assert merged["ARIEL_DATABASE_URL"] == "custom-url"
+
+
+def test_load_local_env_ignores_blank_ariel_env_file(tmp_path: Path) -> None:
+    (tmp_path / ".env.local").write_text("ARIEL_DATABASE_URL=prod-url\n")
+
+    merged = load_local_env(
+        tmp_path,
+        environ={"ARIEL_ENV_FILE": "   "},
+    )
+
+    assert merged["ARIEL_DATABASE_URL"] == "prod-url"
+
+
 def test_resolve_local_postgres_runtime_uses_connection_string_values() -> None:
     runtime = resolve_local_postgres_runtime(
         {

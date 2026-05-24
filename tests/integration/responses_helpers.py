@@ -15,9 +15,9 @@ from ariel.action_runtime import (
     process_action_execution_task,
     process_one_call,
 )
-from ariel.app import _new_id, _utcnow
-from ariel.config import MEMORY_EMBEDDING_DIMENSIONS
+from ariel.clock import utcnow
 from ariel.google_connector import GoogleConnectorRuntime
+from ariel.ids import new_id
 from ariel.model_adapter import (
     ModelAdapter,
     ModelCall,
@@ -28,7 +28,7 @@ from ariel.model_adapter import (
     TokenUsage,
 )
 from ariel.model_tiers import TierBinding
-from ariel.persistence import BackgroundTaskRecord, TurnRecord
+from ariel.persistence import MEMORY_EMBEDDING_DIMENSIONS, BackgroundTaskRecord, TurnRecord
 from ariel.worker import process_one_task
 
 
@@ -53,7 +53,7 @@ def post_message_and_drain(
     Queries TurnRecord without filtering by session_id so rotation tests work
     correctly (the new session's turn is still found).
     """
-    posted_at = _utcnow()
+    posted_at = utcnow()
     body: dict[str, Any] = {"message": message}
     if json_extra:
         body.update(json_extra)
@@ -67,19 +67,7 @@ def post_message_and_drain(
 
     app_state = cast(Any, client.app).state
     runtime = app_state.runtime
-
-    for _ in range(20):
-        process_one_task(
-            session_factory=runtime.session_factory,
-            settings=runtime.settings,
-            runtime=runtime,
-        )
-        with runtime.session_factory() as db:
-            still_pending = db.get(BackgroundTaskRecord, task_id)
-        if still_pending is None:
-            break
-    else:
-        raise AssertionError(f"task {task_id} was not consumed after 20 process_one_task calls")
+    drain_task(client, task_id)
 
     with runtime.session_factory() as db:
         turn = db.scalar(
@@ -234,7 +222,6 @@ def responses_run_message(
     output_tokens: int = 1,
 ) -> ModelResponse:
     return responses_with_run_calls(
-        assistant_text=assistant_text,
         calls=[{"name": "agent.emit_message", "input": {"text": assistant_text}}],
         provider=provider,
         model=model,
@@ -266,7 +253,6 @@ def run_program_source_from_calls(calls: list[dict[str, Any]]) -> str:
 
 def responses_with_run_calls(
     *,
-    assistant_text: str,
     calls: list[dict[str, Any]],
     provider: str,
     model: str,
@@ -274,7 +260,6 @@ def responses_with_run_calls(
     input_tokens: int = 1,
     output_tokens: int = 1,
 ) -> ModelResponse:
-    del assistant_text
     if not calls:
         raise AssertionError("responses_with_run_calls requires at least one run call")
     return _build_response(
@@ -374,19 +359,13 @@ def _detect_memory_subsystem(messages: list[ModelMessage]) -> str | None:
     return None
 
 
-def is_retriever_call(messages: list[ModelMessage]) -> bool:
+def is_memory_subsystem_call(messages: list[ModelMessage]) -> bool:
     """Detects a memory subsystem model call by its system prompt.
 
-    Catches all three memory configurations of ``run_agent_loop``: the
-    pre-turn retriever (``Ariel's memory retriever``), the agent-invoked
-    encoder (``Ariel's memory encoder``), and the scheduled dreamer
-    (``Ariel's memory dreamer``). Tests that filter retriever calls also need
-    to filter rememberer calls, because the worker's ``memory_dream`` task is
-    enqueued by ``enqueue_due_memory_dream`` on every ``process_one_task``
-    and runs in the same drain loop as ``user_message`` tasks.
-
-    The name remains ``is_retriever_call`` for callsite compatibility; the
-    contract is "memory-subsystem call, return a synthesized done response."
+    Catches the three memory model-call prompts used by the two memory drivers:
+    the pre-turn retriever (``Ariel's memory retriever``), the agent-invoked
+    rememberer encode prompt (``Ariel's memory encoder``), and the scheduled
+    rememberer dream prompt (``Ariel's memory dreamer``).
     """
     return _detect_memory_subsystem(messages) is not None
 
@@ -395,21 +374,21 @@ def empty_recall_response(
     *,
     provider: str,
     model: str,
+    messages: list[ModelMessage],
     provider_response_id: str | None = None,
-    messages: list[ModelMessage] | None = None,
 ) -> ModelResponse:
     """A canned response that exits a memory-subsystem loop immediately.
 
     For the retriever (``output_mode='finding'``) the program emits an empty
     ``recall_v1`` finding; for the encoder / dreamer (``output_mode='operations'``)
-    it calls ``agent.emit_done``. The configuration is sniffed from
-    ``messages`` when supplied; the retriever finding is the safe default
-    for the original callers that pre-date the rememberer.
+    it calls ``agent.emit_done``. The memory prompt kind is sniffed from
+    ``messages``; the retriever finding is the safe default when no memory
+    subsystem prompt is present.
 
     Lets tests' canned-response queues stay focused on the main agent.
     """
     rid = provider_response_id or "resp_retriever_empty"
-    config = _detect_memory_subsystem(messages) if messages is not None else "retriever"
+    config = _detect_memory_subsystem(messages)
     if config in ("encoder", "dreamer"):
         program = "agent.emit_done(summary='')"
     else:
@@ -495,6 +474,6 @@ def process_queued_action_execution(client: TestClient, approval_payload: dict[s
             ),
         ),
         agency_runtime=None,
-        now_fn=_utcnow,
-        new_id_fn=_new_id,
+        now_fn=utcnow,
+        new_id_fn=new_id,
     )

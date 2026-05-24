@@ -4,7 +4,6 @@ import asyncio
 from typing import Any, cast
 
 import discord
-from fastapi.testclient import TestClient
 import httpx
 import pytest
 
@@ -25,31 +24,6 @@ from ariel.discord_bot import (
     submit_discord_turn,
     _is_ariel_custom_id,
 )
-from tests.fake_sandbox import FakeSandboxRuntime
-from tests.integration.responses_helpers import (
-    FakeModelAdapter,
-    empty_recall_response,
-    is_retriever_call,
-    responses_run_message,
-)
-from ariel.model_adapter import ModelCall, ModelResponse
-
-
-class StaticModelAdapter(FakeModelAdapter):
-    provider = "test.responses"
-    model = "test-model"
-
-    def _respond(self, request: ModelCall) -> ModelResponse:
-        if is_retriever_call(request.messages):
-            return empty_recall_response(
-                provider=self.provider, model=self.model, messages=request.messages
-            )
-        return responses_run_message(
-            assistant_text="ok",
-            provider=self.provider,
-            model=self.model,
-            provider_response_id="resp_test",
-        )
 
 
 class FakeHttpClient:
@@ -367,18 +341,6 @@ def test_discord_bot_registers_only_deterministic_ops_slash_commands() -> None:
     assert bot.tree.get_command("jobs") is not None
     assert bot.tree.get_command("capture") is not None
 
-    removed_memory_commands = (
-        "memory",
-        "memory-inbox",
-        "memory-recall",
-        "memory-conflicts",
-        "memory-consolidate",
-        "memory-export",
-        "memory-no",
-    )
-    for command_name in removed_memory_commands:
-        assert bot.tree.get_command(command_name) is None
-
 
 def test_format_discord_message_truncates_to_safe_size() -> None:
     formatted = format_discord_message("x" * 2000)
@@ -553,7 +515,7 @@ def test_refresh_job_fetches_job_and_events(monkeypatch: pytest.MonkeyPatch) -> 
                         "job": {
                             "id": "job_123",
                             "status": "completed",
-                            "title": "Agency bridge",
+                            "title": "Draft release notes",
                             "summary": "done",
                         },
                     },
@@ -581,7 +543,7 @@ def test_refresh_job_fetches_job_and_events(monkeypatch: pytest.MonkeyPatch) -> 
     message = refresh_job(ariel_base_url="http://127.0.0.1:8000", job_id="job_123")
 
     assert "Job job_123: completed" in message
-    assert "Agency bridge" in message
+    assert "Draft release notes" in message
     assert "- completed at 2026-04-27T12:00:00Z" in message
     assert fake_clients[0].calls[:2] == [
         {"method": "GET", "url": "http://127.0.0.1:8000/v1/jobs/job_123"},
@@ -646,7 +608,13 @@ def test_jobs_command_fetches_job_list(monkeypatch: pytest.MonkeyPatch) -> None:
                     200,
                     json={
                         "ok": True,
-                        "jobs": [{"id": "job_123", "status": "running", "title": "Agency bridge"}],
+                        "jobs": [
+                            {
+                                "id": "job_123",
+                                "status": "running",
+                                "title": "Draft release notes",
+                            }
+                        ],
                     },
                 )
             ]
@@ -658,7 +626,7 @@ def test_jobs_command_fetches_job_list(monkeypatch: pytest.MonkeyPatch) -> None:
 
     message = list_jobs(ariel_base_url="http://127.0.0.1:8000")
 
-    assert message == "Recent jobs:\n- job_123: running: Agency bridge"
+    assert message == "Recent jobs:\n- job_123: running: Draft release notes"
     assert fake_clients[0].calls == [
         {"method": "GET", "url": "http://127.0.0.1:8000/v1/jobs?limit=10"}
     ]
@@ -677,7 +645,7 @@ def test_capture_command_records_capture_without_message_endpoint(
                     200,
                     json={
                         "ok": True,
-                        "capture": {"id": "cpt_123", "terminal_state": "turn_created"},
+                        "capture": {"id": "cpt_123"},
                     },
                 )
             ]
@@ -693,7 +661,7 @@ def test_capture_command_records_capture_without_message_endpoint(
         discord_interaction_id=987,
     )
 
-    assert message == "Capture recorded: cpt_123 (turn_created)"
+    assert message == "Capture recorded: cpt_123"
     assert fake_clients[0].calls == [
         {
             "method": "POST",
@@ -757,7 +725,7 @@ def test_slash_capture_sends_ephemeral_deterministic_response(
                 "discord_interaction_id": discord_interaction_id,
             }
         )
-        return "Capture recorded: cpt_123 (turn_created)"
+        return "Capture recorded: cpt_123"
 
     monkeypatch.setattr("ariel.discord_bot.record_capture", fake_record_capture)
     bot = _bot()
@@ -774,7 +742,7 @@ def test_slash_capture_sends_ephemeral_deterministic_response(
         }
     ]
     assert interaction.response.deferrals == [{"thinking": True, "ephemeral": True}]
-    assert interaction.followup.messages[0]["content"] == "Capture recorded: cpt_123 (turn_created)"
+    assert interaction.followup.messages[0]["content"] == "Capture recorded: cpt_123"
     assert interaction.followup.messages[0]["ephemeral"] is True
 
 
@@ -1014,7 +982,7 @@ def test_on_message_answers_attachment_only_home_guild_message(
     assert message.replies == []
 
 
-def test_on_message_sends_legacy_approval_text_as_prompt(
+def test_on_message_forwards_approval_decision_text_as_prompt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = _stub_discord_turn(monkeypatch)
@@ -1139,28 +1107,6 @@ def test_on_message_ignores_other_server_unmentioned_message(
 
     assert calls == []
     assert message.replies == []
-
-
-def test_root_is_discord_primary_status_not_phone_chat() -> None:
-    from ariel.app import create_app
-
-    app = create_app(
-        database_url="sqlite+pysqlite:///:memory:",
-        model_adapter=StaticModelAdapter(),
-        sandbox=FakeSandboxRuntime(),
-    )
-    with TestClient(app) as client:
-        response = client.get("/")
-
-    assert response.status_code == 200
-    assert response.headers["content-type"].startswith("application/json")
-    payload = response.json()
-    assert payload["ok"] is True
-    assert payload["surface"] == "discord"
-    assert "Discord" in payload["message"]
-    assert payload["api"]["active_session"] == "/v1/sessions/active"
-    assert "chat-form" not in response.text
-    assert "/v1/sessions/${sessionId}/events" not in response.text
 
 
 @pytest.mark.parametrize(

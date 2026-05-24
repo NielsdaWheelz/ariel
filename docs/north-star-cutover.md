@@ -7,7 +7,7 @@ architecture north-star.
 
 It converts the repository-wide rules in [ai-first.md](ai-first.md) into an
 implementation spec for this codebase. The `run` execution model is narrowed by
-[run-program-cutover.md](run-program-cutover.md).
+[modules/agent-loop.md](modules/agent-loop.md).
 
 The cutover is intentionally incompatible with the current broad tool-catalog
 runtime. There is no compatibility layer, no legacy mode, no fallback path, and
@@ -152,8 +152,8 @@ relevance score. Fields and docs must not imply otherwise.
 
 ### Runtime Flow
 
-Normal user turn (as of the agent-loop cutover — turns are async and
-worker-run; the HTTP ingress enqueues and returns 202):
+Normal user turn (turns are async and worker-run; the HTTP ingress enqueues and
+returns 202):
 
 1. Discord/API message arrives; the ingress endpoint enqueues a
    `user_message` task on `background_tasks` and returns 202.
@@ -208,8 +208,8 @@ Current module ownership:
 - `src/ariel/worker.py`: the single-threaded `background_tasks` worker —
   scheduled-wake dispatch, provider push/poll ingestion, and shared background
   tasks.
-- `src/ariel/memory.py`: the fact store, the profile and digest documents, and
-  the retriever and rememberer subagents.
+- `src/ariel/memory.py`: the two-layer memory substrate (`memory_log`,
+  `memory_notes`), retriever, and rememberer drivers.
 - `src/ariel/discord_bot.py`: Discord presentation and deterministic operator
   commands.
 
@@ -379,7 +379,7 @@ The cutover is complete only when all of these are true:
 - The single `run` tool can become an unaudited execution surface. Mitigation:
   the program runs in a gVisor sandbox, every effect is a typed syscall through
   policy and approval, output is bounded, and action attempts are durable. See
-  [run-program-cutover.md](run-program-cutover.md).
+  [modules/agent-loop.md](modules/agent-loop.md).
 - Agency can become too broad. Mitigation: sandbox, egress, approval, transcript,
   and outbox receipts are required before terminal-first is safe.
 - Tests can preserve legacy shape accidentally. Mitigation: write failing
@@ -393,18 +393,23 @@ The cutover is complete only when all of these are true:
 
 ## Source Findings
 
-This spec is based on the May 2026 code survey of:
+This spec is based on the May 2026 code survey of the live north-star owners
+and module docs:
 
 - `src/ariel/app.py`
 - `src/ariel/capability_registry.py`
 - `src/ariel/action_runtime.py`
-- `src/ariel/proactivity.py`
 - `src/ariel/memory.py`
+- `src/ariel/worker.py`
+- `src/ariel/sync_runtime.py`
+- `src/ariel/pubsub_subscriber.py`
+- `src/ariel/google_connector.py`
 - `src/ariel/agency_daemon.py`
 - `src/ariel/discord_bot.py`
 - `src/ariel/executor.py`
 - `src/ariel/policy_engine.py`
 - `src/ariel/config.py`
+- `docs/modules/proactivity.md`
 - current unit and integration tests
 
 The implemented cutover must stay guarded against regressions in these areas:
@@ -415,5 +420,6 @@ The implemented cutover must stay guarded against regressions in these areas:
 - Agency PR requests losing receipt-derived idempotency IDs
 - authority-bearing local routes bypassing bearer auth
 - Discord copy exposing internal capability IDs
-- a proactive wake reintroducing a duplicate action or `remember` shape outside
+- a proactive wake reintroducing deleted proactivity, workspace-reasoning, or
+  attention-ranking modules, or a duplicate action or `remember` shape outside
   the capability system

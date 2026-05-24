@@ -1,32 +1,32 @@
-# Attachment Content Hard Cutover
+# Attachments
 
 ## Scope
 
-This doc owns the target architecture for turning user-supplied attachment
+This doc owns attachment content handling: turning user-supplied attachment
 references into model-usable evidence. It covers Discord attachments first, but
-the product surface is transport-neutral: the assistant reads an attachment, not
-"a Discord CDN URL".
+the product surface is transport-neutral: the assistant reads an attachment,
+not "a Discord CDN URL".
 
-This doc supersedes the current metadata-only attachment behavior for any user
-intent that clearly requires attachment content.
+When user intent clearly requires attachment content, metadata-only context is
+only a pre-read reference surface; content-dependent answers go through the
+attachment-read capability.
 
 Attachment handling follows [../ai-first.md](../ai-first.md): the model decides
 whether attachment content is needed and how to use it; deterministic services
-own acquisition, authorization, scanning, extraction limits, taint, provenance,
-and typed failures.
+own acquisition, authorization, scanner-mode gating, extraction limits, taint,
+provenance, and typed failures.
 
-## Cutover Policy
+## Current Contract
 
-- Ship as a hard cutover.
-- Do not preserve the old behavior where Ariel can only mention attachment
-  filenames, sizes, content types, or URLs when content is required.
-- Do not add a legacy metadata-only fallback path.
-- Do not support old request aliases or compatibility fields once the cutover
-  lands.
+- Do not answer content-required requests using only attachment filenames,
+  sizes, content types, or URLs.
+- Do not add metadata-only answer paths for content-required requests.
+- Keep the attachment-read input shape narrow: attachment reference plus intent.
 - Do not pass Discord attachment URLs or raw bytes directly to the model as
   ambient context.
-- Fail closed with a typed attachment-read outcome when acquisition, scanning,
-  extraction, permission checks, or provider processing cannot complete.
+- Fail closed with a typed attachment-read outcome when acquisition,
+  scanner-mode gating, extraction, permission checks, or provider processing
+  blocks a read.
 - Keep metadata-only attachment context only as a pre-read reference surface,
   so the model can decide whether to call the attachment-read capability.
 
@@ -59,10 +59,11 @@ and typed failures.
   URL.
 - The model chooses whether the `run` program should invoke the `attachment.read`
   callable to inspect content. Internally, that maps to `cap.attachment.read`.
-- The read capability performs authorization, acquisition, validation, malware
-  scanning, extraction, artifact persistence, and provenance creation.
-- Extracted text, OCR, image observations, and transcripts are returned as
-  bounded tool output, never as system instructions.
+- The read capability performs authorization, acquisition, validation,
+  scanner-mode gating, extraction, source/blob/extraction persistence, and
+  provenance creation.
+- Extracted attachment content is returned as bounded text blocks, never as
+  system instructions.
 - The action runtime treats attachment content as untrusted file evidence and
   records retrieval provenance in the same grounded-answer path used by web and
   Drive reads.
@@ -76,13 +77,14 @@ and typed failures.
 - Keep Discord transport code responsible for delivery and reference capture
   only.
 - Keep acquisition and extraction isolated from prompt assembly.
-- Preserve provenance from user message to attachment blob to extracted block
-  to final answer.
-- Respect attachment permissions, home-guild/user boundaries, retention, and
-  data minimization.
+- Preserve durable source, blob, and extraction linkage, and carry runtime
+  provenance into retrieval-artifact handling.
+- Respect attachment permissions, home-guild/user boundaries, acquisition-handle
+  expiry, and data minimization.
 - Treat all attachment content as untrusted input.
-- Bound every resource dimension: bytes, pages, image pixels, audio duration,
-  wall time, extraction output, chunks, and citations.
+- Bound implemented resource dimensions: bytes, wall time, extracted block
+  count, extracted text length, provider calls, and retrieval-artifact
+  candidates.
 - Make failure explicit and recoverable instead of hiding it behind generic
   model text.
 
@@ -95,9 +97,9 @@ and typed failures.
 - No arbitrary URL fetch tool exposed through attachment reading.
 - No Discord CDN URL as canonical storage.
 - No provider-hosted file object as Ariel's canonical record of the attachment.
-- No compatibility mode for old metadata-only answer behavior.
+- No metadata-only answer path for content-required requests.
 - No broad document-management system, shared-drive sync, or full enterprise
-  RAG platform in this cutover.
+  RAG platform in attachment reading.
 
 ## Reference Model
 
@@ -117,7 +119,7 @@ systems:
 
 ## Structure
 
-The final system is split into clear ownership layers:
+The attachment system is split into clear ownership layers:
 
 - Transport reference surface: Discord captures attachment facts and Ariel
   attachment references.
@@ -125,11 +127,13 @@ The final system is split into clear ownership layers:
   without content or raw download URLs.
 - Capability surface: `cap.attachment.read` is the single internal operation for
   attachment inspection.
-- Attachment content service: acquisition, validation, scanning, storage, and
-  extraction orchestration.
+- Attachment content service: acquisition, validation, scanner-mode gating,
+  storage, and extraction orchestration.
 - Blob and extraction stores: Ariel-owned durable evidence records.
-- Modality extractors: document, image, and audio adapters with bounded outputs.
-- Runtime provenance: retrieval artifacts, citations, and taint propagation.
+- Modality extractors: local text, PDF/document, image, and audio extraction
+  paths with bounded text outputs.
+- Runtime provenance: retrieval artifacts, citation candidates, and taint
+  propagation.
 - Policy: permission checks, side-effect gating, and memory-write prevention.
 
 The primary data flow is:
@@ -139,10 +143,11 @@ The primary data flow is:
    user/session boundary.
 3. The model sees the reference and invokes `attachment.read` inside `run`
    only when content is needed.
-4. The capability resolves, authorizes, fetches, scans, stores, and extracts the
-   attachment.
-5. Extracted blocks return as bounded tainted tool output with source anchors.
-6. The final answer cites attachment artifacts or reports a typed read failure.
+4. The capability resolves, authorizes, fetches, applies scanner-mode gating,
+   stores, and extracts the attachment.
+5. Extracted blocks return as bounded tainted tool output with source metadata.
+6. The final answer can cite persisted retrieval artifacts or report a typed
+   read failure.
 
 ## Architecture
 
@@ -177,10 +182,10 @@ attachment's identity.
 - The model cannot see or choose an arbitrary download URL.
 - Clear content-read intents are expected to make the model invoke
   `attachment.read` inside `run` before a grounded answer. Deterministic code
-  validates the call and enforces authorization, scanning, extraction limits,
-  taint, and provenance.
+  validates the call and enforces authorization, scanner-mode gating,
+  extraction limits, taint, and provenance.
 
-The old text-only context that lists `url=...` is removed.
+Model-visible attachment context does not include `url=...` entries.
 
 ### Layer 3: Attachment Read Capability
 
@@ -190,45 +195,50 @@ The old text-only context that lists `url=...` is removed.
 - Input: `attachment_ref` and a narrow intent: `summarize`, `ocr`,
   `transcribe`, `extract_text`, or `answer`
 - Output: typed status, normalized artifact metadata, bounded extracted blocks,
-  citations, and runtime provenance
+  retrieval-source candidates, and runtime provenance
 
 The capability accepts only attachment references produced by Ariel ingress. It
 does not accept user-provided URLs or filesystem paths.
 
 ### Layer 4: Acquisition and Storage
 
-New attachment-content code owns acquisition and persistence:
+Attachment-content code owns acquisition and persistence:
 
 - Resolve the reference to a permitted Discord attachment handle.
 - Verify the source message belongs to the active user/session boundary.
 - Fetch with strict host allowlisting, redirect limits, byte limits, and
   timeout limits.
 - Sniff content from bytes; extension and declared content type are advisory.
-- Scan before extraction.
+- Apply scanner-mode gating before extraction: `fail_closed` returns
+  `scan_failed` for newly fetched blobs; `disabled` stores them as clean with
+  the `disabled-development` scanner-version marker.
 - Store bytes in a configured content-addressed blob store keyed by hash.
-- Store metadata, source linkage, scan status, extraction status, and retention
-  policy in Postgres.
+- Store metadata, source linkage, scan-gate status, extraction status,
+  acquisition-handle expiry, and blob deletion markers in Postgres.
 - Never store raw bytes in message events, assistant context, logs, or
   retrieval summaries.
 
-Production requires an explicit blob-store and scanner configuration. Tests can
-use fakes. Development can use a local configured store, but there is no
-implicit temporary-directory fallback.
+Runtime uses configured blob-store path and scanner mode. Scanner behavior is
+controlled by `attachment_scanner_mode`, which accepts only `fail_closed` and
+`disabled`; there is no separate scanner backend configuration. Tests can use
+fakes. Development can use a local configured store, but there is no implicit
+temporary directory.
 
 ### Layer 5: Modality Extractors
 
 Attachment extraction is modality-specific and behind the capability boundary.
 
-- Documents and text: parse text, PDFs, and supported office formats into
-  bounded text blocks with page or section provenance.
-- Images: run OCR and visual understanding into bounded observations, object
-  descriptions, and OCR blocks with image-region provenance when available.
-- Audio: transcribe supported audio files into timestamped transcript blocks
-  and diarization labels when the provider supports them.
+- Text: parse text-like files locally into bounded text blocks.
+- Documents: parse PDFs locally when possible, then use the configured provider
+  path for document extraction into bounded text blocks.
+- Images: use local SVG text extraction when possible, then use the configured
+  provider path for visual extraction into bounded text blocks.
+- Audio: use the configured audio transcription provider and return bounded
+  text blocks.
 - Unsupported types return `unsupported_type`.
 - Oversized or over-budget inputs return `too_large` or `resource_limit`.
 - Provider failures return typed transient outcomes and do not produce partial
-  uncited answers.
+  final answers.
 
 Provider-native multimodal input is an implementation detail of an extractor.
 It is not the app architecture and is not exposed through Discord transport.
@@ -238,13 +248,15 @@ It is not the app architecture and is not exposed through Discord transport.
 `src/ariel/action_runtime.py` treats successful attachment reads as retrieval
 evidence:
 
-- Persist a retrieval artifact for every successful read.
-- Preserve the source chain from Discord message to attachment reference to blob
-  hash to extracted block.
+- Persist retrieval artifacts for successful reads while response citation
+  budget remains.
+- Persist source/blob/extraction records that can be joined for provenance,
+  surface retrieval artifacts as response sources, and carry tainted runtime
+  provenance forward.
 - Mark runtime provenance as tainted because attachment content is untrusted
   file content.
 - Feed bounded extracted blocks back to the model as tool output.
-- Require final answers to cite the artifact/source blocks they used.
+- Make persisted retrieval artifacts available for cited final answers.
 - Keep taint on any later action proposal influenced by attachment content.
 - Do not synthesize final attachment answers deterministically from extracted
   blocks. The model authors the answer from audited tool output or the turn
@@ -266,7 +278,7 @@ Drive, and prior tool output:
 
 ## Data Model
 
-The final schema should separate source references, blobs, and extractions.
+The schema separates source references, blobs, and extractions.
 
 ### Attachment Source Record
 
@@ -276,7 +288,8 @@ The final schema should separate source references, blobs, and extractions.
 - Filename and declared metadata
 - Opaque reference id
 - Encrypted transient acquisition handle when still valid
-- Retention and deletion timestamps
+- Acquisition expiry
+- Linked blob id when bytes have been acquired
 
 ### Attachment Blob Record
 
@@ -285,7 +298,7 @@ The final schema should separate source references, blobs, and extractions.
 - Storage key
 - Size
 - Sniffed MIME type
-- Scan status and scanner version
+- Scan-gate status and scanner mode/version marker
 - Created/deleted timestamps
 
 ### Attachment Extraction Record
@@ -296,7 +309,8 @@ The final schema should separate source references, blobs, and extractions.
 - Extractor and version
 - Status
 - Bounded structured blocks
-- Citation anchors, such as page, section, image region, or audio timestamp
+- Citation-anchor storage exists, but current extractors do not populate page,
+  region, or timestamp anchors
 - Provider request metadata without raw content
 
 Existing `ArtifactRecord` remains the answer/provenance surface. Attachment
@@ -311,19 +325,20 @@ tables own source bytes and extraction lifecycle.
 - Do not answer content questions from metadata.
 - Do not treat filenames, extensions, or declared content types as proof of
   modality.
-- Do not extract unscanned bytes in production.
+- Do not extract newly fetched bytes when `attachment_scanner_mode` is
+  `fail_closed`.
 - Do not send raw file content to non-extractor paths.
 - Do not write attachment-derived facts to memory unless the memory flow is
   explicitly invoked and provenance is preserved.
 - Do not let attachment content choose tools, recipients, permissions, or
   policy.
-- Do not keep partial legacy tests that assert `"Uploaded attachment(s)."` as a
-  complete assistant behavior.
+- Do not keep tests that assert `"Uploaded attachment(s)."` as a complete
+  assistant behavior.
 - Do not silently degrade to metadata-only answers after read failure.
 
-## Files
+## Owned Surfaces
 
-Implementation should touch these files deliberately:
+Attachment behavior is owned by these surfaces:
 
 - `docs/modules/attachments.md`: this spec
 - `docs/modules/index.md`: module-doc index
@@ -337,13 +352,13 @@ Implementation should touch these files deliberately:
 - `src/ariel/capability_registry.py`: `cap.attachment.read`
 - `src/ariel/action_runtime.py`: retrieval artifact and taint integration
 - `src/ariel/persistence.py`: attachment tables and artifact integration
-- `src/ariel/attachment_content.py`: acquisition, scanning gate, blob storage,
+- `src/ariel/attachment_content.py`: acquisition, scanner-mode gate, blob storage,
   extraction, typed outcomes, and runtime provenance
-- `alembic/versions/`: hard-cutover schema migration
+- `alembic/versions/`: schema migrations
 - `tests/unit/test_discord_bot.py`: reference capture and no blind ingestion
 - `tests/unit/test_responses_tool_contract.py`: strict tool schema
-- `tests/integration/test_pr01_acceptance.py`: Discord message behavior
-- New integration tests for image, document, audio, failure, and taint cases
+- `tests/integration/test_discord_message_acceptance.py`: Discord message behavior
+- Integration coverage for image, document, audio, failure, and taint cases
 
 ## Key Decisions
 
@@ -370,15 +385,37 @@ Implementation should touch these files deliberately:
    If content is needed and cannot be read, the user should see why.
 
 7. Keep attachment-only messages intent-gated.
-   Hard cutover does not mean blind ingestion. It means clear content intents
+   Intent gating does not mean blind ingestion. It means clear content intents
    cannot be satisfied by metadata-only behavior.
 
-8. Cut over tests and docs in the same change.
-   Old tests that encode metadata-only behavior are removed or rewritten.
+8. Keep tests and docs aligned with the current contract.
+   Tests that encode metadata-only answers for content-required requests are
+   removed or rewritten.
 
-## Acceptance Criteria
+## Acceptance Coverage
 
-### Behavior
+### Current Coverage
+
+- Unit tests cover Discord reference capture without URL rendering.
+- Unit tests cover strict `cap.attachment.read` input validation.
+- Unit tests cover the runtime attachment-read execution path and taint
+  propagation.
+- Integration coverage proves PDF attachments are available to the model as
+  opaque references without raw URL exposure.
+- Integration coverage proves the text attachment read path invokes
+  `attachment.read`, fetches Discord bytes, returns bounded text blocks,
+  persists durable output without raw URLs, and produces a cited answer.
+
+### Target Coverage
+
+- Image, PDF/document, and audio success paths are covered end to end.
+- Prompt-injection text embedded inside an attachment stays untrusted.
+- Side-effect proposals influenced by attachment content remain tainted.
+- Attachment read failures cover unsupported, too-large, expired, unavailable,
+  unsafe, scan-failed, extraction-failed, timeout, and provider-unavailable
+  outcomes.
+
+### Target Behavior
 
 - A Discord message with an image attachment and "what is in this?" causes
   `attachment.read` before Ariel answers.
@@ -393,77 +430,36 @@ Implementation should touch these files deliberately:
 - Successful attachment answers cite source artifacts.
 - Failed attachment reads surface typed user-visible outcomes.
 
-### Security
+### Target Security
 
 - Model-visible context never contains raw Discord attachment URLs.
 - `cap.attachment.read` rejects arbitrary URLs, paths, and stale refs.
 - The read path enforces user/session/source boundaries.
-- Production extraction refuses unscanned bytes.
+- With `attachment_scanner_mode=fail_closed`, newly fetched blobs return
+  `scan_failed` before extraction.
 - MIME sniffing controls extractor selection.
 - Attachment content appears in tool output or artifacts, not system messages.
 - Tainted attachment content cannot silently trigger side effects or memory
   writes.
 
-### Persistence
+### Target Persistence
 
 - Attachment source records, blob records, and extraction records are distinct.
 - Blobs are content-addressed.
-- Retrieval artifacts preserve source-chain provenance.
+- Attachment source/blob/extraction records preserve joinable provenance;
+  retrieval artifacts expose response citation metadata.
 - Logs and events do not contain raw attachment bytes or full extracted content
   beyond intended bounded artifacts.
-- Retention and deletion paths cover source records, blobs, and extractions.
+- Retention and deletion enforcement covers source records, blobs, stored bytes,
+  and extractions before reads reuse cached bytes.
 
-### Testing
+## Current State
 
-- Unit tests cover Discord reference capture without URL rendering.
-- Unit tests cover strict `cap.attachment.read` input validation.
-- Unit tests cover unsupported, too-large, expired, unavailable, unsafe,
-  scan-failed, extraction-failed, and timeout outcomes.
-- Integration tests cover image, document, and audio success paths.
-- Integration tests cover prompt-injection text embedded inside an attachment.
-- Integration tests cover side-effect proposals influenced by attachment
-  content remaining tainted.
-- Existing metadata-only attachment assertions are removed or rewritten.
-- `make verify` passes after the cutover branch is complete.
-
-## Implementation Plan
-
-1. Add the schema and persistence layer.
-   Create source, blob, and extraction records with a hard-cutover migration and
-   no compatibility aliases.
-
-2. Add the attachment-content service.
-   Implement reference resolution, authorization, acquisition, byte sniffing,
-   scanning, blob storage, extraction dispatch, and typed outcomes.
-
-3. Add modality extractors.
-   Start with text/PDF, images/OCR/vision, and audio transcription because
-   those match the product promise. Keep each extractor bounded and versioned.
-
-4. Add `cap.attachment.read`.
-   Register the strict input validation, execution path, and capability metadata.
-
-5. Cut over Discord ingress and app context.
-   Replace raw URL rendering with opaque attachment refs and update the model
-   context so content-read intents call the capability.
-
-6. Wire runtime provenance.
-   Persist retrieval artifacts, return bounded content blocks, cite sources,
-   and propagate taint into later proposals.
-
-7. Rewrite tests and docs.
-   Remove metadata-only expectations, add success/failure/security coverage,
-   and update README/runbook behavior.
-
-8. Run verification.
-   Run focused tests first, then full verification. Fix blockers in the
-   cutover branch instead of adding fallback behavior.
-
-## Final State
-
-Ariel can receive Discord attachments as references, read supported image,
-document, and audio content through one capability, persist evidence under
-Ariel-owned provenance, and answer with citations. The Discord transport stays
-thin. The model never sees raw Discord attachment URLs as ambient context.
-Attachment content remains untrusted. Clear content-read requests either produce
-a grounded answer or a typed failure. The old metadata-only behavior is gone.
+Ariel receives Discord attachments as opaque references and can read supported
+text attachments through `cap.attachment.read` when scanner mode permits
+extraction. The same capability contains PDF/document, image, and audio
+extractor paths, with broader end-to-end coverage tracked as target coverage.
+Reads persist Ariel-owned source, blob, and extraction records, emit bounded
+untrusted tool output, expose retrieval-source candidates for cited answers, and
+return typed failures when the read path cannot continue. Discord transport stays
+thin, and raw Discord attachment URLs are not ambient model context.

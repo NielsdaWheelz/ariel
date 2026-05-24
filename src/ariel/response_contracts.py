@@ -4,6 +4,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from .research_modes import ResearchMode
+
 
 class ResponseContractViolation(Exception):
     def __init__(self, *, contract: str, errors: list[Any]) -> None:
@@ -24,6 +26,10 @@ class SurfaceSessionContract(BaseModel):
 
 SurfaceEventType = Literal[
     "evt.turn.started",
+    "evt.research.started",
+    "evt.research.finding_emitted",
+    "evt.research.failed",
+    "evt.research.partial",
     "evt.memory.recalled",
     "evt.memory.recall_failed",
     "evt.ai_judgment.failed",
@@ -38,6 +44,7 @@ SurfaceEventType = Literal[
     "evt.run.validation_failed",
     "evt.agent.value_emitted",
     "evt.agent.output_not_applied",
+    "evt.agent.premature_synthesis_rejected",
     "evt.action.call_denied",
     "evt.action.proposed",
     "evt.action.policy_decided",
@@ -113,12 +120,21 @@ class SurfaceModelUsageContract(BaseModel):
 class SurfaceTaintEvidenceContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # ``research_finding_in_context`` is the evidence kind that a research-
+    # completion ``agent_wake`` carries: the wake renders the finding into the
+    # main agent's context as untrusted-influenced content, so the wake's
+    # ``ingress_provenance`` records it. ``research_mode`` (``web`` | ``personal``
+    # | ``memories``) and ``research_status`` (``complete`` | ``partial`` |
+    # ``failed``) mirror the producer in ``worker._agent_wake_context`` so the
+    # surface can show *which* research run motivated the proposal. See
+    # ``docs/modules/agent-loop.md`` (The completion wake).
     kind: Literal[
         "prior_tool_output_in_context",
         "runtime_provenance_missing",
         "runtime_provenance_evidence_malformed",
         "capture_shared_content_ingress",
         "attachment_content_read",
+        "research_finding_in_context",
     ]
     turn_id: str | None = None
     action_attempt_id: str | None = None
@@ -127,6 +143,8 @@ class SurfaceTaintEvidenceContract(BaseModel):
     attachment_ref: str | None = None
     filename: str | None = None
     modality: str | None = None
+    research_mode: ResearchMode | None = None
+    research_status: Literal["complete", "partial", "failed"] | None = None
 
 
 class SurfaceRuntimeProvenanceContract(BaseModel):
@@ -156,6 +174,19 @@ class SurfaceEventTurnStartedPayloadContract(BaseModel):
 
     message: str
     discord: dict[str, Any] | None
+
+
+class SurfaceEventResearchStartedPayloadContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    research_question: str
+    research_mode: ResearchMode
+
+
+class SurfaceEventResearchModePayloadContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: ResearchMode
 
 
 class SurfaceEventMemoryRecalledPayloadContract(BaseModel):
@@ -258,6 +289,15 @@ class SurfaceEventAgentOutputNotAppliedPayloadContract(BaseModel):
 
     reason: str
     current_turn_id: str | None = None
+
+
+class SurfaceEventAgentPrematureSynthesisRejectedPayloadContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model_call_count: int
+    rejected_message_chars: int
+    read_capability_ids: list[str]
+    provider_response_id: str | None = None
 
 
 class SurfaceEventActionProposedPayloadContract(BaseModel):
@@ -378,9 +418,7 @@ class SurfaceEventProviderWriteReceiptReconciledPayloadContract(BaseModel):
 class SurfaceEventAIJudgmentPayloadContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    judgment_type: Literal[
-        "memory_recall", "memory_encode", "memory_dream", "model_output", "research"
-    ]
+    judgment_type: Literal["memory_recall", "memory_encode", "memory_dream", "model_output"]
     parse_status: (
         Literal[
             "parsed",
@@ -543,34 +581,14 @@ class SurfaceApprovalContract(BaseModel):
     decided_at: str | None
 
 
-class SurfaceErrorContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    code: str
-    message: str
-    details: dict[str, Any]
-    retryable: bool
-
-
-class SurfaceCaptureIngestFailureContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    code: str
-    message: str
-    details: dict[str, Any]
-    retryable: bool
-
-
 class SurfaceCaptureContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
-    kind: Literal["text", "url", "shared_content", "unknown"]
-    terminal_state: Literal["turn_created", "ingest_failed"]
-    effective_session_id: str | None
-    turn_id: str | None
+    kind: Literal["text", "url", "shared_content"]
+    effective_session_id: str
+    turn_id: str
     idempotency_key: str | None
-    ingest_failure: SurfaceCaptureIngestFailureContract | None
     created_at: str
     updated_at: str
 
@@ -819,22 +837,11 @@ class SurfaceDiscordMessageEventListResponseContract(BaseModel):
     events: list[SurfaceDiscordMessageEventContract]
 
 
-class SurfaceCaptureSuccessResponseContract(BaseModel):
+class SurfaceCaptureRecordResponseContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     ok: Literal[True]
     capture: SurfaceCaptureContract
-    session: SurfaceSessionContract
-    turn: SurfaceTurnContract
-    assistant: SurfaceAssistantContract
-
-
-class SurfaceCaptureFailureResponseContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    ok: Literal[False]
-    capture: SurfaceCaptureContract
-    error: SurfaceErrorContract
 
 
 class MemoryRecallItemContract(BaseModel):
@@ -886,6 +893,30 @@ def _project_surface_event_payload(
         return _validate_contract(
             "surface_event_payload.evt.turn.started",
             SurfaceEventTurnStartedPayloadContract,
+            payload,
+        )
+    if event_type == "evt.research.started":
+        return _validate_contract(
+            "surface_event_payload.evt.research.started",
+            SurfaceEventResearchStartedPayloadContract,
+            payload,
+        )
+    if event_type == "evt.research.finding_emitted":
+        return _validate_contract(
+            "surface_event_payload.evt.research.finding_emitted",
+            SurfaceEventResearchModePayloadContract,
+            payload,
+        )
+    if event_type == "evt.research.failed":
+        return _validate_contract(
+            "surface_event_payload.evt.research.failed",
+            SurfaceEventResearchModePayloadContract,
+            payload,
+        )
+    if event_type == "evt.research.partial":
+        return _validate_contract(
+            "surface_event_payload.evt.research.partial",
+            SurfaceEventResearchModePayloadContract,
             payload,
         )
     if event_type == "evt.memory.recalled":
@@ -964,6 +995,12 @@ def _project_surface_event_payload(
         return _validate_contract(
             "surface_event_payload.evt.agent.output_not_applied",
             SurfaceEventAgentOutputNotAppliedPayloadContract,
+            payload,
+        )
+    if event_type == "evt.agent.premature_synthesis_rejected":
+        return _validate_contract(
+            "surface_event_payload.evt.agent.premature_synthesis_rejected",
+            SurfaceEventAgentPrematureSynthesisRejectedPayloadContract,
             payload,
         )
     if event_type == "evt.action.proposed":
@@ -1120,11 +1157,6 @@ def _project_surface_capture(raw_capture: Any) -> dict[str, Any]:
     return _validate_contract("surface_capture", SurfaceCaptureContract, capture_payload)
 
 
-def _project_surface_error(raw_error: Any) -> dict[str, Any]:
-    error_payload = raw_error if isinstance(raw_error, dict) else {}
-    return _validate_contract("surface_error", SurfaceErrorContract, error_payload)
-
-
 def build_surface_message_response(
     *,
     session: Any,
@@ -1141,7 +1173,6 @@ def build_surface_message_response(
             "ok": True,
             "session": _project_surface_session(session),
             "turn": _project_surface_turn(turn),
-            # PR-06 deprecates assistant.provider/model for surfaced responses.
             "assistant": {
                 "message": assistant_message,
                 "sources": sources_payload,
@@ -1151,40 +1182,13 @@ def build_surface_message_response(
     )
 
 
-def build_surface_capture_success_response(
-    *,
-    capture: Any,
-    session: Any,
-    turn: Any,
-    assistant_message: Any,
-    assistant_sources: Any,
-) -> dict[str, Any]:
-    sources_payload = assistant_sources if isinstance(assistant_sources, list) else []
+def build_surface_capture_record_response(*, capture: Any) -> dict[str, Any]:
     return _validate_contract(
-        "surface_capture_success_response",
-        SurfaceCaptureSuccessResponseContract,
+        "surface_capture_record_response",
+        SurfaceCaptureRecordResponseContract,
         {
             "ok": True,
             "capture": _project_surface_capture(capture),
-            "session": _project_surface_session(session),
-            "turn": _project_surface_turn(turn),
-            "assistant": {"message": assistant_message, "sources": sources_payload},
-        },
-    )
-
-
-def build_surface_capture_failure_response(
-    *,
-    capture: Any,
-    error: Any,
-) -> dict[str, Any]:
-    return _validate_contract(
-        "surface_capture_failure_response",
-        SurfaceCaptureFailureResponseContract,
-        {
-            "ok": False,
-            "capture": _project_surface_capture(capture),
-            "error": _project_surface_error(error),
         },
     )
 

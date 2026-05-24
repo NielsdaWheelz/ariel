@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from testcontainers.postgres import PostgresContainer
 
 from ariel.config import AppSettings
-from ariel.db import reset_schema_for_tests
+from ariel.db import run_migrations
 
 
 @pytest.fixture(autouse=True)
@@ -25,9 +25,20 @@ def _hermetic_app_settings(request: pytest.FixtureRequest, monkeypatch: pytest.M
     monkeypatch.setitem(AppSettings.model_config, "env_file", None)
 
 
+def _localhost_only_postgres(image: str) -> PostgresContainer:
+    """PostgresContainer bound to 127.0.0.1 only.
+
+    testcontainers-python publishes container ports to 0.0.0.0 by default,
+    which goes around UFW via Docker's iptables chain.
+    """
+    container = PostgresContainer(image)
+    container.ports = {"5432/tcp": ("127.0.0.1", None)}
+    return container
+
+
 @pytest.fixture(scope="session")
 def postgres_container_url() -> Generator[str, None, None]:
-    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
+    with _localhost_only_postgres("pgvector/pgvector:pg16") as postgres:
         yield postgres.get_connection_url().replace("psycopg2", "psycopg")
 
 
@@ -67,7 +78,13 @@ def _new_database_url(postgres_container_url: str) -> Generator[str, None, None]
 
 @pytest.fixture
 def postgres_url(postgres_container_url: str) -> Generator[str, None, None]:
-    yield from _new_database_url(postgres_container_url)
+    database_urls = _new_database_url(postgres_container_url)
+    database_url = next(database_urls)
+    try:
+        run_migrations(database_url)
+        yield database_url
+    finally:
+        database_urls.close()
 
 
 @pytest.fixture
@@ -78,7 +95,6 @@ def unmigrated_postgres_url(postgres_container_url: str) -> Generator[str, None,
 @pytest.fixture
 def session_factory(postgres_url: str) -> Generator[sessionmaker[Session], None, None]:
     engine = create_engine(postgres_url, future=True, pool_pre_ping=True)
-    reset_schema_for_tests(engine, postgres_url)
     try:
         yield sessionmaker(bind=engine, future=True, expire_on_commit=False)
     finally:

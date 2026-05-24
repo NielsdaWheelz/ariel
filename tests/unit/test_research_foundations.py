@@ -1,10 +1,9 @@
-"""Unit tests for the P3 research foundations.
+"""Unit tests for research configuration and capability validation.
 
 Covers:
 - ``config.py``: ``research_run_budget_seconds`` default, env override, validator.
-- ``capability_registry.py``: ``_validate_research_investigate_input`` happy path and
-  rejection cases; ``cap.research.investigate`` contract shape; the module-level
-  whitelist constants; the run-callable alias.
+- ``capability_registry.py``: ``cap.research.investigate`` validation, contract shape,
+  and run-callable alias.
 """
 
 from __future__ import annotations
@@ -15,10 +14,6 @@ import pytest
 from pydantic import ValidationError
 
 from ariel.capability_registry import (
-    RESEARCH_CAPABILITY_IDS,
-    RESEARCH_PERSONAL_CAPABILITY_IDS,
-    RESEARCH_WEB_CAPABILITY_IDS,
-    _validate_research_investigate_input,
     capability_id_for_run_callable,
     get_capability,
     run_callable_name_for_capability_id,
@@ -62,33 +57,45 @@ def test_research_run_budget_seconds_rejects_negative(monkeypatch: pytest.Monkey
 
 
 # ---------------------------------------------------------------------------
-# capability_registry.py — _validate_research_investigate_input
+# capability_registry.py — cap.research.investigate validation
 # ---------------------------------------------------------------------------
 
 
-def test_research_investigate_input_accepts_valid_web() -> None:
-    """A well-formed web-mode input validates cleanly."""
-    normalized, error = _validate_research_investigate_input(
-        {"question": "  What is the status of X?  ", "mode": "web"}
-    )
-    assert error is None
-    assert normalized == {"question": "What is the status of X?", "mode": "web"}
+@pytest.mark.parametrize(
+    ("raw_input", "expected"),
+    [
+        (
+            {"question": "  What is the status of X?  ", "mode": "web"},
+            {"question": "What is the status of X?", "mode": "web"},
+        ),
+        (
+            {"question": "Find emails from Alice about the budget", "mode": "personal"},
+            {"question": "Find emails from Alice about the budget", "mode": "personal"},
+        ),
+        (
+            {"question": "What did I decide about Q2 retainers?", "mode": "memories"},
+            {"question": "What did I decide about Q2 retainers?", "mode": "memories"},
+        ),
+    ],
+)
+def test_research_investigate_input_accepts_valid_modes(
+    raw_input: dict[str, object],
+    expected: dict[str, str],
+) -> None:
+    """Every research mode accepts a well-formed question."""
+    capability = get_capability("cap.research.investigate")
+    assert capability is not None
 
-
-def test_research_investigate_input_accepts_valid_personal() -> None:
-    """A well-formed personal-mode input validates cleanly."""
-    normalized, error = _validate_research_investigate_input(
-        {"question": "Find emails from Alice about the budget", "mode": "personal"}
-    )
+    normalized, error = capability.validate_input(raw_input)
     assert error is None
-    assert normalized == {
-        "question": "Find emails from Alice about the budget",
-        "mode": "personal",
-    }
+    assert normalized == expected
 
 
 def test_research_investigate_input_rejects_bad_inputs() -> None:
     """Every ill-formed payload fails closed with ``schema_invalid``."""
+    capability = get_capability("cap.research.investigate")
+    assert capability is not None
+
     over_length_question = "x" * 4001
     bad_inputs: list[dict[str, object]] = [
         {},
@@ -104,9 +111,50 @@ def test_research_investigate_input_rejects_bad_inputs() -> None:
         {"question": 999, "mode": "web"},
     ]
     for raw_input in bad_inputs:
-        normalized, error = _validate_research_investigate_input(raw_input)
+        normalized, error = capability.validate_input(raw_input)
         assert normalized is None, raw_input
         assert error == "schema_invalid", raw_input
+
+
+def test_research_investigate_input_rejects_status_poll_questions() -> None:
+    """Queued research handles are not investigation questions.
+
+    The validator must reject the two precise poll shapes so a malformed status
+    check never enqueues another research run.
+    """
+    capability = get_capability("cap.research.investigate")
+    assert capability is not None
+
+    poll_questions: list[str] = [
+        "status:tsk_01ks4etnmd54cb2qg1z2khe58d",
+        "Status:tsk_01abc",  # case-insensitive
+        "STATUS:anything",
+        "status: tsk_01abc",  # space after colon
+        "tsk_01abc",  # short bare task id
+        "tsk_01ks4et",
+        "is tsk_01abc?",  # < 20 chars with tsk_
+    ]
+    for question in poll_questions:
+        normalized, error = capability.validate_input({"question": question, "mode": "personal"})
+        assert normalized is None, question
+        assert error == "schema_invalid", question
+
+
+def test_research_investigate_input_accepts_real_questions_mentioning_tsk() -> None:
+    """The status-poll guard must not swallow legitimate longer questions
+    that happen to contain a ``tsk_`` substring (e.g. a question about an
+    earlier task). The guard is bounded to short questions only.
+    """
+    legitimate = (
+        "What did the earlier research task tsk_01abc actually find about "
+        "the Q2 retainer revisions?"
+    )
+    capability = get_capability("cap.research.investigate")
+    assert capability is not None
+
+    normalized, error = capability.validate_input({"question": legitimate, "mode": "personal"})
+    assert error is None
+    assert normalized == {"question": legitimate, "mode": "personal"}
 
 
 # ---------------------------------------------------------------------------
@@ -131,52 +179,7 @@ def test_research_investigate_capability_contract() -> None:
     assert capability.contract_metadata["execution_mode"] == "background_task_enqueue"
 
 
-def test_research_capability_ids_constant() -> None:
-    """``RESEARCH_CAPABILITY_IDS`` contains exactly ``cap.research.investigate``."""
-    assert RESEARCH_CAPABILITY_IDS == {"cap.research.investigate"}
-
-
 def test_research_investigate_run_callable_alias() -> None:
     """The ``research.investigate`` alias round-trips through both lookup helpers."""
     assert capability_id_for_run_callable("research.investigate") == "cap.research.investigate"
     assert run_callable_name_for_capability_id("cap.research.investigate") == "research.investigate"
-
-
-# ---------------------------------------------------------------------------
-# capability_registry.py — whitelist constants
-# ---------------------------------------------------------------------------
-
-
-def test_research_web_whitelist_capabilities_exist_and_are_read() -> None:
-    """Every cap id in ``RESEARCH_WEB_CAPABILITY_IDS`` exists in the registry and
-    is ``impact_level='read'``."""
-    assert RESEARCH_WEB_CAPABILITY_IDS == {
-        "cap.search.web",
-        "cap.search.news",
-        "cap.web.extract",
-    }
-    for cap_id in RESEARCH_WEB_CAPABILITY_IDS:
-        cap = get_capability(cap_id)
-        assert cap is not None, f"{cap_id} not found in registry"
-        assert cap.impact_level == "read", f"{cap_id} impact_level is {cap.impact_level!r}"
-
-
-def test_research_personal_whitelist_capabilities_exist_and_are_read() -> None:
-    """Every cap id in ``RESEARCH_PERSONAL_CAPABILITY_IDS`` exists in the registry
-    and is ``impact_level='read'``."""
-    assert RESEARCH_PERSONAL_CAPABILITY_IDS == {
-        "cap.email.search",
-        "cap.email.read",
-        "cap.drive.search",
-        "cap.drive.read",
-        "cap.calendar.list",
-    }
-    for cap_id in RESEARCH_PERSONAL_CAPABILITY_IDS:
-        cap = get_capability(cap_id)
-        assert cap is not None, f"{cap_id} not found in registry"
-        assert cap.impact_level == "read", f"{cap_id} impact_level is {cap.impact_level!r}"
-
-
-def test_research_web_and_personal_whitelists_are_disjoint() -> None:
-    """The two research mode whitelists share no capabilities — the Rule of Two."""
-    assert RESEARCH_WEB_CAPABILITY_IDS.isdisjoint(RESEARCH_PERSONAL_CAPABILITY_IDS)

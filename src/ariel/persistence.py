@@ -4,7 +4,6 @@ import hashlib
 from datetime import UTC, datetime
 from typing import Any
 
-import ulid
 from pgvector.sqlalchemy import Vector  # type: ignore[import-untyped]
 from sqlalchemy import (
     Boolean,
@@ -21,20 +20,20 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, Session
 
+from ariel.clock import utcnow
+from ariel.ids import new_id
 from ariel.redaction import redact_json_value, redact_text
 
 
 MEMORY_EMBEDDING_DIMENSIONS = 1536
+_ACTIVE_SESSION_LOCK_ID = 24_310_001
 
 
 def to_rfc3339(timestamp: datetime) -> str:
     return timestamp.astimezone(UTC).isoformat().replace("+00:00", "Z")
-
-
-def _new_id(prefix: str) -> str:
-    return f"{prefix}_{ulid.new().str.lower()}"
 
 
 # Stable id of the singleton session row that owns background work without a
@@ -58,7 +57,7 @@ class SessionRecord(Base):
     lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
     rotated_from_session_id: Mapped[str | None] = mapped_column(
         String(32),
-        ForeignKey("sessions.id", ondelete="SET NULL"),
+        ForeignKey("sessions.id", ondelete="RESTRICT"),
         nullable=True,
         index=True,
     )
@@ -73,7 +72,7 @@ class SessionRecord(Base):
             (
                 "(rotation_reason IS NULL) OR "
                 "(rotation_reason IN ('user_initiated', 'threshold_turn_count', "
-                "'threshold_age', 'threshold_context_pressure'))"
+                "'threshold_age'))"
             ),
             name="ck_session_rotation_reason",
         ),
@@ -139,6 +138,47 @@ def ensure_system_session(db: Session, *, now: datetime) -> str:
     return SYSTEM_SESSION_ID
 
 
+def lock_active_session(db: Session) -> None:
+    bind = db.get_bind()
+    if bind is not None and bind.dialect.name == "postgresql":
+        db.execute(
+            text("SELECT pg_advisory_xact_lock(:lock_id)"),
+            {"lock_id": _ACTIVE_SESSION_LOCK_ID},
+        )
+
+
+def get_or_create_active_session(db: Session, *, now: datetime) -> SessionRecord:
+    lock_active_session(db)
+
+    active_session = db.scalar(
+        select(SessionRecord).where(SessionRecord.is_active.is_(True)).limit(1)
+    )
+    if active_session is not None:
+        return active_session
+
+    with db.begin_nested():
+        created = SessionRecord(
+            id=new_id("ses"),
+            is_active=True,
+            lifecycle_state="active",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(created)
+        try:
+            db.flush()
+            return created
+        except IntegrityError:
+            pass
+
+    active_session = db.scalar(
+        select(SessionRecord).where(SessionRecord.is_active.is_(True)).limit(1)
+    )
+    if active_session is None:
+        raise RuntimeError("failed to create or load active session")
+    return active_session
+
+
 class SessionRotationRecord(Base):
     __tablename__ = "session_rotations"
 
@@ -153,25 +193,19 @@ class SessionRotationRecord(Base):
         String(32),
         ForeignKey("sessions.id", ondelete="RESTRICT"),
         nullable=False,
-        unique=True,
-        index=True,
     )
     reason: Mapped[str] = mapped_column(String(32), nullable=False)
     idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     actor_id: Mapped[str] = mapped_column(String(128), nullable=False)
     trigger_snapshot: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, index=True
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     __table_args__ = (
         CheckConstraint(
-            (
-                "reason IN ('user_initiated', 'threshold_turn_count', "
-                "'threshold_age', 'threshold_context_pressure')"
-            ),
+            ("reason IN ('user_initiated', 'threshold_turn_count', 'threshold_age')"),
             name="ck_session_rotation_reason_type",
         ),
+        UniqueConstraint("rotated_to_session_id", name="uq_session_rotations_rotated_to"),
         Index(
             "ix_session_rotations_idempotency_key_unique",
             "idempotency_key",
@@ -258,32 +292,21 @@ class CaptureRecord(Base):
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     capture_kind: Mapped[str] = mapped_column(String(16), nullable=False)
-    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    original_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    normalized_turn_input: Mapped[str | None] = mapped_column(Text, nullable=True)
-    effective_session_id: Mapped[str | None] = mapped_column(
+    normalized_turn_input: Mapped[str] = mapped_column(Text, nullable=False)
+    effective_session_id: Mapped[str] = mapped_column(
         String(32),
-        ForeignKey("sessions.id", ondelete="SET NULL"),
-        nullable=True,
+        ForeignKey("sessions.id", ondelete="RESTRICT"),
+        nullable=False,
         index=True,
     )
-    turn_id: Mapped[str | None] = mapped_column(
+    turn_id: Mapped[str] = mapped_column(
         String(32),
-        ForeignKey("turns.id", ondelete="SET NULL"),
-        nullable=True,
+        ForeignKey("turns.id", ondelete="RESTRICT"),
+        nullable=False,
         index=True,
     )
-    terminal_state: Mapped[str] = mapped_column(String(32), nullable=False)
-    ingest_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    ingest_error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
-    ingest_error_details: Mapped[dict[str, Any] | None] = mapped_column(
-        JSONB(none_as_null=True),
-        nullable=True,
-    )
-    ingest_error_retryable: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
-    status_code: Mapped[int] = mapped_column(Integer, nullable=False)
-    response_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )
@@ -293,34 +316,8 @@ class CaptureRecord(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "capture_kind IN ('text', 'url', 'shared_content', 'unknown')",
+            "capture_kind IN ('text', 'url', 'shared_content')",
             name="ck_capture_kind",
-        ),
-        CheckConstraint(
-            "terminal_state IN ('turn_created', 'ingest_failed')",
-            name="ck_capture_terminal_state",
-        ),
-        CheckConstraint(
-            (
-                "(terminal_state = 'turn_created' "
-                "AND turn_id IS NOT NULL "
-                "AND effective_session_id IS NOT NULL "
-                "AND normalized_turn_input IS NOT NULL "
-                "AND ingest_error_code IS NULL "
-                "AND ingest_error_message IS NULL "
-                "AND ingest_error_details IS NULL "
-                "AND ingest_error_retryable IS NULL) "
-                "OR "
-                "(terminal_state = 'ingest_failed' "
-                "AND turn_id IS NULL "
-                "AND effective_session_id IS NULL "
-                "AND normalized_turn_input IS NULL "
-                "AND ingest_error_code IS NOT NULL "
-                "AND ingest_error_message IS NOT NULL "
-                "AND ingest_error_details IS NOT NULL "
-                "AND ingest_error_retryable IS NOT NULL)"
-            ),
-            name="ck_capture_terminal_linkage",
         ),
         Index(
             "ix_captures_idempotency_key_unique",
@@ -423,7 +420,7 @@ class ActionAttemptRecord(Base):
     )
     turn_id: Mapped[str] = mapped_column(
         String(32),
-        ForeignKey("turns.id", ondelete="CASCADE"),
+        ForeignKey("turns.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
@@ -511,7 +508,7 @@ class ApprovalRequestRecord(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     action_attempt_id: Mapped[str] = mapped_column(
         String(32),
-        ForeignKey("action_attempts.id", ondelete="CASCADE"),
+        ForeignKey("action_attempts.id", ondelete="RESTRICT"),
         nullable=False,
         unique=True,
         index=True,
@@ -524,7 +521,7 @@ class ApprovalRequestRecord(Base):
     )
     turn_id: Mapped[str] = mapped_column(
         String(32),
-        ForeignKey("turns.id", ondelete="CASCADE"),
+        ForeignKey("turns.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
@@ -563,13 +560,13 @@ class ArtifactRecord(Base):
     )
     turn_id: Mapped[str] = mapped_column(
         String(32),
-        ForeignKey("turns.id", ondelete="CASCADE"),
+        ForeignKey("turns.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
     action_attempt_id: Mapped[str] = mapped_column(
         String(32),
-        ForeignKey("action_attempts.id", ondelete="CASCADE"),
+        ForeignKey("action_attempts.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
@@ -633,7 +630,7 @@ class AttachmentSourceRecord(Base):
     )
     turn_id: Mapped[str] = mapped_column(
         String(32),
-        ForeignKey("turns.id", ondelete="CASCADE"),
+        ForeignKey("turns.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
@@ -684,7 +681,7 @@ class AttachmentExtractionRecord(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     source_id: Mapped[str] = mapped_column(
         String(32),
-        ForeignKey("attachment_sources.id", ondelete="CASCADE"),
+        ForeignKey("attachment_sources.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
@@ -755,7 +752,6 @@ class MemoryLogRecord(Base):
     taint: Mapped[str] = mapped_column(String(32), nullable=False)
     source_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    # The HNSW index over ``embedding`` is migration-only — not in __table_args__.
     __table_args__ = (
         CheckConstraint(
             (
@@ -775,6 +771,12 @@ class MemoryLogRecord(Base):
             postgresql_using="gin",
         ),
         Index("ix_memory_log_session_created", "session_id", "created_at"),
+        Index(
+            "ix_memory_log_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
     )
 
 
@@ -796,7 +798,6 @@ class MemoryNoteRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     taint: Mapped[str] = mapped_column(String(32), nullable=False)
 
-    # The HNSW index over ``embedding`` is migration-only — not in __table_args__.
     __table_args__ = (
         CheckConstraint(
             "taint IN ('clean', 'tainted')",
@@ -806,6 +807,12 @@ class MemoryNoteRecord(Base):
             "ix_memory_notes_search_vector",
             "search_vector",
             postgresql_using="gin",
+        ),
+        Index(
+            "ix_memory_notes_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
         ),
     )
 
@@ -902,6 +909,25 @@ class GoogleConnectorRecord(Base):
             "status IN ('not_connected', 'connected', 'error', 'revoked')",
             name="ck_google_connector_status",
         ),
+        CheckConstraint(
+            "status <> 'connected' OR ("
+            "account_subject IS NOT NULL "
+            "AND btrim(account_subject) <> '' "
+            "AND account_subject !~ '[[:space:]]'"
+            ")",
+            name="ck_google_connector_connected_account_subject",
+        ),
+        CheckConstraint(
+            "status <> 'connected' OR ("
+            "account_email IS NOT NULL "
+            "AND btrim(account_email) <> '' "
+            "AND account_email !~ '[[:space:]]' "
+            "AND length(account_email) - length(replace(account_email, '@', '')) = 1 "
+            "AND position('@' in account_email) > 1 "
+            "AND position('@' in account_email) < length(account_email)"
+            ")",
+            name="ck_google_connector_connected_account_email",
+        ),
     )
 
 
@@ -940,7 +966,7 @@ class GoogleConnectorEventRecord(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     connector_id: Mapped[str] = mapped_column(
         String(32),
-        ForeignKey("google_connectors.id", ondelete="CASCADE"),
+        ForeignKey("google_connectors.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
@@ -1054,6 +1080,7 @@ class ProviderEventRecord(Base):
     body_digest: Mapped[str | None] = mapped_column(String(128), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )
@@ -1458,7 +1485,7 @@ class BackgroundTaskRecord(Base):
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     task_type: Mapped[str] = mapped_column(String(64), nullable=False)
-    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     provider_write_receipt_id: Mapped[str | None] = mapped_column(
         String(32),
         ForeignKey("provider_write_receipts.id", ondelete="RESTRICT"),
@@ -1522,6 +1549,7 @@ class AgencyEventRecord(Base):
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="accepted")
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, index=True
     )
@@ -1553,19 +1581,19 @@ class JobRecord(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     session_id: Mapped[str | None] = mapped_column(
         String(32),
-        ForeignKey("sessions.id", ondelete="SET NULL"),
+        ForeignKey("sessions.id", ondelete="RESTRICT"),
         nullable=True,
         index=True,
     )
     turn_id: Mapped[str | None] = mapped_column(
         String(32),
-        ForeignKey("turns.id", ondelete="SET NULL"),
+        ForeignKey("turns.id", ondelete="RESTRICT"),
         nullable=True,
         index=True,
     )
     action_attempt_id: Mapped[str | None] = mapped_column(
         String(32),
-        ForeignKey("action_attempts.id", ondelete="SET NULL"),
+        ForeignKey("action_attempts.id", ondelete="RESTRICT"),
         nullable=True,
         index=True,
     )
@@ -1631,7 +1659,7 @@ class JobEventRecord(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     job_id: Mapped[str] = mapped_column(
         String(32),
-        ForeignKey("jobs.id", ondelete="CASCADE"),
+        ForeignKey("jobs.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
@@ -1639,8 +1667,6 @@ class JobEventRecord(Base):
         String(32),
         ForeignKey("agency_events.id", ondelete="RESTRICT"),
         nullable=True,
-        unique=True,
-        index=True,
     )
     event_type: Mapped[str] = mapped_column(String(64), nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
@@ -1650,18 +1676,34 @@ class JobEventRecord(Base):
 
     job: Mapped[JobRecord] = relationship(back_populates="events")
 
+    __table_args__ = (UniqueConstraint("agency_event_id"),)
+
 
 class SubscriberHeartbeatRecord(Base):
     __tablename__ = "subscriber_heartbeat"
 
-    subscriber_name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    subscriber_name: Mapped[str] = mapped_column(String(64), nullable=False)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     in_flight_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     errors_in_window: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     last_error_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "in_flight_count >= 0",
+            name="ck_subscriber_heartbeat_in_flight_count_nonnegative",
+        ),
+        CheckConstraint(
+            "errors_in_window >= 0",
+            name="ck_subscriber_heartbeat_errors_in_window_nonnegative",
+        ),
+        UniqueConstraint("subscriber_name", name="uq_subscriber_heartbeat_subscriber_name"),
+    )
 
 
 def serialize_session(session: SessionRecord) -> dict[str, Any]:
@@ -1675,24 +1717,12 @@ def serialize_session(session: SessionRecord) -> dict[str, Any]:
 
 
 def serialize_capture(capture: CaptureRecord) -> dict[str, Any]:
-    ingest_failure = (
-        {
-            "code": capture.ingest_error_code,
-            "message": capture.ingest_error_message,
-            "details": redact_json_value(capture.ingest_error_details or {}),
-            "retryable": bool(capture.ingest_error_retryable),
-        }
-        if capture.terminal_state == "ingest_failed"
-        else None
-    )
     return {
         "id": capture.id,
         "kind": capture.capture_kind,
-        "terminal_state": capture.terminal_state,
         "effective_session_id": capture.effective_session_id,
         "turn_id": capture.turn_id,
         "idempotency_key": capture.idempotency_key,
-        "ingest_failure": ingest_failure,
         "created_at": to_rfc3339(capture.created_at),
         "updated_at": to_rfc3339(capture.updated_at),
     }
@@ -1734,7 +1764,7 @@ def enqueue_background_task(
             raise RuntimeError("provider_write_reconcile_due task payload invalid")
         provider_write_receipt_id = receipt_id
     task = BackgroundTaskRecord(
-        id=_new_id("tsk"),
+        id=new_id("tsk"),
         task_type=task_type,
         idempotency_key=idempotency_key,
         provider_write_receipt_id=provider_write_receipt_id,
@@ -1868,7 +1898,7 @@ def serialize_email_action(receipt: ProviderWriteReceiptRecord) -> dict[str, Any
         receipt.status == "succeeded"
         and receipt.undo_token_hash is not None
         and receipt.undo_expires_at is not None
-        and receipt.undo_expires_at > datetime.now(tz=UTC)
+        and receipt.undo_expires_at > utcnow()
     )
     return {
         "id": receipt.id,

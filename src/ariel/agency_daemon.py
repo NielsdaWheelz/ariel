@@ -437,26 +437,21 @@ class AgencyRuntime:
             and prepared["pr_sync_client_request_id"]
             else client_request_id
         )
-        try:
-            invocation = self.client.get_invocation(repo_id=repo_id, invocation_ref=invocation_id)
-            land_response = None
-            if invocation.get("landing_status") == "pending":
-                land_response = self.client.land_invocation(
-                    repo_id=repo_id,
-                    invocation_ref=invocation_id,
-                    client_request_id=land_client_request_id,
-                )
-            pr_response = self.client.worktree_pr_sync(
+        invocation = self.client.get_invocation(repo_id=repo_id, invocation_ref=invocation_id)
+        land_response = None
+        if invocation.get("landing_status") == "pending":
+            land_response = self.client.land_invocation(
                 repo_id=repo_id,
-                worktree_ref=worktree_id,
-                allow_dirty=bool(prepared.get("allow_dirty")),
-                force_with_lease=bool(prepared.get("force_with_lease")),
-                client_request_id=pr_sync_client_request_id,
+                invocation_ref=invocation_id,
+                client_request_id=land_client_request_id,
             )
-        except AgencyDaemonError:
-            raise
-        except Exception as exc:
-            raise AgencyDaemonError(str(exc) or "agency request_pr failed") from exc
+        pr_response = self.client.worktree_pr_sync(
+            repo_id=repo_id,
+            worktree_ref=worktree_id,
+            allow_dirty=bool(prepared.get("allow_dirty")),
+            force_with_lease=bool(prepared.get("force_with_lease")),
+            client_request_id=pr_sync_client_request_id,
+        )
         if not (
             isinstance(pr_response.get("pr_number"), int)
             or isinstance(pr_response.get("pr_url"), str)

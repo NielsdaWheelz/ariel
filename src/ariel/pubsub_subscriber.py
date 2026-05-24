@@ -19,16 +19,24 @@ import logging
 import os
 import signal
 import threading
-from datetime import UTC, datetime
+from concurrent.futures import TimeoutError as FutureTimeoutError
+from dataclasses import dataclass
+from datetime import datetime
 from types import FrameType
-from typing import Any
+from typing import Any, Literal
 
-import ulid
 from google.cloud import pubsub_v1  # type: ignore[import-untyped]
+from google.cloud.pubsub_v1.subscriber.exceptions import (  # type: ignore[import-untyped]
+    AcknowledgeError,
+)
 from sqlalchemy import create_engine, select
+from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
+from .clock import utcnow
 from .config import AppSettings
+from .ids import new_id
+from .google_connector import google_connected_account_subject
 from .persistence import (
     GoogleConnectorRecord,
     ProviderEventRecord,
@@ -39,14 +47,137 @@ from .persistence import (
 _log = logging.getLogger(__name__)
 
 SUBSCRIBER_NAME = "gmail_pubsub"
+_RETRYABLE_DB_SQLSTATES = frozenset(
+    {
+        "40001",  # serialization_failure
+        "40P01",  # deadlock_detected
+        "53300",  # too_many_connections
+        "55P03",  # lock_not_available
+        "57014",  # query_canceled
+        "57P01",  # admin_shutdown
+        "57P02",  # crash_shutdown
+        "57P03",  # cannot_connect_now
+    }
+)
+_PROVIDER_EVENT_DEDUPE_CONSTRAINT = "provider_events_dedupe_key_key"
+_HEARTBEAT_SUBSCRIBER_CONSTRAINT = "uq_subscriber_heartbeat_subscriber_name"
 
 
-def _utcnow() -> datetime:
-    return datetime.now(tz=UTC)
+class MalformedPubSubPayload(ValueError):
+    pass
 
 
-def _new_id(prefix: str) -> str:
-    return f"{prefix}_{ulid.new().str.lower()}"
+class PubSubMessageHandlingFailure(RuntimeError):
+    pass
+
+
+PubSubAckFailureCode = Literal[
+    "ack_timeout",
+    "ack_rejected",
+    "ack_status_not_success",
+]
+
+
+class PubSubAckFailure(PubSubMessageHandlingFailure):
+    def __init__(self, *, code: PubSubAckFailureCode, detail: str | None = None) -> None:
+        message = code if detail is None else f"{code}:{detail}"
+        super().__init__(message)
+        self.code = code
+        self.detail = detail
+
+
+class PubSubProviderEventPersistenceFailure(PubSubMessageHandlingFailure):
+    def __init__(self) -> None:
+        super().__init__("provider_event_write_failed")
+
+
+class PubSubHeartbeatWriteFailure(RuntimeError):
+    def __init__(self) -> None:
+        super().__init__("subscriber_heartbeat_write_failed")
+
+
+ProviderEventDeliveryOutcome = Literal["accepted", "duplicate", "unknown_account"]
+
+
+@dataclass(frozen=True, slots=True)
+class GmailPubSubNotification:
+    message_id: str
+    data: bytes
+    email_address: str
+    history_id: str
+    publish_time_iso: str | None
+
+
+def _parse_message_payload(message: Any) -> GmailPubSubNotification:
+    message_id_raw = getattr(message, "message_id", None)
+    if not isinstance(message_id_raw, str) or not message_id_raw.strip():
+        raise MalformedPubSubPayload("message_id_missing")
+    message_id = message_id_raw.strip()
+    data = getattr(message, "data", None)
+    if not isinstance(data, bytes):
+        raise MalformedPubSubPayload("data_missing")
+    try:
+        raw_payload = json.loads(data.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise MalformedPubSubPayload("payload_invalid_json") from exc
+    if not isinstance(raw_payload, dict):
+        raise MalformedPubSubPayload("payload_not_object")
+    email_address_raw = raw_payload.get("emailAddress")
+    history_id_raw = raw_payload.get("historyId")
+    if not isinstance(email_address_raw, str) or not email_address_raw.strip():
+        raise MalformedPubSubPayload("email_address_invalid")
+    if not isinstance(history_id_raw, str) or not history_id_raw.strip():
+        raise MalformedPubSubPayload("history_id_invalid")
+    publish_time = getattr(message, "publish_time", None)
+    return GmailPubSubNotification(
+        message_id=message_id,
+        data=data,
+        email_address=email_address_raw.strip(),
+        history_id=history_id_raw.strip(),
+        publish_time_iso=publish_time.isoformat() if isinstance(publish_time, datetime) else None,
+    )
+
+
+def _db_sqlstate(exc: DBAPIError) -> str | None:
+    sqlstate = getattr(exc.orig, "sqlstate", None)
+    if isinstance(sqlstate, str):
+        return sqlstate
+    pgcode = getattr(exc.orig, "pgcode", None)
+    return pgcode if isinstance(pgcode, str) else None
+
+
+def _db_constraint_name(exc: IntegrityError) -> str | None:
+    diag = getattr(exc.orig, "diag", None)
+    constraint_name = getattr(diag, "constraint_name", None)
+    return constraint_name if isinstance(constraint_name, str) else None
+
+
+def _is_retryable_dbapi_failure(exc: DBAPIError) -> bool:
+    sqlstate = _db_sqlstate(exc)
+    if sqlstate is None:
+        return isinstance(exc, OperationalError)
+    return sqlstate.startswith("08") or sqlstate in _RETRYABLE_DB_SQLSTATES
+
+
+def _is_unique_constraint_failure(exc: IntegrityError, constraint_name: str) -> bool:
+    return _db_sqlstate(exc) == "23505" and _db_constraint_name(exc) == constraint_name
+
+
+def _ack_message(message: Any) -> None:
+    try:
+        result = message.ack_with_response().result(timeout=30)
+    except FutureTimeoutError as exc:
+        raise PubSubAckFailure(code="ack_timeout") from exc
+    except AcknowledgeError as exc:
+        raise PubSubAckFailure(code="ack_rejected", detail=str(exc)) from exc
+    if result != "SUCCESS" and getattr(result, "name", None) != "SUCCESS":
+        raise PubSubAckFailure(code="ack_status_not_success", detail=str(result))
+
+
+def _provider_account_subject(connector: GoogleConnectorRecord | None) -> str | None:
+    if connector is None or connector.status != "connected":
+        return None
+    return google_connected_account_subject(connector)
 
 
 def handle_message(
@@ -56,86 +187,118 @@ def handle_message(
     """Process one Pub/Sub message: decode, dedup, insert, enqueue, ack.
 
     Malformed payload → nack (Pub/Sub redelivers up to ``max_delivery_attempts``,
-    then dead-letters). Unknown account → ack (drop). Duplicate messageId → ack.
-    DB serialization failure → no ack; Pub/Sub redelivers; dedup catches.
+    then dead-letters). Unknown or inactive account → ack (drop). Duplicate
+    messageId → ack. DB serialization failure → no ack; Pub/Sub redelivers;
+    dedup catches.
     """
     try:
-        decoded = json.loads(message.data.decode("utf-8"))
-        email_address = decoded["emailAddress"]
-        history_id = str(decoded["historyId"])
-    except (json.JSONDecodeError, KeyError, UnicodeDecodeError, AttributeError) as exc:
-        _log.warning("malformed Pub/Sub payload (message_id=%s): %s", message.message_id, exc)
+        notification = _parse_message_payload(message)
+    except MalformedPubSubPayload as exc:
+        message_id = getattr(message, "message_id", "<unknown>")
+        _log.warning("malformed Pub/Sub payload (message_id=%s): %s", message_id, exc)
         message.nack()
         return
 
-    publish_time = getattr(message, "publish_time", None)
-    publish_time_iso = publish_time.isoformat() if isinstance(publish_time, datetime) else None
-    dedup_input = f"google:gmail:{email_address}:pubsub:{message.message_id}"
+    dedup_input = f"google:gmail:{notification.email_address}:pubsub:{notification.message_id}"
     dedup_key = "google:" + hashlib.sha256(dedup_input.encode("utf-8")).hexdigest()
 
-    with session_factory() as db:
-        with db.begin():
-            connector = db.scalar(
-                select(GoogleConnectorRecord)
-                .where(GoogleConnectorRecord.account_email == email_address)
-                .limit(1)
-            )
-            if connector is None or connector.account_subject is None:
-                _log.info(
-                    "Pub/Sub message for unknown account %s (message_id=%s); acking",
-                    email_address,
-                    message.message_id,
+    outcome = _persist_provider_event(
+        session_factory, notification=notification, dedup_key=dedup_key
+    )
+    _ack_message(message)
+    if outcome == "accepted":
+        _write_last_message_heartbeat(session_factory)
+
+
+def _persist_provider_event(
+    session_factory: sessionmaker[Session],
+    *,
+    notification: GmailPubSubNotification,
+    dedup_key: str,
+) -> ProviderEventDeliveryOutcome:
+    try:
+        with session_factory() as db:
+            with db.begin():
+                connector = db.scalar(
+                    select(GoogleConnectorRecord)
+                    .where(GoogleConnectorRecord.account_email == notification.email_address)
+                    .limit(1)
                 )
-                message.ack_with_response().result(timeout=30)
-                return
+                provider_account_subject = _provider_account_subject(connector)
+                if provider_account_subject is None:
+                    _log.info(
+                        "Pub/Sub message for unknown or inactive account %s "
+                        "(message_id=%s); acking",
+                        notification.email_address,
+                        notification.message_id,
+                    )
+                    return "unknown_account"
 
-            existing = db.scalar(
-                select(ProviderEventRecord)
-                .where(ProviderEventRecord.dedupe_key == dedup_key)
-                .with_for_update()
-                .limit(1)
-            )
-            if existing is not None:
-                message.ack_with_response().result(timeout=30)
-                return
-
-            now = _utcnow()
-            event_id = _new_id("pev")
-            db.add(
-                ProviderEventRecord(
-                    id=event_id,
-                    provider="google",
-                    resource_type="gmail",
-                    resource_id=connector.account_subject,
-                    external_event_id=f"pubsub:{message.message_id}",
-                    dedupe_key=dedup_key,
-                    event_type="pubsub_notification",
-                    headers={
-                        "pubsub_message_id": message.message_id,
-                        "publish_time": publish_time_iso,
-                    },
-                    payload={
-                        "emailAddress": email_address,
-                        "historyId": history_id,
-                        "pubsub_message_id": message.message_id,
-                        "publish_time": publish_time_iso,
-                    },
-                    body_digest=hashlib.sha256(message.data).hexdigest(),
-                    status="accepted",
-                    error=None,
-                    received_at=now,
-                    processed_at=None,
+                existing = db.scalar(
+                    select(ProviderEventRecord)
+                    .where(ProviderEventRecord.dedupe_key == dedup_key)
+                    .with_for_update()
+                    .limit(1)
                 )
-            )
-            enqueue_background_task(
-                db,
-                task_type="provider_event_received",
-                payload={"provider_event_id": event_id},
-                now=now,
-            )
+                if existing is not None:
+                    return "duplicate"
 
-    message.ack_with_response().result(timeout=30)
-    _write_heartbeat(session_factory, last_message=True)
+                now = utcnow()
+                event_id = new_id("pev")
+                db.add(
+                    ProviderEventRecord(
+                        id=event_id,
+                        provider="google",
+                        resource_type="gmail",
+                        resource_id=provider_account_subject,
+                        external_event_id=f"pubsub:{notification.message_id}",
+                        dedupe_key=dedup_key,
+                        event_type="pubsub_notification",
+                        headers={
+                            "pubsub_message_id": notification.message_id,
+                            "publish_time": notification.publish_time_iso,
+                        },
+                        payload={
+                            "emailAddress": notification.email_address,
+                            "historyId": notification.history_id,
+                            "pubsub_message_id": notification.message_id,
+                            "publish_time": notification.publish_time_iso,
+                        },
+                        body_digest=hashlib.sha256(notification.data).hexdigest(),
+                        status="accepted",
+                        error=None,
+                        created_at=now,
+                        received_at=now,
+                        processed_at=None,
+                    )
+                )
+                enqueue_background_task(
+                    db,
+                    task_type="provider_event_received",
+                    payload={"provider_event_id": event_id},
+                    now=now,
+                )
+    except IntegrityError as exc:
+        if not _is_unique_constraint_failure(exc, _PROVIDER_EVENT_DEDUPE_CONSTRAINT):
+            raise
+        raise PubSubProviderEventPersistenceFailure() from exc
+    except DBAPIError as exc:
+        if not _is_retryable_dbapi_failure(exc):
+            raise
+        raise PubSubProviderEventPersistenceFailure() from exc
+    return "accepted"
+
+
+def _handle_streaming_message(
+    session_factory: sessionmaker[Session],
+    message: Any,
+) -> None:
+    try:
+        handle_message(session_factory, message)
+    except PubSubMessageHandlingFailure:
+        # The StreamingPull callback is the subscriber boundary. Do not ack or
+        # nack here: unresolved messages stay eligible for Pub/Sub redelivery.
+        _log.exception("Pub/Sub message handler failed; message will be redelivered")
 
 
 def _write_heartbeat(
@@ -143,28 +306,61 @@ def _write_heartbeat(
     *,
     last_message: bool = False,
 ) -> None:
-    now = _utcnow()
-    with session_factory() as db:
-        with db.begin():
-            row = db.get(SubscriberHeartbeatRecord, SUBSCRIBER_NAME)
-            if row is None:
-                db.add(
-                    SubscriberHeartbeatRecord(
-                        subscriber_name=SUBSCRIBER_NAME,
-                        last_seen_at=now,
-                        last_message_at=now if last_message else None,
-                        in_flight_count=0,
-                        errors_in_window=0,
-                        last_error_code=None,
-                        last_error_at=None,
-                        updated_at=now,
-                    )
+    now = utcnow()
+    try:
+        with session_factory() as db:
+            with db.begin():
+                row = db.scalar(
+                    select(SubscriberHeartbeatRecord)
+                    .where(SubscriberHeartbeatRecord.subscriber_name == SUBSCRIBER_NAME)
+                    .with_for_update()
+                    .limit(1)
                 )
-                return
-            row.last_seen_at = now
-            if last_message:
-                row.last_message_at = now
-            row.updated_at = now
+                if row is None:
+                    db.add(
+                        SubscriberHeartbeatRecord(
+                            id=new_id("shb"),
+                            subscriber_name=SUBSCRIBER_NAME,
+                            last_seen_at=now,
+                            last_message_at=now if last_message else None,
+                            in_flight_count=0,
+                            errors_in_window=0,
+                            last_error_code=None,
+                            last_error_at=None,
+                            created_at=now,
+                            updated_at=now,
+                        )
+                    )
+                    return
+                row.last_seen_at = now
+                if last_message:
+                    row.last_message_at = now
+                row.updated_at = now
+    except IntegrityError as exc:
+        if not _is_unique_constraint_failure(exc, _HEARTBEAT_SUBSCRIBER_CONSTRAINT):
+            raise
+        raise PubSubHeartbeatWriteFailure() from exc
+    except DBAPIError as exc:
+        if not _is_retryable_dbapi_failure(exc):
+            raise
+        raise PubSubHeartbeatWriteFailure() from exc
+
+
+def _write_last_message_heartbeat(session_factory: sessionmaker[Session]) -> None:
+    try:
+        _write_heartbeat(session_factory, last_message=True)
+    except PubSubHeartbeatWriteFailure:
+        # justify-ignore-error: the provider event is durable and acked; the
+        # heartbeat loop retries liveness writes independently.
+        _log.exception("subscriber heartbeat write failed after Pub/Sub ack")
+
+
+def _run_heartbeat_tick(session_factory: sessionmaker[Session]) -> None:
+    try:
+        _write_heartbeat(session_factory)
+    except PubSubHeartbeatWriteFailure:
+        # justify-ignore-error: heartbeat writes are retried on the next tick.
+        _log.exception("subscriber heartbeat write failed")
 
 
 def main() -> None:
@@ -208,10 +404,7 @@ def main() -> None:
     )
 
     def _callback(message: Any) -> None:
-        try:
-            handle_message(session_factory, message)
-        except Exception:
-            _log.exception("Pub/Sub message handler raised; message will be redelivered")
+        _handle_streaming_message(session_factory, message)
 
     future = subscriber.subscribe(
         subscription_path,
@@ -223,10 +416,7 @@ def main() -> None:
 
     def _heartbeat_loop() -> None:
         while not stop_event.is_set():
-            try:
-                _write_heartbeat(session_factory)
-            except Exception:
-                _log.exception("subscriber heartbeat write failed")
+            _run_heartbeat_tick(session_factory)
             stop_event.wait(settings.subscriber_heartbeat_interval_seconds)
 
     heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)

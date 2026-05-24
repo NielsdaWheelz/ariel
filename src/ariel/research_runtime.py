@@ -5,11 +5,9 @@
 configuration only where a research run must differ:
 
 - ``output_mode="finding"`` — terminates on ``agent.emit_finding``;
-- ``is_research_run=True`` — enables ``agent.emit_finding`` in the sandbox whitelist;
-- the eligible capabilities are exactly one mode whitelist —
-  ``RESEARCH_WEB_CAPABILITY_IDS`` for ``mode == "web"`` or
-  ``RESEARCH_PERSONAL_CAPABILITY_IDS`` for ``mode == "personal"``, never both:
-  the lethal-trifecta defence (a run touches web XOR personal);
+- ``is_main_agent_loop=False`` — allows ``agent.emit_finding``;
+- the eligible capabilities are exactly one mode whitelist: ``web``,
+  ``personal``, or ``memories``;
 - ``research_run_budget_seconds`` budget;
 - the prompt is research-framed — question, mode, eligible callables, and the
   instruction to call ``agent.emit_finding`` once;
@@ -41,10 +39,9 @@ from __future__ import annotations
 import dataclasses
 import json
 from collections.abc import Callable
-from datetime import UTC, datetime
-from typing import Any
+from datetime import datetime
+from typing import TYPE_CHECKING, Any, assert_never
 
-import ulid
 from fastapi.encoders import jsonable_encoder
 from pydantic_ai.messages import ModelRequest, SystemPromptPart, UserPromptPart
 from sqlalchemy.orm import Session, sessionmaker
@@ -55,24 +52,22 @@ from .capability_registry import (
     RESEARCH_PERSONAL_CAPABILITY_IDS,
     RESEARCH_WEB_CAPABILITY_IDS,
     run_callable_name_for_capability_id,
+    run_callable_signature,
 )
+from .clock import utcnow
 from .config import AppSettings
 from .google_connector import GoogleConnectorRuntime
-from .model_adapter import ModelAdapter, ModelMessage
+from .ids import new_id
 from .persistence import EventRecord, TurnRecord
+from .research_modes import ResearchMode
 from .run_runtime import ScratchEntry, run_tool_definitions
 from .sandbox_runtime import RunSandbox
 
-
-RESEARCH_PROMPT_VERSION = "research-v1"
-
-
-def _utcnow() -> datetime:
-    return datetime.now(tz=UTC)
+if TYPE_CHECKING:
+    from .model_adapter import ModelAdapter, ModelMessage
 
 
-def _new_id(prefix: str) -> str:
-    return f"{prefix}_{ulid.new().str.lower()}"
+RESEARCH_PROMPT_VERSION = "research-v3"
 
 
 def render_finding(finding: ResearchFinding) -> str:
@@ -105,21 +100,10 @@ def render_finding(finding: ResearchFinding) -> str:
     )
 
 
-def _research_capability_ids(mode: str) -> frozenset[str]:
-    """The mode's read-capability whitelist — web XOR personal XOR memories, never mixed."""
-    if mode == "web":
-        return RESEARCH_WEB_CAPABILITY_IDS
-    if mode == "personal":
-        return RESEARCH_PERSONAL_CAPABILITY_IDS
-    if mode == "memories":
-        return RESEARCH_MEMORIES_CAPABILITY_IDS
-    raise ValueError(f"unknown research mode: {mode}")
-
-
 def _build_research_messages(
     *,
     question: str,
-    mode: str,
+    mode: ResearchMode,
     eligible_callables: list[str],
 ) -> list[ModelMessage]:
     """The research prompt: the run-program syscall framing plus research framing.
@@ -130,7 +114,7 @@ def _build_research_messages(
     to finish.
     """
 
-    callable_lines = [f"- {name}" for name in eligible_callables]
+    callable_lines = [f"- {name}{run_callable_signature(name)}" for name in eligible_callables]
     parts: list[Any] = [
         SystemPromptPart(
             content=(
@@ -155,7 +139,16 @@ def _build_research_messages(
                 "syscall callables your run program may call this run "
                 "(each is namespace.member(...) and returns its result; "
                 "scratch.set, scratch.get, agent.emit_value, and "
-                "agent.emit_finding are always available):\n"
+                "agent.emit_finding are always available). The agent, scratch, "
+                "and capability namespaces are pre-injected globals in your "
+                "program. Do NOT import them: ``import agent`` and ``import "
+                "memory`` are rejected by the sandbox, and ``import ariel`` "
+                "fails. All syscall arguments are keyword arguments — "
+                "``agent.emit_value(value=...)``, not ``agent.emit_value(...)``. "
+                "The standard library is available for compute (json, re, "
+                "datetime, urllib.parse, email.utils, etc.). The signature "
+                "shown after each callable is the contract: calls that pass "
+                "extra or wrong-named keys return schema_invalid.\n"
             )
             + "\n".join(callable_lines)
         ),
@@ -186,7 +179,7 @@ def run_research(
     google_runtime: GoogleConnectorRuntime,
     session_id: str,
     question: str,
-    mode: str,
+    mode: ResearchMode,
     now_fn: Callable[[], datetime] | None = None,
 ) -> ResearchFinding:
     """Drive the read-only research loop and return a typed finding.
@@ -199,17 +192,26 @@ def run_research(
     ``ResearchFinding(status="complete"|"partial"|"failed", ...)``;
     never raises.
 
-    ``google_runtime`` is always required: web mode ignores it; personal mode
-    uses it to execute the Google Workspace capabilities in
+    ``google_runtime`` is always required. ``web`` and ``memories`` modes ignore
+    it; ``personal`` mode uses it to execute the Google Workspace capabilities in
     ``RESEARCH_PERSONAL_CAPABILITY_IDS``.
     """
 
-    allowed_capability_ids = _research_capability_ids(mode)
-    clock = now_fn or _utcnow
+    match mode:
+        case "web":
+            allowed_capability_ids = RESEARCH_WEB_CAPABILITY_IDS
+        case "personal":
+            allowed_capability_ids = RESEARCH_PERSONAL_CAPABILITY_IDS
+        case "memories":
+            allowed_capability_ids = RESEARCH_MEMORIES_CAPABILITY_IDS
+        case _:
+            assert_never(mode)
+
+    clock = now_fn or utcnow
 
     now = clock()
     turn = TurnRecord(
-        id=_new_id("trn"),
+        id=new_id("trn"),
         session_id=session_id,
         user_message=question,
         assistant_message=None,
@@ -228,7 +230,7 @@ def run_research(
         sequence += 1
         db.add(
             EventRecord(
-                id=_new_id("evn"),
+                id=new_id("evn"),
                 session_id=session_id,
                 turn_id=turn.id,
                 sequence=sequence,
@@ -247,7 +249,7 @@ def run_research(
         if name is not None
     )
     add_event(
-        "evt.turn.started",
+        "evt.research.started",
         {"research_question": question, "research_mode": mode},
     )
 
@@ -264,7 +266,7 @@ def run_research(
         prompt_version=RESEARCH_PROMPT_VERSION,
         budget_seconds=float(settings.research_run_budget_seconds),
         max_model_calls=int(settings.agent_loop_max_model_calls),
-        is_research_run=True,
+        is_main_agent_loop=False,
         record_judgments=False,
         judgment_type=None,
         retry_on_model_error=False,
@@ -286,7 +288,7 @@ def run_research(
             "run program emitted internal values. Continue with "
             "exactly one run call; finish by calling agent.emit_finding."
         ),
-        fallback_nudge=(
+        no_terminal_output_nudge=(
             "run program completed without a finding. Continue with "
             "exactly one run call; finish by calling agent.emit_finding."
         ),
@@ -310,7 +312,7 @@ def run_research(
         approval_actor_id=str(settings.approval_actor_id),
         add_event=add_event,
         now_fn=clock,
-        new_id_fn=_new_id,
+        new_id_fn=new_id,
         runtime_provenance=None,
         google_runtime=google_runtime,
         execute_google_reads_outside_transaction=False,
@@ -355,19 +357,8 @@ def run_research(
             turn.status = "completed"
             add_event("evt.research.partial", {"mode": mode})
         case "message" | "approval" | "paused" | "operations" | "bounded_failure":
-            # Not valid outcomes for output_mode="finding" — treat as partial.
-            finding = ResearchFinding(
-                question=question,
-                mode=mode,
-                status="partial",
-                summary="The research run ended unexpectedly.",
-                claims=[],
-                gaps=[],
-                sources=[],
-            )
-            turn.assistant_message = finding.summary
-            turn.status = "completed"
-            add_event("evt.research.partial", {"mode": mode})
+            msg = f"unexpected research loop outcome: {loop_result.outcome}"
+            raise AssertionError(msg)
 
     turn.updated_at = clock()
     add_event("evt.turn.completed", {})

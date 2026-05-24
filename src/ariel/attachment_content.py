@@ -16,7 +16,6 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .executor import ExecutionResult
-from .google_connector import _decrypt_secret, _encrypt_secret
 from .model_adapter import ModelAdapter, ModelCall, ModelTier
 from .persistence import (
     AttachmentBlobRecord,
@@ -25,6 +24,7 @@ from .persistence import (
     to_rfc3339,
 )
 from .response_contracts import ResponseContractViolation
+from .secret_cipher import SecretDecryptionFailure, decrypt_secret, encrypt_secret
 
 
 _DISCORD_ATTACHMENT_HOSTS = {"cdn.discordapp.com", "media.discordapp.net"}
@@ -33,13 +33,20 @@ _MAX_BLOCKS = 4
 _MAX_BLOCK_CHARS = 2000
 _MAX_TOTAL_CHARS = 6000
 _EXTRACTOR_VERSION = "1.0"
+AttachmentScannerMode = Literal["disabled", "fail_closed"]
 _ATTACHMENT_RECOVERY: dict[str, str] = {
     "unsupported_type": "Upload a text, PDF, image, or audio attachment.",
     "too_large": "Upload a smaller attachment or share the relevant excerpt as text.",
     "expired": "Re-upload the attachment and ask again.",
     "unavailable": "Re-upload the attachment or verify that Discord still exposes it.",
-    "unsafe": "The attachment was blocked by safety scanning.",
-    "scan_failed": "Attachment scanning is not available. Ask the operator to configure scanning.",
+    "unsafe": (
+        "The attachment matched a blocked-file safety check. Upload a clean export or paste "
+        "the relevant text."
+    ),
+    "scan_failed": (
+        "Attachment reads are blocked by this deployment's fail-closed scanner mode. Paste "
+        "the relevant text or ask the operator to review the file outside Ariel."
+    ),
     "extract_failed": "The attachment could not be read. Try a clearer export or paste the text.",
     "provider_timeout": "The extraction provider timed out. Retry shortly.",
     "provider_unavailable": "The extraction provider is unavailable or not configured.",
@@ -53,7 +60,7 @@ class AttachmentContentRuntime:
     max_bytes: int
     fetch_timeout_seconds: float
     handle_ttl_seconds: int
-    scanner_mode: str
+    scanner_mode: AttachmentScannerMode
     adapter: ModelAdapter
     # Audio-only OpenAI plumbing — image/PDF extraction routes through
     # ``adapter`` on the VISION tier. The audio path keeps direct httpx
@@ -64,6 +71,10 @@ class AttachmentContentRuntime:
     encryption_secret: str
     encryption_key_version: str
     encryption_keys: str | None
+
+    def __post_init__(self) -> None:
+        if self.scanner_mode not in ("disabled", "fail_closed"):
+            raise ValueError("scanner_mode must be one of: disabled, fail_closed")
 
     def record_discord_sources(
         self,
@@ -119,7 +130,7 @@ class AttachmentContentRuntime:
                     filename=filename,
                     declared_content_type=declared_content_type,
                     declared_size_bytes=declared_size_bytes,
-                    acquisition_url_enc=_encrypt_secret(
+                    acquisition_url_enc=encrypt_secret(
                         plaintext=download_url,
                         secret=self.encryption_secret,
                         key_version=self.encryption_key_version,
@@ -172,10 +183,11 @@ class AttachmentContentRuntime:
         content: bytes | None = None
         blob: AttachmentBlobRecord | None = None
         if source.blob_id is not None:
-            blob = db.get(AttachmentBlobRecord, source.blob_id)
-            if blob is not None:
-                stored_path = Path(self.blob_store_path) / blob.storage_key
+            cached_blob = db.get(AttachmentBlobRecord, source.blob_id)
+            if cached_blob is not None and cached_blob.deleted_at is None:
+                stored_path = Path(self.blob_store_path) / cached_blob.storage_key
                 if stored_path.is_file():
+                    blob = cached_blob
                     content = stored_path.read_bytes()
 
         if content is None:
@@ -213,13 +225,13 @@ class AttachmentContentRuntime:
                     error=None,
                 )
             try:
-                download_url = _decrypt_secret(
+                download_url = decrypt_secret(
                     ciphertext=source.acquisition_url_enc,
                     secret=self.encryption_secret,
                     expected_key_version=self.encryption_key_version,
                     encryption_keys=self.encryption_keys,
                 )
-            except ValueError:
+            except SecretDecryptionFailure:
                 return ExecutionResult(
                     status="succeeded",
                     output=_failure_output(
@@ -339,6 +351,19 @@ class AttachmentContentRuntime:
                 )
                 db.add(blob)
                 db.flush()
+            else:
+                stored_path = Path(self.blob_store_path) / blob.storage_key
+                stored_path.parent.mkdir(parents=True, exist_ok=True)
+                if not stored_path.exists():
+                    stored_path.write_bytes(content)
+                if blob.deleted_at is not None:
+                    blob.size_bytes = len(content)
+                    blob.sniffed_mime_type = sniffed_mime_type
+                    blob.scan_status = "clean"
+                    blob.scanner_version = "disabled-development"
+                    blob.deleted_at = None
+                    blob.updated_at = retrieved_at
+                    db.flush()
             source.blob_id = blob.id
             source.updated_at = retrieved_at
             db.flush()
@@ -350,6 +375,7 @@ class AttachmentContentRuntime:
                 AttachmentExtractionRecord.extractor_version == _EXTRACTOR_VERSION,
                 AttachmentExtractionRecord.modality == modality,
                 AttachmentExtractionRecord.status == "succeeded",
+                AttachmentExtractionRecord.created_at >= blob.updated_at,
             )
             .limit(1)
         )

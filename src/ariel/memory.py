@@ -1,17 +1,17 @@
 """Ariel's memory substrate — a two-layer append-only raw log plus an editable
 curated note layer, with agentic retrieval and encoding/dreaming.
 
-Three functions drive the substrate, all of them ``run_agent_loop`` in a
-different configuration:
+Two model-loop drivers operate on the substrate:
 
 - ``run_retriever`` — fires every wake; reconstructs the working context
   agentically by searching and reading the substrate, then returns a
   ``recall_v1`` finding.
 - ``run_rememberer`` — writes the curated layer on ``encode`` (agent-invoked)
   or ``dream`` (scheduled) triggers; never the raw log.
-- The raw log is written only by ``append_log_event`` (a rail); the curated
-  layer only by ``create_note`` / ``edit_note`` / ``delete_note`` (rails that
-  also append ``note_*`` events to the log).
+
+The raw log is written only by ``append_log_event`` (a rail); the curated layer
+only by ``create_note`` / ``edit_note`` / ``delete_note`` (rails that also append
+``note_*`` events to the log).
 
 Deterministic code here does exactly five things, all rails: durable substrate
 storage, embedding computation, hybrid search, loop configuration, and
@@ -23,17 +23,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal
 
-import ulid
 from pydantic_ai.messages import ModelRequest, SystemPromptPart, UserPromptPart
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from .capability_registry import run_callable_signature
 from .config import AppSettings
+from .ids import new_id
 from .model_adapter import ModelAdapter, ModelMessage
 from .persistence import (
     BackgroundTaskRecord,
@@ -53,77 +54,146 @@ if TYPE_CHECKING:
     from .sandbox_runtime import RunSandbox
 
 from .agent_loop import LoopConfig, LoopResult, run_agent_loop
-from .response_contracts import validate_memory_recall_v1
+from .response_contracts import ResponseContractViolation, validate_memory_recall_v1
 
 
 # ---------------------------------------------------------------------------
 # Prompt-version constants
 # ---------------------------------------------------------------------------
 
-RETRIEVER_PROMPT_VERSION = "memory-retriever-v3"
-REMEMBERER_ENCODE_PROMPT_VERSION = "memory-rememberer-encode-v2"
-REMEMBERER_DREAM_PROMPT_VERSION = "memory-rememberer-dream-v2"
+RETRIEVER_PROMPT_VERSION = "memory-retriever-v4"
+REMEMBERER_ENCODE_PROMPT_VERSION = "memory-rememberer-encode-v3"
+REMEMBERER_DREAM_PROMPT_VERSION = "memory-rememberer-dream-v3"
+
+
+class MemoryExecutionError(Exception):
+    def __init__(self, safe_reason: str) -> None:
+        super().__init__(safe_reason)
+        self.safe_reason = safe_reason
+
+
+class MemoryRecallError(MemoryExecutionError):
+    """Expected memory recall failure that should not fail the user turn."""
+
+
+class MemoryEmbeddingResponseError(Exception):
+    pass
 
 
 # ---------------------------------------------------------------------------
 # System prompts
 # ---------------------------------------------------------------------------
 
-_RETRIEVER_PROMPT = (
-    "You are Ariel's memory retriever. Your job is to reconstruct the working "
-    "context for the current wake by agentically searching the memory substrate. "
-    "The `agent` and `memory` namespaces are pre-injected globals in your run "
-    "program — do not import them. All syscall arguments are keyword arguments. "
-    "Call memory.search(query='...', limit=N, since='...', kinds=[...]) to search "
-    "both the raw log and the curated notes (query is required; limit/since/kinds "
-    "are optional). Call memory.read(id='...') to fetch the full content of any "
-    "row by id. Search broadly, read what looks relevant, and follow up across "
-    "multiple rounds if the first results lead to more useful entries. When "
-    "satisfied — or when you have covered both relevance-based recall and "
-    "recent-session continuity — call agent.emit_finding(summary='...', "
-    "claims=[{'id': ..., 'layer': ..., 'created_at': ..., 'content': ..., "
-    "'taint': ...}, ...], gaps=[], sources=[]). Exactly these four keyword "
-    "arguments are accepted; pass empty lists for gaps and sources when there "
-    "is nothing to report. If you exhaust your budget before finishing, the "
-    'loop ends with status "partial" automatically. The retriever fires on '
-    "every wake — cover both semantic relevance and recent session continuity "
-    "so the main agent can act without missing recent history. Do not invent "
-    "ids; every id in claims must be a real id returned by a memory.search or "
-    "memory.read call."
-)
+_RETRIEVER_PROMPT = """\
+You are Ariel's memory retriever. Your job is to reconstruct the working \
+context for the current wake by agentically searching the memory substrate.
 
-_REMEMBERER_ENCODE_PROMPT = (
-    "You are Ariel's memory encoder. The user message will include "
-    '{"trigger": "encode", "note": "<what to remember>", ...}. '
-    "Your job is to write this to the curated note layer, editing rather than "
-    "duplicating when a related note already exists. "
-    "First call memory.search(query='...') (with kinds omitted to search the "
-    "curated layer) to find relevant existing notes. Read candidates with "
-    "memory.read(id='...') to inspect their content. Then apply "
-    "memory.note.create(content='...'), memory.note.edit(id='...', content='...'), "
-    "and/or memory.note.delete(id='...') as needed — edit a note when the new "
-    "material updates or extends it; delete a note only when it is fully "
-    "superseded. All syscall arguments must be keyword arguments. When done, "
-    "call agent.emit_done(summary='...') with a short string describing what you "
-    "did. The raw log is append-only and must never be the target of note "
-    "operations."
-)
+Runtime contract (violations fail the program):
+- `agent` and `memory` are pre-injected globals — do not import them; \
+`import ariel` fails.
+- All syscall arguments are keyword arguments. Positional calls raise TypeError.
+- `print` is not a safe builtin and most introspection builtins (`hasattr`, \
+`type`, `locals`, ...) are absent. Do not use them.
+- You are a subagent, not the main agent: do NOT call `agent.emit_message` or \
+`agent.emit_value`. The only terminal for this run is `agent.emit_finding`.
 
-_REMEMBERER_DREAM_PROMPT = (
-    "You are Ariel's memory dreamer. The user message will include "
-    '{"trigger": "dream"}. '
-    "Your job is to consolidate the recent raw log into the curated note layer: "
-    "generalizations, summaries, connections, topic abstractions. "
-    "Read recent log events with memory.search(query='...', since='...') (over "
-    "the log; use the since parameter to scope to recent time). Also search the "
-    "curated layer for existing notes to edit or delete rather than duplicate. "
-    "Write new notes with memory.note.create(content='...'), update existing "
-    "ones with memory.note.edit(id='...', content='...'), and delete superseded "
-    "ones with memory.note.delete(id='...'). All syscall arguments must be "
-    "keyword arguments. The raw log is append-only — only memory_notes is "
-    "mutable; never use note operations with a log id. When satisfied, call "
-    "agent.emit_done(summary='...') with a short summary of what you consolidated."
-)
+Search and read syscalls:
+- `memory.search(query='...', limit=24, since=None, kinds=None)` searches the \
+raw log AND the curated notes together; there is no layer selector. `since` is \
+RFC3339 (e.g. `'2026-05-20T12:00:00Z'`). `kinds` filters the log layer to \
+specific event types — pass only values from this enum: 'user_message', \
+'agent_round', 'assistant_message', 'tool_observation', 'proactive_trigger', \
+'note_create', 'note_edit', 'note_delete', 'recall', 'research_finding'. \
+Passing 'log', 'note', 'memory_notes', or any other value is invalid and the \
+call will fail.
+- `memory.read(id='...')` fetches the full content of any row by id.
+
+Workflow: search broadly, read what looks relevant, follow up across rounds if \
+first results lead to more useful entries. Cover both semantic relevance AND \
+recent session continuity so the main agent can act without missing recent \
+history.
+
+Terminal — exact form required:
+  `agent.emit_finding(summary='<plain-language recap>', claims=[{'id': ..., \
+'layer': ..., 'created_at': ..., 'content': ..., 'taint': ...}, ...], gaps=[], \
+sources=[])`
+Exactly these four keyword arguments — `summary`, `claims`, `gaps`, `sources`. \
+Pass `[]` for `gaps` and `sources` when there is nothing to report. Do NOT use \
+`items=`, `status=`, or any other keyword (those are fields of the recall \
+return shape, not arguments to `emit_finding`). Every id in `claims` must be a \
+real id returned by `memory.search` or `memory.read` — do not invent ids. If \
+you exhaust your budget before finishing, the loop ends with status 'partial' \
+automatically."""
+
+_REMEMBERER_ENCODE_PROMPT = """\
+You are Ariel's memory encoder. The user message will include \
+{"trigger": "encode", "note": "<what to remember>", ...}.
+
+Your job is to write this to the curated note layer, editing rather than \
+duplicating when a related note already exists.
+
+Runtime contract (violations fail the program):
+- `agent` and `memory` are pre-injected globals — do not import them; \
+`import ariel` fails.
+- All syscall arguments are keyword arguments. Positional calls raise TypeError.
+- `print` is not a safe builtin; do not call it.
+- You are a subagent, not the main agent: do NOT call `agent.emit_message` or \
+`agent.emit_value`. The only terminal for this run is `agent.emit_done`.
+
+Workflow:
+1. Call `memory.search(query='...')` to find relevant existing notes. \
+`memory.search` searches both layers together; there is no layer selector. \
+`kinds` filters the log layer to specific event types — omit it to include \
+curated notes in results. Only these `kinds` values are valid: 'user_message', \
+'agent_round', 'assistant_message', 'tool_observation', 'proactive_trigger', \
+'note_create', 'note_edit', 'note_delete', 'recall', 'research_finding'. Other \
+values fail.
+2. Inspect candidates with `memory.read(id='...')`.
+3. Apply `memory.note.create(content='...')`, \
+`memory.note.edit(id='...', content='...')`, or \
+`memory.note.delete(id='...')`. Edit when new material updates or extends a \
+note; delete only when the note is fully superseded. The raw log is \
+append-only — never use note operations with a log id.
+
+Terminal — exact form required:
+  `agent.emit_done(summary='<short description of what you did>')`
+Exactly one keyword argument — `summary`. Do NOT use `message=`, `result=`, \
+`text=`, or any extra kwargs."""
+
+_REMEMBERER_DREAM_PROMPT = """\
+You are Ariel's memory dreamer. The user message will include \
+{"trigger": "dream"}.
+
+Your job is to consolidate the recent raw log into the curated note layer: \
+generalizations, summaries, connections, topic abstractions.
+
+Runtime contract (violations fail the program):
+- `agent` and `memory` are pre-injected globals — do not import them; \
+`import ariel` fails.
+- All syscall arguments are keyword arguments. Positional calls raise TypeError.
+- `print` is not a safe builtin; do not call it.
+- You are a subagent, not the main agent: do NOT call `agent.emit_message` or \
+`agent.emit_value`. The only terminal for this run is `agent.emit_done`.
+
+Workflow:
+1. Read recent log events with `memory.search(query='...', since='...')`. \
+`since` is RFC3339 (e.g. `'2026-05-20T12:00:00Z'`). `memory.search` searches \
+both layers together; there is no layer selector. `kinds` filters the log \
+layer to specific event types — only these values are valid: 'user_message', \
+'agent_round', 'assistant_message', 'tool_observation', 'proactive_trigger', \
+'note_create', 'note_edit', 'note_delete', 'recall', 'research_finding'. \
+Passing 'log', 'note', or 'memory_notes' is invalid and the call fails.
+2. Also search for existing curated notes to edit or delete rather than \
+duplicate.
+3. Write new notes with `memory.note.create(content='...')`, update existing \
+ones with `memory.note.edit(id='...', content='...')`, and delete superseded \
+ones with `memory.note.delete(id='...')`. The raw log is append-only — only \
+memory_notes is mutable; never use note operations with a log id.
+
+Terminal — exact form required:
+  `agent.emit_done(summary='<short summary of what you consolidated>')`
+Exactly one keyword argument — `summary`. Do NOT use `message=`, `result=`, \
+`text=`, or any extra kwargs."""
 
 
 # ---------------------------------------------------------------------------
@@ -135,14 +205,17 @@ def embed_text(text: str, *, adapter: ModelAdapter, settings: AppSettings) -> li
     """Embed ``text`` via the shared ``ModelAdapter``'s EMBEDDING tier.
 
     The adapter is async; we bridge with ``asyncio.run`` because the rest of
-    the memory path is sync — same pattern as ``agent_loop.py``. The DB column
-    is fixed-width so we validate the response dimension here and raise on
-    mismatch; callers (``append_log_event`` / ``create_note`` / ``edit_note``
-    / ``search_memory``) catch ``RuntimeError`` to fall back to a null vector.
+    the memory path is sync — same pattern as ``agent_loop.py``. Any
+    provider-side failure (missing credentials, network, malformed response)
+    is wrapped in ``RuntimeError`` so the fail-soft contract holds regardless
+    of which substrate the EMBEDDING tier resolves to; callers
+    (``append_log_event`` / ``create_note`` / ``edit_note`` / ``search_memory``)
+    catch ``RuntimeError`` to fall back to a null vector.
 
-    Any provider-side failure (missing credentials, network, malformed
-    response) is wrapped in ``RuntimeError`` so the fail-soft contract holds
-    regardless of which substrate the EMBEDDING tier resolves to.
+    The DB column is fixed-width so a dimension mismatch in the adapter's
+    response is a configuration defect (wrong embedding model bound to the
+    EMBEDDING tier) and raises ``MemoryEmbeddingResponseError``, which
+    propagates past the fail-soft callers.
     """
     try:
         vectors = asyncio.run(adapter.embed([" ".join(text.split())]))
@@ -150,7 +223,7 @@ def embed_text(text: str, *, adapter: ModelAdapter, settings: AppSettings) -> li
         raise RuntimeError(f"memory embedding failed: {exc}") from exc
     vector = vectors[0]
     if len(vector) != settings.memory_embedding_dimensions:
-        raise RuntimeError(
+        raise MemoryEmbeddingResponseError(
             "memory embedding response dimension mismatch: "
             f"expected {settings.memory_embedding_dimensions}, got {len(vector)}"
         )
@@ -175,6 +248,24 @@ _LogKind = Literal[
 ]
 
 
+# Assistant failure messages such as "Calendar fetch failed", "Email query
+# unavailable", and "Drive errored" poison future retrieval if they enter
+# ``memory_log``. The retriever can surface them as authoritative evidence of
+# failure even after the capability is succeeding again, so filter them at both
+# the write and retrieval sites. Deliberately tight: "no events found" can be a
+# legitimate result and must not match.
+_ASSISTANT_FAILURE_MESSAGE_RE = re.compile(
+    r"^(calendar|email|drive|memory|inbox)\s*"
+    r"(fetch|query|search|request)?\s*(failed|unavailable|errored)\b"
+    r"|re-link in settings",
+    re.IGNORECASE,
+)
+
+
+def _is_assistant_failure_message(content: str) -> bool:
+    return _ASSISTANT_FAILURE_MESSAGE_RE.search(content) is not None
+
+
 def append_log_event(
     db: Session,
     *,
@@ -188,14 +279,20 @@ def append_log_event(
     settings: AppSettings,
     now: datetime,
     new_id_fn: Callable[[str], str],
-) -> MemoryLogRecord:
+) -> MemoryLogRecord | None:
     """Append one event to the raw log inside the caller's transaction.
 
-    Computes the embedding via ``embed_text``; on ``RuntimeError`` (dimension
-    mismatch) inserts with ``embedding=None`` (null = pending, to be backfilled).
-    Provider/network errors from the EMBEDDING tier propagate — the loop's
-    ``model_failed`` exhaustion path handles them.
+    Computes the embedding via ``embed_text``; when the EMBEDDING tier fails
+    (missing credentials, network, malformed response), inserts with
+    ``embedding=None`` (null = pending, to be backfilled).
+
+    Returns ``None`` when the row is skipped by an inbound filter — currently
+    only ``assistant_message`` rows whose content matches the assistant-failure
+    vocabulary above.
     """
+    if kind == "assistant_message" and _is_assistant_failure_message(content):
+        return None
+
     try:
         embedding: list[float] | None = embed_text(content, adapter=adapter, settings=settings)
     except RuntimeError:
@@ -288,7 +385,7 @@ def edit_note(
     """Rewrite a note's content in place and append a ``note_edit`` log event."""
     note = db.scalar(select(MemoryNoteRecord).where(MemoryNoteRecord.id == note_id))
     if note is None:
-        raise RuntimeError(f"edit_note: note {note_id!r} does not exist")
+        raise MemoryExecutionError("memory_note_not_found")
 
     try:
         embedding: list[float] | None = embed_text(content, adapter=adapter, settings=settings)
@@ -329,7 +426,7 @@ def delete_note(
     """Delete a curated note and append a ``note_delete`` log event."""
     note = db.scalar(select(MemoryNoteRecord).where(MemoryNoteRecord.id == note_id))
     if note is None:
-        raise RuntimeError(f"delete_note: note {note_id!r} does not exist")
+        raise MemoryExecutionError("memory_note_not_found")
 
     note_taint: Literal["clean", "tainted"] = "tainted" if note.taint == "tainted" else "clean"
     db.delete(note)
@@ -375,6 +472,13 @@ def search_memory(
     log layer, and returns up to ``limit`` hits ordered by ``created_at DESC``
     (transport order — the model ranks, code does not).
 
+    Skips ``assistant_message`` log rows whose content matches the
+    assistant-failure vocabulary. The same filter applies at the write site
+    (``append_log_event``); the retrieval-side filter also protects rows already
+    present in the append-only log. Filter-after-LIMIT: the cap is honoured as a
+    cap, no overfetching, and surfacing fewer hits is more honest to the model
+    than padding with noise.
+
     Returns ``[{"id", "layer", "kind", "created_at", "snippet", "taint"}, ...]``.
     ``"kind"`` is ``None`` for note-layer hits.
     """
@@ -393,6 +497,8 @@ def search_memory(
         if kinds is not None:
             stmt = stmt.where(MemoryLogRecord.kind.in_(kinds))
         for row in db.scalars(stmt.order_by(MemoryLogRecord.created_at.desc()).limit(limit)).all():
+            if row.kind == "assistant_message" and _is_assistant_failure_message(row.content):
+                continue
             hits[row.id] = {
                 "id": row.id,
                 "layer": "log",
@@ -413,6 +519,8 @@ def search_memory(
                 vec_stmt = vec_stmt.where(MemoryLogRecord.kind.in_(kinds))
             distance = MemoryLogRecord.embedding.cosine_distance(query_embedding)
             for row in db.scalars(vec_stmt.order_by(distance.asc()).limit(limit)).all():
+                if row.kind == "assistant_message" and _is_assistant_failure_message(row.content):
+                    continue
                 if row.id not in hits:
                     hits[row.id] = {
                         "id": row.id,
@@ -463,20 +571,7 @@ def search_memory(
 
 
 # ---------------------------------------------------------------------------
-# Loop helpers shared by run_retriever / run_rememberer
-# ---------------------------------------------------------------------------
-
-
-def _new_id(prefix: str) -> str:
-    return f"{prefix}_{ulid.new().str.lower()}"
-
-
-def _utcnow() -> datetime:
-    return datetime.now(tz=UTC)
-
-
-# ---------------------------------------------------------------------------
-# The retriever — run_agent_loop in investigation/memories/lite config
+# The retriever — memory_recall loop driver
 # ---------------------------------------------------------------------------
 
 
@@ -502,11 +597,11 @@ def run_retriever(
 ) -> dict[str, Any]:
     """Run the retriever and return a ``recall_v1`` dict.
 
-    Fires the shared loop in ``investigation``/``memories``/``lite``
-    configuration.  The retriever builds its own input items — context
-    firewall: its rounds never enter the main agent's context.  On any
-    failure (budget, model error, contract violation) returns a minimal
-    partial dict rather than raising; recall failure is non-fatal.
+    Runs the shared loop as the retriever driver. The retriever builds
+    its own input items — context firewall: its rounds never enter the main
+    agent's context. Budget/backstop exhaustion returns a minimal partial
+    recall. Model-provider recall failure raises ``MemoryRecallError`` so the
+    caller can keep recall non-fatal without swallowing internal defects.
     """
     eligible_callables = ["memory.search", "memory.read", "agent.emit_finding"]
     callable_lines = "\n".join(
@@ -541,7 +636,7 @@ def run_retriever(
         prompt_version=RETRIEVER_PROMPT_VERSION,
         budget_seconds=float(settings.memory_recall_budget_seconds),
         max_model_calls=int(settings.agent_loop_max_model_calls),
-        is_research_run=True,
+        is_main_agent_loop=False,
         record_judgments=True,
         judgment_type="memory_recall",
         retry_on_model_error=False,
@@ -559,7 +654,7 @@ def run_retriever(
         emit_value_nudge=(
             "Values emitted. Continue with one run call; finish by calling agent.emit_finding."
         ),
-        fallback_nudge=(
+        no_terminal_output_nudge=(
             "Program completed without a finding. Continue with one run call; "
             "finish by calling agent.emit_finding."
         ),
@@ -591,23 +686,30 @@ def run_retriever(
         attachment_runtime=attachment_runtime,
     )
 
-    if loop_result.emitted_finding is not None:
-        raw = loop_result.emitted_finding
-        payload = {
-            "summary": raw.summary,
-            "items": raw.claims,  # finding carries items in claims for recall_v1
-            "status": raw.status,
-        }
-        try:
-            return validate_memory_recall_v1(payload)
-        except Exception:
-            pass
-
-    return {"summary": "", "items": [], "status": "partial"}
+    match loop_result.outcome:
+        case "finding":
+            assert loop_result.emitted_finding is not None
+            raw = loop_result.emitted_finding
+            payload = {
+                "summary": raw.summary,
+                "items": raw.claims,  # finding carries items in claims for recall_v1
+                "status": raw.status,
+            }
+            try:
+                return validate_memory_recall_v1(payload)
+            except ResponseContractViolation as exc:
+                raise MemoryRecallError("memory_recall_contract_invalid") from exc
+        case "budget_exhausted":
+            return {"summary": "", "items": [], "status": "partial"}
+        case "model_failed":
+            raise MemoryRecallError("memory_recall_model_failed")
+        case "message" | "approval" | "paused" | "operations" | "bounded_failure":
+            msg = f"unexpected memory recall loop outcome: {loop_result.outcome}"
+            raise AssertionError(msg)
 
 
 # ---------------------------------------------------------------------------
-# The rememberer — run_agent_loop in rememberer/encode|dream config
+# The rememberer — memory_encode/memory_dream loop driver
 # ---------------------------------------------------------------------------
 
 
@@ -634,7 +736,7 @@ def run_rememberer(
     """Run the rememberer (encode or dream) as a background task.
 
     Builds its own ``TurnRecord`` (kind ``memory_encode`` or ``memory_dream``),
-    calls ``run_agent_loop`` in the rememberer configuration, and returns
+    calls ``run_agent_loop`` as the rememberer driver, and returns
     ``None``.  The loop applies note mutations via ``memory.note.*`` syscalls
     (which call ``create_note`` / ``edit_note`` / ``delete_note`` above, which
     also log the events).  Never raises.
@@ -720,7 +822,7 @@ def run_rememberer(
         prompt_version=prompt_version,
         budget_seconds=budget,
         max_model_calls=int(settings.agent_loop_max_model_calls),
-        is_research_run=True,
+        is_main_agent_loop=False,
         record_judgments=True,
         judgment_type=judgment_type,
         retry_on_model_error=False,
@@ -738,7 +840,7 @@ def run_rememberer(
         emit_value_nudge=(
             "Values emitted. Continue with one run call; finish by calling agent.emit_done."
         ),
-        fallback_nudge=(
+        no_terminal_output_nudge=(
             "Program completed without finishing. Continue with one run call; "
             "finish by calling agent.emit_done."
         ),
@@ -796,7 +898,7 @@ def enqueue_memory_encode(
     now: datetime,
 ) -> str:
     """Enqueue a ``memory_encode`` background task. Returns the task id."""
-    stable_id = _new_id("enc")
+    stable_id = new_id("enc")
     task = enqueue_background_task(
         db,
         task_type="memory_encode",

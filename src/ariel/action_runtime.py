@@ -9,7 +9,7 @@ import secrets
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
-    from ariel.app import ModelAdapter
+    from ariel.model_adapter import ModelAdapter
     from ariel.sandbox_runtime import RunSandbox
 
 from fastapi.encoders import jsonable_encoder
@@ -51,8 +51,7 @@ from ariel.google_connector import (
     GOOGLE_WRITE_CAPABILITY_IDS,
     GoogleCapabilityExecutionResult,
     GoogleConnectorRuntime,
-    _decrypt_secret,
-    _encrypt_secret,
+    google_connected_account_subject,
 )
 from ariel.persistence import (
     ActionAttemptRecord,
@@ -71,6 +70,7 @@ from ariel.persistence import (
 )
 from ariel.policy_engine import evaluate_proposal
 from ariel.redaction import safe_failure_reason
+from ariel.secret_cipher import decrypt_secret, encrypt_secret
 from ariel.weather_state import resolve_weather_location
 
 _SIDE_EFFECT_EXECUTION_LOCK_ID = 24_310_002
@@ -114,6 +114,18 @@ class ActionRuntimeError(Exception):
         self.message = message
         self.details = details
         self.retryable = retryable
+
+
+class _EmailProviderStateError(RuntimeError):
+    pass
+
+
+class _EmailBeforeStateMissing(_EmailProviderStateError):
+    pass
+
+
+class _EmailAfterStateMissing(_EmailProviderStateError):
+    pass
 
 
 @dataclass(slots=True)
@@ -264,7 +276,7 @@ def _store_action_private_payload(
             action_attempt_id=action_attempt.id,
             payload_kind="google_provider_write_input",
             payload_digest=_json_digest(private_payload),
-            payload_enc=_encrypt_secret(
+            payload_enc=encrypt_secret(
                 plaintext=json.dumps(
                     jsonable_encoder(private_payload),
                     sort_keys=True,
@@ -316,7 +328,7 @@ def _full_action_input_payload(
     if private_payload_record is None:
         return None, "private_action_payload_missing"
     try:
-        plaintext = _decrypt_secret(
+        plaintext = decrypt_secret(
             ciphertext=private_payload_record.payload_enc,
             secret=google_runtime.encryption_secret,
             expected_key_version=google_runtime.encryption_key_version,
@@ -355,10 +367,23 @@ def _current_google_provider_account_id(db: Session) -> str | None:
     )
     if connector is None or connector.status != "connected":
         return None
-    account_subject = connector.account_subject
-    if account_subject is None or not account_subject.strip():
-        return None
-    return account_subject
+    return google_connected_account_subject(connector)
+
+
+def _provider_write_account_id(
+    *,
+    db: Session,
+    provider: str,
+    provider_account_id: str | None,
+) -> str:
+    if isinstance(provider_account_id, str) and provider_account_id.strip():
+        return provider_account_id.strip()
+    if provider != "google":
+        return provider
+    current_provider_account_id = _current_google_provider_account_id(db)
+    if current_provider_account_id is None:
+        raise RuntimeError("google_account_identity_missing")
+    return current_provider_account_id
 
 
 def _email_advisory_lock_id(*parts: str) -> int:
@@ -366,14 +391,26 @@ def _email_advisory_lock_id(*parts: str) -> int:
     return int.from_bytes(digest[:8], "big") & 0x7FFF_FFFF_FFFF_FFFF
 
 
-def _acquire_email_advisory_lock(db: Session, *parts: str) -> None:
-    bind = db.get_bind()
+def _acquire_email_mutation_lock(
+    session_factory: sessionmaker[Session], *parts: str
+) -> tuple[Session | None, int | None]:
+    lock_db = session_factory()
+    bind = lock_db.get_bind()
     if bind is None or bind.dialect.name != "postgresql":
+        lock_db.close()
+        return None, None
+    lock_id = _email_advisory_lock_id(*parts)
+    lock_db.execute(text("SELECT pg_advisory_lock(:lock_id)"), {"lock_id": lock_id})
+    lock_db.commit()
+    return lock_db, lock_id
+
+
+def _release_email_mutation_lock(lock_db: Session | None, lock_id: int | None) -> None:
+    if lock_db is None or lock_id is None:
         return
-    db.execute(
-        text("SELECT pg_advisory_xact_lock(:lock_id)"),
-        {"lock_id": _email_advisory_lock_id(*parts)},
-    )
+    lock_db.execute(text("SELECT pg_advisory_unlock(:lock_id)"), {"lock_id": lock_id})
+    lock_db.commit()
+    lock_db.close()
 
 
 def _email_receipt_result_payload(
@@ -413,9 +450,9 @@ def _email_provider_state_lists(output: dict[str, Any]) -> tuple[dict[str, Any],
     before_state_raw = output.get("before_state")
     after_state_raw = output.get("after_state")
     if not isinstance(before_state_raw, list):
-        raise RuntimeError("email_before_state_missing")
+        raise _EmailBeforeStateMissing("email_before_state_missing")
     if not isinstance(after_state_raw, list):
-        raise RuntimeError("email_after_state_missing")
+        raise _EmailAfterStateMissing("email_after_state_missing")
     return {"messages": before_state_raw}, {"messages": after_state_raw}
 
 
@@ -630,7 +667,7 @@ def _execute_memory_capability(
     ``cap.memory.recall`` runs the retriever subagent inline (firewalled context,
     bounded budget) and returns a ``recall_v1`` dict.
     ``cap.memory.remember`` enqueues a ``memory_encode`` background task and
-    returns the task id — fire-and-forget.
+    returns ``{"status": "queued", "encode_id": ...}`` — fire-and-forget.
     ``cap.memory.search`` / ``.read`` / ``.note.*`` execute directly against the
     substrate inside their own short transaction.
 
@@ -698,16 +735,14 @@ def _execute_memory_capability(
 
     if capability_id == "cap.memory.search":
         query = str(normalized_input["query"])
-        limit_raw = normalized_input.get("limit")
-        limit = int(limit_raw) if limit_raw is not None else 24
-        since_raw = normalized_input.get("since")
-        since: datetime | None = None
-        if isinstance(since_raw, str) and since_raw:
-            try:
-                since = datetime.fromisoformat(since_raw.replace("Z", "+00:00"))
-            except ValueError:
-                raise RuntimeError("memory_search_since_invalid")
-        kinds_raw = normalized_input.get("kinds")
+        limit = int(normalized_input["limit"])
+        since_raw = normalized_input["since"]
+        since = (
+            datetime.fromisoformat(since_raw.replace("Z", "+00:00"))
+            if since_raw is not None
+            else None
+        )
+        kinds_raw = normalized_input["kinds"]
         kinds: tuple[str, ...] | None = tuple(kinds_raw) if kinds_raw is not None else None
         with session_factory() as db:
             with db.begin():
@@ -1065,6 +1100,64 @@ def _extract_search_source_candidates(
     retrieved_at = _parse_rfc3339_timestamp(output_payload.get("retrieved_at")) or now_fn()
     candidates: list[GroundedSourceCandidate] = []
 
+    raw_document = output_payload.get("document")
+    if isinstance(raw_document, dict):
+        title_raw = raw_document.get("title")
+        title = (
+            title_raw.strip() if isinstance(title_raw, str) and title_raw.strip() else "document"
+        )
+        source_raw = raw_document.get("canonical_source")
+        source = source_raw.strip() if isinstance(source_raw, str) and source_raw.strip() else None
+        raw_blocks = raw_document.get("content_blocks")
+        blocks = raw_blocks if isinstance(raw_blocks, list) else []
+        snippet_parts: list[str] = []
+        for block in blocks[:2]:
+            if not isinstance(block, dict):
+                continue
+            text_raw = block.get("text")
+            if isinstance(text_raw, str) and text_raw.strip():
+                snippet_parts.append(text_raw.strip())
+        snippet = _truncate_snippet(" ".join(snippet_parts))
+        if source is not None and snippet:
+            candidates.append(
+                GroundedSourceCandidate(
+                    title=title,
+                    source=source,
+                    snippet=snippet,
+                    retrieved_at=_parse_rfc3339_timestamp(raw_document.get("retrieved_at"))
+                    or retrieved_at,
+                    published_at=_parse_rfc3339_timestamp(raw_document.get("published_at")),
+                )
+            )
+            return candidates
+
+    raw_forecast = output_payload.get("forecast")
+    if isinstance(raw_forecast, dict):
+        summary_raw = raw_forecast.get("summary")
+        source_raw = raw_forecast.get("source")
+        summary = (
+            summary_raw.strip() if isinstance(summary_raw, str) and summary_raw.strip() else None
+        )
+        source = source_raw.strip() if isinstance(source_raw, str) and source_raw.strip() else None
+        location_raw = output_payload.get("location")
+        timeframe_raw = output_payload.get("timeframe")
+        title_parts = ["weather forecast"]
+        if isinstance(location_raw, str) and location_raw.strip():
+            title_parts.append(location_raw.strip())
+        if isinstance(timeframe_raw, str) and timeframe_raw.strip():
+            title_parts.append(timeframe_raw.strip())
+        if summary is not None and source is not None:
+            candidates.append(
+                GroundedSourceCandidate(
+                    title=" - ".join(title_parts),
+                    source=source,
+                    snippet=_truncate_snippet(summary),
+                    retrieved_at=retrieved_at,
+                    published_at=_parse_rfc3339_timestamp(raw_forecast.get("timestamp")),
+                )
+            )
+            return candidates
+
     raw_message = output_payload.get("message")
     if isinstance(raw_message, dict):
         subject_raw = raw_message.get("subject")
@@ -1216,6 +1309,32 @@ def _extract_search_source_candidates(
                     snippet=_truncate_snippet(" ".join(snippet_parts)),
                     retrieved_at=retrieved_at,
                     published_at=_parse_rfc3339_timestamp(updated_raw),
+                )
+            )
+        return candidates
+
+    if output_payload.get("schema_version") == "google.drive.read_result.v1":
+        title_raw = output_payload.get("title")
+        source_raw = output_payload.get("source")
+        excerpt_raw = output_payload.get("content_excerpt")
+        read_outcome = output_payload.get("read_outcome")
+        recovery_raw = read_outcome.get("recovery") if isinstance(read_outcome, dict) else None
+        reason_raw = read_outcome.get("reason_code") if isinstance(read_outcome, dict) else None
+        title = title_raw.strip() if isinstance(title_raw, str) and title_raw.strip() else ""
+        source = source_raw.strip() if isinstance(source_raw, str) and source_raw.strip() else ""
+        snippet_raw = excerpt_raw if isinstance(excerpt_raw, str) and excerpt_raw.strip() else None
+        if snippet_raw is None and isinstance(recovery_raw, str) and recovery_raw.strip():
+            snippet_raw = recovery_raw
+        if snippet_raw is None and isinstance(reason_raw, str) and reason_raw.strip():
+            snippet_raw = reason_raw
+        if title and source and snippet_raw is not None:
+            candidates.append(
+                GroundedSourceCandidate(
+                    title=title,
+                    source=source,
+                    snippet=_truncate_snippet(snippet_raw),
+                    retrieved_at=retrieved_at,
+                    published_at=_parse_rfc3339_timestamp(output_payload.get("published_at")),
                 )
             )
         return candidates
@@ -2096,10 +2215,10 @@ def _record_provider_write_receipt(
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
 ) -> ProviderWriteReceiptRecord:
-    resolved_provider_account_id = (
-        provider_account_id
-        or (_current_google_provider_account_id(db) if provider == "google" else None)
-        or provider
+    resolved_provider_account_id = _provider_write_account_id(
+        db=db,
+        provider=provider,
+        provider_account_id=provider_account_id,
     )
     idempotency_key = _provider_write_idempotency_key(
         action_attempt=action_attempt,
@@ -2337,10 +2456,10 @@ def _provider_write_receipt_for_attempt(
     provider_account_id: str | None,
     normalized_input: dict[str, Any] | None,
 ) -> ProviderWriteReceiptRecord | None:
-    resolved_provider_account_id = (
-        provider_account_id
-        or (_current_google_provider_account_id(db) if provider == "google" else None)
-        or provider
+    resolved_provider_account_id = _provider_write_account_id(
+        db=db,
+        provider=provider,
+        provider_account_id=provider_account_id,
     )
     idempotency_key = _provider_write_idempotency_key(
         action_attempt=action_attempt,
@@ -2557,7 +2676,7 @@ def process_provider_write_reconcile_due(
     except AgencyDaemonError as exc:
         indeterminate_reason = safe_failure_reason(
             str(exc),
-            fallback="agency_reconcile_probe_failed",
+            safe_reason="agency_reconcile_probe_failed",
         )
         with session_factory() as db:
             with db.begin():
@@ -3202,41 +3321,45 @@ def process_one_call(
         ):
             db.flush()
             db.commit()
-            google_runtime.refresh_access_token_for_capability(
+            refresh_failure = google_runtime.refresh_access_token_for_capability(
                 session_factory=session_factory,
                 capability_id=capability_id,
                 now_fn=now_fn,
                 new_id_fn=new_id_fn,
             )
-            with session_factory() as access_db:
-                with access_db.begin():
-                    (
-                        access_token,
-                        granted_scopes,
-                        provider_account_id,
-                        access_failure,
-                    ) = google_runtime.prepare_capability_access_without_refresh(
-                        db=access_db,
-                        capability_id=capability_id,
-                        now_fn=now_fn,
-                    )
-            if access_failure is not None:
-                google_execution_result = access_failure
-            elif access_token is None:
-                google_execution_result = GoogleCapabilityExecutionResult(
-                    status="failed",
-                    output=None,
-                    auth_failure=None,
-                    error="token_expired",
-                )
+            if refresh_failure is not None:
+                google_execution_result = refresh_failure
             else:
-                google_execution_result = google_runtime.execute_provider_capability(
-                    capability_id=capability_id,
-                    normalized_input=evaluation.normalized_input,
-                    access_token=access_token,
-                    granted_scopes=granted_scopes,
-                    provider_account_id=provider_account_id,
-                )
+                with session_factory() as access_db:
+                    with access_db.begin():
+                        (
+                            access_token,
+                            granted_scopes,
+                            provider_account_id,
+                            access_failure,
+                        ) = google_runtime.prepare_capability_access_without_refresh(
+                            db=access_db,
+                            capability_id=capability_id,
+                            now_fn=now_fn,
+                        )
+                if access_failure is not None:
+                    google_execution_result = access_failure
+                elif access_token is None:
+                    google_execution_result = GoogleCapabilityExecutionResult(
+                        status="failed",
+                        output=None,
+                        auth_failure=None,
+                        error="token_expired",
+                    )
+                else:
+                    assert provider_account_id is not None
+                    google_execution_result = google_runtime.execute_provider_capability(
+                        capability_id=capability_id,
+                        normalized_input=evaluation.normalized_input,
+                        access_token=access_token,
+                        granted_scopes=granted_scopes,
+                        provider_account_id=provider_account_id,
+                    )
         else:
             _acquire_side_effect_execution_lock(
                 db=db,
@@ -3337,6 +3460,8 @@ def process_one_call(
     elif is_memory_capability_call:
         # The prior branch handles a missing session_factory; here it is bound.
         assert session_factory is not None
+        from ariel.memory import MemoryExecutionError
+
         try:
             memory_output = _execute_memory_capability(
                 session_factory=session_factory,
@@ -3357,14 +3482,11 @@ def process_one_call(
                 approval_actor_id=approval_actor_id,
                 add_event=add_event,
             )
-        except Exception as exc:  # noqa: BLE001
+        except MemoryExecutionError as exc:
             execution_result = ExecutionResult(
                 status="failed",
                 output=None,
-                error=safe_failure_reason(
-                    str(exc),
-                    fallback=f"unexpected {exc.__class__.__name__}",
-                ),
+                error=exc.safe_reason,
             )
         else:
             execution_result = ExecutionResult(
@@ -3375,56 +3497,34 @@ def process_one_call(
     elif is_proactive_capability_call:
         # The schedule syscall writes one agent_wake row to the caller's
         # transaction and returns the task identity into the program.
-        try:
-            proactive_output = _execute_proactive_capability(
-                db=db,
-                capability_id=capability_id,
-                normalized_input=evaluation.normalized_input,
-                now_fn=now_fn,
-            )
-        except Exception as exc:  # noqa: BLE001
-            execution_result = ExecutionResult(
-                status="failed",
-                output=None,
-                error=safe_failure_reason(
-                    str(exc),
-                    fallback=f"unexpected {exc.__class__.__name__}",
-                ),
-            )
-        else:
-            execution_result = ExecutionResult(
-                status="succeeded",
-                output=proactive_output,
-                error=None,
-            )
+        proactive_output = _execute_proactive_capability(
+            db=db,
+            capability_id=capability_id,
+            normalized_input=evaluation.normalized_input,
+            now_fn=now_fn,
+        )
+        execution_result = ExecutionResult(
+            status="succeeded",
+            output=proactive_output,
+            error=None,
+        )
     elif is_research_capability_call:
         # The investigate syscall is a read capability that executes inline: it
         # writes one immediate research_run row to the caller's transaction and
         # returns the research task identity into the program. The research run
         # itself executes in the worker.
-        try:
-            research_output = _execute_research_capability(
-                db=db,
-                capability_id=capability_id,
-                normalized_input=evaluation.normalized_input,
-                session_id=session_id,
-                now_fn=now_fn,
-            )
-        except Exception as exc:  # noqa: BLE001
-            execution_result = ExecutionResult(
-                status="failed",
-                output=None,
-                error=safe_failure_reason(
-                    str(exc),
-                    fallback=f"unexpected {exc.__class__.__name__}",
-                ),
-            )
-        else:
-            execution_result = ExecutionResult(
-                status="succeeded",
-                output=research_output,
-                error=None,
-            )
+        research_output = _execute_research_capability(
+            db=db,
+            capability_id=capability_id,
+            normalized_input=evaluation.normalized_input,
+            session_id=session_id,
+            now_fn=now_fn,
+        )
+        execution_result = ExecutionResult(
+            status="succeeded",
+            output=research_output,
+            error=None,
+        )
     else:
         _acquire_side_effect_execution_lock(
             db=db,
@@ -4058,6 +4158,7 @@ def process_action_execution_task(
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
     settings: AppSettings | None = None,
+    model_adapter: ModelAdapter | None = None,
 ) -> bool:
     provider_call: tuple[str, dict[str, Any], str, set[str], str | None] | None = None
     email_provider_call: tuple[str, str, dict[str, Any], str, set[str], str] | None = None
@@ -4079,6 +4180,7 @@ def process_action_execution_task(
     retryable_provider_error: str | None = None
     provider_write_failure_payload: dict[str, Any] | None = None
     provider_write_failure_status: ProviderWriteReceiptStatus | None = None
+    preflight_google_refresh_failure: GoogleCapabilityExecutionResult | None = None
 
     if google_runtime is not None:
         with session_factory() as db:
@@ -4092,7 +4194,7 @@ def process_action_execution_task(
                     else None
                 )
         if google_capability_id is not None:
-            google_runtime.refresh_access_token_for_capability(
+            preflight_google_refresh_failure = google_runtime.refresh_access_token_for_capability(
                 session_factory=session_factory,
                 capability_id=google_capability_id,
                 now_fn=now_fn,
@@ -4157,7 +4259,10 @@ def process_action_execution_task(
                             new_id_fn=new_id_fn,
                         )
                         return True
-                    if existing_receipt is not None and existing_receipt.status == "succeeded":
+                    if existing_receipt is not None and existing_receipt.status in {
+                        "succeeded",
+                        "undone",
+                    }:
                         action_attempt.status = "succeeded"
                         action_attempt.execution_output = existing_receipt.response_payload
                         action_attempt.execution_error = None
@@ -4184,15 +4289,28 @@ def process_action_execution_task(
                         and isinstance(existing_receipt.response_payload, dict)
                         else None
                     )
-                    if (
+                    retry_failed_email_receipt = (
                         action_attempt.capability_id in EMAIL_MUTATION_CAPABILITY_IDS
                         and existing_receipt is not None
                         and existing_receipt.status == "failed"
                         and isinstance(existing_error, str)
                         and _email_provider_error_is_retryable(existing_error)
+                    )
+                    if (
+                        existing_receipt is not None
+                        and existing_receipt.status == "failed"
+                        and isinstance(existing_error, str)
+                        and not retry_failed_email_receipt
                     ):
-                        pass
-                    else:
+                        _fail_action_execution(
+                            db=db,
+                            action_attempt=action_attempt,
+                            error=existing_error,
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                        return True
+                    if not retry_failed_email_receipt:
                         receipt = existing_receipt
                         if receipt is None or receipt.status != "ambiguous":
                             receipt = _record_provider_write_receipt(
@@ -4340,6 +4458,20 @@ def process_action_execution_task(
                     )
                     return True
 
+            if preflight_google_refresh_failure is not None:
+                _fail_action_execution(
+                    db=db,
+                    action_attempt=action_attempt,
+                    error=(
+                        preflight_google_refresh_failure.auth_failure.failure_class
+                        if preflight_google_refresh_failure.auth_failure is not None
+                        else (preflight_google_refresh_failure.error or "google_refresh_failed")
+                    ),
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
+                )
+                return True
+
             capability = get_capability(action_attempt.capability_id)
             if capability is None:
                 _fail_action_execution(
@@ -4402,6 +4534,8 @@ def process_action_execution_task(
                 return True
 
             if action_attempt.capability_id in MEMORY_CAPABILITY_IDS:
+                from ariel.memory import MemoryExecutionError
+
                 try:
                     memory_output = _execute_memory_capability(
                         session_factory=session_factory,
@@ -4411,15 +4545,13 @@ def process_action_execution_task(
                         now_fn=now_fn,
                         new_id_fn=new_id_fn,
                         settings=settings,
+                        model_adapter=model_adapter,
                     )
-                except Exception as exc:  # noqa: BLE001
+                except MemoryExecutionError as exc:
                     _fail_action_execution(
                         db=db,
                         action_attempt=action_attempt,
-                        error=safe_failure_reason(
-                            str(exc),
-                            fallback=f"unexpected {exc.__class__.__name__}",
-                        ),
+                        error=exc.safe_reason,
                         now_fn=now_fn,
                         new_id_fn=new_id_fn,
                     )
@@ -4445,25 +4577,12 @@ def process_action_execution_task(
                 # proactive.* is allow_inline but taint can escalate it; on
                 # approval the action re-executes through this path. Mirror
                 # the inline dispatch so the agent_wake row gets written.
-                try:
-                    proactive_output = _execute_proactive_capability(
-                        db=db,
-                        capability_id=action_attempt.capability_id,
-                        normalized_input=normalized_input,
-                        now_fn=now_fn,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    _fail_action_execution(
-                        db=db,
-                        action_attempt=action_attempt,
-                        error=safe_failure_reason(
-                            str(exc),
-                            fallback=f"unexpected {exc.__class__.__name__}",
-                        ),
-                        now_fn=now_fn,
-                        new_id_fn=new_id_fn,
-                    )
-                    return True
+                proactive_output = _execute_proactive_capability(
+                    db=db,
+                    capability_id=action_attempt.capability_id,
+                    normalized_input=normalized_input,
+                    now_fn=now_fn,
+                )
                 action_attempt.status = "succeeded"
                 action_attempt.execution_output = proactive_output
                 action_attempt.execution_error = None
@@ -4484,26 +4603,13 @@ def process_action_execution_task(
             if action_attempt.capability_id in RESEARCH_CAPABILITY_IDS:
                 # research.* enqueues a research_run task in the inline path.
                 # On approval, the same dispatch must happen here.
-                try:
-                    research_output = _execute_research_capability(
-                        db=db,
-                        capability_id=action_attempt.capability_id,
-                        normalized_input=normalized_input,
-                        session_id=action_attempt.session_id,
-                        now_fn=now_fn,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    _fail_action_execution(
-                        db=db,
-                        action_attempt=action_attempt,
-                        error=safe_failure_reason(
-                            str(exc),
-                            fallback=f"unexpected {exc.__class__.__name__}",
-                        ),
-                        now_fn=now_fn,
-                        new_id_fn=new_id_fn,
-                    )
-                    return True
+                research_output = _execute_research_capability(
+                    db=db,
+                    capability_id=action_attempt.capability_id,
+                    normalized_input=normalized_input,
+                    session_id=action_attempt.session_id,
+                    now_fn=now_fn,
+                )
                 action_attempt.status = "succeeded"
                 action_attempt.execution_output = research_output
                 action_attempt.execution_error = None
@@ -4705,7 +4811,6 @@ def process_action_execution_task(
                     provider_account_id,
                     ",".join(sorted(provider_message_ids)),
                 )
-                _acquire_email_advisory_lock(db, *email_lock_parts)
                 receipt = _record_provider_write_receipt(
                     db=db,
                     action_attempt=action_attempt,
@@ -5031,17 +5136,9 @@ def process_action_execution_task(
         assert google_runtime is not None
         lock_db: Session | None = None
         lock_id: int | None = None
-        if email_lock_parts is not None:
-            lock_db = session_factory()
-            bind = lock_db.get_bind()
-            if bind is not None and bind.dialect.name == "postgresql":
-                lock_id = _email_advisory_lock_id(*email_lock_parts)
-                lock_db.execute(text("SELECT pg_advisory_lock(:lock_id)"), {"lock_id": lock_id})
-                lock_db.commit()
-            else:
-                lock_db.close()
-                lock_db = None
         try:
+            if email_lock_parts is not None:
+                lock_db, lock_id = _acquire_email_mutation_lock(session_factory, *email_lock_parts)
             if capability_id != "cap.email.undo" and "before_state" not in normalized_input:
                 message_ids = normalized_input["message_ids"]
                 before_state_output = (
@@ -5052,17 +5149,17 @@ def process_action_execution_task(
                 )
                 before_messages_raw = before_state_output.get("state")
                 if not isinstance(before_messages_raw, list):
-                    raise RuntimeError("email_before_state_missing")
+                    raise _EmailBeforeStateMissing("email_before_state_missing")
                 before_message_ids: list[str] = []
                 for before_message in before_messages_raw:
                     if not isinstance(before_message, dict):
-                        raise RuntimeError("email_before_state_missing")
+                        raise _EmailBeforeStateMissing("email_before_state_missing")
                     before_message_id = before_message.get("message_id")
                     if not isinstance(before_message_id, str) or not before_message_id:
-                        raise RuntimeError("email_before_state_missing")
+                        raise _EmailBeforeStateMissing("email_before_state_missing")
                     before_message_ids.append(before_message_id)
                 if sorted(before_message_ids) != sorted(message_ids):
-                    raise RuntimeError("email_before_state_missing")
+                    raise _EmailBeforeStateMissing("email_before_state_missing")
                 before_messages = before_messages_raw
                 normalized_input = {**normalized_input, "before_state": before_messages}
                 with session_factory() as db:
@@ -5084,6 +5181,7 @@ def process_action_execution_task(
                 granted_scopes,
                 provider_account_id,
             )
+            assert provider_account_id is not None
             execution_result = google_runtime.execute_provider_capability(
                 capability_id=capability_id,
                 normalized_input=normalized_input,
@@ -5092,18 +5190,13 @@ def process_action_execution_task(
                 provider_account_id=provider_account_id,
             )
         finally:
-            if lock_db is not None and lock_id is not None:
-                lock_db.execute(
-                    text("SELECT pg_advisory_unlock(:lock_id)"),
-                    {"lock_id": lock_id},
-                )
-                lock_db.commit()
-                lock_db.close()
+            _release_email_mutation_lock(lock_db, lock_id)
     elif provider_call is not None:
         capability_id, normalized_input, access_token, granted_scopes, provider_account_id = (
             provider_call
         )
         assert google_runtime is not None
+        assert provider_account_id is not None
         execution_result = google_runtime.execute_provider_capability(
             capability_id=capability_id,
             normalized_input=normalized_input,
@@ -5248,17 +5341,15 @@ def process_action_execution_task(
                         before_state, after_state = _email_provider_state_lists(
                             execution_result.output
                         )
-                    except RuntimeError as exc:
-                        if str(exc) != "email_before_state_missing":
-                            raise
+                    except _EmailBeforeStateMissing as exc:
                         captured_before_messages = provider_input.get("before_state")
                         if not isinstance(captured_before_messages, list):
                             raise
                         before_state = {"messages": captured_before_messages}
                         after_state_raw = execution_result.output.get("after_state")
-                        after_state = {
-                            "messages": after_state_raw if isinstance(after_state_raw, list) else []
-                        }
+                        if not isinstance(after_state_raw, list):
+                            raise _EmailAfterStateMissing("email_after_state_missing") from exc
+                        after_state = {"messages": after_state_raw}
                         provider_result_raw = execution_result.output.get("provider_result")
                         if isinstance(provider_result_raw, dict):
                             provider_result_raw["before_state_error"] = str(exc)

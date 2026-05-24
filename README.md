@@ -5,7 +5,7 @@ discord-primary Ariel runtime with:
 - fastapi backend
 - discord bot surface adapter
 - postgres-backed sessions/turns/events/jobs persistence
-- slice-2 action-attempt + approval persistence (`action_attempts`, `approval_requests`)
+- action-attempt and approval persistence (`action_attempts`, `approval_requests`)
 - single active-session contract
 - durable command/event surface for worker, agency, and notification flows
 - acceptance-first integration tests using real postgres (testcontainers)
@@ -110,26 +110,28 @@ make e2e
 bash scripts/agency_verify.sh
 ```
 
-`make e2e` runs high-signal smoke coverage for the current timeline and slice-1 bounded-context event auditing.
-for maps-focused acceptance during slice-6 pr-02 work, run:
+`make e2e` runs high-signal smoke coverage for the current timeline and bounded-context event auditing.
+for maps acceptance, run:
 
 ```bash
-.venv/bin/python -m pytest tests/integration/test_s6_pr02_acceptance.py
+.venv/bin/python -m pytest tests/integration/test_maps_acceptance.py
 ```
 
-for url-extract acceptance during slice-7 pr-01 work, run:
+for web extraction acceptance, run:
 
 ```bash
-.venv/bin/python -m pytest tests/integration/test_s7_pr01_acceptance.py
+.venv/bin/python -m pytest tests/integration/test_web_extract_acceptance.py
 ```
 
-for quick-capture acceptance during slice-8 pr-01 work, run:
+for quick-capture acceptance, run:
 
 ```bash
-.venv/bin/python -m pytest tests/integration/test_s8_pr01_acceptance.py
+.venv/bin/python -m pytest \
+  tests/integration/test_no_ai_ops_acceptance.py::test_capture_record_creates_durable_capture_without_model \
+  tests/integration/test_no_ai_ops_acceptance.py::test_capture_record_idempotency_blocks_payload_conflicts
 ```
 
-## slice-2 action surface
+## Action Surface
 
 the action engine now evaluates model proposals per turn and emits an auditable lifecycle:
 
@@ -149,7 +151,7 @@ user-facing turn/timeline payloads now include a dedicated surfaced lifecycle pr
 Discord and API consumers render action details from this surfaced projection, not from raw engine records.
 `turn.action_attempts` is not part of the user-facing turn/timeline contract.
 
-slice-2 pr-06 locks response boundaries for user-facing slice-2 APIs:
+Response boundary contracts are strict for user-facing action APIs:
 
 - `POST /v1/sessions/{session_id}/message`, `GET /v1/sessions/{session_id}/events`,
   and `POST /v1/approvals` are schema-enforced surfaced contracts.
@@ -158,13 +160,13 @@ slice-2 pr-06 locks response boundaries for user-facing slice-2 APIs:
 - turn events use strict per-`event_type` payload schemas (no open `events[].payload` dictionaries).
 - contract drift is fail-closed with `E_RESPONSE_CONTRACT` and sanitized error details.
 
-slice-2 pr-07 closes the deterministic expiry gap for pending approvals:
+Pending approval expiry is reconciled deterministically:
 
 - `GET /v1/sessions/{session_id}/events` reconciles expired pending approvals to terminal `expired` state.
 - reconciliation emits exactly one auditable `evt.action.approval.expired` per reconciled approval.
 - repeated timeline reads and post-reconcile approval decisions remain non-executing and idempotent.
 
-slice-2 pr-08 hardens outbound side effects with fail-closed egress preflight:
+Outbound side effects use fail-closed egress preflight:
 
 - `external_send` capabilities declare egress intent via capability contract metadata and runtime
   preflights destinations before dispatch.
@@ -172,10 +174,9 @@ slice-2 pr-08 hardens outbound side effects with fail-closed egress preflight:
 - outbound dispatch flows through a centralized runtime boundary instead of capability-specific
   side-effect paths.
 
-## slice-3 pr-01 grounded retrieval core
+## Grounded Retrieval Core
 
-slice-3 pr-01 introduces the first externally grounded factual retrieval path with citation and provenance
-contracts:
+Externally grounded factual retrieval uses citation and provenance contracts:
 
 - factual retrieval executes through `search.web` (`read`) under capability policy, not model-vendor
   native search shortcuts.
@@ -188,7 +189,7 @@ contracts:
 - retrieval failure modes (timeout/rate-limit/upstream/no evidence) surface explicit uncertainty or
   partial-result recovery guidance in user-visible assistant messages.
 
-slice-3 pr-03 hardens grounding safety for conflicting evidence and mixed proposal sets:
+Grounding safety covers conflicting evidence and mixed proposal sets:
 
 - when any retrieval callable executes (`search.web`, `search.news`, `weather.forecast`, `web.extract`),
   `assistant.message` stays grounded narrative with inline citations and synchronized `assistant.sources[]`,
@@ -199,9 +200,9 @@ slice-3 pr-03 hardens grounding safety for conflicting evidence and mixed propos
   surfaced answer text is derived from citation-backed retrieval synthesis.
 - conflicting same-claim retrieval evidence fails closed to uncertainty + concrete recovery guidance.
 
-## slice-4 pr-01 google connector + read flows
+## Google Connector And Read Flows
 
-slice-4 pr-01 adds google oauth connector lifecycle and allowlisted read capabilities:
+Google OAuth connector lifecycle and allowlisted read capabilities:
 
 - connector lifecycle endpoints:
   - `GET /v1/connectors/google`
@@ -218,10 +219,10 @@ slice-4 pr-01 adds google oauth connector lifecycle and allowlisted read capabil
 - typed recoverable auth/scope failures:
   - `not_connected`, `consent_required`, `scope_missing`, `token_expired`, `access_revoked`
 
-## slice-4 pr-02 approval-safe writes (calendar create + email draft/send)
+## Google Connector Approval-Safe Writes
 
-slice-4 pr-02 extends google workspace write safety with least-privilege scope remediation and
-approval-safe execution boundaries:
+Google Workspace writes use least-privilege scope remediation and approval-safe
+execution boundaries:
 
 - new write callables:
   - `calendar.create_event` (`write_reversible`, approval required)
@@ -237,9 +238,9 @@ approval-safe execution boundaries:
     and never performs external delivery.
   - send remains approval-gated and executes only once per approved payload hash.
 
-## slice-4 pr-03 connector readiness semantics + attendee consent closure
+## Google Connector Readiness And Attendee Consent
 
-slice-4 pr-03 closes readiness/remediation gaps so connector status semantics match runtime auth outcomes:
+Connector readiness and remediation semantics match runtime auth outcomes:
 
 - readiness remap is deterministic and explicit:
   - blocking failures (`consent_required`, `scope_missing`, `access_revoked`) surface as
@@ -258,9 +259,9 @@ slice-4 pr-03 closes readiness/remediation gaps so connector status semantics ma
     guidance.
   - after attendee consent, outputs use attendee intersection and stop fallback-only guidance.
 
-## slice-5 durable memory + session management hardening
+## Durable Memory And Session Management
 
-slice-5 adds canonical durable memory, explicit + threshold rotation, and hardened session ingress:
+Canonical durable memory, explicit rotation, threshold rotation, and hardened session ingress:
 
 - message idempotency:
   - `POST /v1/sessions/{session_id}/message` accepts optional `Idempotency-Key`.
@@ -269,24 +270,21 @@ slice-5 adds canonical durable memory, explicit + threshold rotation, and harden
 - rotation surfaces:
   - `POST /v1/sessions/rotate`
   - `GET /v1/sessions/rotations`
-  - rotation reason codes: `user_initiated`, `threshold_turn_count`, `threshold_age`, `threshold_context_pressure`.
+  - rotation reason codes: `user_initiated`, `threshold_turn_count`, `threshold_age`.
 - timeline incremental sync:
   - `GET /v1/sessions/{session_id}/events?after=<event_id>`
   - unknown cursor returns `404` with `E_EVENT_CURSOR_NOT_FOUND`.
 - session lifecycle:
   - surfaced session payloads now include `lifecycle_state` (`active`, `rotating`, `closed`, `recovery_needed`).
-- context assembly contract (deterministic order):
+- base context assembly contract (deterministic order):
   - `policy_system_instructions`
-  - `recent_active_session_turns`
-  - `profile`
-  - `session_digest`
-  - `recalled_memory`
+  - `recall_v1`
   - `open_commitments_and_jobs`
   - `relevant_artifacts_and_observations`
 
-## slice-6 pr-01 drive vertical (search/read/share)
+## Google Drive Capabilities
 
-slice-6 pr-01 adds drive capabilities and capability-scoped reconnect intent under existing policy and
+Drive capabilities use capability-scoped reconnect intent under existing policy and
 approval boundaries:
 
 - allowlisted read callables:
@@ -308,12 +306,13 @@ approval boundaries:
   - `unsupported` (`drive_read_unsupported`)
   - `too_large` (`drive_read_too_large`)
   - `unavailable` (`drive_read_unavailable`)
-- drive read/search outputs stay retrieval-style with inline citations and `assistant.sources[]`,
-  preserving grounded answer synthesis behavior.
+- drive search outputs stay retrieval-style with `results[]`; drive read outputs are read-native
+  (`title`, `source`, `published_at`, bounded `content_excerpt`, typed `read_outcome`) and still
+  preserve grounded answer synthesis via `assistant.sources[]`.
 
-## slice-6 pr-02 maps read vertical (directions + nearby places)
+## Maps Read Capabilities (directions + nearby places)
 
-slice-6 pr-02 adds maps retrieval capabilities under explicit read-only policy and fail-closed egress:
+Maps retrieval capabilities run under explicit read-only policy and fail-closed egress:
 
 - allowlisted read callables (no approval path):
   - `maps.directions`
@@ -351,10 +350,10 @@ slice-6 pr-02 adds maps retrieval capabilities under explicit read-only policy a
 - maps retrieval remains isolated from google connector readiness/consent state.
 - maps outputs stay grounded with inline citations and `assistant.sources[]` in single- and mixed-retrieval turns.
 
-## slice-7 pr-01 url extraction vertical (`web.extract`)
+## Web Extraction (`web.extract`)
 
-slice-7 pr-01 adds url extraction retrieval under strict safety preflight, fail-closed egress, and
-grounded provenance contracts:
+Web extraction runs under strict safety preflight, fail-closed egress, and grounded
+provenance contracts:
 
 - allowlisted read capability:
   - `web.extract` (`read`, `allow_inline`)
@@ -380,9 +379,10 @@ grounded provenance contracts:
 - mixed turns containing `web.extract` plus non-retrieval proposals keep retrieval-grounded
   assistant messaging while preserving structured lifecycle inspectability for all proposals.
 
-## slice-8 quick capture surface (`post /v1/captures/record`)
+## Quick Capture Surface (`POST /v1/captures/record`)
 
-slice-8 adds first-class quick capture ingress for bounded text, url, and shared-content payloads via `POST /v1/captures/record`. (`/v1/captures` was removed in the agent-loop cutover; only `/v1/captures/record` remains.)
+Quick capture records bounded text, url, and shared-content payloads via
+`POST /v1/captures/record`; only `/v1/captures/record` remains.
 
 - request shape:
   - `kind="text"` requires `text`
@@ -422,7 +422,7 @@ google connector runtime config:
 - `ARIEL_GOOGLE_OAUTH_TIMEOUT_SECONDS` (default `10.0`)
 - `ARIEL_CONNECTOR_ENCRYPTION_KEY_VERSION` (default `v1`)
 - `ARIEL_CONNECTOR_ENCRYPTION_KEYS` (required in production; active version must be present)
-- `ARIEL_CONNECTOR_ENCRYPTION_SECRET` (legacy fallback/dev secret path only; dev default is rejected in production)
+- `ARIEL_CONNECTOR_ENCRYPTION_SECRET` (dev single-secret key source; dev default is rejected in production)
 
 `ARIEL_CONNECTOR_ENCRYPTION_KEYS` accepts either:
 
@@ -438,9 +438,9 @@ memory runtime config:
 - `ARIEL_MEMORY_EMBEDDING_MODEL` (default `text-embedding-3-small`)
 - `ARIEL_MEMORY_EMBEDDING_DIMENSIONS` (default `1536`; must match schema)
 
-memory is a flat `memory_facts` store plus an always-loaded profile document and
-a per-session digest, maintained by the retriever and rememberer subagents. the
-model's memory surface is two syscalls, `memory.recall` and `memory.remember`.
+memory uses two layers: append-only `memory_log` events and editable
+`memory_notes`. `memory.recall` runs the retriever over that substrate;
+`memory.remember` queues `memory_encode` for the rememberer.
 
 search capability runtime config:
 
@@ -455,7 +455,7 @@ policy, egress preflight, and the `search_results_v1` output mapping.
 
 weather capability runtime config:
 
-- `ARIEL_WEATHER_PROVIDER_MODE` (`production` default, `dev_fallback` optional)
+- `ARIEL_WEATHER_PROVIDER_MODE` (`production` default, `dev` optional)
 - `ARIEL_WEATHER_PRODUCTION_ENDPOINT` (optional; defaults to Tomorrow.io forecast endpoint)
 - `ARIEL_WEATHER_PRODUCTION_API_KEY` (required for production weather backend)
 - `ARIEL_WEATHER_PRODUCTION_TIMEOUT_SECONDS` (optional; defaults to `8.0`)
@@ -524,7 +524,7 @@ response body:
 the endpoint is single-use, actor-bound, expiry-bound, executes only the frozen proposed payload,
 and exposes surfaced approval state only (no internal action-attempt object in response).
 
-slice-2 pr-02/pr-03 hardening adds runtime boundary checks for side effects:
+Runtime boundary checks protect side effects:
 
 - runtime-provenance taint authorization for side-effecting proposals; model taint flags are advisory-only and cannot clear runtime taint.
 - fail-closed taint handling for side effects: tainted/ambiguous `write_reversible` requires approval; tainted/ambiguous `write_irreversible` and `external_send` are denied.
@@ -533,24 +533,6 @@ slice-2 pr-02/pr-03 hardening adds runtime boundary checks for side effects:
 - deny-by-default outbound control via preflight-declared per-capability destination allowlists; non-allowlisted egress is blocked before dispatch.
 - pre-execution input guardrails and post-execution output guardrails before side effects/user surfacing.
 - serialized side-effect execution gates during approval-triggered runs using transactional postgres advisory locks.
-
-see `docs/v1/s2/s2_prs/s2_pr02_implementation_notes.md` and
-`docs/v1/s2/s2_prs/s2_pr03_implementation_notes.md` and
-`docs/v1/s2/s2_prs/s2_pr04_implementation_notes.md` and
-`docs/v1/s2/s2_prs/s2_pr05_implementation_notes.md` and
-`docs/v1/s2/s2_prs/s2_pr06_implementation_notes.md` and
-`docs/v1/s2/s2_prs/s2_pr07_implementation_notes.md` and
-`docs/v1/s2/s2_prs/s2_pr08_implementation_notes.md` and
-`docs/v1/s3/s3_prs/s3_pr01_implementation_notes.md` and
-`docs/v1/s3/s3_prs/s3_pr02_implementation_notes.md` and
-`docs/v1/s3/s3_prs/s3_pr03_implementation_notes.md` and
-`docs/v1/s4/s4_prs/s4_pr01_implementation_notes.md` and
-`docs/v1/s4/s4_prs/s4_pr02_implementation_notes.md` and
-`docs/v1/s4/s4_prs/s4_pr03_implementation_notes.md` and
-`docs/v1/s6/s6_prs/s6_pr01_implementation_notes.md` and
-`docs/v1/s6/s6_prs/s6_pr02_implementation_notes.md` and
-`docs/v1/s7/s7_prs/s7_pr01_implementation_notes.md` and
-`docs/v1/s8/s8_prs/s8_pr01_implementation_notes.md` for implementation details and tradeoffs.
 
 ## run locally
 
@@ -630,7 +612,6 @@ turn and session settings are runtime-configurable:
 - `ARIEL_MAX_CONTEXT_TOKENS` (default `6000`) bounds estimated prompt/context tokens for a turn.
 - `ARIEL_AUTO_ROTATE_MAX_TURNS` (default `120`) rotates on turn boundary when prior turn count meets/exceeds threshold.
 - `ARIEL_AUTO_ROTATE_MAX_AGE_SECONDS` (default `172800`) rotates on turn boundary when session age meets/exceeds threshold.
-- `ARIEL_AUTO_ROTATE_CONTEXT_PRESSURE_TOKENS` (default `5400`) rotates on turn boundary when estimated context pressure meets/exceeds threshold.
 - `ARIEL_MAX_RESPONSE_TOKENS` (default `700`) bounds assistant completion tokens per turn.
 - `ARIEL_MAIN_TURN_BUDGET_SECONDS` — wall-clock budget for a main-agent turn; the model is told its remaining budget each round.
 - `ARIEL_RESEARCH_RUN_BUDGET_SECONDS` — wall-clock budget for a research subagent run.
@@ -648,9 +629,3 @@ curl -sS http://127.0.0.1:8000/v1/health
 curl -sS http://127.0.0.1:8000/v1/sessions/active \
   -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}"
 ```
-
-## private tailnet deployment
-
-for the pr-02 private ingress setup + restart durability verification workflow, use:
-
-- `docs/v1/s0/private_tailnet_runbook.md`

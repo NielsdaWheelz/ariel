@@ -18,9 +18,12 @@ class FakeAckResponse:
     """Future returned by ``ack_with_response()``; ``.result()`` returns SUCCESS."""
 
     succeeded: bool = True
+    exception: BaseException | None = None
 
     def result(self, timeout: float | None = None) -> str:
         del timeout
+        if self.exception is not None:
+            raise self.exception
         return "SUCCESS" if self.succeeded else "PERMISSION_DENIED"
 
 
@@ -31,12 +34,14 @@ class FakePubSubMessage:
     message_id: str
     data: bytes
     publish_time: datetime
+    ack_succeeded: bool = True
+    ack_exception: BaseException | None = None
     ack_calls: list[None] = field(default_factory=list)
     nack_calls: list[None] = field(default_factory=list)
 
     def ack_with_response(self) -> FakeAckResponse:
         self.ack_calls.append(None)
-        return FakeAckResponse()
+        return FakeAckResponse(succeeded=self.ack_succeeded, exception=self.ack_exception)
 
     def nack(self) -> None:
         self.nack_calls.append(None)

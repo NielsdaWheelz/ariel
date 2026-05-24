@@ -163,10 +163,9 @@ def record_capture(
     if not isinstance(capture, dict):
         raise ArielDiscordError("Ariel returned an invalid capture response.")
     capture_id = capture.get("id")
-    terminal_state = capture.get("terminal_state")
-    if not isinstance(capture_id, str) or not isinstance(terminal_state, str):
+    if not isinstance(capture_id, str):
         raise ArielDiscordError("Ariel returned an invalid capture response.")
-    return f"Capture recorded: {capture_id} ({terminal_state})"
+    return f"Capture recorded: {capture_id}"
 
 
 def decide_approval(

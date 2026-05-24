@@ -111,28 +111,14 @@ process restarts. A single-threaded worker drains it. Because there is exactly
 one worker, the queue carries no claim protocol: a row existing and due is the
 only pending state.
 
-```sql
-CREATE TABLE background_tasks (
-    id                        TEXT PRIMARY KEY,  -- prefixed ULID
-    task_type                 TEXT NOT NULL,
-    idempotency_key           TEXT,
-    provider_write_receipt_id TEXT,
-    payload                   JSONB NOT NULL,
-    attempts                  INT NOT NULL DEFAULT 0,
-    recurrence_seconds        INT,
-    run_after                 TIMESTAMPTZ NOT NULL,
-    created_at                TIMESTAMPTZ NOT NULL,
-    updated_at                TIMESTAMPTZ NOT NULL
-);
-```
+The queue row shape is documented in
+[modules/proactivity.md](modules/proactivity.md) and implemented by
+`BackgroundTaskRecord`. The allowed `task_type` set is implemented by
+`BackgroundTaskRecord`; dispatch behavior is owned by `worker.py`. This
+document records only the coordination contract.
 
 - **Enqueue**: insert a row. `run_after` is when it becomes due; `task_type` is
-  the discriminator the worker dispatches on. Current task types:
-  `agent_wake`, `user_message`, `research_run`, `execute_action_attempt`,
-  `expire_approvals`, `provider_event_received`, `provider_sync_due`,
-  `provider_write_reconcile_due`, `provider_watch_renew_due`,
-  `provider_reconcile_sync_due`, `agency_event_received`, `memory_remember`,
-  `memory_sweep`.
+  the discriminator the worker dispatches on.
 - **Dequeue**: select the earliest due row ordered by `(run_after, created_at,
   id)`. No `SELECT ... FOR UPDATE SKIP LOCKED` — there is no second worker to
   race.

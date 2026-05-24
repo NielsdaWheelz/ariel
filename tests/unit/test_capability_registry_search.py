@@ -105,6 +105,7 @@ def test_search_web_maps_provider_results_to_search_results_v1(
                 "published_at": "2026-04-26T10:00:00Z",
             }
         ],
+        "status": "succeeded",
     }
     assert _FakeProvider.last_init == {
         "api_key": "test-key",
@@ -150,22 +151,36 @@ def test_search_news_uses_news_result_type_and_preserves_egress_preflight(
             "payload": {"query": "news query"},
         }
     ]
-    assert output["results"] == [
-        {
-            "title": "News",
-            "source": "https://publisher.test/story",
-            "snippet": "Story",
-            "published_at": "2026-04-27T12:30:00Z",
-        }
-    ]
+    assert output == {
+        "query": "news query",
+        "retrieved_at": "2026-04-27T13:00:00Z",
+        "results": [
+            {
+                "title": "News",
+                "source": "https://publisher.test/story",
+                "snippet": "Story",
+                "published_at": "2026-04-27T12:30:00Z",
+            }
+        ],
+        "status": "succeeded",
+    }
     assert _FakeProvider.last_request is not None
     assert _FakeProvider.last_request.query == "news query"
     assert _FakeProvider.last_request.result_type == registry.WebSearchResultType.NEWS
     assert _FakeProvider.last_request.limit == 5
 
 
-def test_search_provider_errors_map_to_existing_runtime_error_messages(
+@pytest.mark.parametrize(
+    ("capability_id", "expected_error"),
+    [
+        ("cap.search.web", "search provider rate limited"),
+        ("cap.search.news", "news provider rate limited"),
+    ],
+)
+def test_search_provider_errors_map_to_execution_errors_by_capability(
     monkeypatch: pytest.MonkeyPatch,
+    capability_id: str,
+    expected_error: str,
 ) -> None:
     _install_fake_search_tool(monkeypatch)
     monkeypatch.setenv("ARIEL_SEARCH_WEB_API_KEY", "test-key")
@@ -175,8 +190,100 @@ def test_search_provider_errors_map_to_existing_runtime_error_messages(
         provider="test",
     )
 
-    with pytest.raises(RuntimeError, match="search provider rate limited"):
-        capability = registry.get_capability("cap.search.web")
+    with pytest.raises(registry.CapabilityExecutionError, match=expected_error):
+        capability = registry.get_capability(capability_id)
         assert capability is not None
         assert capability.execute is not None
         capability.execute({"query": "example query"})
+
+
+@pytest.mark.parametrize("capability_id", ["cap.search.web", "cap.search.news"])
+def test_search_web_and_news_validate_query_only_inputs(capability_id: str) -> None:
+    capability = registry.get_capability(capability_id)
+    assert capability is not None
+
+    normalized, error = capability.validate_input({"query": "  launch plan  "})
+
+    assert error is None
+    assert normalized == {"query": "launch plan"}
+
+
+@pytest.mark.parametrize("capability_id", ["cap.search.web", "cap.search.news"])
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"q": "x"},
+        {"query": "x", "limit": 5},
+        {"query": "x", "topn": 10},
+        {"query": ""},
+        {"query": "   "},
+        {"query": 123},
+        {"query": "x" * 1001},
+    ],
+)
+def test_search_web_and_news_reject_non_query_or_malformed_inputs(
+    capability_id: str,
+    payload: dict[str, Any],
+) -> None:
+    capability = registry.get_capability(capability_id)
+    assert capability is not None
+
+    normalized, error = capability.validate_input(payload)
+
+    assert normalized is None
+    assert error == "schema_invalid"
+
+
+def test_memory_search_validator_normalizes_boundary_filters() -> None:
+    capability = registry.get_capability("cap.memory.search")
+    assert capability is not None
+
+    normalized, error = capability.validate_input(
+        {
+            "query": "  offsite plan  ",
+            "limit": 12,
+            "since": "2026-05-20T10:15:00-07:00",
+            "kinds": ["user_message", "tool_observation"],
+        }
+    )
+
+    assert error is None
+    assert normalized == {
+        "query": "offsite plan",
+        "limit": 12,
+        "since": "2026-05-20T17:15:00Z",
+        "kinds": ["user_message", "tool_observation"],
+    }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"query": "offsite", "limit": 0},
+        {"query": "offsite", "limit": 101},
+        {"query": "offsite", "limit": True},
+        {"query": "offsite", "limit": None},
+        {"query": "offsite", "since": "not-a-date"},
+        {"query": "offsite", "since": ""},
+        {"query": "offsite", "since": 123},
+        {"query": "offsite", "kinds": []},
+        {"query": "offsite", "kinds": ["assistant_message", "unknown_kind"]},
+        {"query": "offsite", "kinds": ["user_message", 7]},
+        {"query": "offsite", "kinds": ["log"]},
+        {"query": "offsite", "kinds": ["note"]},
+        {"query": "offsite", "kinds": ["memory_notes"]},
+        {"query": "offsite", "kinds": "assistant_message"},
+        {"query": "offsite", "layer": "note"},
+    ],
+)
+def test_memory_search_validator_rejects_malformed_boundary_filters(
+    payload: dict[str, Any],
+) -> None:
+    capability = registry.get_capability("cap.memory.search")
+    assert capability is not None
+
+    normalized, error = capability.validate_input(payload)
+
+    assert normalized is None
+    assert error == "schema_invalid"

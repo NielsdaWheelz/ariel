@@ -29,6 +29,14 @@ class _SyscallError(Exception):
     """Raised inside the program when a syscall callback returns ``ok=False``."""
 
 
+class _HostCallbackDefect(BaseException):
+    """Carries a host callback defect out of guest-authored control flow."""
+
+    def __init__(self, defect: Exception) -> None:
+        super().__init__(str(defect))
+        self.defect = defect
+
+
 def _build_namespaces(
     syscall_names: tuple[str, ...],
     syscall_callback: SyscallCallback,
@@ -49,7 +57,12 @@ def _build_namespaces(
 
         def _make(bound_name: str) -> Callable[..., Any]:
             def _syscall(**kwargs: Any) -> Any:
-                ok, value_or_error = syscall_callback(bound_name, dict(kwargs))
+                try:
+                    ok, value_or_error = syscall_callback(bound_name, dict(kwargs))
+                except Exception as exc:  # noqa: BLE001 - host defects are not guest errors
+                    # justify-defect: the fake sandbox mirrors production host
+                    # callback defects, which bypass guest-authored handlers.
+                    raise _HostCallbackDefect(exc) from exc
                 if ok:
                     return value_or_error
                 raise _SyscallError(str(value_or_error))
@@ -100,6 +113,8 @@ class FakeSandboxRuntime:
             )
         try:
             exec(compiled, program_globals)  # noqa: S102 - in-process test double
+        except _HostCallbackDefect as exc:
+            raise exc.defect from exc
         except _SyscallError as exc:
             return ProgramResult(ok=False, error=f"syscall_error: {exc}", syscall_count=0)
         except Exception as exc:  # noqa: BLE001 - mirror the guest worker's catch-all

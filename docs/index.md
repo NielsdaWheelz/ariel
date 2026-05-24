@@ -35,19 +35,8 @@ This directory is the canonical home for repository documentation.
 - [ai-first.md](ai-first.md): AI owns judgment, deterministic code owns rails
 - [personal-agent-sota-roadmap.md](personal-agent-sota-roadmap.md):
   OpenClaw-class parity, Claw-variant lessons, and personal-agent SOTA roadmap
-- [north-star-cutover.md](north-star-cutover.md): hard cutover spec for the
-  single-`run`, Agency-centered product architecture
-- [run-program-cutover.md](run-program-cutover.md): hard cutover from the
-  flat-JSON `run` call list to a sandboxed Python `run` program with typed
-  syscall host functions
-- [agent-loop-cutover.md](agent-loop-cutover.md): hard cutover — async
-  worker-run turns, the long adaptive loop, the scratch store, and the research
-  subagent
-- [memory-substrate-cutover.md](memory-substrate-cutover.md): hard cutover —
-  two-layer memory substrate (raw log + curated notes), agentic recall, and
-  unified rememberer
-- [main-agent-jarvis-prompt-cutover.md](main-agent-jarvis-prompt-cutover.md):
-  hard cutover to a versioned, code-owned Jarvis prompt for the main agent
+- [north-star-cutover.md](north-star-cutover.md): single-`run`,
+  Agency-centered product architecture
 - [simplicity.md](simplicity.md): fewer code paths, no speculative surface
 - [function-parameters.md](function-parameters.md): parameter conventions
 - [control-flow.md](control-flow.md): exhaustive branching and race-safety
@@ -57,14 +46,17 @@ This directory is the canonical home for repository documentation.
 
 - [codebase.md](codebase.md): tech stack, repo structure, imports, and module boundaries
 - [database.md](database.md): PostgreSQL schema, queries, and transactions
-- [schema-consolidation-cutover.md](schema-consolidation-cutover.md): phased plan to consolidate the schema from 86 tables toward ~72
-- [schema-cross-cutting-cutover.md](schema-cross-cutting-cutover.md): Phase 4 of the consolidation — job queues, write ledgers, event logs
 
 ### Product operations
 
 - [production-runbook.md](production-runbook.md): production deployment, operations,
   ambient Discord chat, deterministic slash operations, health checks, recovery,
   and acceptance criteria
+- [dev-environment.md](dev-environment.md): isolated local dev stack — `.env.dev`,
+  parallel postgres on `:5435`, dev API on `:8001`, coexistence with the prod
+  systemd services
+- [google-reconnect.md](google-reconnect.md): how to (re)connect Google and grant
+  identity + write scopes (Gmail send/modify, Calendar write, Drive share)
 
 ### Modules
 

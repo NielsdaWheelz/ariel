@@ -105,6 +105,10 @@ class _FakeGuestProcess:
         self._guest_to_host.close()
         self._host_to_guest.close()
 
+    @property
+    def killed(self) -> bool:
+        return self._killed
+
     def wait(self, timeout: float | None = None) -> int:
         del timeout
         self._thread.join(timeout=1.0)
@@ -210,7 +214,18 @@ def test_callback_failure_is_marshalled_back_as_a_typed_error() -> None:
     ]
 
 
-def test_callback_that_raises_is_surfaced_to_the_guest_not_crashing_the_host() -> None:
+@pytest.mark.parametrize(
+    ("exception_type", "message"),
+    [
+        (RuntimeError, "host fault"),
+        (ValueError, "host value fault"),
+        (OSError, "host channel-looking fault"),
+    ],
+)
+def test_callback_that_raises_propagates_after_killing_guest(
+    exception_type: type[Exception],
+    message: str,
+) -> None:
     process = _FakeGuestProcess(
         [
             {"type": "syscall", "name": "stub.boom", "input": {}},
@@ -220,12 +235,12 @@ def test_callback_that_raises_is_surfaced_to_the_guest_not_crashing_the_host() -
 
     def callback(name: str, payload: dict[str, Any]) -> tuple[bool, Any]:
         del name, payload
-        raise RuntimeError("host fault")
+        raise exception_type(message)
 
-    result = _drive(process, syscall_names=("stub.boom",), syscall_callback=callback)
-    assert result.ok is True
-    assert process.received_syscall_results[0]["ok"] is False
-    assert "syscall_host_error" in process.received_syscall_results[0]["error"]
+    with pytest.raises(exception_type, match=message):
+        _drive(process, syscall_names=("stub.boom",), syscall_callback=callback)
+    assert process.killed is True
+    assert process.received_syscall_results == []
 
 
 def test_program_failure_result_is_propagated() -> None:

@@ -2,21 +2,19 @@
 
 ## Scope
 
-This document owns Ariel's memory subsystem: the two-layer substrate, the three
-loop configurations that operate on it, the capability surface, the background
-tasks, and the HTTP inspection routes.
+This document owns Ariel's memory subsystem: the two-layer substrate, the memory
+loop drivers, the capability surface, the background tasks, and the HTTP
+inspection routes.
 
 Memory follows [../ai-first.md](../ai-first.md): every memory judgment is the
-model's, made by `run_agent_loop` in the appropriate configuration; deterministic
-code owns only rails. The cutover that produced this design is recorded in
-[../memory-substrate-cutover.md](../memory-substrate-cutover.md).
+model's, made by `run_agent_loop` in the retriever or rememberer driver;
+deterministic code owns only rails.
 
 ## The Two Layers
 
 ### `memory_log` — the raw log
 
-Append-only, immutable. One row per event. No code path updates or deletes a row
-except the privileged operator erasure route (genuine privacy/legal erasure).
+Append-only, immutable. One row per event. No code path updates or deletes a row.
 
 | Column | Notes |
 |---|---|
@@ -37,6 +35,16 @@ message; proactive triggers append on wake; the rememberer's note mutations each
 append a `note_create`/`note_edit`/`note_delete` event. The model never writes
 the log directly.
 
+`append_log_event` skips one specific class of `assistant_message` rows at the
+write site: assistant failure prose such as "Calendar fetch failed", "Email
+errored", "re-link in settings", and similar. `memory.py` owns the tight
+predicate so that legitimate "no X found" messages still write. The same check
+runs at the retrieval site (`search_memory`) so directly inserted failure rows
+already present in the append-only log never surface in `memory.search` /
+`memory.recall` results. Without this, those rows would surface in the
+retriever as authoritative evidence of failure even after the capability has
+recovered, making the model repeat the same failure prose.
+
 ### `memory_notes` — the curated layer
 
 Flat, editable. One row per note. The agent authors and shapes it.
@@ -52,44 +60,38 @@ Flat, editable. One row per note. The agent authors and shapes it.
 | `taint` | trust label of the note's content |
 
 No `kind`, category, tag, or status column. A note is live; editing rewrites it;
-deleting removes it; the log preserves the full mutation trail. There is no
-profile and no digest.
+deleting removes it; the log preserves the full mutation trail.
 
-See `alembic/versions/` for the migration that drops `memory_facts`,
-`memory_profile`, and `sessions.digest` and creates these two tables.
+See `alembic/versions/` for the migration that creates these two tables and
+enforces append-only log behavior.
 
-## One Loop, Three Configurations
+## Memory Loop Drivers
 
-`run_agent_loop` is one function run in three configurations. A configuration is
-a capability whitelist, a budget, an output mode, and a system prompt.
+`run_agent_loop` is the shared loop. Memory owns two thin drivers around it:
 
-- **main** — the user-facing agent. Every eligible capability; output mode
-  `message`; the conversational prompt. Driven by `_wake`.
-- **investigation** — read-only agentic search; output mode `finding`. Two axes:
-  domain (`memories` | `web` | `personal`) and preset (`lite` | `heavy`). The
-  *retriever* is `investigation` / `memories` / `lite`, fired as a pre-turn step
-  on every wake. The *researcher* is `investigation` / any domain / `heavy`,
-  agent-dispatched.
-- **rememberer** — reads the substrate and writes the curated layer; output mode
-  `operations`. Two triggers: `encode` (small scope, agent-invoked, fire-and-
-  forget) and `dream` (large scope, scheduled).
+- **retriever** — read-only memory recall. It searches and reads the substrate,
+  emits a `recall_v1` finding, writes `memory_recall` judgments, and runs before
+  every wake.
+- **rememberer** — curated-layer mutation. It searches and reads the substrate,
+  calls `memory.note.*`, emits an operations summary, and runs on the `encode`
+  and `dream` triggers.
 
-`_wake`, the retriever, the researcher, and the rememberer are thin drivers
-around `run_agent_loop` with a configuration.
+The main agent (`_wake`) and the research subagent (`run_research`) are owned by
+their modules. They can call memory capabilities; they are not memory drivers.
 
 ## Capability Surface
 
-### `main` configuration
+### Main-Agent Memory Capabilities
 
-- **`memory.recall(query)`** — runs the lite retriever inline, host-side,
-  firewalled; returns a `recall_v1` finding. `allow_inline`, read impact.
+- **`memory.recall(query)`** — runs the retriever inline, host-side, firewalled;
+  returns a `recall_v1` finding. `allow_inline`, read impact.
 - **`memory.remember(note)`** — enqueues a `memory_encode` task and returns
   `{status: "queued", encode_id}`. Fire-and-forget. `allow_inline`, write
   reversible impact.
 - **`research.investigate(question, mode)`** — unchanged except `mode` now
   accepts `memories`. `memories` is mutually exclusive with `web` (see Rules).
 
-### `investigation` configuration (`memories` domain)
+### Memory Read Capabilities
 
 - **`memory.search(query, limit, since?, kinds?)`** — hybrid semantic + keyword
   search over `memory_log` and `memory_notes`. Returns `{id, layer, kind,
@@ -98,7 +100,7 @@ around `run_agent_loop` with a configuration.
 - **`memory.read(id)`** — returns the full `content` and metadata of a log event
   or note by id. Read impact.
 
-### `rememberer` configuration
+### Rememberer Write Capabilities
 
 Whitelists `memory.search` and `memory.read`, plus:
 
@@ -123,8 +125,7 @@ Capability whitelists are frozensets in `capability_registry.py`:
   Superseded notes are edited or deleted; every mutation is logged; the raw log
   is never touched.
 
-`background_tasks.task_type` CHECK enum: `memory_encode` and `memory_dream`
-replace the old `memory_remember` and `memory_sweep`.
+`background_tasks.task_type` CHECK enum: `memory_encode` and `memory_dream`.
 
 ## Mode Exclusivity
 
@@ -137,10 +138,10 @@ is in exactly one domain.
 
 ## Audit
 
-Every model call in every configuration writes one `ai_judgments` row, on both
-success and failure. New `judgment_type` values: `memory_recall` (retriever),
-`memory_encode` and `memory_dream` (rememberer). Research calls use the existing
-research type. `ai_judgments` is the complete memory audit trail.
+Every memory model call writes one `ai_judgments` row, on both success and
+failure. The memory `judgment_type` values are `memory_recall` (retriever),
+`memory_encode`, and `memory_dream` (rememberer). Main-agent model calls write
+`model_output`; no `research` judgment type exists.
 
 ## HTTP Routes
 
@@ -149,18 +150,16 @@ Operator inspection surface (read-only, paginated):
 - `GET /v1/memory/log` — paginates `memory_log` rows.
 - `GET /v1/memory/notes` — paginates `memory_notes` rows.
 
-These replace `GET /v1/memory/facts`. Genuine privacy/legal erasure is a
-privileged operator route (`DELETE /v1/memory/log/{id}`) — the one sanctioned
-exception to log immutability.
+There is no write HTTP route for memory.
 
 ## Rules
 
 - Memory is two layers: an append-only immutable `memory_log` and an editable
-  `memory_notes`. The log is never edited or deleted by any normal code path or
-  by the model. The sole exception is the privileged operator erasure route.
+  `memory_notes`. The log is never edited or deleted by any code path or by the
+  model.
 - Every memory judgment — what to recall, what to encode, what to consolidate,
   what to supersede — is the model's, made by `run_agent_loop` in the
-  `investigation` or `rememberer` configuration.
+  retriever or rememberer driver.
 - Deterministic code stores the substrate, maintains the embedding and keyword
   indexes, exposes the search/read/write primitives, runs the loop, propagates
   taint, and writes audit rows. It makes no relevance, importance,
@@ -171,20 +170,19 @@ exception to log immutability.
   written only by the rememberer. The main agent never writes either directly.
 - Every note mutation appends a `note_*` event to the raw log.
 - The retriever fires as a pre-turn step on every wake — user message, proactive
-  trigger, capture, research completion — with no exception. It reconstructs the
-  working context; there is no profile, digest, working note, or verbatim
-  recent-turns window.
+  trigger, capture, research completion — with no exception. Its `recall_v1`
+  finding is the working-context reconstruction consumed by the main-agent
+  prompt.
 - Recall is bounded by `memory_recall_budget_seconds`, the
   `agent_loop_max_model_calls` backstop, and stuck-detection. Recall failure is
   non-fatal — the turn proceeds on the system prompt alone.
 - Recalled memory is tainted; any action it motivates routes through
   `requires_approval`.
-- Every retriever, rememberer, and researcher model call writes one
-  `ai_judgments` row, on success and failure.
+- Every retriever and rememberer model call writes one `ai_judgments` row, on
+  success and failure.
 - `memories` is mutually exclusive with `web` in `research.investigate`. This is
   a security rail and cannot be relaxed.
 - New memory machinery — schemas on a note, scorers, rankers, decay functions,
   graph algorithms, projection tables, candidate-gather pipelines, importance
-  weights — is forbidden. A product need is met by a configuration's prompt,
-  never by code. See [../memory-substrate-cutover.md](../memory-substrate-cutover.md)
-  for the full rationale.
+  weights — is forbidden. A product need is met by a driver or trigger prompt,
+  never by code.

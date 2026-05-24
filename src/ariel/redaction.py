@@ -17,12 +17,12 @@ _SECRET_LIKE_PATTERN = re.compile(
 )
 
 
-def safe_failure_reason(raw_message: str, *, fallback: str) -> str:
+def safe_failure_reason(raw_message: str, *, safe_reason: str) -> str:
     candidate = raw_message.strip()
     if not candidate:
-        return fallback
+        return safe_reason
     if _SECRET_LIKE_PATTERN.search(candidate):
-        return fallback
+        return safe_reason
     return candidate[:500]
 
 

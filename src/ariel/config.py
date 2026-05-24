@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from ipaddress import ip_address
 from pathlib import Path
 import re
@@ -9,16 +10,32 @@ from urllib.parse import urlparse
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from ariel.google_connector import ConnectorTokenCipher
+from ariel.persistence import MEMORY_EMBEDDING_DIMENSIONS
+from ariel.secret_cipher import SecretCipher
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-MEMORY_EMBEDDING_DIMENSIONS = 1536
 _LOCAL_AUTH_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,}$")
 _PUBSUB_SUBSCRIPTION_PATTERN = re.compile(
     r"^projects/[a-z][a-z0-9-]{4,28}[a-z0-9]/subscriptions/[A-Za-z][A-Za-z0-9_.~+%-]{2,254}$"
 )
-_ENV_FILES = (_PROJECT_ROOT / ".env", _PROJECT_ROOT / ".env.local")
+# Default env-file stack: `.env` for shared local defaults, `.env.local` for
+# local secrets and overrides. Dev workflows set `ARIEL_ENV_FILE` (e.g., to
+# `.env.dev`) to swap in an isolated env file without touching local defaults.
+_DEFAULT_ENV_FILES = (_PROJECT_ROOT / ".env", _PROJECT_ROOT / ".env.local")
+
+
+def _resolve_env_files() -> tuple[Path, ...]:
+    override = os.environ.get("ARIEL_ENV_FILE", "").strip()
+    if not override:
+        return _DEFAULT_ENV_FILES
+    path = Path(override)
+    if not path.is_absolute():
+        path = _PROJECT_ROOT / path
+    return (path,)
+
+
+_ENV_FILES = _resolve_env_files()
 
 
 class AppSettings(BaseSettings):
@@ -77,7 +94,6 @@ class AppSettings(BaseSettings):
     google_oauth_redirect_uri: str = "http://127.0.0.1:8000/v1/connectors/google/callback"
     google_oauth_state_ttl_seconds: int = 600
     google_oauth_timeout_seconds: float = 10.0
-    google_provider_event_token: str | None = None
     google_pubsub_topic: str | None = None
     public_webhook_base_url: str | None = None
     google_pubsub_subscription: str | None = None
@@ -98,7 +114,7 @@ class AppSettings(BaseSettings):
     attachment_max_bytes: int = 25 * 1024 * 1024
     attachment_fetch_timeout_seconds: float = 10.0
     attachment_handle_ttl_seconds: int = 3600
-    attachment_scanner_mode: str = "fail_closed"
+    attachment_scanner_mode: Literal["disabled", "fail_closed"] = "fail_closed"
     # Image/PDF extraction routes through the VISION tier on the shared
     # ``ModelAdapter``. Audio transcription still calls OpenAI directly (no
     # audio Model in pydantic-ai 1.99), and uses this audio-model name plus
@@ -122,7 +138,6 @@ class AppSettings(BaseSettings):
     web_extract_api_key: str | None = None
     maps_api_key: str | None = None
     maps_timeout_seconds: float = 8.0
-    home_address: str | None = None
     weather_provider_mode: str = "production"
     weather_production_endpoint: str = "https://api.tomorrow.io/v4/weather/forecast"
     weather_production_timeout_seconds: float = 8.0
@@ -189,7 +204,6 @@ class AppSettings(BaseSettings):
         "maps_api_key",
         "weather_production_api_key",
         "weather_default_location",
-        "home_address",
         "google_pubsub_topic",
         "public_webhook_base_url",
         "google_pubsub_subscription",
@@ -241,8 +255,8 @@ class AppSettings(BaseSettings):
     @classmethod
     def _weather_provider_mode_must_be_supported(cls, value: str) -> str:
         normalized = value.strip().lower()
-        if normalized not in {"production", "dev_fallback"}:
-            raise ValueError("weather_provider_mode must be production or dev_fallback")
+        if normalized not in {"production", "dev"}:
+            raise ValueError("weather_provider_mode must be production or dev")
         return normalized
 
     @field_validator(
@@ -256,13 +270,6 @@ class AppSettings(BaseSettings):
         if not normalized:
             raise ValueError("provider endpoint settings must be nonblank")
         return normalized
-
-    @field_validator("google_provider_event_token", mode="before")
-    @classmethod
-    def _blank_google_provider_event_token_is_unset(cls, value: Any) -> Any:
-        if isinstance(value, str) and not value.strip():
-            return None
-        return value
 
     @field_validator("local_auth_token", mode="before")
     @classmethod
@@ -295,10 +302,10 @@ class AppSettings(BaseSettings):
             if self.connector_encryption_keys is None or not self.connector_encryption_keys.strip():
                 raise ValueError("connector_encryption_keys is required in production")
             try:
-                ConnectorTokenCipher.from_config(
+                SecretCipher.from_config(
                     active_key_version=self.connector_encryption_key_version,
                     configured_keys=self.connector_encryption_keys,
-                    fallback_secret=self.connector_encryption_secret,
+                    single_secret=self.connector_encryption_secret,
                 )
             except RuntimeError as exc:
                 raise ValueError(str(exc)) from exc
@@ -577,10 +584,12 @@ class AppSettings(BaseSettings):
             raise ValueError("attachment settings must not be blank")
         return normalized
 
-    @field_validator("attachment_scanner_mode")
+    @field_validator("attachment_scanner_mode", mode="before")
     @classmethod
-    def _attachment_scanner_mode_must_be_supported(cls, value: str) -> str:
-        normalized = value.strip().lower()
+    def _attachment_scanner_mode_must_be_supported(
+        cls, value: object
+    ) -> Literal["disabled", "fail_closed"]:
+        normalized = value.strip().lower() if isinstance(value, str) else ""
         if normalized not in {"disabled", "fail_closed"}:
             raise ValueError("attachment_scanner_mode must be one of: disabled, fail_closed")
-        return normalized
+        return "disabled" if normalized == "disabled" else "fail_closed"

@@ -6,8 +6,8 @@ it. It owns the host side of the line-delimited JSON syscall channel and is the
 ingress trust boundary for everything the in-sandbox guest worker sends back.
 
 The runtime is a clean seam: it receives a parsed ``{name, input}`` syscall and
-calls a host-provided ``syscall_callback`` to actually run it. Phase 4/5 inject
-the real capability-execution callback; this module never imports the
+calls a host-provided ``syscall_callback`` to actually run it. The agent loop
+injects the capability-execution callback; this module never imports the
 capability registry, the action runtime, or the run runtime.
 
 Design — persistent sandbox, fresh process per program:
@@ -28,7 +28,6 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
-import sys
 import tempfile
 import threading
 from dataclasses import dataclass, field
@@ -77,7 +76,7 @@ class _Syscall:
 
 
 # A syscall callback returns (ok, value_or_error): ok True carries a JSON value,
-# ok False carries a typed error string. Phase 4/5 supply the real one.
+# ok False carries a typed error string.
 SyscallCallback = Callable[[str, dict[str, Any]], "tuple[bool, Any]"]
 
 
@@ -280,8 +279,8 @@ class SandboxRuntime:
         ``syscall_names`` are the eligible syscalls exposed to the program as
         namespaced callables. ``syscall_callback`` is invoked for each guest
         syscall: it receives the validated ``(name, input)`` and returns
-        ``(ok, value_or_error)``. This is the seam Phase 4/5 use to inject the
-        real capability-derived syscall surface and capability execution.
+        ``(ok, value_or_error)``. This is where the host path injects the
+        capability-derived syscall surface and capability execution.
         """
 
         with self._lock:
@@ -354,21 +353,22 @@ def _invoke_syscall_callback(
     """Run the host syscall callback and shape its outcome as a result message.
 
     A callback that raises is a host-side defect, not a guest error; it is
-    surfaced to the guest as a typed failure so the program can observe it,
-    while the runtime keeps a clean lifecycle.
+    allowed to propagate after the runtime closes the guest process.
     """
 
-    try:
-        ok, value_or_error = syscall_callback(syscall.name, syscall.input)
-    except Exception as exc:  # noqa: BLE001 - host callback faults must not crash the runtime
-        return {
-            "type": "syscall-result",
-            "ok": False,
-            "error": f"syscall_host_error: {type(exc).__name__}: {exc}",
-        }
+    ok, value_or_error = syscall_callback(syscall.name, syscall.input)
     if ok:
         return {"type": "syscall-result", "ok": True, "value": value_or_error}
     return {"type": "syscall-result", "ok": False, "error": str(value_or_error)}
+
+
+def _kill_and_wait(process: "subprocess.Popen[str]") -> int:
+    process.kill()
+    try:
+        return process.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        return process.wait()
 
 
 def _drive_program(
@@ -382,7 +382,7 @@ def _drive_program(
     """Own the host side of the channel for one program: send, dispatch, finish.
 
     The channel conversation — and therefore ``syscall_callback`` — runs on the
-    CALLER's thread. Phase 4 syscalls do DB work on the caller's SQLAlchemy
+    CALLER's thread. Capability syscalls do DB work on the caller's SQLAlchemy
     session, which is not safe to touch off-thread, so the callback must never
     be driven from a worker thread. The wall-clock backstop is a
     ``threading.Timer`` watchdog that only calls ``process.kill()`` on overrun;
@@ -399,8 +399,16 @@ def _drive_program(
     watchdog = threading.Timer(wall_clock_seconds, _watchdog)
     watchdog.daemon = True
 
+    def _send_host_message(message: dict[str, Any]) -> None:
+        encoded = _encode_host_message(message)
+        try:
+            assert process.stdin is not None
+            process.stdin.write(encoded)
+            process.stdin.flush()
+        except (OSError, ValueError) as exc:
+            raise SandboxRuntimeError(f"channel failed: {exc}") from exc
+
     def _conversation() -> None:
-        assert process.stdin is not None
         assert process.stdout is not None
         run_program = {
             "type": "run-program",
@@ -414,12 +422,14 @@ def _drive_program(
                 "memory_bytes": SANDBOX_MEMORY_BYTES,
             },
         }
-        process.stdin.write(_encode_host_message(run_program))
-        process.stdin.flush()
+        _send_host_message(run_program)
 
         syscall_count = 0
         while True:
-            line = process.stdout.readline()
+            try:
+                line = process.stdout.readline()
+            except (OSError, ValueError) as exc:
+                raise SandboxRuntimeError(f"channel failed: {exc}") from exc
             if line == "":
                 outcome.update(closed_early=True, syscall_count=syscall_count)
                 return
@@ -428,8 +438,7 @@ def _drive_program(
                 syscall_count += 1
                 syscall = _Syscall(name=message["name"], input=message["input"])
                 result = _invoke_syscall_callback(syscall, syscall_callback)
-                process.stdin.write(_encode_host_message(result))
-                process.stdin.flush()
+                _send_host_message(result)
                 continue
             outcome.update(
                 ok=bool(message["ok"]),
@@ -444,10 +453,11 @@ def _drive_program(
         _conversation()
     except SandboxRuntimeError as exc:
         conversation_error.append(str(exc))
-    except (OSError, ValueError) as exc:
-        # A broken pipe or decode fault means the guest died mid-channel — which
-        # is also how a watchdog kill surfaces while a read or write is blocked.
-        conversation_error.append(f"channel failed: {exc}")
+    except Exception:
+        # justify-defect: unexpected host-side defects must close the guest
+        # process before propagating beyond the sandbox runtime.
+        _kill_and_wait(process)
+        raise
     finally:
         watchdog.cancel()
 
@@ -462,8 +472,7 @@ def _drive_program(
     try:
         return_code = process.wait(timeout=2.0)
     except subprocess.TimeoutExpired:
-        process.kill()
-        return_code = process.wait()
+        return_code = _kill_and_wait(process)
     syscall_count = int(outcome.get("syscall_count", 0))
 
     if conversation_error:
@@ -492,17 +501,3 @@ def _drive_program(
         error=outcome["error"],
         syscall_count=syscall_count,
     )
-
-
-if __name__ == "__main__":  # pragma: no cover - manual smoke entry point
-    runtime = SandboxRuntime()
-    runtime.start()
-    try:
-        outcome = runtime.run_program(
-            source="x = 1 + 1\n",
-            syscall_names=(),
-            syscall_callback=lambda _name, _input: (False, "no syscalls in phase 3"),
-        )
-        sys.stdout.write(f"{outcome}\n")
-    finally:
-        runtime.close()

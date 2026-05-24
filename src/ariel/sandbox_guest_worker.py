@@ -26,8 +26,14 @@ import sys
 from types import SimpleNamespace
 from typing import Any, Callable
 
-# Standard-library modules the program may import: the safe compute surface
-# named in the run-program cutover. No os, sys, socket, subprocess, importlib.
+# Standard-library modules the sandboxed run program may import: pure compute
+# helpers only. No os, sys, socket, subprocess, importlib.
+# Entries are matched as exact module paths in ``_restricted_import``, so
+# ``urllib`` listed here means the bare ``urllib`` package and not the
+# I/O-capable ``urllib.request``. The two dotted entries below
+# (``urllib.parse``, ``email.utils``) are pure-text stdlib utilities — URL
+# parsing and RFC2822 date/address parsing — with no I/O, no network, and no
+# subprocess; the model reaches for them in normal programs.
 _ALLOWED_IMPORTS = frozenset(
     {
         "json",
@@ -49,9 +55,12 @@ _ALLOWED_IMPORTS = frozenset(
         "hmac",
         "uuid",
         "calendar",
+        "time",
         "zoneinfo",
         "unicodedata",
         "typing",
+        "urllib.parse",
+        "email.utils",
     }
 )
 
@@ -121,6 +130,7 @@ _SAFE_BUILTIN_NAMES = frozenset(
         "RecursionError",
         "RuntimeError",
         "StopIteration",
+        "SystemExit",
         "TypeError",
         "UnicodeError",
         "ValueError",
@@ -162,13 +172,24 @@ def _restricted_import(
     fromlist: Any = (),
     level: int = 0,
 ) -> Any:
-    del globals_, locals_, fromlist
+    del globals_, locals_
     if level != 0:
         raise ImportError("relative imports are not allowed in a run program")
-    root = name.split(".", 1)[0]
-    if root not in _ALLOWED_IMPORTS:
-        raise ImportError(f"import of {name!r} is not allowed in a run program")
-    return __import__(name, level=0)
+    # Match against the exact module path, then progressively-shorter dotted
+    # prefixes. ``urllib.parse`` is allowed by an exact entry; ``urllib.request``
+    # (network-capable), ``urllib.robotparser`` (HTTP client), and the bare
+    # ``urllib`` package are not. ``from urllib.parse import urlparse`` passes
+    # ``"urllib.parse"`` as ``name``, so the exact match covers ``from`` imports
+    # as well as ``import urllib.parse``.
+    segments = name.split(".")
+    for i in range(len(segments), 0, -1):
+        candidate = ".".join(segments[:i])
+        if candidate in _ALLOWED_IMPORTS:
+            # Forward the original ``fromlist`` so ``from pkg.sub import name``
+            # gets the leaf module CPython expects (a bare ``__import__(name)``
+            # returns the top-level package and breaks ``from`` imports).
+            return __import__(name, fromlist=fromlist or (), level=0)
+    raise ImportError(f"import of {name!r} is not allowed in a run program")
 
 
 def _build_safe_builtins() -> dict[str, Any]:
@@ -304,6 +325,21 @@ def _run() -> dict[str, Any]:
         raise
     except _SyscallError as exc:
         return {"type": "program-result", "ok": False, "error": f"syscall_error: {exc}"}
+    except SystemExit as exc:
+        # ``raise SystemExit(...)`` is a natural Python idiom the model reaches
+        # for to end a program early. Mirror CPython's semantics: code=None or
+        # code=0 is a clean exit; anything else (non-zero int, string message)
+        # is a program failure with the code rendered into the error string.
+        code = exc.code
+        if code is None:
+            return {"type": "program-result", "ok": True, "error": None}
+        if isinstance(code, int) and code == 0:
+            return {"type": "program-result", "ok": True, "error": None}
+        return {
+            "type": "program-result",
+            "ok": False,
+            "error": f"program_error: SystemExit: {code}",
+        }
     except Exception as exc:  # noqa: BLE001 - report any program failure to the host
         return {
             "type": "program-result",

@@ -70,7 +70,7 @@ def _run(
     session_factory: Any,
     turn: TurnRecord,
     source: str,
-    is_research_run: bool = False,
+    is_main_agent_loop: bool = True,
 ) -> Any:
     scratch: dict[str, ScratchEntry] = {}
     seq = [0]
@@ -100,14 +100,14 @@ def _run(
         allowed_capability_ids=set(),
         settings=_settings(),
         scratch=scratch,
-        is_research_run=is_research_run,
+        is_main_agent_loop=is_main_agent_loop,
     )
 
 
 def test_research_finding_happy_path_sets_emitted_finding(
     session_factory: Any,
 ) -> None:
-    """research.finding stores the finding dict in emitted_finding on a clean run."""
+    """agent.emit_finding stores the finding dict in emitted_finding on a clean run."""
     sandbox = FakeSandboxRuntime()
     sandbox.start()
     with session_factory() as db:
@@ -119,7 +119,7 @@ def test_research_finding_happy_path_sets_emitted_finding(
                 session_factory=session_factory,
                 turn=turn,
                 source=_VALID_FINDING_SOURCE,
-                is_research_run=True,
+                is_main_agent_loop=False,
             )
             assert result.program_ok
             assert result.emitted_finding is not None
@@ -139,7 +139,7 @@ def test_research_finding_emitted_finding_is_none_on_failed_program(
     with session_factory() as db:
         with db.begin():
             turn = _turn(db, session_id="ses_finding_fail", turn_id="trn_finding_fail")
-            # Program calls research.finding then raises, so program_ok=False.
+            # Program calls agent.emit_finding then raises, so program_ok=False.
             source = _VALID_FINDING_SOURCE + "raise RuntimeError('boom')\n"
             result = _run(
                 sandbox=sandbox,
@@ -147,7 +147,7 @@ def test_research_finding_emitted_finding_is_none_on_failed_program(
                 session_factory=session_factory,
                 turn=turn,
                 source=source,
-                is_research_run=True,
+                is_main_agent_loop=False,
             )
             assert not result.program_ok
             assert result.emitted_finding is None
@@ -157,7 +157,7 @@ def test_research_finding_emitted_finding_is_none_on_failed_program(
 def test_research_finding_schema_invalid_missing_field(
     session_factory: Any,
 ) -> None:
-    """research.finding with a missing required field appends the error and fails."""
+    """agent.emit_finding with a missing required field appends the error and fails."""
     sandbox = FakeSandboxRuntime()
     sandbox.start()
     with session_factory() as db:
@@ -171,7 +171,7 @@ def test_research_finding_schema_invalid_missing_field(
                 session_factory=session_factory,
                 turn=turn,
                 source=source,
-                is_research_run=True,
+                is_main_agent_loop=False,
             )
             assert not result.program_ok
             assert "agent_emit_finding_schema_invalid" in result.callback_errors
@@ -181,7 +181,7 @@ def test_research_finding_schema_invalid_missing_field(
 def test_research_finding_schema_invalid_wrong_type(
     session_factory: Any,
 ) -> None:
-    """research.finding with a non-list claims field rejects as schema_invalid."""
+    """agent.emit_finding with a non-list claims field rejects as schema_invalid."""
     sandbox = FakeSandboxRuntime()
     sandbox.start()
     with session_factory() as db:
@@ -201,7 +201,7 @@ def test_research_finding_schema_invalid_wrong_type(
                 session_factory=session_factory,
                 turn=turn,
                 source=source,
-                is_research_run=True,
+                is_main_agent_loop=False,
             )
             assert not result.program_ok
             assert "agent_emit_finding_schema_invalid" in result.callback_errors
@@ -211,7 +211,7 @@ def test_research_finding_schema_invalid_wrong_type(
 def test_research_finding_too_large_rejected(
     session_factory: Any,
 ) -> None:
-    """research.finding whose JSON encoding exceeds _MAX_EMITTED_FINDING_BYTES is rejected."""
+    """agent.emit_finding whose JSON encoding exceeds _MAX_EMITTED_FINDING_BYTES is rejected."""
     sandbox = FakeSandboxRuntime()
     sandbox.start()
     big_summary = "x" * (_MAX_EMITTED_FINDING_BYTES + 1)
@@ -232,18 +232,17 @@ def test_research_finding_too_large_rejected(
                 session_factory=session_factory,
                 turn=turn,
                 source=source,
-                is_research_run=True,
+                is_main_agent_loop=False,
             )
             assert not result.program_ok
             assert "agent_emit_finding_too_large" in result.callback_errors
     sandbox.close()
 
 
-def test_research_finding_not_eligible_in_main_agent_run(
+def test_emit_finding_rejected_in_main_agent_run(
     session_factory: Any,
 ) -> None:
-    """research.finding is not in the eligible syscall set for a main-agent run
-    (is_research_run=False, the default), so the call fails as unknown_callable."""
+    """agent.emit_finding is bound but rejected in main-agent runs."""
     sandbox = FakeSandboxRuntime()
     sandbox.start()
     with session_factory() as db:
@@ -255,9 +254,12 @@ def test_research_finding_not_eligible_in_main_agent_run(
                 session_factory=session_factory,
                 turn=turn,
                 source=_VALID_FINDING_SOURCE,
-                is_research_run=False,
             )
             assert not result.program_ok
+            assert any(
+                "agent.emit_finding is not available in the main agent loop" in error
+                for error in result.callback_errors
+            )
     sandbox.close()
 
 
@@ -276,7 +278,6 @@ def test_main_agent_run_emitted_finding_is_none(
                 session_factory=session_factory,
                 turn=turn,
                 source="agent.emit_message(text='hello')\n",
-                is_research_run=False,
             )
             assert result.program_ok
             assert result.emitted_finding is None

@@ -10,7 +10,7 @@ from fastapi.encoders import jsonable_encoder
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from ariel.capability_registry import CapabilityDefinition
+from ariel.capability_registry import CapabilityDefinition, CapabilityExecutionError
 from ariel.persistence import EventRecord
 from ariel.redaction import redact_json_value, safe_failure_reason
 
@@ -31,8 +31,6 @@ _UNSAFE_OUTPUT_PATTERNS: tuple[tuple[str, str], ...] = (
     ("script_tag", "<script"),
     ("javascript_uri", "javascript:"),
 )
-
-_EGRESS_SENTINEL_KEY = "__egress__"
 
 
 def _iter_nested_strings(value: Any) -> list[str]:
@@ -174,10 +172,7 @@ def _preflight_egress_requests(
     if not callable(declare_egress_intent):
         return [], "egress_preflight_contract_invalid"
 
-    try:
-        raw_declarations = declare_egress_intent(normalized_input)
-    except Exception:  # noqa: BLE001
-        return [], "egress_preflight_contract_invalid"
+    raw_declarations = declare_egress_intent(normalized_input)
 
     egress_requests, declaration_error = _normalize_declared_egress_requests(raw_declarations)
     if declaration_error is not None:
@@ -219,14 +214,7 @@ def _dispatch_egress_requests(*, egress_requests: list[dict[str, Any]]) -> str |
         payload = request.get("payload")
         if not isinstance(destination, str) or not isinstance(payload, dict):
             return "egress_dispatch_contract_invalid"
-        try:
-            dispatch_error = _dispatch_egress_request(destination=destination, payload=payload)
-        except Exception as exc:  # noqa: BLE001
-            safe_reason = safe_failure_reason(
-                str(exc),
-                fallback=f"unexpected {exc.__class__.__name__}",
-            )
-            return f"egress_dispatch_failed:{safe_reason}"
+        dispatch_error = _dispatch_egress_request(destination=destination, payload=payload)
         if dispatch_error is not None:
             return f"egress_dispatch_failed:{dispatch_error}"
     return None
@@ -289,35 +277,29 @@ def execute_capability(
 
     try:
         raw_output = capability.execute(normalized_input)
-        if isinstance(raw_output, dict) and _EGRESS_SENTINEL_KEY in raw_output:
-            return ExecutionResult(
-                status="failed",
-                output=None,
-                error="egress_preflight_undeclared_intent",
-            )
-
-        post_guardrail_error = _post_execution_guardrail_error(raw_output)
-        if post_guardrail_error is not None:
-            return ExecutionResult(status="failed", output=None, error=post_guardrail_error)
-
-        encoded_output = jsonable_encoder(raw_output)
-        post_guardrail_error = _post_execution_guardrail_error(encoded_output)
-        if post_guardrail_error is not None:
-            return ExecutionResult(status="failed", output=None, error=post_guardrail_error)
-
-        if capability.impact_level == "external_send":
-            dispatch_error = _dispatch_egress_requests(egress_requests=egress_requests)
-            if dispatch_error is not None:
-                return ExecutionResult(status="failed", output=None, error=dispatch_error)
-
-        redacted_output = redact_json_value(encoded_output)
-        output_payload = (
-            redacted_output if isinstance(redacted_output, dict) else {"value": redacted_output}
-        )
-        return ExecutionResult(status="succeeded", output=output_payload, error=None)
-    except Exception as exc:  # noqa: BLE001
+    except CapabilityExecutionError as exc:
         error_reason = safe_failure_reason(
             str(exc),
-            fallback=f"unexpected {exc.__class__.__name__}",
+            safe_reason=f"unexpected {exc.__class__.__name__}",
         )
         return ExecutionResult(status="failed", output=None, error=error_reason)
+
+    post_guardrail_error = _post_execution_guardrail_error(raw_output)
+    if post_guardrail_error is not None:
+        return ExecutionResult(status="failed", output=None, error=post_guardrail_error)
+
+    encoded_output = jsonable_encoder(raw_output)
+    post_guardrail_error = _post_execution_guardrail_error(encoded_output)
+    if post_guardrail_error is not None:
+        return ExecutionResult(status="failed", output=None, error=post_guardrail_error)
+
+    if capability.impact_level == "external_send":
+        dispatch_error = _dispatch_egress_requests(egress_requests=egress_requests)
+        if dispatch_error is not None:
+            return ExecutionResult(status="failed", output=None, error=dispatch_error)
+
+    redacted_output = redact_json_value(encoded_output)
+    output_payload = (
+        redacted_output if isinstance(redacted_output, dict) else {"value": redacted_output}
+    )
+    return ExecutionResult(status="succeeded", output=output_payload, error=None)

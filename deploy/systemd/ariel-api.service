@@ -5,11 +5,12 @@ Wants=network-online.target docker.service
 
 [Service]
 Type=simple
-User=niels
-Group=niels
-WorkingDirectory=/home/niels/src/personal/ariel
+User=ariel
+Group=ariel
+WorkingDirectory=/opt/ariel
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/niels/src/personal/ariel/.venv/bin/uvicorn ariel.app:create_app --factory --host 127.0.0.1 --port 8000
+EnvironmentFile=/etc/ariel/ariel.env
+ExecStart=/opt/ariel/.venv/bin/uvicorn ariel.app:create_app --factory --host 127.0.0.1 --port 8000
 Restart=always
 RestartSec=5
 SyslogIdentifier=ariel-api

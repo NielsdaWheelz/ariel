@@ -1,22 +1,22 @@
-"""The shared agent loop — one body, three output-mode configurations.
+"""The shared agent loop — one body, configured by each driver.
 
 ``run_agent_loop`` is the single while-True loop that drives every
 configuration of the agent: the main conversational turn (``_wake``), the
-read-only research subagent (``run_research``), and the future rememberer
-(``output_mode="operations"``).
+read-only research subagent (``run_research``), the memory retriever
+(``run_retriever``), and the memory rememberer (``run_rememberer``).
 
 A **configuration** is a ``LoopConfig`` frozen dataclass that captures every
-axis on which the three configurations differ: the output mode (what terminal
+axis on which drivers differ: the output mode (what terminal
 result exits the loop), the wall-clock budget, the model-call backstop, the
-is-research flag, the judgment-recording flag and type, the retry policy, and
-the system-message strings emitted on each non-terminal branch.
+main-agent-loop flag, the judgment-recording flag and type, the retry policy,
+and the system-message strings emitted on each non-terminal branch.
 
-The callers — ``_wake`` and ``run_research`` — build their configuration, call
-``run_agent_loop``, and map the ``LoopResult`` to their own post-loop
-behaviour.  All per-round work (budget check, budget-signal update, model call,
-protocol parsing, stuck-detection, ``execute_run_program``, per-program commit,
-emit_value eviction, round-history eviction, judgment recording, retry) lives
-inside ``run_agent_loop`` and does not appear in either driver.
+The callers build their configuration, call ``run_agent_loop``, and map the
+``LoopResult`` to their own post-loop behaviour.  All per-round work (budget
+check, budget-signal update, model call, protocol parsing, stuck-detection,
+``execute_run_program``, per-program commit, emit_value eviction,
+round-history eviction, judgment recording, retry) lives inside
+``run_agent_loop`` and does not appear in the drivers.
 
 This module imports only ``config``, ``persistence``, ``run_runtime``,
 ``ai_judgments``, ``sandbox_runtime``, ``google_connector``,
@@ -116,7 +116,7 @@ class ResearchFinding:
 
 @dataclass(slots=True, frozen=True)
 class LoopConfig:
-    """All axes on which the three loop configurations differ.
+    """All axes on which loop configurations differ.
 
     Pass one ``LoopConfig`` instance to ``run_agent_loop``; the loop reads only
     this object — it never inspects the caller's local state.
@@ -130,8 +130,9 @@ class LoopConfig:
         ``emitted_finding``.  ``"operations"`` exits on ``emitted_operations``
         (the summary string from ``agent.emit_done``).
     finding_mode:
-        The research mode string (e.g. ``"web"``, ``"personal"``) embedded in
-        the returned ``ResearchFinding`` when ``output_mode="finding"``.
+        The research mode string (``"web"``, ``"personal"``, or ``"memories"``)
+        embedded in the returned ``ResearchFinding`` when
+        ``output_mode="finding"``.
         Ignored for other output modes.
     prompt_version:
         The semantic version of the system prompt for this loop configuration.
@@ -140,9 +141,9 @@ class LoopConfig:
         Wall-clock budget for the loop.
     max_model_calls:
         Backstop on the number of model calls before graceful exhaustion.
-    is_research_run:
-        Passed through to ``execute_run_program``; enables ``agent.emit_finding``
-        and ``agent.emit_done`` in the sandbox's syscall whitelist.
+    is_main_agent_loop:
+        Passed through to ``execute_run_program``; main-agent loops reject
+        subsystem-only outputs and append clean program rounds to memory.
     record_judgments:
         When True, the loop records an ``ai_judgments`` row on protocol failure
         and on program failure (the ``_wake`` behaviour).  When False it does
@@ -164,7 +165,7 @@ class LoopConfig:
     emit_value_nudge:
         The system-message text appended when the program emitted internal
         values via ``agent.emit_value``.
-    fallback_nudge:
+    no_terminal_output_nudge:
         The system-message text appended when the program completed but
         produced no visible output and no other branch matched.
     void_failed_program_approvals:
@@ -180,18 +181,16 @@ class LoopConfig:
     prompt_version: str
     budget_seconds: float
     max_model_calls: int
-    is_research_run: bool
+    is_main_agent_loop: bool
     record_judgments: bool
-    judgment_type: (
-        Literal["memory_recall", "memory_encode", "memory_dream", "model_output", "research"] | None
-    )
+    judgment_type: Literal["memory_recall", "memory_encode", "memory_dream", "model_output"] | None
     retry_on_model_error: bool
     void_failed_program_approvals: bool
     protocol_nudge: str
     program_failure_nudge: str
     action_trace_nudge: str
     emit_value_nudge: str
-    fallback_nudge: str
+    no_terminal_output_nudge: str
 
 
 @dataclass(slots=True, frozen=True)
@@ -318,10 +317,6 @@ def run_agent_loop(
         elapsed_s = time.perf_counter() - loop_started_at
         if elapsed_s > cfg.budget_seconds or model_call_count > cfg.max_model_calls:
             return _budget_exhausted_result(
-                cfg=cfg,
-                model_adapter=model_adapter,
-                messages=messages,
-                add_event=add_event,
                 model_call_count=model_call_count,
                 created_action_attempt_count=created_action_attempt_count,
                 final_runtime_provenance=final_runtime_provenance,
@@ -462,10 +457,6 @@ def run_agent_loop(
         # Stuck-detection: identical source in consecutive rounds → budget_exhausted.
         if run_source == prev_run_source:
             return _budget_exhausted_result(
-                cfg=cfg,
-                model_adapter=model_adapter,
-                messages=messages,
-                add_event=add_event,
                 model_call_count=model_call_count,
                 created_action_attempt_count=created_action_attempt_count,
                 final_runtime_provenance=final_runtime_provenance,
@@ -496,7 +487,7 @@ def run_agent_loop(
             settings=settings,
             scratch=scratch,
             model_adapter=model_adapter,
-            is_research_run=cfg.is_research_run,
+            is_main_agent_loop=cfg.is_main_agent_loop,
         )
         created_action_attempt_count += len(run_program_result.action_attempts)
         # Thread taint across programs in the same turn.
@@ -514,10 +505,6 @@ def run_agent_loop(
             # Stuck-detection: identical program_errors in consecutive rounds.
             if program_errors and program_errors == last_program_errors:
                 return _budget_exhausted_result(
-                    cfg=cfg,
-                    model_adapter=model_adapter,
-                    messages=messages,
-                    add_event=add_event,
                     model_call_count=model_call_count,
                     created_action_attempt_count=created_action_attempt_count,
                     final_runtime_provenance=final_runtime_provenance,
@@ -541,22 +528,32 @@ def run_agent_loop(
             round_start = len(messages)
             nudge = cfg.program_failure_nudge
             for err in program_errors:
-                if "agent.emit_finding is only available inside a research run" in err:
+                if "agent.emit_finding is not available in the main agent loop" in err:
                     nudge = (
                         "agent.emit_finding is not available in this loop. "
                         "Continue with one run call that ends by calling "
                         "agent.emit_message(text=...) to reply to the user."
                     )
                     break
-                if "agent.emit_done is only available inside memory subsystem runs" in err:
+                if "agent.emit_done is not available in the main agent loop" in err:
                     nudge = (
                         "agent.emit_done is not available in this loop. "
                         "Continue with one run call that ends by calling "
                         "agent.emit_message(text=...) to reply to the user."
                     )
                     break
+            # A failed program may still have succeeded syscalls before it
+            # raised. Surface the attempt ledger, but not capability payloads:
+            # model-visible cross-round data must be carried deliberately with
+            # emit_value, not auto-echoed from the audit record.
+            attempt_observations = _action_attempt_observations(run_program_result.action_attempts)
             failure_output = json.dumps(
-                {"status": "failed", "errors": program_errors}, sort_keys=True
+                {
+                    "status": "failed",
+                    "errors": program_errors,
+                    "action_attempts": attempt_observations,
+                },
+                sort_keys=True,
             )
             nudge_text = (
                 "run program did not complete: "
@@ -626,11 +623,11 @@ def run_agent_loop(
         db.commit()
 
         # Append an agent_round event to the raw memory log for main-agent
-        # turns (not research/retriever runs).  This is the within-turn
+        # program rounds. This is the within-turn
         # round-eviction complement: evicted rounds live in the log and can
         # be recalled by memory.recall if a later round needs them.
         # Imported lazily to avoid the agent_loop ↔ memory circular import.
-        if not cfg.is_research_run:
+        if cfg.is_main_agent_loop:
             from .memory import append_log_event  # noqa: PLC0415
 
             action_summary = [
@@ -669,6 +666,38 @@ def run_agent_loop(
                 new_id_fn=new_id_fn,
             )
             db.commit()
+
+        # Premature-synthesis rail (main agent only): in the very first model
+        # round the program cannot both perform a read capability call and
+        # emit a user-visible message, because the model authored that program
+        # (and the message text in it) before observing the call's result.
+        # emit_message cannot carry a model-authored prose summary of fetched
+        # content in the same first-round program, because the model wrote the
+        # message before seeing the fetched content. Writes and approval-gated
+        # actions are exempt: the model has full knowledge of what it staged or
+        # attempted, so an accompanying "drafted X for review" message is
+        # grounded. When the rail fires the message is dropped, the attempt
+        # ledger is fed back, and the loop continues.
+        premature_synthesis = (
+            cfg.output_mode == "message"
+            and model_call_count == 1
+            and bool(run_program_result.emitted_message)
+            and any(a.impact_level == "read" for a in run_program_result.action_attempts)
+        )
+        if premature_synthesis:
+            add_event(
+                "evt.agent.premature_synthesis_rejected",
+                {
+                    "model_call_count": model_call_count,
+                    "provider_response_id": candidate_response.provider_response_id,
+                    "rejected_message_chars": len(run_program_result.emitted_message),
+                    "read_capability_ids": [
+                        a.capability_id
+                        for a in run_program_result.action_attempts
+                        if a.impact_level == "read"
+                    ],
+                },
+            )
 
         # --- Terminal branches (exhaustive over output_mode) ---
 
@@ -712,7 +741,7 @@ def run_agent_loop(
                         runtime_provenance=final_runtime_provenance,
                     )
             case "message":
-                if run_program_result.emitted_message:
+                if run_program_result.emitted_message and not premature_synthesis:
                     return LoopResult(
                         outcome="message",
                         emitted_message=run_program_result.emitted_message,
@@ -791,6 +820,9 @@ def run_agent_loop(
                 {
                     "status": "completed",
                     "emitted_values": jsonable_encoder(run_program_result.emitted_values),
+                    "action_attempts": _action_attempt_observations(
+                        run_program_result.action_attempts
+                    ),
                 },
                 sort_keys=True,
             )
@@ -813,29 +845,30 @@ def run_agent_loop(
 
         if run_program_result.action_attempts:
             # Syscall trace: feed back so the model can author the next program.
-            action_attempt_summary = [
-                {
-                    "action_attempt_id": a.id,
-                    "capability_id": a.capability_id,
-                    "status": a.status,
-                    "policy_decision": a.policy_decision,
-                    "approval_required": a.approval_required,
-                }
-                for a in run_program_result.action_attempts
-            ]
+            # Deliberately omit capability payloads. The program already saw each
+            # syscall result inline; data that should survive into a later model
+            # round must be carried through agent.emit_value.
+            attempt_observations = _action_attempt_observations(run_program_result.action_attempts)
             trace_output = json.dumps(
                 {
                     "status": "completed",
                     "message_emitted": False,
-                    "action_attempts": action_attempt_summary,
+                    "action_attempts": attempt_observations,
                 },
                 sort_keys=True,
             )
+            # When the premature-synthesis rail dropped the round's
+            # emit_message, the model needs a different nudge than the
+            # generic "user saw no output": it must know its message was
+            # rejected as ungrounded and what to do on the next round.
+            trace_nudge_body = (
+                _PREMATURE_SYNTHESIS_NUDGE if premature_synthesis else cfg.action_trace_nudge
+            )
             trace_nudge = (
                 "run program syscall trace:\n"
-                + json.dumps(action_attempt_summary, sort_keys=True)
+                + json.dumps(attempt_observations, sort_keys=True)
                 + "\n"
-                + cfg.action_trace_nudge
+                + trace_nudge_body
             )
             messages.append(_assistant_tool_call_message(tool_calls))
             messages.append(
@@ -854,8 +887,8 @@ def run_agent_loop(
             )
             continue
 
-        # Fallback: the program ran but produced no terminal output.
-        messages.append(_system_message(cfg.fallback_nudge))
+        # The program ran but produced no terminal output.
+        messages.append(_system_message(cfg.no_terminal_output_nudge))
         add_event(
             "evt.model.protocol_failed",
             {
@@ -880,10 +913,13 @@ def run_agent_loop(
 # ---------------------------------------------------------------------------
 
 
-_BUDGET_EXHAUSTED_SUMMARY_INSTRUCTION = (
-    "Your time has run out. In one short paragraph of plain text, tell the "
-    "user what you did and what remains. Do not call any tools — return the "
-    "text directly."
+_PREMATURE_SYNTHESIS_NUDGE = (
+    "Your round-one program both called a read capability and emitted a "
+    "user-visible message. That message was authored before you observed the "
+    "capability's result, so it could not be grounded in fetched data; the "
+    "loop dropped it and the user did not see it. Take another round: fetch "
+    "the data again and, if it needs model synthesis, carry the relevant facts "
+    "forward with agent.emit_value before answering in a later round."
 )
 
 
@@ -941,115 +977,15 @@ def _usage_payload(response: ModelResponse) -> dict[str, int]:
 
 def _budget_exhausted_result(
     *,
-    cfg: LoopConfig,
-    model_adapter: ModelAdapter,
-    messages: list[ModelMessage],
-    add_event: Callable[[str, dict[str, Any]], None],
     model_call_count: int,
     created_action_attempt_count: int,
     final_runtime_provenance: RuntimeProvenance | None,
 ) -> LoopResult:
-    """Build the budget-exhausted result, attempting a one-shot summary call
-    on the main loop (``output_mode == "message"``).
-
-    On main-loop budget exhaustion, makes one constrained model call with
-    ``tools=[]`` and a tight system instruction asking the model to summarise
-    what it did and what remains. On usable text, returns an ``outcome="message"``
-    result so the caller's existing assistant-message path handles it. On any
-    failure, empty text, or non-message output mode, returns the unchanged
-    ``outcome="budget_exhausted"`` result.
-    """
-    if cfg.output_mode != "message":
-        return LoopResult(
-            outcome="budget_exhausted",
-            emitted_message=None,
-            emitted_finding=None,
-            emitted_operations=None,
-            model_call_count=model_call_count,
-            created_action_attempt_count=created_action_attempt_count,
-            awaiting_approval=None,
-            bounded_failure_details=None,
-            runtime_provenance=final_runtime_provenance,
-        )
-
-    summary_messages = [
-        *messages,
-        _system_message(_BUDGET_EXHAUSTED_SUMMARY_INSTRUCTION),
-    ]
-    binding = model_adapter.tier_binding(ModelTier.MAIN)
-    model_call_count += 1
-    add_event(
-        "evt.model.started",
-        {
-            "provider": binding.provider,
-            "model": binding.model,
-            "model_call_count": model_call_count,
-        },
-    )
-    started_at = time.perf_counter()
-    try:
-        summary_response = asyncio.run(
-            model_adapter.call(
-                ModelCall(
-                    tier=ModelTier.MAIN,
-                    messages=summary_messages,
-                    tools=[],
-                    tool_choice="auto",
-                    reasoning=ReasoningConfig(),
-                )
-            )
-        )
-    except Exception as exc:
-        add_event(
-            "evt.model.failed",
-            {
-                "provider": binding.provider,
-                "model": binding.model,
-                "duration_ms": int((time.perf_counter() - started_at) * 1000),
-                "failure_reason": getattr(exc, "safe_reason", str(exc)),
-                "model_call_count": model_call_count,
-            },
-        )
-        return LoopResult(
-            outcome="budget_exhausted",
-            emitted_message=None,
-            emitted_finding=None,
-            emitted_operations=None,
-            model_call_count=model_call_count,
-            created_action_attempt_count=created_action_attempt_count,
-            awaiting_approval=None,
-            bounded_failure_details=None,
-            runtime_provenance=final_runtime_provenance,
-        )
-    add_event(
-        "evt.model.completed",
-        {
-            "provider": summary_response.provider,
-            "model": summary_response.model,
-            "duration_ms": summary_response.duration_ms,
-            "usage": _usage_payload(summary_response),
-            "provider_response_id": summary_response.provider_response_id,
-            "model_call_count": model_call_count,
-        },
-    )
-
-    summary_text = (summary_response.text or "").strip()
-    if summary_response.tool_calls or not summary_text:
-        return LoopResult(
-            outcome="budget_exhausted",
-            emitted_message=None,
-            emitted_finding=None,
-            emitted_operations=None,
-            model_call_count=model_call_count,
-            created_action_attempt_count=created_action_attempt_count,
-            awaiting_approval=None,
-            bounded_failure_details=None,
-            runtime_provenance=final_runtime_provenance,
-        )
+    """Build the deterministic rail outcome for loop exhaustion."""
 
     return LoopResult(
-        outcome="message",
-        emitted_message=summary_text,
+        outcome="budget_exhausted",
+        emitted_message=None,
         emitted_finding=None,
         emitted_operations=None,
         model_call_count=model_call_count,
@@ -1076,6 +1012,35 @@ def _merge_provenance(
         status=merged_status,
         evidence=tuple([*baseline.evidence, *ingress.evidence]),
     )
+
+
+def _action_attempt_observations(
+    action_attempts: list[ActionAttemptRecord],
+) -> list[dict[str, Any]]:
+    """Build the per-attempt observation list fed back to the model.
+
+    Each entry carries the attempt's identity, rail decision, and status. It
+    intentionally omits ``execution_output``. Capability results return inline
+    to the program that called them; the model must use ``agent.emit_value``
+    when it deliberately wants facts in a later model round.
+
+    Failed/blocked/denied attempts carry the safe ``execution_error`` so the
+    model can name the actual failure mode rather than guess at one.
+    """
+
+    observations: list[dict[str, Any]] = []
+    for attempt in action_attempts:
+        entry: dict[str, Any] = {
+            "action_attempt_id": attempt.id,
+            "capability_id": attempt.capability_id,
+            "status": attempt.status,
+            "policy_decision": attempt.policy_decision,
+            "approval_required": attempt.approval_required,
+        }
+        if attempt.execution_error is not None:
+            entry["execution_error"] = attempt.execution_error
+        observations.append(entry)
+    return observations
 
 
 def _record_judgment(
@@ -1167,12 +1132,11 @@ def _void_approvals(
 ) -> None:
     """Void approval proposals staged by a program that did not complete cleanly.
 
-    Per the cutover's "Program Failure", a program that fails commits no
-    proposals.  Any approval the failed program staged must never surface as a
-    live pending action: the approval and its action attempt move to
-    ``"expired"`` so nothing is left ``"pending"`` for the user to act on.
-    The syscall trace (the ``action_attempts`` rows) is preserved as the audit
-    record.
+    A program that fails commits no proposals. Any approval the failed program
+    staged must never surface as a live pending action: the approval and its
+    action attempt move to ``"expired"`` so nothing is left ``"pending"`` for
+    the user to act on. The syscall trace (the ``action_attempts`` rows) is
+    preserved as the audit record.
     """
     now = now_fn()
     for action_attempt in action_attempts:

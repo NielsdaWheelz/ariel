@@ -1,4 +1,4 @@
-"""Integration tests for the research subagent wiring — P3 end to end.
+"""Integration tests for research dispatch, worker execution, and completion wakes.
 
 These cover the three coupled pieces that connect ``cap.research.investigate``
 to the research loop and its finding back to the main agent:
@@ -31,20 +31,21 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from ariel.action_runtime import RuntimeProvenance
-from ariel.app import create_app
+from tests.integration.app_helpers import create_test_app
 from ariel.persistence import (
+    ActionAttemptRecord,
     BackgroundTaskRecord,
+    MemoryLogRecord,
     SessionRecord,
     TurnRecord,
     enqueue_background_task,
 )
-from ariel.research_runtime import ResearchFinding, render_finding
-from ariel.worker import _agent_wake_context, process_one_task
+from ariel.worker import process_one_task
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.responses_helpers import (
     FakeModelAdapter,
     empty_recall_response,
-    is_retriever_call,
+    is_memory_subsystem_call,
     run_function_calls,
 )
 from ariel.model_adapter import ModelCall, ModelResponse
@@ -95,7 +96,7 @@ def _seed_turn(session_factory: sessionmaker[Session], *, session_id: str, turn_
 # ===========================================================================
 
 
-@pytest.mark.parametrize("mode", ["web", "personal"])
+@pytest.mark.parametrize("mode", ["web", "personal", "memories"])
 def test_research_investigate_syscall_enqueues_a_research_run_task(
     session_factory: sessionmaker[Session],
     mode: str,
@@ -215,6 +216,54 @@ def test_research_investigate_syscall_rejects_a_bad_mode(
         assert tasks == []
 
 
+def test_research_investigate_queue_defect_rolls_back_instead_of_failing_action(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seed_active_session(session_factory, "ses_resdefect")
+    _seed_turn(session_factory, session_id="ses_resdefect", turn_id="trn_resdefect")
+
+    def fail_enqueue(*_args: Any, **_kwargs: Any) -> BackgroundTaskRecord:
+        raise RuntimeError("queue bug")
+
+    monkeypatch.setattr("ariel.action_runtime.enqueue_background_task", fail_enqueue)
+
+    with pytest.raises(RuntimeError, match="queue bug"):
+        with session_factory() as db:
+            with db.begin():
+                turn = db.get(TurnRecord, "trn_resdefect")
+                assert turn is not None
+                run_function_calls(
+                    db=db,
+                    session_id="ses_resdefect",
+                    turn=turn,
+                    function_calls_raw=[
+                        {
+                            "call_id": "call_resdefect",
+                            "capability_id": "cap.research.investigate",
+                            "input": {
+                                "question": "What changed in the API this week?",
+                                "mode": "web",
+                            },
+                            "influenced_by_untrusted_content": False,
+                        }
+                    ],
+                    approval_ttl_seconds=300,
+                    approval_actor_id="usr_resdefect",
+                    add_event=lambda _event_type, _payload: None,
+                    now_fn=lambda: NOW,
+                    new_id_fn=lambda prefix: f"{prefix}_resdefect_1",
+                    allowed_capability_ids=["cap.research.investigate"],
+                    runtime_provenance=RuntimeProvenance(status="clean"),
+                )
+
+    with session_factory() as db:
+        attempts = db.scalars(select(ActionAttemptRecord)).all()
+        tasks = db.scalars(select(BackgroundTaskRecord)).all()
+    assert attempts == []
+    assert tasks == []
+
+
 # ===========================================================================
 # 2. The worker research_run arm — run_research, then a completion agent_wake
 # ===========================================================================
@@ -233,9 +282,9 @@ _FINDING_PROGRAM = (
 
 
 class _ResearchRunAdapter(FakeModelAdapter):
-    """A model adapter whose single ``run`` program calls ``research.finding``.
+    """A model adapter whose single ``run`` program calls ``agent.emit_finding``.
 
-    Records the ``input_items`` of every call so a test can assert what the
+    Records the ``messages`` of every call so a test can assert what the
     research loop and the completion wake placed in the model's context."""
 
     provider = "provider.research"
@@ -247,7 +296,7 @@ class _ResearchRunAdapter(FakeModelAdapter):
         self.program_source = _FINDING_PROGRAM
 
     def _respond(self, request: ModelCall) -> ModelResponse:
-        if is_retriever_call(request.messages):
+        if is_memory_subsystem_call(request.messages):
             return empty_recall_response(
                 provider=self.provider, model=self.model, messages=request.messages
             )
@@ -275,13 +324,12 @@ def test_worker_research_run_arm_runs_research_and_enqueues_completion_wake(
     dispatching session (CONTRACT B). The research_run row is then deleted."""
 
     _stub_memory_retriever(monkeypatch)
-    monkeypatch.setattr("ariel.worker._utcnow", lambda: NOW)
+    monkeypatch.setattr("ariel.worker.utcnow", lambda: NOW)
     adapter = _ResearchRunAdapter()
-    app = create_app(
+    app = create_test_app(
         database_url=postgres_url,
         model_adapter=adapter,
         sandbox=FakeSandboxRuntime(),
-        reset_database=True,
     )
     with TestClient(app) as client:
         runtime = client.app.state.runtime  # type: ignore[attr-defined]
@@ -375,12 +423,11 @@ def test_worker_research_run_arm_rejects_a_bad_payload(
     completion ``agent_wake`` is enqueued."""
 
     _stub_memory_retriever(monkeypatch)
-    monkeypatch.setattr("ariel.worker._utcnow", lambda: NOW)
-    app = create_app(
+    monkeypatch.setattr("ariel.worker.utcnow", lambda: NOW)
+    app = create_test_app(
         database_url=postgres_url,
         model_adapter=_ResearchRunAdapter(),
         sandbox=FakeSandboxRuntime(),
-        reset_database=True,
     )
     with TestClient(app) as client:
         runtime = client.app.state.runtime  # type: ignore[attr-defined]
@@ -422,62 +469,6 @@ def test_worker_research_run_arm_rejects_a_bad_payload(
             )
 
 
-# ===========================================================================
-# 3. The completion agent_wake arm — finding rendered into context, tainted
-# ===========================================================================
-
-
-def test_agent_wake_context_research_completion_is_tainted_and_targets_session() -> None:
-    """A completion ``agent_wake`` payload builds a ``research_completion``
-    ``WakeContext`` that targets the carried ``session_id``, renders the finding
-    into ``prompt_text``, and carries a TAINTED ``ingress_provenance`` — the
-    finding's text is model-authored over untrusted content, so taint is the
-    containment that keeps a prompt-injected finding from authorizing an action.
-    A plain note wake keeps its untainted ``scheduled_task`` path."""
-
-    finding = ResearchFinding(
-        question="What changed?",
-        mode="web",
-        status="complete",
-        summary="A summary.",
-        claims=[{"statement": "X", "sources": [], "confidence": "low"}],
-        gaps=["Y"],
-        sources=[{"title": "S", "reference": "r", "retrieved_at": "2026-06-01T12:00:00Z"}],
-    )
-    session_id, wake_context = _agent_wake_context(
-        {
-            "research_finding": {
-                "question": finding.question,
-                "mode": finding.mode,
-                "status": finding.status,
-                "summary": finding.summary,
-                "claims": finding.claims,
-                "gaps": finding.gaps,
-                "sources": finding.sources,
-            },
-            "session_id": "ses_target",
-        }
-    )
-    # Targets the carried session, not the active one.
-    assert session_id == "ses_target"
-    assert wake_context.trigger_kind == "research_completion"
-    # The finding is rendered as a clearly-attributed block.
-    assert wake_context.prompt_text == render_finding(finding)
-    assert "Research run result" in wake_context.prompt_text
-    assert "status: complete" in wake_context.prompt_text
-    assert "A summary." in wake_context.prompt_text
-    # The wake is carried TAINTED.
-    assert wake_context.ingress_provenance is not None
-    assert wake_context.ingress_provenance.status == "tainted"
-
-    # A plain note wake keeps None target (active session) and no taint.
-    plain_session_id, plain_context = _agent_wake_context({"note": "follow up"})
-    assert plain_session_id is None
-    assert plain_context.trigger_kind == "scheduled_task"
-    assert plain_context.prompt_text == "follow up"
-    assert plain_context.ingress_provenance is None
-
-
 def test_worker_completion_wake_renders_finding_into_main_agent_context(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -488,7 +479,7 @@ def test_worker_completion_wake_renders_finding_into_main_agent_context(
     the carried session, exactly as the agency-completion class of wake."""
 
     _stub_memory_retriever(monkeypatch)
-    monkeypatch.setattr("ariel.worker._utcnow", lambda: NOW)
+    monkeypatch.setattr("ariel.worker.utcnow", lambda: NOW)
 
     class _MainAgentAdapter(FakeModelAdapter):
         """The main agent: emits a message; records its context items."""
@@ -501,7 +492,7 @@ def test_worker_completion_wake_renders_finding_into_main_agent_context(
             self.snapshots: list[list[Any]] = []
 
         def _respond(self, request: ModelCall) -> ModelResponse:
-            if is_retriever_call(request.messages):
+            if is_memory_subsystem_call(request.messages):
                 return empty_recall_response(
                     provider=self.provider, model=self.model, messages=request.messages
                 )
@@ -519,11 +510,10 @@ def test_worker_completion_wake_renders_finding_into_main_agent_context(
             )
 
     adapter = _MainAgentAdapter()
-    app = create_app(
+    app = create_test_app(
         database_url=postgres_url,
         model_adapter=adapter,
         sandbox=FakeSandboxRuntime(),
-        reset_database=True,
     )
     with TestClient(app) as client:
         runtime = client.app.state.runtime  # type: ignore[attr-defined]
@@ -585,3 +575,13 @@ def test_worker_completion_wake_renders_finding_into_main_agent_context(
         assert turn is not None
         assert turn.status == "completed"
         assert turn.assistant_message == "Here is what the research found."
+        wake_log = db.scalar(
+            select(MemoryLogRecord).where(
+                MemoryLogRecord.kind == "proactive_trigger",
+                MemoryLogRecord.turn_id == turn.id,
+            )
+        )
+        assert wake_log is not None
+        assert wake_log.taint == "tainted"
+        assert "Research run result" in wake_log.content
+        assert "Paris is the capital of France." in wake_log.content

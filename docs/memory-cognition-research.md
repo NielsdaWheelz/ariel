@@ -1,8 +1,9 @@
 # Memory & Cognition — Research Synthesis
 
 > **Status:** research pass, May 2026. No code, no cutover. This document is the
-> deliverable of a "survey first" phase ([research-first SME workflow]); it
-> feeds a later design decision. It does not propose an implementation.
+> deliverable of a "survey first" phase: research, plan, confirm forks, then
+> implement. It feeds a later design decision. It does not propose an
+> implementation.
 >
 > **Method:** nine parallel research subagents, ~150 sources, covering the
 > neuroscience of memory, cognitive psychology, spreading-activation models,
@@ -24,7 +25,7 @@ The bottom line, stated up front so a skim catches it:
 - **Most of the neuroscience-grounded SOTA is machinery** — spreading-activation
   graphs, activation/decay scoring, bi-temporal validity, consolidation
   schedulers, episodic projection tables. Ariel's memory subsystem was
-  *crystallized two days ago* (`memory-cutover.md`, migration `0042`) by
+  *crystallized two days ago* by
   deliberately deleting a 9,400-line engine containing almost exactly that
   machinery, on the principle that **code owns no judgment** (`ai-first.md`).
 - So the honest finding is not "build HippoRAG." It is: the neuroscience splits
@@ -61,7 +62,7 @@ it is the *attention* problem: deciding what gets to be conscious.
 The questions an SME insists on answering before designing anything:
 
 - Which of the five sub-problems is actually failing or about to fail? (For
-  Ariel: §7 argues it is #1 and #3, driven by the agent-loop cutover.)
+  Ariel: §7 argues it is #1 and #3, driven by the current agent loop.)
 - What is the *unit* of memory — a turn, a fact, an event, an episode?
 - Is there one store or several? Born how — episodic and abstracted later, or
   semantic immediately?
@@ -450,14 +451,13 @@ well-judged:
   facts, the current session's verbatim recent turns, and the digest. The
   rememberer jumps straight from a raw turn to a durable semantic fact, with no
   notion of a recent-but-not-yet-durable episode.
-- **Compaction was deleted, and a long-conversation pressure is arriving.** The
-  cutover removed all summarization/compaction; the running context is "verbatim
-  recent turns + digest," declared "inherently bounded." But the **agent-loop
-  cutover** (`docs/agent-loop-cutover.md`) is about to make turns **long and
-  adaptive** — and its own P2 flags that `emit_value` accumulates untrimmed
-  within a turn. *Within-turn* context growth is a real, unsolved problem that
-  "recent turns + digest" does not address. The user named "compaction" and
-  "long conversations" precisely because this is the live gap.
+- **Compaction was deleted, and long turns add context pressure.** The memory
+  cutover removed all summarization/compaction; the running context is
+  "verbatim recent turns + digest," declared "inherently bounded." The current
+  agent loop (`docs/modules/agent-loop.md`) makes turns long and adaptive, so
+  *within-turn* context growth is a real, unsolved problem that "recent turns +
+  digest" does not address. The user named "compaction" and "long
+  conversations" precisely because this is the live gap.
 - **Retrieval has no activation, recency, or association signal.** The candidate
   gather is an unranked union; the cutover deleted decay, RRF, and the graph.
   The retriever is a capable AI judge, but it works from flat vector/keyword
@@ -478,8 +478,8 @@ well-judged:
 Here is the finding that matters most, and the reason this is a research
 document and not a cutover plan.
 
-Ariel **crystallized** its memory subsystem two days ago. `memory-cutover.md`
-deleted a 31-table, ~9,400-line "SOTA memory engine" and, with it,
+Ariel **crystallized** its memory subsystem two days ago. That cutover deleted a
+31-table, ~9,400-line "SOTA memory engine" and, with it,
 **deliberately and by name**: the predicate registry, the conflict-set
 lifecycle, RRF retrieval fusion and its seven signals, **bi-temporal validity**,
 the **entity/relationship graph**, projection tables, topics, the
@@ -531,7 +531,7 @@ conscious decision to amend `ai-first.md`'s "no machinery" rule:
 - **Bi-temporal validity** — validity-interval columns on facts.
 - A separate **episodic store** as its own retrievable tier.
 - A **compaction/consolidation mechanism** for long turns — though note this one
-  is also partly forced by the agent-loop cutover regardless, and a *minimal*
+  is also partly forced by the current agent loop regardless, and a *minimal*
   version may be defensible as a rail rather than judgment.
 
 The honest SME read: Bucket 1 alone would meaningfully improve Ariel's memory
@@ -553,9 +553,9 @@ forks before any design):
 - *Prompt-only.* Adopt Bucket 1; touch no schema or code structure. Maximally
   faithful to the crystallization. Lowest risk, real but bounded gains.
 - *Targeted machinery.* Bucket 1 plus one or two genuinely-earned mechanisms
-  (most likely: a real compaction/consolidation mechanism, since the agent-loop
-  cutover forces the question anyway). A deliberate, scoped amendment to the "no
-  machinery" rule.
+  (most likely: a real compaction/consolidation mechanism, since the current
+  agent loop forces the question anyway). A deliberate, scoped amendment to the
+  "no machinery" rule.
 - *Reopen the design.* Treat the flat store itself as the thing to reconsider,
   and scope a fresh cutover toward a lean spreading-activation / graph memory —
   accepting that this re-litigates a two-day-old decision.
@@ -565,7 +565,7 @@ forks before any design):
 **Fork B — Which sub-problem leads the design phase?** (§2's five.)
 
 - *Working memory / compaction* — the within-turn and cross-turn context
-  problem. Couples tightly with the agent-loop cutover; the most time-sensitive.
+  problem. Couples tightly with the agent loop; the most time-sensitive.
 - *Retrieval* — associative / spreading-activation recall; the "connections,
   nodes" idea; the biggest accuracy lever but the most machinery.
 - *The episodic/semantic split* — add an episodic tier and a consolidation
@@ -573,11 +573,11 @@ forks before any design):
 - *Consolidation* — make the rememberer a genuine offline consolidator
   (salience-weighted, transformative).
 
-**Fork C — Sequencing against the agent-loop cutover.** The agent-loop cutover
-(P2: long adaptive loop + a host-side per-turn scratch store) is the *in-turn
-working-memory* mechanism, and it is awaiting review. A memory redesign and that
-cutover touch the same nerve — long conversations. Decide whether memory work
-waits for it, merges with it, or proceeds independently.
+**Fork C — Sequencing against the agent loop.** The current agent loop
+(long adaptive loop + a host-side per-turn scratch store) is the *in-turn
+working-memory* mechanism. A memory redesign and the loop touch the same nerve:
+long conversations. Decide whether memory work waits for it, merges with it, or
+proceeds independently.
 
 ## 10. Canonical reading list
 
@@ -641,6 +641,3 @@ The gold-standard sources, curated — what an SME would actually point to.
 spreading activation, cognitive architectures, consciousness, agent memory,
 long-context, frontier architectures, graph/temporal memory — are preserved
 verbatim in [`memory-cognition-research-appendix.md`](memory-cognition-research-appendix.md).*
-
-[research-first SME workflow]: the May 2026 survey-first practice — research →
-plan → confirm forks → implement.

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
 from typing import Any, cast
 
 import pytest
 from pydantic import ValidationError
 
 from ariel.app import create_app
-from ariel.config import AppSettings, _ENV_FILES
+from ariel.config import AppSettings
+from ariel.persistence import MEMORY_EMBEDDING_DIMENSIONS
 
 STRONG_LOCAL_AUTH_TOKEN = "test_local_auth_token_0123456789abcdef"
 CONNECTOR_KEYRING = '{"v1":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}'
@@ -17,9 +23,48 @@ def _app_settings_without_env_files() -> AppSettings:
 
 
 @pytest.mark.uses_real_env_files
-def test_app_settings_load_from_project_env_files() -> None:
-    assert {path.name for path in _ENV_FILES} == {".env", ".env.local"}
-    assert AppSettings.model_config["env_file"] == _ENV_FILES
+def test_app_settings_honors_ariel_env_file_override(tmp_path: Path) -> None:
+    env_file = tmp_path / "ariel.env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "ARIEL_DATABASE_URL=postgresql+psycopg://dev-user:dev-pass@localhost/dev-db",
+                "ARIEL_BIND_PORT=8123",
+                "ARIEL_MODEL_NAME=env-file-model",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    env = {key: value for key, value in os.environ.items() if not key.startswith("ARIEL_")}
+    env["ARIEL_ENV_FILE"] = str(env_file)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json\n"
+                "from ariel.config import AppSettings\n"
+                "settings = AppSettings()\n"
+                "print(json.dumps({\n"
+                "    'database_url': settings.database_url,\n"
+                "    'bind_port': settings.bind_port,\n"
+                "    'model_name': settings.model_name,\n"
+                "}))\n"
+            ),
+        ],
+        check=True,
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+
+    assert json.loads(result.stdout) == {
+        "database_url": "postgresql+psycopg://dev-user:dev-pass@localhost/dev-db",
+        "bind_port": 8123,
+        "model_name": "env-file-model",
+    }
 
 
 def test_create_app_uses_ariel_database_url_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -54,7 +99,7 @@ def test_bind_host_rejects_public_interfaces(monkeypatch: pytest.MonkeyPatch) ->
         AppSettings()
 
 
-def test_slice1_turn_budget_defaults_are_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_turn_budget_defaults_are_configured(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("ARIEL_AUTO_ROTATE_MAX_TURNS", raising=False)
     monkeypatch.delenv("ARIEL_AUTO_ROTATE_MAX_AGE_SECONDS", raising=False)
     monkeypatch.delenv("ARIEL_MAX_RESPONSE_TOKENS", raising=False)
@@ -159,14 +204,14 @@ def test_turn_budget_env_overrides_are_loaded(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_memory_runtime_settings_load_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ARIEL_MEMORY_EMBEDDING_DIMENSIONS", "1536")
+    monkeypatch.setenv("ARIEL_MEMORY_EMBEDDING_DIMENSIONS", str(MEMORY_EMBEDDING_DIMENSIONS))
     monkeypatch.setenv("ARIEL_MEMORY_RECALL_BUDGET_SECONDS", "30.0")
     monkeypatch.setenv("ARIEL_MEMORY_ENCODE_BUDGET_SECONDS", "45.0")
     monkeypatch.setenv("ARIEL_MEMORY_DREAM_BUDGET_SECONDS", "1200.0")
     monkeypatch.setenv("ARIEL_MEMORY_DREAM_INTERVAL_SECONDS", "3600.0")
 
     settings = AppSettings()
-    assert settings.memory_embedding_dimensions == 1536
+    assert settings.memory_embedding_dimensions == MEMORY_EMBEDDING_DIMENSIONS
     assert settings.memory_recall_budget_seconds == 30.0
     assert settings.memory_encode_budget_seconds == 45.0
     assert settings.memory_dream_budget_seconds == 1200.0
@@ -174,7 +219,7 @@ def test_memory_runtime_settings_load_from_env(monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_memory_embedding_dimensions_must_match_schema(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ARIEL_MEMORY_EMBEDDING_DIMENSIONS", "3072")
+    monkeypatch.setenv("ARIEL_MEMORY_EMBEDDING_DIMENSIONS", str(MEMORY_EMBEDDING_DIMENSIONS + 1))
 
     with pytest.raises(ValidationError):
         AppSettings()
@@ -270,7 +315,6 @@ def test_provider_runtime_settings_default_to_production_values() -> None:
     assert settings.web_extract_api_key is None
     assert settings.maps_api_key is None
     assert settings.maps_timeout_seconds == 8.0
-    assert settings.home_address is None
     assert settings.weather_provider_mode == "production"
     assert settings.weather_production_endpoint == "https://api.tomorrow.io/v4/weather/forecast"
     assert settings.weather_production_timeout_seconds == 8.0
@@ -292,8 +336,7 @@ def test_provider_runtime_settings_load_from_env(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("ARIEL_WEB_EXTRACT_API_KEY", "extract-key")
     monkeypatch.setenv("ARIEL_MAPS_API_KEY", "maps-key")
     monkeypatch.setenv("ARIEL_MAPS_TIMEOUT_SECONDS", "6.5")
-    monkeypatch.setenv("ARIEL_HOME_ADDRESS", "789 Residential Ave")
-    monkeypatch.setenv("ARIEL_WEATHER_PROVIDER_MODE", "dev_fallback")
+    monkeypatch.setenv("ARIEL_WEATHER_PROVIDER_MODE", "dev")
     monkeypatch.setenv("ARIEL_WEATHER_PRODUCTION_ENDPOINT", "https://weather.example.test")
     monkeypatch.setenv("ARIEL_WEATHER_PRODUCTION_TIMEOUT_SECONDS", "7.5")
     monkeypatch.setenv("ARIEL_WEATHER_PRODUCTION_API_KEY", "weather-key")
@@ -314,14 +357,30 @@ def test_provider_runtime_settings_load_from_env(monkeypatch: pytest.MonkeyPatch
     assert settings.web_extract_api_key == "extract-key"
     assert settings.maps_api_key == "maps-key"
     assert settings.maps_timeout_seconds == 6.5
-    assert settings.home_address == "789 Residential Ave"
-    assert settings.weather_provider_mode == "dev_fallback"
+    assert settings.weather_provider_mode == "dev"
     assert settings.weather_production_endpoint == "https://weather.example.test"
     assert settings.weather_production_timeout_seconds == 7.5
     assert settings.weather_production_api_key == "weather-key"
     assert settings.weather_dev_endpoint == "https://wttr.example.test"
     assert settings.weather_dev_timeout_seconds == 8.5
     assert settings.weather_default_location == "Austin, TX"
+
+
+def test_attachment_scanner_mode_normalizes_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARIEL_ATTACHMENT_SCANNER_MODE", " FAIL_CLOSED ")
+
+    settings = _app_settings_without_env_files()
+
+    assert settings.attachment_scanner_mode == "fail_closed"
+
+
+def test_attachment_scanner_mode_rejects_unknown_env_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARIEL_ATTACHMENT_SCANNER_MODE", "permissive")
+
+    with pytest.raises(ValidationError, match="attachment_scanner_mode"):
+        _app_settings_without_env_files()
 
 
 @pytest.mark.parametrize(

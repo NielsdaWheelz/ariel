@@ -16,6 +16,8 @@ from ariel.google_connector import (
     DefaultGoogleWorkspaceProvider,
     GOOGLE_CONNECTOR_ID,
     GoogleConnectorRuntime,
+    GoogleProviderRequestFailure,
+    google_connected_account_subject,
     is_typed_google_read_output,
 )
 from ariel.google_workspace_normalization import normalize_calendar_event
@@ -40,6 +42,12 @@ def _provider_sync_lock_id(*parts: str) -> int:
 def _json_digest(payload: dict[str, Any]) -> str:
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+class ProviderSyncFailure(RuntimeError):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
 
 
 def _acquire_provider_sync_lock(
@@ -69,14 +77,19 @@ def _release_provider_sync_lock(lock_db: Session | None, lock_id: int | None) ->
 
 
 def _provider_account_id_for_sync(db: Session) -> str:
-    account_subject = db.scalar(
-        select(GoogleConnectorRecord.account_subject)
-        .where(GoogleConnectorRecord.id == GOOGLE_CONNECTOR_ID)
-        .limit(1)
-    )
-    if isinstance(account_subject, str) and account_subject.strip():
-        return account_subject.strip()
-    return GOOGLE_CONNECTOR_ID
+    connector = db.get(GoogleConnectorRecord, GOOGLE_CONNECTOR_ID)
+    if connector is None or connector.status == "not_connected":
+        raise ProviderSyncFailure("not_connected")
+    if connector.status == "revoked":
+        raise ProviderSyncFailure("access_revoked")
+    if connector.status != "connected":
+        error_code = (
+            "account_identity_missing"
+            if connector.last_error_code == "account_identity_missing"
+            else "not_connected"
+        )
+        raise ProviderSyncFailure(error_code)
+    return google_connected_account_subject(connector)
 
 
 def process_provider_event_received(
@@ -134,13 +147,32 @@ def process_provider_sync_due(
 
     now = now_fn()
     sync_run_id = new_id_fn("syn")
-    lock_db, lock_id = _acquire_provider_sync_lock(
-        session_factory,
-        provider="google",
-        resource_type=resource_type,
-        resource_id=resource_id,
-    )
+    lock_db: Session | None = None
+    lock_id: int | None = None
+    if provider_event_id is not None:
+        with session_factory() as db:
+            source_event = db.scalar(
+                select(ProviderEventRecord)
+                .where(ProviderEventRecord.id == provider_event_id)
+                .limit(1)
+            )
+            if source_event is None:
+                raise RuntimeError("provider event not found")
+            provider = source_event.provider
+            resource_type = source_event.resource_type
+            resource_id = source_event.resource_id
+            if provider != "google":
+                raise RuntimeError("unsupported provider sync")
+            if resource_type not in {"calendar", "gmail", "drive"}:
+                raise RuntimeError("provider_sync_due task missing supported resource_type")
+
     try:
+        lock_db, lock_id = _acquire_provider_sync_lock(
+            session_factory,
+            provider=provider,
+            resource_type=resource_type,
+            resource_id=resource_id,
+        )
         with session_factory() as db:
             with db.begin():
                 event: ProviderEventRecord | None = None
@@ -154,7 +186,6 @@ def process_provider_sync_due(
                     if event is None:
                         raise RuntimeError("provider event not found")
                     if event.status == "processed":
-                        _release_provider_sync_lock(lock_db, lock_id)
                         return
                     resource_type = event.resource_type
                     resource_id = event.resource_id
@@ -212,7 +243,6 @@ def process_provider_sync_due(
                     if event is not None:
                         event.status = "failed"
                         event.error = "gmail_sync_cursor_invalid"
-                    _release_provider_sync_lock(lock_db, lock_id)
                     return
 
                 cursor.status = "syncing"
@@ -236,115 +266,122 @@ def process_provider_sync_due(
                     )
                 )
                 cursor_before = cursor.cursor_value
-    except Exception:
-        _release_provider_sync_lock(lock_db, lock_id)
-        raise
-    runtime = GoogleConnectorRuntime(
-        oauth_client=DefaultGoogleOAuthClient(
-            client_id=settings.google_oauth_client_id,
-            client_secret=settings.google_oauth_client_secret,
-            timeout_seconds=settings.google_oauth_timeout_seconds,
-        ),
-        workspace_provider=DefaultGoogleWorkspaceProvider(),
-        redirect_uri=settings.google_oauth_redirect_uri,
-        oauth_state_ttl_seconds=settings.google_oauth_state_ttl_seconds,
-        encryption_secret=settings.connector_encryption_secret,
-        encryption_key_version=settings.connector_encryption_key_version,
-        encryption_keys=settings.connector_encryption_keys,
-        pubsub_topic=settings.google_pubsub_topic,
-        public_webhook_base_url=settings.public_webhook_base_url,
-    )
+        runtime = GoogleConnectorRuntime(
+            oauth_client=DefaultGoogleOAuthClient(
+                client_id=settings.google_oauth_client_id,
+                client_secret=settings.google_oauth_client_secret,
+                timeout_seconds=settings.google_oauth_timeout_seconds,
+            ),
+            workspace_provider=DefaultGoogleWorkspaceProvider(),
+            redirect_uri=settings.google_oauth_redirect_uri,
+            oauth_state_ttl_seconds=settings.google_oauth_state_ttl_seconds,
+            encryption_secret=settings.connector_encryption_secret,
+            encryption_key_version=settings.connector_encryption_key_version,
+            encryption_keys=settings.connector_encryption_keys,
+            pubsub_topic=settings.google_pubsub_topic,
+            public_webhook_base_url=settings.public_webhook_base_url,
+        )
 
-    outputs: list[dict[str, Any]] = []
-    sync_provider_account_id = GOOGLE_CONNECTOR_ID
-    try:
-        sync_capability_id = {
-            "calendar": "cap.calendar.list",
-            "gmail": "cap.email.search",
-            "drive": "cap.drive.search",
-        }[resource_type]
-        refresh_access_token = getattr(runtime, "refresh_access_token_for_capability", None)
-        if callable(refresh_access_token):
-            refresh_access_token(
-                session_factory=session_factory,
-                capability_id=sync_capability_id,
-                now_fn=now_fn,
-                new_id_fn=new_id_fn,
-            )
-        with session_factory() as db:
-            with db.begin():
-                access_token_without_refresh = getattr(
-                    runtime,
-                    "access_token_for_background_sync_without_refresh",
-                    None,
+        outputs: list[dict[str, Any]] = []
+        sync_provider_account_id: str | None = None
+        try:
+            sync_capability_id = {
+                "calendar": "cap.calendar.list",
+                "gmail": "cap.email.search",
+                "drive": "cap.drive.search",
+            }[resource_type]
+            refresh_access_token = getattr(runtime, "refresh_access_token_for_capability", None)
+            if callable(refresh_access_token):
+                refresh_access_token(
+                    session_factory=session_factory,
+                    capability_id=sync_capability_id,
+                    now_fn=now_fn,
+                    new_id_fn=new_id_fn,
                 )
-                if callable(access_token_without_refresh):
-                    access_token = access_token_without_refresh(db=db, now_fn=now_fn)
+            with session_factory() as db:
+                with db.begin():
+                    access_token_without_refresh = getattr(
+                        runtime,
+                        "access_token_for_background_sync_without_refresh",
+                        None,
+                    )
+                    if callable(access_token_without_refresh):
+                        access_token = access_token_without_refresh(db=db, now_fn=now_fn)
+                    else:
+                        access_token = runtime.access_token_for_background_sync(
+                            db=db,
+                            now_fn=now_fn,
+                            new_id_fn=new_id_fn,
+                        )
+                    sync_provider_account_id = _provider_account_id_for_sync(db)
+            if resource_type == "calendar":
+                page_token: str | None = None
+                while True:
+                    output = runtime.workspace_provider.calendar_list_event_deltas(
+                        access_token=access_token,
+                        calendar_id=resource_id,
+                        sync_token=cursor_before,
+                        time_min=None if cursor_before else to_rfc3339(now - timedelta(days=30)),
+                        page_token=page_token,
+                    )
+                    outputs.append(output)
+                    page_token = _payload_text(output, "nextPageToken")
+                    if page_token is None:
+                        break
+            elif resource_type == "gmail":
+                if cursor_before is None:
+                    history_id = _gmail_bootstrap_history_id(
+                        runtime.workspace_provider,
+                        access_token=access_token,
+                    )
+                    if history_id is None:
+                        raise ProviderSyncFailure("gmail_sync_cursor_missing")
+                    outputs.append({"historyId": history_id, "history": []})
                 else:
-                    access_token = runtime.access_token_for_background_sync(
-                        db=db,
-                        now_fn=now_fn,
-                        new_id_fn=new_id_fn,
-                    )
-                sync_provider_account_id = _provider_account_id_for_sync(db)
-        if resource_type == "calendar":
-            page_token: str | None = None
-            while True:
-                output = runtime.workspace_provider.calendar_list_event_deltas(
-                    access_token=access_token,
-                    calendar_id=resource_id,
-                    sync_token=cursor_before,
-                    time_min=None if cursor_before else to_rfc3339(now - timedelta(days=30)),
-                    page_token=page_token,
-                )
-                outputs.append(output)
-                page_token = _payload_text(output, "nextPageToken")
-                if page_token is None:
-                    break
-        elif resource_type == "gmail":
-            if cursor_before is None:
-                history_id = _gmail_bootstrap_history_id(
-                    runtime.workspace_provider,
-                    access_token=access_token,
-                )
-                if history_id is None:
-                    raise RuntimeError("gmail_sync_cursor_missing")
-                outputs.append({"historyId": history_id, "history": []})
+                    page_token = None
+                    while True:
+                        output = runtime.workspace_provider.email_list_history(
+                            access_token=access_token,
+                            start_history_id=cursor_before,
+                            page_token=page_token,
+                        )
+                        outputs.append(output)
+                        page_token = _payload_text(output, "nextPageToken")
+                        if page_token is None:
+                            break
             else:
-                page_token = None
-                while True:
-                    output = runtime.workspace_provider.email_list_history(
-                        access_token=access_token,
-                        start_history_id=cursor_before,
-                        page_token=page_token,
+                if cursor_before is None:
+                    output = runtime.workspace_provider.drive_get_start_page_token(
+                        access_token=access_token
                     )
                     outputs.append(output)
-                    page_token = _payload_text(output, "nextPageToken")
-                    if page_token is None:
-                        break
-        else:
-            if cursor_before is None:
-                output = runtime.workspace_provider.drive_get_start_page_token(
-                    access_token=access_token
+                else:
+                    page_token = cursor_before
+                    while True:
+                        output = runtime.workspace_provider.drive_list_changes(
+                            access_token=access_token,
+                            page_token=page_token,
+                        )
+                        outputs.append(output)
+                        page_token = _payload_text(output, "nextPageToken")
+                        if page_token is None:
+                            break
+        except (GoogleProviderRequestFailure, ProviderSyncFailure) as exc:
+            error = exc.code
+            if _is_stale_cursor_error(resource_type=resource_type, error=error):
+                # A stale delta cursor — Gmail 404 or Calendar 410. Clear the
+                # cursor and re-enqueue a full sync; the next run bootstraps.
+                _handle_stale_cursor(
+                    session_factory=session_factory,
+                    provider_event_id=provider_event_id,
+                    sync_run_id=sync_run_id,
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    error=error,
+                    now=now_fn(),
                 )
-                outputs.append(output)
-            else:
-                page_token = cursor_before
-                while True:
-                    output = runtime.workspace_provider.drive_list_changes(
-                        access_token=access_token,
-                        page_token=page_token,
-                    )
-                    outputs.append(output)
-                    page_token = _payload_text(output, "nextPageToken")
-                    if page_token is None:
-                        break
-    except Exception as exc:
-        error = str(exc)
-        if _is_stale_cursor_error(resource_type=resource_type, error=error):
-            # A stale delta cursor — Gmail 404 or Calendar 410. Clear the
-            # cursor and re-enqueue a full sync; the next run bootstraps.
-            _handle_stale_cursor(
+                return
+            _mark_sync_failed(
                 session_factory=session_factory,
                 provider_event_id=provider_event_id,
                 sync_run_id=sync_run_id,
@@ -353,141 +390,123 @@ def process_provider_sync_due(
                 error=error,
                 now=now_fn(),
             )
-            _release_provider_sync_lock(lock_db, lock_id)
-            return
-        _mark_sync_failed(
-            session_factory=session_factory,
-            provider_event_id=provider_event_id,
-            sync_run_id=sync_run_id,
-            resource_type=resource_type,
-            resource_id=resource_id,
-            error=error,
-            now=now_fn(),
-        )
-        _release_provider_sync_lock(lock_db, lock_id)
-        raise
+            raise
 
-    try:
-        gmail_read_outputs: dict[str, dict[str, Any]] = {}
-        if resource_type == "gmail":
-            email_read = getattr(runtime.workspace_provider, "email_read", None)
-            seen_message_ids: set[str] = set()
-            for output in outputs:
-                raw_histories = output.get("history")
-                histories = raw_histories if isinstance(raw_histories, list) else []
-                for history in histories:
-                    if not isinstance(history, dict):
-                        continue
-                    for key in ("messagesAdded", "labelsAdded", "labelsRemoved"):
-                        raw_entries = history.get(key)
-                        entries = raw_entries if isinstance(raw_entries, list) else []
-                        for entry in entries:
-                            message = entry.get("message") if isinstance(entry, dict) else None
-                            if not isinstance(message, dict):
-                                continue
-                            message_id = _payload_text(message, "id")
-                            if message_id is None or message_id in seen_message_ids:
-                                continue
-                            seen_message_ids.add(message_id)
-                            if not callable(email_read):
-                                raise RuntimeError("gmail_sync_email_read_unavailable")
-                            try:
-                                read_output = email_read(
-                                    access_token=access_token,
-                                    normalized_input={
-                                        "message_id": message_id,
-                                        "thread_id": None,
-                                        "mode": "message",
-                                    },
-                                )
-                            except RuntimeError as exc:
-                                reason = str(exc).strip()
-                                if reason == "resource_not_found":
-                                    reason_code = "gmail_message_unavailable"
-                                    status = "no_body"
-                                    recovery = "The message changed or disappeared before sync could read it."
-                                elif reason == "google_response_too_large":
-                                    reason_code = "gmail_body_too_large"
-                                    status = "body_too_large"
-                                    recovery = (
-                                        "Use narrower message context or ask for metadata only."
+        try:
+            gmail_read_outputs: dict[str, dict[str, Any]] = {}
+            if resource_type == "gmail":
+                email_read = getattr(runtime.workspace_provider, "email_read", None)
+                seen_message_ids: set[str] = set()
+                for output in outputs:
+                    raw_histories = output.get("history")
+                    histories = raw_histories if isinstance(raw_histories, list) else []
+                    for history in histories:
+                        if not isinstance(history, dict):
+                            continue
+                        for key in ("messagesAdded", "labelsAdded", "labelsRemoved"):
+                            raw_entries = history.get(key)
+                            entries = raw_entries if isinstance(raw_entries, list) else []
+                            for entry in entries:
+                                message = entry.get("message") if isinstance(entry, dict) else None
+                                if not isinstance(message, dict):
+                                    continue
+                                message_id = _payload_text(message, "id")
+                                if message_id is None or message_id in seen_message_ids:
+                                    continue
+                                seen_message_ids.add(message_id)
+                                if not callable(email_read):
+                                    raise RuntimeError("gmail_sync_email_read_unavailable")
+                                try:
+                                    read_output = email_read(
+                                        access_token=access_token,
+                                        normalized_input={
+                                            "message_id": message_id,
+                                            "thread_id": None,
+                                            "mode": "message",
+                                        },
+                                        provider_account_id=sync_provider_account_id,
                                     )
-                                else:
-                                    raise
-                                read_output = {
-                                    "schema_version": "google.gmail.message_evidence.v1",
-                                    "mode": "message",
-                                    "message": {
-                                        "provider_account_id": sync_provider_account_id,
-                                        "message_id": message_id,
-                                        "thread_id": _payload_text(message, "threadId"),
-                                        "history_id": None,
-                                        "rfc_message_id": None,
-                                        "in_reply_to": None,
-                                        "references": [],
-                                        "subject": None,
-                                        "subject_key": None,
-                                        "sender": None,
-                                        "recipients": [],
-                                        "cc": [],
-                                        "header_date": None,
-                                        "internal_date": None,
-                                        "label_ids": [
-                                            label_id
-                                            for label_id in message.get("labelIds", [])
-                                            if isinstance(label_id, str)
-                                        ]
-                                        if isinstance(message.get("labelIds"), list)
-                                        else [],
-                                        "direction": "unknown",
-                                        "provider_url": (
-                                            f"https://mail.google.com/mail/u/0/#all/{message_id}"
-                                        ),
-                                        "raw_payload_digest": hashlib.sha256(
-                                            message_id.encode("utf-8")
-                                        ).hexdigest(),
-                                        "attachments": [],
-                                    },
-                                    "published_at": None,
-                                    "evidence": {
-                                        "source_kind": "gmail_message",
-                                        "message_id": message_id,
-                                        "thread_id": _payload_text(message, "threadId"),
-                                        "blocks": [],
-                                        "truncated": False,
-                                        "decode_notes": [reason_code],
-                                        "html_security": {},
-                                    },
-                                    "read_outcome": {
-                                        "status": status,
-                                        "reason_code": reason_code,
-                                        "recovery": recovery,
-                                    },
-                                    "retrieved_at": to_rfc3339(now_fn()),
-                                }
-                                if isinstance(read_output, dict):
-                                    read_message = read_output.get("message")
-                                    if isinstance(read_message, dict):
-                                        read_message["provider_account_id"] = (
-                                            sync_provider_account_id
+                                except GoogleProviderRequestFailure as exc:
+                                    reason = exc.code
+                                    if reason == "resource_not_found":
+                                        reason_code = "gmail_message_unavailable"
+                                        status = "no_body"
+                                        recovery = "The message changed or disappeared before sync could read it."
+                                    elif reason == "google_response_too_large":
+                                        reason_code = "gmail_body_too_large"
+                                        status = "body_too_large"
+                                        recovery = (
+                                            "Use narrower message context or ask for metadata only."
                                         )
-                            if not _gmail_sync_read_output_valid(read_output):
-                                raise RuntimeError("gmail_sync_read_output_invalid")
-                            gmail_read_outputs[message_id] = read_output
-    except Exception as exc:
-        _mark_sync_failed(
-            session_factory=session_factory,
-            provider_event_id=provider_event_id,
-            sync_run_id=sync_run_id,
-            resource_type=resource_type,
-            resource_id=resource_id,
-            error=str(exc),
-            now=now_fn(),
-        )
-        _release_provider_sync_lock(lock_db, lock_id)
-        raise
+                                    else:
+                                        raise
+                                    read_output = {
+                                        "schema_version": "google.gmail.message_evidence.v1",
+                                        "mode": "message",
+                                        "message": {
+                                            "provider_account_id": sync_provider_account_id,
+                                            "message_id": message_id,
+                                            "thread_id": _payload_text(message, "threadId"),
+                                            "history_id": None,
+                                            "rfc_message_id": None,
+                                            "in_reply_to": None,
+                                            "references": [],
+                                            "subject": None,
+                                            "subject_key": None,
+                                            "sender": None,
+                                            "recipients": [],
+                                            "cc": [],
+                                            "header_date": None,
+                                            "internal_date": None,
+                                            "label_ids": [
+                                                label_id
+                                                for label_id in message.get("labelIds", [])
+                                                if isinstance(label_id, str)
+                                            ]
+                                            if isinstance(message.get("labelIds"), list)
+                                            else [],
+                                            "direction": "unknown",
+                                            "provider_url": (
+                                                f"https://mail.google.com/mail/u/0/#all/{message_id}"
+                                            ),
+                                            "raw_payload_digest": hashlib.sha256(
+                                                message_id.encode("utf-8")
+                                            ).hexdigest(),
+                                            "attachments": [],
+                                        },
+                                        "published_at": None,
+                                        "evidence": {
+                                            "source_kind": "gmail_message",
+                                            "message_id": message_id,
+                                            "thread_id": _payload_text(message, "threadId"),
+                                            "blocks": [],
+                                            "truncated": False,
+                                            "decode_notes": [reason_code],
+                                            "html_security": {},
+                                        },
+                                        "read_outcome": {
+                                            "status": status,
+                                            "reason_code": reason_code,
+                                            "recovery": recovery,
+                                        },
+                                        "retrieved_at": to_rfc3339(now_fn()),
+                                        "status": "succeeded",
+                                    }
+                                if not _gmail_sync_read_output_valid(read_output):
+                                    raise RuntimeError("gmail_sync_read_output_invalid")
+                                gmail_read_outputs[message_id] = read_output
+        except GoogleProviderRequestFailure as exc:
+            _mark_sync_failed(
+                session_factory=session_factory,
+                provider_event_id=provider_event_id,
+                sync_run_id=sync_run_id,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                error=exc.code,
+                now=now_fn(),
+            )
+            raise
 
-    try:
         with session_factory() as db:
             with db.begin():
                 event = (
@@ -527,13 +546,14 @@ def process_provider_sync_due(
                     if event is not None:
                         event.status = "failed"
                         event.error = "sync_cursor_changed"
-                    _release_provider_sync_lock(lock_db, lock_id)
                     return
 
                 now = now_fn()
                 item_count = 0
                 observation_count = 0
                 cursor_after = cursor_before
+                if sync_provider_account_id is None:
+                    raise RuntimeError("sync provider account identity missing")
                 provider_account_id = sync_provider_account_id
                 if resource_type == "calendar":
                     for output in outputs:
@@ -614,10 +634,8 @@ def process_provider_sync_due(
                         payload={"note": _provider_sync_wake_note(resource_type, item_count)},
                         now=now,
                     )
-    except Exception:
+    finally:
         _release_provider_sync_lock(lock_db, lock_id)
-        raise
-    _release_provider_sync_lock(lock_db, lock_id)
 
 
 def _sync_calendar_item(
@@ -635,7 +653,8 @@ def _sync_calendar_item(
     if external_id is None:
         return False
     status = "deleted" if item.get("status") == "cancelled" else "active"
-    updated = _payload_text(item, "updated") or to_rfc3339(now)
+    updated = _payload_text(item, "updated")
+    source_timestamp = _parse_provider_timestamp(updated)
     normalized = normalize_calendar_event(
         item,
         provider_account_id=provider_account_id,
@@ -684,7 +703,7 @@ def _sync_calendar_item(
             calendar_id=resource_id,
             ical_uid=normalized.ical_uid,
             status=status,
-            source_timestamp=_parse_provider_timestamp(updated),
+            source_timestamp=source_timestamp,
             observed_at=now,
             provider_url=normalized.provider_url,
             metadata_json=metadata,
@@ -696,7 +715,7 @@ def _sync_calendar_item(
         db.flush()
     else:
         provider_object.status = status
-        provider_object.source_timestamp = _parse_provider_timestamp(updated)
+        provider_object.source_timestamp = source_timestamp
         provider_object.observed_at = now
         provider_object.provider_url = normalized.provider_url
         provider_object.metadata_json = metadata
@@ -735,7 +754,7 @@ def _sync_calendar_item(
                 thread_external_id=None,
                 calendar_id=resource_id,
                 source_uri=normalized.provider_url,
-                source_timestamp=_parse_provider_timestamp(updated),
+                source_timestamp=source_timestamp,
                 content_digest=content_digest,
                 metadata_json=metadata,
                 taint="provider_untrusted",
@@ -787,7 +806,7 @@ def _sync_calendar_item(
             thread_external_id=None,
             calendar_id=resource_id,
             source_uri=normalized.provider_url,
-            source_timestamp=_parse_provider_timestamp(updated),
+            source_timestamp=source_timestamp,
             content_digest=content_digest,
             metadata_json=metadata,
             taint="provider_untrusted",
@@ -852,28 +871,7 @@ def _gmail_bootstrap_history_id(
 def _gmail_sync_read_output_valid(value: Any) -> bool:
     if not isinstance(value, dict):
         return False
-    if is_typed_google_read_output(capability_id="cap.email.read", payload=value):
-        return True
-    if value.get("schema_version") != "google.gmail.message_evidence.v1":
-        return False
-    if not isinstance(value.get("retrieved_at"), str) or not value["retrieved_at"].strip():
-        return False
-    read_outcome = value.get("read_outcome")
-    if not isinstance(read_outcome, dict):
-        return False
-    if read_outcome.get("status") not in {"body_too_large", "decode_failed", "no_body"}:
-        return False
-    evidence = value.get("evidence")
-    if not isinstance(evidence, dict) or evidence.get("source_kind") != "gmail_message":
-        return False
-    blocks = evidence.get("blocks")
-    if not isinstance(blocks, list) or blocks:
-        return False
-    message = value.get("message")
-    if not isinstance(message, dict):
-        return False
-    message_id = message.get("message_id")
-    return isinstance(message_id, str) and bool(message_id.strip())
+    return is_typed_google_read_output(capability_id="cap.email.read", payload=value)
 
 
 def _parse_provider_timestamp(value: str | None) -> datetime | None:
@@ -914,7 +912,7 @@ def _sync_gmail_history(
             if message_id is None:
                 continue
             thread_id = _payload_text(message, "threadId")
-            message_received_at = _gmail_message_received_at(message, fallback=now)
+            message_received_at = _gmail_message_received_at(message)
             label_ids_raw = message.get("labelIds")
             label_ids = (
                 [label_id for label_id in label_ids_raw if isinstance(label_id, str)]
@@ -1209,16 +1207,16 @@ def _sync_gmail_history(
     return item_count, observation_count
 
 
-def _gmail_message_received_at(message: dict[str, Any], *, fallback: datetime) -> datetime:
+def _gmail_message_received_at(message: dict[str, Any]) -> datetime | None:
     internal_date_raw = message.get("internalDate")
     if isinstance(internal_date_raw, str) and internal_date_raw.strip():
         try:
             millis = int(internal_date_raw.strip())
         except ValueError:
-            return fallback
+            return None
         if millis >= 0:
             return datetime.fromtimestamp(millis / 1000, tz=UTC)
-    return fallback
+    return None
 
 
 def _sync_drive_change(

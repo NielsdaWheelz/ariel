@@ -1,1 +1,1 @@
-"""Ariel slice-0 package."""
+"""Ariel package."""

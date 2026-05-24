@@ -1,0 +1,1161 @@
+from __future__ import annotations
+
+import copy
+from dataclasses import dataclass, field
+from typing import Any, cast
+
+from fastapi.testclient import TestClient
+import pytest
+from sqlalchemy import select
+
+from ariel.google_connector import (
+    GoogleOAuthRefreshFailure,
+    GoogleProviderRequestFailure,
+    GoogleWorkspaceProvider,
+)
+from tests.integration.app_helpers import create_test_app
+from ariel.persistence import ArtifactRecord, ProviderWriteReceiptRecord
+from tests.integration.responses_helpers import (
+    FakeModelAdapter,
+    empty_recall_response,
+    has_tool_returns,
+    is_memory_subsystem_call,
+    last_user_message,
+    post_message_and_drain,
+    process_queued_action_execution,
+    responses_with_run_calls,
+)
+from ariel.model_adapter import ModelAdapter, ModelCall, ModelResponse
+from ariel.persistence import to_rfc3339
+from tests.fake_sandbox import FakeSandboxRuntime
+
+
+GOOGLE_CALENDAR_READ_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
+GOOGLE_GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+GOOGLE_DRIVE_METADATA_READ_SCOPE = "https://www.googleapis.com/auth/drive.metadata.readonly"
+GOOGLE_DRIVE_READ_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
+GOOGLE_DRIVE_SHARE_SCOPE = "https://www.googleapis.com/auth/drive"
+GOOGLE_GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
+GOOGLE_GMAIL_COMPOSE_SCOPE = "https://www.googleapis.com/auth/gmail.compose"
+GOOGLE_CALENDAR_WRITE_SCOPE = "https://www.googleapis.com/auth/calendar.events"
+GOOGLE_OPENID_SCOPE = "openid"
+GOOGLE_USERINFO_EMAIL_SCOPE = "https://www.googleapis.com/auth/userinfo.email"
+GOOGLE_USERINFO_PROFILE_SCOPE = "https://www.googleapis.com/auth/userinfo.profile"
+
+
+class ActionProposalAdapter(FakeModelAdapter):
+    provider = "provider.google-drive"
+    model = "model.google-drive-v1"
+
+    def __init__(
+        self,
+        *,
+        run_calls_by_message: dict[str, list[dict[str, Any]]] | None = None,
+        assistant_text_by_message: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__()
+        self.run_calls_by_message: dict[str, list[dict[str, Any]]] = (
+            run_calls_by_message if run_calls_by_message is not None else {}
+        )
+        self.assistant_text_by_message: dict[str, str] = (
+            assistant_text_by_message if assistant_text_by_message is not None else {}
+        )
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        user_message = last_user_message(request.messages)
+        if is_memory_subsystem_call(request.messages):
+            return empty_recall_response(
+                provider=self.provider, model=self.model, messages=request.messages
+            )
+        run_calls = copy.deepcopy(self.run_calls_by_message.get(user_message, []))
+        current_turn_ref = None
+        from pydantic_ai.messages import ModelRequest, SystemPromptPart  # noqa: PLC0415
+
+        for message in request.messages:
+            if not isinstance(message, ModelRequest):
+                continue
+            for part in message.parts:
+                if not isinstance(part, SystemPromptPart):
+                    continue
+                for line in part.content.splitlines():
+                    if line.startswith("- current user instruction: "):
+                        current_turn_ref = line.removeprefix("- current user instruction: ").strip()
+        for run_call in run_calls:
+            input_payload = run_call.get("input")
+            if (
+                current_turn_ref is not None
+                and isinstance(input_payload, dict)
+                and input_payload.get("user_instruction_ref") == "turn:current"
+            ):
+                input_payload["user_instruction_ref"] = current_turn_ref
+        assistant_text = self.assistant_text_by_message.get(
+            user_message,
+            f"assistant::{user_message}",
+        )
+        if has_tool_returns(request.messages):
+            run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
+        if not run_calls:
+            run_calls = [{"name": "agent.emit_message", "input": {"text": assistant_text}}]
+        return responses_with_run_calls(
+            calls=run_calls,
+            provider=self.provider,
+            model=self.model,
+            provider_response_id="resp_google_drive_123",
+            input_tokens=37,
+            output_tokens=22,
+        )
+
+
+@dataclass(slots=True)
+class FakeTokenBundle:
+    account_subject: str
+    account_email: str
+    granted_scopes: list[str]
+    access_token: str
+    refresh_token: str
+    expires_in_seconds: int = 3600
+
+
+@dataclass
+class FakeGoogleOAuthClient:
+    tokens_by_code: dict[str, FakeTokenBundle] = field(default_factory=dict)
+    refresh_mode: str = "ok"
+
+    def build_authorization_url(
+        self,
+        *,
+        state: str,
+        code_challenge: str,
+        scopes: list[str],
+        redirect_uri: str,
+        prompt_consent: bool,
+    ) -> str:
+        scope_value = "+".join(sorted(scopes))
+        prompt = "consent" if prompt_consent else "none"
+        return (
+            "https://accounts.google.com/o/oauth2/v2/auth"
+            f"?client_id=test-client"
+            f"&response_type=code"
+            f"&redirect_uri={redirect_uri}"
+            f"&scope={scope_value}"
+            f"&state={state}"
+            f"&code_challenge={code_challenge}"
+            f"&code_challenge_method=S256"
+            f"&prompt={prompt}"
+        )
+
+    def exchange_code_for_tokens(
+        self,
+        *,
+        code: str,
+        code_verifier: str,
+        redirect_uri: str,
+        state: str,
+    ) -> dict[str, Any]:
+        assert isinstance(code_verifier, str)
+        assert len(code_verifier) >= 43
+        assert redirect_uri
+        assert state
+        token_bundle = self.tokens_by_code.get(code)
+        if token_bundle is None:
+            msg = f"unexpected_code:{code}"
+            raise RuntimeError(msg)
+        return {
+            "account_subject": token_bundle.account_subject,
+            "account_email": token_bundle.account_email,
+            "granted_scopes": list(token_bundle.granted_scopes),
+            "access_token": token_bundle.access_token,
+            "refresh_token": token_bundle.refresh_token,
+            "expires_in_seconds": token_bundle.expires_in_seconds,
+        }
+
+    def refresh_access_token(self, *, refresh_token: str) -> dict[str, Any]:
+        if self.refresh_mode == "invalid_grant":
+            raise GoogleOAuthRefreshFailure(code="access_revoked")
+        if self.refresh_mode == "transient_failure":
+            raise GoogleOAuthRefreshFailure(code="provider_timeout")
+        return {
+            "access_token": f"refreshed::{refresh_token}",
+            "refresh_token": refresh_token,
+            "expires_in_seconds": 3600,
+        }
+
+    def revoke_token(self, *, token: str) -> None:
+        del token
+
+
+@dataclass
+class FakeGoogleWorkspaceProvider:
+    fail_scope_missing_for: set[str] = field(default_factory=set)
+    provider_error_by_capability: dict[str, str] = field(default_factory=dict)
+    drive_read_outcomes_by_file_id: dict[str, str] = field(default_factory=dict)
+    drive_search_calls: list[dict[str, Any]] = field(default_factory=list)
+    drive_read_calls: list[dict[str, Any]] = field(default_factory=list)
+    drive_share_calls: list[dict[str, Any]] = field(default_factory=list)
+
+    def _raise_if_configured(self, capability_id: str) -> None:
+        if capability_id in self.fail_scope_missing_for:
+            raise GoogleProviderRequestFailure("insufficient_permissions")
+        provider_error = self.provider_error_by_capability.get(capability_id)
+        if provider_error is not None:
+            raise GoogleProviderRequestFailure(provider_error)
+
+    def calendar_list(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+        provider_account_id: str,
+    ) -> dict[str, Any]:
+        del access_token, provider_account_id
+        return {
+            "schema_version": "google.calendar.events.v1",
+            "status": "succeeded",
+            "events": [],
+            "retrieved_at": "2026-03-06T12:00:00Z",
+            "window_start": normalized_input["window_start"],
+            "window_end": normalized_input["window_end"],
+        }
+
+    def calendar_propose_slots(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+        provider_account_id: str,
+        attendee_intersection_enabled: bool,
+    ) -> dict[str, Any]:
+        del access_token, normalized_input, attendee_intersection_enabled
+        return {
+            "schema_version": "google.calendar.slot_options.v1",
+            "provider_account_id": provider_account_id,
+            "slots": [],
+            "retrieved_at": "2026-03-06T12:00:00Z",
+            "window_start": "2026-03-06T00:00:00Z",
+            "window_end": "2026-03-07T00:00:00Z",
+            "duration_minutes": 30,
+            "attendees_considered": [],
+            "availability_scope": "all_attendees",
+            "partial": False,
+            "partial_reason": None,
+            "timezone": "UTC",
+            "source_evidence_refs": [],
+            "constraints_used": {},
+            "freebusy_diagnostics": [],
+            "no_slots_reason": "no_slots_available",
+        }
+
+    def email_search(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+        provider_account_id: str,
+    ) -> dict[str, Any]:
+        del access_token, normalized_input, provider_account_id
+        return {
+            "schema_version": "google.gmail.message_refs.v1",
+            "status": "succeeded",
+            "messages": [],
+            "retrieved_at": "2026-03-06T12:00:00Z",
+            "total_estimate": 0,
+        }
+
+    def email_read(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+        provider_account_id: str,
+    ) -> dict[str, Any]:
+        del access_token, provider_account_id
+        message_id = normalized_input["message_id"]
+        return {
+            "schema_version": "google.gmail.message_evidence.v1",
+            "message": {"message_id": message_id},
+            "evidence": {
+                "source_kind": "gmail_message",
+                "message_id": message_id,
+                "body_digest": "f" * 64,
+                "blocks": [
+                    {
+                        "block_id": f"gmail:{message_id}:body:0",
+                        "kind": "body",
+                        "text": "availability request",
+                        "digest": "a" * 64,
+                    }
+                ],
+            },
+            "read_outcome": {"status": "ok", "reason_code": None, "recovery": None},
+            "retrieved_at": "2026-03-06T12:00:00Z",
+        }
+
+    def calendar_create_event(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]:
+        del access_token, normalized_input
+        return {
+            "schema_version": "google.calendar.create_result.v1",
+            "status": "created",
+            "event_id": "evt_ignored",
+            "calendar_id": "primary",
+            "title": "ignored",
+            "start_time": "2026-03-06T10:00:00Z",
+            "end_time": "2026-03-06T10:30:00Z",
+            "provider_event_ref": "calendar://ignored",
+            "etag": "etag_ignored",
+            "updated": "2026-03-06T12:00:00Z",
+            "ical_uid": "evt_ignored@google.com",
+            "provider_status": "confirmed",
+            "executed_at": "2026-03-06T12:00:01Z",
+        }
+
+    def email_create_draft(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]:
+        del access_token, normalized_input
+        return {"provider_draft_ref": "gmail://draft/ignored"}
+
+    def email_send(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]:
+        del access_token, normalized_input
+        return {
+            "status": "sent",
+            "message_id": "msg_ignored",
+            "provider_message_ref": "gmail://sent/msg_ignored",
+            "to": [],
+            "subject": "ignored",
+        }
+
+    def drive_search(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+        provider_account_id: str,
+    ) -> dict[str, Any]:
+        self._raise_if_configured("cap.drive.search")
+        self.drive_search_calls.append(
+            {
+                "access_token": access_token,
+                "normalized_input": copy.deepcopy(normalized_input),
+            }
+        )
+        query = normalized_input["query"]
+        return {
+            "schema_version": "google.drive.search_results.v1",
+            "query": query,
+            "provider_account_id": provider_account_id,
+            "retrieved_at": "2026-03-06T12:00:00Z",
+            "results": [
+                {
+                    "title": "Q3 Launch Plan",
+                    "source": "https://drive.google.com/file/d/drv_plan/view",
+                    "snippet": (
+                        "mime_type=application/vnd.google-apps.document "
+                        "owner=ops@example.com modified=2026-03-05T09:30:00Z"
+                    ),
+                    "published_at": "2026-03-05T09:30:00Z",
+                }
+            ],
+            "status": "succeeded",
+        }
+
+    def drive_read(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+        provider_account_id: str,
+    ) -> dict[str, Any]:
+        self._raise_if_configured("cap.drive.read")
+        self.drive_read_calls.append(
+            {
+                "access_token": access_token,
+                "normalized_input": copy.deepcopy(normalized_input),
+            }
+        )
+        file_id = normalized_input["file_id"]
+        base_source = f"https://drive.google.com/file/d/{file_id}/view"
+        outcome = self.drive_read_outcomes_by_file_id.get(file_id, "ok")
+        if outcome == "unsupported":
+            return {
+                "schema_version": "google.drive.read_result.v1",
+                "file_id": file_id,
+                "provider_account_id": provider_account_id,
+                "retrieved_at": "2026-03-06T12:00:00Z",
+                "title": f"Drive file {file_id}",
+                "source": base_source,
+                "published_at": "2026-03-05T09:30:00Z",
+                "content_excerpt": "",
+                "truncated": False,
+                "read_outcome": {
+                    "status": "unsupported",
+                    "reason_code": "drive_read_unsupported",
+                    "recovery": "Export this file to Google Docs or plain text, then retry.",
+                },
+                "status": "succeeded",
+            }
+        if outcome == "too_large":
+            return {
+                "schema_version": "google.drive.read_result.v1",
+                "file_id": file_id,
+                "provider_account_id": provider_account_id,
+                "retrieved_at": "2026-03-06T12:00:00Z",
+                "title": f"Drive file {file_id}",
+                "source": base_source,
+                "published_at": "2026-03-05T09:30:00Z",
+                "content_excerpt": "",
+                "truncated": False,
+                "read_outcome": {
+                    "status": "too_large",
+                    "reason_code": "drive_read_too_large",
+                    "recovery": "Open the file and request a smaller section, then retry.",
+                },
+                "status": "succeeded",
+            }
+        if outcome == "unavailable":
+            return {
+                "schema_version": "google.drive.read_result.v1",
+                "file_id": file_id,
+                "provider_account_id": provider_account_id,
+                "retrieved_at": "2026-03-06T12:00:00Z",
+                "title": f"Drive file {file_id}",
+                "source": base_source,
+                "published_at": "2026-03-05T09:30:00Z",
+                "content_excerpt": "",
+                "truncated": False,
+                "read_outcome": {
+                    "status": "unavailable",
+                    "reason_code": "drive_read_unavailable",
+                    "recovery": "Verify file access and file ID, then retry.",
+                },
+                "status": "succeeded",
+            }
+        return {
+            "schema_version": "google.drive.read_result.v1",
+            "file_id": file_id,
+            "provider_account_id": provider_account_id,
+            "retrieved_at": "2026-03-06T12:00:00Z",
+            "title": "Q3 Launch Plan",
+            "source": base_source,
+            "published_at": "2026-03-05T09:30:00Z",
+            "content_excerpt": (
+                "launch plan excerpt: phase 1 closes security review by mar 12; "
+                "phase 2 starts staged rollout by mar 18."
+            ),
+            "truncated": False,
+            "read_outcome": {
+                "status": "ok",
+                "reason_code": None,
+                "recovery": None,
+            },
+            "status": "succeeded",
+        }
+
+    def drive_share(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+    ) -> dict[str, Any]:
+        self._raise_if_configured("cap.drive.share")
+        self.drive_share_calls.append(
+            {
+                "access_token": access_token,
+                "normalized_input": copy.deepcopy(normalized_input),
+            }
+        )
+        return {
+            "status": "shared",
+            "file_id": normalized_input["file_id"],
+            "grantee_email": normalized_input["grantee_email"],
+            "role": normalized_input["role"],
+            "permission_id": f"perm_{len(self.drive_share_calls)}",
+        }
+
+
+def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
+    app = create_test_app(
+        database_url=postgres_url,
+        model_adapter=adapter,
+        sandbox=FakeSandboxRuntime(),
+    )
+    return TestClient(app)
+
+
+def _bind_google_fakes(
+    client: TestClient,
+    *,
+    oauth_client: FakeGoogleOAuthClient,
+    workspace_provider: FakeGoogleWorkspaceProvider,
+) -> None:
+    import ariel.worker as _worker_module
+    from ariel.app import build_google_runtime as _orig_build_google_runtime
+
+    app_state = cast(Any, client.app).state
+    app_state.google_oauth_client = oauth_client
+    app_state.google_workspace_provider = workspace_provider
+
+    def _worker_build_google_runtime(settings: Any, **kw: Any) -> Any:
+        return _orig_build_google_runtime(
+            settings,
+            oauth_client=kw.pop("oauth_client", None) or oauth_client,
+            workspace_provider=cast(
+                GoogleWorkspaceProvider, kw.pop("workspace_provider", None) or workspace_provider
+            ),
+            **kw,
+        )
+
+    _worker_module.build_google_runtime = _worker_build_google_runtime
+
+
+def _session_id(client: TestClient) -> str:
+    active = client.get("/v1/sessions/active")
+    assert active.status_code == 200
+    return active.json()["session"]["id"]
+
+
+def _turn_data(client: TestClient, session_id: str) -> dict[str, Any]:
+    resp = client.get(f"/v1/sessions/{session_id}/events")
+    assert resp.status_code == 200
+    turns = resp.json()["turns"]
+    assert turns, "no turns in timeline"
+    return turns[-1]
+
+
+def _surface_attempt(turn_payload: dict[str, Any], *, proposal_index: int = 1) -> dict[str, Any]:
+    lifecycle = turn_payload.get("surface_action_lifecycle")
+    assert isinstance(lifecycle, list)
+    assert len(lifecycle) >= proposal_index
+    item = lifecycle[proposal_index - 1]
+    assert isinstance(item, dict)
+    return item
+
+
+def _approval_ref(turn_payload: dict[str, Any], *, proposal_index: int = 1) -> str:
+    attempt = _surface_attempt(turn_payload, proposal_index=proposal_index)
+    approval = attempt.get("approval")
+    assert isinstance(approval, dict)
+    ref = approval.get("reference")
+    assert isinstance(ref, str)
+    return ref
+
+
+def _event_types(turn_payload: dict[str, Any]) -> list[str]:
+    return [event["event_type"] for event in turn_payload["events"]]
+
+
+def _turn_sources(client: TestClient, turn_id: str) -> list[dict[str, Any]]:
+    """Return retrieval-provenance sources for a turn by querying the DB directly.
+
+    Sources are ArtifactRecord rows with artifact_type == "retrieval_provenance";
+    they are not embedded in the events timeline.
+    """
+    session_factory = cast(Any, client.app).state.session_factory
+    with session_factory() as db:
+        artifacts = db.scalars(
+            select(ArtifactRecord)
+            .where(
+                ArtifactRecord.turn_id == turn_id,
+                ArtifactRecord.artifact_type == "retrieval_provenance",
+            )
+            .order_by(ArtifactRecord.created_at.asc(), ArtifactRecord.id.asc())
+        ).all()
+    return [
+        {
+            "artifact_id": artifact.id,
+            "title": artifact.title,
+            "source": artifact.source,
+            "retrieved_at": to_rfc3339(artifact.retrieved_at),
+            "published_at": (
+                to_rfc3339(artifact.published_at) if artifact.published_at is not None else None
+            ),
+        }
+        for artifact in artifacts
+    ]
+
+
+def _connect_google(client: TestClient, *, code: str) -> dict[str, Any]:
+    started = client.post("/v1/connectors/google/start")
+    assert started.status_code == 200
+    state = started.json()["oauth"]["state"]
+    callback = client.get(
+        "/v1/connectors/google/callback",
+        params={"state": state, "code": code},
+    )
+    assert callback.status_code == 200
+    return callback.json()
+
+
+def test_drive_search_and_read_execute_inline_with_retrieval_citations(
+    postgres_url: str,
+) -> None:
+    adapter = ActionProposalAdapter(
+        run_calls_by_message={
+            "find launch plan": [{"name": "drive.search", "input": {"query": "launch plan"}}],
+            "read launch plan": [{"name": "drive.read", "input": {"file_id": "drv_plan"}}],
+        },
+        assistant_text_by_message={
+            "find launch plan": "I found the Q3 launch plan. [1]",
+            "read launch plan": "The launch plan excerpt is available. [1]",
+        },
+    )
+    oauth_client = FakeGoogleOAuthClient(
+        tokens_by_code={
+            "connect-drive-read": FakeTokenBundle(
+                account_subject="sub_drive_read",
+                account_email="drive-read@example.com",
+                granted_scopes=[
+                    GOOGLE_CALENDAR_READ_SCOPE,
+                    GOOGLE_GMAIL_READ_SCOPE,
+                    GOOGLE_DRIVE_METADATA_READ_SCOPE,
+                    GOOGLE_DRIVE_READ_SCOPE,
+                ],
+                access_token="tok_access_drive_read",
+                refresh_token="tok_refresh_drive_read",
+            )
+        }
+    )
+    workspace_provider = FakeGoogleWorkspaceProvider()
+    with _build_client(postgres_url, adapter) as client:
+        _bind_google_fakes(
+            client,
+            oauth_client=oauth_client,
+            workspace_provider=workspace_provider,
+        )
+        _connect_google(client, code="connect-drive-read")
+        session_id = _session_id(client)
+
+        post_message_and_drain(client, session_id, message="find launch plan")
+        search_turn_data = _turn_data(client, session_id)
+        search_attempt = _surface_attempt(search_turn_data)
+        assert search_attempt["proposal"]["capability_id"] == "cap.drive.search"
+        assert search_attempt["policy"]["decision"] == "allow_inline"
+        assert search_attempt["approval"]["status"] == "not_requested"
+        assert search_attempt["execution"]["status"] == "succeeded"
+        search_output = search_attempt["execution"]["output"]
+        assert search_output["provider_account_id"] == "sub_drive_read"
+        assert isinstance(search_output["results"], list)
+        assert search_output["results"][0]["title"] == "Q3 Launch Plan"
+        assert "mime_type=" in search_output["results"][0]["snippet"]
+        assert "[1]" in search_turn_data["assistant_message"]
+        assert len(_turn_sources(client, search_turn_data["id"])) == 1
+
+        post_message_and_drain(client, session_id, message="read launch plan")
+        read_turn_data = _turn_data(client, session_id)
+        read_attempt = _surface_attempt(read_turn_data)
+        assert read_attempt["proposal"]["capability_id"] == "cap.drive.read"
+        assert read_attempt["policy"]["decision"] == "allow_inline"
+        assert read_attempt["approval"]["status"] == "not_requested"
+        assert read_attempt["execution"]["status"] == "succeeded"
+        read_output = read_attempt["execution"]["output"]
+        assert set(read_output.keys()) == {
+            "schema_version",
+            "file_id",
+            "provider_account_id",
+            "retrieved_at",
+            "title",
+            "source",
+            "published_at",
+            "content_excerpt",
+            "truncated",
+            "read_outcome",
+            "status",
+        }
+        assert read_output["provider_account_id"] == "sub_drive_read"
+        assert read_output["title"] == "Q3 Launch Plan"
+        assert "drive.google.com" in read_output["source"]
+        assert read_output["read_outcome"]["status"] == "ok"
+        assert "launch plan excerpt" in read_output["content_excerpt"]
+        assert read_output["truncated"] is False
+        assert len(read_output["content_excerpt"]) <= 2000
+        assert "[1]" in read_turn_data["assistant_message"]
+        read_sources = _turn_sources(client, read_turn_data["id"])
+        assert len(read_sources) == 1
+        assert "drive.google.com" in read_sources[0]["source"]
+
+
+@pytest.mark.parametrize(
+    ("message", "file_id", "expected_status", "expected_hint"),
+    [
+        ("read unsupported file", "drv_unsupported", "unsupported", "export"),
+        ("read too large file", "drv_too_large", "too_large", "smaller"),
+        ("read unavailable file", "drv_unavailable", "unavailable", "verify"),
+    ],
+)
+def test_drive_read_typed_outcomes_are_explicit_and_recoverable(
+    postgres_url: str,
+    message: str,
+    file_id: str,
+    expected_status: str,
+    expected_hint: str,
+) -> None:
+    adapter = ActionProposalAdapter(
+        run_calls_by_message={message: [{"name": "drive.read", "input": {"file_id": file_id}}]},
+        assistant_text_by_message={
+            message: f"The Drive read outcome is {expected_status}; {expected_hint}.",
+        },
+    )
+    oauth_client = FakeGoogleOAuthClient(
+        tokens_by_code={
+            "connect-drive-read": FakeTokenBundle(
+                account_subject="sub_drive_read",
+                account_email="drive-read@example.com",
+                granted_scopes=[
+                    GOOGLE_CALENDAR_READ_SCOPE,
+                    GOOGLE_GMAIL_READ_SCOPE,
+                    GOOGLE_DRIVE_READ_SCOPE,
+                ],
+                access_token="tok_access_drive_read",
+                refresh_token="tok_refresh_drive_read",
+            )
+        }
+    )
+    workspace_provider = FakeGoogleWorkspaceProvider(
+        drive_read_outcomes_by_file_id={
+            "drv_unsupported": "unsupported",
+            "drv_too_large": "too_large",
+            "drv_unavailable": "unavailable",
+        }
+    )
+    with _build_client(postgres_url, adapter) as client:
+        _bind_google_fakes(
+            client,
+            oauth_client=oauth_client,
+            workspace_provider=workspace_provider,
+        )
+        _connect_google(client, code="connect-drive-read")
+        session_id = _session_id(client)
+
+        post_message_and_drain(client, session_id, message=message)
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
+        assert attempt["execution"]["status"] == "succeeded"
+        output = attempt["execution"]["output"]
+        assert output["provider_account_id"] == "sub_drive_read"
+        assert "results" not in output
+        assert output["title"] == f"Drive file {file_id}"
+        assert "drive.google.com" in output["source"]
+        assert output["read_outcome"]["status"] == expected_status
+        assert expected_hint in output["read_outcome"]["recovery"].lower()
+        assert expected_hint in turn_data["assistant_message"].lower()
+        assert len(_turn_sources(client, turn_data["id"])) == 1
+
+
+def test_drive_reconnect_intent_is_capability_scoped_and_least_privilege(
+    postgres_url: str,
+) -> None:
+    adapter = ActionProposalAdapter()
+    oauth_client = FakeGoogleOAuthClient(
+        tokens_by_code={
+            "connect-read-only": FakeTokenBundle(
+                account_subject="sub_drive_scope",
+                account_email="drive-scope@example.com",
+                granted_scopes=[GOOGLE_CALENDAR_READ_SCOPE, GOOGLE_GMAIL_READ_SCOPE],
+                access_token="tok_access_read_only",
+                refresh_token="tok_refresh_read_only",
+            )
+        }
+    )
+    with _build_client(postgres_url, adapter) as client:
+        _bind_google_fakes(
+            client,
+            oauth_client=oauth_client,
+            workspace_provider=FakeGoogleWorkspaceProvider(),
+        )
+        _connect_google(client, code="connect-read-only")
+
+        search_reconnect = client.post(
+            "/v1/connectors/google/reconnect",
+            params={"capability_intent": "cap.drive.search"},
+        )
+        assert search_reconnect.status_code == 200
+        search_scopes = set(search_reconnect.json()["oauth"]["requested_scopes"])
+        assert GOOGLE_CALENDAR_READ_SCOPE in search_scopes
+        assert GOOGLE_GMAIL_READ_SCOPE in search_scopes
+        assert GOOGLE_DRIVE_METADATA_READ_SCOPE in search_scopes
+        assert GOOGLE_DRIVE_READ_SCOPE not in search_scopes
+        assert GOOGLE_DRIVE_SHARE_SCOPE not in search_scopes
+
+        read_reconnect = client.post(
+            "/v1/connectors/google/reconnect",
+            params={"capability_intent": "cap.drive.read"},
+        )
+        assert read_reconnect.status_code == 200
+        read_scopes = set(read_reconnect.json()["oauth"]["requested_scopes"])
+        assert GOOGLE_CALENDAR_READ_SCOPE in read_scopes
+        assert GOOGLE_GMAIL_READ_SCOPE in read_scopes
+        assert GOOGLE_DRIVE_READ_SCOPE in read_scopes
+        assert GOOGLE_DRIVE_SHARE_SCOPE not in read_scopes
+        assert GOOGLE_GMAIL_SEND_SCOPE not in read_scopes
+        assert GOOGLE_CALENDAR_WRITE_SCOPE not in read_scopes
+
+        share_reconnect = client.post(
+            "/v1/connectors/google/reconnect",
+            params={"capability_intent": "cap.drive.share"},
+        )
+        assert share_reconnect.status_code == 200
+        share_scopes = set(share_reconnect.json()["oauth"]["requested_scopes"])
+        assert GOOGLE_CALENDAR_READ_SCOPE in share_scopes
+        assert GOOGLE_GMAIL_READ_SCOPE in share_scopes
+        assert GOOGLE_DRIVE_SHARE_SCOPE in share_scopes
+        assert GOOGLE_GMAIL_SEND_SCOPE not in share_scopes
+        assert GOOGLE_GMAIL_COMPOSE_SCOPE not in share_scopes
+        assert GOOGLE_CALENDAR_WRITE_SCOPE not in share_scopes
+
+        # Reconnect always unions in the current default identity and read scope set.
+        for scopes in (search_scopes, read_scopes, share_scopes):
+            assert GOOGLE_OPENID_SCOPE in scopes
+            assert GOOGLE_USERINFO_EMAIL_SCOPE in scopes
+            assert GOOGLE_USERINFO_PROFILE_SCOPE in scopes
+
+
+def test_drive_share_is_approval_gated_exact_payload_and_exactly_once(
+    postgres_url: str,
+) -> None:
+    adapter = ActionProposalAdapter(
+        run_calls_by_message={
+            "share launch plan": [
+                {
+                    "name": "drive.share",
+                    "input": {
+                        "file_id": "drv_plan",
+                        "grantee_email": "partner@example.com",
+                        "role": "reader",
+                        "idempotency_key": "drive-share-launch-plan-1",
+                        "user_instruction_ref": "turn:current",
+                    },
+                }
+            ]
+        }
+    )
+    oauth_client = FakeGoogleOAuthClient(
+        tokens_by_code={
+            "connect-drive-share": FakeTokenBundle(
+                account_subject="sub_drive_share",
+                account_email="drive-share@example.com",
+                granted_scopes=[
+                    GOOGLE_CALENDAR_READ_SCOPE,
+                    GOOGLE_GMAIL_READ_SCOPE,
+                    GOOGLE_DRIVE_SHARE_SCOPE,
+                ],
+                access_token="tok_access_drive_share",
+                refresh_token="tok_refresh_drive_share",
+            )
+        }
+    )
+    workspace_provider = FakeGoogleWorkspaceProvider()
+    with _build_client(postgres_url, adapter) as client:
+        _bind_google_fakes(
+            client,
+            oauth_client=oauth_client,
+            workspace_provider=workspace_provider,
+        )
+        _connect_google(client, code="connect-drive-share")
+        session_id = _session_id(client)
+
+        post_message_and_drain(client, session_id, message="share launch plan")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
+        assert attempt["proposal"]["capability_id"] == "cap.drive.share"
+        assert attempt["policy"]["decision"] == "requires_approval"
+        assert attempt["approval"]["status"] == "pending"
+        assert "evt.action.execution.started" not in _event_types(turn_data)
+
+        approval_ref = _approval_ref(turn_data)
+        approved = client.post(
+            "/v1/approvals",
+            json={"approval_ref": approval_ref, "decision": "approve", "actor_id": "user.local"},
+        )
+        assert approved.status_code == 200
+        assert process_queued_action_execution(client, approved.json()) is True
+
+        replay = client.post(
+            "/v1/approvals",
+            json={"approval_ref": approval_ref, "decision": "approve", "actor_id": "user.local"},
+        )
+        assert replay.status_code == 409
+        assert replay.json()["error"]["code"] == "E_APPROVAL_NOT_PENDING"
+
+        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        assert timeline.status_code == 200
+        latest_turn = timeline.json()["turns"][-1]
+        latest_attempt = _surface_attempt(latest_turn)
+        assert latest_attempt["execution"]["status"] == "succeeded"
+        assert latest_attempt["execution"]["output"]["status"] == "shared"
+        assert latest_attempt["execution"]["output"]["file_id"] == "drv_plan"
+        assert latest_attempt["execution"]["output"]["grantee_email"] == "partner@example.com"
+        assert latest_attempt["execution"]["output"]["role"] == "reader"
+
+        event_types = _event_types(latest_turn)
+        assert event_types.count("evt.action.execution.started") == 1
+        assert event_types.count("evt.action.execution.succeeded") == 1
+        assert event_types.index("evt.action.approval.approved") < event_types.index(
+            "evt.action.execution.started"
+        )
+
+        assert len(workspace_provider.drive_share_calls) == 1
+        normalized_share_input = workspace_provider.drive_share_calls[0]["normalized_input"]
+        assert normalized_share_input == {
+            "file_id": "drv_plan",
+            "grantee_email": "partner@example.com",
+            "role": "reader",
+            "idempotency_key": "drive-share-launch-plan-1",
+            "user_instruction_ref": normalized_share_input["user_instruction_ref"],
+        }
+        assert normalized_share_input["user_instruction_ref"].startswith("turn:")
+        with cast(Any, client.app).state.session_factory() as db:
+            receipts = db.scalars(select(ProviderWriteReceiptRecord)).all()
+        assert len(receipts) == 1
+        receipt = receipts[0]
+        assert receipt.capability_id == "cap.drive.share"
+        assert receipt.status == "succeeded"
+        assert receipt.provider_object_ids["file_id"] == "drv_plan"
+        assert receipt.provider_object_ids["permission_id"] == "perm_1"
+        assert (
+            receipt.provider_object_ids["user_instruction_ref"]
+            == normalized_share_input["user_instruction_ref"]
+        )
+        assert (
+            receipt.response_payload["authority"]["user_instruction_ref"]
+            == (normalized_share_input["user_instruction_ref"])
+        )
+
+
+def test_drive_share_denial_blocks_the_provider_write(
+    postgres_url: str,
+) -> None:
+    adapter = ActionProposalAdapter(
+        run_calls_by_message={
+            "share launch plan": [
+                {
+                    "name": "drive.share",
+                    "input": {
+                        "file_id": "drv_plan",
+                        "grantee_email": "partner@example.com",
+                        "role": "reader",
+                        "idempotency_key": "drive-share-denied-1",
+                        "user_instruction_ref": "turn:current",
+                    },
+                }
+            ]
+        }
+    )
+    oauth_client = FakeGoogleOAuthClient(
+        tokens_by_code={
+            "connect-drive-share": FakeTokenBundle(
+                account_subject="sub_drive_share_deny",
+                account_email="drive-share-deny@example.com",
+                granted_scopes=[
+                    GOOGLE_CALENDAR_READ_SCOPE,
+                    GOOGLE_GMAIL_READ_SCOPE,
+                    GOOGLE_DRIVE_SHARE_SCOPE,
+                ],
+                access_token="tok_access_drive_share_deny",
+                refresh_token="tok_refresh_drive_share_deny",
+            )
+        }
+    )
+    workspace_provider = FakeGoogleWorkspaceProvider()
+    with _build_client(postgres_url, adapter) as client:
+        _bind_google_fakes(
+            client,
+            oauth_client=oauth_client,
+            workspace_provider=workspace_provider,
+        )
+        _connect_google(client, code="connect-drive-share")
+        session_id = _session_id(client)
+
+        post_message_and_drain(client, session_id, message="share launch plan")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
+        assert attempt["policy"]["decision"] == "requires_approval"
+
+        approval_ref = _approval_ref(turn_data)
+        denied = client.post(
+            "/v1/approvals",
+            json={"approval_ref": approval_ref, "decision": "deny", "actor_id": "user.local"},
+        )
+        assert denied.status_code == 200
+
+        # A denied approval never reaches the provider: no drive-share call.
+        assert len(workspace_provider.drive_share_calls) == 0
+
+
+@pytest.mark.parametrize(
+    ("case_name", "connect_code", "refresh_mode", "scope_missing", "expected_class"),
+    [
+        ("not_connected", None, "ok", False, "not_connected"),
+        ("consent_required", "connect-baseline", "ok", False, "consent_required"),
+        ("scope_missing", "connect-drive-read", "ok", True, "scope_missing"),
+        (
+            "provider_timeout",
+            "connect-drive-read-expired",
+            "transient_failure",
+            False,
+            "provider_timeout",
+        ),
+        ("access_revoked", "connect-drive-read-expired", "invalid_grant", False, "access_revoked"),
+    ],
+)
+def test_drive_auth_scope_failures_are_typed_and_recoverable(
+    postgres_url: str,
+    case_name: str,
+    connect_code: str | None,
+    refresh_mode: str,
+    scope_missing: bool,
+    expected_class: str,
+) -> None:
+    del case_name
+    adapter = ActionProposalAdapter(
+        run_calls_by_message={
+            "read planning doc": [{"name": "drive.read", "input": {"file_id": "drv_auth"}}]
+        },
+        assistant_text_by_message={
+            "read planning doc": f"{expected_class}: connect, reconnect, then retry.",
+        },
+    )
+    oauth_client = FakeGoogleOAuthClient(
+        tokens_by_code={
+            "connect-baseline": FakeTokenBundle(
+                account_subject="sub_baseline",
+                account_email="baseline@example.com",
+                granted_scopes=[GOOGLE_CALENDAR_READ_SCOPE, GOOGLE_GMAIL_READ_SCOPE],
+                access_token="tok_access_baseline",
+                refresh_token="tok_refresh_baseline",
+            ),
+            "connect-drive-read": FakeTokenBundle(
+                account_subject="sub_drive_read",
+                account_email="drive-read@example.com",
+                granted_scopes=[
+                    GOOGLE_CALENDAR_READ_SCOPE,
+                    GOOGLE_GMAIL_READ_SCOPE,
+                    GOOGLE_DRIVE_READ_SCOPE,
+                ],
+                access_token="tok_access_drive_read",
+                refresh_token="tok_refresh_drive_read",
+            ),
+            "connect-drive-read-expired": FakeTokenBundle(
+                account_subject="sub_drive_expired",
+                account_email="drive-expired@example.com",
+                granted_scopes=[
+                    GOOGLE_CALENDAR_READ_SCOPE,
+                    GOOGLE_GMAIL_READ_SCOPE,
+                    GOOGLE_DRIVE_READ_SCOPE,
+                ],
+                access_token="tok_access_drive_expired",
+                refresh_token="tok_refresh_drive_expired",
+                expires_in_seconds=-5,
+            ),
+        },
+        refresh_mode=refresh_mode,
+    )
+    workspace_provider = FakeGoogleWorkspaceProvider(
+        fail_scope_missing_for={"cap.drive.read"} if scope_missing else set()
+    )
+    with _build_client(postgres_url, adapter) as client:
+        _bind_google_fakes(
+            client,
+            oauth_client=oauth_client,
+            workspace_provider=workspace_provider,
+        )
+        if connect_code is not None:
+            _connect_google(client, code=connect_code)
+        session_id = _session_id(client)
+
+        post_message_and_drain(client, session_id, message="read planning doc")
+        turn_data = _turn_data(client, session_id)
+
+        rendered_message = turn_data["assistant_message"].lower()
+        assert expected_class in rendered_message
+        if expected_class == "not_connected":
+            assert "connect" in rendered_message
+            assert turn_data["surface_action_lifecycle"] == []
+            assert all(
+                event["event_type"] != "evt.action.execution.failed"
+                for event in turn_data["events"]
+            )
+            return
+        if expected_class == "consent_required" and turn_data["surface_action_lifecycle"] == []:
+            assert "reconnect" in rendered_message
+            assert all(
+                event["event_type"] != "evt.action.execution.started"
+                for event in turn_data["events"]
+            )
+            return
+        if expected_class in {"consent_required", "scope_missing", "access_revoked"}:
+            assert "reconnect" in rendered_message
+        attempt = _surface_attempt(turn_data)
+        assert attempt["execution"]["status"] == "failed"
+        assert attempt["execution"]["error"] == expected_class
+
+
+@pytest.mark.parametrize(
+    ("provider_error", "expected_class", "expected_hint"),
+    [
+        ("google_upstream_timeout", "provider_timeout", "retry"),
+        ("google_upstream_429", "provider_rate_limited", "rate"),
+        ("google_forbidden", "provider_permission_denied", "permission"),
+    ],
+)
+def test_drive_provider_failures_are_typed_and_recoverable(
+    postgres_url: str,
+    provider_error: str,
+    expected_class: str,
+    expected_hint: str,
+) -> None:
+    adapter = ActionProposalAdapter(
+        run_calls_by_message={
+            "find risk register": [{"name": "drive.search", "input": {"query": "risk register"}}]
+        },
+        assistant_text_by_message={
+            "find risk register": f"{expected_class}: {expected_hint}.",
+        },
+    )
+    oauth_client = FakeGoogleOAuthClient(
+        tokens_by_code={
+            "connect-drive-search": FakeTokenBundle(
+                account_subject="sub_drive_search",
+                account_email="drive-search@example.com",
+                granted_scopes=[
+                    GOOGLE_CALENDAR_READ_SCOPE,
+                    GOOGLE_GMAIL_READ_SCOPE,
+                    GOOGLE_DRIVE_METADATA_READ_SCOPE,
+                ],
+                access_token="tok_access_drive_search",
+                refresh_token="tok_refresh_drive_search",
+            )
+        }
+    )
+    workspace_provider = FakeGoogleWorkspaceProvider(
+        provider_error_by_capability={"cap.drive.search": provider_error}
+    )
+    with _build_client(postgres_url, adapter) as client:
+        _bind_google_fakes(
+            client,
+            oauth_client=oauth_client,
+            workspace_provider=workspace_provider,
+        )
+        _connect_google(client, code="connect-drive-search")
+        session_id = _session_id(client)
+
+        post_message_and_drain(client, session_id, message="find risk register")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
+        assert attempt["execution"]["status"] == "failed"
+        assert attempt["execution"]["error"] == expected_class
+
+        message = turn_data["assistant_message"].lower()
+        assert expected_class in message
+        assert expected_hint in message

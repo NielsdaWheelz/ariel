@@ -3,15 +3,13 @@
 ## Scope
 
 This document owns Ariel's agent loop: the run-program reason→act→observe loop,
-its two instances — the main agent and the research subagent — async worker-run
-turns and Discord delivery, the long adaptive loop, the per-turn scratch store,
-and per-program commit.
+its configured drivers — the main agent, research subagent, memory retriever,
+and memory rememberer — async worker-run turns and Discord delivery, the long
+adaptive loop, the per-turn scratch store, and per-program commit.
 
 The agent loop follows [../ai-first.md](../ai-first.md): the model owns every
 judgment within a turn; deterministic code owns the rails — the sandbox, the
-syscall boundary, the budget, stuck-detection, commit, and delivery. The cutover
-that produced this design is recorded in
-[../agent-loop-cutover.md](../agent-loop-cutover.md).
+syscall boundary, the budget, stuck-detection, commit, and delivery.
 
 ## The run-program loop
 
@@ -27,7 +25,7 @@ program, and when the program finishes feeds the program's outcome back into
 the model's context for the next round. The loop ends when the model emits its
 terminal output or a rail stops it.
 
-A syscall is one of three kinds. The `agent.*` output syscalls
+A syscall is one of three kinds. The main-loop `agent.*` output syscalls
 (`agent.emit_message`, `agent.emit_value`, `agent.pause_until_input`) and the
 two `scratch.*` store syscalls are handled inline in `run_runtime.py` — they are
 not capabilities. Every other syscall is a capability call routed through
@@ -36,8 +34,8 @@ egress, output guardrails, and the `action_attempts` audit ledger. The model
 never reaches a capability except as a syscall, and deterministic code never
 routes between capabilities — the program decides.
 
-`research.finding` is a fourth syscall kind, eligible only in a research run
-(see [The research subagent](#the-research-subagent)).
+`agent.emit_finding` and `agent.emit_done` are non-main-loop output syscalls,
+eligible only in research and memory-subsystem runs.
 
 Taint accumulates within a program: a syscall that returns
 untrusted-influenced content advances the program's runtime provenance, so
@@ -46,10 +44,11 @@ taint delta; the loop merges that into the turn baseline so the next program
 sees it (`_merge_runtime_provenance` in `app.py`). Taint crosses programs;
 nothing inside a turn launders it.
 
-## The two loop instances
+## Loop Drivers
 
-There is no shared `run_agent_loop` function. Two separate loops exist, each its
-own reason→act→observe `while True`:
+`run_agent_loop` (`agent_loop.py`) is the shared reason→act→observe loop. Each
+driver assembles its context and `LoopConfig`, calls the shared loop, then maps
+`LoopResult` to its own persistence and delivery contract:
 
 - **The main agent** — `_wake` in `app.py`. It owns the user-facing
   conversation and every write. It assembles memory and eligibility context,
@@ -57,21 +56,18 @@ own reason→act→observe `while True`:
   `requires_approval`), and ends when the model calls `agent.emit_message`.
 - **The research subagent** — `run_research` in `research_runtime.py`. The same
   loop structure, driven read-only on one research mode's capability whitelist,
-  ending on `research.finding`.
+  ending on `agent.emit_finding`.
+- **The memory retriever** — `run_retriever` in `memory.py`. It searches and
+  reads the memory substrate, then emits one `recall_v1` finding.
+- **The memory rememberer** — `run_rememberer` in `memory.py`. It runs in
+  `memory_encode` or `memory_dream` mode, applies `memory.note.*` operations,
+  and exits with `agent.emit_done`.
 
-The two loops are siblings, not driver and engine. What they share is one level
-down: the same run-program model, the same `execute_run_program` — one
-program's sandboxed execution and its syscall rails — and the same
-`run_runtime.py` helpers. Each loop owns its own outer mechanics: its context
-assembly, its capability set, its budget, its terminal output, its persistence.
-`research_runtime.py` does not import `app.py`; the worker imports both.
-
-The differences between the two are exactly: the eligible capabilities (every
-eligible capability vs. one mode whitelist), the wall-clock budget, the terminal
-output (a message vs. a finding), the system prompt, and persistence (a normal
-turn vs. a `kind="research"` `TurnRecord`). Everything else — the loop shape,
-the model-call backstop, stuck-detection, the scratch store, `emit_value`
-eviction, per-program commit — is identical and intentionally mirrored.
+The drivers differ by eligible callables, wall-clock budget, terminal output,
+prompt version, judgment recording, and persistence. Everything else — the
+model-call backstop, stuck-detection, scratch store, `emit_value` eviction,
+round-history eviction, per-program commit, retry, and run-protocol validation
+— lives once in `run_agent_loop`.
 
 ## Async worker-run turns and delivery
 
@@ -137,9 +133,9 @@ seconds not minutes.
 A failed program is **not rolled back**. Its syscall-trace audit — the
 `EventRecord` rows and the `action_attempts` ledger — is the audit spine and
 commits regardless. What a failed program does not get to keep: its staged
-approvals are voided (`_void_failed_program_approvals` moves the approval and
+approvals are voided (`_void_approvals` moves the approval and
 its action attempt to `expired` so nothing surfaces as a live pending action),
-and the program's emitted outputs — message, values, finding, pause — are
+and the program's emitted outputs — message, values, finding/done, pause — are
 scrubbed from `RunProgramResult`. The model is fed the program error and
 authors the next program.
 
@@ -164,11 +160,10 @@ The store is bounded host-side — 64 entries, 512 KiB per value, 4 MiB total �
 and lives for the turn only; it is not memory.
 
 Large intermediate data — search results, fetched pages, mailbox extracts —
-lives in the scratch store as host-side values. Only keys, and the summaries
-the model deliberately surfaces with `agent.emit_value`, enter the model's
-context. `agent.emit_value` keeps its role — the model's deliberate channel for
-data it wants to reason over next round — but is no longer the only way to
-carry data forward. As a backstop, superseded `emit_value` rounds are evicted
+lives in the scratch store as host-side values. Capability outputs are not
+auto-echoed into later model rounds. The only values that enter later model
+context are the facts the program deliberately surfaces with
+`agent.emit_value`. As a backstop, superseded `emit_value` rounds are evicted
 from the model's input items: only the most recent `emit_value` round is
 retained.
 
@@ -191,14 +186,14 @@ subagent cannot call `research.investigate`; delegation is single-level.
 **The run.** The worker runs the `research_run` task through `run_research`,
 which drives the read-only loop. The research prompt frames the question, the
 mode, and the eligible read capabilities, and instructs the model to write its
-sub-questions first, investigate, and call `research.finding` exactly once. The
+sub-questions first, investigate, and call `agent.emit_finding` exactly once. The
 run is persisted as a `TurnRecord` with `kind="research"` — no new table. Its
 read syscalls write `action_attempts` rows like any turn; it stages no
 approvals.
 
-**The two modes.** A research run is in exactly one of two mutually exclusive
-modes — the "Rule of Two": a run is exposed to at most two of {untrusted input,
-private data, outbound reach}, never all three.
+**The modes.** A research run is in exactly one mutually exclusive mode. It is
+exposed to at most two of {untrusted input, private data, outbound reach}, never
+all three.
 
 - **`web`** — whitelist `RESEARCH_WEB_CAPABILITY_IDS`: `cap.search.web`,
   `cap.search.news`, `cap.web.extract`. Untrusted input and outbound reach; no
@@ -207,8 +202,12 @@ private data, outbound reach}, never all three.
   `cap.email.search`, `cap.email.read`, `cap.drive.search`, `cap.drive.read`,
   `cap.calendar.list`. Private data and untrusted input (the mailbox is
   attacker-influenced); no outbound web reach.
+- **`memories`** — whitelist `RESEARCH_MEMORIES_CAPABILITY_IDS`:
+  `cap.memory.search`, `cap.memory.read`. Ariel-owned memory substrate only; no
+  outbound web reach or live provider reads.
 
-A run never holds both whitelists. A task needing both is two runs; the main
+A run never holds multiple whitelists. A task needing more than one mode is split
+into separate runs; the main
 agent combines their findings — coupled synthesis stays with the single main
 thread.
 
@@ -220,10 +219,10 @@ egress controls. Every fetch is a capability syscall routed through
 `process_one_call` and recorded in the `action_attempts` ledger. There is no
 separate browsing service; the safety boundary is the capability rails.
 
-**The finding.** The run terminates on `research.finding(summary, claims, gaps,
+**The finding.** The run terminates on `agent.emit_finding(summary, claims, gaps,
 sources)`, returned as a typed `ResearchFinding`. `status` is one of three:
 
-- `complete` — the run called `research.finding`.
+- `complete` — the run called `agent.emit_finding`.
 - `partial` — the wall-clock budget, the model-call backstop, or
   stuck-detection ended the run before a finding. The loop ran cleanly; it just
   did not converge. The three lists are empty and `summary` is a short
@@ -253,9 +252,9 @@ unapproved action.
 - The model's tool surface is exactly `run`. Delegation is a syscall
   (`research.investigate`), never a second tool and never a deterministic
   route.
-- There are two agent loops — `_wake` and `run_research` — each its own
-  reason→act→observe loop. They share `execute_run_program` and the
-  run-program model, not an outer-loop function. There is no third loop.
+- `run_agent_loop` is the one shared reason→act→observe loop. `_wake`,
+  `run_research`, `run_retriever`, and `run_rememberer` configure it and own
+  their domain-specific setup and post-loop handling.
 - `_wake` is the one trigger entrypoint. The research loop is a worker-task
   handler, not a trigger.
 - Every turn runs in the single-threaded worker. The HTTP ingress enqueues and

@@ -57,10 +57,27 @@ def load_local_env(
     *,
     environ: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
+    """Merge env-file values with the process environment, honoring ``ARIEL_ENV_FILE``.
+
+    When ``ARIEL_ENV_FILE`` is set in ``environ`` (e.g., ``.env.dev``), only that
+    file is read — the default ``.env.local`` is bypassed entirely. When unset,
+    the default ``.env`` then ``.env.local`` stack is used. The process
+    environment always wins last.
+    """
+    proc_env = dict(environ or os.environ)
+    override = proc_env.get("ARIEL_ENV_FILE", "").strip()
+    if override:
+        override_path = Path(override)
+        if not override_path.is_absolute():
+            override_path = project_root / override_path
+        env_files: tuple[Path, ...] = (override_path,)
+    else:
+        env_files = (project_root / ".env", project_root / ".env.local")
+
     merged: dict[str, str] = {}
-    merged.update(parse_dotenv_file(project_root / ".env"))
-    merged.update(parse_dotenv_file(project_root / ".env.local"))
-    merged.update(dict(environ or os.environ))
+    for env_file in env_files:
+        merged.update(parse_dotenv_file(env_file))
+    merged.update(proc_env)
     return merged
 
 
@@ -221,7 +238,7 @@ def cmd_up(runtime: LocalPostgresRuntime) -> int:
     if not _port_available("127.0.0.1", runtime.host_port):
         print(
             f"error: port {runtime.host_port} is already in use — "
-            "update ARIEL_DATABASE_URL in .env.local to use a free port"
+            "update ARIEL_DATABASE_URL in the active env file to use a free port"
         )
         return 1
 
