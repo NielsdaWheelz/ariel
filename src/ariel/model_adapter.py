@@ -149,7 +149,7 @@ class ModelAdapter:
         if binding.provider == "cloudflare":
             # Workers AI exposes only chat-completions + embeddings; the Responses
             # API is OpenAI-only. Account id lives in the URL path; auth is a
-            # bearer token. See docs/ai-sdk-cutover.md and providers/cloudflare.
+            # bearer token.
             base_url = (
                 f"https://api.cloudflare.com/client/v4/accounts/{s.cloudflare_account_id}/ai/v1"
             )

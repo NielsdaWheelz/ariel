@@ -52,8 +52,7 @@ def _tool_returns(messages: list[ModelMessage]) -> list[dict[str, Any]]:
     include a ``ToolReturnPart`` per syscall return; the ``content`` is a
     JSON document carrying ``status``, ``emitted_values``, ``action_attempts``,
     etc. This helper returns the parsed bodies in message order so tests can
-    assert on the cross-round payload contract that used to live in the
-    legacy ``function_call_output`` dict shape.
+    assert on the cross-round payload contract.
     """
     bodies: list[dict[str, Any]] = []
     for message in messages:

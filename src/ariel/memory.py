@@ -461,15 +461,14 @@ def search_memory(
     limit: int = 24,
     since: datetime | None = None,
     kinds: tuple[str, ...] | None = None,
-    layers: tuple[Literal["log", "note"], ...] = ("log", "note"),
 ) -> list[dict[str, Any]]:
     """Hybrid search across ``memory_log`` and ``memory_notes``.
 
-    Computes the query embedding once; for each requested layer runs a keyword
-    tsquery match against ``search_vector`` and a vector cosine-distance match
-    against ``embedding`` (skipped when no rows have embeddings yet). Unions
-    the results, deduplicates by id, applies ``since``/``kinds`` filters on the
-    log layer, and returns up to ``limit`` hits ordered by ``created_at DESC``
+    Computes the query embedding once; for each layer runs a keyword tsquery
+    match against ``search_vector`` and a vector cosine-distance match against
+    ``embedding`` (skipped when no rows have embeddings yet). Unions the
+    results, deduplicates by id, applies ``since``/``kinds`` filters on the log
+    layer, and returns up to ``limit`` hits ordered by ``created_at DESC``
     (transport order — the model ranks, code does not).
 
     Skips ``assistant_message`` log rows whose content matches the
@@ -489,83 +488,80 @@ def search_memory(
 
     hits: dict[str, dict[str, Any]] = {}
 
-    if "log" in layers:
-        tsquery = func.websearch_to_tsquery("english", query)
-        stmt = select(MemoryLogRecord).where(MemoryLogRecord.search_vector.op("@@")(tsquery))
+    tsquery = func.websearch_to_tsquery("english", query)
+    stmt = select(MemoryLogRecord).where(MemoryLogRecord.search_vector.op("@@")(tsquery))
+    if since is not None:
+        stmt = stmt.where(MemoryLogRecord.created_at >= since)
+    if kinds is not None:
+        stmt = stmt.where(MemoryLogRecord.kind.in_(kinds))
+    for row in db.scalars(stmt.order_by(MemoryLogRecord.created_at.desc()).limit(limit)).all():
+        if row.kind == "assistant_message" and _is_assistant_failure_message(row.content):
+            continue
+        hits[row.id] = {
+            "id": row.id,
+            "layer": "log",
+            "kind": row.kind,
+            "created_at": to_rfc3339(row.created_at),
+            "snippet": row.content[:200],
+            "taint": row.taint,
+        }
+
+    has_log_embeddings = db.scalar(
+        select(MemoryLogRecord.id).where(MemoryLogRecord.embedding.is_not(None)).limit(1)
+    )
+    if query_embedding is not None and has_log_embeddings is not None:
+        vec_stmt = select(MemoryLogRecord).where(MemoryLogRecord.embedding.is_not(None))
         if since is not None:
-            stmt = stmt.where(MemoryLogRecord.created_at >= since)
+            vec_stmt = vec_stmt.where(MemoryLogRecord.created_at >= since)
         if kinds is not None:
-            stmt = stmt.where(MemoryLogRecord.kind.in_(kinds))
-        for row in db.scalars(stmt.order_by(MemoryLogRecord.created_at.desc()).limit(limit)).all():
+            vec_stmt = vec_stmt.where(MemoryLogRecord.kind.in_(kinds))
+        distance = MemoryLogRecord.embedding.cosine_distance(query_embedding)
+        for row in db.scalars(vec_stmt.order_by(distance.asc()).limit(limit)).all():
             if row.kind == "assistant_message" and _is_assistant_failure_message(row.content):
                 continue
-            hits[row.id] = {
-                "id": row.id,
-                "layer": "log",
-                "kind": row.kind,
-                "created_at": to_rfc3339(row.created_at),
-                "snippet": row.content[:200],
-                "taint": row.taint,
-            }
+            if row.id not in hits:
+                hits[row.id] = {
+                    "id": row.id,
+                    "layer": "log",
+                    "kind": row.kind,
+                    "created_at": to_rfc3339(row.created_at),
+                    "snippet": row.content[:200],
+                    "taint": row.taint,
+                }
 
-        has_log_embeddings = db.scalar(
-            select(MemoryLogRecord.id).where(MemoryLogRecord.embedding.is_not(None)).limit(1)
-        )
-        if query_embedding is not None and has_log_embeddings is not None:
-            vec_stmt = select(MemoryLogRecord).where(MemoryLogRecord.embedding.is_not(None))
-            if since is not None:
-                vec_stmt = vec_stmt.where(MemoryLogRecord.created_at >= since)
-            if kinds is not None:
-                vec_stmt = vec_stmt.where(MemoryLogRecord.kind.in_(kinds))
-            distance = MemoryLogRecord.embedding.cosine_distance(query_embedding)
-            for row in db.scalars(vec_stmt.order_by(distance.asc()).limit(limit)).all():
-                if row.kind == "assistant_message" and _is_assistant_failure_message(row.content):
-                    continue
-                if row.id not in hits:
-                    hits[row.id] = {
-                        "id": row.id,
-                        "layer": "log",
-                        "kind": row.kind,
-                        "created_at": to_rfc3339(row.created_at),
-                        "snippet": row.content[:200],
-                        "taint": row.taint,
-                    }
+    note_stmt = select(MemoryNoteRecord).where(MemoryNoteRecord.search_vector.op("@@")(tsquery))
+    for note_row in db.scalars(
+        note_stmt.order_by(MemoryNoteRecord.created_at.desc()).limit(limit)
+    ).all():
+        hits[note_row.id] = {
+            "id": note_row.id,
+            "layer": "note",
+            "kind": None,
+            "created_at": to_rfc3339(note_row.created_at),
+            "snippet": note_row.content[:200],
+            "taint": note_row.taint,
+        }
 
-    if "note" in layers:
-        tsquery = func.websearch_to_tsquery("english", query)
-        note_stmt = select(MemoryNoteRecord).where(MemoryNoteRecord.search_vector.op("@@")(tsquery))
+    has_note_embeddings = db.scalar(
+        select(MemoryNoteRecord.id).where(MemoryNoteRecord.embedding.is_not(None)).limit(1)
+    )
+    if query_embedding is not None and has_note_embeddings is not None:
+        distance = MemoryNoteRecord.embedding.cosine_distance(query_embedding)
         for note_row in db.scalars(
-            note_stmt.order_by(MemoryNoteRecord.created_at.desc()).limit(limit)
+            select(MemoryNoteRecord)
+            .where(MemoryNoteRecord.embedding.is_not(None))
+            .order_by(distance.asc())
+            .limit(limit)
         ).all():
-            hits[note_row.id] = {
-                "id": note_row.id,
-                "layer": "note",
-                "kind": None,
-                "created_at": to_rfc3339(note_row.created_at),
-                "snippet": note_row.content[:200],
-                "taint": note_row.taint,
-            }
-
-        has_note_embeddings = db.scalar(
-            select(MemoryNoteRecord.id).where(MemoryNoteRecord.embedding.is_not(None)).limit(1)
-        )
-        if query_embedding is not None and has_note_embeddings is not None:
-            distance = MemoryNoteRecord.embedding.cosine_distance(query_embedding)
-            for note_row in db.scalars(
-                select(MemoryNoteRecord)
-                .where(MemoryNoteRecord.embedding.is_not(None))
-                .order_by(distance.asc())
-                .limit(limit)
-            ).all():
-                if note_row.id not in hits:
-                    hits[note_row.id] = {
-                        "id": note_row.id,
-                        "layer": "note",
-                        "kind": None,
-                        "created_at": to_rfc3339(note_row.created_at),
-                        "snippet": note_row.content[:200],
-                        "taint": note_row.taint,
-                    }
+            if note_row.id not in hits:
+                hits[note_row.id] = {
+                    "id": note_row.id,
+                    "layer": "note",
+                    "kind": None,
+                    "created_at": to_rfc3339(note_row.created_at),
+                    "snippet": note_row.content[:200],
+                    "taint": note_row.taint,
+                }
 
     return sorted(hits.values(), key=lambda h: h["created_at"], reverse=True)[:limit]
 

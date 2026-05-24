@@ -64,7 +64,7 @@ class AttachmentContentRuntime:
     adapter: ModelAdapter
     # Audio-only OpenAI plumbing — image/PDF extraction routes through
     # ``adapter`` on the VISION tier. The audio path keeps direct httpx
-    # because pydantic-ai 1.99 has no STT Model; revisit in Phase 4+.
+    # because pydantic-ai 1.99 has no STT Model; revisit when it grows one.
     openai_api_key: str | None
     openai_audio_model: str
     openai_audio_timeout_seconds: float
@@ -678,7 +678,7 @@ def _extract_with_vision_adapter(
     ``_extract_failed`` surface: a structured-output contract violation maps
     to ``extract_failed``; any other adapter exception maps to
     ``provider_unavailable``. The extractor label stays ``openai_responses``
-    so cached extraction rows keep their identity across the cutover.
+    so cached extraction rows keep their identity.
     """
     prompt = (
         "Read this attachment for Ariel. Extract only visible or embedded user-provided "
@@ -728,10 +728,9 @@ def _extract_with_openai_audio(
     # justify-direct-httpx-audio: pydantic-ai 1.99 ships no audio/STT ``Model``
     # class, and the ``ModelAdapter`` exposes only ``call`` (text/tool/vision)
     # and ``embed``. Migrating audio would require adding an ``AUDIO`` tier
-    # *and* an ``adapter.transcribe`` method — out of scope for Phase 3. This
-    # is the single narrowly-scoped exception to the "no httpx for model
-    # calls" invariant; tighten the Phase 4 grep test to allow only this
-    # function. Revisit when pydantic-ai grows an STT contract.
+    # *and* an ``adapter.transcribe`` method. This is the single narrowly-
+    # scoped exception to the "no httpx for model calls" invariant. Revisit
+    # when pydantic-ai grows an STT contract.
     if runtime.openai_api_key is None:
         return _extract_failed("provider_unavailable", "openai_audio")
     try:

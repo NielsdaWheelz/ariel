@@ -210,10 +210,3 @@ def test_model_call_rejects_unknown_fields() -> None:
             messages=_msgs(),
             unknown="x",
         )
-
-
-def test_module_reexports_model_message() -> None:
-    from ariel.model_adapter import ModelMessage as ReExportedModelMessage
-    from pydantic_ai.messages import ModelMessage as UpstreamModelMessage
-
-    assert ReExportedModelMessage is UpstreamModelMessage

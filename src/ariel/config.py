@@ -72,7 +72,6 @@ class AppSettings(BaseSettings):
     model_tier_embedding: str | None = None
     model_timeout_seconds: float = 30.0
     model_reasoning_effort: Literal["minimal", "low", "medium", "high"] = "medium"
-    model_verbosity: str = "low"
     # ``memory_embedding_dimensions`` is the DB column width invariant; the
     # actual provider/model are resolved by the EMBEDDING tier in the adapter.
     memory_embedding_dimensions: int = MEMORY_EMBEDDING_DIMENSIONS
@@ -333,14 +332,6 @@ class AppSettings(BaseSettings):
         if normalized not in {"minimal", "low", "medium", "high"}:
             raise ValueError("model_reasoning_effort must be one of: minimal, low, medium, high")
         return normalized  # type: ignore[return-value]  # justify-narrowed-by-set-check
-
-    @field_validator("model_verbosity")
-    @classmethod
-    def _model_verbosity_must_be_supported(cls, value: str) -> str:
-        normalized = value.strip().lower()
-        if normalized not in {"low", "medium", "high"}:
-            raise ValueError("model_verbosity must be one of: low, medium, high")
-        return normalized
 
     @field_validator("memory_embedding_dimensions")
     @classmethod

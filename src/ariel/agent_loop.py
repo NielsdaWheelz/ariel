@@ -359,13 +359,20 @@ def run_agent_loop(
                     )
                 )
             )
+            usage = candidate_response.usage
             add_event(
                 "evt.model.completed",
                 {
                     "provider": candidate_response.provider,
                     "model": candidate_response.model,
                     "duration_ms": candidate_response.duration_ms,
-                    "usage": _usage_payload(candidate_response),
+                    "usage": {
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                        "total_tokens": usage.input_tokens + usage.output_tokens,
+                        "reasoning_tokens": usage.reasoning_tokens,
+                        "cached_tokens": usage.cached_tokens,
+                    },
                     "provider_response_id": candidate_response.provider_response_id,
                     "model_call_count": model_call_count,
                 },
@@ -961,18 +968,6 @@ def _tool_returns_with_nudge(
     if nudge is not None:
         parts.append(SystemPromptPart(content=nudge))
     return ModelRequest(parts=parts)
-
-
-def _usage_payload(response: ModelResponse) -> dict[str, int]:
-    """Render ``ModelResponse.usage`` into the ``SurfaceModelUsageContract`` shape."""
-    usage = response.usage
-    return {
-        "input_tokens": usage.input_tokens,
-        "output_tokens": usage.output_tokens,
-        "total_tokens": usage.input_tokens + usage.output_tokens,
-        "reasoning_tokens": usage.reasoning_tokens,
-        "cached_tokens": usage.cached_tokens,
-    }
 
 
 def _budget_exhausted_result(

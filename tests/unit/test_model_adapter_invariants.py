@@ -1,10 +1,10 @@
-"""Spec invariants for the model-adapter cutover (docs/ai-sdk-cutover.md §10).
+"""Model-adapter boundary invariants.
 
-The adapter is the *only* place where provider SDKs are touched and where
-HTTP traffic to model providers originates. These tests guard the boundary
-by scanning ``src/ariel/`` source. Each assertion mirrors one acceptance
-criterion in the spec; if a future change widens the surface, the failing
-test forces an explicit acknowledgement here rather than silent leakage.
+``ariel.model_adapter`` is the only place where provider SDKs are touched
+and where HTTP traffic to model providers originates. These tests guard
+that boundary by scanning ``src/ariel/`` source. If a future change widens
+the surface, the failing test forces an explicit acknowledgement here
+rather than silent leakage.
 """
 
 from __future__ import annotations
@@ -30,9 +30,9 @@ def _grep(pattern: str) -> list[tuple[Path, int, str]]:
 
 
 def test_no_provider_sdk_imports_in_subsystems() -> None:
-    """Acceptance §10.1 — provider SDKs (openai / anthropic / google-genai) are
-    routed exclusively through ``ariel.model_adapter``. pydantic-ai pulls the
-    real SDKs as transitive dependencies; subsystems never import them.
+    """Provider SDKs (openai / anthropic / google-genai) are routed exclusively
+    through ``ariel.model_adapter``. pydantic-ai pulls the real SDKs as
+    transitive dependencies; subsystems never import them directly.
     """
     hits = _grep(
         r"^\s*(from openai|import openai|from anthropic|import anthropic|from google\.genai|import google\.genai)\b"
@@ -41,7 +41,7 @@ def test_no_provider_sdk_imports_in_subsystems() -> None:
 
 
 def test_no_stateful_conversation_cursor_anywhere() -> None:
-    """Acceptance §10.10 — conversation history is caller-owned and stateless.
+    """Conversation history is caller-owned and stateless.
     ``previous_response_id`` is the OpenAI Responses server-side cursor; we
     re-send full history every call instead. ``provider_response_id`` is the
     telemetry id of a *single* response and remains in the event schema.
@@ -51,10 +51,10 @@ def test_no_stateful_conversation_cursor_anywhere() -> None:
 
 
 def test_httpx_to_model_providers_is_only_the_audio_exception() -> None:
-    """Acceptance §10.2 — no subsystem calls a model provider via ``httpx``.
-    The single documented exception is ``attachment_content._extract_with_openai_audio``
-    (pydantic-ai 1.99 ships no STT contract; see ``justify-direct-httpx-audio``).
-    Everything else hits providers through ``ModelAdapter``.
+    """No subsystem calls a model provider via ``httpx``. The single documented
+    exception is ``attachment_content._extract_with_openai_audio`` (pydantic-ai
+    1.99 ships no STT contract; see ``justify-direct-httpx-audio``). Everything
+    else hits providers through ``ModelAdapter``.
     """
     files_with_httpx = {hit[0].as_posix() for hit in _grep(r"^\s*import httpx\b")}
     # Non-model uses of httpx (URL fetching, RPC clients, OAuth) are allowed.

@@ -327,9 +327,7 @@ def has_tool_returns(messages: list[ModelMessage]) -> bool:
     tool returns).
 
     Test fakes that respond with a syscall on round 1 use this to detect the
-    next round and switch to an ``agent.emit_message`` finalisation — the
-    equivalent of the legacy ``input_items`` ``function_call_output`` check
-    against the pre-cutover dict-shaped input.
+    next round and switch to an ``agent.emit_message`` finalisation.
     """
     for message in messages:
         if not isinstance(message, ModelRequest):

@@ -540,71 +540,6 @@ def _discord_context_text(raw_context: Any) -> str | None:
     return "\n".join(lines)
 
 
-@dataclass(slots=True, frozen=True)
-class TurnLimitViolation:
-    budget: str
-    unit: str
-    measured: int
-    limit: int
-
-
-def _response_tokens_from_model_payload(
-    assistant_response: dict[str, Any],
-    *,
-    assistant_text: str,
-) -> int:
-    del assistant_text
-    usage_payload = assistant_response.get("usage")
-    if isinstance(usage_payload, dict):
-        output_tokens = usage_payload.get("output_tokens")
-        if isinstance(output_tokens, int) and output_tokens >= 0:
-            return output_tokens
-    return 0
-
-
-def _turn_limit_message(violation: TurnLimitViolation) -> str:
-    if violation.budget == "response_tokens":
-        return (
-            "this turn stopped because the response budget was exhausted. "
-            "please narrow the request so i can answer within the response budget."
-        )
-    return "this turn stopped because a configured turn budget was exhausted."
-
-
-def _applied_turn_limits(settings: AppSettings) -> dict[str, Any]:
-    return {
-        "max_response_tokens": int(settings.max_response_tokens),
-        "main_turn_budget_seconds": float(settings.main_turn_budget_seconds),
-        "agent_loop_max_model_calls": int(settings.agent_loop_max_model_calls),
-    }
-
-
-def _build_turn_limit_error(
-    *,
-    session_id: str,
-    turn_id: str,
-    violation: TurnLimitViolation,
-    applied_limits: dict[str, Any],
-) -> ApiError:
-    return ApiError(
-        status_code=429,
-        code="E_TURN_LIMIT_REACHED",
-        message=_turn_limit_message(violation),
-        details={
-            "session_id": session_id,
-            "turn_id": turn_id,
-            "limit": {
-                "budget": violation.budget,
-                "unit": violation.unit,
-                "limit": violation.limit,
-                "measured": violation.measured,
-            },
-            "applied_limits": applied_limits,
-        },
-        retryable=False,
-    )
-
-
 @dataclass(slots=True)
 class ApiError(Exception):
     status_code: int
@@ -1309,53 +1244,6 @@ def _wake(
         agency_configured=agency_configured,
         settings=runtime.settings,
     )
-    applied_limits = _applied_turn_limits(runtime.settings)
-
-    def build_turn_limit_failure(
-        *,
-        budget: str,
-        unit: str,
-        measured: int,
-        limit: int,
-    ) -> ApiError:
-        return _build_turn_limit_error(
-            session_id=effective_session_id,
-            turn_id=turn.id,
-            violation=TurnLimitViolation(
-                budget=budget,
-                unit=unit,
-                measured=measured,
-                limit=limit,
-            ),
-            applied_limits=applied_limits,
-        )
-
-    def emit_turn_limit_failure(failure: ApiError) -> None:
-        raw_limit = failure.details.get("limit")
-        limit_details = raw_limit if isinstance(raw_limit, dict) else {}
-        add_event(
-            "evt.assistant.emitted",
-            {
-                "message": failure.message,
-                "bounded_failure": {
-                    "code": failure.code,
-                    "limit": limit_details,
-                },
-            },
-        )
-        turn.assistant_message = failure.message
-        turn.status = "failed"
-        turn.updated_at = utcnow()
-        add_event(
-            "evt.turn.failed",
-            {
-                "failure_reason": failure.message,
-                "error_code": failure.code,
-                "limit": limit_details,
-            },
-        )
-
-    bounded_failure: ApiError | None = None
     model_failure: ApiError | None = None
     model_failure_reason: str | None = None
     assistant_response: dict[str, Any] | None = None
@@ -1460,23 +1348,11 @@ def _wake(
     match loop_result.outcome:
         case "message":
             assert loop_result.emitted_message is not None
-            response_tokens = _response_tokens_from_model_payload(
-                exhausted_response,
-                assistant_text=loop_result.emitted_message,
-            )
-            if response_tokens > runtime.settings.max_response_tokens:
-                bounded_failure = build_turn_limit_failure(
-                    budget="response_tokens",
-                    unit="tokens",
-                    measured=response_tokens,
-                    limit=runtime.settings.max_response_tokens,
-                )
-            else:
-                assistant_response = {
-                    **exhausted_response,
-                    "assistant_text": loop_result.emitted_message,
-                    "assistant_silent": False,
-                }
+            assistant_response = {
+                **exhausted_response,
+                "assistant_text": loop_result.emitted_message,
+                "assistant_silent": False,
+            }
         case "approval":
             assistant_response = {
                 **exhausted_response,
@@ -1489,7 +1365,10 @@ def _wake(
                 "assistant_text": "",
                 "assistant_silent": True,
             }
-        case "budget_exhausted":
+        case "budget_exhausted" | "bounded_failure" | "finding" | "operations":
+            # "bounded_failure" is reserved on the loop but never produced; the
+            # cross-mode outcomes "finding"/"operations" are not valid for
+            # output_mode="message". All three degrade to the exhausted message.
             assistant_response = exhausted_response
         case "model_failed":
             model_failure = ApiError(
@@ -1504,15 +1383,8 @@ def _wake(
                 retryable=True,
             )
             model_failure_reason = "model provider request failed"
-        case "bounded_failure":
-            pass  # bounded_failure set inside the message branch above
-        case "finding" | "operations":
-            # Not a valid outcome for output_mode="message" — treat as exhausted.
-            assistant_response = exhausted_response
 
-    if bounded_failure is not None:
-        emit_turn_limit_failure(bounded_failure)
-    elif model_failure is not None:
+    if model_failure is not None:
         turn.status = "failed"
         turn.updated_at = utcnow()
         add_event(
@@ -1564,13 +1436,6 @@ def _wake(
     active_session.updated_at = utcnow()
     db.commit()
 
-    if bounded_failure is not None:
-        return TurnExecutionOutcome(
-            turn_id=turn.id,
-            effective_session_id=effective_session_id,
-            status_code=bounded_failure.status_code,
-            response_payload=_error_payload(bounded_failure),
-        )
     if model_failure is not None:
         return TurnExecutionOutcome(
             turn_id=turn.id,
