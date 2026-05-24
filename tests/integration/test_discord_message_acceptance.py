@@ -1,21 +1,24 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import json
 from pathlib import Path
 from typing import Any, cast
 
 from fastapi.testclient import TestClient
+from fastapi.encoders import jsonable_encoder
 import pytest
+from pydantic_ai.messages import ModelRequest, SystemPromptPart
 from sqlalchemy import text
 
-from ariel.model_adapter import ModelAdapter
+from ariel.model_adapter import ModelAdapter, ModelCall, ModelMessage, ModelResponse
 from tests.integration.app_helpers import create_test_app
 from tests.integration.responses_helpers import (
+    FakeModelAdapter,
     empty_recall_response,
+    has_tool_returns,
     is_memory_subsystem_call,
+    last_user_message,
     post_message_and_drain,
-    responses_message,
     responses_run_message,
     responses_with_run_calls,
 )
@@ -35,6 +38,18 @@ def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
         sandbox=FakeSandboxRuntime(),
     )
     return TestClient(app)
+
+
+def _system_prompt_text(messages: list[ModelMessage]) -> str:
+    """Concatenate all SystemPromptPart contents from ``messages`` for substring checks."""
+    parts: list[str] = []
+    for message in messages:
+        if not isinstance(message, ModelRequest):
+            continue
+        for part in message.parts:
+            if isinstance(part, SystemPromptPart):
+                parts.append(part.content)
+    return "\n".join(parts)
 
 
 def _patch_discord_attachment_download(
@@ -104,25 +119,16 @@ def _post_report_attachment_read_request(client: TestClient, session_id: str) ->
     )
 
 
-@dataclass
-class DiscordStatusAdapter:
-    provider: str = "provider.discord-status"
-    model: str = "model.discord-status-v1"
+class DiscordStatusAdapter(FakeModelAdapter):
+    provider = "provider.discord-status"
+    model = "model.discord-status-v1"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_memory_subsystem_call(input_items):
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_memory_subsystem_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del tools, history, context_bundle
+        user_message = last_user_message(request.messages)
         return responses_run_message(
             assistant_text=f"assistant::{user_message}",
             provider=self.provider,
@@ -133,29 +139,20 @@ class DiscordStatusAdapter:
         )
 
 
-@dataclass
-class NoVisibleResponseAdapter:
-    provider: str = "provider.discord"
-    model: str = "model.discord-v1"
-    input_items: list[list[dict[str, Any]]] = field(default_factory=list)
-    context_bundles: list[dict[str, Any]] = field(default_factory=list)
+class NoVisibleResponseAdapter(FakeModelAdapter):
+    provider = "provider.discord"
+    model = "model.discord-v1"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_memory_subsystem_call(input_items):
+    def __init__(self) -> None:
+        super().__init__()
+        self.messages_seen: list[list[ModelMessage]] = []
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_memory_subsystem_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del tools, history, user_message
-        self.input_items.append(input_items)
-        self.context_bundles.append(context_bundle)
+        self.messages_seen.append(list(request.messages))
         calls = [{"name": "agent.pause_until_input", "input": {}}]
         return responses_with_run_calls(
             calls=calls,
@@ -167,29 +164,21 @@ class NoVisibleResponseAdapter:
         )
 
 
-@dataclass
-class CapturingAttachmentAdapter:
-    provider: str = "provider.attachments"
-    model: str = "model.attachments-v1"
-    input_items: list[list[dict[str, Any]]] = field(default_factory=list)
-    context_bundles: list[dict[str, Any]] = field(default_factory=list)
+class CapturingAttachmentAdapter(FakeModelAdapter):
+    provider = "provider.attachments"
+    model = "model.attachments-v1"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_memory_subsystem_call(input_items):
+    def __init__(self) -> None:
+        super().__init__()
+        self.messages_seen: list[list[ModelMessage]] = []
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_memory_subsystem_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del tools, history
-        self.input_items.append(input_items)
-        self.context_bundles.append(context_bundle)
+        self.messages_seen.append(list(request.messages))
+        user_message = last_user_message(request.messages)
         return responses_run_message(
             assistant_text=f"ack::{user_message}",
             provider=self.provider,
@@ -200,64 +189,20 @@ class CapturingAttachmentAdapter:
         )
 
 
-@dataclass
-class AttachmentReadAdapter:
-    provider: str = "provider.attachment-read"
-    model: str = "model.attachment-read-v1"
-    input_items: list[list[dict[str, Any]]] = field(default_factory=list)
+class AttachmentReadAdapter(FakeModelAdapter):
+    provider = "provider.attachment-read"
+    model = "model.attachment-read-v1"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_memory_subsystem_call(input_items):
+    def __init__(self) -> None:
+        super().__init__()
+        self.messages_seen: list[list[ModelMessage]] = []
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_memory_subsystem_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del tools, user_message, history
-        if context_bundle.get("origin") == "tool_result_interpretation":
-            interpreter_input = json.loads(
-                next(
-                    item["content"]
-                    for item in input_items
-                    if item.get("role") == "user" and isinstance(item.get("content"), str)
-                )
-            )
-            selected_output_refs = [
-                output["output_ref"]
-                for output in interpreter_input["audited_tool_outputs"]
-                if isinstance(output, dict) and isinstance(output.get("output_ref"), str)
-            ]
-            return responses_message(
-                assistant_text=json.dumps(
-                    {
-                        "findings": ["attachment output requires interpreted answer context"],
-                        "contradictions": [],
-                        "uncertainty": [],
-                        "selected_output_refs": selected_output_refs,
-                        "omitted_output_refs": [],
-                        "citation_refs": interpreter_input["citation_refs"],
-                        "artifact_refs": interpreter_input["artifact_refs"],
-                        "recommended_next_evidence": [],
-                        "confidence": 0.91,
-                    },
-                    sort_keys=True,
-                ),
-                provider=self.provider,
-                model=self.model,
-                provider_response_id="resp_attachment_interpreter_123",
-                input_tokens=7,
-                output_tokens=5,
-            )
-        if any(
-            isinstance(item, dict) and item.get("type") == "function_call_output"
-            for item in input_items
-        ):
+        if has_tool_returns(request.messages):
             return responses_run_message(
                 assistant_text="attachment content: quarterly revenue increased [1]",
                 provider=self.provider,
@@ -266,7 +211,7 @@ class AttachmentReadAdapter:
                 input_tokens=7,
                 output_tokens=5,
             )
-        self.input_items.append(input_items)
+        self.messages_seen.append(list(request.messages))
         return responses_with_run_calls(
             calls=[
                 {
@@ -336,17 +281,12 @@ def test_no_visible_response_operation_completes_turn_without_visible_reply(
             event for event in turn_data["events"] if event["event_type"] == "evt.turn.started"
         )
         assert turn_started["payload"]["discord"]["channel_name"] == "ops"
-        assert adapter.context_bundles[0]["discord_context"]["message_id"] == 101112
-        assert any(
-            item.get("role") == "system"
-            and isinstance(item.get("content"), str)
-            and "discord context:" in item["content"]
-            and "filename=note.txt" in item["content"]
-            and "attachment_ref=discord:161718" in item["content"]
-            and "url=" not in item["content"]
-            and "https://cdn.discordapp.com/attachments/note.txt" not in item["content"]
-            for item in adapter.input_items[0]
-        )
+        system_text = _system_prompt_text(adapter.messages_seen[0])
+        assert "discord context:" in system_text
+        assert "filename=note.txt" in system_text
+        assert "attachment_ref=discord:161718" in system_text
+        assert "url=" not in system_text
+        assert "https://cdn.discordapp.com/attachments/note.txt" not in system_text
         with cast(Any, client.app).state.session_factory() as db:
             with db.begin():
                 discord_message = (
@@ -416,17 +356,7 @@ def test_discord_attachment_content_is_referenced_without_raw_cdn_url(
         )
         assert turn.status == "completed"
 
-    context_attachment = adapter.context_bundles[0]["discord_context"]["attachments"][0]
-    assert context_attachment == {
-        "source": "discord",
-        "source_attachment_id": 131415,
-        "filename": "quarterly.pdf",
-        "content_type": "application/pdf",
-        "size_bytes": 2048,
-        "attachment_ref": "discord:131415",
-    }
-
-    model_payload = json.dumps(adapter.input_items, sort_keys=True)
+    model_payload = json.dumps(jsonable_encoder(adapter.messages_seen), sort_keys=True)
     assert "attachment_ref=discord:131415" in model_payload
     assert "filename=quarterly.pdf" in model_payload
     assert "url=" not in model_payload

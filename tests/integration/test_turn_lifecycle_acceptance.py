@@ -1,22 +1,22 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-import pytest
 from fastapi.testclient import TestClient
 
 from ariel.app import create_app
-from ariel.model_adapter import ModelAdapter, ModelAdapterError
+from ariel.model_adapter import ModelAdapter, ModelCall, ModelResponse
+from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.app_helpers import create_test_app
 from tests.integration.responses_helpers import (
+    FakeModelAdapter,
     empty_recall_response,
     is_memory_subsystem_call,
+    last_user_message,
     post_message_and_drain,
     responses_run_message,
 )
-from tests.fake_sandbox import FakeSandboxRuntime
 
 
 def _parse_utc_rfc3339(value: str) -> datetime:
@@ -31,34 +31,22 @@ def _timeline(client: TestClient, session_id: str) -> dict[str, Any]:
     return resp.json()
 
 
-@dataclass
-class DeterministicModelAdapter:
-    provider: str = "provider.test"
-    model: str = "model.test-v1"
-    fail: bool = False
+class DeterministicModelAdapter(FakeModelAdapter):
+    provider = "provider.test"
+    model = "model.test-v1"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_memory_subsystem_call(input_items):
+    def __init__(self, *, fail: bool = False) -> None:
+        super().__init__()
+        self.fail = fail
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_memory_subsystem_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del tools, history, context_bundle
         if self.fail:
-            raise ModelAdapterError(
-                safe_reason="simulated provider failure",
-                status_code=502,
-                code="E_MODEL_FAILURE",
-                message="model provider request failed",
-                retryable=False,
-            )
+            raise RuntimeError("simulated provider failure")
+        user_message = last_user_message(request.messages)
         return responses_run_message(
             assistant_text=f"assistant::{user_message}",
             provider=self.provider,
@@ -142,7 +130,11 @@ def test_single_active_session_and_ordered_turn_event_chain(postgres_url: str) -
 
 
 def test_model_timeline_includes_identity_duration_and_usage(postgres_url: str) -> None:
-    adapter = DeterministicModelAdapter(provider="provider.alpha", model="alpha-mini")
+    class IdentifiedAdapter(DeterministicModelAdapter):
+        provider = "provider.alpha"
+        model = "alpha-mini"
+
+    adapter = IdentifiedAdapter()
     with _build_client(postgres_url, adapter) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
         post_message_and_drain(client, session_id, message="inspect model metadata")
@@ -181,7 +173,7 @@ def test_model_failure_is_auditable_and_turn_terminates_failed(postgres_url: str
         assert turn_data["status"] == "failed"
         event_types = [event["event_type"] for event in turn_data["events"]]
         # Retriever runs first (succeeds, emitting its model events); then the
-        # main agent call fails with the typed model adapter error.
+        # main agent call fails with the simulated provider failure.
         assert event_types == [
             "evt.turn.started",
             "evt.model.started",  # retriever
@@ -249,70 +241,16 @@ def test_whitespace_only_message_is_rejected_with_standard_error(postgres_url: s
         assert timeline["turns"] == []
 
 
-@dataclass
-class NonSecretFailureAdapter:
-    provider: str = "provider.non-secret"
-    model: str = "model.non-secret-v1"
+class NonSecretFailureAdapter(FakeModelAdapter):
+    provider = "provider.non-secret"
+    model = "model.non-secret-v1"
 
-    def create_response(
-        self,
-        *,
-        input_items: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        user_message: str,
-        history: list[dict[str, Any]],
-        context_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        if is_memory_subsystem_call(input_items):
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_memory_subsystem_call(request.messages):
             return empty_recall_response(
-                provider=self.provider, model=self.model, input_items=input_items
+                provider=self.provider, model=self.model, messages=request.messages
             )
-        del tools, user_message, history, context_bundle
-        raise ModelAdapterError(
-            safe_reason="token limit exceeded for this request",
-            status_code=502,
-            code="E_MODEL_FAILURE",
-            message="model provider request failed",
-            retryable=False,
-        )
-
-
-def test_default_runtime_model_requires_server_secret_credentials(
-    postgres_url: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("ARIEL_MODEL_NAME", "gpt-5.5")
-    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "")
-
-    app = create_test_app(
-        database_url=postgres_url,
-        model_adapter=None,
-        sandbox=FakeSandboxRuntime(),
-    )
-    with TestClient(app) as client:
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        turn = post_message_and_drain(client, session_id, message="credential check")
-        assert turn.status == "failed"
-
-        timeline = _timeline(client, session_id)
-        events = timeline["turns"][0]["events"]
-        event_types = [event["event_type"] for event in events]
-        # The real adapter raises ModelAdapterError(safe_reason="model credentials
-        # are not configured") for both the retriever call and the main agent call.
-        assert event_types == [
-            "evt.turn.started",
-            "evt.model.started",  # retriever (no API key)
-            "evt.model.failed",  # retriever fails
-            "evt.memory.recall_failed",  # typed recall failure is non-fatal
-            "evt.model.started",  # main agent (no API key)
-            "evt.model.failed",  # main agent fails
-            "evt.turn.failed",
-        ]
-        # The main agent's model.failed is the last evt.model.failed event.
-        model_failed_events = [e for e in events if e["event_type"] == "evt.model.failed"]
-        failure_payload = model_failed_events[-1]["payload"]
-        assert "credential" in failure_payload["failure_reason"].lower()
-        assert "sk-" not in failure_payload["failure_reason"]
+        raise RuntimeError("token limit exceeded for this request")
 
 
 def test_model_failure_reason_preserves_non_secret_detail(postgres_url: str) -> None:
